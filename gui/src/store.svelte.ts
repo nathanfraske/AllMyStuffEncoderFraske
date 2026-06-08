@@ -14,7 +14,14 @@ import {
   type GrantRequest,
 } from "./catalog";
 import { demoCatalog } from "./mock";
-import { scanSelf } from "./tauri";
+import {
+  connectRoute,
+  disconnectRoute,
+  onSession,
+  onSubscription,
+  scanSelf,
+  type SessionSnapshot,
+} from "./tauri";
 import type { Capability, Catalog, Grant, MediaKind, MeshNode, Relationship } from "./types";
 
 let seq = 0;
@@ -57,6 +64,9 @@ class AppStore {
   groupPickerFor = $state<string | null>(null); // groupId awaiting a target
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
+  /** The local machine's node id. `"this"` in demo/web mode; the real mesh
+   *  device id once the backend session is up. The graph centres on it. */
+  localId = $state("this");
 
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
@@ -80,20 +90,86 @@ class AppStore {
 
   // ---- lifecycle ---------------------------------------------------
 
-  /** Pull a real scan from the backend, if there is one. No-op (keeps the
-   *  demo graph) in web mode. */
+  /** Wire up live backend data, if there is a backend. No-op (keeps the
+   *  demo graph) in web mode. Called once on mount. */
+  async init() {
+    await this.hydrateFromBackend();
+    await onSubscription((s) => {
+      this.backendConnected = s.status === "live";
+    });
+    await onSession((snap) => this.applySessionSnapshot(snap));
+  }
+
+  /** Pull a real scan from the backend and re-home the local node onto its
+   *  real mesh id + real devices. */
   async hydrateFromBackend() {
     const scan = await scanSelf();
     if (!scan) return;
     this.backendConnected = true;
-    // Replace `this` node's caps + summary with the real machine.
-    const me = this.catalog.nodes.find((n) => n.id === "this");
-    if (me) me.summary = scan.summary;
+
+    const oldId = this.localId;
+    const newId = scan.node_id || "this";
+    this.localId = newId;
+
+    // Re-home the local node: drop its demo id + caps, adopt the real ones.
+    const me = this.catalog.nodes.find((n) => n.id === oldId);
+    if (me) {
+      me.id = newId;
+      me.kind = "this";
+      me.summary = scan.summary;
+    }
     this.catalog.capabilities = [
       ...scan.capabilities,
-      ...this.catalog.capabilities.filter((c) => c.node !== "this"),
+      ...this.catalog.capabilities.filter((c) => c.node !== oldId),
     ];
+    // Demo groups referenced the old id; start live mode without them.
+    if (newId !== oldId) this.catalog.groups = this.catalog.groups.filter((g) => g.node !== oldId);
     this.toast("ok", "Scanned this machine");
+  }
+
+  /** Merge a live session snapshot into the graph: presence peers become
+   *  nodes (keeping any relationship the user already set), and live route
+   *  states are reflected. */
+  applySessionSnapshot(snap: SessionSnapshot) {
+    if (!snap.ready) return;
+    if (snap.me) this.localId = snap.me;
+
+    for (const p of snap.peers ?? []) {
+      let node = this.catalog.nodes.find((n) => n.id === p.node);
+      if (!node) {
+        // A freshly-discovered peer defaults to "mine" (it's on your mesh);
+        // reclassify it as a guest from its drawer if it's someone else's.
+        node = {
+          id: p.node,
+          label: p.label,
+          kind: "machine",
+          relationship: { kind: "mine" },
+          online: true,
+        };
+        this.catalog.nodes.push(node);
+      } else {
+        node.label = p.label;
+        node.online = true;
+      }
+      node.summary = p.summary;
+      // Refresh this peer's capabilities.
+      this.catalog.capabilities = [
+        ...this.catalog.capabilities.filter((c) => c.node !== p.node),
+        ...p.capabilities,
+      ];
+    }
+
+    // Reflect live routes (active ones become catalog routes).
+    for (const lr of snap.routes ?? []) {
+      const active = lr.state.state === "active";
+      const id = lr.route.id;
+      const exists = this.catalog.routes.some((r) => r.id === id);
+      if (active && !exists) {
+        this.catalog.routes.push({ ...lr.route, group: null });
+      } else if (!active && exists) {
+        this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
+      }
+    }
   }
 
   // ---- selection ---------------------------------------------------
@@ -150,6 +226,7 @@ class AppStore {
     const res = proposeRoute(this.catalog, from, to);
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
+      this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
       const f = this.capability(from)?.label ?? from;
       const t = this.capability(to)?.label ?? to;
       this.toast("ok", `Connected ${f} → ${t}`);
@@ -177,6 +254,7 @@ class AppStore {
     const res = proposeRoute(this.catalog, p.from, p.to);
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
+      this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
       this.toast("ok", `Shared — connected ${p.fromLabel} → ${p.toLabel}`);
     }
     this.pendingShare = null;
@@ -184,6 +262,13 @@ class AppStore {
 
   dismissPendingShare() {
     this.pendingShare = null;
+  }
+
+  /** When a real backend is connected, fire the actual mesh route offer.
+   *  The backend's session snapshots then keep the route's live state in
+   *  sync; in web mode this is a no-op and the local route stands in. */
+  private fireBackendConnect(from: string, to: string, media: MediaKind) {
+    if (this.backendConnected) void connectRoute(from, to, media);
   }
 
   private addRoute(from: string, to: string, group: string | null = null) {
@@ -194,6 +279,7 @@ class AppStore {
   }
 
   disconnect(routeId: string) {
+    if (this.backendConnected) void disconnectRoute(routeId);
     const route = this.catalog.routes.find((r) => r.id === routeId);
     this.catalog.routes = this.catalog.routes.filter((r) => r.id !== routeId);
     // Tearing one leg of a group tears the whole bundle — it's one thing.

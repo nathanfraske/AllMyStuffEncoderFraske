@@ -36,7 +36,9 @@ crates/
 ├── allmystuff-graph       # the device graph + authorization model
 ├── allmystuff-protocol    # wire types: myownmesh control mirror + app messages
 ├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
-└── allmystuff-cli         # `allmystuff scan` / `capabilities`
+├── allmystuff-session     # live presence + the route offer/accept handshake + AudioFrame
+├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
+└── allmystuff-cli         # `allmystuff` (opens the GUI) + scan / capabilities / update
 ```
 
 ### allmystuff-inventory
@@ -113,15 +115,17 @@ once.
 
 Tauri 2 + Svelte 5, a client of the daemon.
 
-- **Backend** (`src-tauri/`) — `scan_self` (inventory + bridge), one-shot
-  control commands, an event pump that re-emits the daemon's stream as
-  `allmystuff://event`, and `daemon_spawn` to launch `myownmesh serve` if one
-  isn't already up. Mirrors the MyOwnMesh GUI almost line-for-line.
+- **Backend** (`src-tauri/`) — `scan_self` (inventory + bridge), the live
+  `mesh::Mesh` (subscribes to the presence/control/media channels, drives the
+  `allmystuff-session` state machine, emits `allmystuff://session`
+  snapshots), the `audio` cpal bridge (capture → mesh → playback for active
+  audio routes), `connect_route`/`disconnect_route` commands, and
+  `daemon_spawn`. `update_*` commands drive `allmystuff-updater`.
 - **Front-end** (`src/`) — the graph. `catalog.ts` is a faithful TypeScript
   port of the graph crate's rules, so the canvas is fully interactive on
   demo data with no backend; when the backend is present it validates the
-  same way in Rust before anything touches the wire. `store.svelte.ts` holds
-  the catalog + interaction state as Svelte 5 runes.
+  same way in Rust and fires the real route over the mesh. Live presence +
+  route snapshots merge into the catalog so the graph fills with real peers.
 
 ## Data flow: connecting a device
 
@@ -132,8 +136,10 @@ Tauri 2 + Svelte 5, a client of the daemon.
 4. If a **shared** endpoint isn't covered, `requiredGrants` raises the share
    sheet ("Let Alex receive your screen?"). Approving adds exactly that grant
    and completes the connection.
-5. With a live daemon, the backend would send a `RouteControl::Offer` to the
-   peer over `CHANNEL_CONTROL`; media transport is the next milestone.
+5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
+   over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
+   audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
+   over `CHANNEL_MEDIA`, and the sink plays them.
 
 ## Persistent state
 
@@ -142,11 +148,18 @@ overridable via `MYOWNMESH_HOME`). Its own additions — relationships, grants,
 groups, and saved routes — are app state layered on top; the mesh provides
 the cryptographic identity that those grants attach to.
 
-## Out of scope (today)
+## Next milestones
 
-- Real-time media transport (the actual audio/video/input streaming over the
-  established routes) — the model, protocol, and UI are in place; the codecs
-  and pipes are the next milestone.
-- Full macOS / Windows device enumeration beyond the `sysinfo` basics.
-- Embedding `myownmesh-core` at the source level — AllMyStuff is a control-
-  socket client by design, matching the rest of the family.
+- **Video / screen / input transport** over the same route pipe that audio
+  already uses — each needs a capture/inject backend (screen grab, camera,
+  input injection) feeding the existing offer/accept/media plumbing.
+- **Per-device routing** — map a specific scanned device to a `cpal` device
+  (v1 uses the default input/output), and an audio codec (Opus) so the media
+  channel isn't raw PCM.
+- **Persisted relationships + grants** — remember per peer whether it's
+  *mine* or a *guest*, and its grants, across restarts (today a freshly
+  discovered peer defaults to "mine" and is reclassified from its drawer).
+
+Deliberately out of scope: embedding `myownmesh-core` at the source level —
+AllMyStuff is a control-socket client by design, matching the rest of the
+family.

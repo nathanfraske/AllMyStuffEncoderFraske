@@ -33,8 +33,8 @@
     const cx = width / 2;
     const cy = height / 2;
     const nodes = app.catalog.nodes;
-    const me = nodes.find((n) => n.id === "this");
-    const others = nodes.filter((n) => n.id !== "this");
+    const me = nodes.find((n) => n.id === app.localId);
+    const others = nodes.filter((n) => n.id !== app.localId);
     others.sort((a, b) => {
       const rank = (n: MeshNode) => (n.relationship.kind === "mine" ? 0 : 1);
       return rank(a) - rank(b) || a.label.localeCompare(b.label);

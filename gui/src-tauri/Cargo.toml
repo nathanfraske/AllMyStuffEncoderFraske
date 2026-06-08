@@ -48,6 +48,13 @@ allmystuff-inventory = { path = "../../crates/allmystuff-inventory" }
 allmystuff-graph = { path = "../../crates/allmystuff-graph" }
 allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../../crates/allmystuff-bridge" }
+allmystuff-session = { path = "../../crates/allmystuff-session" }
+allmystuff-updater = { path = "../../crates/allmystuff-updater" }
+
+# Cross-platform audio capture + playback for the media plane — CoreAudio
+# on macOS, WASAPI on Windows, ALSA on Linux. Same crate (and version)
+# MyOwnLLM uses for its audio.
+cpal = "0.15"
 
 [profile.release]
 panic = "abort"

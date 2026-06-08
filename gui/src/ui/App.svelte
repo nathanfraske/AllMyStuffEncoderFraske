@@ -9,9 +9,10 @@
   import Toasts from "./Toasts.svelte";
 
   onMount(() => {
-    // Pull a real scan if the Tauri backend is here; otherwise the demo
-    // graph stands in so the app is never empty.
-    void app.hydrateFromBackend();
+    // Wire up live backend data (scan + presence + routes) if the Tauri
+    // backend is here; otherwise the demo graph stands in so the app is
+    // never empty.
+    void app.init();
   });
 </script>
 

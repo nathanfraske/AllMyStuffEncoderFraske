@@ -1,0 +1,437 @@
+//! The live mesh: wires the daemon's typed channels to the
+//! [`allmystuff_session::Session`] state machine and the [`AudioBridge`].
+//!
+//! On start it subscribes to the AllMyStuff presence / control / media
+//! channels on the active network, broadcasts this node's
+//! [`NodeProfile`], and pumps inbound frames:
+//!
+//!  * **presence** → updates the peer set (the graph fills with real peers).
+//!  * **control** → drives the route handshake; the [`Effect`]s it returns
+//!    send replies and start/stop audio.
+//!  * **media** → audio frames fed to the playback side of active routes.
+//!
+//! Everything the front-end sees comes through `allmystuff://session`
+//! snapshots emitted after each change.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
+use tokio::sync::mpsc;
+
+use allmystuff_graph::{MediaKind, NodeId, Route};
+use allmystuff_protocol::{
+    ClientId, ControlMessage, NodeProfile, Request, RouteControl, CHANNEL_CONTROL, CHANNEL_MEDIA,
+    CHANNEL_PRESENCE, PROTOCOL_VERSION,
+};
+use allmystuff_session::{AudioFrame, Effect, Session};
+
+use crate::audio::AudioBridge;
+use crate::control_client::ControlClient;
+
+pub struct Mesh {
+    client: Arc<ControlClient>,
+    app: AppHandle,
+    audio: Arc<AudioBridge>,
+    state: Mutex<State>,
+    /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
+    /// task sends them on the media channel.
+    audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
+}
+
+struct State {
+    session: Option<Session>,
+    network: Option<String>,
+    client_id: Option<ClientId>,
+    profile: Option<NodeProfile>,
+}
+
+impl Mesh {
+    pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
+        let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
+        let mesh = Arc::new(Mesh {
+            client: client.clone(),
+            app,
+            audio: Arc::new(AudioBridge::new()),
+            state: Mutex::new(State {
+                session: None,
+                network: None,
+                client_id: None,
+                profile: None,
+            }),
+            audio_out,
+        });
+
+        // Forwarder: drain captured frames out to peers on the media channel.
+        {
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                while let Some((peer, frame)) = audio_rx.recv().await {
+                    let Some(network) = mesh.network() else { continue };
+                    let payload = match serde_json::to_value(&frame) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let _ = mesh
+                        .client
+                        .request(&Request::ChannelSendTo {
+                            network,
+                            channel: CHANNEL_MEDIA.to_string(),
+                            peer,
+                            payload,
+                        })
+                        .await;
+                }
+            });
+        }
+        mesh
+    }
+
+    fn network(&self) -> Option<String> {
+        self.state.lock().network.clone()
+    }
+
+    /// This node's mesh id once known (the daemon device id), else `None`.
+    pub fn local_node_id(&self) -> Option<String> {
+        self.state.lock().session.as_ref().map(|s| s.me().to_string())
+    }
+
+    /// Bring the session online: identify, pick a network, subscribe, and
+    /// start pumping events. Safe to call once the daemon socket is up.
+    pub async fn start(self: Arc<Self>) {
+        let (tx, mut rx) = mpsc::channel::<Value>(512);
+        let client_id = match self.client.subscribe_events(tx).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("mesh: event subscribe failed: {e}");
+                self.emit_status("disconnected", Some(&e.to_string()));
+                return;
+            }
+        };
+
+        // Identity → our node id + presence profile.
+        let me = self.fetch_identity().await.unwrap_or_else(|| NodeId::this().to_string());
+        let profile = self.build_profile(&me);
+        // Active network: the first one the daemon has joined.
+        let network = self.fetch_first_network().await;
+
+        {
+            let mut st = self.state.lock();
+            st.client_id = Some(client_id);
+            st.session = Some(Session::new(me.clone()));
+            st.profile = Some(profile.clone());
+            st.network = network.clone();
+        }
+
+        if let Some(network) = &network {
+            for channel in [CHANNEL_PRESENCE, CHANNEL_CONTROL, CHANNEL_MEDIA] {
+                let _ = self
+                    .client
+                    .request(&Request::ChannelSubscribe {
+                        client_id,
+                        network: network.clone(),
+                        channel: channel.to_string(),
+                    })
+                    .await;
+            }
+            self.broadcast_presence().await;
+            self.emit_status("live", None);
+        } else {
+            self.emit_status("no_network", None);
+        }
+
+        // Periodic presence re-broadcast so late joiners see us.
+        {
+            let mesh = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+                loop {
+                    tick.tick().await;
+                    mesh.broadcast_presence().await;
+                }
+            });
+        }
+
+        // Event loop.
+        let mesh = self.clone();
+        tokio::spawn(async move {
+            while let Some(value) = rx.recv().await {
+                mesh.handle_value(value).await;
+            }
+            mesh.emit_status("disconnected", None);
+        });
+    }
+
+    async fn fetch_identity(&self) -> Option<String> {
+        let resp = self.client.request(&Request::IdentityShow).await.ok()?;
+        resp.data?
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    async fn fetch_first_network(&self) -> Option<String> {
+        let resp = self.client.request(&Request::NetworksList).await.ok()?;
+        let arr = resp.data?;
+        arr.as_array()?
+            .iter()
+            .find_map(|n| n.get("config_id").and_then(|v| v.as_str()).map(str::to_string))
+    }
+
+    fn build_profile(&self, me: &str) -> NodeProfile {
+        let inv = allmystuff_inventory::scan();
+        let node = NodeId::from(me);
+        NodeProfile {
+            protocol: PROTOCOL_VERSION,
+            node: node.clone(),
+            label: inv.host.hostname.clone(),
+            summary: allmystuff_bridge::node_summary(&inv),
+            capabilities: allmystuff_bridge::capabilities_from_inventory(&inv, &node),
+        }
+    }
+
+    async fn broadcast_presence(&self) {
+        let (network, profile) = {
+            let st = self.state.lock();
+            (st.network.clone(), st.profile.clone())
+        };
+        let (Some(network), Some(profile)) = (network, profile) else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_value(&profile) {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendAll {
+                    network,
+                    channel: CHANNEL_PRESENCE.to_string(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    async fn handle_value(self: &Arc<Self>, value: Value) {
+        let Some(kind) = value.get("kind").and_then(|v| v.as_str()) else {
+            return;
+        };
+        match kind {
+            "channel_inbound" => {
+                let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let payload = value.get("payload").cloned().unwrap_or(Value::Null);
+                self.handle_channel(channel, from, payload).await;
+            }
+            "event" => {
+                if let Some(event) = value.get("event") {
+                    let _ = self.app.emit("allmystuff://event", event.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_channel(self: &Arc<Self>, channel: &str, from: String, payload: Value) {
+        match channel {
+            CHANNEL_PRESENCE => {
+                if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
+                    let changed = {
+                        let mut st = self.state.lock();
+                        st.session.as_mut().map(|s| s.apply_presence(profile)).unwrap_or(false)
+                    };
+                    if changed {
+                        self.emit_snapshot();
+                    }
+                }
+            }
+            CHANNEL_CONTROL => {
+                if let Ok(msg) = serde_json::from_value::<ControlMessage>(payload) {
+                    let effects = {
+                        let mut st = self.state.lock();
+                        st.session
+                            .as_mut()
+                            .map(|s| s.handle(NodeId::from(from.as_str()), msg))
+                            .unwrap_or_default()
+                    };
+                    self.process_effects(effects).await;
+                    self.emit_snapshot();
+                }
+            }
+            CHANNEL_MEDIA => {
+                if let Ok(frame) = serde_json::from_value::<AudioFrame>(payload) {
+                    self.audio.feed(&frame.route.clone(), &frame);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Front-end command: offer a route from `from` to `to`.
+    pub async fn connect(self: &Arc<Self>, from: String, to: String, media: String) -> Result<String, String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let media = parse_media(&media);
+        let route = Route {
+            id: format!("route:{from}→{to}"),
+            from: from.clone(),
+            to: to.clone(),
+            media,
+            group: None,
+        };
+        let from_node = node_of(&from);
+        let to_node = node_of(&to);
+        let peer = if from_node == me { to_node } else { from_node };
+
+        if peer == me {
+            // Local loopback (e.g. this machine's mic to its own speakers):
+            // no peer to negotiate with — record it active and stream now.
+            // Offer-then-Accept drives the session to Active and yields the
+            // StartMedia effect we process below.
+            let effects = {
+                let mut st = self.state.lock();
+                let s = st.session.as_mut().ok_or("mesh not ready")?;
+                let _ = s.offer(route.clone(), me.as_str());
+                s.handle(
+                    NodeId::from(me.as_str()),
+                    ControlMessage::Route(RouteControl::Accept { route_id: route.id.clone() }),
+                )
+            };
+            self.process_effects(effects).await;
+            self.emit_snapshot();
+            return Ok(route.id);
+        }
+
+        let msg = {
+            let mut st = self.state.lock();
+            let s = st.session.as_mut().ok_or("mesh not ready")?;
+            s.offer(route.clone(), peer.as_str())
+        };
+        self.send_control(&peer, &msg).await;
+        self.emit_snapshot();
+        Ok(route.id)
+    }
+
+    pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        let msg = {
+            let mut st = self.state.lock();
+            st.session.as_mut().and_then(|s| s.teardown(&route_id))
+        };
+        self.audio.stop(&route_id);
+        if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
+            self.send_control(&peer, msg).await;
+        }
+        self.emit_snapshot();
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let st = self.state.lock();
+        let Some(session) = st.session.as_ref() else {
+            return json!({ "ready": false });
+        };
+        json!({
+            "ready": true,
+            "me": session.me().to_string(),
+            "network": st.network,
+            "peers": session.peers().collect::<Vec<_>>(),
+            "routes": session.routes().collect::<Vec<_>>(),
+        })
+    }
+
+    fn route_peer(&self, route_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id).map(|r| r.peer.to_string()))
+    }
+
+    async fn process_effects(self: &Arc<Self>, effects: Vec<Effect>) {
+        for e in effects {
+            match e {
+                Effect::Send { peer, message } => self.send_control(&peer.to_string(), &message).await,
+                Effect::StartMedia(route) => self.start_media(&route),
+                Effect::StopMedia(id) => self.audio.stop(&id),
+                Effect::Share { from, message } => {
+                    let _ = self.app.emit(
+                        "allmystuff://share",
+                        json!({ "from": from.to_string(), "message": message }),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Begin carrying media for a now-active route. Only audio is wired
+    /// today; the route still shows active for other media so the UI is
+    /// honest about what's connected vs streaming.
+    fn start_media(&self, route: &Route) {
+        if route.media != MediaKind::Audio {
+            tracing::info!("route {} active ({:?}); media transport for it is a follow-up", route.id, route.media);
+            return;
+        }
+        let Some(me) = self.local_node_id() else { return };
+        let from_node = node_of(&route.from);
+        let to_node = node_of(&route.to);
+
+        // We source: capture the default mic and stream to the sink node.
+        if from_node == me {
+            let peer = to_node.clone();
+            let rid = route.id.clone();
+            let tx = self.audio_out.clone();
+            let seq = Arc::new(AtomicU64::new(0));
+            self.audio.start_capture(route.id.clone(), move |pcm, rate| {
+                let s = seq.fetch_add(1, Ordering::Relaxed);
+                let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
+                let _ = tx.send((peer.clone(), frame));
+            });
+        }
+        // We sink: play inbound frames for this route.
+        if to_node == me {
+            self.audio.start_playback(route.id.clone());
+        }
+    }
+
+    async fn send_control(&self, peer: &str, message: &ControlMessage) {
+        let Some(network) = self.network() else { return };
+        if let Ok(payload) = serde_json::to_value(message) {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_CONTROL.to_string(),
+                    peer: peer.to_string(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    fn emit_snapshot(&self) {
+        let _ = self.app.emit("allmystuff://session", self.snapshot());
+    }
+
+    fn emit_status(&self, status: &str, error: Option<&str>) {
+        let _ = self.app.emit(
+            "allmystuff://subscription",
+            json!({ "status": status, "error": error }),
+        );
+    }
+}
+
+/// Node id from a capability id (`"<node>:<device>"`). The node segment is
+/// everything before the first colon.
+fn node_of(cap_id: &str) -> String {
+    cap_id.split_once(':').map(|(n, _)| n.to_string()).unwrap_or_else(|| cap_id.to_string())
+}
+
+fn parse_media(s: &str) -> MediaKind {
+    match s {
+        "audio" => MediaKind::Audio,
+        "video" => MediaKind::Video,
+        "display" => MediaKind::Display,
+        "input" => MediaKind::Input,
+        "storage" => MediaKind::Storage,
+        _ => MediaKind::Generic,
+    }
+}
