@@ -120,7 +120,11 @@ Tauri 2 + Svelte 5, a client of the daemon.
   `allmystuff-session` state machine, emits `allmystuff://session`
   snapshots), the `audio` cpal bridge (capture → mesh → playback for active
   audio routes), `connect_route`/`disconnect_route` commands, and
-  `daemon_spawn`. `update_*` commands drive `allmystuff-updater`.
+  `daemon_spawn`. The `myownmesh` daemon ships **bundled with the app**:
+  `build.rs` fetches the rev pinned in `.myownmesh-rev` and stages it as a
+  Tauri sidecar (`binaries/myownmesh-<triple>`, `externalBin`), so the mesh
+  is there for free — `daemon_spawn` resolves the bundled binary and
+  auto-spawns it. `update_*` commands drive `allmystuff-updater`.
 - **Front-end** (`src/`) — the graph. `catalog.ts` is a faithful TypeScript
   port of the graph crate's rules, so the canvas is fully interactive on
   demo data with no backend; when the backend is present it validates the

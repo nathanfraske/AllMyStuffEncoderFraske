@@ -9,6 +9,10 @@ gui/dist
 gui/.svelte-kit
 gui/src-tauri/target
 gui/src-tauri/gen/schemas
+# build.rs bundles the myownmesh daemon here as a Tauri sidecar
+# (binaries/myownmesh-<triple>{.exe}); it's a build artefact — the pinned
+# source rev lives in .myownmesh-rev.
+gui/src-tauri/binaries/
 
 # Editor / OS
 .DS_Store

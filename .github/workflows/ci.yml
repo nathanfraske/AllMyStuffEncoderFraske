@@ -67,6 +67,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Skip bundling the myownmesh daemon sidecar here — CI only needs to
+    # verify the app compiles. build.rs stamps a stub so tauri-build's
+    # externalBin check passes; the real bundle happens on dev / release
+    # builds (and is exercised by `just dev`).
+    env:
+      ALLMYSTUFF_SKIP_SIDECAR: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
