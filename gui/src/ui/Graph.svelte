@@ -264,6 +264,14 @@
     {/each}
   </div>
 
+  {#if app.catalog.nodes.length === 0}
+    <div class="empty" aria-live="polite">
+      <div class="empty-orb">🧦</div>
+      <div class="empty-title">Getting your stuff together…</div>
+      <div class="empty-sub">Scanning this machine and waiting for peers to appear.</div>
+    </div>
+  {/if}
+
   {#if armed}
     <div class="arm-banner">
       {#if app.dragFrom}
@@ -435,6 +443,44 @@
   .tag.guest {
     background: #fdedd2;
     color: #97631a;
+  }
+  .empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    text-align: center;
+    padding: 1rem;
+    pointer-events: none;
+  }
+  .empty-orb {
+    font-size: 2.6rem;
+    filter: drop-shadow(0 3px 6px rgba(108, 92, 231, 0.25));
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .empty-title {
+    font-weight: 750;
+    font-size: 1.05rem;
+    color: var(--ink);
+  }
+  .empty-sub {
+    font-size: 0.84rem;
+    color: var(--ink-faint);
+    max-width: 22rem;
+  }
+  @keyframes breathe {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 0.85;
+    }
+    50% {
+      transform: scale(1.08);
+      opacity: 1;
+    }
   }
   .arm-banner {
     position: absolute;
