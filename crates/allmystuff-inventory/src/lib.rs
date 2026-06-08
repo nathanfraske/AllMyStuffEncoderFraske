@@ -1,0 +1,205 @@
+//! # allmystuff-inventory
+//!
+//! Scan a machine for **everything plugged into it** — the compute
+//! (CPU, GPU, RAM), the storage, the networks, and the human-facing
+//! peripherals: displays, microphones (including 4+ element arrays),
+//! speakers, cameras, keyboards, mice, and the rest of the USB bus.
+//!
+//! The result is one [`Inventory`] value: a stable, `serde`-clean
+//! description of the box. AllMyStuff turns each entry into a node on
+//! the mesh graph you can wire to other devices; this crate's only job
+//! is to find the things and describe them well.
+//!
+//! ```no_run
+//! let inv = allmystuff_inventory::scan();
+//! println!("{} has {} devices", inv.host.hostname, inv.device_count());
+//! println!("{}", allmystuff_inventory::report::render(&inv));
+//! ```
+//!
+//! ## Design
+//!
+//! * **Never panics, always returns.** Every probe degrades to "nothing
+//!   here" on a missing file or denied read, so a scan inside a minimal
+//!   container returns the same well-formed shape it does on a loaded
+//!   desktop — just with fewer devices.
+//! * **Linux is the reference platform.** It reads `/proc` and `/sys`
+//!   directly (no shelling out for the hot paths). macOS and Windows
+//!   reuse the cross-platform `sysinfo` host basics and scaffold the
+//!   device classes via `system_profiler` / CIM.
+//! * **Pure parsers, fixture tests.** The fiddly decoding — EDID timing,
+//!   ALSA stream channels, `/proc/bus/input/devices` classification — is
+//!   isolated into pure functions tested against real-world samples, so
+//!   correctness doesn't depend on the hardware being present.
+
+mod sys;
+mod types;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+pub mod report;
+
+pub use types::*;
+
+use sysinfo::System;
+
+/// Scan this machine and return a full [`Inventory`].
+///
+/// Cheap enough to call on a button press — the heaviest cost is the
+/// `sysinfo` CPU/memory refresh and a handful of `/sys` directory walks.
+pub fn scan() -> Inventory {
+    let mut system = System::new();
+    system.refresh_cpu_all();
+    system.refresh_memory();
+
+    let mut gpus = platform_gpus();
+    enrich_nvidia(&mut gpus);
+    let (microphones, speakers) = platform_audio();
+
+    Inventory {
+        scanned_at: unix_now(),
+        host: sys::host_info(),
+        cpu: sys::cpu(&system),
+        memory: sys::memory(&system),
+        gpus,
+        storage: sys::storage(),
+        networks: sys::networks(),
+        displays: platform_displays(),
+        microphones,
+        speakers,
+        cameras: platform_cameras(),
+        inputs: platform_inputs(),
+        usb: platform_usb(),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---- platform dispatch -----------------------------------------------
+//
+// Each device class routes to the active platform module, or to an empty
+// vec on a platform we haven't taught the class yet. Kept as small
+// dispatch fns rather than a `use platform::*` alias so each class can be
+// implemented on different platforms independently.
+
+macro_rules! platform_dispatch {
+    ($name:ident, $ret:ty, $method:ident) => {
+        fn $name() -> $ret {
+            #[cfg(target_os = "linux")]
+            {
+                return linux::$method();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                return macos::$method();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                return windows::$method();
+            }
+            #[allow(unreachable_code)]
+            Default::default()
+        }
+    };
+}
+
+platform_dispatch!(platform_gpus, Vec<Gpu>, collect_gpus);
+platform_dispatch!(platform_displays, Vec<Display>, collect_displays);
+platform_dispatch!(
+    platform_audio,
+    (Vec<AudioDevice>, Vec<AudioDevice>),
+    collect_audio
+);
+platform_dispatch!(platform_cameras, Vec<Camera>, collect_cameras);
+platform_dispatch!(platform_inputs, Vec<InputDevice>, collect_inputs);
+platform_dispatch!(platform_usb, Vec<UsbDevice>, collect_usb);
+
+/// Fill in NVIDIA VRAM + model from `nvidia-smi` when it's on PATH.
+/// amdgpu reports VRAM through sysfs already (handled in `linux.rs`);
+/// NVIDIA needs the tool, so this is the one place we shell out, and only
+/// if there's an NVIDIA card to ask about. Mirrors MyOwnLLM's probe.
+fn enrich_nvidia(gpus: &mut [Gpu]) {
+    if !gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
+        return;
+    }
+    let Ok(out) = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows = text.lines().filter_map(|l| {
+        let (name, mib) = l.split_once(',')?;
+        let mib: u64 = mib.trim().parse().ok()?;
+        Some((name.trim().to_string(), mib * 1024 * 1024))
+    });
+    for g in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Nvidia) {
+        if let Some((name, bytes)) = rows.next() {
+            g.name = name;
+            g.vram_bytes = Some(bytes);
+            g.kind = GpuKind::Discrete;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_is_well_formed() {
+        // The scan must always return a usable shape, even in a sandbox
+        // with almost nothing mounted — that's the whole contract.
+        let inv = scan();
+        assert!(!inv.host.os.is_empty());
+        assert!(inv.cpu.logical_cores >= 1);
+        // CPU + memory are the two guaranteed devices.
+        assert!(inv.device_count() >= 2);
+        // Round-trips through JSON (the wire shape the GUI consumes).
+        let json = serde_json::to_string(&inv).expect("serialize");
+        let back: Inventory = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.cpu.logical_cores, inv.cpu.logical_cores);
+    }
+
+    #[test]
+    fn array_microphone_is_flagged() {
+        let mic = AudioDevice {
+            id: "mic:1:0".into(),
+            name: "ReSpeaker 4 Mic Array".into(),
+            direction: AudioDirection::Input,
+            channels: Some(4),
+            card: Some("1".into()),
+        };
+        assert!(mic.is_array());
+
+        let mono = AudioDevice {
+            channels: Some(1),
+            ..mic.clone()
+        };
+        assert!(!mono.is_array());
+
+        // Output devices are never "arrays" regardless of channel count.
+        let speaker = AudioDevice {
+            direction: AudioDirection::Output,
+            channels: Some(8),
+            ..mic
+        };
+        assert!(!speaker.is_array());
+    }
+}

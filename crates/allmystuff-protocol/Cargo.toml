@@ -1,0 +1,17 @@
+[package]
+name = "allmystuff-protocol"
+description = "Wire types AllMyStuff speaks: a dependency-free mirror of the MyOwnMesh daemon control socket, plus AllMyStuff's own peer-to-peer presence/route/share messages."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+allmystuff-graph = { workspace = true }
