@@ -53,6 +53,11 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** A short, readable device id for labels when no friendly name is known. */
+function shortId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 10)}…` : id;
+}
+
 let seq = 0;
 const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 
@@ -129,6 +134,9 @@ class AppStore {
   /** slot id → chosen local capability id, for the draft bundle. */
   bundleSlots = $state<Record<string, string>>({});
 
+  /** Safety-net poll that keeps the graph's mesh members fresh. */
+  private meshPoll: ReturnType<typeof setInterval> | null = null;
+
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
@@ -171,6 +179,8 @@ class AppStore {
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
+    await this.syncMeshGraph();
+    this.startMeshPolling();
     await onSubscription((s) => {
       const live = s.status === "live";
       // When the mesh comes up, re-scan + reload networks/identity: the first
@@ -178,11 +188,76 @@ class AppStore {
       if (live) {
         void this.hydrateFromBackend();
         void this.loadIdentity();
-        void this.refreshNetworks();
+        void this.refreshNetworks().then(() => this.syncMeshGraph());
       }
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
+  }
+
+  /** Poll the daemon's mesh membership as a safety net (peer/roster changes
+   *  don't all arrive as session snapshots). Mirrors the MyOwnMesh client. */
+  private startMeshPolling() {
+    if (!isTauri() || this.meshPoll) return;
+    this.meshPoll = setInterval(() => void this.syncMeshGraph(), 3000);
+  }
+
+  /** Build the graph's machine nodes from the daemon's *actual* mesh
+   *  membership — the roster of known devices plus currently-live peers,
+   *  across every joined network. This is what makes "others on the mesh"
+   *  appear; the bespoke presence channel only layers device detail on top
+   *  when a peer also runs AllMyStuff. Mirrors how MyOwnMesh builds its map. */
+  async syncMeshGraph() {
+    if (!isTauri()) return;
+    const known = new Map<string, { label: string; online: boolean }>();
+    const note = (id: string, label: string | undefined, online: boolean) => {
+      if (!id) return;
+      const e = known.get(id) ?? { label: label?.trim() || shortId(id), online: false };
+      if (label?.trim()) e.label = label.trim();
+      if (online) e.online = true;
+      known.set(id, e);
+    };
+    const nets = Array.isArray(this.networks) ? this.networks : [];
+    for (const net of nets) {
+      let peers: PeerInfo[] = [];
+      let roster: RosterPeer[] = [];
+      try {
+        peers = await meshPeers(net.config_id);
+      } catch {
+        /* network still settling */
+      }
+      try {
+        roster = await meshRosterList(net.config_id);
+      } catch {
+        /* roster optional */
+      }
+      for (const r of roster) note(r.device_id, r.label, false);
+      for (const p of peers) {
+        if (p.status === "pending_approval") continue; // shown under approvals
+        note(p.device_id, p.label, p.status === "active");
+      }
+    }
+    // Upsert a node per known device (never the local machine).
+    for (const [id, info] of known) {
+      if (id === this.localId) continue;
+      const node = this.catalog.nodes.find((n) => n.id === id);
+      if (!node) {
+        this.catalog.nodes.push({
+          id,
+          label: info.label,
+          kind: "machine",
+          relationship: { kind: "mine" },
+          online: info.online,
+        });
+      } else {
+        node.online = info.online;
+        if (!node.hostname && info.label) node.label = info.label;
+      }
+    }
+    // A machine that's no longer in any roster/peer set has dropped offline.
+    for (const n of this.catalog.nodes) {
+      if (n.kind !== "this" && n.id !== this.localId && !known.has(n.id)) n.online = false;
+    }
   }
 
   /** Pull a real scan from the backend and re-home the local node onto its
