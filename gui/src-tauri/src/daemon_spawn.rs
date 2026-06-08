@@ -41,17 +41,34 @@ pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
 }
 
-/// Locate the `myownmesh` binary: `MYOWNMESH_BIN` override first, then a
-/// manual `$PATH` walk (so we can skip stale, non-existent entries and
-/// report the resolved location).
+/// Locate the `myownmesh` binary. Discovery order:
+///
+/// 1. `MYOWNMESH_BIN` environment variable (manual override).
+/// 2. A side-by-side `MyOwnMesh` source checkout's build artefacts
+///    (`../MyOwnMesh/target/{debug,release}/myownmesh`) — so a developer
+///    working on both repos who's run `cargo build` over there gets live
+///    mesh from `just dev` without installing anything.
+/// 3. `myownmesh` on `$PATH` (the production / `just mesh-install` path).
 pub fn find_daemon_binary() -> Result<PathBuf> {
+    let exe = if cfg!(windows) { "myownmesh.exe" } else { "myownmesh" };
+
     if let Ok(p) = std::env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
             return Ok(p);
         }
     }
-    let exe = if cfg!(windows) { "myownmesh.exe" } else { "myownmesh" };
+    // Side-by-side dev checkout (debug first — `just dev` over there builds
+    // debug; then release).
+    for profile in ["debug", "release"] {
+        if let Some(p) = sibling_myownmesh_path(profile, exe) {
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    // Manual PATH walk (rather than Command's implicit search) so we skip
+    // stale, non-existent entries and can report the resolved location.
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
@@ -61,9 +78,26 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         }
     }
     Err(anyhow!(
-        "couldn't find `{exe}` — install MyOwnMesh (see the version pinned in \
-         .myownmesh-rev) or set MYOWNMESH_BIN"
+        "couldn't find `{exe}` — run `just mesh-install` (installs the version \
+         pinned in .myownmesh-rev), put it on PATH, or set MYOWNMESH_BIN"
     ))
+}
+
+/// `../MyOwnMesh/target/<profile>/myownmesh` relative to the AllMyStuff repo
+/// root. CARGO_MANIFEST_DIR here is `gui/src-tauri`, so the repo root is two
+/// parents up and the sibling checkout one more.
+fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Some(
+        PathBuf::from(manifest_dir)
+            .parent()? // gui/
+            .parent()? // AllMyStuff/
+            .parent()? // workspace dir (AllMyStuff + MyOwnMesh side by side)
+            .join("MyOwnMesh")
+            .join("target")
+            .join(profile)
+            .join(exe),
+    )
 }
 
 /// Spawn `myownmesh serve` and wait briefly for its socket. Returns
