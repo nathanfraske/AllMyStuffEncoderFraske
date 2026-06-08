@@ -41,34 +41,75 @@ pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
 }
 
-/// Locate the `myownmesh` binary. Discovery order:
+/// The target triple `build.rs` bundled the sidecar for. In a dev build
+/// Tauri keeps the `-<triple>` suffix on the staged sidecar; a production
+/// bundle strips it to plain `myownmesh{.exe}`.
+const DAEMON_SIDECAR_TRIPLE: &str = env!("DAEMON_SIDECAR_TRIPLE");
+
+/// True when a path is a real, non-empty binary (not a zero-byte sidecar
+/// stub `build.rs` wrote when it couldn't fetch the daemon).
+fn usable(p: &std::path::Path) -> bool {
+    p.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+}
+
+/// Locate the `myownmesh` daemon. It normally ships *with the app* — bundled
+/// as a Tauri sidecar by `build.rs` (see that file) — so this resolves the
+/// bundled binary first and only falls back for unusual setups:
 ///
-/// 1. `MYOWNMESH_BIN` environment variable (manual override).
-/// 2. A side-by-side `MyOwnMesh` source checkout's build artefacts
-///    (`../MyOwnMesh/target/{debug,release}/myownmesh`) — so a developer
-///    working on both repos who's run `cargo build` over there gets live
-///    mesh from `just dev` without installing anything.
-/// 3. `myownmesh` on `$PATH` (the production / `just mesh-install` path).
+/// 1. `MYOWNMESH_BIN` override.
+/// 2. **Bundled sidecar** next to the app binary — `myownmesh{.exe}`
+///    (production) or `myownmesh-<triple>{.exe}` (dev).
+/// 3. **Dev source slot** — `gui/src-tauri/binaries/myownmesh-<triple>`
+///    (the path `build.rs` writes; reachable in a dev run via the
+///    build-time manifest dir).
+/// 4. Side-by-side `../MyOwnMesh` source build.
+/// 5. `myownmesh` on `$PATH`.
 pub fn find_daemon_binary() -> Result<PathBuf> {
     let exe = if cfg!(windows) { "myownmesh.exe" } else { "myownmesh" };
+    let exe_triple = if cfg!(windows) {
+        format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}.exe")
+    } else {
+        format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}")
+    };
 
+    // 1. Override.
     if let Ok(p) = std::env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
             return Ok(p);
         }
     }
-    // Side-by-side dev checkout (debug first — `just dev` over there builds
-    // debug; then release).
-    for profile in ["debug", "release"] {
+
+    // 2. Bundled sidecar next to the running app binary.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            for name in [exe, exe_triple.as_str()] {
+                let p = dir.join(name);
+                if usable(&p) {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+
+    // 3. Dev source slot written by build.rs (build-time manifest dir).
+    let dev_slot = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join(&exe_triple);
+    if usable(&dev_slot) {
+        return Ok(dev_slot);
+    }
+
+    // 4. Side-by-side MyOwnMesh checkout (release first, then debug).
+    for profile in ["release", "debug"] {
         if let Some(p) = sibling_myownmesh_path(profile, exe) {
             if p.exists() {
                 return Ok(p);
             }
         }
     }
-    // Manual PATH walk (rather than Command's implicit search) so we skip
-    // stale, non-existent entries and can report the resolved location.
+
+    // 5. PATH walk (skip stale, non-existent entries).
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
@@ -78,8 +119,9 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         }
     }
     Err(anyhow!(
-        "couldn't find `{exe}` — run `just mesh-install` (installs the version \
-         pinned in .myownmesh-rev), put it on PATH, or set MYOWNMESH_BIN"
+        "couldn't find the `myownmesh` daemon — it normally ships bundled with \
+         the app; build from source (so build.rs bundles it), put `myownmesh` \
+         on PATH, or set MYOWNMESH_BIN"
     ))
 }
 

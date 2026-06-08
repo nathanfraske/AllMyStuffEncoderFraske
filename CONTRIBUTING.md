@@ -94,16 +94,19 @@ groups — works offline (a plain `cd gui && pnpm dev` in a browser too).
 
 ### Live mesh (real peers + streaming)
 
-Live peers + streaming ride on a `myownmesh serve` daemon. Get one with:
+The mesh daemon ships **with the app** — there's nothing to install. The
+GUI's `build.rs` bundles `myownmesh` as a Tauri sidecar
+(`binaries/myownmesh-<triple>`, listed in `tauri.conf.json` →
+`externalBin`), fetching the prebuilt binary for the rev pinned in
+`.myownmesh-rev` from MyOwnMesh's Releases (with a `cargo install` fallback)
+on the first build. The GUI auto-spawns it at runtime.
 
-```sh
-just mesh-install   # installs the daemon pinned in .myownmesh-rev onto PATH
-```
-
-(or check out [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) next to this
-repo and `cargo build` it — the app auto-finds a sibling `../MyOwnMesh`
-build, or anything on PATH / `MYOWNMESH_BIN`). `just dev` then auto-spawns
-the daemon; `just serve` runs it in the foreground with debug logging.
+So `just dev` gives you live mesh out of the box. Override the bundled
+daemon during development by pointing `MYOWNMESH_BIN` at your own build, or
+keep a sibling `../MyOwnMesh` checkout built (`cargo build -p myownmesh`) —
+both `build.rs` and the runtime prefer those. Set `ALLMYSTUFF_SKIP_SIDECAR=1`
+to skip the fetch (offline builds; the runtime then falls back to a
+sibling/PATH daemon).
 
 For two machines to see each other, both need the daemon joined to the
 **same** network (AllMyStuff uses the first network it finds). Then:

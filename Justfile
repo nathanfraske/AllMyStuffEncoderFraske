@@ -28,46 +28,19 @@ setup:
 setup:
     @& .\scripts\bootstrap.ps1
 
-# Run the desktop app (Tauri + Svelte) with hot reload. The app opens
-# into a populated demo graph with no mesh; for live peers + streaming,
-# run `just mesh-install` once (or have `myownmesh` on PATH) — the GUI
-# then auto-spawns `myownmesh serve` for you.
+# Run the desktop app (Tauri + Svelte) with hot reload. The mesh daemon is
+# bundled automatically (build.rs fetches the rev pinned in .myownmesh-rev
+# the first time — slowest part of the first run), and the GUI auto-spawns
+# it. So `just dev` gives you the full app with live mesh, no extra steps.
 [unix]
-[doc("Run the app with hot reload (demo graph; live mesh if a daemon is present).")]
+[doc("Run the app with hot reload (mesh daemon bundled automatically).")]
 dev *ARGS:
     @cd gui && pnpm install --silent && pnpm tauri dev {{ARGS}}
 
 [windows]
-[doc("Run the app with hot reload (demo graph; live mesh if a daemon is present).")]
+[doc("Run the app with hot reload (mesh daemon bundled automatically).")]
 dev *ARGS:
     @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
-
-# Install the pinned MyOwnMesh daemon (the mesh sidecar) onto your PATH,
-# so the GUI can auto-spawn it and live peers + audio streaming work. The
-# version is pinned in .myownmesh-rev. First build pulls the WebRTC stack
-# and is slow; it's cached after that.
-[unix]
-[doc("Install the pinned myownmesh daemon (live mesh). Slow first build.")]
-mesh-install:
-    @cargo install --git https://github.com/mrjeeves/MyOwnMesh --tag "$(cat .myownmesh-rev)" myownmesh --locked
-
-[windows]
-[doc("Install the pinned myownmesh daemon (live mesh). Slow first build.")]
-mesh-install:
-    @cargo install --git https://github.com/mrjeeves/MyOwnMesh --tag (Get-Content .myownmesh-rev).Trim() myownmesh --locked
-
-# Run the mesh daemon in the foreground with debug logging. `just dev`
-# connects to it over the control socket (it also auto-spawns one if you
-# don't run this). Requires the daemon on PATH — see `just mesh-install`.
-[unix]
-[doc("Run the myownmesh daemon in foreground with debug logging.")]
-serve *ARGS:
-    @MYOWNMESH_LOG="debug,myownmesh=debug" myownmesh serve {{ARGS}}
-
-[windows]
-[doc("Run the myownmesh daemon in foreground with debug logging.")]
-serve *ARGS:
-    @$env:MYOWNMESH_LOG = "debug,myownmesh=debug"; myownmesh serve {{ARGS}}
 
 # Build the library workspace (no webview / Tauri compile).
 build:
