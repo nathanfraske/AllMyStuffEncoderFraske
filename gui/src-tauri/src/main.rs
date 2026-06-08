@@ -41,9 +41,10 @@ fn unwrap_response(resp: Response) -> Result<Value, String> {
 
 // ---- this machine -----------------------------------------------------
 
-/// Scan this machine: `{ node_id, summary, capabilities }`. `node_id` is the
-/// mesh device id once the session is up (so capabilities match what peers
-/// see), else `"this"` for the offline/demo graph.
+/// Scan this machine: `{ node_id, label, summary, capabilities }`. `node_id`
+/// is the mesh device id once the session is up (so capabilities match what
+/// peers see), else `"this"` for the offline/demo graph; `label` is the
+/// hostname shown on the local node.
 #[tauri::command]
 fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
     let me = mesh.local_node_id().unwrap_or_else(|| "this".to_string());
@@ -51,6 +52,7 @@ fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
     let inv = allmystuff_inventory::scan();
     serde_json::to_value(json!({
         "node_id": me,
+        "label": inv.host.hostname,
         "summary": allmystuff_bridge::node_summary(&inv),
         "capabilities": allmystuff_bridge::capabilities_from_inventory(&inv, &node),
     }))

@@ -17,6 +17,7 @@ import { demoCatalog } from "./mock";
 import {
   connectRoute,
   disconnectRoute,
+  isTauri,
   onSession,
   onSubscription,
   scanSelf,
@@ -50,8 +51,19 @@ export interface PendingGroupShare {
   requests: GrantRequest[];
 }
 
+/** A graph with nothing in it — the starting point under the real backend,
+ *  where every node + capability comes from the live scan and mesh presence
+ *  (no demo stand-ins). */
+function emptyCatalog(): Catalog {
+  return { nodes: [], capabilities: [], routes: [], groups: [] };
+}
+
 class AppStore {
-  catalog = $state<Catalog>(demoCatalog());
+  // Under the real app the graph is built entirely from the live scan + mesh
+  // presence, so it starts empty and fills with *your* stuff. The demo
+  // catalog is only a stand-in for the browser/preview build (no Tauri
+  // backend) so the marketing page is never blank.
+  catalog = $state<Catalog>(isTauri() ? emptyCatalog() : demoCatalog());
 
   // ---- interaction state ------------------------------------------
   selectedNodeId = $state<string | null>(null);
@@ -95,7 +107,12 @@ class AppStore {
   async init() {
     await this.hydrateFromBackend();
     await onSubscription((s) => {
-      this.backendConnected = s.status === "live";
+      const live = s.status === "live";
+      // When the mesh comes up, re-scan: the first scan at mount can run
+      // before the session is ready (so it returns the placeholder id), and
+      // now `scan_self` reports the real mesh device id + capabilities.
+      if (live) void this.hydrateFromBackend();
+      this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
   }
@@ -107,23 +124,37 @@ class AppStore {
     if (!scan) return;
     this.backendConnected = true;
 
-    const oldId = this.localId;
+    const prevId = this.localId;
     const newId = scan.node_id || "this";
     this.localId = newId;
 
-    // Re-home the local node: drop its demo id + caps, adopt the real ones.
-    const me = this.catalog.nodes.find((n) => n.id === oldId);
+    // Adopt this machine as "this device". Match the local node by its new
+    // id or its previous one, so a re-scan (once the mesh id is known)
+    // re-homes the same node rather than adding a duplicate.
+    const me =
+      this.catalog.nodes.find((n) => n.id === newId) ??
+      this.catalog.nodes.find((n) => n.id === prevId && n.kind === "this");
     if (me) {
       me.id = newId;
       me.kind = "this";
+      if (scan.label) me.label = scan.label;
       me.summary = scan.summary;
+    } else {
+      this.catalog.nodes.push({
+        id: newId,
+        label: scan.label || "This device",
+        kind: "this",
+        relationship: { kind: "mine" },
+        online: true,
+        summary: scan.summary,
+      });
     }
+    // Local capabilities are exactly what the scan reports; drop any tied to
+    // the old or new local id so a re-scan replaces rather than accumulates.
     this.catalog.capabilities = [
       ...scan.capabilities,
-      ...this.catalog.capabilities.filter((c) => c.node !== oldId),
+      ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
-    // Demo groups referenced the old id; start live mode without them.
-    if (newId !== oldId) this.catalog.groups = this.catalog.groups.filter((g) => g.node !== oldId);
     this.toast("ok", "Scanned this machine");
   }
 
