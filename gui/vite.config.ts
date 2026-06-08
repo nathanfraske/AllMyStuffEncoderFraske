@@ -1,0 +1,23 @@
+import { defineConfig } from "vite";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
+
+// Tauri expects a fixed dev port and leaves the build output in `dist/`.
+// Mirrors the MyOwnMesh GUI's Vite setup so `pnpm tauri dev|build` works
+// the same way across the product family.
+const host = process.env.TAURI_DEV_HOST;
+
+export default defineConfig({
+  plugins: [svelte()],
+  clearScreen: false,
+  server: {
+    port: 1430,
+    strictPort: true,
+    host: host || false,
+    hmr: host ? { protocol: "ws", host, port: 1431 } : undefined,
+    watch: { ignored: ["**/src-tauri/**"] },
+  },
+  build: {
+    target: "es2022",
+    sourcemap: true,
+  },
+});

@@ -3,12 +3,21 @@
 version = 4
 
 [[package]]
-name = "allmystuff-cli"
+name = "allmystuff-bridge"
 version = "0.1.0"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-protocol",
+]
+
+[[package]]
+name = "allmystuff-cli"
+version = "0.1.0"
+dependencies = [
+ "allmystuff-bridge",
+ "allmystuff-graph",
+ "allmystuff-inventory",
  "serde_json",
 ]
 

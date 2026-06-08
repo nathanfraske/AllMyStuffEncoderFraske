@@ -11,8 +11,6 @@
 //! allmystuff capabilities    # what this machine would expose on the mesh
 //! ```
 
-mod bridge;
-
 use std::process::ExitCode;
 
 use allmystuff_graph::{Catalog, MeshNode, NodeId, Relationship};
@@ -65,11 +63,11 @@ fn run_scan(json: bool) -> ExitCode {
 fn run_capabilities() -> ExitCode {
     let inv = allmystuff_inventory::scan();
     let me = NodeId::this();
-    let caps = bridge::capabilities_from_inventory(&inv, &me);
+    let caps = allmystuff_bridge::capabilities_from_inventory(&inv, &me);
 
     // The presence advert this node would broadcast to peers (see
     // `allmystuff_protocol::NodeProfile`).
-    let summary = bridge::node_summary(&inv);
+    let summary = allmystuff_bridge::node_summary(&inv);
     println!(
         "Presence advert  ·  {}  ·  {}  ·  {} devices\n",
         summary.os, summary.cpu, summary.device_count

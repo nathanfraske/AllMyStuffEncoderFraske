@@ -1,5 +1,9 @@
-//! The bridge: turn a hardware [`Inventory`] into the routable
-//! [`Capability`] nodes the graph wires together.
+//! # allmystuff-bridge
+//!
+//! The seam between hardware and graph: turn a scanned [`Inventory`] into
+//! the routable [`Capability`] nodes the graph wires together. Shared by
+//! the headless CLI and the Tauri backend so "what this machine exposes"
+//! is computed in exactly one place.
 //!
 //! Two kinds of capability come out of a machine:
 //!
