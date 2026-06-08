@@ -13,11 +13,46 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The daemon's per-connection client handle id. Transparent over a
-/// `u64` on the wire, matching `myownmesh::ipc::ClientId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+/// The daemon's per-connection client handle id. On the wire it's the
+/// `Display` string `c<n>` (e.g. `"c42"`), exactly matching
+/// `myownmesh::ipc::ClientId` — the daemon parses it back with
+/// `FromStr`, so a bare number would be rejected. The daemon hands a
+/// client its id in the `EventsSubscribe` ack (`data.client_id`); the
+/// client passes it back on every channel/RPC op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u64);
+
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "c{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ClientId {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let n = s
+            .strip_prefix('c')
+            .ok_or_else(|| format!("ClientId must start with 'c', got '{s}'"))?;
+        Ok(ClientId(
+            n.parse().map_err(|e| format!("ClientId parse: {e}"))?,
+        ))
+    }
+}
+
+impl Serialize for ClientId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// Client → daemon request. One JSON object per line, dispatched on `op`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,9 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn client_id_is_a_bare_number() {
+    fn client_id_serialises_as_the_c_string() {
+        // The daemon parses client_id with FromStr ("c42"), so it must go
+        // on the wire as that string — never a bare number.
         let j = serde_json::to_value(ClientId(42)).unwrap();
-        assert_eq!(j, serde_json::json!(42));
+        assert_eq!(j, serde_json::json!("c42"));
+        let back: ClientId = serde_json::from_value(serde_json::json!("c42")).unwrap();
+        assert_eq!(back, ClientId(42));
+        assert!(serde_json::from_value::<ClientId>(serde_json::json!(42)).is_err());
     }
 
     #[test]

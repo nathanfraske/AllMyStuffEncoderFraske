@@ -82,7 +82,10 @@ impl ControlClient {
 
     /// Subscribe to the daemon's event stream. Forwards each line to `tx`
     /// as opaque JSON; returns after the initial ack.
-    pub async fn subscribe_events(&self, tx: mpsc::Sender<serde_json::Value>) -> Result<()> {
+    pub async fn subscribe_events(
+        &self,
+        tx: mpsc::Sender<serde_json::Value>,
+    ) -> Result<allmystuff_protocol::ClientId> {
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -107,6 +110,16 @@ impl ControlClient {
                 parsed.error.unwrap_or_else(|| "(no error)".into())
             ));
         }
+        // The ack carries this connection's client_id (as the daemon's
+        // `c<n>` string); we pass it back on ChannelSubscribe so channel
+        // frames route to this event socket.
+        let client_id: allmystuff_protocol::ClientId = parsed
+            .data
+            .as_ref()
+            .and_then(|d| d.get("client_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow!("subscribe ack missing client_id"))?;
 
         tokio::spawn(async move {
             // Keep the writer half alive for the lifetime of the read loop.
@@ -135,7 +148,7 @@ impl ControlClient {
             }
         });
 
-        Ok(())
+        Ok(client_id)
     }
 
     async fn connect(&self) -> Result<LocalSocketStream> {

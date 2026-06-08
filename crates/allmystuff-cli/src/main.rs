@@ -1,23 +1,33 @@
-//! `allmystuff` — the headless face of the app.
+//! `allmystuff` — the CLI half of the app.
 //!
-//! No window, no mesh daemon required: it scans the machine it runs on and
-//! shows you what AllMyStuff sees — the raw inventory, or the routable
-//! capabilities that inventory becomes on the graph. Handy on a headless
-//! box, in CI, or just to sanity-check the scanner.
+//! A bare `allmystuff` opens the desktop app (`allmystuff-gui`). The
+//! subcommands are for headless boxes, scripts, and CI: scan the machine,
+//! show what it would expose on the mesh, or self-update.
 //!
 //! ```text
-//! allmystuff                 # pretty inventory of this machine
+//! allmystuff                 # open the desktop app
+//! allmystuff scan            # pretty inventory of this machine
 //! allmystuff scan --json     # the same, as JSON
 //! allmystuff capabilities    # what this machine would expose on the mesh
+//! allmystuff update          # update to the latest release
 //! ```
+
+mod gui_launch;
 
 use std::process::ExitCode;
 
 use allmystuff_graph::{Catalog, MeshNode, NodeId, Relationship};
 
 fn main() -> ExitCode {
+    // Apply any update staged on the previous run before doing anything
+    // else — same "stage now, apply on next launch" model as MyOwnMesh.
+    allmystuff_updater::apply_pending_if_any();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("scan");
+    let Some(cmd) = args.first().map(String::as_str) else {
+        // No subcommand → open the desktop app.
+        return gui_launch::launch();
+    };
 
     match cmd {
         "-h" | "--help" | "help" => {
@@ -33,9 +43,107 @@ fn main() -> ExitCode {
             run_scan(json)
         }
         "capabilities" | "caps" | "graph" => run_capabilities(),
+        "update" => run_update(&args[1..]),
         other => {
             eprintln!("allmystuff: unknown command `{other}`\n");
             print_help();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `allmystuff update [check|apply|status|enable|disable] [--json]` —
+/// self-update, mirroring `myownmesh update`. A bare `update` fetches the
+/// latest release and updates both binaries in one shot.
+fn run_update(args: &[String]) -> ExitCode {
+    let json = args.iter().any(|a| a == "--json");
+    let sub = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with('-'));
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("allmystuff: couldn't start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result: Result<(), String> = rt.block_on(async {
+        match sub {
+            None => {
+                let outcome = allmystuff_updater::update_now()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match outcome {
+                    allmystuff_updater::UpdateNowOutcome::PackageManager => println!(
+                        "Installed by a package manager — use it to update (brew/apt/winget)."
+                    ),
+                    allmystuff_updater::UpdateNowOutcome::UpToDate { current, .. } => {
+                        println!("Already up to date (v{current}).")
+                    }
+                    allmystuff_updater::UpdateNowOutcome::Updated { to, components } => println!(
+                        "Updated to v{to} ({}). Restart to run the new version.",
+                        components.join(" + ")
+                    ),
+                }
+                Ok(())
+            }
+            Some("check") => {
+                let outcome = allmystuff_updater::check_now(true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&outcome).unwrap_or_default()
+                    );
+                } else {
+                    println!("{outcome:?}");
+                }
+                Ok(())
+            }
+            Some("apply") => {
+                match allmystuff_updater::apply_now().map_err(|e| e.to_string())? {
+                    Some(v) => println!("Applied v{v}. Restart to run it."),
+                    None => println!("No staged update to apply."),
+                }
+                Ok(())
+            }
+            Some("status") => {
+                let st = allmystuff_updater::status().map_err(|e| e.to_string())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+                } else {
+                    println!("version    {}", st.current_version);
+                    println!("install    {:?}", st.install_kind);
+                    println!(
+                        "auto       {} ({}, every {}h)",
+                        st.enabled, st.auto_apply, st.check_interval_hours
+                    );
+                    println!("channel    {}", st.channel);
+                    println!("feed       {}", st.release_url);
+                    if let Some(v) = st.staged_version {
+                        println!("staged     v{v} (applies on next launch)");
+                    }
+                }
+                Ok(())
+            }
+            Some("enable") | Some("disable") => {
+                let on = sub == Some("enable");
+                allmystuff_updater::set_enabled(on).map_err(|e| e.to_string())?;
+                println!("Automatic updates {}.", if on { "on" } else { "off" });
+                Ok(())
+            }
+            Some(other) => Err(format!("unknown update subcommand `{other}`")),
+        }
+    });
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("allmystuff update: {e}");
             ExitCode::FAILURE
         }
     }
@@ -159,15 +267,15 @@ fn print_help() {
 USAGE:
     allmystuff [COMMAND]
 
+    With no command, opens the desktop app (allmystuff-gui).
+
 COMMANDS:
-    scan            Pretty inventory of this machine (default)
+    scan            Pretty inventory of this machine
     scan --json     Inventory as JSON
     capabilities    Capabilities this machine would expose on the mesh graph
+    update          Update to the latest release (check | apply | status | enable | disable)
     version         Print version
-    help            Show this help
-
-The desktop app (Tauri + Svelte) adds the graph, mesh joining, and the
-share flow on top of exactly these scans. See the README.",
+    help            Show this help",
         ver = env!("CARGO_PKG_VERSION")
     );
 }

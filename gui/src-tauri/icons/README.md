@@ -1,14 +1,18 @@
 # App icons
 
-`icon.png` is a 512×512 placeholder (a little node graph in the AllMyStuff
-accent). Before cutting a release, generate the full platform set —
-`.ico`, `.icns`, and the multi-resolution PNGs — from a final source
-artwork:
+The desktop icon set (`icon.ico`, `icon.icns`, and the multi-resolution
+PNGs listed in `tauri.conf.json` → `bundle.icon`) is generated from
+`icon.png` — a 512×512 placeholder (a little node graph in the AllMyStuff
+accent). The `.ico` is also what `tauri-build` embeds as the Windows
+resource, so it must exist for a Windows build.
+
+To regenerate from new source artwork (≥ 1024×1024 recommended):
 
 ```sh
 cd gui
 pnpm tauri icon path/to/allmystuff-1024.png
 ```
 
-That writes every size Tauri needs back into this folder; then list them
-in `tauri.conf.json` under `bundle.icon`.
+That rewrites every size Tauri needs back into this folder. The mobile /
+Windows-Store assets it also emits (`android/`, `ios/`, `Square*Logo.png`,
+`StoreLogo.png`) aren't used by the desktop bundle and aren't committed.

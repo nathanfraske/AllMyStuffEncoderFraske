@@ -111,17 +111,11 @@ gui/                   # app — Tauri 2 backend + Svelte 5 front-end (the graph
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full tour.
 
-## Run it
+## What a scan sees
 
-### Scan this machine (no GUI, no mesh needed)
-
-```sh
-cargo run -p allmystuff-cli -- scan          # pretty inventory
-cargo run -p allmystuff-cli -- scan --json   # the same, as JSON
-cargo run -p allmystuff-cli -- capabilities  # what it would expose on the mesh
-```
-
-Real output from the box this was built on:
+Every probe degrades gracefully, so a bare container shows compute +
+storage + network while a loaded laptop shows the lot — displays, mic
+arrays, cameras, the works. On the box this was built on:
 
 ```text
 ┌──────┐
@@ -149,27 +143,17 @@ The graph in action (on this machine's real devices):
       your friend isn't allowed to receive your display yet
 ```
 
-### The desktop app
+## Build & run
 
-```sh
-cd gui
-pnpm install
-pnpm tauri dev      # needs a running `myownmesh serve` for live mesh data
-```
+The desktop app opens straight into a populated demo graph even with no
+mesh, so you can explore the whole experience — clicking nodes, drawing
+connections, the share sheet, groups — offline. A bare `allmystuff` opens
+it; the subcommands (`scan`, `capabilities`, `update`) are for headless
+boxes and scripts.
 
-The app opens straight into a populated demo graph even with no daemon, so
-you can explore the whole experience offline. The Tauri backend needs the
-standard Linux webview deps to build: `libgtk-3-dev` and
-`libwebkit2gtk-4.1-dev` (macOS/Windows use the system webview).
-
-### Develop
-
-```sh
-just            # fmt-check + clippy + test + GUI typecheck/build
-just test       # cargo test --workspace
-just scan       # cargo run -p allmystuff-cli -- scan
-just gui-check  # svelte-check + vite build
-```
+Build instructions, the full CLI reference, the desktop-app dependencies,
+the live-mesh setup, and **how to help test on macOS / Windows / Pi** all
+live in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## Status
 
@@ -177,11 +161,12 @@ This repository is a **working foundation**, honest about what's real:
 
 | Piece | State |
 |---|---|
-| Device scanner (Linux) | **Working** — live `/proc` + `/sys` probes, fixture-tested decoders (EDID, ALSA arrays, input devices) |
+| Device scanner | **Working** on Linux (`/proc` + `/sys`), macOS (`system_profiler`), and Windows (CIM) — fixture-tested decoders, compiled + tested on all three in CI |
 | Graph model + authorization | **Working** — pure Rust, fully unit-tested; mirrored in TS for the UI |
-| Desktop graph UI | **Working** — builds, typechecks, fully interactive on demo data |
-| macOS / Windows scanners | **Scaffolded** — host basics via `sysinfo`; richer classes are follow-ups |
-| Live mesh routing of real A/V | **Designed** — the protocol + control wiring are in place; media transport is the next milestone |
+| Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data |
+| Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
+| Live audio streaming | **Working** — a mic → speakers route opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
+| Video / screen / input streaming | **Next** — same proven route pipe; needs each medium's capture/inject backend |
 
 ## Lineage
 

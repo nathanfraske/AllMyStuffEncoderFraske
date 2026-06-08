@@ -31,6 +31,11 @@ pub const CHANNEL_PRESENCE: &str = "allmystuff/presence/v1";
 /// Typed-channel name for point-to-point route/share control.
 pub const CHANNEL_CONTROL: &str = "allmystuff/control/v1";
 
+/// Typed-channel name carrying the media plane (audio frames) of active
+/// routes. Frames self-identify by route id, so one channel demuxes them
+/// all.
+pub const CHANNEL_MEDIA: &str = "allmystuff/media/v1";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
