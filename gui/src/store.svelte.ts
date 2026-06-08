@@ -15,15 +15,43 @@ import {
 } from "./catalog";
 import { demoCatalog } from "./mock";
 import {
+  buildNetworkConfig,
   connectRoute,
   disconnectRoute,
   isTauri,
+  meshIdentity,
+  meshIdentitySetLabel,
+  meshNetworkAdd,
+  meshNetworkIdGenerate,
+  meshNetworkRemove,
+  meshNetworks,
+  meshPeers,
+  meshRosterApprove,
+  meshRosterList,
+  meshRosterRemove,
   onSession,
   onSubscription,
   scanSelf,
   type SessionSnapshot,
 } from "./tauri";
-import type { Capability, Catalog, Grant, MediaKind, MeshNode, Relationship } from "./types";
+import {
+  BUNDLE_TEMPLATES,
+  type Capability,
+  type Catalog,
+  type Flow,
+  type Grant,
+  type IdentityInfo,
+  type MediaKind,
+  type MeshNode,
+  type NetworkSummary,
+  type PeerInfo,
+  type Relationship,
+  type RosterPeer,
+} from "./types";
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
 let seq = 0;
 const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
@@ -71,7 +99,11 @@ class AppStore {
   dragFrom = $state<string | null>(null);
   pendingShare = $state<PendingShare | null>(null);
   pendingGroupShare = $state<PendingGroupShare | null>(null);
-  addNodeOpen = $state(false);
+  /** The "Add a machine" onboarding sheet (real machines join the mesh; you
+   *  don't fabricate them). */
+  addMachineOpen = $state(false);
+  /** The Networks panel (identity, create/join/leave, approvals). */
+  networksOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
   groupPickerFor = $state<string | null>(null); // groupId awaiting a target
   toasts = $state<Toast[]>([]);
@@ -80,6 +112,23 @@ class AppStore {
    *  device id once the backend session is up. The graph centres on it. */
   localId = $state("this");
 
+  // ---- networks / identity / roster (live mesh control) -----------
+  /** This device's mesh identity. `label` is the display-name override. */
+  identity = $state<IdentityInfo | null>(null);
+  networks = $state<NetworkSummary[]>([]);
+  /** config_id of the network the live session is currently on. */
+  sessionNetwork = $state<string | null>(null);
+  /** The network whose roster/approvals the Networks panel is showing. */
+  rosterNetwork = $state<string | null>(null);
+  roster = $state<RosterPeer[]>([]);
+  livePeers = $state<PeerInfo[]>([]);
+
+  // ---- bundles (pre-set kits with category slots) -----------------
+  /** The bundle template id currently being filled, if any. */
+  bundleDraftId = $state<string | null>(null);
+  /** slot id → chosen local capability id, for the draft bundle. */
+  bundleSlots = $state<Record<string, string>>({});
+
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
@@ -87,6 +136,13 @@ class AppStore {
 
   mineCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "mine").length);
   sharedCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "shared").length);
+
+  /** The network the live session is on (or the first one configured). */
+  activeNetwork = $derived(
+    this.networks.find((n) => n.config_id === this.sessionNetwork) ?? this.networks[0] ?? null,
+  );
+  /** Devices waiting to be let onto the roster network. */
+  pendingPeers = $derived(this.livePeers.filter((p) => p.status === "pending_approval"));
 
   capsOf(nodeId: string): Capability[] {
     return this.catalog.capabilities.filter((c) => c.node === nodeId);
@@ -106,12 +162,17 @@ class AppStore {
    *  demo graph) in web mode. Called once on mount. */
   async init() {
     await this.hydrateFromBackend();
+    await this.loadIdentity();
+    await this.refreshNetworks();
     await onSubscription((s) => {
       const live = s.status === "live";
-      // When the mesh comes up, re-scan: the first scan at mount can run
-      // before the session is ready (so it returns the placeholder id), and
-      // now `scan_self` reports the real mesh device id + capabilities.
-      if (live) void this.hydrateFromBackend();
+      // When the mesh comes up, re-scan + reload networks/identity: the first
+      // pass at mount can run before the session is ready.
+      if (live) {
+        void this.hydrateFromBackend();
+        void this.loadIdentity();
+        void this.refreshNetworks();
+      }
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
@@ -131,18 +192,24 @@ class AppStore {
     // Adopt this machine as "this device". Match the local node by its new
     // id or its previous one, so a re-scan (once the mesh id is known)
     // re-homes the same node rather than adding a duplicate.
+    const host = scan.hostname || scan.label || "This device";
+    // Display name follows the naming rule: the override if the user set one,
+    // else the machine hostname.
+    const label = this.identity?.label?.trim() || host;
     const me =
       this.catalog.nodes.find((n) => n.id === newId) ??
       this.catalog.nodes.find((n) => n.id === prevId && n.kind === "this");
     if (me) {
       me.id = newId;
       me.kind = "this";
-      if (scan.label) me.label = scan.label;
+      me.label = label;
+      me.hostname = host;
       me.summary = scan.summary;
     } else {
       this.catalog.nodes.push({
         id: newId,
-        label: scan.label || "This device",
+        label,
+        hostname: host,
         kind: "this",
         relationship: { kind: "mine" },
         online: true,
@@ -164,6 +231,7 @@ class AppStore {
   applySessionSnapshot(snap: SessionSnapshot) {
     if (!snap.ready) return;
     if (snap.me) this.localId = snap.me;
+    if (snap.network !== undefined) this.sessionNetwork = snap.network ?? null;
 
     for (const p of snap.peers ?? []) {
       let node = this.catalog.nodes.find((n) => n.id === p.node);
@@ -173,6 +241,7 @@ class AppStore {
         node = {
           id: p.node,
           label: p.label,
+          hostname: p.hostname,
           kind: "machine",
           relationship: { kind: "mine" },
           online: true,
@@ -180,6 +249,7 @@ class AppStore {
         this.catalog.nodes.push(node);
       } else {
         node.label = p.label;
+        node.hostname = p.hostname;
         node.online = true;
       }
       node.summary = p.summary;
@@ -368,34 +438,173 @@ class AppStore {
     return id;
   }
 
-  // ---- nodes + relationships --------------------------------------
+  // ---- bundles (pre-set kits with category slots) -----------------
 
-  addNode(label: string, relationship: Relationship, summary?: MeshNode["summary"]) {
-    const id = newId("node");
-    this.catalog.nodes.push({
-      id,
-      label,
-      kind: "machine",
-      relationship,
-      online: true,
-      summary,
-    });
-    // A brand-new machine still exposes the synthetic trio.
-    this.catalog.capabilities.push(
-      { id: `${id}:screen`, node: id, label: "Screen", media: "display", flow: "source", origin: "screen" },
-      { id: `${id}:control`, node: id, label: "Keyboard & mouse", media: "input", flow: "sink", origin: "control" },
-      { id: `${id}:system-audio`, node: id, label: "System audio", media: "audio", flow: "duplex", origin: "system" },
-    );
-    this.addNodeOpen = false;
-    this.selectNode(id);
-    this.toast(
-      "ok",
-      relationship.kind === "mine"
-        ? `Added ${label} to your stuff`
-        : `Sharing with ${label}`,
-    );
-    return id;
+  /** Start filling a bundle template — auto-fill each slot from this
+   *  machine's matching devices; the user can swap any of them. */
+  startBundle(templateId: string) {
+    const tpl = BUNDLE_TEMPLATES.find((t) => t.id === templateId);
+    if (!tpl) return;
+    this.bundleDraftId = templateId;
+    const slots: Record<string, string> = {};
+    for (const slot of tpl.slots) {
+      const role = slot.flow === "source" ? "provide" : "consume";
+      const cap = matchEndpoint(this.catalog, this.localId, slot.media, role);
+      if (cap) slots[slot.id] = cap.id;
+    }
+    this.bundleSlots = slots;
   }
+
+  setBundleSlot(slotId: string, capId: string) {
+    this.bundleSlots = { ...this.bundleSlots, [slotId]: capId };
+  }
+
+  cancelBundle() {
+    this.bundleDraftId = null;
+    this.bundleSlots = {};
+  }
+
+  /** This machine's capabilities that fit a slot (same media + direction). */
+  bundleCandidates(slot: { media: MediaKind; flow: Flow }): Capability[] {
+    const wantSource = slot.flow === "source";
+    return this.capsOf(this.localId).filter(
+      (c) => c.media === slot.media && (wantSource ? canSource(c.flow) : canSink(c.flow)),
+    );
+  }
+
+  /** Turn the filled draft into a bundle and arm the "tap a machine to send
+   *  it there" picker — it fans out as one connection. */
+  sendBundle() {
+    const tpl = BUNDLE_TEMPLATES.find((t) => t.id === this.bundleDraftId);
+    if (!tpl) return;
+    const members = Object.values(this.bundleSlots).filter(Boolean);
+    if (members.length === 0) {
+      this.toast("warn", "Fill at least one slot first");
+      return;
+    }
+    const groupId = this.createGroup(tpl.name, this.localId, members);
+    this.cancelBundle();
+    this.startGroupConnect(groupId);
+  }
+
+  // ---- networks / identity / roster -------------------------------
+
+  async loadIdentity() {
+    if (!isTauri()) return;
+    try {
+      this.identity = await meshIdentity();
+      this.applyLocalLabel();
+    } catch {
+      /* no daemon yet — the graph still works from the demo/scan */
+    }
+  }
+
+  /** Re-apply the naming rule to the local node after identity changes. */
+  private applyLocalLabel() {
+    const me = this.node(this.localId);
+    if (!me) return;
+    const host = me.hostname ?? me.label;
+    me.label = this.identity?.label?.trim() || host;
+  }
+
+  async refreshNetworks() {
+    if (!isTauri()) return;
+    try {
+      this.networks = (await meshNetworks()) ?? [];
+      if (this.rosterNetwork) await this.refreshRoster(this.rosterNetwork);
+    } catch (e) {
+      this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+    }
+  }
+
+  /** Set this device's display-name override (empty resets to the hostname). */
+  async setIdentityLabel(label: string) {
+    try {
+      await meshIdentitySetLabel(label);
+      this.identity = { device_id: this.identity?.device_id ?? "", label };
+      this.applyLocalLabel();
+      this.toast("ok", label.trim() ? "Updated this device's name" : "Reset to the machine name");
+    } catch (e) {
+      this.toast("warn", `Couldn't set name: ${errMsg(e)}`);
+    }
+  }
+
+  async createNetwork(label?: string, autoApprove = false): Promise<string | null> {
+    try {
+      const networkId = await meshNetworkIdGenerate();
+      await meshNetworkAdd(buildNetworkConfig({ networkId, label, autoApprove }));
+      this.toast("ok", `Created network ${label?.trim() || networkId}`);
+      await this.refreshNetworks();
+      return networkId;
+    } catch (e) {
+      this.toast("warn", `Couldn't create network: ${errMsg(e)}`);
+      return null;
+    }
+  }
+
+  async joinNetwork(networkId: string, label?: string) {
+    const id = networkId.trim();
+    if (!id) return;
+    try {
+      await meshNetworkAdd(buildNetworkConfig({ networkId: id, label }));
+      this.toast("ok", `Joined ${label?.trim() || id}`);
+      await this.refreshNetworks();
+    } catch (e) {
+      this.toast("warn", `Couldn't join: ${errMsg(e)}`);
+    }
+  }
+
+  async leaveNetwork(configId: string) {
+    try {
+      await meshNetworkRemove(configId);
+      if (this.rosterNetwork === configId) {
+        this.rosterNetwork = null;
+        this.roster = [];
+        this.livePeers = [];
+      }
+      this.toast("info", "Left the network");
+      await this.refreshNetworks();
+    } catch (e) {
+      this.toast("warn", `Couldn't leave: ${errMsg(e)}`);
+    }
+  }
+
+  /** Load the roster + live peers for one network (the approvals view). */
+  async refreshRoster(configId: string) {
+    this.rosterNetwork = configId;
+    try {
+      this.roster = (await meshRosterList(configId)) ?? [];
+    } catch {
+      this.roster = [];
+    }
+    try {
+      this.livePeers = (await meshPeers(configId)) ?? [];
+    } catch {
+      this.livePeers = [];
+    }
+  }
+
+  async approveDevice(configId: string, deviceId: string, label?: string) {
+    try {
+      await meshRosterApprove(configId, deviceId, label);
+      this.toast("ok", "Approved — it can join now");
+      await this.refreshRoster(configId);
+    } catch (e) {
+      this.toast("warn", `Couldn't approve: ${errMsg(e)}`);
+    }
+  }
+
+  async removeDevice(configId: string, deviceId: string) {
+    try {
+      await meshRosterRemove(configId, deviceId);
+      this.toast("info", "Removed from the network");
+      await this.refreshRoster(configId);
+    } catch (e) {
+      this.toast("warn", `Couldn't remove: ${errMsg(e)}`);
+    }
+  }
+
+  // ---- relationships ----------------------------------------------
 
   /** Flip a node between "mine" and a fresh share, or vice versa. */
   setRelationship(nodeId: string, relationship: Relationship) {

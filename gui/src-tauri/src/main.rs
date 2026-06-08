@@ -53,6 +53,7 @@ fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
     serde_json::to_value(json!({
         "node_id": me,
         "label": inv.host.hostname,
+        "hostname": inv.host.hostname,
         "summary": allmystuff_bridge::node_summary(&inv),
         "capabilities": allmystuff_bridge::capabilities_from_inventory(&inv, &node),
     }))
@@ -150,6 +151,49 @@ async fn mesh_roster_remove(
     )
 }
 
+#[tauri::command]
+async fn mesh_roster_list(state: State<'_, AppState>, network: String) -> Result<Value, String> {
+    unwrap_response(
+        state.client.request(&Request::RosterList { network }).await.map_err(|e| e.to_string())?,
+    )
+}
+
+/// Ask the daemon for a fresh, valid network id (the shareable handle peers
+/// join with). Used by the "create network" flow.
+#[tauri::command]
+async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<Value, String> {
+    unwrap_response(
+        state.client.request(&Request::NetworkIdGenerate).await.map_err(|e| e.to_string())?,
+    )
+}
+
+#[tauri::command]
+async fn mesh_network_remove(state: State<'_, AppState>, network: String) -> Result<Value, String> {
+    unwrap_response(
+        state.client.request(&Request::NetworkRemove { network }).await.map_err(|e| e.to_string())?,
+    )
+}
+
+/// Set this device's display-name override. Persists in the daemon identity
+/// and updates the live presence profile so peers see the new name on the
+/// next broadcast. An empty string resets the name to the hostname.
+#[tauri::command]
+async fn mesh_identity_set_label(
+    state: State<'_, AppState>,
+    mesh: State<'_, Arc<Mesh>>,
+    label: String,
+) -> Result<Value, String> {
+    let data = unwrap_response(
+        state
+            .client
+            .request(&Request::IdentitySetLabel { label: label.clone() })
+            .await
+            .map_err(|e| e.to_string())?,
+    )?;
+    mesh.inner().set_label(label).await;
+    Ok(data)
+}
+
 // ---- self-update (AllMyStuff's own updater, not the daemon's) ----------
 
 #[tauri::command]
@@ -227,8 +271,12 @@ fn main() {
             mesh_networks,
             mesh_peers,
             mesh_network_add,
+            mesh_network_remove,
+            mesh_network_id_generate,
             mesh_roster_approve,
             mesh_roster_remove,
+            mesh_roster_list,
+            mesh_identity_set_label,
             update_status,
             update_check,
             update_apply,

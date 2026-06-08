@@ -55,7 +55,15 @@ pub struct InventorySummary {
 pub struct NodeProfile {
     pub protocol: u32,
     pub node: NodeId,
+    /// Display name for this node — the machine's hostname by default, or a
+    /// user-set override. When it differs from `hostname`, the UI renders
+    /// "label (hostname)" so the real machine is always visible.
     pub label: String,
+    /// The node's real machine hostname, always straight from its own scan.
+    /// `#[serde(default)]` so presence from an older peer (no hostname field)
+    /// still decodes — the UI just falls back to `label`.
+    #[serde(default)]
+    pub hostname: String,
     pub summary: InventorySummary,
     /// The capabilities this node is willing to expose. The owner curates
     /// this; nothing here is reachable without the receiver's catalog also
@@ -126,6 +134,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             node: "desk".into(),
             label: "Desk PC".into(),
+            hostname: "desk-pc.local".into(),
             summary: InventorySummary {
                 os: "linux".into(),
                 cpu: "Test CPU".into(),

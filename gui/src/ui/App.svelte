@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
+  import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
-  import GroupsBar from "./GroupsBar.svelte";
-  import AddNodeModal from "./AddNodeModal.svelte";
+  import BundlesBar from "./BundlesBar.svelte";
+  import AddMachineSheet from "./AddMachineSheet.svelte";
+  import NetworksSheet from "./NetworksSheet.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import Toasts from "./Toasts.svelte";
 
@@ -31,24 +33,32 @@
       <span class="chip"><b>{app.sharedCount}</b> shared</span>
       <span class="chip net" class:live={app.backendConnected}>
         <span class="net-dot"></span>
-        {app.backendConnected ? "mesh connected" : "demo mode"}
+        {app.backendConnected
+          ? app.activeNetwork
+            ? networkDisplayName(app.activeNetwork)
+            : "mesh connected"
+          : "demo mode"}
       </span>
     </div>
 
     <div class="actions">
+      <button class="btn" onclick={() => (app.networksOpen = true)} title="Networks, identity & approvals">🌐 Networks</button>
       <button class="btn" onclick={() => app.hydrateFromBackend()} title="Scan this machine">↻ Scan</button>
-      <button class="btn primary" onclick={() => (app.addNodeOpen = true)}>＋ Add</button>
+      <button class="btn primary" onclick={() => (app.addMachineOpen = true)}>＋ Add machine</button>
     </div>
   </header>
 
   <main class="stage">
     <Graph />
-    <GroupsBar />
+    <BundlesBar />
     <NodeDrawer />
   </main>
 
-  {#if app.addNodeOpen}
-    <AddNodeModal />
+  {#if app.addMachineOpen}
+    <AddMachineSheet />
+  {/if}
+  {#if app.networksOpen}
+    <NetworksSheet />
   {/if}
   <ShareSheet />
   <Toasts />

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
-  import { mediaColor, humanBytes, type MediaKind } from "../types";
+  import { displayName, mediaColor, humanBytes, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
 
   // Canvas size tracked via ResizeObserver so the layout fits its
@@ -236,12 +236,12 @@
         }}
         role="button"
         tabindex="0"
-        aria-label={n.label}
+        aria-label={displayName(n)}
       >
         <div class="node-top">
           <span class="avatar">{nodeAvatar(n)}</span>
           <div class="node-id">
-            <div class="node-label" title={n.label}>{n.label}</div>
+            <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
             <div class="node-sub">
               {#if shared && n.relationship.kind === "shared"}
                 shared with {n.relationship.person.name}
