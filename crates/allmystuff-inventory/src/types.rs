@@ -1,0 +1,300 @@
+//! The data model a scan produces.
+//!
+//! Every device the scanner finds becomes a typed record with a
+//! **stable `id`** — derived from durable attributes (a MAC address, a
+//! drm connector, a USB `vid:pid:serial`) rather than an enumeration
+//! index — so the graph layer can pin a route to "this exact mic" and
+//! have it survive a reboot or a replug. Friendly `name`s are for the
+//! human; `id`s are for the wire.
+//!
+//! Shapes are deliberately `serde`-clean and additive: new fields are
+//! `#[serde(default)]` so an older config snapshot or an older peer
+//! still deserialises. This mirrors the discipline in
+//! `MyOwnLLM`'s `HardwareProfile`.
+
+use serde::{Deserialize, Serialize};
+
+/// A full snapshot of one machine's hardware and attached devices.
+///
+/// This is what `allmystuff_inventory::scan()` returns and what the
+/// desktop app hands to the graph as "this node's stuff."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Inventory {
+    /// Unix seconds the scan completed. Lets the UI show "scanned 2m
+    /// ago" and lets a peer reason about staleness of a shared
+    /// snapshot.
+    pub scanned_at: u64,
+    pub host: HostInfo,
+    pub cpu: Cpu,
+    pub memory: Memory,
+    #[serde(default)]
+    pub gpus: Vec<Gpu>,
+    #[serde(default)]
+    pub storage: Vec<StorageVolume>,
+    #[serde(default)]
+    pub networks: Vec<NetworkInterface>,
+    #[serde(default)]
+    pub displays: Vec<Display>,
+    /// Capture devices — microphones, line-in, loopback. The `channels`
+    /// field is how we surface "this is a 4+ mic array" (a conference
+    /// puck, a ReSpeaker, a laptop's beam-forming array).
+    #[serde(default)]
+    pub microphones: Vec<AudioDevice>,
+    /// Playback devices — speakers, headphones, HDMI audio.
+    #[serde(default)]
+    pub speakers: Vec<AudioDevice>,
+    #[serde(default)]
+    pub cameras: Vec<Camera>,
+    /// Keyboards, mice, touchpads, game controllers, touchscreens.
+    #[serde(default)]
+    pub inputs: Vec<InputDevice>,
+    /// Everything else identifiable on the USB bus that didn't slot
+    /// into a richer category above (printers, yubikeys, dongles…).
+    #[serde(default)]
+    pub usb: Vec<UsbDevice>,
+}
+
+impl Inventory {
+    /// Total number of individually-addressable devices across every
+    /// category — the headline "you have N things" number for the UI.
+    pub fn device_count(&self) -> usize {
+        self.gpus.len()
+            + self.storage.len()
+            + self.networks.len()
+            + self.displays.len()
+            + self.microphones.len()
+            + self.speakers.len()
+            + self.cameras.len()
+            + self.inputs.len()
+            + self.usb.len()
+            // CPU + memory are always-present singletons.
+            + 2
+    }
+}
+
+// ---- host -------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub hostname: String,
+    /// `linux` / `macos` / `windows` — `std::env::consts::OS`.
+    pub os: String,
+    pub os_version: Option<String>,
+    pub kernel_version: Option<String>,
+    /// `x86_64`, `aarch64`, … — what the running binary was built for.
+    pub arch: String,
+    /// Friendly board / vendor label from DMI (`Dell Inc. XPS 15`) when
+    /// available on x86 desktops/laptops.
+    pub board: Option<String>,
+    /// Single-board-computer / SoC label when identifiable — e.g.
+    /// "Raspberry Pi 5 Model B". `None` on most x86 and Macs. Same
+    /// detection MyOwnLLM uses to right-size its model pick.
+    pub soc: Option<String>,
+    pub uptime_secs: u64,
+}
+
+// ---- cpu --------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cpu {
+    /// Marketing string — "Intel(R) Core(TM) i7-1185G7", "Apple M2".
+    pub brand: String,
+    pub vendor: Option<String>,
+    pub physical_cores: Option<usize>,
+    pub logical_cores: usize,
+    /// Nominal / max frequency in MHz when the OS reports it.
+    pub max_mhz: Option<u64>,
+}
+
+// ---- memory -----------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Memory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
+// ---- gpu --------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Gpu {
+    pub id: String,
+    pub name: String,
+    pub vendor: GpuVendor,
+    /// Dedicated video memory in bytes when discoverable (NVML, amdgpu
+    /// sysfs, Apple unified memory). `None` for most integrated GPUs.
+    pub vram_bytes: Option<u64>,
+    pub kind: GpuKind,
+    pub driver: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuKind {
+    Discrete,
+    Integrated,
+    Unknown,
+}
+
+// ---- storage ----------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageVolume {
+    pub id: String,
+    pub name: String,
+    pub mount_point: Option<String>,
+    pub filesystem: Option<String>,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub removable: bool,
+    pub kind: DiskKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskKind {
+    Ssd,
+    Hdd,
+    Removable,
+    Unknown,
+}
+
+// ---- network ----------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInterface {
+    pub id: String,
+    pub name: String,
+    pub mac: Option<String>,
+    pub kind: NetKind,
+    pub up: bool,
+    /// Link speed in Mbit/s when the driver reports it (`/sys/class/net/
+    /// <if>/speed`). `None` on Wi-Fi/virtual where it's not meaningful.
+    pub speed_mbps: Option<u64>,
+    #[serde(default)]
+    pub ipv4: Vec<String>,
+    #[serde(default)]
+    pub ipv6: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetKind {
+    Ethernet,
+    Wifi,
+    Loopback,
+    Virtual,
+    Cellular,
+    Bluetooth,
+    Unknown,
+}
+
+// ---- display ----------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Display {
+    pub id: String,
+    /// Monitor model name from EDID when we can read it ("DELL U2720Q"),
+    /// otherwise the connector name.
+    pub name: String,
+    /// drm connector — "eDP-1", "HDMI-A-1", "DP-2".
+    pub connector: String,
+    pub connected: bool,
+    /// Native / preferred resolution in pixels.
+    pub width_px: Option<u32>,
+    pub height_px: Option<u32>,
+    /// `true` for built-in panels (eDP / LVDS / DSI) — a laptop screen
+    /// rather than an external monitor.
+    pub internal: bool,
+}
+
+// ---- audio ------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub direction: AudioDirection,
+    /// Max channel count when discoverable. `>= 4` on a capture device
+    /// is the tell for a microphone *array* (beam-forming pucks,
+    /// conference mics, dev boards).
+    pub channels: Option<u32>,
+    /// ALSA card index / CoreAudio uid / WASAPI id — for debugging and
+    /// stable id derivation.
+    pub card: Option<String>,
+}
+
+impl AudioDevice {
+    /// A capture device with four or more channels is treated as a mic
+    /// *array* — the UI badges it and the graph can offer "use the
+    /// whole array" vs "use one element."
+    pub fn is_array(&self) -> bool {
+        matches!(self.direction, AudioDirection::Input) && self.channels.is_some_and(|c| c >= 4)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioDirection {
+    Input,
+    Output,
+}
+
+// ---- camera -----------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Camera {
+    pub id: String,
+    pub name: String,
+    /// Device node on Unix (`/dev/video0`). Informational on other OSes.
+    pub path: Option<String>,
+}
+
+// ---- input ------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputDevice {
+    pub id: String,
+    pub name: String,
+    pub kind: InputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Keyboard,
+    Mouse,
+    Touchpad,
+    Touchscreen,
+    Gamepad,
+    Tablet,
+    Other,
+}
+
+// ---- usb --------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDevice {
+    pub id: String,
+    pub name: String,
+    /// 4-hex-digit USB vendor id (`"046d"`).
+    pub vendor_id: String,
+    /// 4-hex-digit USB product id (`"085e"`).
+    pub product_id: String,
+    pub manufacturer: Option<String>,
+    /// Friendly USB device-class label ("Audio", "Video", "HID",
+    /// "Mass Storage") derived from `bDeviceClass`.
+    pub class: Option<String>,
+}

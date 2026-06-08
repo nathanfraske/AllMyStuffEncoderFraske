@@ -1,0 +1,17 @@
+[package]
+name = "allmystuff-inventory"
+description = "Cross-platform scan of everything plugged into a machine — CPU, GPU, RAM, storage, network, displays, mics (incl. arrays), speakers, cameras, input devices, and USB peripherals."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "allmystuff-cli"
+description = "Headless AllMyStuff — scan this machine and show the capabilities it would expose on the mesh graph."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "allmystuff"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+allmystuff-inventory = { workspace = true }
+allmystuff-graph = { workspace = true }
+allmystuff-bridge = { workspace = true }
+serde_json = { workspace = true }

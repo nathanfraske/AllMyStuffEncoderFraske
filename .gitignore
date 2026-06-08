@@ -1,0 +1,18 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Node / Vite / Tauri GUI
+gui/node_modules
+gui/dist
+gui/.svelte-kit
+gui/src-tauri/target
+gui/src-tauri/gen/schemas
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea
+.vscode/*
+!.vscode/extensions.json
