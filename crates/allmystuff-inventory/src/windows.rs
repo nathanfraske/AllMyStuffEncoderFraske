@@ -1,36 +1,279 @@
-//! Windows device probing.
+//! Windows device probing via PowerShell + CIM (`Get-CimInstance`).
 //!
-//! Linux is the reference implementation (`linux.rs`); on Windows the
-//! host basics come from `sysinfo` and the device classes here are
-//! scaffolded against PowerShell/CIM (`Get-CimInstance`). Collectors that
-//! aren't wired yet return empty so the scan still yields a complete,
-//! correctly-typed `Inventory`. Full WMI/SetupAPI enumeration is a
-//! follow-up.
+//! Linux (`linux.rs`) is the reference; this is the Windows implementation
+//! of the same collector surface. Host basics (CPU/memory/storage/network)
+//! come from `sysinfo`; everything here queries CIM and parses the JSON.
+//! Each probe is defensive — a failed query or a shape change degrades to
+//! "nothing here" rather than a panic.
 
 #![cfg(target_os = "windows")]
 
+use std::process::Command;
+
 use crate::types::*;
 
+/// Run a PowerShell snippet that ends in `ConvertTo-Json` and parse the
+/// result. `ConvertTo-Json` emits a bare object for a single row and an
+/// array for many; [`as_rows`] normalises both.
+fn ps_json(script: &str) -> Option<serde_json::Value> {
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
+fn as_rows(v: serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Null => Vec::new(),
+        other => vec![other],
+    }
+}
+
+fn rows(script: &str) -> Vec<serde_json::Value> {
+    ps_json(script).map(as_rows).unwrap_or_default()
+}
+
+fn s(v: &serde_json::Value, key: &str) -> Option<String> {
+    v[key]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn board_label() -> Option<String> {
+    let v = ps_json(
+        "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model | ConvertTo-Json -Compress",
+    )?;
+    let vendor = s(&v, "Manufacturer");
+    let model = s(&v, "Model")?;
+    Some(match vendor {
+        Some(vn) if !model.starts_with(&vn) => format!("{vn} {model}"),
+        _ => model,
+    })
+}
+
+pub fn soc_label() -> Option<String> {
+    None
+}
+
 pub fn collect_gpus() -> Vec<Gpu> {
-    Vec::new()
+    rows("Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress")
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let name = s(&v, "Name")?;
+            let lname = name.to_lowercase();
+            let vendor = if lname.contains("nvidia") {
+                GpuVendor::Nvidia
+            } else if lname.contains("amd") || lname.contains("radeon") {
+                GpuVendor::Amd
+            } else if lname.contains("intel") {
+                GpuVendor::Intel
+            } else {
+                GpuVendor::Other
+            };
+            // AdapterRAM is a uint32 and wraps for >4 GB cards; treat 0 /
+            // missing as unknown rather than wrong.
+            let vram_bytes = v["AdapterRAM"].as_u64().filter(|&b| b > 0);
+            Some(Gpu {
+                id: format!("gpu:{i}"),
+                name,
+                vendor,
+                vram_bytes,
+                kind: if vendor == GpuVendor::Intel {
+                    GpuKind::Integrated
+                } else if vram_bytes.is_some() {
+                    GpuKind::Discrete
+                } else {
+                    GpuKind::Unknown
+                },
+                driver: s(&v, "DriverVersion"),
+            })
+        })
+        .collect()
 }
 
 pub fn collect_displays() -> Vec<Display> {
-    Vec::new()
+    // Decode the uint16 UserFriendlyName array from WmiMonitorID in
+    // PowerShell, then carry the primary resolution from the video
+    // controller (per-monitor native resolution needs the EDID timing
+    // block, a follow-up).
+    let script = r#"
+$res = Get-CimInstance Win32_VideoController |
+    Where-Object { $_.CurrentHorizontalResolution } |
+    Select-Object -First 1
+Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
+    $name = -join ($_.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
+    [pscustomobject]@{
+        Name = $name
+        Instance = $_.InstanceName
+        Width = $res.CurrentHorizontalResolution
+        Height = $res.CurrentVerticalResolution
+    }
+} | ConvertTo-Json -Compress
+"#;
+    rows(script)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let name = s(&v, "Name").unwrap_or_else(|| format!("Display {i}"));
+            let connector = s(&v, "Instance").unwrap_or_default();
+            let internal = connector.to_uppercase().contains("LCD")
+                || name.to_lowercase().contains("internal");
+            Display {
+                id: format!("display:{i}"),
+                name,
+                connector,
+                connected: true,
+                width_px: v["Width"].as_u64().map(|w| w as u32),
+                height_px: v["Height"].as_u64().map(|h| h as u32),
+                internal,
+            }
+        })
+        .collect()
 }
 
 pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
-    (Vec::new(), Vec::new())
+    let (mut mics, mut speakers) = (Vec::new(), Vec::new());
+    let endpoints = rows(
+        "Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='AudioEndpoint'\" | Select-Object Name,DeviceID | ConvertTo-Json -Compress",
+    );
+    for (i, v) in endpoints.into_iter().enumerate() {
+        let Some(name) = s(&v, "Name") else { continue };
+        let l = name.to_lowercase();
+        let is_input = l.contains("microphone")
+            || l.contains("mic ")
+            || l.contains("line in")
+            || l.contains("capture")
+            || l.contains("input");
+        let dev = AudioDevice {
+            id: format!("{}:{i}", if is_input { "mic" } else { "spk" }),
+            name,
+            direction: if is_input {
+                AudioDirection::Input
+            } else {
+                AudioDirection::Output
+            },
+            channels: None,
+            card: s(&v, "DeviceID"),
+        };
+        if is_input {
+            mics.push(dev);
+        } else {
+            speakers.push(dev);
+        }
+    }
+    (mics, speakers)
 }
 
 pub fn collect_cameras() -> Vec<Camera> {
-    Vec::new()
+    rows("Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Camera'\" | Select-Object Name | ConvertTo-Json -Compress")
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            Some(Camera {
+                id: format!("cam:{i}"),
+                name: s(&v, "Name")?,
+                path: None,
+            })
+        })
+        .collect()
 }
 
 pub fn collect_inputs() -> Vec<InputDevice> {
-    Vec::new()
+    let mut out = Vec::new();
+    for (i, v) in rows("Get-CimInstance Win32_Keyboard | Select-Object Name,Description | ConvertTo-Json -Compress")
+        .into_iter()
+        .enumerate()
+    {
+        let name = s(&v, "Name").or_else(|| s(&v, "Description")).unwrap_or_else(|| "Keyboard".into());
+        out.push(InputDevice { id: format!("input:kbd:{i}"), name, kind: InputKind::Keyboard });
+    }
+    for (i, v) in rows("Get-CimInstance Win32_PointingDevice | Select-Object Name,Description | ConvertTo-Json -Compress")
+        .into_iter()
+        .enumerate()
+    {
+        let name = s(&v, "Name").or_else(|| s(&v, "Description")).unwrap_or_else(|| "Pointer".into());
+        let l = name.to_lowercase();
+        let kind = if l.contains("touchpad") || l.contains("trackpad") {
+            InputKind::Touchpad
+        } else {
+            InputKind::Mouse
+        };
+        out.push(InputDevice { id: format!("input:pt:{i}"), name, kind });
+    }
+    out
 }
 
 pub fn collect_usb() -> Vec<UsbDevice> {
-    Vec::new()
+    let mut out = Vec::new();
+    for v in rows(
+        "Get-CimInstance Win32_PnPEntity -Filter \"DeviceID like 'USB\\\\VID_%'\" | Select-Object Name,Manufacturer,DeviceID | ConvertTo-Json -Compress",
+    ) {
+        let Some(device_id) = s(&v, "DeviceID") else { continue };
+        let Some((vid, pid)) = parse_usb_id(&device_id) else { continue };
+        // Skip Microsoft/host root entries that aren't really peripherals.
+        let name = s(&v, "Name").unwrap_or_else(|| format!("USB {vid}:{pid}"));
+        out.push(UsbDevice {
+            id: format!("usb:{vid}:{pid}"),
+            name,
+            vendor_id: vid,
+            product_id: pid,
+            manufacturer: s(&v, "Manufacturer"),
+            class: None,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+/// `USB\VID_046D&PID_C52B\...` → (`046d`, `c52b`).
+fn parse_usb_id(device_id: &str) -> Option<(String, String)> {
+    let up = device_id.to_uppercase();
+    let vid = up.split("VID_").nth(1)?.get(..4)?.to_lowercase();
+    let pid = up.split("PID_").nth(1)?.get(..4)?.to_lowercase();
+    (vid.chars().all(|c| c.is_ascii_hexdigit()) && pid.chars().all(|c| c.is_ascii_hexdigit()))
+        .then_some((vid, pid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_usb_device_id() {
+        assert_eq!(
+            parse_usb_id("USB\\VID_046D&PID_C52B\\5&1234"),
+            Some(("046d".into(), "c52b".into()))
+        );
+        assert_eq!(parse_usb_id("HID\\nope"), None);
+    }
+
+    #[test]
+    fn normalises_single_and_array_rows() {
+        assert_eq!(as_rows(serde_json::json!({"Name": "a"})).len(), 1);
+        assert_eq!(
+            as_rows(serde_json::json!([{"Name": "a"}, {"Name": "b"}])).len(),
+            2
+        );
+        assert_eq!(as_rows(serde_json::Value::Null).len(), 0);
+    }
 }

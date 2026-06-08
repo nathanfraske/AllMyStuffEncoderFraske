@@ -14,7 +14,11 @@ pub fn host_info() -> HostInfo {
 
     #[cfg(target_os = "linux")]
     let (board, soc) = (crate::linux::board_label(), crate::linux::soc_label());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let (board, soc) = (crate::macos::board_label(), crate::macos::soc_label());
+    #[cfg(target_os = "windows")]
+    let (board, soc) = (crate::windows::board_label(), crate::windows::soc_label());
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let (board, soc) = (None, None);
 
     HostInfo {
