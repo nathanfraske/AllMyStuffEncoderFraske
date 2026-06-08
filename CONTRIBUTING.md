@@ -4,12 +4,29 @@ Everything you need to build, run, and hack on AllMyStuff. For *what it is
 and why*, see the [README](README.md); for *how it fits together*, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Quick start
+
+```sh
+just setup     # one-time: WebKit/GTK/ALSA libs, Rust, Node, pnpm, GUI deps
+just dev       # run the desktop app with hot reload
+```
+
+`just dev` opens the app on a populated demo graph, so you get the full UI
+with no mesh running. For live peers + audio streaming, also run
+`just mesh-install` once (see [Live mesh](#live-mesh-real-peers--streaming)).
+
+Install [`just`](https://github.com/casey/just) first (`cargo install just`,
+`brew install just`, `winget install Casey.Just`, or your package manager).
+Everything below also runs as plain `cargo` / `pnpm` if you'd rather skip it.
+
 ## Prerequisites
 
-- **Rust** (stable) — `rustup` recommended; the toolchain is pinned in
-  `rust-toolchain.toml`.
+`just setup` installs these for you (via `scripts/bootstrap.{sh,ps1}`):
+
+- **Rust** (stable) — toolchain pinned in `rust-toolchain.toml`.
 - **Node 22 + pnpm 10** — for the desktop front-end.
-- **[`just`](https://github.com/casey/just)** (optional) — the task runner.
+- **Tauri + audio libs** — WebKitGTK/GTK + ALSA on Linux; Xcode CLT on
+  macOS; WebView2 + MSVC Build Tools on Windows.
 
 ## The library workspace
 
@@ -57,33 +74,39 @@ inventory of the machine this was built on:
 ## The desktop app
 
 ```sh
-cd gui
-pnpm install
-pnpm check          # svelte-check (types)
-pnpm build          # vite production build (no webview needed)
-pnpm tauri dev      # the full app
-pnpm tauri build    # a .deb / .AppImage / .dmg / .msi bundle
+just dev         # hot-reload dev (pnpm install + pnpm tauri dev)
+just gui-build   # build a .deb / .AppImage / .dmg / .msi bundle
+just gui-check   # svelte-check + vite build (front-end only, no webview)
 ```
 
-The front-end builds anywhere. The **Tauri backend links the system
-webview and the audio stack**, so building the desktop app needs:
+The front-end builds anywhere; the **Tauri backend links the system webview
+and the audio stack** — `just setup` installs those deps:
 
-| Platform | Deps |
+| Platform | Deps (installed by `just setup`) |
 |---|---|
 | Linux | `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`, `libasound2-dev` |
 | macOS | Xcode command-line tools (WKWebView + CoreAudio are built in) |
-| Windows | WebView2 + the MSVC toolchain (both standard) |
+| Windows | WebView2 + the MSVC toolchain |
 
-The app opens straight into a populated **demo graph** even with no
-backend, so the whole experience — clicking nodes, drawing connections, the
-share sheet, groups — works offline (`pnpm dev` in a browser too).
+The app opens straight into a populated **demo graph** even with no mesh, so
+the whole experience — clicking nodes, drawing connections, the share sheet,
+groups — works offline (a plain `cd gui && pnpm dev` in a browser too).
 
 ### Live mesh (real peers + streaming)
 
-For two machines to see each other and stream, both need a running
-`myownmesh serve` daemon, joined to the **same** network (set that up with
-[MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh); AllMyStuff uses the
-first network it finds). Then:
+Live peers + streaming ride on a `myownmesh serve` daemon. Get one with:
+
+```sh
+just mesh-install   # installs the daemon pinned in .myownmesh-rev onto PATH
+```
+
+(or check out [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) next to this
+repo and `cargo build` it — the app auto-finds a sibling `../MyOwnMesh`
+build, or anything on PATH / `MYOWNMESH_BIN`). `just dev` then auto-spawns
+the daemon; `just serve` runs it in the foreground with debug logging.
+
+For two machines to see each other, both need the daemon joined to the
+**same** network (AllMyStuff uses the first network it finds). Then:
 
 - presence makes each machine appear on the other's graph,
 - connecting an audio capability (e.g. a mic → another machine's speakers)

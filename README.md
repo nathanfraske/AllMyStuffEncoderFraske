@@ -151,9 +151,16 @@ connections, the share sheet, groups — offline. A bare `allmystuff` opens
 it; the subcommands (`scan`, `capabilities`, `update`) are for headless
 boxes and scripts.
 
-Build instructions, the full CLI reference, the desktop-app dependencies,
-the live-mesh setup, and **how to help test on macOS / Windows / Pi** all
-live in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+From a source checkout it's two commands:
+
+```sh
+just setup    # one-time: build deps, Rust, Node, pnpm, GUI deps
+just dev      # run the app with hot reload
+```
+
+The full CLI reference, the desktop-app dependencies, the live-mesh setup,
+and **how to help test on macOS / Windows / Pi** all live in
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## Status
 
