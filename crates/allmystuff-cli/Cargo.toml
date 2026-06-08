@@ -19,4 +19,6 @@ unsafe_code = "forbid"
 allmystuff-inventory = { workspace = true }
 allmystuff-graph = { workspace = true }
 allmystuff-bridge = { workspace = true }
+allmystuff-updater = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }

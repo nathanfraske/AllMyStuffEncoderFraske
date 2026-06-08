@@ -1,0 +1,19 @@
+[package]
+name = "allmystuff-session"
+description = "The live mesh session for AllMyStuff: peer presence, the route offer/accept/teardown handshake, and the audio frame carried over a route."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+allmystuff-graph = { workspace = true }
+allmystuff-protocol = { workspace = true }

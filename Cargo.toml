@@ -5,6 +5,8 @@ members = [
     "crates/allmystuff-graph",
     "crates/allmystuff-protocol",
     "crates/allmystuff-bridge",
+    "crates/allmystuff-session",
+    "crates/allmystuff-updater",
     "crates/allmystuff-cli",
 ]
 # The Tauri desktop app lives in its own Cargo workspace (`gui/src-tauri`)
@@ -28,6 +30,8 @@ allmystuff-inventory = { path = "crates/allmystuff-inventory", version = "0.1.0"
 allmystuff-graph = { path = "crates/allmystuff-graph", version = "0.1.0" }
 allmystuff-protocol = { path = "crates/allmystuff-protocol", version = "0.1.0" }
 allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.1.0" }
+allmystuff-session = { path = "crates/allmystuff-session", version = "0.1.0" }
+allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +39,25 @@ thiserror = "1"
 # Cross-platform host basics (CPU / memory / disks / networks / uptime).
 # Pinned to the 0.38 line — 0.39 wants Rust 1.95 and we target 1.88.
 sysinfo = "0.38"
+
+# Async runtime + HTTP, used by the self-updater (and the mesh session).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Crypto / encoding / archives for the updater.
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+dirs = "5"
+
+# Compact transport encoding for audio frames over the mesh channel.
+base64 = "0.22"
+
+# Test-only.
+tempfile = "3"
 
 [profile.release]
 # Match the MyOwnMesh release profile: small, fast-starting binaries that
