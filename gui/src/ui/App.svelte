@@ -31,13 +31,13 @@
     <div class="summary">
       <span class="chip"><b>{app.mineCount}</b> yours</span>
       <span class="chip"><b>{app.sharedCount}</b> shared</span>
-      <span class="chip net" class:live={app.backendConnected}>
+      <span class="chip net" class:live={app.backendConnected && !!app.activeNetwork}>
         <span class="net-dot"></span>
-        {app.backendConnected
-          ? app.activeNetwork
+        {!app.backendConnected
+          ? "demo mode"
+          : app.activeNetwork
             ? networkDisplayName(app.activeNetwork)
-            : "mesh connected"
-          : "demo mode"}
+            : "no network"}
       </span>
     </div>
 

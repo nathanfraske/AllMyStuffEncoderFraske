@@ -112,7 +112,13 @@ export const meshIdentity = () => invokeReq<IdentityInfo>("mesh_identity");
 export const meshIdentitySetLabel = (label: string) =>
   invokeReq<unknown>("mesh_identity_set_label", { label });
 
-export const meshNetworks = () => invokeReq<NetworkSummary[]>("mesh_networks");
+// The daemon wraps these lists in an object (`{ networks }`, `{ peers }`,
+// `{ roster }`) — matching MyOwnMesh's client, we unwrap to the inner array
+// and never hand a non-array back (a non-array would crash the graph).
+export async function meshNetworks(): Promise<NetworkSummary[]> {
+  const r = await invokeReq<{ networks?: NetworkSummary[] }>("mesh_networks");
+  return Array.isArray(r?.networks) ? r.networks : [];
+}
 
 export async function meshNetworkIdGenerate(): Promise<string> {
   const r = await invokeReq<{ network_id: string }>("mesh_network_id_generate");
@@ -125,8 +131,10 @@ export const meshNetworkAdd = (config: unknown) =>
 export const meshNetworkRemove = (network: string) =>
   invokeReq<unknown>("mesh_network_remove", { network });
 
-export const meshRosterList = (network: string) =>
-  invokeReq<RosterPeer[]>("mesh_roster_list", { network });
+export async function meshRosterList(network: string): Promise<RosterPeer[]> {
+  const r = await invokeReq<{ roster?: RosterPeer[] }>("mesh_roster_list", { network });
+  return Array.isArray(r?.roster) ? r.roster : [];
+}
 
 export const meshRosterApprove = (network: string, deviceId: string, label?: string) =>
   invokeReq<unknown>("mesh_roster_approve", { network, deviceId, label });
@@ -134,7 +142,10 @@ export const meshRosterApprove = (network: string, deviceId: string, label?: str
 export const meshRosterRemove = (network: string, deviceId: string) =>
   invokeReq<unknown>("mesh_roster_remove", { network, deviceId });
 
-export const meshPeers = (network: string) => invokeReq<PeerInfo[]>("mesh_peers", { network });
+export async function meshPeers(network: string): Promise<PeerInfo[]> {
+  const r = await invokeReq<{ peers?: PeerInfo[] }>("mesh_peers", { network });
+  return Array.isArray(r?.peers) ? r.peers : [];
+}
 
 const DEFAULT_STUN = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
 

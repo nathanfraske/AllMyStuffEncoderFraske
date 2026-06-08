@@ -137,12 +137,19 @@ class AppStore {
   mineCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "mine").length);
   sharedCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "shared").length);
 
-  /** The network the live session is on (or the first one configured). */
-  activeNetwork = $derived(
-    this.networks.find((n) => n.config_id === this.sessionNetwork) ?? this.networks[0] ?? null,
-  );
+  /** The network the live session is on (or the first one configured).
+   *  Guarded against a non-array `networks` — this derived renders in the top
+   *  bar every frame, so a bad backend shape here would wedge the whole UI. */
+  activeNetwork = $derived.by(() => {
+    const nets = Array.isArray(this.networks) ? this.networks : [];
+    return nets.find((n) => n.config_id === this.sessionNetwork) ?? nets[0] ?? null;
+  });
   /** Devices waiting to be let onto the roster network. */
-  pendingPeers = $derived(this.livePeers.filter((p) => p.status === "pending_approval"));
+  pendingPeers = $derived(
+    (Array.isArray(this.livePeers) ? this.livePeers : []).filter(
+      (p) => p.status === "pending_approval",
+    ),
+  );
 
   capsOf(nodeId: string): Capability[] {
     return this.catalog.capabilities.filter((c) => c.node === nodeId);
