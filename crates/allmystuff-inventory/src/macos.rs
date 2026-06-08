@@ -249,8 +249,8 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
     let s = s.split('@').next().unwrap_or(s);
     let (w, h) = s.split_once(['x', 'X'])?;
     Some((
-        w.trim().replace(' ', "").parse().ok()?,
-        h.trim().split_whitespace().next()?.parse().ok()?,
+        w.replace(' ', "").parse().ok()?,
+        h.split_whitespace().next()?.parse().ok()?,
     ))
 }
 

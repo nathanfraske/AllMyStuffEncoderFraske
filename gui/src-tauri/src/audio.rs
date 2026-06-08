@@ -160,49 +160,40 @@ where
     let channels = supported.channels();
     let config: cpal::StreamConfig = supported.config();
     let fmt = supported.sample_format();
-    let cb = Arc::new(on_frame);
     let err = |e| tracing::warn!("input stream error: {e}");
 
+    // `on_frame` is moved into whichever arm runs (match arms are mutually
+    // exclusive, so a single move per arm is fine). `Fn` is callable
+    // directly — no `Arc` wrapper.
     let stream = match fmt {
-        cpal::SampleFormat::F32 => {
-            let cb = cb.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[f32], _: &_| {
-                    let pcm: Vec<i16> = downmix(
-                        &data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(),
-                        channels,
-                    );
-                    cb(pcm, sample_rate);
-                },
-                err,
-                None,
-            )
-        }
-        cpal::SampleFormat::I16 => {
-            let cb = cb.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[i16], _: &_| cb(downmix(data, channels), sample_rate),
-                err,
-                None,
-            )
-        }
-        cpal::SampleFormat::U16 => {
-            let cb = cb.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[u16], _: &_| {
-                    let pcm: Vec<i16> = downmix(
-                        &data.iter().map(|&u| (u as i32 - 32768) as i16).collect::<Vec<_>>(),
-                        channels,
-                    );
-                    cb(pcm, sample_rate);
-                },
-                err,
-                None,
-            )
-        }
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |data: &[f32], _: &_| {
+                let pcm: Vec<i16> =
+                    downmix(&data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(), channels);
+                on_frame(pcm, sample_rate);
+            },
+            err,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |data: &[i16], _: &_| on_frame(downmix(data, channels), sample_rate),
+            err,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config,
+            move |data: &[u16], _: &_| {
+                let pcm: Vec<i16> = downmix(
+                    &data.iter().map(|&u| (u as i32 - 32768) as i16).collect::<Vec<_>>(),
+                    channels,
+                );
+                on_frame(pcm, sample_rate);
+            },
+            err,
+            None,
+        ),
         other => return Err(format!("unsupported input sample format: {other:?}")),
     }
     .map_err(|e| e.to_string())?;
@@ -234,9 +225,9 @@ fn run_playback(
     // the ring and write the same sample to every channel.
     macro_rules! fill {
         ($data:expr, $conv:expr) => {{
-            let mut ring = ring.lock();
+            let mut guard = ring.lock();
             for frame in $data.chunks_mut(channels) {
-                let s = ring.pop_front().unwrap_or(0);
+                let s = guard.pop_front().unwrap_or(0);
                 for slot in frame.iter_mut() {
                     *slot = $conv(s);
                 }

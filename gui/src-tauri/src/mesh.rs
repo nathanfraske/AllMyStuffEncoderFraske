@@ -67,7 +67,7 @@ impl Mesh {
         // Forwarder: drain captured frames out to peers on the media channel.
         {
             let mesh = mesh.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 while let Some((peer, frame)) = audio_rx.recv().await {
                     let Some(network) = mesh.network() else { continue };
                     let payload = match serde_json::to_value(&frame) {
@@ -145,7 +145,7 @@ impl Mesh {
         // Periodic presence re-broadcast so late joiners see us.
         {
             let mesh = self.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
                 loop {
                     tick.tick().await;
@@ -156,7 +156,7 @@ impl Mesh {
 
         // Event loop.
         let mesh = self.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             while let Some(value) = rx.recv().await {
                 mesh.handle_value(value).await;
             }
@@ -260,7 +260,7 @@ impl Mesh {
             }
             CHANNEL_MEDIA => {
                 if let Ok(frame) = serde_json::from_value::<AudioFrame>(payload) {
-                    self.audio.feed(&frame.route.clone(), &frame);
+                    self.audio.feed(&frame.route, &frame);
                 }
             }
             _ => {}
@@ -273,8 +273,8 @@ impl Mesh {
         let media = parse_media(&media);
         let route = Route {
             id: format!("route:{from}→{to}"),
-            from: from.clone(),
-            to: to.clone(),
+            from: from.clone().into(),
+            to: to.clone().into(),
             media,
             group: None,
         };
@@ -329,12 +329,16 @@ impl Mesh {
         let Some(session) = st.session.as_ref() else {
             return json!({ "ready": false });
         };
+        let me = session.me().to_string();
+        let network = st.network.clone();
+        let peers: Vec<_> = session.peers().collect();
+        let routes: Vec<_> = session.routes().collect();
         json!({
             "ready": true,
-            "me": session.me().to_string(),
-            "network": st.network,
-            "peers": session.peers().collect::<Vec<_>>(),
-            "routes": session.routes().collect::<Vec<_>>(),
+            "me": me,
+            "network": network,
+            "peers": peers,
+            "routes": routes,
         })
     }
 
@@ -371,8 +375,8 @@ impl Mesh {
             return;
         }
         let Some(me) = self.local_node_id() else { return };
-        let from_node = node_of(&route.from);
-        let to_node = node_of(&route.to);
+        let from_node = node_of(route.from.as_str());
+        let to_node = node_of(route.to.as_str());
 
         // We source: capture the default mic and stream to the sink node.
         if from_node == me {
