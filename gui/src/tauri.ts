@@ -7,6 +7,8 @@ import type { Capability, InventorySummary, MediaKind } from "./types";
 
 interface ScanResult {
   node_id: string;
+  /** This machine's hostname — the local node's label on the graph. */
+  label?: string;
   summary: InventorySummary;
   capabilities: Capability[];
 }
