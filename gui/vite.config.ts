@@ -9,6 +9,13 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
+  // Force the browser export of `svelte` so `mount()` resolves to the
+  // client build rather than the SSR stub (which throws
+  // `lifecycle_function_unavailable` and leaves the WebView blank). Matches
+  // the MyOwnMesh / MyOwnLLM GUI setup.
+  resolve: {
+    conditions: ["browser", "module", "import", "default"],
+  },
   server: {
     port: 1430,
     strictPort: true,
