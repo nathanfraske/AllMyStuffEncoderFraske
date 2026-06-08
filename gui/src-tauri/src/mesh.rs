@@ -111,9 +111,12 @@ impl Mesh {
             }
         };
 
-        // Identity → our node id + presence profile.
+        // Identity → our node id + presence profile. The label is the
+        // user's optional override; `build_profile` falls back to the
+        // hostname when it's unset.
         let me = self.fetch_identity().await.unwrap_or_else(|| NodeId::this().to_string());
-        let profile = self.build_profile(&me);
+        let label = self.fetch_identity_label().await;
+        let profile = self.build_profile(&me, label);
         // Active network: the first one the daemon has joined.
         let network = self.fetch_first_network().await;
 
@@ -172,6 +175,34 @@ impl Mesh {
             .map(str::to_string)
     }
 
+    /// The user's optional display-name override from the daemon identity.
+    /// `None` (or empty) means "use the hostname".
+    async fn fetch_identity_label(&self) -> Option<String> {
+        let resp = self.client.request(&Request::IdentityShow).await.ok()?;
+        resp.data?
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Update this node's display label (the identity override) on the live
+    /// presence profile and re-broadcast so peers pick it up. An empty label
+    /// resets the display to the machine hostname.
+    pub async fn set_label(self: &Arc<Self>, label: String) {
+        {
+            let mut st = self.state.lock();
+            if let Some(p) = st.profile.as_mut() {
+                p.label = if label.trim().is_empty() {
+                    p.hostname.clone()
+                } else {
+                    label
+                };
+            }
+        }
+        self.broadcast_presence().await;
+    }
+
     async fn fetch_first_network(&self) -> Option<String> {
         let resp = self.client.request(&Request::NetworksList).await.ok()?;
         let arr = resp.data?;
@@ -180,13 +211,19 @@ impl Mesh {
             .find_map(|n| n.get("config_id").and_then(|v| v.as_str()).map(str::to_string))
     }
 
-    fn build_profile(&self, me: &str) -> NodeProfile {
+    fn build_profile(&self, me: &str, label_override: Option<String>) -> NodeProfile {
         let inv = allmystuff_inventory::scan();
         let node = NodeId::from(me);
+        let hostname = inv.host.hostname.clone();
+        // Display name = override if the user set one, else the hostname.
+        let label = label_override
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| hostname.clone());
         NodeProfile {
             protocol: PROTOCOL_VERSION,
             node: node.clone(),
-            label: inv.host.hostname.clone(),
+            label,
+            hostname,
             summary: allmystuff_bridge::node_summary(&inv),
             capabilities: allmystuff_bridge::capabilities_from_inventory(&inv, &node),
         }

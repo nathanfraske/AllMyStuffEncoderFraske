@@ -2,6 +2,7 @@
   import { app } from "../store.svelte";
   import {
     MEDIA,
+    displayName,
     originIcon,
     flowWord,
     humanBytes,
@@ -93,11 +94,11 @@
 </script>
 
 {#if node}
-  <aside class="drawer" aria-label="{node.label} details">
+  <aside class="drawer" aria-label="{displayName(node)} details">
     <header class="head">
       <span class="avatar">{shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span>
       <div class="title">
-        <div class="name">{node.label}</div>
+        <div class="name">{displayName(node)}</div>
         <div class="kindline">
           {#if node.kind === "this"}this device · {/if}
           {#if shared && node.relationship.kind === "shared"}

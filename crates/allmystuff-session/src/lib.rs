@@ -283,6 +283,7 @@ mod tests {
             protocol: allmystuff_protocol::PROTOCOL_VERSION,
             node: node.into(),
             label: node.into(),
+            hostname: node.into(),
             summary: InventorySummary {
                 os: "linux".into(),
                 cpu: "cpu".into(),

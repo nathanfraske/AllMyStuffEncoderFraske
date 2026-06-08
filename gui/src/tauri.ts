@@ -3,12 +3,22 @@
 // browser, this repo's CI build — so the graph is always interactive even
 // without the Rust side or a running `myownmesh` daemon.
 
-import type { Capability, InventorySummary, MediaKind } from "./types";
+import type {
+  Capability,
+  IdentityInfo,
+  InventorySummary,
+  MediaKind,
+  NetworkSummary,
+  PeerInfo,
+  RosterPeer,
+} from "./types";
 
 interface ScanResult {
   node_id: string;
-  /** This machine's hostname — the local node's label on the graph. */
+  /** This machine's display name (hostname unless overridden). */
   label?: string;
+  /** This machine's real hostname. */
+  hostname?: string;
   summary: InventorySummary;
   capabilities: Capability[];
 }
@@ -23,6 +33,7 @@ export interface SessionSnapshot {
   peers?: Array<{
     node: string;
     label: string;
+    hostname?: string;
     summary: InventorySummary;
     capabilities: Capability[];
   }>;
@@ -81,4 +92,70 @@ export async function onSubscription(cb: (s: { status: string }) => void): Promi
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<{ status: string }>("allmystuff://subscription", (e) => cb(e.payload));
+}
+
+// ---- networks · identity · roster -------------------------------------
+//
+// Unlike the graph commands above (which degrade to null in web mode), these
+// require a real daemon — the Networks panel only renders under Tauri. They
+// throw on error so the UI can surface "couldn't create network", etc.
+
+async function invokeReq<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauri()) throw new Error("Networks need the desktop app (no backend in the browser).");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke(cmd, args)) as T;
+}
+
+export const meshIdentity = () => invokeReq<IdentityInfo>("mesh_identity");
+
+/** Set this device's display-name override (empty resets to the hostname). */
+export const meshIdentitySetLabel = (label: string) =>
+  invokeReq<unknown>("mesh_identity_set_label", { label });
+
+export const meshNetworks = () => invokeReq<NetworkSummary[]>("mesh_networks");
+
+export async function meshNetworkIdGenerate(): Promise<string> {
+  const r = await invokeReq<{ network_id: string }>("mesh_network_id_generate");
+  return r.network_id;
+}
+
+export const meshNetworkAdd = (config: unknown) =>
+  invokeReq<unknown>("mesh_network_add", { config });
+
+export const meshNetworkRemove = (network: string) =>
+  invokeReq<unknown>("mesh_network_remove", { network });
+
+export const meshRosterList = (network: string) =>
+  invokeReq<RosterPeer[]>("mesh_roster_list", { network });
+
+export const meshRosterApprove = (network: string, deviceId: string, label?: string) =>
+  invokeReq<unknown>("mesh_roster_approve", { network, deviceId, label });
+
+export const meshRosterRemove = (network: string, deviceId: string) =>
+  invokeReq<unknown>("mesh_roster_remove", { network, deviceId });
+
+export const meshPeers = (network: string) => invokeReq<PeerInfo[]>("mesh_peers", { network });
+
+const DEFAULT_STUN = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
+
+function newNetworkInternalId(): string {
+  return `net_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+}
+
+/** Build the NetworkConfig payload `mesh_network_add` expects from the bits
+ *  the UI collects. The daemon fills topology/signaling defaults (empty
+ *  signaling → its built-in relays), so we only set id, network_id, an
+ *  optional label, sensible STUN servers, and the auto-approve toggle. */
+export function buildNetworkConfig(args: {
+  networkId: string;
+  label?: string;
+  autoApprove?: boolean;
+}): Record<string, unknown> {
+  return {
+    id: newNetworkInternalId(),
+    network_id: args.networkId,
+    label: args.label?.trim() || undefined,
+    stun_servers: DEFAULT_STUN.map((u) => ({ urls: [u] })),
+    auto_approve: args.autoApprove ?? false,
+  };
 }

@@ -52,6 +52,10 @@ export interface InventorySummary {
 export interface MeshNode {
   id: string;
   label: string;
+  /** The node's real machine hostname (from its scan / presence advert).
+   *  When `label` is a user override that differs from this, the UI shows
+   *  "label (hostname)" so the true machine is always visible. */
+  hostname?: string;
   kind: NodeKind;
   relationship: Relationship;
   online: boolean;
@@ -83,7 +87,120 @@ export interface Catalog {
   groups: Group[];
 }
 
+// ---- networks · identity · roster (mirror the daemon control shapes) --
+
+/** This device's mesh identity (from `mesh_identity`). `label` is the
+ *  user's display-name override; empty means "use the hostname". */
+export interface IdentityInfo {
+  device_id: string;
+  pubkey?: string;
+  label: string;
+}
+
+/** A network the daemon knows about (from `mesh_networks`). `config_id` is
+ *  the stable local key for control ops; `network_id` is the shareable
+ *  handle peers join with; `label` is an optional cosmetic name. */
+export interface NetworkSummary {
+  config_id: string;
+  network_id: string;
+  label: string;
+  phase?: string;
+}
+
+/** Friendly name for a network: cosmetic label, else the joinable id, else
+ *  the internal config id. */
+export function networkDisplayName(n: {
+  label?: string;
+  network_id?: string;
+  config_id?: string;
+}): string {
+  return n.label?.trim() || n.network_id?.trim() || n.config_id || "";
+}
+
+/** An approved member of a network's roster (from `mesh_roster_list`). */
+export interface RosterPeer {
+  device_id: string;
+  label: string;
+  approved_at?: number;
+}
+
+/** A live peer on a network (from `mesh_peers`). We only surface the bits the
+ *  approvals UI needs; `status === "pending_approval"` is the one to act on. */
+export interface PeerInfo {
+  device_id: string;
+  label: string;
+  status: string;
+  device_suffix?: string;
+  verification_code_received?: string | null;
+  verification_code_sent?: string | null;
+}
+
+// ---- bundles (pre-set kits with category slots) -----------------------
+
+/** One slot in a bundle template — a category of local device to include.
+ *  `flow` is the local device's direction: a `source` feeds the target, a
+ *  `sink` is fed by it (so "Screen" is a display sink — your monitor shows
+ *  the remote machine; "Keyboard & mouse" is an input source). */
+export interface BundleSlot {
+  id: string;
+  label: string;
+  media: MediaKind;
+  flow: Flow;
+}
+
+export interface BundleTemplate {
+  id: string;
+  name: string;
+  icon: string;
+  blurb: string;
+  slots: BundleSlot[];
+}
+
+/** Ready-made kits you fill from this machine's devices and point at another
+ *  machine as one unit — no hand-building. */
+export const BUNDLE_TEMPLATES: BundleTemplate[] = [
+  {
+    id: "desk",
+    name: "My desk",
+    icon: "🖥️",
+    blurb: "Screen, keyboard & mouse, mic and speakers — turn another machine into your desk.",
+    slots: [
+      { id: "screen", label: "Screen", media: "display", flow: "sink" },
+      { id: "keyboard", label: "Keyboard & mouse", media: "input", flow: "source" },
+      { id: "mic", label: "Microphone", media: "audio", flow: "source" },
+      { id: "speakers", label: "Speakers", media: "audio", flow: "sink" },
+    ],
+  },
+  {
+    id: "callkit",
+    name: "Call kit",
+    icon: "🎥",
+    blurb: "Camera, mic and speakers — send your A/V to another machine.",
+    slots: [
+      { id: "camera", label: "Camera", media: "video", flow: "source" },
+      { id: "mic", label: "Microphone", media: "audio", flow: "source" },
+      { id: "speakers", label: "Speakers", media: "audio", flow: "sink" },
+    ],
+  },
+  {
+    id: "listen",
+    name: "Listening room",
+    icon: "🔊",
+    blurb: "Send this machine's audio to another's speakers.",
+    slots: [{ id: "audio", label: "System audio", media: "audio", flow: "source" }],
+  },
+];
+
 // ---- visual helpers ---------------------------------------------------
+
+/** How a node's name reads on screen: the chosen name, with the real machine
+ *  hostname in parens when the name is an override. Implements the naming
+ *  rule — default is the hostname; an override shows as "Override (hostname)". */
+export function displayName(n: { label: string; hostname?: string }): string {
+  const host = n.hostname?.trim();
+  if (host && host !== n.label) return `${n.label} (${host})`;
+  return n.label;
+}
 
 export const MEDIA: Record<MediaKind, { label: string; color: string; icon: string }> = {
   audio: { label: "Audio", color: "var(--m-audio)", icon: "🎙" },
