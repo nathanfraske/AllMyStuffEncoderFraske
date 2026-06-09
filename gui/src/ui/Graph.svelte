@@ -215,11 +215,13 @@
     {#each layout as p (p.node.id)}
       {@const n = p.node}
       {@const shared = n.relationship.kind === "shared"}
+      {@const unclaimed = n.relationship.kind === "unclaimed"}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
         class:self={n.kind === "this"}
         class:shared
+        class:unclaimed
         class:selected={app.selectedNodeId === n.id}
         class:armed
         class:offline={!n.online}
@@ -256,7 +258,9 @@
         </div>
         <div class="node-meta">
           {#if n.kind === "this"}<span class="tag you">this device</span>{/if}
-          {#if shared}<span class="tag guest">guest</span>{:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
+          {#if shared}<span class="tag guest">guest</span>
+          {:else if unclaimed}<span class="tag unclaimed">unclaimed</span>
+          {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
@@ -360,6 +364,10 @@
     border-color: #f0c27a;
     background: linear-gradient(180deg, #fffaf0, #ffffff);
   }
+  .node.unclaimed {
+    border-style: dashed;
+    border-color: var(--line-strong);
+  }
   .node.selected {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
@@ -443,6 +451,11 @@
   .tag.guest {
     background: #fdedd2;
     color: #97631a;
+  }
+  .tag.unclaimed {
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    border: 1px dashed var(--line-strong);
   }
   .empty {
     position: absolute;

@@ -35,11 +35,14 @@ export interface Share {
   grants: Grant[];
 }
 
-// Relationship is internally tagged on `kind` (matches the Rust
-// `#[serde(tag = "kind")]`). `mine` = a device you own or manage; `shared`
-// = someone you're connecting with for specific purposes.
+// Relationship is internally tagged on `kind`. `mine` = a device you own or
+// manage; `shared` = someone you're connecting with for specific purposes;
+// `unclaimed` = on your mesh but not yet classified (a GUI-only state for
+// freshly-discovered peers — you claim it as mine or mark it shared). The
+// Rust model only knows `mine`/`shared`; `unclaimed` never crosses the wire.
 export type Relationship =
   | { kind: "mine" }
+  | { kind: "unclaimed" }
   | ({ kind: "shared" } & Share);
 
 export interface InventorySummary {

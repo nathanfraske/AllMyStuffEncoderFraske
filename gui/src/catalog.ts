@@ -114,6 +114,14 @@ export function proposeRoute(cat: Catalog, from: string, to: string): ConnectRes
   const dst = capability(cat, to);
   if (!src) return { ok: false, reason: `Unknown capability: ${from}` };
   if (!dst) return { ok: false, reason: `Unknown capability: ${to}` };
+  // An unclaimed device is on the mesh but not yet yours — claim it (or mark
+  // it shared) before anything can route to or from it.
+  const srcNode = cat.nodes.find((n) => n.id === src.node);
+  const dstNode = cat.nodes.find((n) => n.id === dst.node);
+  if (srcNode?.relationship.kind === "unclaimed")
+    return { ok: false, reason: `${srcNode.label} isn't yours yet — claim it first.` };
+  if (dstNode?.relationship.kind === "unclaimed")
+    return { ok: false, reason: `${dstNode.label} isn't yours yet — claim it first.` };
   if (!canSource(src.flow))
     return { ok: false, reason: `${src.label} can't send — it only receives.` };
   if (!canSink(dst.flow))

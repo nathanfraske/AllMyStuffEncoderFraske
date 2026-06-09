@@ -209,14 +209,10 @@ class AppStore {
    *  when a peer also runs AllMyStuff. Mirrors how MyOwnMesh builds its map. */
   async syncMeshGraph() {
     if (!isTauri()) return;
-    const known = new Map<string, { label: string; online: boolean }>();
-    const note = (id: string, label: string | undefined, online: boolean) => {
-      if (!id) return;
-      const e = known.get(id) ?? { label: label?.trim() || shortId(id), online: false };
-      if (label?.trim()) e.label = label.trim();
-      if (online) e.online = true;
-      known.set(id, e);
-    };
+    // Live peers are keyed by the full device id (`{pubkey}-{suffix}`) — the
+    // same id presence + capabilities use, so they merge into one node.
+    const live = new Map<string, { label: string; online: boolean }>();
+    const rosterAll: RosterPeer[] = [];
     const nets = Array.isArray(this.networks) ? this.networks : [];
     for (const net of nets) {
       let peers: PeerInfo[] = [];
@@ -231,13 +227,28 @@ class AppStore {
       } catch {
         /* roster optional */
       }
-      for (const r of roster) note(r.device_id, r.label, false);
       for (const p of peers) {
         if (p.status === "pending_approval") continue; // shown under approvals
-        note(p.device_id, p.label, p.status === "active");
+        const e = live.get(p.device_id) ?? { label: p.label?.trim() || shortId(p.device_id), online: false };
+        if (p.label?.trim()) e.label = p.label.trim();
+        if (p.status === "active") e.online = true;
+        live.set(p.device_id, e);
       }
+      rosterAll.push(...roster);
     }
-    // Upsert a node per known device (never the local machine).
+    // The roster stores the bare pubkey; a live peer's id is `{pubkey}-{suffix}`.
+    // Only surface a roster entry as its own offline node when no live peer
+    // already covers that pubkey — otherwise one machine would show twice.
+    const liveIds = [...live.keys()];
+    const known = new Map(live);
+    for (const r of rosterAll) {
+      const covered = liveIds.some((id) => id === r.device_id || id.startsWith(`${r.device_id}-`));
+      if (covered || known.has(r.device_id)) continue;
+      known.set(r.device_id, { label: r.label?.trim() || shortId(r.device_id), online: false });
+    }
+    // Upsert a node per known device (never the local machine). Discovered
+    // devices start *unclaimed* — they're on the mesh but not yet yours; you
+    // claim them (or mark them shared) from their drawer.
     for (const [id, info] of known) {
       if (id === this.localId) continue;
       const node = this.catalog.nodes.find((n) => n.id === id);
@@ -246,7 +257,7 @@ class AppStore {
           id,
           label: info.label,
           kind: "machine",
-          relationship: { kind: "mine" },
+          relationship: { kind: "unclaimed" },
           online: info.online,
         });
       } else {
@@ -318,14 +329,14 @@ class AppStore {
     for (const p of snap.peers ?? []) {
       let node = this.catalog.nodes.find((n) => n.id === p.node);
       if (!node) {
-        // A freshly-discovered peer defaults to "mine" (it's on your mesh);
-        // reclassify it as a guest from its drawer if it's someone else's.
+        // A freshly-discovered peer starts unclaimed — claim it as yours or
+        // mark it shared from its drawer.
         node = {
           id: p.node,
           label: p.label,
           hostname: p.hostname,
           kind: "machine",
-          relationship: { kind: "mine" },
+          relationship: { kind: "unclaimed" },
           online: true,
         };
         this.catalog.nodes.push(node);

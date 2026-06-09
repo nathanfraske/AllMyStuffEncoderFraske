@@ -103,6 +103,8 @@
           {#if node.kind === "this"}this device · {/if}
           {#if shared && node.relationship.kind === "shared"}
             <span class="pill guest">shared with {node.relationship.person.name}</span>
+          {:else if node.relationship.kind === "unclaimed"}
+            <span class="pill soft">unclaimed</span>
           {:else}
             <span class="pill mine">yours</span>
           {/if}
@@ -127,7 +129,16 @@
 
     <!-- Relationship / sharing -->
     <section class="block">
-      {#if shared && node.relationship.kind === "shared"}
+      {#if node.relationship.kind === "unclaimed"}
+        <p class="muted">
+          This device is on your mesh, but you haven't claimed it. Is it one of
+          yours, or someone you're sharing with?
+        </p>
+        <div class="claim">
+          <button class="btn small primary" onclick={makeMine}>This is mine</button>
+          <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
+        </div>
+      {:else if shared && node.relationship.kind === "shared"}
         <div class="block-head">
           <h4>What {node.relationship.person.name} can do</h4>
           <button class="btn small" onclick={() => (addingGrant = !addingGrant)}>
@@ -278,6 +289,16 @@
   .pill.guest {
     background: #fdedd2;
     color: #97631a;
+  }
+  .pill.soft {
+    background: var(--surface-2);
+    color: var(--ink-soft);
+  }
+  .claim {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.4rem;
   }
   .state {
     font-size: 0.7rem;
