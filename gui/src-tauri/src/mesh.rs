@@ -23,19 +23,23 @@ use tokio::sync::mpsc;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
-    ClientId, ControlMessage, NodeProfile, Request, RouteControl, CHANNEL_CONTROL, CHANNEL_MEDIA,
-    CHANNEL_PRESENCE, PROTOCOL_VERSION,
+    ClientId, ControlMessage, NodeProfile, OwnershipControl, Request, RouteControl, CHANNEL_CONTROL,
+    CHANNEL_MEDIA, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 use allmystuff_session::{AudioFrame, Effect, Session};
 
 use crate::audio::AudioBridge;
 use crate::control_client::ControlClient;
+use crate::ownership::Ownership;
 
 pub struct Mesh {
     client: Arc<ControlClient>,
     app: AppHandle,
     audio: Arc<AudioBridge>,
     state: Mutex<State>,
+    /// This device's persisted ownership record — who owns it and whether
+    /// it's currently offering itself for adoption (claim mode).
+    ownership: Arc<Ownership>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel.
     audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
@@ -66,6 +70,7 @@ impl Mesh {
                 client_id: None,
                 profile: None,
             }),
+            ownership: Arc::new(Ownership::load()),
             audio_out,
         });
 
@@ -260,6 +265,11 @@ impl Mesh {
             hostname,
             summary: allmystuff_bridge::node_summary(&inv),
             capabilities: allmystuff_bridge::capabilities_from_inventory(&inv, &node),
+            // Tell peers who owns this device and whether it's up for
+            // adoption, so they can't silently grab a box that's already
+            // spoken for (or one that was never put into claim mode).
+            owner: self.ownership.owner().map(NodeId::from),
+            claimable: self.ownership.claimable(),
         }
     }
 
@@ -432,8 +442,86 @@ impl Mesh {
                         json!({ "from": from.to_string(), "message": message }),
                     );
                 }
+                Effect::Ownership { from, message } => self.handle_ownership(from, message).await,
             }
         }
+    }
+
+    /// Apply an inbound ownership message. A [`OwnershipControl::Claim`] is
+    /// the load-bearing one: this device only lets the claim take if it's
+    /// actually claimable (in claim mode and unowned) — that's the rule that
+    /// stops a peer flat-out taking a box. The other variants are feedback
+    /// the claimer's UI surfaces.
+    async fn handle_ownership(self: &Arc<Self>, from: NodeId, message: OwnershipControl) {
+        match message {
+            OwnershipControl::Claim { owner } => {
+                // The owner of record is the *authenticated sender* the mesh
+                // delivered (`from`), never an arbitrary value in the body —
+                // otherwise a peer could claim a box "for" someone else. We
+                // accept the body only when it's self-asserted (owner == from).
+                let reply = if owner.as_str() != from.as_str() {
+                    OwnershipControl::Declined {
+                        reason: "a claim must be self-asserted".into(),
+                    }
+                } else if self.ownership.try_accept_claim(from.as_str()) {
+                    // The claim took — re-advertise with the new owner so the
+                    // claimer (and everyone) sees it's now spoken for.
+                    self.refresh_profile_ownership().await;
+                    OwnershipControl::Claimed { owner }
+                } else {
+                    OwnershipControl::Declined {
+                        reason: "this device isn't in claim mode".into(),
+                    }
+                };
+                self.send_control(&from.to_string(), &ControlMessage::Ownership(reply))
+                    .await;
+            }
+            OwnershipControl::Release => {
+                // The recorded owner is letting this device go.
+                if self.ownership.owner().as_deref() == Some(from.as_str()) {
+                    self.ownership.set_owner(None);
+                    self.refresh_profile_ownership().await;
+                }
+            }
+            other => {
+                // Claimed / Declined — feedback for the claimer's UI.
+                let _ = self.app.emit(
+                    "allmystuff://ownership",
+                    json!({ "from": from.to_string(), "message": other }),
+                );
+            }
+        }
+    }
+
+    /// Re-stamp the live presence profile's owner/claimable from the store
+    /// and broadcast, so an ownership change propagates immediately.
+    async fn refresh_profile_ownership(self: &Arc<Self>) {
+        {
+            let mut st = self.state.lock();
+            if let Some(p) = st.profile.as_mut() {
+                p.owner = self.ownership.owner().map(NodeId::from);
+                p.claimable = self.ownership.claimable();
+            }
+        }
+        self.broadcast_presence().await;
+        self.emit_snapshot();
+    }
+
+    /// Front-end command: claim `node` as owned by this device. Only the
+    /// target deciding it's claimable makes it stick; we just send intent.
+    pub async fn claim(self: &Arc<Self>, node: String) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
+        self.send_control(&node, &msg).await;
+        Ok(())
+    }
+
+    /// Front-end command: put *this* device into (or out of) claim mode, so
+    /// another of your machines can adopt it. Re-advertises immediately.
+    pub async fn set_claimable(self: &Arc<Self>, on: bool) -> Result<bool, String> {
+        self.ownership.set_claim_mode(on);
+        self.refresh_profile_ownership().await;
+        Ok(self.ownership.claimable())
     }
 
     /// Begin carrying media for a now-active route. Only audio is wired

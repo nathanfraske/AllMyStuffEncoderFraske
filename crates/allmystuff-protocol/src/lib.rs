@@ -21,7 +21,7 @@ pub mod control;
 
 // Re-export the most-used items at the crate root.
 pub use app::{
-    ControlMessage, InventorySummary, NodeProfile, RouteControl, ShareControl, APP_ID,
-    CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, PROTOCOL_VERSION,
+    ControlMessage, InventorySummary, NodeProfile, OwnershipControl, RouteControl, ShareControl,
+    APP_ID, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 pub use control::{ClientId, Request, Response, ServerOut};

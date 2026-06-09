@@ -15,6 +15,11 @@ export interface Capability {
   media: MediaKind;
   flow: Flow;
   origin: string;
+  /** `true` when this is the node's current default for its device category
+   *  (the mic it captures from, the screen it drives first…). The drawer
+   *  badges it and routing prefers it. Mirrors the Rust `Capability.default`;
+   *  optional so older presence without the field still decodes. */
+  default?: boolean;
 }
 
 export interface Person {
@@ -66,6 +71,24 @@ export interface MeshNode {
    *  or this machine's own scan). Not part of the Rust `MeshNode` — the GUI
    *  carries it alongside for display. */
   summary?: InventorySummary;
+  /** `true` once we've heard this node's AllMyStuff presence advert — i.e.
+   *  it's actually *running AllMyStuff*, not just a device on the mesh. A
+   *  node that's only known from the daemon's roster/peers (no app) has no
+   *  wireable capabilities, so the graph shows it but makes it un-targetable
+   *  and visually quieter. The local machine is always an app node. */
+  app?: boolean;
+  /** The node id that owns this device, from its presence advert. `owner`
+   *  equal to the local node means the device says *you* own it. */
+  owner?: string | null;
+  /** `true` when the device is in claim mode and unowned — it's offering
+   *  itself for adoption, the only state in which a claim takes. */
+  claimable?: boolean;
+}
+
+/** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
+ *  The local node and any node we've had presence from count as app nodes. */
+export function isAppNode(n: { kind?: NodeKind; app?: boolean }): boolean {
+  return n.kind === "this" || n.app === true;
 }
 
 export interface Route {

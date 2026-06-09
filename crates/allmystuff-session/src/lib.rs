@@ -24,7 +24,9 @@ mod audio;
 use std::collections::HashMap;
 
 use allmystuff_graph::{NodeId, Route};
-use allmystuff_protocol::{ControlMessage, NodeProfile, RouteControl, ShareControl};
+use allmystuff_protocol::{
+    ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
+};
 
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
@@ -86,6 +88,12 @@ pub enum Effect {
     StopMedia(String),
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
+    /// An ownership/claim message arrived; the backend applies it against
+    /// this device's ownership record (claim mode, recorded owner).
+    Ownership {
+        from: NodeId,
+        message: OwnershipControl,
+    },
 }
 
 /// The live session for this node.
@@ -207,6 +215,7 @@ impl Session {
         match message {
             ControlMessage::Route(rc) => self.handle_route(from, rc),
             ControlMessage::Share(sc) => vec![Effect::Share { from, message: sc }],
+            ControlMessage::Ownership(oc) => vec![Effect::Ownership { from, message: oc }],
         }
     }
 
@@ -298,6 +307,8 @@ mod tests {
                 Flow::Source,
                 "microphone",
             )],
+            owner: None,
+            claimable: false,
         }
     }
 
@@ -427,6 +438,24 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Share { from, message: ShareControl::Decline }] if from == &NodeId::from("alex")
+        ));
+    }
+
+    #[test]
+    fn ownership_messages_surface_for_the_backend() {
+        // A peer claims this device; the session just hands it up as an
+        // Ownership effect — the backend decides whether the claim takes.
+        let mut s = Session::new("puck");
+        let effects = s.handle(
+            "phone".into(),
+            ControlMessage::Ownership(OwnershipControl::Claim {
+                owner: "phone".into(),
+            }),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Ownership { from, message: OwnershipControl::Claim { owner } }]
+                if from == &NodeId::from("phone") && owner == &NodeId::from("phone")
         ));
     }
 }

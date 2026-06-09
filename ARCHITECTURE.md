@@ -68,7 +68,10 @@ rules, no I/O.
 
 - **Capability** — one routable thing on one node: a `(media, flow)` pair.
   `media` ∈ {audio, video, display, input, storage, generic}; `flow` ∈
-  {source, sink, duplex}.
+  {source, sink, duplex}. Carries a `default` flag — whether it's the node's
+  **current default** for its category — which the UI badges and
+  `match_endpoint` prefers (after a synthetic machine endpoint) when
+  auto-picking where a connection lands.
 - **Route** — wires a source capability to a sink of compatible media. Only
   ever minted by `Catalog::propose_route`, which is where media, flow, and
   authorization are all checked.
@@ -81,6 +84,12 @@ rules, no I/O.
   (`Provide` = they source, `Consume` = they sink) for one media, optionally
   pinned to one capability. `required_grants` returns the minimal grant that
   would unblock a denied route — the "one-tap allow."
+- **Ownership** (in `allmystuff-protocol` + the GUI) — distinct from a
+  relationship: a device *advertises* who owns it and whether it's
+  *claimable*. You can't flat-take a box — a claim only lands if the device
+  was started in **claim mode** (the `ALLMYSTUFF_CLAIMABLE` flag, or its own
+  "allow adoption" toggle) and is still unowned. The recorded owner is the
+  authenticated claimer the mesh delivered, persisted next to the identity.
 
 See `crates/allmystuff-graph/src/lib.rs` tests for the full behaviour,
 including the RDC fan-out and the share-breach abort.
@@ -130,6 +139,11 @@ Tauri 2 + Svelte 5, a client of the daemon.
   demo data with no backend; when the backend is present it validates the
   same way in Rust and fires the real route over the mesh. Live presence +
   route snapshots merge into the catalog so the graph fills with real peers.
+  A node only known from the daemon's roster (not running AllMyStuff) is
+  shown but quieted and un-targetable, since it exposes no capabilities. The
+  **remote console** (`Console.svelte`) is the pikvm-style session handle for
+  a machine: a video-inputs tab bar over its screen + cameras, plus audio and
+  control toggles, each owning the real route it set up.
 
 ## Data flow: connecting a device
 
@@ -150,13 +164,18 @@ Tauri 2 + Svelte 5, a client of the daemon.
 AllMyStuff rides on MyOwnMesh's identity + roster (under `~/.myownmesh/`,
 overridable via `MYOWNMESH_HOME`). Its own additions — relationships, grants,
 groups, and saved routes — are app state layered on top; the mesh provides
-the cryptographic identity that those grants attach to.
+the cryptographic identity that those grants attach to. **Device ownership**
+is already persisted there (`allmystuff-ownership.json`): the recorded owner
+survives restarts, while claim mode is deliberately transient (re-asserted
+each start by the flag) so a box never sits silently adoptable across reboots.
 
 ## Next milestones
 
 - **Video / screen / input transport** over the same route pipe that audio
   already uses — each needs a capture/inject backend (screen grab, camera,
-  input injection) feeding the existing offer/accept/media plumbing.
+  input injection) feeding the existing offer/accept/media plumbing. The
+  remote console already establishes and shows these routes; what's left is
+  the pixels and the input events on the wire.
 - **Per-device routing** — map a specific scanned device to a `cpal` device
   (v1 uses the default input/output), and an audio codec (Opus) so the media
   channel isn't raw PCM.

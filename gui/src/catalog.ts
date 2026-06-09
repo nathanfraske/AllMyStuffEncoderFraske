@@ -185,6 +185,15 @@ export function connectGroup(
 
 const MACHINE_ORIGINS = new Set(["screen", "control", "system"]);
 
+/** Sort key (lower = preferred), mirroring the Rust `endpoint_rank`: a
+ *  synthetic machine endpoint first, then the category's current default
+ *  device, then everything else. */
+function endpointRank(c: Capability): number {
+  if (MACHINE_ORIGINS.has(c.origin)) return 0;
+  if (c.default) return 1;
+  return 2;
+}
+
 export function matchEndpoint(
   cat: Catalog,
   node: string,
@@ -194,8 +203,5 @@ export function matchEndpoint(
   return cat.capabilities
     .filter((c) => c.node === node && mediaCompatible(c.media, media))
     .filter((c) => (role === "provide" ? canSource(c.flow) : canSink(c.flow)))
-    .sort((a, b) => {
-      const r = Number(!MACHINE_ORIGINS.has(a.origin)) - Number(!MACHINE_ORIGINS.has(b.origin));
-      return r !== 0 ? r : a.id.localeCompare(b.id);
-    })[0];
+    .sort((a, b) => endpointRank(a) - endpointRank(b) || a.id.localeCompare(b.id))[0];
 }

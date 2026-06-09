@@ -8,6 +8,7 @@
   import AddMachineSheet from "./AddMachineSheet.svelte";
   import NetworksSheet from "./NetworksSheet.svelte";
   import ShareSheet from "./ShareSheet.svelte";
+  import Console from "./Console.svelte";
   import Toasts from "./Toasts.svelte";
 
   onMount(() => {
@@ -60,6 +61,7 @@
   {#if app.networksOpen}
     <NetworksSheet />
   {/if}
+  <Console />
   <ShareSheet />
   <Toasts />
 </div>

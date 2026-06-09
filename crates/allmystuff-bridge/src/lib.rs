@@ -57,50 +57,66 @@ pub fn capabilities_from_inventory(inv: &Inventory, node: &NodeId) -> Vec<Capabi
     ));
 
     // ---- physical devices -------------------------------------------
+    //
+    // The scan flags each category's current default (the mic the machine
+    // captures from, the display it drives first…); that flag rides onto
+    // the capability so the UI can badge it and routing can prefer it.
     for m in &inv.microphones {
         let label = if m.is_array() {
             format!("{} (array)", m.name)
         } else {
             m.name.clone()
         };
-        caps.push(mk(
-            qualify(n, &m.id),
-            label,
-            MediaKind::Audio,
-            Flow::Source,
-            "microphone",
-        ));
+        caps.push(
+            mk(
+                qualify(n, &m.id),
+                label,
+                MediaKind::Audio,
+                Flow::Source,
+                "microphone",
+            )
+            .as_default(m.default),
+        );
     }
     for s in &inv.speakers {
-        caps.push(mk(
-            qualify(n, &s.id),
-            s.name.clone(),
-            MediaKind::Audio,
-            Flow::Sink,
-            "speaker",
-        ));
+        caps.push(
+            mk(
+                qualify(n, &s.id),
+                s.name.clone(),
+                MediaKind::Audio,
+                Flow::Sink,
+                "speaker",
+            )
+            .as_default(s.default),
+        );
     }
     for c in &inv.cameras {
-        caps.push(mk(
-            qualify(n, &c.id),
-            c.name.clone(),
-            MediaKind::Video,
-            Flow::Source,
-            "camera",
-        ));
+        caps.push(
+            mk(
+                qualify(n, &c.id),
+                c.name.clone(),
+                MediaKind::Video,
+                Flow::Source,
+                "camera",
+            )
+            .as_default(c.default),
+        );
     }
     for d in &inv.displays {
         // Only connected monitors are wireable sinks.
         if !d.connected {
             continue;
         }
-        caps.push(mk(
-            qualify(n, &d.id),
-            d.name.clone(),
-            MediaKind::Display,
-            Flow::Sink,
-            "display",
-        ));
+        caps.push(
+            mk(
+                qualify(n, &d.id),
+                d.name.clone(),
+                MediaKind::Display,
+                Flow::Sink,
+                "display",
+            )
+            .as_default(d.default),
+        );
     }
     for i in &inv.inputs {
         // Keyboards/mice/etc. are input *sources* (they produce events).
@@ -230,6 +246,7 @@ mod tests {
             direction: AudioDirection::Input,
             channels: Some(4),
             card: Some("1".into()),
+            default: true,
         });
         inv.speakers.push(AudioDevice {
             id: "spk:0:0".into(),
@@ -237,11 +254,13 @@ mod tests {
             direction: AudioDirection::Output,
             channels: None,
             card: Some("0".into()),
+            default: false,
         });
         inv.cameras.push(Camera {
             id: "cam:video0".into(),
             name: "Webcam".into(),
             path: None,
+            default: true,
         });
         inv.displays.push(Display {
             id: "display:HDMI-A-1".into(),
@@ -251,6 +270,7 @@ mod tests {
             width_px: Some(1920),
             height_px: Some(1080),
             internal: false,
+            default: true,
         });
         inv.inputs.push(InputDevice {
             id: "input:input1".into(),
@@ -260,6 +280,17 @@ mod tests {
 
         let caps = capabilities_from_inventory(&inv, &NodeId::this());
         let find = |origin: &str| caps.iter().find(|c| c.origin == origin).unwrap();
+
+        // The scan's per-category default flag rides onto the capability.
+        assert!(
+            find("microphone").default,
+            "mic was the default capture device"
+        );
+        assert!(find("camera").default);
+        assert!(find("display").default);
+        assert!(!find("speaker").default, "this speaker wasn't the default");
+        // Synthetic machine endpoints aren't a category default.
+        assert!(!find("system").default);
 
         assert_eq!(
             (find("microphone").media, find("microphone").flow),
@@ -299,6 +330,7 @@ mod tests {
             width_px: None,
             height_px: None,
             internal: false,
+            default: false,
         });
         let caps = capabilities_from_inventory(&inv, &NodeId::this());
         assert!(caps.iter().all(|c| c.origin != "display"));

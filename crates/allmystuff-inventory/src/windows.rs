@@ -145,6 +145,7 @@ Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Silentl
                 width_px: v["Width"].as_u64().map(|w| w as u32),
                 height_px: v["Height"].as_u64().map(|h| h as u32),
                 internal,
+                default: false,
             }
         })
         .collect()
@@ -173,6 +174,7 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
             },
             channels: None,
             card: s(&v, "DeviceID"),
+            default: false,
         };
         if is_input {
             mics.push(dev);
@@ -192,6 +194,7 @@ pub fn collect_cameras() -> Vec<Camera> {
                 id: format!("cam:{i}"),
                 name: s(&v, "Name")?,
                 path: None,
+                default: false,
             })
         })
         .collect()

@@ -410,6 +410,59 @@ mod tests {
     }
 
     #[test]
+    fn group_routing_prefers_the_default_device() {
+        // A target with two speakers and no synthetic system-audio endpoint:
+        // a group's audio source should land on the one marked default.
+        let mut cat = Catalog::new();
+        cat.nodes.push(MeshNode::this("My laptop"));
+        cat.nodes.push(MeshNode {
+            id: "box".into(),
+            label: "Box".into(),
+            kind: NodeKind::Machine,
+            relationship: Relationship::Mine,
+            online: true,
+        });
+        cat.capabilities.push(Capability::new(
+            "this",
+            "this:mic",
+            "Mic",
+            MediaKind::Audio,
+            Flow::Source,
+            "microphone",
+        ));
+        // The default is the id-*later* speaker, so only default-preference
+        // (not id order, which would pick spkA) can explain the choice.
+        cat.capabilities.push(Capability::new(
+            "box",
+            "box:spkA",
+            "Aux speaker",
+            MediaKind::Audio,
+            Flow::Sink,
+            "speaker",
+        ));
+        cat.capabilities.push(
+            Capability::new(
+                "box",
+                "box:spkZ",
+                "Main speaker",
+                MediaKind::Audio,
+                Flow::Sink,
+                "speaker",
+            )
+            .as_default(true),
+        );
+        cat.groups.push(Group {
+            id: "g".into(),
+            name: "Audio".into(),
+            node: NodeId::this(),
+            members: vec!["this:mic".into()],
+        });
+        let routes = cat.connect_group("g", &"box".into()).expect("connects");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].to, "box:spkZ".into());
+    }
+
+    #[test]
     fn group_connect_aborts_when_a_leg_would_breach_a_share() {
         // A group on a shared person's node, pointed at my desk PC, must
         // not silently connect the authorized legs while dropping the

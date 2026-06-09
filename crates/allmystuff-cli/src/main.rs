@@ -191,8 +191,9 @@ fn run_capabilities() -> ExitCode {
             allmystuff_graph::Flow::Sink => "in  →",
             allmystuff_graph::Flow::Duplex => "↔",
         };
+        let def = if c.default { "  ★ default" } else { "" };
         println!(
-            "  {:<7} {:<8} {arrow:<6}  {}  [{}]",
+            "  {:<7} {:<8} {arrow:<6}  {}  [{}]{def}",
             c.media.label(),
             c.origin,
             c.label,

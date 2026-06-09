@@ -16,6 +16,7 @@ import {
 import { demoCatalog } from "./mock";
 import {
   buildNetworkConfig,
+  claimNode,
   connectRoute,
   disconnectRoute,
   isTauri,
@@ -29,13 +30,16 @@ import {
   meshRosterApprove,
   meshRosterList,
   meshRosterRemove,
+  onOwnership,
   onSession,
   onSubscription,
   scanSelf,
+  setClaimable,
   type SessionSnapshot,
 } from "./tauri";
 import {
   BUNDLE_TEMPLATES,
+  isAppNode,
   type Capability,
   type Catalog,
   type Flow,
@@ -113,6 +117,22 @@ class AppStore {
   groupPickerFor = $state<string | null>(null); // groupId awaiting a target
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
+
+  // ---- remote console (the pikvm-style session popup) -------------
+  /** The remote machine a console session is open on, if any. */
+  consoleNodeId = $state<string | null>(null);
+  /** The video input (a remote display/camera source) currently selected in
+   *  the console's input tab bar. */
+  consoleInput = $state<string | null>(null);
+  /** Whether audio passthrough is on for the session. */
+  consoleAudio = $state(false);
+  /** Whether keyboard & mouse control is being sent to the remote. */
+  consoleControl = $state(false);
+  // Route ids the console owns, by channel, so it tears down exactly what it
+  // set up (and nothing a different connection made).
+  private consoleVideoRouteId: string | null = null;
+  private consoleAudioRouteIds: string[] = [];
+  private consoleControlRouteId: string | null = null;
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
   localId = $state("this");
@@ -140,6 +160,11 @@ class AppStore {
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
+  );
+
+  /** The machine a console session is currently open on, if any. */
+  consoleNode = $derived(
+    this.consoleNodeId ? this.catalog.nodes.find((n) => n.id === this.consoleNodeId) ?? null : null,
   );
 
   mineCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "mine").length);
@@ -193,6 +218,12 @@ class AppStore {
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
+    await onOwnership((o) => {
+      const who = this.node(o.from)?.label ?? "A device";
+      if (o.message.kind === "claimed") this.toast("ok", `${who} is yours now`);
+      else if (o.message.kind === "declined")
+        this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
+    });
   }
 
   /** Poll the daemon's mesh membership as a safety net (peer/roster changes
@@ -248,7 +279,10 @@ class AppStore {
     }
     // Upsert a node per known device (never the local machine). Discovered
     // devices start *unclaimed* — they're on the mesh but not yet yours; you
-    // claim them (or mark them shared) from their drawer.
+    // claim them (only if they offer it) or mark them shared from their
+    // drawer. A device known only from the daemon's roster/peers isn't
+    // running AllMyStuff yet (`app: false`) — presence is what flips that on,
+    // so we never downgrade a node the bespoke channel already enriched.
     for (const [id, info] of known) {
       if (id === this.localId) continue;
       const node = this.catalog.nodes.find((n) => n.id === id);
@@ -259,6 +293,7 @@ class AppStore {
           kind: "machine",
           relationship: { kind: "unclaimed" },
           online: info.online,
+          app: false,
         });
       } else {
         node.online = info.online;
@@ -298,6 +333,7 @@ class AppStore {
       me.label = label;
       me.hostname = host;
       me.summary = scan.summary;
+      me.app = true;
     } else {
       this.catalog.nodes.push({
         id: newId,
@@ -306,6 +342,7 @@ class AppStore {
         kind: "this",
         relationship: { kind: "mine" },
         online: true,
+        app: true,
         summary: scan.summary,
       });
     }
@@ -329,8 +366,8 @@ class AppStore {
     for (const p of snap.peers ?? []) {
       let node = this.catalog.nodes.find((n) => n.id === p.node);
       if (!node) {
-        // A freshly-discovered peer starts unclaimed — claim it as yours or
-        // mark it shared from its drawer.
+        // A freshly-discovered peer starts unclaimed — claim it (only if it
+        // offers itself) or mark it shared from its drawer.
         node = {
           id: p.node,
           label: p.label,
@@ -346,6 +383,17 @@ class AppStore {
         node.online = true;
       }
       node.summary = p.summary;
+      // Presence means it's running AllMyStuff — it has wireable stuff.
+      node.app = true;
+      // Ownership the device advertises about itself (Task 4).
+      node.owner = p.owner ?? null;
+      node.claimable = p.claimable ?? false;
+      // A device that says *we* own it is ours; one owned by someone else
+      // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
+      // relationship the user already set, and never auto-adopt.
+      if (p.owner && p.owner === this.localId && node.relationship.kind === "unclaimed") {
+        node.relationship = { kind: "mine" };
+      }
       // Refresh this peer's capabilities.
       this.catalog.capabilities = [
         ...this.catalog.capabilities.filter((c) => c.node !== p.node),
@@ -390,6 +438,14 @@ class AppStore {
     const capId = this.dragFrom;
     this.dragFrom = null;
     if (!capId) return;
+    const cap = this.capability(capId);
+    // Dragging a remote machine's *screen* onto this device is the "watch /
+    // control that machine here" gesture — open its console rather than just
+    // drawing a wire.
+    if (cap && cap.origin === "screen" && cap.node !== this.localId && nodeId === this.localId) {
+      this.openConsole(cap.node);
+      return;
+    }
     this.connectCapToNode(capId, nodeId);
   }
 
@@ -400,6 +456,13 @@ class AppStore {
     if (!cap) return;
     if (cap.node === nodeId) {
       this.toast("warn", "Pick a different device");
+      return;
+    }
+    // A device on the mesh that isn't running AllMyStuff has nothing to wire
+    // to — keep it un-targetable (Task 1).
+    const target = this.node(nodeId);
+    if (target && !isAppNode(target)) {
+      this.toast("warn", `${target.label} isn't running AllMyStuff`);
       return;
     }
     if (canSource(cap.flow)) {
@@ -480,6 +543,210 @@ class AppStore {
     if (route?.group) {
       this.catalog.routes = this.catalog.routes.filter((r) => r.group !== route.group);
       this.toast("info", "Disconnected the group");
+    }
+  }
+
+  // ---- remote console (the pikvm-style session) -------------------
+
+  /** A remote machine's video-capable sources — its screen plus any cameras
+   *  — ordered so the screen leads and the default sits near the front. This
+   *  is the console's "video inputs" tab bar. */
+  consoleVideoInputs(nodeId: string): Capability[] {
+    return this.capsOf(nodeId)
+      .filter((c) => (c.media === "display" || c.media === "video") && canSource(c.flow))
+      .sort((a, b) => {
+        const rank = (c: Capability) => (c.origin === "screen" ? 0 : c.default ? 1 : 2);
+        return rank(a) - rank(b) || a.id.localeCompare(b.id);
+      });
+  }
+
+  /** Open a console session on a remote machine — the single handle for its
+   *  screen, its audio passthrough and keyboard/mouse control. Wires the
+   *  backbone video route to this machine's display now; audio and control
+   *  are toggled from inside the console. */
+  openConsole(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (nodeId === this.localId) {
+      this.toast("warn", "That's this device");
+      return;
+    }
+    if (!isAppNode(node)) {
+      this.toast("warn", `${node.label} isn't running AllMyStuff`);
+      return;
+    }
+    if (node.relationship.kind === "unclaimed") {
+      this.toast("warn", `Claim ${node.label} first, or mark it shared`);
+      return;
+    }
+    this.consoleNodeId = nodeId;
+    this.consoleAudio = false;
+    this.consoleControl = false;
+    this.consoleVideoRouteId = null;
+    this.consoleAudioRouteIds = [];
+    this.consoleControlRouteId = null;
+    this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
+    this.applyConsoleVideo();
+    this.toast("ok", `Console open on ${node.label}`);
+  }
+
+  /** Close the console, tearing down exactly the routes it created. */
+  closeConsole() {
+    if (this.consoleVideoRouteId) this.disconnect(this.consoleVideoRouteId);
+    for (const id of this.consoleAudioRouteIds) this.disconnect(id);
+    if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
+    this.consoleVideoRouteId = null;
+    this.consoleAudioRouteIds = [];
+    this.consoleControlRouteId = null;
+    this.consoleNodeId = null;
+    this.consoleInput = null;
+    this.consoleAudio = false;
+    this.consoleControl = false;
+  }
+
+  /** Switch which remote source the console is showing. */
+  setConsoleInput(capId: string) {
+    this.consoleInput = capId;
+    this.applyConsoleVideo();
+  }
+
+  private applyConsoleVideo() {
+    if (this.consoleVideoRouteId) {
+      this.disconnect(this.consoleVideoRouteId);
+      this.consoleVideoRouteId = null;
+    }
+    const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
+    if (!inp) return;
+    // The remote screen (display) lands on this machine's display sink — a
+    // real route. A camera (video) has no local sink yet, so it's view-only
+    // until video transport lands; the console is honest about that.
+    const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
+    if (!sink) return;
+    const leg = this.consoleConnect(inp.id, sink.id);
+    // Only own the route for teardown if this call created it.
+    this.consoleVideoRouteId = leg?.created ? leg.id : null;
+  }
+
+  /** Audio passthrough: hear the remote *and* send it your audio. */
+  toggleConsoleAudio() {
+    const remote = this.consoleNodeId;
+    if (!remote) return;
+    if (this.consoleAudio) {
+      for (const id of this.consoleAudioRouteIds) this.disconnect(id);
+      this.consoleAudioRouteIds = [];
+      this.consoleAudio = false;
+      return;
+    }
+    // Two legs: hear the remote, and send it your audio. The channel reads
+    // as on when either leg is live; only legs this call created are owned
+    // for teardown.
+    const owned: string[] = [];
+    let anyLive = false;
+    const legs: Array<[Capability | undefined, Capability | undefined]> = [
+      [matchEndpoint(this.catalog, remote, "audio", "provide"), matchEndpoint(this.catalog, this.localId, "audio", "consume")],
+      [matchEndpoint(this.catalog, this.localId, "audio", "provide"), matchEndpoint(this.catalog, remote, "audio", "consume")],
+    ];
+    for (const [from, to] of legs) {
+      if (!from || !to) continue;
+      const leg = this.consoleConnect(from.id, to.id);
+      if (!leg) continue;
+      anyLive = true;
+      if (leg.created) owned.push(leg.id);
+    }
+    this.consoleAudioRouteIds = owned;
+    this.consoleAudio = anyLive;
+    if (!anyLive) this.toast("warn", "No audio path to that machine");
+  }
+
+  /** Send this machine's keyboard & mouse to the remote (input injection on
+   *  the far side is a follow-up; the route is real and shows active). */
+  toggleConsoleControl() {
+    const remote = this.consoleNodeId;
+    if (!remote) return;
+    if (this.consoleControl) {
+      if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
+      this.consoleControlRouteId = null;
+      this.consoleControl = false;
+      return;
+    }
+    const mySrc = matchEndpoint(this.catalog, this.localId, "input", "provide");
+    const remoteSink = matchEndpoint(this.catalog, remote, "input", "consume");
+    const leg = mySrc && remoteSink ? this.consoleConnect(mySrc.id, remoteSink.id) : null;
+    if (leg) {
+      this.consoleControlRouteId = leg.created ? leg.id : null;
+      this.consoleControl = true;
+    } else {
+      this.toast("warn", "No control path to that machine");
+    }
+  }
+
+  /** Connect a console leg through the normal route path (so authorization
+   *  and the backend offer still apply). Returns the route id when it's now
+   *  live, and whether *this* call created it — so the console reads the
+   *  channel as on only when something is actually wired, and tears down only
+   *  the routes it made (never a pre-existing one the user set up, and never
+   *  a leg that was blocked behind a share prompt). */
+  private consoleConnect(from: string, to: string): { id: string; created: boolean } | null {
+    const id = `route:${from}→${to}`;
+    const existedBefore = this.catalog.routes.some((r) => r.id === id);
+    this.connect(from, to);
+    const existsNow = this.catalog.routes.some((r) => r.id === id);
+    if (!existsNow) return null; // blocked / denied — nothing got wired
+    return { id, created: !existedBefore };
+  }
+
+  // ---- ownership / claiming ---------------------------------------
+
+  /** Adopt a device as one of yours. Honours Task 4: this only works when
+   *  the device is *claimable* (booted in claim mode, still unowned) or
+   *  already says you own it — you can't flat-out take a box that has an
+   *  owner or was never offered. */
+  claim(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    if (n.owner && n.owner !== this.localId) {
+      this.toast("warn", `${n.label} is owned by another device — you can't take it`);
+      return;
+    }
+    if (!n.claimable && n.owner !== this.localId) {
+      this.toast(
+        "warn",
+        `${n.label} isn't in claim mode. Start it claimable on the device itself to adopt it.`,
+      );
+      return;
+    }
+    if (this.backendConnected) {
+      // The device confirms by re-advertising presence with owner = us.
+      void claimNode(nodeId);
+      this.toast("info", `Asking ${n.label} to join your fleet…`);
+    } else {
+      // Demo/web: the claimable device accepts.
+      n.owner = this.localId;
+      n.claimable = false;
+      n.relationship = { kind: "mine" };
+      this.toast("ok", `${n.label} is yours now`);
+      this.reauthorize();
+    }
+  }
+
+  /** Put *this* device into (or out of) claim mode so another of your
+   *  machines can adopt it. */
+  async setLocalClaimable(on: boolean) {
+    const me = this.node(this.localId);
+    if (this.backendConnected) {
+      try {
+        const now = await setClaimable(on);
+        if (me) me.claimable = now ?? on;
+        this.toast(
+          on ? "info" : "ok",
+          on ? "This device can now be adopted by another of your machines" : "Adoption turned off",
+        );
+      } catch (e) {
+        this.toast("warn", `Couldn't change claim mode: ${errMsg(e)}`);
+      }
+    } else {
+      if (me) me.claimable = on;
+      this.toast("info", on ? "Adoption on (demo)" : "Adoption off (demo)");
     }
   }
 

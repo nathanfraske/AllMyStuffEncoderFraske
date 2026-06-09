@@ -60,7 +60,7 @@ pub fn scan() -> Inventory {
     enrich_nvidia(&mut gpus);
     let (microphones, speakers) = platform_audio();
 
-    Inventory {
+    let mut inv = Inventory {
         scanned_at: unix_now(),
         host: sys::host_info(),
         cpu: sys::cpu(&system),
@@ -74,6 +74,88 @@ pub fn scan() -> Inventory {
         cameras: platform_cameras(),
         inputs: platform_inputs(),
         usb: platform_usb(),
+    };
+    ensure_category_defaults(&mut inv);
+    inv
+}
+
+/// Guarantee every device category that has a notion of "current default"
+/// has exactly one marked. The Linux probe already flags the real default
+/// (the ALSA default card, the built-in panel); this is the safety net for
+/// the macOS / Windows scaffolds and for any degraded scan where the probe
+/// found devices but had no signal to rank them — so the UI and routing can
+/// always answer "which is the default here?" Idempotent: a category that
+/// already has a default is left untouched.
+fn ensure_category_defaults(inv: &mut Inventory) {
+    fn ensure<T: DefaultFlag>(devices: &mut [T]) {
+        if devices.iter().any(T::is_default) {
+            return;
+        }
+        // Prefer an eligible device the type considers primary (a built-in
+        // panel), else the first eligible one — both stable across rescans.
+        // If nothing is eligible (e.g. a headless box with only disconnected
+        // outputs), the category simply has no default, which is correct.
+        let pick = devices
+            .iter()
+            .position(|d| d.is_eligible() && d.is_primary_hint())
+            .or_else(|| devices.iter().position(T::is_eligible));
+        if let Some(i) = pick {
+            devices[i].set_default();
+        }
+    }
+    ensure(&mut inv.microphones);
+    ensure(&mut inv.speakers);
+    ensure(&mut inv.displays);
+    ensure(&mut inv.cameras);
+}
+
+/// Minimal interface over the device records that carry a `default` flag,
+/// so [`ensure_category_defaults`] can treat them uniformly.
+trait DefaultFlag {
+    fn is_default(&self) -> bool;
+    fn set_default(&mut self);
+    /// Whether this device can be the category default at all. Default: yes;
+    /// a display overrides it so a disconnected output is never chosen.
+    fn is_eligible(&self) -> bool {
+        true
+    }
+    /// Whether this device should win the fallback when nothing is marked
+    /// (e.g. a built-in display). Default: no preference.
+    fn is_primary_hint(&self) -> bool {
+        false
+    }
+}
+
+impl DefaultFlag for AudioDevice {
+    fn is_default(&self) -> bool {
+        self.default
+    }
+    fn set_default(&mut self) {
+        self.default = true;
+    }
+}
+
+impl DefaultFlag for Display {
+    fn is_default(&self) -> bool {
+        self.default
+    }
+    fn set_default(&mut self) {
+        self.default = true;
+    }
+    fn is_eligible(&self) -> bool {
+        self.connected
+    }
+    fn is_primary_hint(&self) -> bool {
+        self.connected && self.internal
+    }
+}
+
+impl DefaultFlag for Camera {
+    fn is_default(&self) -> bool {
+        self.default
+    }
+    fn set_default(&mut self) {
+        self.default = true;
     }
 }
 
@@ -185,6 +267,7 @@ mod tests {
             direction: AudioDirection::Input,
             channels: Some(4),
             card: Some("1".into()),
+            default: false,
         };
         assert!(mic.is_array());
 
@@ -201,5 +284,77 @@ mod tests {
             ..mic
         };
         assert!(!speaker.is_array());
+    }
+
+    #[test]
+    fn category_defaults_are_guaranteed_and_idempotent() {
+        let mut inv = scan();
+        // Give the scan some devices regardless of the host it ran on, with
+        // none marked default, and confirm the fallback marks exactly one.
+        inv.cameras = vec![
+            Camera {
+                id: "cam:0".into(),
+                name: "A".into(),
+                path: None,
+                default: false,
+            },
+            Camera {
+                id: "cam:1".into(),
+                name: "B".into(),
+                path: None,
+                default: false,
+            },
+        ];
+        inv.displays = vec![
+            Display {
+                id: "d:ext".into(),
+                name: "Ext".into(),
+                connector: "HDMI-A-1".into(),
+                connected: true,
+                width_px: None,
+                height_px: None,
+                internal: false,
+                default: false,
+            },
+            Display {
+                id: "d:panel".into(),
+                name: "Panel".into(),
+                connector: "eDP-1".into(),
+                connected: true,
+                width_px: None,
+                height_px: None,
+                internal: true,
+                default: false,
+            },
+        ];
+        ensure_category_defaults(&mut inv);
+        assert_eq!(inv.cameras.iter().filter(|c| c.default).count(), 1);
+        assert!(
+            inv.cameras[0].default,
+            "first camera is the fallback default"
+        );
+        // The built-in panel wins the display fallback over the external.
+        assert!(inv.displays.iter().find(|d| d.internal).unwrap().default);
+        assert_eq!(inv.displays.iter().filter(|d| d.default).count(), 1);
+
+        // Running again changes nothing (idempotent).
+        ensure_category_defaults(&mut inv);
+        assert_eq!(inv.cameras.iter().filter(|c| c.default).count(), 1);
+        assert_eq!(inv.displays.iter().filter(|d| d.default).count(), 1);
+
+        // A headless box (only disconnected outputs) gets *no* default
+        // display — never a disconnected one.
+        inv.displays = vec![Display {
+            id: "d:off".into(),
+            name: "Off".into(),
+            connector: "HDMI-A-1".into(),
+            connected: false,
+            width_px: None,
+            height_px: None,
+            internal: false,
+            default: false,
+        }];
+        ensure_category_defaults(&mut inv);
+        assert!(inv.displays.iter().all(|d| !d.default));
     }
 }
