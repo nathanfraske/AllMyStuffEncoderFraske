@@ -316,7 +316,13 @@ class AppStore {
     // running AllMyStuff yet (`app: false`) — presence is what flips that on,
     // so we never downgrade a node the bespoke channel already enriched.
     for (const [id, info] of known) {
-      if (sameMachine(id, this.localId)) continue;
+      // "Self" is recognised by the live local id *and* the daemon identity's
+      // device id — the latter is known as soon as the socket is up, before a
+      // scan has re-homed the local node off its `"this"` placeholder. Without
+      // it, this machine's own roster entry (bare pubkey) would spawn a
+      // "not on AllMyStuff" twin at startup and the real "this device" node
+      // wouldn't be recognised.
+      if (this.isLocalMachine(id)) continue;
       // The daemon reports the bare pubkey; a presence advert may already
       // have created this machine's node under its display id. Resolve by
       // canonical pubkey so we update that one node rather than spawning a
@@ -341,14 +347,18 @@ class AppStore {
     // marked offline just because the daemon lists it under the bare pubkey.
     const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
     for (const n of this.catalog.nodes) {
-      if (
-        n.kind !== "this" &&
-        !sameMachine(n.id, this.localId) &&
-        !knownCanon.has(canonicalNodeId(n.id))
-      ) {
+      if (n.kind !== "this" && !this.isLocalMachine(n.id) && !knownCanon.has(canonicalNodeId(n.id))) {
         n.online = false;
       }
     }
+  }
+
+  /** Whether `id` names this machine — by the live local id or the daemon
+   *  identity's device id (known before a scan re-homes the local node). */
+  private isLocalMachine(id: string): boolean {
+    if (sameMachine(id, this.localId)) return true;
+    const did = this.identity?.device_id;
+    return !!did && sameMachine(id, did);
   }
 
   /** Pull a real scan from the backend and re-home the local node onto its

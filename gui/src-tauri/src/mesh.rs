@@ -108,6 +108,20 @@ impl Mesh {
         self.state.lock().session.as_ref().map(|s| s.me().to_string())
     }
 
+    /// This node's mesh id, resolved even before the live session starts: the
+    /// session id once `start()` has run, else the daemon identity's device id
+    /// (available as soon as the control socket is up). So a scan at launch
+    /// already carries the real id and the local node never lingers under the
+    /// `"this"` placeholder (which is what made this machine briefly show as a
+    /// bare "not on AllMyStuff" twin). `None` only when the daemon is
+    /// unreachable.
+    pub async fn resolve_local_id(&self) -> Option<String> {
+        if let Some(id) = self.local_node_id() {
+            return Some(id);
+        }
+        self.fetch_identity().await
+    }
+
     /// Bring the session online: identify, pick a network, subscribe, and
     /// start pumping events. Safe to call once the daemon socket is up.
     pub async fn start(self: Arc<Self>) {

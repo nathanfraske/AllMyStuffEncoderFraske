@@ -47,8 +47,8 @@ fn unwrap_response(resp: Response) -> Result<Value, String> {
 /// peers see), else `"this"` for the offline/demo graph; `label` is the
 /// hostname shown on the local node.
 #[tauri::command]
-fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
-    let me = mesh.local_node_id().unwrap_or_else(|| "this".to_string());
+async fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
+    let me = mesh.resolve_local_id().await.unwrap_or_else(|| "this".to_string());
     let node = allmystuff_graph::NodeId::from(me.as_str());
     let inv = allmystuff_inventory::scan();
     serde_json::to_value(json!({
