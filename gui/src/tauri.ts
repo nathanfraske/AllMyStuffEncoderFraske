@@ -9,6 +9,7 @@ import type {
   IdentityInfo,
   InventorySummary,
   MediaKind,
+  NetworkConfigFull,
   NetworkSummary,
   OwnedRoster,
   PeerInfo,
@@ -199,8 +200,18 @@ export async function meshNetworkIdGenerate(): Promise<string> {
 export const meshNetworkAdd = (config: unknown) =>
   invokeReq<unknown>("mesh_network_add", { config });
 
+export const meshNetworkUpdate = (config: unknown) =>
+  invokeReq<unknown>("mesh_network_update", { config });
+
 export const meshNetworkRemove = (network: string) =>
   invokeReq<unknown>("mesh_network_remove", { network });
+
+/** The whole daemon config (every network with its full signaling/STUN/TURN).
+ *  The Servers settings pane reads this to populate its editor. */
+export async function meshConfigShow(): Promise<NetworkConfigFull[]> {
+  const r = await invokeReq<{ config?: { networks?: NetworkConfigFull[] } }>("mesh_config_show");
+  return Array.isArray(r?.config?.networks) ? r.config!.networks! : [];
+}
 
 export async function meshRosterList(network: string): Promise<RosterPeer[]> {
   const r = await invokeReq<{ roster?: RosterPeer[] }>("mesh_roster_list", { network });
@@ -218,16 +229,25 @@ export async function meshPeers(network: string): Promise<PeerInfo[]> {
   return Array.isArray(r?.peers) ? r.peers : [];
 }
 
-const DEFAULT_STUN = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
+// MyOwnMesh's semi-public reference servers — the defaults a new network
+// uses so two devices rendezvous on the *same* signaling relay (the usual
+// reason "nothing connects": peers scattered across different public relays)
+// and can traverse NAT via the shared STUN/TURN. All three are editable per
+// network from Settings → Networks → Servers.
+export const MYOWNMESH_SIGNALING = "wss://myownmesh.com";
+export const MYOWNMESH_STUN = "stun:stun.myownmesh.com:3478";
+export const MYOWNMESH_TURN_URL = "turn:turn.myownmesh.com:3478";
+export const MYOWNMESH_TURN_USER = "guest";
+export const MYOWNMESH_TURN_PASS = "theguestpassword";
 
 function newNetworkInternalId(): string {
   return `net_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 }
 
-/** Build the NetworkConfig payload `mesh_network_add` expects from the bits
- *  the UI collects. The daemon fills topology/signaling defaults (empty
- *  signaling → its built-in relays), so we only set id, network_id, an
- *  optional label, sensible STUN servers, and the auto-approve toggle. */
+/** Build the NetworkConfig payload `mesh_network_add` expects. Defaults the
+ *  signaling relay + STUN + TURN to MyOwnMesh's reference servers so a freshly
+ *  created/joined network connects out of the box; the Servers pane can change
+ *  any of them later. */
 export function buildNetworkConfig(args: {
   networkId: string;
   label?: string;
@@ -237,7 +257,11 @@ export function buildNetworkConfig(args: {
     id: newNetworkInternalId(),
     network_id: args.networkId,
     label: args.label?.trim() || undefined,
-    stun_servers: DEFAULT_STUN.map((u) => ({ urls: [u] })),
+    signaling: { servers: [MYOWNMESH_SIGNALING] },
+    stun_servers: [{ urls: [MYOWNMESH_STUN] }],
+    turn_servers: [
+      { urls: [MYOWNMESH_TURN_URL], username: MYOWNMESH_TURN_USER, credential: MYOWNMESH_TURN_PASS },
+    ],
     auto_approve: args.autoApprove ?? false,
   };
 }

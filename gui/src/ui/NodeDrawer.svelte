@@ -121,6 +121,12 @@
           {#if app.isFleetMember(node.id)}<span class="pill fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
           <span class="state" class:on={node.online}>{node.online ? "online" : "offline"}</span>
         </div>
+        {#if node.networks && node.networks.length}
+          <div class="netline" title="On {node.networks.join(', ')}">
+            <span class="netline-k">on</span>
+            {#each node.networks as net}<span class="net-chip">{net}</span>{/each}
+          </div>
+        {/if}
       </div>
       <button class="x" onclick={() => app.selectNode(null)} aria-label="Close">✕</button>
     </header>
@@ -362,6 +368,28 @@
   .pill.fleet {
     background: var(--accent-soft);
     color: var(--accent-ink);
+  }
+  .netline {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.3rem;
+  }
+  .netline-k {
+    font-size: 0.66rem;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .net-chip {
+    font-size: 0.64rem;
+    font-weight: 650;
+    background: #eef0fb;
+    border: 1px solid #dfe3f7;
+    color: #4a3bc0;
+    border-radius: var(--r-pill);
+    padding: 0.04rem 0.4rem;
   }
   .claim {
     display: flex;

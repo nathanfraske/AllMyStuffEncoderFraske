@@ -22,10 +22,12 @@ import {
   isTauri,
   meshIdentity,
   meshIdentitySetLabel,
+  meshConfigShow,
   meshNetworkAdd,
   meshNetworkIdGenerate,
   meshNetworkRemove,
   meshNetworks,
+  meshNetworkUpdate,
   meshPeers,
   meshRosterApprove,
   meshRosterList,
@@ -55,17 +57,22 @@ import {
   type IdentityInfo,
   type MediaKind,
   type MeshNode,
+  type NetworkConfigFull,
   type NetworkSummary,
   type OwnedRoster,
   type PeerInfo,
   type Relationship,
   type RosterPeer,
+  type TurnEntry,
   type UpdatePrefs,
   type UpdateStatus,
 } from "./types";
 
 /** Which pane the settings panel is showing. */
 export type SettingsTab = "networks" | "updates" | "fleet";
+
+/** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
+export type NetworksSubtab = "status" | "servers" | "devices";
 
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
@@ -188,6 +195,13 @@ class AppStore {
   networks = $state<NetworkSummary[]>([]);
   /** config_id of the network the live session is currently on. */
   sessionNetwork = $state<string | null>(null);
+  /** Which sub-pane of the Networks settings tab is showing. */
+  networksSubtab = $state<NetworksSubtab>("status");
+  /** Full per-network configs (signaling/STUN/TURN) from the daemon — the
+   *  Servers pane reads + round-trips these. Keyed implicitly by `id`. */
+  networkConfigs = $state<NetworkConfigFull[]>([]);
+  /** config_id currently selected in the Servers pane. */
+  serversNetwork = $state<string | null>(null);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -298,7 +312,10 @@ class AppStore {
   /** Wire up live backend data, if there is a backend. No-op (keeps the
    *  demo graph) in web mode. Called once on mount. */
   async init() {
-    if (!isTauri()) this.seedDemoFleet();
+    if (!isTauri()) {
+      this.seedDemoFleet();
+      this.seedDemoNetworks();
+    }
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
@@ -351,8 +368,17 @@ class AppStore {
     const live = new Map<string, { label: string; online: boolean }>();
     const rosterAll: RosterPeer[] = [];
     const joins: PendingJoin[] = [];
+    // Which networks each machine is seen on (canonical pubkey → network
+    // names), so the graph can show that you're on several networks and a
+    // device may share only some of them.
+    const deviceNets = new Map<string, Set<string>>();
+    const addNet = (deviceId: string, name: string) => {
+      const k = canonicalNodeId(deviceId);
+      (deviceNets.get(k) ?? deviceNets.set(k, new Set()).get(k)!).add(name);
+    };
     const nets = Array.isArray(this.networks) ? this.networks : [];
     for (const net of nets) {
+      const netName = networkDisplayName(net);
       let peers: PeerInfo[] = [];
       let roster: RosterPeer[] = [];
       try {
@@ -369,14 +395,16 @@ class AppStore {
         if (p.status === "pending_approval") {
           // Surfaced as a "new device wants to join" nudge + popup, not on the
           // graph. Gathered across every network so the nudge catches them all.
-          joins.push({ networkId: net.config_id, networkName: networkDisplayName(net), peer: p });
+          joins.push({ networkId: net.config_id, networkName: netName, peer: p });
           continue;
         }
+        addNet(p.device_id, netName);
         const e = live.get(p.device_id) ?? { label: p.label?.trim() || shortId(p.device_id), online: false };
         if (p.label?.trim()) e.label = p.label.trim();
         if (p.status === "active") e.online = true;
         live.set(p.device_id, e);
       }
+      for (const r of roster) addNet(r.device_id, netName);
       rosterAll.push(...roster);
     }
     this.pendingJoins = joins;
@@ -414,6 +442,7 @@ class AppStore {
       // have created this machine's node under its display id. Resolve by
       // canonical pubkey so we update that one node rather than spawning a
       // bare-pubkey twin that reads as "not on AllMyStuff".
+      const nodeNets = [...(deviceNets.get(canonicalNodeId(id)) ?? [])].sort();
       const node = this.nodeByCanonical(id);
       if (!node) {
         this.catalog.nodes.push({
@@ -423,12 +452,17 @@ class AppStore {
           relationship: { kind: "unclaimed" },
           online: info.online,
           app: false,
+          networks: nodeNets,
         });
       } else {
         node.online = info.online;
+        node.networks = nodeNets;
         if (!node.hostname && info.label) node.label = info.label;
       }
     }
+    // The local machine is on every network we've joined.
+    const me = this.node(this.localId) ?? this.catalog.nodes.find((n) => n.kind === "this");
+    if (me) me.networks = nets.map((n) => networkDisplayName(n)).sort();
     // A machine that's no longer in any roster/peer set has dropped offline.
     // Compare by canonical pubkey so a presence node (display id) isn't wrongly
     // marked offline just because the daemon lists it under the bare pubkey.
@@ -949,6 +983,49 @@ class AppStore {
     }
   }
 
+  /** Demo/web only: stand in two networks with their server configs and spread
+   *  the demo devices across them, so the multi-network UI (the Servers +
+   *  Devices panes, the per-node network chips) is alive in the preview. */
+  private seedDemoNetworks() {
+    this.networks = [
+      { config_id: "net-home", network_id: "home-7f3a91c2x", label: "Home", phase: "joined" },
+      { config_id: "net-work", network_id: "work-22ab90f1y", label: "Work", phase: "joined" },
+    ];
+    this.networkConfigs = [
+      {
+        id: "net-home",
+        network_id: "home-7f3a91c2x",
+        label: "Home",
+        signaling: { servers: ["wss://myownmesh.com"] },
+        stun_servers: [{ urls: ["stun:stun.myownmesh.com:3478"] }],
+        turn_servers: [
+          { urls: ["turn:turn.myownmesh.com:3478"], username: "guest", credential: "theguestpassword" },
+        ],
+      },
+      {
+        id: "net-work",
+        network_id: "work-22ab90f1y",
+        label: "Work",
+        signaling: { servers: ["wss://relay.example.org"] },
+        stun_servers: [{ urls: ["stun:stun.example.org:3478"] }],
+        turn_servers: [],
+      },
+    ];
+    this.serversNetwork = "net-home";
+    // Spread the demo machines across the two networks — note some are on only
+    // one, which is the whole point: you're not on a single "mesh".
+    const assign: Record<string, string[]> = {
+      this: ["Home", "Work"],
+      desk: ["Home"],
+      tv: ["Home"],
+      studio: ["Work"],
+      nuc: ["Work"],
+      garage: ["Home"],
+      alex: ["Work"],
+    };
+    for (const n of this.catalog.nodes) if (assign[n.id]) n.networks = assign[n.id];
+  }
+
   /** Put *this* device into (or out of) claim mode so another of your
    *  machines can adopt it. */
   async setLocalClaimable(on: boolean) {
@@ -1149,6 +1226,64 @@ class AppStore {
     }
   }
 
+  // ---- per-network transport config (signaling · STUN · TURN) -----
+
+  /** Pull every network's full config (servers) from the daemon for the
+   *  Servers pane. Safe to call often; no-op in web mode. */
+  async loadNetworkConfigs() {
+    if (!isTauri()) return;
+    try {
+      this.networkConfigs = (await meshConfigShow()) ?? [];
+      if (!this.serversNetwork && this.networkConfigs.length > 0) {
+        this.serversNetwork = this.networkConfigs[0].id;
+      }
+    } catch (e) {
+      this.toast("warn", `Couldn't load network settings: ${errMsg(e)}`);
+    }
+  }
+
+  networkConfig(configId: string): NetworkConfigFull | undefined {
+    return this.networkConfigs.find((n) => n.id === configId);
+  }
+
+  /** Replace one network's signaling/STUN/TURN servers. Round-trips the full
+   *  config so unrelated fields (topology, auto-approve, roster path) survive,
+   *  then asks the daemon to apply it — which restarts that network's
+   *  transport and reconnects. */
+  async updateNetworkServers(
+    configId: string,
+    servers: { signaling: string[]; stun: string[]; turn: TurnEntry[] },
+  ) {
+    const cfg = this.networkConfig(configId);
+    if (!cfg) {
+      this.toast("warn", "That network isn't loaded — reopen Settings");
+      return;
+    }
+    const next: NetworkConfigFull = {
+      ...cfg,
+      signaling: {
+        ...(cfg.signaling ?? {}),
+        servers: servers.signaling.map((s) => s.trim()).filter(Boolean),
+      },
+      stun_servers: servers.stun.map((s) => s.trim()).filter(Boolean).map((u) => ({ urls: [u] })),
+      turn_servers: servers.turn
+        .filter((t) => t.url.trim())
+        .map((t) => ({
+          urls: [t.url.trim()],
+          username: t.username.trim() || null,
+          credential: t.credential.trim() || null,
+        })),
+    };
+    try {
+      await meshNetworkUpdate(next);
+      this.toast("ok", "Saved — reconnecting with the new servers");
+      await this.loadNetworkConfigs();
+      await this.refreshNetworks();
+    } catch (e) {
+      this.toast("warn", `Couldn't save servers: ${errMsg(e)}`);
+    }
+  }
+
   /** Load the roster + live peers for one network (the approvals view). */
   async refreshRoster(configId: string) {
     this.rosterNetwork = configId;
@@ -1197,6 +1332,7 @@ class AppStore {
       if (net) void this.refreshRoster(net);
     });
     void this.loadOwnedFleet();
+    void this.loadNetworkConfigs();
     if (tab === "updates") void this.loadUpdateStatus();
   }
 

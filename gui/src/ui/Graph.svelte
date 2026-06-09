@@ -289,6 +289,11 @@
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
+        {#if n.networks && n.networks.length}
+          <div class="node-nets" title="On {n.networks.join(', ')}">
+            {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
+          </div>
+        {/if}
       </div>
     {/each}
   </div>
@@ -477,6 +482,21 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.25rem;
+  }
+  .node-nets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem;
+    margin-top: 0.1rem;
+  }
+  .net-chip {
+    font-size: 0.6rem;
+    font-weight: 650;
+    background: #eef0fb;
+    border: 1px solid #dfe3f7;
+    color: #4a3bc0;
+    border-radius: var(--r-pill);
+    padding: 0.02rem 0.36rem;
   }
   .tag {
     font-size: 0.64rem;

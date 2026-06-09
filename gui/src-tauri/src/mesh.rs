@@ -13,6 +13,7 @@
 //! Everything the front-end sees comes through `allmystuff://session`
 //! snapshots emitted after each change.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -47,11 +48,17 @@ pub struct Mesh {
 
 struct State {
     session: Option<Session>,
-    /// Primary network — where route control/media operate.
+    /// Primary network — the fallback for route control/media when we don't
+    /// yet know which network a peer is on.
     network: Option<String>,
     /// Every joined network. Presence is broadcast on all of them so peers
     /// find each other regardless of which network the daemon lists first.
     networks: Vec<String>,
+    /// Which network each peer was last seen on (canonical pubkey → network
+    /// config_id). You can be on several networks at once and a given peer may
+    /// only share one of them, so control/media must be addressed to the
+    /// network that peer actually lives on — not a single "primary" mesh.
+    peer_networks: HashMap<String, String>,
     client_id: Option<ClientId>,
     profile: Option<NodeProfile>,
 }
@@ -67,6 +74,7 @@ impl Mesh {
                 session: None,
                 network: None,
                 networks: Vec::new(),
+                peer_networks: HashMap::new(),
                 client_id: None,
                 profile: None,
             }),
@@ -79,7 +87,7 @@ impl Mesh {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some((peer, frame)) = audio_rx.recv().await {
-                    let Some(network) = mesh.network() else { continue };
+                    let Some(network) = mesh.network_for_peer(&peer) else { continue };
                     let payload = match serde_json::to_value(&frame) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -101,6 +109,17 @@ impl Mesh {
 
     fn network(&self) -> Option<String> {
         self.state.lock().network.clone()
+    }
+
+    /// The network to reach `peer` on: the one we last saw them advertise on,
+    /// falling back to the primary. This is what lets a connection cross to a
+    /// peer that only shares a secondary network with us.
+    fn network_for_peer(&self, peer: &str) -> Option<String> {
+        let st = self.state.lock();
+        st.peer_networks
+            .get(pubkey_part(peer))
+            .cloned()
+            .or_else(|| st.network.clone())
     }
 
     /// This node's mesh id once known (the daemon device id), else `None`.
@@ -320,8 +339,11 @@ impl Mesh {
             "channel_inbound" => {
                 let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
                 let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                // The network this frame arrived on — so we learn which network
+                // each peer lives on and can address replies back to it.
+                let network = value.get("network").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let payload = value.get("payload").cloned().unwrap_or(Value::Null);
-                self.handle_channel(channel, from, payload).await;
+                self.handle_channel(channel, from, network, payload).await;
             }
             "event" => {
                 if let Some(event) = value.get("event") {
@@ -332,7 +354,13 @@ impl Mesh {
         }
     }
 
-    async fn handle_channel(self: &Arc<Self>, channel: &str, from: String, payload: Value) {
+    async fn handle_channel(self: &Arc<Self>, channel: &str, from: String, network: String, payload: Value) {
+        // Remember which network this peer is reachable on, so control/media
+        // we send back goes to the right one (a peer may share only one of the
+        // several networks we're on).
+        if !network.is_empty() && !from.is_empty() {
+            self.state.lock().peer_networks.insert(pubkey_part(&from).to_string(), network);
+        }
         match channel {
             CHANNEL_PRESENCE => {
                 if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
@@ -629,7 +657,7 @@ impl Mesh {
         let Some(roster) = self.ownership.fleet() else {
             return;
         };
-        let Some(network) = self.network() else {
+        let Some(network) = self.network_for_peer(peer) else {
             return;
         };
         if let Ok(payload) = serde_json::to_value(&roster) {
@@ -677,6 +705,51 @@ impl Mesh {
         Ok(self.ownership.claimable())
     }
 
+    /// Re-read the joined networks and (re)subscribe presence + owned on each,
+    /// control + media on the primary, then re-advertise. Called after the set
+    /// of networks changes (create / join / leave) or a network's transport is
+    /// restarted by a signaling/STUN/TURN edit — so the session follows the
+    /// user across *every* network they're on, not just the ones present at
+    /// launch. Re-subscribing an existing channel is idempotent on the daemon.
+    pub async fn sync_networks(self: &Arc<Self>) {
+        let client_id = { self.state.lock().client_id };
+        let Some(client_id) = client_id else { return };
+        let networks = self.fetch_networks().await;
+        let primary = networks.first().cloned();
+        {
+            let mut st = self.state.lock();
+            st.networks = networks.clone();
+            st.network = primary.clone();
+        }
+        for network in &networks {
+            for channel in [CHANNEL_PRESENCE, CHANNEL_OWNED] {
+                let _ = self
+                    .client
+                    .request(&Request::ChannelSubscribe {
+                        client_id,
+                        network: network.clone(),
+                        channel: channel.to_string(),
+                    })
+                    .await;
+            }
+        }
+        if let Some(primary) = &primary {
+            for channel in [CHANNEL_CONTROL, CHANNEL_MEDIA] {
+                let _ = self
+                    .client
+                    .request(&Request::ChannelSubscribe {
+                        client_id,
+                        network: primary.clone(),
+                        channel: channel.to_string(),
+                    })
+                    .await;
+            }
+        }
+        self.broadcast_presence().await;
+        self.broadcast_owned().await;
+        self.emit_snapshot();
+    }
+
     /// Begin carrying media for a now-active route. Only audio is wired
     /// today; the route still shows active for other media so the UI is
     /// honest about what's connected vs streaming.
@@ -708,7 +781,7 @@ impl Mesh {
     }
 
     async fn send_control(&self, peer: &str, message: &ControlMessage) {
-        let Some(network) = self.network() else { return };
+        let Some(network) = self.network_for_peer(peer) else { return };
         if let Ok(payload) = serde_json::to_value(message) {
             let _ = self
                 .client
