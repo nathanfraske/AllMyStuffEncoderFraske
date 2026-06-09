@@ -416,12 +416,36 @@ class AppStore {
     this.toast("ok", "Scanned this machine");
   }
 
+  /** Point the graph's local identity at `id`, re-homing the "this" node and
+   *  its capabilities so everything keyed by the local id (graph centring,
+   *  endpoint matching) stays consistent. The first scan can label the local
+   *  node with a placeholder id; the live session then hands us the real one,
+   *  and without this the node and `localId` drift apart — leaving the graph
+   *  with no machine in the centre. */
+  private setLocalId(id: string) {
+    if (this.localId === id) return;
+    this.localId = id;
+    const me = this.catalog.nodes.find((n) => n.kind === "this");
+    if (!me || me.id === id) return;
+    const old = me.id;
+    me.id = id;
+    // Re-key this machine's capabilities from `old` to `id`.
+    for (const c of this.catalog.capabilities) {
+      if (c.node === old) {
+        c.id = id + c.id.slice(old.length);
+        c.node = id;
+      }
+    }
+    // Fold any bare-pubkey twin of this machine into the local node.
+    this.catalog.nodes = this.catalog.nodes.filter((n) => n === me || !sameMachine(n.id, id));
+  }
+
   /** Merge a live session snapshot into the graph: presence peers become
    *  nodes (keeping any relationship the user already set), and live route
    *  states are reflected. */
   applySessionSnapshot(snap: SessionSnapshot) {
     if (!snap.ready) return;
-    if (snap.me) this.localId = snap.me;
+    if (snap.me) this.setLocalId(snap.me);
     if (snap.network !== undefined) this.sessionNetwork = snap.network ?? null;
 
     for (const p of snap.peers ?? []) {
