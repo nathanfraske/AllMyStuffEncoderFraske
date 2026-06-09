@@ -105,10 +105,19 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   workspace — the exact discipline the MyOwnMesh GUI's `control_client.rs`
   documents.
 - **`app`** — AllMyStuff's own peer-to-peer messages that ride *inside* the
-  daemon's typed channels: a `NodeProfile` presence advert, and
-  `ControlMessage`s for route setup and share negotiation. Authorization is
+  daemon's typed channels: a `NodeProfile` presence advert,
+  `ControlMessage`s for route setup and share negotiation, and the
+  `OwnedRoster` fleet gossip (`CHANNEL_OWNED`). Authorization is
   never on the wire — a node only advertises or accepts what its local
   `Catalog` already permits.
+- **The owned fleet** — claiming a device doesn't just flip a flag: the two
+  machines start sharing an `OwnedRoster` on `CHANNEL_OWNED` — the set of
+  devices one owner has claimed, all linked by a single shared **fleet key**.
+  The owner mints the key on its first claim and hands it down on each
+  adoption; every co-owned device gossips the roster and converges by version,
+  exactly like a mesh roster. For now the key only groups devices internally
+  (a later edition links it to other things). It's persisted next to the
+  ownership record.
 
 ### allmystuff-bridge
 
@@ -143,7 +152,14 @@ Tauri 2 + Svelte 5, a client of the daemon.
   shown but quieted and un-targetable, since it exposes no capabilities. The
   **remote console** (`Console.svelte`) is the pikvm-style session handle for
   a machine: a video-inputs tab bar over its screen + cameras, plus audio and
-  control toggles, each owning the real route it set up.
+  control toggles, each owning the real route it set up. The top bar's gear
+  opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks
+  (identity, create/join, approvals — folding in "add a device"), Fleet (the
+  owned roster's shared key + members), and Updates (the `allmystuff-updater`
+  controls). A device asking to join surfaces as an outlined, pulsing nudge
+  that opens the **approvals popup** (`ApprovalsPopup.svelte`) — the bilateral
+  code grid (each side's suffix + verification code) with Approve and Decline
+  (a cancel, not a deny).
 
 ## Data flow: connecting a device
 
@@ -168,6 +184,9 @@ the cryptographic identity that those grants attach to. **Device ownership**
 is already persisted there (`allmystuff-ownership.json`): the recorded owner
 survives restarts, while claim mode is deliberately transient (re-asserted
 each start by the flag) so a box never sits silently adoptable across reboots.
+That same record now also holds the **owned fleet** — the shared key and the
+roster of co-owned devices — so a fleet survives restarts and re-converges via
+gossip on the next start.
 
 ## Next milestones
 

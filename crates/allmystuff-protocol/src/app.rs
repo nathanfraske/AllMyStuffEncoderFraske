@@ -36,6 +36,13 @@ pub const CHANNEL_CONTROL: &str = "allmystuff/control/v1";
 /// all.
 pub const CHANNEL_MEDIA: &str = "allmystuff/media/v1";
 
+/// Typed-channel name for the **owned-fleet** roster gossip. When you adopt
+/// a device, the two machines start sharing an [`OwnedRoster`] on this
+/// channel — the list of devices one owner has claimed, all linked by a
+/// single shared key. It rides the daemon's typed channels exactly like
+/// presence, and converges by version the same way a mesh roster does.
+pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
@@ -83,6 +90,42 @@ pub struct NodeProfile {
     /// hasn't been put up for adoption (it defines its own owner instead).
     #[serde(default)]
     pub claimable: bool,
+}
+
+/// One device in an owned fleet — a machine the same owner has claimed, so
+/// it shares the fleet's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedMember {
+    /// The member's stable device id. Stored in canonical (bare-pubkey) form
+    /// so a display-id and bare-pubkey view of one machine collapse to a
+    /// single member.
+    pub device: NodeId,
+    /// Best-known display label for the member (cosmetic; the newest non-empty
+    /// label a gossip carries wins).
+    #[serde(default)]
+    pub label: String,
+}
+
+/// The gossiped roster of an owner's fleet: a shared key that links every
+/// co-owned device, a monotonically-increasing version for last-writer-wins
+/// convergence, and the members themselves.
+///
+/// The key is, for now, an **internal grouping secret** — every device in the
+/// fleet holds the same one, minted by the first owner to claim a device and
+/// handed down on each adoption. A later edition lets the user link that key
+/// to other things; today it exists only to group co-owned devices. It is
+/// gossiped on [`CHANNEL_OWNED`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OwnedRoster {
+    /// Shared fleet key. Empty means "no fleet yet".
+    #[serde(default)]
+    pub key: String,
+    /// Bumped on every membership change so peers converge on the newest copy.
+    #[serde(default)]
+    pub version: u64,
+    /// Every device the owner has claimed (and the owner itself).
+    #[serde(default)]
+    pub members: Vec<OwnedMember>,
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share, and
@@ -203,6 +246,37 @@ mod tests {
         let p: NodeProfile = serde_json::from_str(json).unwrap();
         assert_eq!(p.owner, None);
         assert!(!p.claimable);
+    }
+
+    #[test]
+    fn owned_roster_round_trips() {
+        let r = OwnedRoster {
+            key: "a1b2c3".into(),
+            version: 4,
+            members: vec![
+                OwnedMember {
+                    device: "my-laptop".into(),
+                    label: "My laptop".into(),
+                },
+                OwnedMember {
+                    device: "spare-nuc".into(),
+                    label: "Spare NUC".into(),
+                },
+            ],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: OwnedRoster = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn owned_roster_tolerates_a_minimal_advert() {
+        // A member from an older peer may carry just the device id.
+        let json = r#"{ "key": "k", "members": [{ "device": "d" }] }"#;
+        let r: OwnedRoster = serde_json::from_str(json).unwrap();
+        assert_eq!(r.version, 0);
+        assert_eq!(r.members.len(), 1);
+        assert_eq!(r.members[0].label, "");
     }
 
     #[test]

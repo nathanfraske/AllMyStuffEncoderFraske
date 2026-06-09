@@ -104,6 +104,14 @@ fn session_snapshot(mesh: State<'_, Arc<Mesh>>) -> Value {
     mesh.snapshot()
 }
 
+/// The owned-fleet roster: the shared key and the devices this owner has
+/// claimed (and that have converged via gossip). Drives the Fleet settings
+/// view; updated live by the `allmystuff://owned` event.
+#[tauri::command]
+fn owned_roster(mesh: State<'_, Arc<Mesh>>) -> Value {
+    mesh.owned_roster_value()
+}
+
 // ---- mesh control passthroughs ----------------------------------------
 
 #[tauri::command]
@@ -283,6 +291,7 @@ fn main() {
             claim_node,
             set_claimable,
             session_snapshot,
+            owned_roster,
             mesh_status,
             mesh_identity,
             mesh_networks,

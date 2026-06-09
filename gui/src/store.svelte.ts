@@ -30,28 +30,50 @@ import {
   meshRosterApprove,
   meshRosterList,
   meshRosterRemove,
+  onOwned,
   onOwnership,
   onSession,
   onSubscription,
+  ownedRoster,
   scanSelf,
   setClaimable,
+  updateApply,
+  updateCheck,
+  updateSetPrefs,
+  updateStatus,
   type SessionSnapshot,
 } from "./tauri";
 import {
   BUNDLE_TEMPLATES,
   isAppNode,
+  networkDisplayName,
   type Capability,
   type Catalog,
+  type CheckOutcome,
   type Flow,
   type Grant,
   type IdentityInfo,
   type MediaKind,
   type MeshNode,
   type NetworkSummary,
+  type OwnedRoster,
   type PeerInfo,
   type Relationship,
   type RosterPeer,
+  type UpdatePrefs,
+  type UpdateStatus,
 } from "./types";
+
+/** Which pane the settings panel is showing. */
+export type SettingsTab = "networks" | "updates" | "fleet";
+
+/** A device waiting to be let onto a network — surfaced across *all* joined
+ *  networks for the "new device joining" approval nudge. */
+export interface PendingJoin {
+  networkId: string;
+  networkName: string;
+  peer: PeerInfo;
+}
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -129,11 +151,13 @@ class AppStore {
   dragFrom = $state<string | null>(null);
   pendingShare = $state<PendingShare | null>(null);
   pendingGroupShare = $state<PendingGroupShare | null>(null);
-  /** The "Add a machine" onboarding sheet (real machines join the mesh; you
-   *  don't fabricate them). */
-  addMachineOpen = $state(false);
-  /** The Networks panel (identity, create/join/leave, approvals). */
-  networksOpen = $state(false);
+  /** The unified Settings panel (networks · updates · fleet) and which pane
+   *  it's showing. The top-bar gear opens it; the Networks button deep-links
+   *  to the networks pane. */
+  settingsOpen = $state(false);
+  settingsTab = $state<SettingsTab>("networks");
+  /** The "a new device wants to join" approval popup (the code-grid nudge). */
+  approvalsOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
   groupPickerFor = $state<string | null>(null); // groupId awaiting a target
   toasts = $state<Toast[]>([]);
@@ -168,6 +192,23 @@ class AppStore {
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
   livePeers = $state<PeerInfo[]>([]);
+  /** Devices waiting to join, gathered across *every* joined network — what
+   *  the approval nudge + popup act on. Refreshed by the mesh poll. */
+  pendingJoins = $state<PendingJoin[]>([]);
+  /** device ids the user declined in the popup this session. Declining is a
+   *  cancel, not a deny: the device stays listed under Settings → Networks so
+   *  it can still be approved later; it just stops nagging from the nudge. */
+  dismissedJoins = $state<string[]>([]);
+
+  // ---- owned fleet (the gossiped "Owned" roster) ------------------
+  /** The shared key + members linking the devices you've claimed. */
+  ownedFleet = $state<OwnedRoster | null>(null);
+
+  // ---- self-update -------------------------------------------------
+  updateInfo = $state<UpdateStatus | null>(null);
+  updateBusy = $state(false);
+  /** Result of the last manual "check now", for the Updates pane. */
+  updateOutcome = $state<CheckOutcome | null>(null);
 
   // ---- bundles (pre-set kits with category slots) -----------------
   /** The bundle template id currently being filled, if any. */
@@ -205,6 +246,30 @@ class AppStore {
     ),
   );
 
+  /** Pending joins (across all networks) the user hasn't declined this
+   *  session — what the top-bar nudge counts and the popup shows. */
+  freshJoins = $derived(
+    this.pendingJoins.filter((j) => !this.dismissedJoins.includes(canonicalNodeId(j.peer.device_id))),
+  );
+
+  /** Canonical pubkeys of every device in your owned fleet (you included), so
+   *  the graph/drawer can badge co-owned machines as one group. */
+  fleetMemberIds = $derived.by(() => {
+    const set = new Set<string>();
+    for (const m of this.ownedFleet?.members ?? []) set.add(canonicalNodeId(m.device));
+    return set;
+  });
+
+  /** Whether a node is part of your owned fleet (linked by the shared key). */
+  isFleetMember(nodeId: string): boolean {
+    return this.fleetMemberIds.has(canonicalNodeId(nodeId)) && this.fleetMemberIds.size > 1;
+  }
+
+  /** Whether an id refers to this very machine (any suffix form). */
+  isMe(id: string): boolean {
+    return sameMachine(id, this.localId);
+  }
+
   capsOf(nodeId: string): Capability[] {
     return this.catalog.capabilities.filter((c) => c.node === nodeId);
   }
@@ -233,10 +298,13 @@ class AppStore {
   /** Wire up live backend data, if there is a backend. No-op (keeps the
    *  demo graph) in web mode. Called once on mount. */
   async init() {
+    if (!isTauri()) this.seedDemoFleet();
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
     await this.syncMeshGraph();
+    await this.loadOwnedFleet();
+    await this.loadUpdateStatus();
     this.startMeshPolling();
     await onSubscription((s) => {
       const live = s.status === "live";
@@ -246,13 +314,19 @@ class AppStore {
         void this.hydrateFromBackend();
         void this.loadIdentity();
         void this.refreshNetworks().then(() => this.syncMeshGraph());
+        void this.loadOwnedFleet();
       }
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
+    // The fleet roster converges live — a claim, or gossip catching up, pushes
+    // a fresh copy. This is what makes a claim visibly *do* something.
+    await onOwned((r) => {
+      this.ownedFleet = r;
+    });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
-      if (o.message.kind === "claimed") this.toast("ok", `${who} is yours now`);
+      if (o.message.kind === "claimed") this.toast("ok", `${who} joined your fleet`);
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
     });
@@ -276,6 +350,7 @@ class AppStore {
     // same id presence + capabilities use, so they merge into one node.
     const live = new Map<string, { label: string; online: boolean }>();
     const rosterAll: RosterPeer[] = [];
+    const joins: PendingJoin[] = [];
     const nets = Array.isArray(this.networks) ? this.networks : [];
     for (const net of nets) {
       let peers: PeerInfo[] = [];
@@ -291,13 +366,25 @@ class AppStore {
         /* roster optional */
       }
       for (const p of peers) {
-        if (p.status === "pending_approval") continue; // shown under approvals
+        if (p.status === "pending_approval") {
+          // Surfaced as a "new device wants to join" nudge + popup, not on the
+          // graph. Gathered across every network so the nudge catches them all.
+          joins.push({ networkId: net.config_id, networkName: networkDisplayName(net), peer: p });
+          continue;
+        }
         const e = live.get(p.device_id) ?? { label: p.label?.trim() || shortId(p.device_id), online: false };
         if (p.label?.trim()) e.label = p.label.trim();
         if (p.status === "active") e.online = true;
         live.set(p.device_id, e);
       }
       rosterAll.push(...roster);
+    }
+    this.pendingJoins = joins;
+    // Forget declines for devices that are no longer pending (approved or
+    // gone), so a device that comes back later nudges afresh.
+    const pendingCanon = new Set(joins.map((j) => canonicalNodeId(j.peer.device_id)));
+    if (this.dismissedJoins.some((id) => !pendingCanon.has(id))) {
+      this.dismissedJoins = this.dismissedJoins.filter((id) => pendingCanon.has(id));
     }
     // The roster stores the bare pubkey; a live peer's id is `{pubkey}-{suffix}`.
     // Only surface a roster entry as its own offline node when no live peer
@@ -825,12 +912,40 @@ class AppStore {
       void claimNode(nodeId);
       this.toast("info", `Asking ${n.label} to join your fleet…`);
     } else {
-      // Demo/web: the claimable device accepts.
+      // Demo/web: the claimable device accepts and joins the fleet, so the
+      // "Owned" roster visibly grows under a shared key — exactly what the
+      // backend does over the wire.
       n.owner = this.localId;
       n.claimable = false;
       n.relationship = { kind: "mine" };
-      this.toast("ok", `${n.label} is yours now`);
+      this.addToDemoFleet(n);
+      this.toast("ok", `${n.label} joined your fleet`);
       this.reauthorize();
+    }
+  }
+
+  /** Demo/web only: grow the simulated fleet roster so claiming groups devices
+   *  under a shared key without a backend (the real one gossips it instead). */
+  private addToDemoFleet(node: MeshNode) {
+    const key = this.ownedFleet?.key || `demo-${Math.random().toString(16).slice(2, 10)}`;
+    const members = [...(this.ownedFleet?.members ?? [])];
+    const add = (id: string, label: string) => {
+      if (!members.some((m) => sameMachine(m.device, id))) members.push({ device: id, label });
+    };
+    const me = this.node(this.localId);
+    if (me) add(me.id, me.label);
+    add(node.id, node.label);
+    this.ownedFleet = { key, version: (this.ownedFleet?.version ?? 0) + 1, members };
+  }
+
+  /** Demo/web only: seed the fleet from the machines already marked yours, so
+   *  the Fleet view isn't empty before you claim anything in the preview. */
+  private seedDemoFleet() {
+    const members = this.catalog.nodes
+      .filter((n) => n.relationship.kind === "mine")
+      .map((n) => ({ device: n.id, label: n.label }));
+    if (members.length > 1) {
+      this.ownedFleet = { key: "demo-fleet-key-7f3a91c2", version: 1, members };
     }
   }
 
@@ -1066,6 +1181,137 @@ class AppStore {
       await this.refreshRoster(configId);
     } catch (e) {
       this.toast("warn", `Couldn't remove: ${errMsg(e)}`);
+    }
+  }
+
+  // ---- settings · approvals · fleet · updates ---------------------
+
+  /** Open the unified settings panel on a given pane. The top-bar gear opens
+   *  it on Networks; the Networks button deep-links here too. Refreshes the
+   *  pane data so it's never stale on open. */
+  openSettings(tab: SettingsTab = "networks") {
+    this.settingsTab = tab;
+    this.settingsOpen = true;
+    void this.refreshNetworks().then(() => {
+      const net = this.rosterNetwork ?? this.activeNetwork?.config_id ?? null;
+      if (net) void this.refreshRoster(net);
+    });
+    void this.loadOwnedFleet();
+    if (tab === "updates") void this.loadUpdateStatus();
+  }
+
+  /** Open the "a new device wants to join" approval popup (the code grid). */
+  openApprovals() {
+    if (this.freshJoins.length === 0) return;
+    this.approvalsOpen = true;
+  }
+
+  /** Approve a pending join straight from the popup. */
+  async approveJoin(j: PendingJoin) {
+    await this.approveDevice(j.networkId, j.peer.device_id, j.peer.label);
+    // Drop it locally so the popup updates at once (the next poll confirms).
+    this.pendingJoins = this.pendingJoins.filter(
+      (x) => !(x.networkId === j.networkId && x.peer.device_id === j.peer.device_id),
+    );
+    if (this.freshJoins.length === 0) this.approvalsOpen = false;
+  }
+
+  /** Decline a join — a *cancel*, not a deny. It stops the nudge but leaves
+   *  the device approvable later under Settings → Networks. (A real block is a
+   *  separate control, coming later.) */
+  dismissJoin(deviceId: string) {
+    const canon = canonicalNodeId(deviceId);
+    if (!this.dismissedJoins.includes(canon)) {
+      this.dismissedJoins = [...this.dismissedJoins, canon];
+    }
+    if (this.freshJoins.length === 0) this.approvalsOpen = false;
+  }
+
+  async loadOwnedFleet() {
+    if (!isTauri()) return;
+    try {
+      const r = await ownedRoster();
+      if (r) this.ownedFleet = r;
+    } catch {
+      /* no daemon yet — claim still simulates a fleet in demo mode */
+    }
+  }
+
+  async loadUpdateStatus() {
+    if (!isTauri()) return;
+    try {
+      this.updateInfo = await updateStatus();
+    } catch (e) {
+      this.toast("warn", `Couldn't read update status: ${errMsg(e)}`);
+    }
+  }
+
+  /** Check the release feed now and stage anything permitted. */
+  async checkUpdates() {
+    if (!isTauri()) {
+      this.toast("info", "Updates need the desktop app");
+      return;
+    }
+    this.updateBusy = true;
+    this.updateOutcome = null;
+    try {
+      this.updateOutcome = await updateCheck();
+      this.updateInfo = (await updateStatus()) ?? this.updateInfo;
+      this.describeCheckOutcome(this.updateOutcome);
+    } catch (e) {
+      this.toast("warn", `Update check failed: ${errMsg(e)}`);
+    } finally {
+      this.updateBusy = false;
+    }
+  }
+
+  /** Apply a staged update to disk (it takes effect on next launch). */
+  async applyUpdate() {
+    if (!isTauri()) return;
+    this.updateBusy = true;
+    try {
+      const r = await updateApply();
+      if (r?.applied) this.toast("ok", `Update ${r.applied} staged — it applies on next launch`);
+      else this.toast("info", "Nothing staged to apply");
+      this.updateInfo = (await updateStatus()) ?? this.updateInfo;
+    } catch (e) {
+      this.toast("warn", `Couldn't apply update: ${errMsg(e)}`);
+    } finally {
+      this.updateBusy = false;
+    }
+  }
+
+  async setUpdatePrefs(prefs: UpdatePrefs) {
+    if (!isTauri()) return;
+    try {
+      const next = await updateSetPrefs(prefs);
+      if (next) this.updateInfo = next;
+    } catch (e) {
+      this.toast("warn", `Couldn't save update settings: ${errMsg(e)}`);
+    }
+  }
+
+  private describeCheckOutcome(o: CheckOutcome | null) {
+    if (!o) return;
+    switch (o.outcome) {
+      case "staged":
+        this.toast("ok", `Update ${o.version} downloaded — applies on next launch`);
+        break;
+      case "up_to_date":
+        this.toast("ok", "You're on the latest version");
+        break;
+      case "policy_blocked":
+        this.toast("info", `${o.latest} is available but held by your auto-apply setting`);
+        break;
+      case "package_manager":
+        this.toast("info", "Installed via a package manager — update through it");
+        break;
+      case "disabled":
+        this.toast("info", "Auto-update is off");
+        break;
+      case "not_due":
+        this.toast("info", "Checked recently — try again shortly");
+        break;
     }
   }
 

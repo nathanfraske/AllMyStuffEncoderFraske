@@ -5,8 +5,8 @@
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
   import BundlesBar from "./BundlesBar.svelte";
-  import AddMachineSheet from "./AddMachineSheet.svelte";
-  import NetworksSheet from "./NetworksSheet.svelte";
+  import SettingsPanel from "./SettingsPanel.svelte";
+  import ApprovalsPopup from "./ApprovalsPopup.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import Console from "./Console.svelte";
   import Toasts from "./Toasts.svelte";
@@ -43,9 +43,21 @@
     </div>
 
     <div class="actions">
-      <button class="btn" onclick={() => (app.networksOpen = true)} title="Networks, identity & approvals">🌐 Networks</button>
+      <!-- A device asking to join: the outlined, pulsing nudge that opens the
+           approval popup (the code-grid panel). -->
+      {#if app.freshJoins.length > 0}
+        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your network">
+          <span class="nudge-mark" aria-hidden="true">!</span>
+          {app.freshJoins.length}
+          {app.freshJoins.length === 1 ? "device wants in" : "devices want in"}
+        </button>
+      {/if}
+      <button class="btn" onclick={() => app.openSettings("networks")} title="Networks, identity & approvals">🌐 Networks</button>
       <button class="btn" onclick={() => app.hydrateFromBackend()} title="Scan this machine">↻ Scan</button>
-      <button class="btn primary" onclick={() => (app.addMachineOpen = true)}>＋ Add machine</button>
+      <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
+        ⚙
+        {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
+      </button>
     </div>
   </header>
 
@@ -55,11 +67,11 @@
     <NodeDrawer />
   </main>
 
-  {#if app.addMachineOpen}
-    <AddMachineSheet />
+  {#if app.settingsOpen}
+    <SettingsPanel />
   {/if}
-  {#if app.networksOpen}
-    <NetworksSheet />
+  {#if app.approvalsOpen}
+    <ApprovalsPopup />
   {/if}
   <Console />
   <ShareSheet />
@@ -129,6 +141,65 @@
   .actions {
     display: flex;
     gap: 0.5rem;
+    align-items: center;
+  }
+  /* The "a device wants to join" nudge — outlined and gently pulsing, with a
+     bold exclamation, so a new device asking to join is impossible to miss
+     but never alarming. Tapping it opens the code-grid approval popup. */
+  .nudge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    border: 1.5px solid var(--warn);
+    background: #fff8ee;
+    color: #97631a;
+    padding: 0.34rem 0.7rem 0.34rem 0.5rem;
+    border-radius: var(--r-pill);
+    font-size: 0.8rem;
+    font-weight: 650;
+    box-shadow: 0 0 0 0 rgba(224, 137, 42, 0.5);
+    animation: nudge-pulse 1.8s ease-out infinite;
+  }
+  .nudge:hover {
+    background: #fdedd2;
+  }
+  .nudge-mark {
+    display: grid;
+    place-items: center;
+    width: 1.15rem;
+    height: 1.15rem;
+    border-radius: 50%;
+    background: var(--warn);
+    color: #fff;
+    font-weight: 800;
+    font-size: 0.78rem;
+    line-height: 1;
+  }
+  @keyframes nudge-pulse {
+    0% {
+      box-shadow: 0 0 0 0 rgba(224, 137, 42, 0.45);
+    }
+    70% {
+      box-shadow: 0 0 0 8px rgba(224, 137, 42, 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(224, 137, 42, 0);
+    }
+  }
+  .gear {
+    position: relative;
+    font-size: 1rem;
+    padding: 0.5rem 0.7rem;
+  }
+  .gear-badge {
+    position: absolute;
+    top: 0.3rem;
+    right: 0.35rem;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+    box-shadow: 0 0 0 2px var(--surface);
   }
   .stage {
     position: relative;

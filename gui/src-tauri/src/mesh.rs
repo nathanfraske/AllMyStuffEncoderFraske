@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
-    ClientId, ControlMessage, NodeProfile, OwnershipControl, Request, RouteControl, CHANNEL_CONTROL,
-    CHANNEL_MEDIA, CHANNEL_PRESENCE, PROTOCOL_VERSION,
+    ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RouteControl,
+    CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 use allmystuff_session::{AudioFrame, Effect, Session};
 
@@ -157,17 +157,20 @@ impl Mesh {
         if networks.is_empty() {
             self.emit_status("no_network", None);
         } else {
-            // Presence on *every* network so two machines discover each other
-            // no matter which network the daemon lists first.
+            // Presence + the owned-fleet roster on *every* network so two
+            // machines discover each other (and converge their fleet) no
+            // matter which network the daemon lists first.
             for network in &networks {
-                let _ = self
-                    .client
-                    .request(&Request::ChannelSubscribe {
-                        client_id,
-                        network: network.clone(),
-                        channel: CHANNEL_PRESENCE.to_string(),
-                    })
-                    .await;
+                for channel in [CHANNEL_PRESENCE, CHANNEL_OWNED] {
+                    let _ = self
+                        .client
+                        .request(&Request::ChannelSubscribe {
+                            client_id,
+                            network: network.clone(),
+                            channel: channel.to_string(),
+                        })
+                        .await;
+                }
             }
             // Route control + media ride the primary network.
             if let Some(primary) = &primary {
@@ -183,10 +186,12 @@ impl Mesh {
                 }
             }
             self.broadcast_presence().await;
+            self.broadcast_owned().await;
             self.emit_status("live", None);
         }
 
-        // Periodic presence re-broadcast so late joiners see us.
+        // Periodic presence + owned-roster re-broadcast so late joiners see us
+        // and the fleet converges.
         {
             let mesh = self.clone();
             tauri::async_runtime::spawn(async move {
@@ -194,6 +199,7 @@ impl Mesh {
                 loop {
                     tick.tick().await;
                     mesh.broadcast_presence().await;
+                    mesh.broadcast_owned().await;
                 }
             });
         }
@@ -357,6 +363,18 @@ impl Mesh {
                     self.audio.feed(&frame.route, &frame);
                 }
             }
+            CHANNEL_OWNED => {
+                // A peer gossiped its fleet roster. Merge it; if our copy
+                // changed (a new member, or we adopted the key as a freshly
+                // adopted device), re-broadcast so the fleet converges and
+                // tell the front-end.
+                if let Ok(roster) = serde_json::from_value::<OwnedRoster>(payload) {
+                    if self.ownership.merge_fleet(&roster) {
+                        self.broadcast_owned().await;
+                        self.emit_owned();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -501,8 +519,35 @@ impl Mesh {
                     self.refresh_profile_ownership().await;
                 }
             }
+            OwnershipControl::Claimed { owner } => {
+                // The device we claimed (`from`) accepted us as its owner.
+                // Make the claim *do* something durable: establish or extend
+                // the owned fleet — mint our key on the first adoption, add
+                // ourselves and the new device, hand the full roster straight
+                // to it, and gossip so every co-owned device converges on the
+                // same key + membership. This is the "Owned roster" linking the
+                // fleet under a shared key.
+                self.ownership.ensure_fleet_key();
+                if let Some(me) = self.local_node_id() {
+                    let my_label = self.profile_label().unwrap_or_else(|| me.clone());
+                    self.ownership.upsert_member(&me, &my_label);
+                }
+                let label = self.peer_label(&from);
+                self.ownership.upsert_member(from.as_str(), &label);
+                self.send_owned_to(from.as_str()).await;
+                self.broadcast_owned().await;
+                self.emit_owned();
+                // Surface the claim feedback for the claimer's toast, too.
+                let _ = self.app.emit(
+                    "allmystuff://ownership",
+                    json!({
+                        "from": from.to_string(),
+                        "message": OwnershipControl::Claimed { owner },
+                    }),
+                );
+            }
             other => {
-                // Claimed / Declined — feedback for the claimer's UI.
+                // Declined — feedback for the claimer's UI.
                 let _ = self.app.emit(
                     "allmystuff://ownership",
                     json!({ "from": from.to_string(), "message": other }),
@@ -523,6 +568,96 @@ impl Mesh {
         }
         self.broadcast_presence().await;
         self.emit_snapshot();
+    }
+
+    // ---- owned fleet gossip ------------------------------------------
+
+    /// This node's current display label from the live presence profile.
+    fn profile_label(&self) -> Option<String> {
+        self.state.lock().profile.as_ref().map(|p| p.label.clone())
+    }
+
+    /// Best-known display label for a peer (matched by canonical pubkey, since
+    /// the daemon delivers a bare pubkey while presence is keyed by display
+    /// id), else a short id. Gives fleet members a friendly name.
+    fn peer_label(&self, peer: &NodeId) -> String {
+        let canon = pubkey_part(peer.as_str());
+        {
+            let st = self.state.lock();
+            if let Some(session) = st.session.as_ref() {
+                for p in session.peers() {
+                    if pubkey_part(p.node.as_str()) == canon && !p.label.trim().is_empty() {
+                        return p.label.clone();
+                    }
+                }
+            }
+        }
+        let s = peer.as_str();
+        if s.len() > 12 {
+            format!("{}…", &s[..10])
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// Broadcast this device's fleet roster (if any) on the owned channel to
+    /// every network, so co-owned devices converge on one key + membership.
+    async fn broadcast_owned(&self) {
+        let Some(roster) = self.ownership.fleet() else {
+            return;
+        };
+        let networks = { self.state.lock().networks.clone() };
+        let Ok(payload) = serde_json::to_value(&roster) else {
+            return;
+        };
+        for network in networks {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendAll {
+                    network,
+                    channel: CHANNEL_OWNED.to_string(),
+                    payload: payload.clone(),
+                })
+                .await;
+        }
+    }
+
+    /// Send this device's fleet roster straight to one peer — used right after
+    /// a claim so the new device gets the key + membership immediately, before
+    /// the next periodic broadcast.
+    async fn send_owned_to(&self, peer: &str) {
+        let Some(roster) = self.ownership.fleet() else {
+            return;
+        };
+        let Some(network) = self.network() else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_value(&roster) {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_OWNED.to_string(),
+                    peer: peer.to_string(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    /// Push the current fleet roster to the front-end.
+    fn emit_owned(&self) {
+        let _ = self.app.emit("allmystuff://owned", self.owned_roster_value());
+    }
+
+    /// The current fleet roster as JSON — for the `owned_roster` command and
+    /// the `allmystuff://owned` event. An empty key/members when there's no
+    /// fleet yet, so the front-end always gets a well-formed shape.
+    pub fn owned_roster_value(&self) -> Value {
+        match self.ownership.fleet() {
+            Some(r) => serde_json::to_value(r).unwrap_or_else(|_| empty_owned()),
+            None => empty_owned(),
+        }
     }
 
     /// Front-end command: claim `node` as owned by this device. Only the
@@ -597,6 +732,11 @@ impl Mesh {
             json!({ "status": status, "error": error }),
         );
     }
+}
+
+/// A well-formed but empty owned roster (no fleet yet).
+fn empty_owned() -> Value {
+    json!({ "key": "", "version": 0, "members": [] })
 }
 
 /// Node id from a capability id (`"<node>:<device>"`). The node segment is

@@ -285,6 +285,7 @@
           {:else if shared}<span class="tag guest">guest</span>
           {:else if unclaimed}<span class="tag unclaimed">{n.claimable ? "claimable" : "unclaimed"}</span>
           {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
+          {#if app.isFleetMember(n.id)}<span class="tag fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
@@ -504,6 +505,10 @@
     background: var(--surface-2);
     color: var(--ink-soft);
     border: 1px dashed var(--line-strong);
+  }
+  .tag.fleet {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
   }
   .tag.meshonly {
     background: var(--surface-2);

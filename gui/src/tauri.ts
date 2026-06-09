@@ -5,12 +5,16 @@
 
 import type {
   Capability,
+  CheckOutcome,
   IdentityInfo,
   InventorySummary,
   MediaKind,
   NetworkSummary,
+  OwnedRoster,
   PeerInfo,
   RosterPeer,
+  UpdatePrefs,
+  UpdateStatus,
 } from "./types";
 
 interface ScanResult {
@@ -108,6 +112,43 @@ export async function onOwnership(
 
 export function sessionSnapshot(): Promise<SessionSnapshot | null> {
   return tryInvoke<SessionSnapshot>("session_snapshot");
+}
+
+// ---- owned fleet (the "Owned" roster) ---------------------------------
+
+/** The current owned-fleet roster (shared key + members). Null in web mode —
+ *  the store simulates a fleet on the demo graph. */
+export function ownedRoster(): Promise<OwnedRoster | null> {
+  return tryInvoke<OwnedRoster>("owned_roster");
+}
+
+/** Subscribe to live fleet-roster updates (after a claim, or when gossip
+ *  converges). Returns an unlisten fn (no-op in web mode). */
+export async function onOwned(cb: (r: OwnedRoster) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<OwnedRoster>("allmystuff://owned", (e) => cb(e.payload));
+}
+
+// ---- self-update -------------------------------------------------------
+//
+// These degrade to null in web mode (no backend), so the Updates settings
+// section can render a friendly "desktop only" note instead of throwing.
+
+export function updateStatus(): Promise<UpdateStatus | null> {
+  return tryInvoke<UpdateStatus>("update_status");
+}
+
+export function updateCheck(): Promise<CheckOutcome | null> {
+  return tryInvoke<CheckOutcome>("update_check");
+}
+
+export function updateApply(): Promise<{ applied: string | null } | null> {
+  return tryInvoke<{ applied: string | null }>("update_apply");
+}
+
+export function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus | null> {
+  return tryInvoke<UpdateStatus>("update_set_prefs", { prefs });
 }
 
 /** Subscribe to live session snapshots. Returns an unlisten fn (or a no-op
