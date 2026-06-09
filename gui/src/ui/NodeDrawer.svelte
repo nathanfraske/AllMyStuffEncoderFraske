@@ -118,6 +118,7 @@
           {:else}
             <span class="pill mine">yours</span>
           {/if}
+          {#if app.isFleetMember(node.id)}<span class="pill fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
           <span class="state" class:on={node.online}>{node.online ? "online" : "offline"}</span>
         </div>
       </div>
@@ -217,6 +218,9 @@
         <p class="muted own-note">
           {node.kind === "this" ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
+        {#if app.isFleetMember(node.id)}
+          <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 Part of your fleet — see the shared key →</button>
+        {/if}
         {#if node.kind === "this"}
           <!-- Hand this machine off: put it into claim mode so another of
                your devices can adopt it (Task 4). -->
@@ -354,6 +358,10 @@
   .pill.soft {
     background: var(--surface-2);
     color: var(--ink-soft);
+  }
+  .pill.fleet {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
   }
   .claim {
     display: flex;

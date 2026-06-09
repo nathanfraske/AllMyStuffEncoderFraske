@@ -151,7 +151,10 @@ export interface RosterPeer {
 }
 
 /** A live peer on a network (from `mesh_peers`). We only surface the bits the
- *  approvals UI needs; `status === "pending_approval"` is the one to act on. */
+ *  approvals UI needs; `status === "pending_approval"` is the one to act on.
+ *  The suffix + the two verification codes are the four cells of the approval
+ *  code grid; `local_approve_sent` / `remote_approve_seen` drive the
+ *  fresh / waiting-for-peer / confirm states (mirrors the daemon's PeerInfo). */
 export interface PeerInfo {
   device_id: string;
   label: string;
@@ -159,6 +162,72 @@ export interface PeerInfo {
   device_suffix?: string;
   verification_code_received?: string | null;
   verification_code_sent?: string | null;
+  local_approve_sent?: boolean;
+  remote_approve_seen?: boolean;
+}
+
+// ---- owned fleet (the gossiped "Owned" roster) ------------------------
+
+/** One device in your owned fleet — a machine you claimed, sharing the
+ *  fleet's key. `device` is the canonical (bare-pubkey) id; the graph
+ *  reconciles it to the right node. */
+export interface OwnedMember {
+  device: string;
+  label: string;
+}
+
+/** The fleet roster (from `owned_roster` / the `allmystuff://owned` event):
+ *  the shared key that links your co-owned devices and the members it links.
+ *  An empty `key` means you haven't claimed anything yet. */
+export interface OwnedRoster {
+  key: string;
+  version: number;
+  members: OwnedMember[];
+}
+
+// ---- self-update (mirrors `allmystuff-updater`) -----------------------
+
+export type InstallKind = "raw" | "package_manager";
+
+/** Updater status (from `update_status`). */
+export interface UpdateStatus {
+  current_version: string;
+  install_kind: InstallKind;
+  enabled: boolean;
+  /** "stable" | "beta". */
+  channel: string;
+  /** Auto-apply policy: "patch" | "minor" | "all" | "none". */
+  auto_apply: string;
+  check_interval_hours: number;
+  last_check_at: number | null;
+  staged_version: string | null;
+  release_url: string;
+  release_url_overridden: boolean;
+}
+
+/** Result of a manual check (from `update_check`). Tagged on `outcome`. */
+export interface CheckOutcome {
+  outcome:
+    | "disabled"
+    | "package_manager"
+    | "not_due"
+    | "up_to_date"
+    | "policy_blocked"
+    | "staged";
+  current?: string;
+  latest?: string;
+  policy?: string;
+  version?: string;
+}
+
+/** The bits of updater config the UI can change (sent to `update_set_prefs`). */
+export interface UpdatePrefs {
+  enabled?: boolean;
+  channel?: string;
+  auto_apply?: string;
+  check_interval_hours?: number;
+  stable_url?: string;
+  beta_url?: string;
 }
 
 // ---- bundles (pre-set kits with category slots) -----------------------
