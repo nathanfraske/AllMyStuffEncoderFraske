@@ -457,9 +457,11 @@ impl Mesh {
             OwnershipControl::Claim { owner } => {
                 // The owner of record is the *authenticated sender* the mesh
                 // delivered (`from`), never an arbitrary value in the body —
-                // otherwise a peer could claim a box "for" someone else. We
-                // accept the body only when it's self-asserted (owner == from).
-                let reply = if owner.as_str() != from.as_str() {
+                // otherwise a peer could claim a box "for" someone else. The
+                // claimer asserts its display id while the daemon delivers the
+                // bare pubkey, so compare by pubkey (self-asserted) and record
+                // the authenticated `from`.
+                let reply = if pubkey_part(owner.as_str()) != pubkey_part(from.as_str()) {
                     OwnershipControl::Declined {
                         reason: "a claim must be self-asserted".into(),
                     }
@@ -477,8 +479,10 @@ impl Mesh {
                     .await;
             }
             OwnershipControl::Release => {
-                // The recorded owner is letting this device go.
-                if self.ownership.owner().as_deref() == Some(from.as_str()) {
+                // The recorded owner is letting this device go (compare by
+                // pubkey — same display-vs-bare id reconciliation as Claim).
+                let owner = self.ownership.owner();
+                if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
                     self.ownership.set_owner(None);
                     self.refresh_profile_ownership().await;
                 }
@@ -585,6 +589,20 @@ impl Mesh {
 /// everything before the first colon.
 fn node_of(cap_id: &str) -> String {
     cap_id.split_once(':').map(|(n, _)| n.to_string()).unwrap_or_else(|| cap_id.to_string())
+}
+
+/// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing
+/// 5-char display suffix (`-AB12C`). Mirrors the core's `signing::pubkey_part`,
+/// so a device id in display form (`pubkey-SUFFIX`, what `IdentityShow` and
+/// presence use) and bare form (`pubkey`, what the daemon delivers as a
+/// channel `from`) compare equal.
+fn pubkey_part(id: &str) -> &str {
+    if let Some((body, suffix)) = id.rsplit_once('-') {
+        if suffix.len() == 5 && suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return body;
+        }
+    }
+    id
 }
 
 fn parse_media(s: &str) -> MediaKind {

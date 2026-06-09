@@ -251,7 +251,7 @@ class AppStore {
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
     await onOwnership((o) => {
-      const who = this.node(o.from)?.label ?? "A device";
+      const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
       if (o.message.kind === "claimed") this.toast("ok", `${who} is yours now`);
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
@@ -362,39 +362,40 @@ class AppStore {
     const newId = scan.node_id || "this";
     this.localId = newId;
 
-    // Adopt this machine as "this device". Match the local node by its new
-    // id or its previous one, so a re-scan (once the mesh id is known)
-    // re-homes the same node rather than adding a duplicate.
+    // Adopt this machine as "this device". Find the one true local node —
+    // by its new id, else *the* existing "this" node (its id may have drifted
+    // from `localId` after a session snapshot), else its previous id — and
+    // re-home that one rather than spawning a duplicate.
     const host = scan.hostname || scan.label || "This device";
     // Display name follows the naming rule: the override if the user set one,
     // else the machine hostname.
     const label = this.identity?.label?.trim() || host;
-    const me =
+    const existing =
       this.catalog.nodes.find((n) => n.id === newId) ??
-      this.catalog.nodes.find((n) => n.id === prevId && n.kind === "this");
-    if (me) {
-      me.id = newId;
-      me.kind = "this";
-      me.label = label;
-      me.hostname = host;
-      me.summary = scan.summary;
-      me.app = true;
-    } else {
-      this.catalog.nodes.push({
-        id: newId,
-        label,
-        hostname: host,
-        kind: "this",
-        relationship: { kind: "mine" },
-        online: true,
-        app: true,
-        summary: scan.summary,
-      });
-    }
-    // If an early daemon poll (before we knew our real id) added this same
-    // machine as a bare-pubkey peer node, drop that twin now.
+      this.catalog.nodes.find((n) => n.kind === "this") ??
+      this.catalog.nodes.find((n) => n.id === prevId);
+    const me: MeshNode = existing ?? {
+      id: newId,
+      label,
+      hostname: host,
+      kind: "this",
+      relationship: { kind: "mine" },
+      online: true,
+      app: true,
+      summary: scan.summary,
+    };
+    me.id = newId;
+    me.kind = "this";
+    me.label = label;
+    me.hostname = host;
+    me.summary = scan.summary;
+    me.online = true;
+    me.app = true;
+    if (!existing) this.catalog.nodes.push(me);
+    // Exactly one local node: drop any other "this" node and any peer twin of
+    // this machine (an early daemon poll may have added it under a bare id).
     this.catalog.nodes = this.catalog.nodes.filter(
-      (n) => n.kind === "this" || !sameMachine(n.id, newId),
+      (n) => n === me || (n.kind !== "this" && !sameMachine(n.id, newId)),
     );
     // Local capabilities are exactly what the scan reports; drop any tied to
     // the old or new local id so a re-scan replaces rather than accumulates.
@@ -765,11 +766,14 @@ class AppStore {
   claim(nodeId: string) {
     const n = this.node(nodeId);
     if (!n) return;
-    if (n.owner && n.owner !== this.localId) {
+    // Compare ownership by canonical pubkey: the device advertises its owner
+    // as a bare-pubkey id, while our `localId` is the display id.
+    const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
+    if (n.owner && !ownedByMe) {
       this.toast("warn", `${n.label} is owned by another device — you can't take it`);
       return;
     }
-    if (!n.claimable && n.owner !== this.localId) {
+    if (!n.claimable && !ownedByMe) {
       this.toast(
         "warn",
         `${n.label} isn't in claim mode. Start it claimable on the device itself to adopt it.`,
