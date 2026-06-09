@@ -32,14 +32,21 @@
     <div class="summary">
       <span class="chip"><b>{app.mineCount}</b> yours</span>
       <span class="chip"><b>{app.sharedCount}</b> shared</span>
-      <span class="chip net" class:live={app.backendConnected && !!app.activeNetwork}>
+      <button
+        class="chip net"
+        class:live={app.backendConnected && app.networks.length > 0}
+        onclick={() => app.openSettings("networks")}
+        title="Manage your networks"
+      >
         <span class="net-dot"></span>
         {!app.backendConnected
           ? "demo mode"
-          : app.activeNetwork
-            ? networkDisplayName(app.activeNetwork)
-            : "no network"}
-      </span>
+          : app.networks.length > 1
+            ? `${app.networks.length} networks`
+            : app.activeNetwork
+              ? networkDisplayName(app.activeNetwork)
+              : "no network"}
+      </button>
     </div>
 
     <div class="actions">

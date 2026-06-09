@@ -137,10 +137,42 @@ async fn mesh_peers(state: State<'_, AppState>, network: String) -> Result<Value
 }
 
 #[tauri::command]
-async fn mesh_network_add(state: State<'_, AppState>, config: Value) -> Result<Value, String> {
-    unwrap_response(
+async fn mesh_network_add(
+    state: State<'_, AppState>,
+    mesh: State<'_, Arc<Mesh>>,
+    config: Value,
+) -> Result<Value, String> {
+    let data = unwrap_response(
         state.client.request(&Request::NetworkAdd { config }).await.map_err(|e| e.to_string())?,
-    )
+    )?;
+    // Subscribe + advertise on the freshly-joined network now, not just at
+    // next launch — so a network joined mid-session lights up immediately.
+    mesh.inner().sync_networks().await;
+    Ok(data)
+}
+
+/// The whole daemon config — every network with its full signaling / STUN /
+/// TURN settings. The Servers settings pane reads this to populate its editor
+/// (`NetworksList` only carries summaries).
+#[tauri::command]
+async fn mesh_config_show(state: State<'_, AppState>) -> Result<Value, String> {
+    unwrap_response(state.client.request(&Request::ConfigShow).await.map_err(|e| e.to_string())?)
+}
+
+/// Replace one network's config (its signaling / STUN / TURN servers, label,
+/// etc.). The daemon hot-applies cosmetic changes and restarts the transport
+/// for server changes; we re-subscribe afterwards so the session reconnects.
+#[tauri::command]
+async fn mesh_network_update(
+    state: State<'_, AppState>,
+    mesh: State<'_, Arc<Mesh>>,
+    config: Value,
+) -> Result<Value, String> {
+    let data = unwrap_response(
+        state.client.request(&Request::NetworkUpdate { config }).await.map_err(|e| e.to_string())?,
+    )?;
+    mesh.inner().sync_networks().await;
+    Ok(data)
 }
 
 #[tauri::command]
@@ -191,10 +223,16 @@ async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<Value, S
 }
 
 #[tauri::command]
-async fn mesh_network_remove(state: State<'_, AppState>, network: String) -> Result<Value, String> {
-    unwrap_response(
+async fn mesh_network_remove(
+    state: State<'_, AppState>,
+    mesh: State<'_, Arc<Mesh>>,
+    network: String,
+) -> Result<Value, String> {
+    let data = unwrap_response(
         state.client.request(&Request::NetworkRemove { network }).await.map_err(|e| e.to_string())?,
-    )
+    )?;
+    mesh.inner().sync_networks().await;
+    Ok(data)
 }
 
 /// Set this device's display-name override. Persists in the daemon identity
@@ -298,6 +336,8 @@ fn main() {
             mesh_peers,
             mesh_network_add,
             mesh_network_remove,
+            mesh_network_update,
+            mesh_config_show,
             mesh_network_id_generate,
             mesh_roster_approve,
             mesh_roster_remove,

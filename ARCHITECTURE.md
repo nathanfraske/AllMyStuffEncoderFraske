@@ -153,13 +153,28 @@ Tauri 2 + Svelte 5, a client of the daemon.
   **remote console** (`Console.svelte`) is the pikvm-style session handle for
   a machine: a video-inputs tab bar over its screen + cameras, plus audio and
   control toggles, each owning the real route it set up. The top bar's gear
-  opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks
-  (identity, create/join, approvals — folding in "add a device"), Fleet (the
-  owned roster's shared key + members), and Updates (the `allmystuff-updater`
-  controls). A device asking to join surfaces as an outlined, pulsing nudge
+  opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
+  Fleet (the owned roster's shared key + members), and Updates (the
+  `allmystuff-updater` controls). The **Networks** tab is itself split into
+  sub-tabs (MyOwnLLM-style): **Status** (identity, create/join, approvals,
+  add-a-device), **Servers** (per-network signaling / STUN / TURN, defaulting
+  to MyOwnMesh's reference servers), and **Devices** (every machine and which
+  network(s) it's on). Multiple networks are first-class — you're joined to
+  however many, a peer may share only some, and the graph, drawer, and top bar
+  all show the per-device network membership rather than pretending it's one
+  flat mesh. A device asking to join surfaces as an outlined, pulsing nudge
   that opens the **approvals popup** (`ApprovalsPopup.svelte`) — the bilateral
   code grid (each side's suffix + verification code) with Approve and Decline
   (a cancel, not a deny).
+
+  New/joined networks default their signaling relay + STUN + TURN to
+  MyOwnMesh's semi-public reference servers (`wss://myownmesh.com`,
+  `stun:stun.myownmesh.com:3478`, `turn:turn.myownmesh.com:3478` with the
+  shared `guest` credential) so two devices rendezvous on the *same* relay and
+  traverse NAT out of the box — and any of them is editable per network. The
+  backend learns which network each peer lives on (from the channel a frame
+  arrives on) and addresses control/media there, so a connection follows a
+  device onto whichever network you actually share with it.
 
 ## Data flow: connecting a device
 

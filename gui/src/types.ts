@@ -83,6 +83,10 @@ export interface MeshNode {
   /** `true` when the device is in claim mode and unowned — it's offering
    *  itself for adoption, the only state in which a claim takes. */
   claimable?: boolean;
+  /** Friendly names of the networks this device has been seen on. You can be
+   *  on several networks at once and a device may share only some of them, so
+   *  the graph shows which — it's never just "the" mesh. */
+  networks?: string[];
 }
 
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
@@ -136,7 +140,7 @@ export interface NetworkSummary {
 /** Friendly name for a network: cosmetic label, else the joinable id, else
  *  the internal config id. */
 export function networkDisplayName(n: {
-  label?: string;
+  label?: string | null;
   network_id?: string;
   config_id?: string;
 }): string {
@@ -148,6 +152,46 @@ export interface RosterPeer {
   device_id: string;
   label: string;
   approved_at?: number;
+}
+
+// ---- per-network transport config (signaling · STUN · TURN) -----------
+//
+// The daemon's NetworkConfig shape, round-tripped via `mesh_config_show` /
+// `mesh_network_update`. Loosely typed — we preserve fields we don't edit.
+
+export interface StunServerCfg {
+  urls: string[];
+}
+export interface TurnServerCfg {
+  urls: string[];
+  username?: string | null;
+  credential?: string | null;
+}
+export interface SignalingCfg {
+  kind?: string;
+  servers?: string[];
+  redundancy?: number;
+  denylist?: string[];
+  public_fallback?: boolean;
+}
+/** A full network config as the daemon stores it. We only edit the server
+ *  fields; everything else is preserved on round-trip. */
+export interface NetworkConfigFull {
+  id: string;
+  network_id: string;
+  label?: string | null;
+  signaling?: SignalingCfg;
+  stun_servers?: StunServerCfg[];
+  turn_servers?: TurnServerCfg[];
+  [key: string]: unknown;
+}
+
+/** A TURN entry as the Servers editor works with it (one url + optional
+ *  creds), mapped to/from the daemon's `{ urls: [...] }` shape. */
+export interface TurnEntry {
+  url: string;
+  username: string;
+  credential: string;
 }
 
 /** A live peer on a network (from `mesh_peers`). We only surface the bits the
