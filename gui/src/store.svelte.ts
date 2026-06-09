@@ -402,10 +402,13 @@ class AppStore {
     me.online = true;
     me.app = true;
     if (!existing) this.catalog.nodes.push(me);
-    // Exactly one local node: drop any other "this" node and any peer twin of
-    // this machine (an early daemon poll may have added it under a bare id).
+    // Exactly one local node: keep the one at `newId`, drop any other "this"
+    // node and any peer twin of this machine (an early daemon poll may have
+    // added it under a bare id). Match by id, never by reference — a node just
+    // pushed into the `$state` array comes back as a proxy, so `n === me`
+    // would be false and would silently delete the local node.
     this.catalog.nodes = this.catalog.nodes.filter(
-      (n) => n === me || (n.kind !== "this" && !sameMachine(n.id, newId)),
+      (n) => n.id === newId || (n.kind !== "this" && !sameMachine(n.id, newId)),
     );
     // Local capabilities are exactly what the scan reports; drop any tied to
     // the old or new local id so a re-scan replaces rather than accumulates.
@@ -436,8 +439,9 @@ class AppStore {
         c.node = id;
       }
     }
-    // Fold any bare-pubkey twin of this machine into the local node.
-    this.catalog.nodes = this.catalog.nodes.filter((n) => n === me || !sameMachine(n.id, id));
+    // Fold any bare-pubkey twin of this machine into the local node. Match by
+    // id, not reference (`$state` proxies the array's objects).
+    this.catalog.nodes = this.catalog.nodes.filter((n) => n.id === id || !sameMachine(n.id, id));
   }
 
   /** Merge a live session snapshot into the graph: presence peers become
@@ -486,9 +490,11 @@ class AppStore {
         node.relationship = { kind: "mine" };
       }
       // Collapse any other view of this same machine into the one node we just
-      // settled on — heals an already-split graph.
+      // settled on (id `p.node`) — heals an already-split graph. Match by id,
+      // not reference: a freshly-pushed node is proxied by `$state`, so
+      // `n === node` would be false and would delete the peer we just added.
       this.catalog.nodes = this.catalog.nodes.filter(
-        (n) => n === node || !sameMachine(n.id, p.node),
+        (n) => n.id === p.node || !sameMachine(n.id, p.node),
       );
       // Refresh this peer's capabilities.
       this.catalog.capabilities = [

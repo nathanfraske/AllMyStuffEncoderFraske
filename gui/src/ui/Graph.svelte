@@ -38,7 +38,7 @@
     // before a scan re-homes the node off its first-scan placeholder, and we
     // must never leave the centre empty with "me" stranded out on the ring.
     const me = nodes.find((n) => n.kind === "this") ?? nodes.find((n) => n.id === app.localId);
-    const others = nodes.filter((n) => n !== me);
+    const others = nodes.filter((n) => n.id !== me?.id);
     others.sort((a, b) => {
       const rank = (n: MeshNode) => (n.relationship.kind === "mine" ? 0 : 1);
       return rank(a) - rank(b) || a.label.localeCompare(b.label);
