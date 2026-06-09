@@ -218,6 +218,13 @@ pub struct Display {
     /// `true` for built-in panels (eDP / LVDS / DSI) — a laptop screen
     /// rather than an external monitor.
     pub internal: bool,
+    /// `true` for the machine's **current default** display in this
+    /// category — the primary screen the OS would drive first. Exactly one
+    /// connected display is marked per scan (the built-in panel when there
+    /// is one, else the first connected output). `#[serde(default)]` so an
+    /// older snapshot/peer without the field still decodes.
+    #[serde(default)]
+    pub default: bool,
 }
 
 // ---- audio ------------------------------------------------------------
@@ -234,6 +241,14 @@ pub struct AudioDevice {
     /// ALSA card index / CoreAudio uid / WASAPI id — for debugging and
     /// stable id derivation.
     pub card: Option<String>,
+    /// `true` for the machine's **current default** device of this
+    /// direction — the mic the OS captures from / the speaker it plays to
+    /// by default. Exactly one input and one output are marked per scan
+    /// (the default ALSA card on Linux; the system default elsewhere).
+    /// A desktop sound server can route elsewhere at runtime, but this is
+    /// the default the scan can see. `#[serde(default)]` for older peers.
+    #[serde(default)]
+    pub default: bool,
 }
 
 impl AudioDevice {
@@ -260,6 +275,10 @@ pub struct Camera {
     pub name: String,
     /// Device node on Unix (`/dev/video0`). Informational on other OSes.
     pub path: Option<String>,
+    /// `true` for the machine's **current default** camera — the first
+    /// capture node the OS would open. `#[serde(default)]` for older peers.
+    #[serde(default)]
+    pub default: bool,
 }
 
 // ---- input ------------------------------------------------------------

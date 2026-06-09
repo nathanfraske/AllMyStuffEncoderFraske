@@ -36,6 +36,10 @@ export interface SessionSnapshot {
     hostname?: string;
     summary: InventorySummary;
     capabilities: Capability[];
+    /** From the peer's presence advert (Task 4): who owns it, and whether
+     *  it's currently offering itself for adoption. */
+    owner?: string | null;
+    claimable?: boolean;
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -74,6 +78,32 @@ export function connectRoute(from: string, to: string, media: MediaKind): Promis
 
 export function disconnectRoute(routeId: string): Promise<null> {
   return tryInvoke("disconnect_route", { routeId });
+}
+
+/** Claim a device as yours. The claim only takes if that device is in claim
+ *  mode; its next presence advert (owner = us) confirms it. Returns null in
+ *  web mode (the store simulates the claim on the demo graph). */
+export function claimNode(node: string): Promise<null> {
+  return tryInvoke("claim_node", { node });
+}
+
+/** Put this device into / out of claim mode so another of your machines can
+ *  adopt it. Returns whether it's now claimable (null in web mode). */
+export function setClaimable(claimable: boolean): Promise<boolean | null> {
+  return tryInvoke<boolean>("set_claimable", { claimable });
+}
+
+/** Ownership feedback from the mesh — a `claimed` / `declined` reply to a
+ *  claim we sent. No-op listener in web mode. */
+export async function onOwnership(
+  cb: (o: { from: string; message: { kind: string; reason?: string } }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string; message: { kind: string; reason?: string } }>(
+    "allmystuff://ownership",
+    (e) => cb(e.payload),
+  );
 }
 
 export function sessionSnapshot(): Promise<SessionSnapshot | null> {

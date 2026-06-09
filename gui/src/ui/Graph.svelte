@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
-  import { displayName, mediaColor, humanBytes, type MediaKind } from "../types";
+  import { displayName, mediaColor, humanBytes, isAppNode, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
 
   // Canvas size tracked via ResizeObserver so the layout fits its
@@ -145,6 +145,9 @@
   }
 
   function nodeAvatar(n: MeshNode): string {
+    // A device on the mesh that isn't running AllMyStuff reads as a bare
+    // endpoint, not a fleshed-out machine.
+    if (!isAppNode(n)) return "📡";
     if (n.relationship.kind === "shared") return "🧑";
     const os = (n.summary?.os ?? "").toLowerCase();
     if (n.kind === "this") return "💻";
@@ -156,14 +159,26 @@
   }
 
   // Whether a node is a valid action target right now (connect drop or
-  // group destination) — drives the pulsing highlight.
+  // group destination) — drives the pulsing highlight. A device must be
+  // running AllMyStuff and already claimed to be a target.
   const armed = $derived(!!app.dragFrom || !!app.groupPickerFor);
+  function targetable(n: MeshNode): boolean {
+    return isAppNode(n) && n.relationship.kind !== "unclaimed";
+  }
 
   function onNodeClick(n: MeshNode) {
-    if (app.dragFrom) {
-      app.dropConnectOnNode(n.id);
-    } else if (app.groupPickerFor) {
-      app.connectGroupTo(app.groupPickerFor, n.id);
+    if (app.dragFrom || app.groupPickerFor) {
+      // Mesh-only and not-yet-claimed nodes aren't connection targets.
+      if (!isAppNode(n)) {
+        app.toast("warn", `${n.label} isn't running AllMyStuff`);
+        return;
+      }
+      if (n.relationship.kind === "unclaimed") {
+        app.toast("warn", `Claim ${n.label} first — open it to adopt it`);
+        return;
+      }
+      if (app.dragFrom) app.dropConnectOnNode(n.id);
+      else if (app.groupPickerFor) app.connectGroupTo(app.groupPickerFor, n.id);
     } else {
       app.selectNode(app.selectedNodeId === n.id ? null : n.id);
     }
@@ -216,14 +231,16 @@
       {@const n = p.node}
       {@const shared = n.relationship.kind === "shared"}
       {@const unclaimed = n.relationship.kind === "unclaimed"}
+      {@const meshonly = !isAppNode(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
         class:self={n.kind === "this"}
         class:shared
         class:unclaimed
+        class:meshonly
         class:selected={app.selectedNodeId === n.id}
-        class:armed
+        class:armed={armed && targetable(n)}
         class:offline={!n.online}
         style="left: {p.x - NODE_W / 2}px; top: {p.y - NODE_H / 2}px; width: {NODE_W}px; min-height: {NODE_H}px;"
         onclick={(e) => {
@@ -247,6 +264,8 @@
             <div class="node-sub">
               {#if shared && n.relationship.kind === "shared"}
                 shared with {n.relationship.person.name}
+              {:else if meshonly}
+                on the mesh · not running AllMyStuff
               {:else if n.summary}
                 {n.summary.cpu}
               {:else}
@@ -258,8 +277,9 @@
         </div>
         <div class="node-meta">
           {#if n.kind === "this"}<span class="tag you">this device</span>{/if}
-          {#if shared}<span class="tag guest">guest</span>
-          {:else if unclaimed}<span class="tag unclaimed">unclaimed</span>
+          {#if meshonly}<span class="tag meshonly">not on AllMyStuff</span>
+          {:else if shared}<span class="tag guest">guest</span>
+          {:else if unclaimed}<span class="tag unclaimed">{n.claimable ? "claimable" : "unclaimed"}</span>
           {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
@@ -368,6 +388,30 @@
     border-style: dashed;
     border-color: var(--line-strong);
   }
+  /* A device that isn't running AllMyStuff: quiet, washed-out, and not a
+     connection target — present so you can see it's there, but it shouldn't
+     invite a click the way your real machines do. */
+  .node.meshonly {
+    background: repeating-linear-gradient(
+      135deg,
+      var(--surface-2),
+      var(--surface-2) 7px,
+      var(--surface) 7px,
+      var(--surface) 14px
+    );
+    border-style: dotted;
+    border-color: var(--line-strong);
+    box-shadow: var(--shadow-sm);
+    opacity: 0.72;
+  }
+  .node.meshonly .avatar {
+    filter: grayscale(1);
+    opacity: 0.8;
+  }
+  .node.meshonly:hover {
+    transform: none;
+    box-shadow: var(--shadow-sm);
+  }
   .node.selected {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
@@ -456,6 +500,11 @@
     background: var(--surface-2);
     color: var(--ink-soft);
     border: 1px dashed var(--line-strong);
+  }
+  .tag.meshonly {
+    background: var(--surface-2);
+    color: var(--ink-faint);
+    border: 1px dotted var(--line-strong);
   }
   .empty {
     position: absolute;

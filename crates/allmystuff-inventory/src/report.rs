@@ -127,7 +127,12 @@ pub fn render(inv: &Inventory) -> String {
             };
             let tag = if d.internal { " (built-in)" } else { "" };
             let status = if d.connected { "" } else { " — disconnected" };
-            item(&mut s, "screen", &format!("{}{res}{tag}{status}", d.name));
+            let def = default_tag(d.default);
+            item(
+                &mut s,
+                "screen",
+                &format!("{}{res}{tag}{status}{def}", d.name),
+            );
         }
     }
 
@@ -137,10 +142,18 @@ pub fn render(inv: &Inventory) -> String {
         for m in &inv.microphones {
             let ch = m.channels.map(|c| format!(" · {c}ch")).unwrap_or_default();
             let array = if m.is_array() { "  ⟨array⟩" } else { "" };
-            item(&mut s, "mic", &format!("{}{ch}{array}", m.name));
+            item(
+                &mut s,
+                "mic",
+                &format!("{}{ch}{array}{}", m.name, default_tag(m.default)),
+            );
         }
         for sp in &inv.speakers {
-            item(&mut s, "speaker", &sp.name);
+            item(
+                &mut s,
+                "speaker",
+                &format!("{}{}", sp.name, default_tag(sp.default)),
+            );
         }
     }
 
@@ -153,7 +166,11 @@ pub fn render(inv: &Inventory) -> String {
                 .as_deref()
                 .map(|p| format!("  {p}"))
                 .unwrap_or_default();
-            item(&mut s, "camera", &format!("{}{path}", c.name));
+            item(
+                &mut s,
+                "camera",
+                &format!("{}{path}{}", c.name, default_tag(c.default)),
+            );
         }
     }
 
@@ -187,6 +204,15 @@ pub fn render(inv: &Inventory) -> String {
 
 fn section(s: &mut String, name: &str) {
     let _ = writeln!(s, "▓ {name}");
+}
+
+/// Trailing "  ★ default" marker for the category default, else nothing.
+fn default_tag(is_default: bool) -> &'static str {
+    if is_default {
+        "  ★ default"
+    } else {
+        ""
+    }
 }
 
 fn item(s: &mut String, tag: &str, body: &str) {

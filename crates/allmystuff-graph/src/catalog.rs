@@ -313,10 +313,12 @@ impl Catalog {
         Ok(routes)
     }
 
-    /// Pick the target capability that can play `role` for `media`. Prefers
-    /// a synthetic machine capability (origin `screen`/`control`/`system`)
-    /// so an RDC group lands on "this computer" rather than a stray device,
-    /// then falls back to the first physical match by id order.
+    /// Pick the target capability that can play `role` for `media`.
+    /// Preference order: a synthetic machine capability (origin
+    /// `screen`/`control`/`system`) first, so an RDC group lands on "this
+    /// computer" rather than a stray device; then the category's **current
+    /// default** device, so a plain "connect audio here" lands on the mic
+    /// the machine actually uses; then the first physical match by id order.
     fn match_endpoint(
         &self,
         node: &NodeId,
@@ -338,8 +340,9 @@ impl Catalog {
             })
             .collect();
         candidates.sort_by(|a, b| {
-            let rank = |c: &Capability| u8::from(!is_machine_origin(&c.origin));
-            rank(a).cmp(&rank(b)).then_with(|| a.id.0.cmp(&b.id.0))
+            endpoint_rank(a)
+                .cmp(&endpoint_rank(b))
+                .then_with(|| a.id.0.cmp(&b.id.0))
         });
         candidates.into_iter().next()
     }
@@ -378,6 +381,19 @@ fn flow_word(f: Flow) -> &'static str {
 
 fn is_machine_origin(origin: &str) -> bool {
     matches!(origin, "screen" | "control" | "system")
+}
+
+/// Sort key for [`Catalog::match_endpoint`] (lower = preferred): a
+/// synthetic machine endpoint first, then the category's current default
+/// device, then everything else. Ties broken by id at the call site.
+fn endpoint_rank(c: &Capability) -> u8 {
+    if is_machine_origin(&c.origin) {
+        0
+    } else if c.default {
+        1
+    } else {
+        2
+    }
 }
 
 // `MediaKind::label` returns `&'static str`; this just re-borrows the

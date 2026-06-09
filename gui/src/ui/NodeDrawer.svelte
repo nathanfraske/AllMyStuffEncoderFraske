@@ -3,6 +3,7 @@
   import {
     MEDIA,
     displayName,
+    isAppNode,
     originIcon,
     flowWord,
     humanBytes,
@@ -16,6 +17,12 @@
   const node = $derived(app.selectedNode);
   const caps = $derived(node ? app.capsOf(node.id) : []);
   const shared = $derived(node?.relationship.kind === "shared");
+  // A device on the mesh that isn't running AllMyStuff: nothing to wire.
+  const meshonly = $derived(!!node && !isAppNode(node));
+  // This device declares an owner that isn't us — it can't be adopted.
+  const ownedByOther = $derived(!!node?.owner && node.owner !== app.localId);
+  // A remote machine you can open a console session on.
+  const isRemoteApp = $derived(!!node && node.kind !== "this" && !meshonly);
 
   // Capabilities grouped by media for tidy sections.
   const grouped = $derived.by(() => {
@@ -87,24 +94,27 @@
       grants: [],
     });
   }
-  function makeMine() {
+  /** Adopt this device — gated: only takes if it's in claim mode (Task 4). */
+  function claimThis() {
     if (!node) return;
-    app.setRelationship(node.id, { kind: "mine" });
+    app.claim(node.id);
   }
 </script>
 
 {#if node}
   <aside class="drawer" aria-label="{displayName(node)} details">
     <header class="head">
-      <span class="avatar">{shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span>
+      <span class="avatar">{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span>
       <div class="title">
         <div class="name">{displayName(node)}</div>
         <div class="kindline">
           {#if node.kind === "this"}this device · {/if}
-          {#if shared && node.relationship.kind === "shared"}
+          {#if meshonly}
+            <span class="pill soft">not on AllMyStuff</span>
+          {:else if shared && node.relationship.kind === "shared"}
             <span class="pill guest">shared with {node.relationship.person.name}</span>
           {:else if node.relationship.kind === "unclaimed"}
-            <span class="pill soft">unclaimed</span>
+            <span class="pill soft">{node.claimable ? "claimable" : "unclaimed"}</span>
           {:else}
             <span class="pill mine">yours</span>
           {/if}
@@ -127,17 +137,47 @@
       <button class="btn small rescan" onclick={() => app.hydrateFromBackend()}>↻ Re-scan this machine</button>
     {/if}
 
+    <!-- Open a remote console session: the pikvm-style handle for this
+         machine's screen, audio passthrough and control. -->
+    {#if isRemoteApp && (node.relationship.kind === "mine" || node.relationship.kind === "shared")}
+      <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
+        🖥 Open console
+      </button>
+    {/if}
+
     <!-- Relationship / sharing -->
     <section class="block">
-      {#if node.relationship.kind === "unclaimed"}
+      {#if meshonly}
         <p class="muted">
-          This device is on your mesh, but you haven't claimed it. Is it one of
-          yours, or someone you're sharing with?
+          This device is on your mesh, but it isn't running AllMyStuff — so it
+          has no screens, mics or other things to wire up, and it can't be a
+          connection target. Install AllMyStuff on it and it'll fill in here.
         </p>
-        <div class="claim">
-          <button class="btn small primary" onclick={makeMine}>This is mine</button>
+        {#if node.id}<div class="devid" title={node.id}>mesh id {node.id.slice(0, 16)}…</div>{/if}
+      {:else if node.relationship.kind === "unclaimed"}
+        {#if ownedByOther}
+          <p class="muted">
+            This device already has an owner, so you can't adopt it. If they
+            want to share it with you, you'll get exactly what they allow.
+          </p>
+          <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
+        {:else if node.claimable}
+          <p class="muted">
+            This device was started in <b>claim mode</b> — it's offering itself
+            for adoption. Make it one of yours, or mark it shared.
+          </p>
+          <div class="claim">
+            <button class="btn small primary" onclick={claimThis}>Claim this device</button>
+            <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
+          </div>
+        {:else}
+          <p class="muted">
+            This device hasn't been put up for adoption. You can't just take
+            ownership — start AllMyStuff on it in claim mode (or toggle
+            “allow adoption” there), then claim it from here.
+          </p>
           <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
-        </div>
+        {/if}
       {:else if shared && node.relationship.kind === "shared"}
         <div class="block-head">
           <h4>What {node.relationship.person.name} can do</h4>
@@ -170,16 +210,33 @@
             {/if}
           </div>
         {/if}
-        <button class="linklike" onclick={makeMine}>This is actually my own device →</button>
+        {#if node.claimable || node.owner === app.localId}
+          <button class="linklike" onclick={claimThis}>This is actually my own device →</button>
+        {/if}
       {:else}
         <p class="muted own-note">
           {node.kind === "this" ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
-        {#if node.kind !== "this"}
+        {#if node.kind === "this"}
+          <!-- Hand this machine off: put it into claim mode so another of
+               your devices can adopt it (Task 4). -->
+          <label class="adopt">
+            <input
+              type="checkbox"
+              checked={node.claimable ?? false}
+              onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
+            />
+            <span>Allow another of my devices to adopt this one</span>
+          </label>
+        {:else}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
         {/if}
       {/if}
     </section>
+
+    {#if meshonly}
+      <!-- Nothing more to show for a non-AllMyStuff device. -->
+    {:else}
 
     <!-- Live connections -->
     {#if connections.length}
@@ -206,10 +263,13 @@
             {MEDIA[media].icon} {MEDIA[media].label}
           </div>
           {#each list as c (c.id)}
-            <div class="cap">
+            <div class="cap" class:is-default={c.default}>
               <span class="cap-icon">{originIcon(c.origin, c.media)}</span>
               <div class="cap-id">
-                <div class="cap-label">{c.label}</div>
+                <div class="cap-label">
+                  {c.label}
+                  {#if c.default}<span class="def" title="This category's current default">default</span>{/if}
+                </div>
                 <div class="cap-flow">{flowWord(c.flow)}</div>
               </div>
               <button
@@ -226,6 +286,7 @@
         </div>
       {/each}
     </section>
+    {/if}
   </aside>
 {/if}
 
@@ -477,6 +538,23 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .def {
+    flex-shrink: 0;
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #97631a;
+    background: #fdedd2;
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.34rem;
+  }
+  .cap.is-default .cap-icon {
+    filter: drop-shadow(0 0 0.5px #e0a13a);
   }
   .cap-flow {
     font-size: 0.72rem;
@@ -499,5 +577,27 @@
     background: var(--mc);
     color: #fff;
     transform: scale(1.08);
+  }
+  .console-open {
+    width: 100%;
+    margin-bottom: 0.8rem;
+  }
+  .adopt {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--ink-soft);
+    line-height: 1.4;
+    cursor: pointer;
+  }
+  .adopt input {
+    margin-top: 0.15rem;
+  }
+  .devid {
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    margin-top: 0.4rem;
   }
 </style>

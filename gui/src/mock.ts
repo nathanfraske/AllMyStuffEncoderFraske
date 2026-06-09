@@ -13,8 +13,9 @@ function cap(
   media: MediaKind,
   flow: Flow,
   origin: string,
+  isDefault = false,
 ): Capability {
-  return { id: `${node}:${id}`, node, label, media, flow, origin };
+  return { id: `${node}:${id}`, node, label, media, flow, origin, default: isDefault };
 }
 
 /** The synthetic "the machine itself" trio every node exposes. */
@@ -34,6 +35,8 @@ export function demoCatalog(): Catalog {
       kind: "this",
       relationship: { kind: "mine" },
       online: true,
+      app: true,
+      owner: "this",
       summary: { os: "macOS 14", cpu: "Apple M2", ram_bytes: 16 * 2 ** 30, device_count: 13 },
     },
     {
@@ -42,6 +45,8 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       relationship: { kind: "mine" },
       online: true,
+      app: true,
+      owner: "this",
       summary: { os: "Windows 11", cpu: "Ryzen 7 7700", ram_bytes: 32 * 2 ** 30, device_count: 11 },
     },
     {
@@ -50,6 +55,8 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       relationship: { kind: "mine" },
       online: true,
+      app: true,
+      owner: "this",
       summary: { os: "Linux", cpu: "Amlogic S905", ram_bytes: 4 * 2 ** 30, device_count: 5 },
     },
     {
@@ -58,13 +65,41 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       relationship: { kind: "mine" },
       online: true,
+      app: true,
+      owner: "this",
       summary: { os: "Linux", cpu: "Pi 5", ram_bytes: 8 * 2 ** 30, device_count: 6 },
+    },
+    {
+      // A spare box that was booted in claim mode — it's offering itself for
+      // adoption, so it can be claimed (Task 4). Runs AllMyStuff (has caps).
+      id: "nuc",
+      label: "Spare NUC",
+      kind: "machine",
+      relationship: { kind: "unclaimed" },
+      online: true,
+      app: true,
+      owner: null,
+      claimable: true,
+      summary: { os: "Linux", cpu: "Intel N100", ram_bytes: 16 * 2 ** 30, device_count: 7 },
+    },
+    {
+      // A device that's on the mesh but isn't running AllMyStuff (Task 1):
+      // no presence advert, so no wireable capabilities. Shown, but quiet
+      // and not a connection target.
+      id: "garage",
+      label: "garage-sensor",
+      kind: "machine",
+      relationship: { kind: "unclaimed" },
+      online: true,
+      app: false,
     },
     {
       id: "alex",
       label: "Alex's laptop",
       kind: "machine",
       online: false,
+      app: true,
+      owner: "alex",
       relationship: {
         kind: "shared",
         person: { id: "person:alex", name: "Alex" },
@@ -85,33 +120,38 @@ export function demoCatalog(): Catalog {
   ];
 
   const capabilities: Capability[] = [
-    // My MacBook.
+    // My MacBook. The trailing `true` marks each category's current default.
     ...machineCaps("this"),
-    cap("this", "mic", "MacBook mic array", "audio", "source", "microphone"),
-    cap("this", "speakers", "MacBook speakers", "audio", "sink", "speaker"),
-    cap("this", "cam", "FaceTime HD camera", "video", "source", "camera"),
-    cap("this", "display", "Built-in Retina display", "display", "sink", "display"),
+    cap("this", "mic", "MacBook mic array", "audio", "source", "microphone", true),
+    cap("this", "speakers", "MacBook speakers", "audio", "sink", "speaker", true),
+    cap("this", "cam", "FaceTime HD camera", "video", "source", "camera", true),
+    cap("this", "display", "Built-in Retina display", "display", "sink", "display", true),
     cap("this", "keyboard", "Magic Keyboard", "input", "source", "keyboard"),
     cap("this", "trackpad", "Trackpad", "input", "source", "touchpad"),
-    // Desk PC.
+    // Desk PC — the Yeti is the default mic, the Dell the default screen.
     ...machineCaps("desk"),
-    cap("desk", "monitor", "Dell U2720Q", "display", "sink", "display"),
-    cap("desk", "speakers", "Desk speakers", "audio", "sink", "speaker"),
-    cap("desk", "yeti", "Blue Yeti", "audio", "source", "microphone"),
+    cap("desk", "monitor", "Dell U2720Q", "display", "sink", "display", true),
+    cap("desk", "speakers", "Desk speakers", "audio", "sink", "speaker", true),
+    cap("desk", "yeti", "Blue Yeti", "audio", "source", "microphone", true),
     cap("desk", "data", "Data (D:)", "storage", "duplex", "storage"),
     // Living-room TV.
     ...machineCaps("tv"),
-    cap("tv", "oled", "LG OLED", "display", "sink", "display"),
-    cap("tv", "soundbar", "Sonos soundbar", "audio", "sink", "speaker"),
-    // Conference puck (the 6-mic array).
+    cap("tv", "oled", "LG OLED", "display", "sink", "display", true),
+    cap("tv", "soundbar", "Sonos soundbar", "audio", "sink", "speaker", true),
+    // Conference puck (the 6-mic array is its default capture device).
     ...machineCaps("studio"),
-    cap("studio", "array", "ReSpeaker 6-mic array", "audio", "source", "microphone"),
-    cap("studio", "speaker", "Puck speaker", "audio", "sink", "speaker"),
+    cap("studio", "array", "ReSpeaker 6-mic array", "audio", "source", "microphone", true),
+    cap("studio", "speaker", "Puck speaker", "audio", "sink", "speaker", true),
+    cap("studio", "cam", "Puck wide camera", "video", "source", "camera", true),
+    // Spare NUC (claimable) — has its own devices, ready once adopted.
+    ...machineCaps("nuc"),
+    cap("nuc", "hdmi", "HDMI capture", "display", "sink", "display", true),
+    cap("nuc", "line", "Line out", "audio", "sink", "speaker", true),
     // Alex (shared).
     ...machineCaps("alex"),
-    cap("alex", "cam", "Alex's webcam", "video", "source", "camera"),
-    cap("alex", "monitor", "Alex's monitor", "display", "sink", "display"),
-    cap("alex", "mic", "Alex's headset mic", "audio", "source", "microphone"),
+    cap("alex", "cam", "Alex's webcam", "video", "source", "camera", true),
+    cap("alex", "monitor", "Alex's monitor", "display", "sink", "display", true),
+    cap("alex", "mic", "Alex's headset mic", "audio", "source", "microphone", true),
   ];
 
   // A few pre-wired routes (all between things I own, so all valid).

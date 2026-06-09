@@ -154,6 +154,14 @@ pub struct Capability {
     /// "camera", "screen", "control". Free-form; not load-bearing.
     #[serde(default)]
     pub origin: String,
+    /// `true` when this is the node's **current default** for its device
+    /// category — the mic the machine captures from, the display it drives
+    /// first, and so on. The UI badges it and routing prefers it when
+    /// auto-picking an endpoint, so "connect audio to that machine" lands
+    /// on the device it actually uses. `#[serde(default)]` so presence from
+    /// an older peer (no field) still decodes.
+    #[serde(default)]
+    pub default: bool,
 }
 
 impl Capability {
@@ -172,7 +180,14 @@ impl Capability {
             media,
             flow,
             origin: origin.into(),
+            default: false,
         }
+    }
+
+    /// Builder: flag this capability as its category's current default.
+    pub fn as_default(mut self, default: bool) -> Self {
+        self.default = default;
+        self
     }
 }
 

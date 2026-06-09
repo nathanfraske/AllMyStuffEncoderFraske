@@ -70,15 +70,29 @@ pub struct NodeProfile {
     /// authorizing the route.
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Who owns this device, if it has recorded an owner — the node id that
+    /// claimed or was configured to own it. A peer reads this to decide
+    /// whether the device is *theirs* (owner == them) or someone else's;
+    /// a device you don't own can't be silently adopted. `None` = unowned.
+    /// `#[serde(default)]` so presence from an older peer still decodes.
+    #[serde(default)]
+    pub owner: Option<NodeId>,
+    /// `true` only when this device was started in **claim mode** and has no
+    /// owner yet — i.e. it is *offering* itself to be adopted. Claiming is
+    /// refused unless this is set, so you can't flat-out take a device that
+    /// hasn't been put up for adoption (it defines its own owner instead).
+    #[serde(default)]
+    pub claimable: bool,
 }
 
-/// Point-to-point control traffic. Tagged on `t` so route and share
-/// negotiation share one channel.
+/// Point-to-point control traffic. Tagged on `t` so route, share, and
+/// ownership negotiation share one channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlMessage {
     Route(RouteControl),
     Share(ShareControl),
+    Ownership(OwnershipControl),
 }
 
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
@@ -123,6 +137,28 @@ pub enum ShareControl {
     Revoke { grant_id: String },
 }
 
+/// Adopting an unowned device that's been put up for adoption. Ownership is
+/// the answer to "whose machine is this?" — and unlike a share, you can't
+/// assert it unilaterally: the device must be in claim mode (advertising
+/// [`NodeProfile::claimable`]) for a claim to take. This keeps a stranger
+/// on the mesh from flat-out grabbing a box that already has an owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnershipControl {
+    /// "I'm adopting you." Sent to a claimable device; `owner` is the
+    /// claimer's node id. The device records it (if still claimable),
+    /// stops being claimable, and re-advertises presence with the new
+    /// owner — that presence is the authoritative confirmation.
+    Claim { owner: NodeId },
+    /// The device confirms the adoption took — it's now owned by `owner`.
+    Claimed { owner: NodeId },
+    /// The device refuses: it isn't in claim mode, or already has an owner.
+    Declined { reason: String },
+    /// The owner relinquishes the device, returning it to unowned. Only the
+    /// current owner's release is honoured.
+    Release,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,10 +185,37 @@ mod tests {
                 Flow::Source,
                 "microphone",
             )],
+            owner: Some("my-laptop".into()),
+            claimable: false,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn presence_without_ownership_fields_still_decodes() {
+        // An older peer's advert has no owner/claimable — they default.
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.owner, None);
+        assert!(!p.claimable);
+    }
+
+    #[test]
+    fn ownership_claim_round_trips_and_tags() {
+        let m = ControlMessage::Ownership(OwnershipControl::Claim {
+            owner: "my-laptop".into(),
+        });
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["t"], "ownership");
+        assert_eq!(j["kind"], "claim");
+        assert_eq!(j["owner"], "my-laptop");
+        let back: ControlMessage = serde_json::from_value(j).unwrap();
+        assert_eq!(m, back);
     }
 
     #[test]

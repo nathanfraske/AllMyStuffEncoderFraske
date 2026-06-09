@@ -159,10 +159,27 @@ pub fn collect_displays() -> Vec<Display> {
             width_px: width,
             height_px: height,
             internal,
+            default: false,
         });
     }
     out.sort_by(|a, b| a.connector.cmp(&b.connector));
+    mark_default_display(&mut out);
     out
+}
+
+/// Flag the machine's primary display: the built-in panel when one is
+/// connected (a laptop's own screen), otherwise the first connected
+/// output. `/sys/class/drm` exposes no "primary" bit — that's an X/Wayland
+/// concept — so this is the honest best signal from sysfs alone, and it's
+/// pure so it carries a test.
+fn mark_default_display(displays: &mut [Display]) {
+    let pick = displays
+        .iter()
+        .position(|d| d.connected && d.internal)
+        .or_else(|| displays.iter().position(|d| d.connected));
+    if let Some(i) = pick {
+        displays[i].default = true;
+    }
 }
 
 /// `card0-HDMI-A-1` → (`HDMI-A-1`, false). Internal panels (eDP / LVDS /
@@ -286,6 +303,7 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
                 direction: AudioDirection::Input,
                 channels,
                 card: Some(p.card.to_string()),
+                default: false,
             });
         }
         if p.playback {
@@ -295,10 +313,103 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
                 direction: AudioDirection::Output,
                 channels: None,
                 card: Some(p.card.to_string()),
+                default: false,
             });
         }
     }
+
+    // Mark the default capture + playback device — the one on ALSA's
+    // default card (config override if set, else the lowest card index).
+    let default_card = alsa_default_card(
+        read_asound_config().as_deref(),
+        &card_indexes(&mics, &speakers),
+    );
+    mark_default_audio(&mut mics, default_card);
+    mark_default_audio(&mut speakers, default_card);
+
     (mics, speakers)
+}
+
+/// Concatenated ALSA config the default-card resolver consults — the
+/// system `/etc/asound.conf` then the user's `~/.asoundrc` (the latter
+/// wins because it's appended last and the parser keeps the final match).
+fn read_asound_config() -> Option<String> {
+    let mut buf = String::new();
+    if let Some(s) = read_trim("/etc/asound.conf") {
+        buf.push_str(&s);
+        buf.push('\n');
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(s) = read_trim(format!("{home}/.asoundrc")) {
+            buf.push_str(&s);
+        }
+    }
+    (!buf.trim().is_empty()).then_some(buf)
+}
+
+/// Every distinct ALSA card index seen across the capture + playback
+/// devices, sorted — the candidate set the default resolver falls back on.
+fn card_indexes(mics: &[AudioDevice], speakers: &[AudioDevice]) -> Vec<u32> {
+    let mut idx: Vec<u32> = mics
+        .iter()
+        .chain(speakers)
+        .filter_map(|d| d.card.as_deref().and_then(|c| c.parse().ok()))
+        .collect();
+    idx.sort_unstable();
+    idx.dedup();
+    idx
+}
+
+/// Resolve ALSA's default card index: an explicit `defaults.pcm.card` /
+/// `defaults.ctl.card` override from the config when present, else the
+/// lowest card index in use (`hw:0` — what ALSA falls back to with no
+/// config). The PCM card governs capture/playback routing, so it wins over
+/// the control card when a config sets the two differently. Pure so it
+/// carries fixture tests.
+fn alsa_default_card(config: Option<&str>, cards: &[u32]) -> Option<u32> {
+    if let Some(cfg) = config {
+        let mut pcm = None;
+        let mut ctl = None;
+        for line in cfg.lines() {
+            // Strip a trailing comment; the last match for each key wins
+            // (user config is appended after the system one).
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(n) = parse_card_directive(line, "defaults.pcm.card") {
+                pcm = Some(n);
+            } else if let Some(n) = parse_card_directive(line, "defaults.ctl.card") {
+                ctl = Some(n);
+            }
+        }
+        if let Some(n) = pcm.or(ctl) {
+            return Some(n);
+        }
+    }
+    cards.iter().min().copied()
+}
+
+/// `defaults.pcm.card 1` → `Some(1)`. Requires a whitespace boundary after
+/// the key (so `defaults.pcm.cardX …` doesn't false-match) and a trailing
+/// integer (an optional `;` tolerated).
+fn parse_card_directive(line: &str, key: &str) -> Option<u32> {
+    let rest = line.strip_prefix(key)?;
+    if rest.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    rest.trim().trim_end_matches(';').trim().parse().ok()
+}
+
+/// Mark the lowest-device endpoint on `default_card` as this direction's
+/// default. Devices arrive in `/proc/asound/pcm` order (card then device),
+/// so the first on the default card is `hw:<card>,0` — the default PCM. If
+/// the default card has no endpoint in this direction the category is left
+/// unmarked here; [`crate::ensure_category_defaults`] then guarantees one.
+fn mark_default_audio(devices: &mut [AudioDevice], default_card: Option<u32>) {
+    let Some(card) = default_card else { return };
+    let on_default =
+        |d: &AudioDevice| d.card.as_deref().and_then(|c| c.parse::<u32>().ok()) == Some(card);
+    if let Some(i) = devices.iter().position(on_default) {
+        devices[i].default = true;
+    }
 }
 
 /// Channel count for a USB-Audio capture endpoint, read from
@@ -418,9 +529,14 @@ pub fn collect_cameras() -> Vec<Camera> {
             id: format!("cam:{sysname}"),
             name,
             path: Some(format!("/dev/{sysname}")),
+            default: false,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    // The lowest `/dev/videoN` is the default capture device.
+    if let Some(first) = out.first_mut() {
+        first.default = true;
+    }
     out
 }
 
@@ -893,5 +1009,114 @@ mod tests {
         assert_eq!(usb_class_label("0e"), Some("Video"));
         assert_eq!(usb_class_label("08"), Some("Mass Storage"));
         assert_eq!(usb_class_label("00"), None);
+    }
+
+    #[test]
+    fn alsa_default_card_falls_back_to_lowest_index() {
+        assert_eq!(alsa_default_card(None, &[0, 1]), Some(0));
+        assert_eq!(alsa_default_card(None, &[2, 1]), Some(1));
+        assert_eq!(alsa_default_card(None, &[]), None);
+    }
+
+    #[test]
+    fn alsa_default_card_honours_config_override() {
+        let cfg = "defaults.pcm.card 1\ndefaults.ctl.card 1\n";
+        assert_eq!(alsa_default_card(Some(cfg), &[0, 1]), Some(1));
+        // A trailing comment / semicolon doesn't trip the integer parse.
+        assert_eq!(
+            alsa_default_card(Some("defaults.pcm.card 2; # external dac"), &[0]),
+            Some(2)
+        );
+        // No recognised key → still the lowest index.
+        assert_eq!(
+            alsa_default_card(Some("pcm.!default { } "), &[0, 3]),
+            Some(0)
+        );
+    }
+
+    fn audio(id: &str, card: &str, dir: AudioDirection) -> AudioDevice {
+        AudioDevice {
+            id: id.into(),
+            name: id.into(),
+            direction: dir,
+            channels: None,
+            card: Some(card.into()),
+            default: false,
+        }
+    }
+
+    #[test]
+    fn default_audio_marks_the_endpoint_on_the_default_card() {
+        let mut mics = vec![
+            audio("mic:1:0", "1", AudioDirection::Input),
+            audio("mic:0:0", "0", AudioDirection::Input),
+        ];
+        mark_default_audio(&mut mics, Some(0));
+        assert!(mics.iter().find(|d| d.id == "mic:0:0").unwrap().default);
+        assert!(!mics.iter().find(|d| d.id == "mic:1:0").unwrap().default);
+
+        // Default card absent from this direction → nothing marked here;
+        // the cross-platform fallback guarantees one later.
+        let mut speakers = vec![audio("spk:1:0", "1", AudioDirection::Output)];
+        mark_default_audio(&mut speakers, Some(0));
+        assert!(!speakers[0].default);
+    }
+
+    #[test]
+    fn default_display_prefers_the_internal_panel() {
+        let mut d = vec![
+            Display {
+                id: "display:HDMI-A-1".into(),
+                name: "Monitor".into(),
+                connector: "HDMI-A-1".into(),
+                connected: true,
+                width_px: None,
+                height_px: None,
+                internal: false,
+                default: false,
+            },
+            Display {
+                id: "display:eDP-1".into(),
+                name: "Panel".into(),
+                connector: "eDP-1".into(),
+                connected: true,
+                width_px: None,
+                height_px: None,
+                internal: true,
+                default: false,
+            },
+        ];
+        mark_default_display(&mut d);
+        assert!(d.iter().find(|x| x.internal).unwrap().default);
+        assert!(!d.iter().find(|x| !x.internal).unwrap().default);
+    }
+
+    #[test]
+    fn default_display_falls_back_to_first_connected_external() {
+        let mut d = vec![
+            Display {
+                id: "display:DP-3".into(),
+                name: "Off".into(),
+                connector: "DP-3".into(),
+                connected: false,
+                width_px: None,
+                height_px: None,
+                internal: false,
+                default: false,
+            },
+            Display {
+                id: "display:HDMI-A-1".into(),
+                name: "On".into(),
+                connector: "HDMI-A-1".into(),
+                connected: true,
+                width_px: None,
+                height_px: None,
+                internal: false,
+                default: false,
+            },
+        ];
+        mark_default_display(&mut d);
+        assert!(!d[0].default);
+        assert!(d[1].default);
     }
 }

@@ -18,6 +18,7 @@ mod audio;
 mod control_client;
 mod daemon_spawn;
 mod mesh;
+mod ownership;
 
 use std::sync::Arc;
 
@@ -81,6 +82,20 @@ async fn connect_route(
 #[tauri::command]
 async fn disconnect_route(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
     mesh.inner().disconnect(route_id).await
+}
+
+/// Claim a device as one of yours. Only takes if the target is in claim
+/// mode; the target's next presence advert (owner = us) confirms it.
+#[tauri::command]
+async fn claim_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
+    mesh.inner().claim(node).await
+}
+
+/// Put this device into / out of claim mode so another of your machines can
+/// adopt it. Returns whether it's now claimable.
+#[tauri::command]
+async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bool, String> {
+    mesh.inner().set_claimable(claimable).await
 }
 
 /// Current peers + live route states.
@@ -265,6 +280,8 @@ fn main() {
             scan_full,
             connect_route,
             disconnect_route,
+            claim_node,
+            set_claimable,
             session_snapshot,
             mesh_status,
             mesh_identity,

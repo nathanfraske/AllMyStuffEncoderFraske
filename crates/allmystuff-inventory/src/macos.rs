@@ -130,6 +130,7 @@ pub fn collect_displays() -> Vec<Display> {
                     width_px: w,
                     height_px: h,
                     internal,
+                    default: false,
                 });
                 idx += 1;
             }
@@ -161,6 +162,7 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
                         direction: AudioDirection::Input,
                         channels: Some(ch as u32),
                         card: None,
+                        default: false,
                     });
                 }
                 if let Some(ch) = out_ch.filter(|&c| c > 0) {
@@ -170,6 +172,7 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
                         direction: AudioDirection::Output,
                         channels: Some(ch as u32),
                         card: None,
+                        default: false,
                     });
                 }
             }
@@ -189,6 +192,7 @@ pub fn collect_cameras() -> Vec<Camera> {
                 id: format!("cam:{i}"),
                 name: c["_name"].as_str().unwrap_or("Camera").to_string(),
                 path: None,
+                default: false,
             });
         }
     }

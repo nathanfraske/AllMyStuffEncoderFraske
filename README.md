@@ -168,12 +168,14 @@ This repository is a **working foundation**, honest about what's real:
 
 | Piece | State |
 |---|---|
-| Device scanner | **Working** on Linux (`/proc` + `/sys`), macOS (`system_profiler`), and Windows (CIM) — fixture-tested decoders, compiled + tested on all three in CI |
-| Graph model + authorization | **Working** — pure Rust, fully unit-tested; mirrored in TS for the UI |
-| Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data |
+| Device scanner | **Working** on Linux (`/proc` + `/sys`), macOS (`system_profiler`), and Windows (CIM) — fixture-tested decoders, compiled + tested on all three in CI. Flags each category's **current default** (the mic it captures from, the screen it drives first) |
+| Graph model + authorization | **Working** — pure Rust, fully unit-tested; mirrored in TS for the UI. Routing prefers a node's default device when auto-picking an endpoint |
+| Device ownership | **Working** — every device advertises its owner and whether it's *claimable*; you can only adopt a box that was started in claim mode, never flat-take one that's already owned |
+| Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data. Devices on the mesh that aren't running AllMyStuff are shown but quieted and un-targetable |
+| Remote console | **Working** — a pikvm-style session window for a remote machine: a video-inputs tab bar (its screen + cameras) and the handle for audio passthrough and keyboard/mouse control, wiring the real routes underneath |
 | Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
-| Live audio streaming | **Working** — a mic → speakers route opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
-| Video / screen / input streaming | **Next** — same proven route pipe; needs each medium's capture/inject backend |
+| Live audio streaming | **Working** — a mic → speakers route (and the console's audio passthrough) opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
+| Video / screen / input streaming | **Next** — the console already wires and shows the session; each medium still needs its capture/inject backend over the proven route pipe |
 
 ## Lineage
 
