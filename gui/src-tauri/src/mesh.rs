@@ -43,7 +43,11 @@ pub struct Mesh {
 
 struct State {
     session: Option<Session>,
+    /// Primary network — where route control/media operate.
     network: Option<String>,
+    /// Every joined network. Presence is broadcast on all of them so peers
+    /// find each other regardless of which network the daemon lists first.
+    networks: Vec<String>,
     client_id: Option<ClientId>,
     profile: Option<NodeProfile>,
 }
@@ -58,6 +62,7 @@ impl Mesh {
             state: Mutex::new(State {
                 session: None,
                 network: None,
+                networks: Vec::new(),
                 client_id: None,
                 profile: None,
             }),
@@ -117,32 +122,49 @@ impl Mesh {
         let me = self.fetch_identity().await.unwrap_or_else(|| NodeId::this().to_string());
         let label = self.fetch_identity_label().await;
         let profile = self.build_profile(&me, label);
-        // Active network: the first one the daemon has joined.
-        let network = self.fetch_first_network().await;
+        // Every joined network; route control/media operate on the primary.
+        let networks = self.fetch_networks().await;
+        let primary = networks.first().cloned();
 
         {
             let mut st = self.state.lock();
             st.client_id = Some(client_id);
             st.session = Some(Session::new(me.clone()));
             st.profile = Some(profile.clone());
-            st.network = network.clone();
+            st.network = primary.clone();
+            st.networks = networks.clone();
         }
 
-        if let Some(network) = &network {
-            for channel in [CHANNEL_PRESENCE, CHANNEL_CONTROL, CHANNEL_MEDIA] {
+        if networks.is_empty() {
+            self.emit_status("no_network", None);
+        } else {
+            // Presence on *every* network so two machines discover each other
+            // no matter which network the daemon lists first.
+            for network in &networks {
                 let _ = self
                     .client
                     .request(&Request::ChannelSubscribe {
                         client_id,
                         network: network.clone(),
-                        channel: channel.to_string(),
+                        channel: CHANNEL_PRESENCE.to_string(),
                     })
                     .await;
             }
+            // Route control + media ride the primary network.
+            if let Some(primary) = &primary {
+                for channel in [CHANNEL_CONTROL, CHANNEL_MEDIA] {
+                    let _ = self
+                        .client
+                        .request(&Request::ChannelSubscribe {
+                            client_id,
+                            network: primary.clone(),
+                            channel: channel.to_string(),
+                        })
+                        .await;
+                }
+            }
             self.broadcast_presence().await;
             self.emit_status("live", None);
-        } else {
-            self.emit_status("no_network", None);
         }
 
         // Periodic presence re-broadcast so late joiners see us.
@@ -203,12 +225,24 @@ impl Mesh {
         self.broadcast_presence().await;
     }
 
-    async fn fetch_first_network(&self) -> Option<String> {
-        let resp = self.client.request(&Request::NetworksList).await.ok()?;
-        let arr = resp.data?;
-        arr.as_array()?
-            .iter()
-            .find_map(|n| n.get("config_id").and_then(|v| v.as_str()).map(str::to_string))
+    /// All joined networks' config ids. The daemon wraps the list as
+    /// `{ "networks": [...] }`, so we read that field (an earlier version
+    /// called `as_array()` on the wrapper and always got nothing — which left
+    /// presence un-subscribed and peers unable to see each other).
+    async fn fetch_networks(&self) -> Vec<String> {
+        let Some(resp) = self.client.request(&Request::NetworksList).await.ok() else {
+            return Vec::new();
+        };
+        resp.data
+            .as_ref()
+            .and_then(|d| d.get("networks"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|n| n.get("config_id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn build_profile(&self, me: &str, label_override: Option<String>) -> NodeProfile {
@@ -230,20 +264,19 @@ impl Mesh {
     }
 
     async fn broadcast_presence(&self) {
-        let (network, profile) = {
+        let (networks, profile) = {
             let st = self.state.lock();
-            (st.network.clone(), st.profile.clone())
+            (st.networks.clone(), st.profile.clone())
         };
-        let (Some(network), Some(profile)) = (network, profile) else {
-            return;
-        };
-        if let Ok(payload) = serde_json::to_value(&profile) {
+        let Some(profile) = profile else { return };
+        let Ok(payload) = serde_json::to_value(&profile) else { return };
+        for network in networks {
             let _ = self
                 .client
                 .request(&Request::ChannelSendAll {
                     network,
                     channel: CHANNEL_PRESENCE.to_string(),
-                    payload,
+                    payload: payload.clone(),
                 })
                 .await;
         }
