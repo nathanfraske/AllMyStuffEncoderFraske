@@ -62,6 +62,27 @@ function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
 }
 
+/** The stable machine identity inside a mesh device id: the bare pubkey,
+ *  with MyOwnMesh's 5-char display suffix (`-AB12C`) stripped. The daemon's
+ *  roster/peer list reports a device by its bare pubkey, while AllMyStuff
+ *  presence and `IdentityShow` report the *display id* (`pubkey-SUFFIX`).
+ *  Keying graph nodes by this canonical form collapses both views of one
+ *  machine into a single node. Mirrors `myownmesh-core`'s
+ *  `signing::pubkey_part` (suffix = 5 alphanumeric chars after the last `-`). */
+function canonicalNodeId(id: string): string {
+  const dash = id.lastIndexOf("-");
+  if (dash > 0) {
+    const suffix = id.slice(dash + 1);
+    if (suffix.length === 5 && /^[0-9a-zA-Z]+$/.test(suffix)) return id.slice(0, dash);
+  }
+  return id;
+}
+
+/** Whether two mesh ids name the same machine (same pubkey, any suffix). */
+function sameMachine(a: string, b: string): boolean {
+  return canonicalNodeId(a) === canonicalNodeId(b);
+}
+
 let seq = 0;
 const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 
@@ -192,6 +213,17 @@ class AppStore {
     return this.catalog.nodes.find((n) => n.id === nodeId);
   }
 
+  /** Find the node representing the same machine as `id`, preferring an
+   *  exact match (so a presence advert lands on its own node) and falling
+   *  back to the canonical pubkey (so the daemon's bare-pubkey view and the
+   *  presence display-id view of one machine resolve to a single node). */
+  private nodeByCanonical(id: string): MeshNode | undefined {
+    return (
+      this.catalog.nodes.find((n) => n.id === id) ??
+      this.catalog.nodes.find((n) => sameMachine(n.id, id))
+    );
+  }
+
   capability(id: string): Capability | undefined {
     return this.catalog.capabilities.find((c) => c.id === id);
   }
@@ -284,8 +316,12 @@ class AppStore {
     // running AllMyStuff yet (`app: false`) — presence is what flips that on,
     // so we never downgrade a node the bespoke channel already enriched.
     for (const [id, info] of known) {
-      if (id === this.localId) continue;
-      const node = this.catalog.nodes.find((n) => n.id === id);
+      if (sameMachine(id, this.localId)) continue;
+      // The daemon reports the bare pubkey; a presence advert may already
+      // have created this machine's node under its display id. Resolve by
+      // canonical pubkey so we update that one node rather than spawning a
+      // bare-pubkey twin that reads as "not on AllMyStuff".
+      const node = this.nodeByCanonical(id);
       if (!node) {
         this.catalog.nodes.push({
           id,
@@ -301,8 +337,17 @@ class AppStore {
       }
     }
     // A machine that's no longer in any roster/peer set has dropped offline.
+    // Compare by canonical pubkey so a presence node (display id) isn't wrongly
+    // marked offline just because the daemon lists it under the bare pubkey.
+    const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
     for (const n of this.catalog.nodes) {
-      if (n.kind !== "this" && n.id !== this.localId && !known.has(n.id)) n.online = false;
+      if (
+        n.kind !== "this" &&
+        !sameMachine(n.id, this.localId) &&
+        !knownCanon.has(canonicalNodeId(n.id))
+      ) {
+        n.online = false;
+      }
     }
   }
 
@@ -346,6 +391,11 @@ class AppStore {
         summary: scan.summary,
       });
     }
+    // If an early daemon poll (before we knew our real id) added this same
+    // machine as a bare-pubkey peer node, drop that twin now.
+    this.catalog.nodes = this.catalog.nodes.filter(
+      (n) => n.kind === "this" || !sameMachine(n.id, newId),
+    );
     // Local capabilities are exactly what the scan reports; drop any tied to
     // the old or new local id so a re-scan replaces rather than accumulates.
     this.catalog.capabilities = [
@@ -364,7 +414,10 @@ class AppStore {
     if (snap.network !== undefined) this.sessionNetwork = snap.network ?? null;
 
     for (const p of snap.peers ?? []) {
-      let node = this.catalog.nodes.find((n) => n.id === p.node);
+      // Resolve by canonical pubkey so presence lands on the same node the
+      // daemon's roster/peer view created (the bare-pubkey "not on AllMyStuff"
+      // twin), rather than a second node keyed by the display id.
+      let node = this.nodeByCanonical(p.node);
       if (!node) {
         // A freshly-discovered peer starts unclaimed — claim it (only if it
         // offers itself) or mark it shared from its drawer.
@@ -378,6 +431,9 @@ class AppStore {
         };
         this.catalog.nodes.push(node);
       } else {
+        // Adopt the presence display id so this peer's capabilities (keyed by
+        // `p.node`) resolve to this node.
+        if (node.id !== p.node) node.id = p.node;
         node.label = p.label;
         node.hostname = p.hostname;
         node.online = true;
@@ -391,9 +447,14 @@ class AppStore {
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
-      if (p.owner && p.owner === this.localId && node.relationship.kind === "unclaimed") {
+      if (p.owner && sameMachine(p.owner, this.localId) && node.relationship.kind === "unclaimed") {
         node.relationship = { kind: "mine" };
       }
+      // Collapse any other view of this same machine into the one node we just
+      // settled on — heals an already-split graph.
+      this.catalog.nodes = this.catalog.nodes.filter(
+        (n) => n === node || !sameMachine(n.id, p.node),
+      );
       // Refresh this peer's capabilities.
       this.catalog.capabilities = [
         ...this.catalog.capabilities.filter((c) => c.node !== p.node),
