@@ -43,6 +43,12 @@ pub const CHANNEL_MEDIA: &str = "allmystuff/media/v1";
 /// presence, and converges by version the same way a mesh roster does.
 pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 
+/// Feature tag a node advertises in [`NodeProfile::features`] when it can
+/// host mesh-native terminal sessions (spawn a PTY and stream it over the
+/// media channel). A peer only offers a terminal route to nodes that
+/// advertise this.
+pub const FEATURE_TERMINAL: &str = "terminal";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
@@ -99,6 +105,13 @@ pub struct NodeProfile {
     /// field (those still heartbeat, so no reply is needed).
     #[serde(default)]
     pub boot: u64,
+    /// App features this node supports beyond the v1 baseline — e.g.
+    /// [`FEATURE_TERMINAL`]. Unknown entries are ignored; absent (an older
+    /// peer) decodes as empty, and empty serializes *without* the key so an
+    /// older receiver sees exactly the presence shape it always did. A
+    /// feature is only ever offered to a peer that advertises it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// One device in an owned fleet — a machine the same owner has claimed, so
@@ -276,10 +289,38 @@ mod tests {
             owner: Some("my-laptop".into()),
             claimable: false,
             boot: 7,
+            features: vec![FEATURE_TERMINAL.into()],
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn presence_features_accept_skew_both_ways() {
+        // An older peer's advert has no `features` — it decodes as empty
+        // rather than failing (so the node never vanishes from the graph).
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert!(p.features.is_empty());
+
+        // Empty features serialize *without* the key, so an older receiver
+        // sees exactly the presence shape it always did.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("features"));
+
+        // A populated list round-trips.
+        let p = NodeProfile {
+            features: vec![FEATURE_TERMINAL.into()],
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"features\":[\"terminal\"]"));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.features, vec![FEATURE_TERMINAL.to_string()]);
     }
 
     #[test]

@@ -28,13 +28,15 @@ use allmystuff_protocol::{
     CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
-    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, VideoAssembler, VideoFrame,
+    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, TermEvent, TermFrame,
+    VideoAssembler, VideoFrame,
 };
 
 use crate::audio::AudioBridge;
 use crate::control_client::{ControlClient, MediaPipe};
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket};
 use crate::video_decode::{Au, DecodeBridge};
 
@@ -55,6 +57,13 @@ pub struct Mesh {
     /// Keyboard/mouse injection for input routes that sink here — gated on
     /// the sender being our owner or a fleet member.
     injector: Injector,
+    /// Mesh-native terminal sessions: PTYs this machine hosts for terminal
+    /// routes sourcing here (gated like input injection), and the output
+    /// buffers terminal windows drain for routes sinking here.
+    terminal: TerminalHost,
+    /// Sequence for viewer-side outbound terminal frames (keystrokes,
+    /// resizes — one stream per app run, like `input_seq`).
+    term_seq: AtomicU64,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -143,6 +152,16 @@ impl VideoInStats {
 /// ~64 KiB ceiling (the WebRTC SCTP max message size).
 const MAX_JPEG_CHUNK_BYTES: usize = 40 * 1024;
 
+/// Raw PTY bytes per terminal Data frame — same ceiling arithmetic as the
+/// video chunks, sized small so a `cat bigfile` interleaves with
+/// keystrokes instead of wedging the channel behind one giant message.
+const MAX_TERM_DATA_BYTES: usize = 16 * 1024;
+
+/// A terminal host whose sends keep failing this long (viewer offline,
+/// network gone) kills the shell and tears the route down — nothing else
+/// reaps a session whose peer silently vanished.
+const TERM_SEND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -182,6 +201,8 @@ impl Mesh {
             video: Arc::new(VideoBridge::new()),
             video_decode: Arc::new(DecodeBridge::new()),
             injector: Injector::new(),
+            terminal: TerminalHost::new(),
+            term_seq: AtomicU64::new(0),
             state: Mutex::new(State {
                 session: None,
                 network: None,
@@ -507,6 +528,11 @@ impl Mesh {
             owner: self.ownership.owner().map(NodeId::from),
             claimable: self.ownership.claimable(),
             boot: self.boot_id,
+            // This build can host mesh-native terminals on every OS the
+            // app ships for (openpty / ConPTY) — advertise it so peers
+            // know to offer one. Runtime spawn failures still degrade
+            // in-band (the viewer sees the error in its terminal).
+            features: vec![allmystuff_protocol::FEATURE_TERMINAL.to_string()],
         }
     }
 
@@ -645,6 +671,34 @@ impl Mesh {
             }
             CHANNEL_CONTROL => {
                 if let Ok(msg) = serde_json::from_value::<ControlMessage>(payload) {
+                    // Terminal offers are screened *before* the session sees
+                    // them: the session auto-accepts (Accept + StartMedia in
+                    // one step), and a shell is owner/fleet-only — same rule
+                    // as input injection, enforced before any reply exists.
+                    if let ControlMessage::Route(RouteControl::Offer { route, .. }) = &msg {
+                        let hosts_here = self
+                            .local_node_id()
+                            .is_some_and(|me| node_of(route.from.as_str()) == me);
+                        if let Some(reason) =
+                            terminal_offer_refusal(route, hosts_here, self.sender_may_control(&from))
+                        {
+                            tracing::warn!(
+                                "terminal offer {} from {} refused: not owner/fleet",
+                                route.id,
+                                short_id(&from)
+                            );
+                            let _ = self
+                                .send_control(
+                                    &from,
+                                    &ControlMessage::Route(RouteControl::Reject {
+                                        route_id: route.id.clone(),
+                                        reason,
+                                    }),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
                     let effects = {
                         let mut st = self.state.lock();
                         st.session
@@ -708,6 +762,7 @@ impl Mesh {
                             );
                         }
                     }
+                    MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
                 }
             }
             CHANNEL_OWNED => {
@@ -1045,6 +1100,7 @@ impl Mesh {
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
+        self.terminal.stop(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -1106,6 +1162,7 @@ impl Mesh {
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
+                    self.terminal.stop(&id);
                 }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
@@ -1607,7 +1664,7 @@ impl Mesh {
     /// Begin carrying media for a now-active route. Audio, display (screen
     /// streaming), and input (remote control) are wired; camera video and
     /// storage still show active without a transport, and the log says so.
-    fn start_media(&self, route: &Route) {
+    fn start_media(self: &Arc<Self>, route: &Route) {
         let Some(me) = self.local_node_id() else {
             return;
         };
@@ -1781,6 +1838,24 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Generic if is_terminal_route(route) => {
+                if from_node == me && to_node != me {
+                    // We're the shell end: spawn a PTY and pump it to the
+                    // viewer (after re-clearing the owner/fleet gate).
+                    self.start_terminal_host(route);
+                } else if to_node == me && from_node != me {
+                    // We're the viewer: buffer output from the very first
+                    // byte — the host's prompt arrives right after Accept,
+                    // before the terminal window has subscribed, and unlike
+                    // a video frame a dropped byte never heals.
+                    self.terminal.ensure_queue(&route.id);
+                    tracing::info!(
+                        "route {} active — terminal session from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             other => {
                 tracing::info!(
                     "route {} active ({other:?}); media transport for it is a follow-up",
@@ -1788,6 +1863,244 @@ impl Mesh {
                 );
             }
         }
+    }
+
+    /// The host side of a terminal route going active: spawn this user's
+    /// shell and pump its output to the viewer. The owner/fleet gate
+    /// already ran at offer time ([`terminal_offer_refusal`]); it's
+    /// re-checked here — and on every inbound byte — so a session can
+    /// never outlive the authorization that allowed it.
+    fn start_terminal_host(self: &Arc<Self>, route: &Route) {
+        let viewer = node_of(route.to.as_str());
+        let peer = self.route_peer(&route.id).unwrap_or(viewer);
+        let rid = route.id.clone();
+        if !self.sender_may_control(&peer) {
+            tracing::warn!(
+                "route {rid} — terminal for non-controller {} refused",
+                short_id(&peer)
+            );
+            let mesh = self.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = mesh.disconnect(rid).await;
+            });
+            return;
+        }
+        match self.terminal.spawn(&rid) {
+            Ok(mut out_rx) => {
+                tracing::info!(
+                    "route {rid} active — hosting a terminal for {}",
+                    short_id(&peer)
+                );
+                let mesh = self.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut seq: u64 = 0;
+                    let mut last_ok = std::time::Instant::now();
+                    let mut last_warn = std::time::Instant::now() - WARN_EVERY;
+                    while let Some(msg) = out_rx.recv().await {
+                        match msg {
+                            OutMsg::Data(bytes) => {
+                                for frame in TermFrame::data_frames(
+                                    &rid,
+                                    seq,
+                                    &bytes,
+                                    MAX_TERM_DATA_BYTES,
+                                ) {
+                                    seq = frame.seq + 1;
+                                    let Ok(payload) = serde_json::to_value(&frame) else {
+                                        continue;
+                                    };
+                                    match mesh.send_media_value(&peer, payload).await {
+                                        Ok(()) => last_ok = std::time::Instant::now(),
+                                        Err(e) => {
+                                            if last_warn.elapsed() >= WARN_EVERY {
+                                                last_warn = std::time::Instant::now();
+                                                tracing::warn!(
+                                                    "terminal output to {} failed: {e}",
+                                                    short_id(&peer)
+                                                );
+                                            }
+                                            // Nothing else reaps a session
+                                            // whose viewer silently vanished
+                                            // (peer drops never reach the
+                                            // session) — the pump is the
+                                            // watchdog.
+                                            if last_ok.elapsed() > TERM_SEND_PATIENCE {
+                                                tracing::warn!(
+                                                    "terminal {rid} — viewer unreachable; ending the session"
+                                                );
+                                                let _ = mesh.disconnect(rid.clone()).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            OutMsg::Exit(code) => {
+                                tracing::info!("terminal {rid} — shell ended ({code:?})");
+                                let frame = TermFrame::new(&rid, seq, TermEvent::Exit { code });
+                                if let Ok(payload) = serde_json::to_value(&frame) {
+                                    let _ = mesh.send_media_value(&peer, payload).await;
+                                }
+                                let _ = mesh.disconnect(rid.clone()).await;
+                                return;
+                            }
+                        }
+                    }
+                    // Stream closed without an Exit: `stop` ran, meaning a
+                    // teardown is already in motion — nothing left to do.
+                });
+            }
+            Err(e) => {
+                // Tell the viewer in its own terms — a terminal renders a
+                // line of text better than a silently vanished route — then
+                // tear the route down.
+                tracing::warn!("route {rid} — shell didn't start: {e}");
+                let mesh = self.clone();
+                tauri::async_runtime::spawn(async move {
+                    let note = format!("[couldn't start a shell here: {e}]\r\n");
+                    for frame in [
+                        TermFrame::new(&rid, 0, TermEvent::Data { bytes: note.into_bytes() }),
+                        TermFrame::new(&rid, 1, TermEvent::Exit { code: None }),
+                    ] {
+                        if let Ok(payload) = serde_json::to_value(&frame) {
+                            let _ = mesh.send_media_value(&peer, payload).await;
+                        }
+                    }
+                    let _ = mesh.disconnect(rid).await;
+                });
+            }
+        }
+    }
+
+    /// One inbound terminal frame. Which side we are comes from the route
+    /// itself: keystrokes/resizes landing on the *host* (the route sources
+    /// here) clear the same two gates as input injection — live route from
+    /// this exact sender, and the sender being an authorized controller;
+    /// output/exit landing on the *viewer* (the route sinks here) goes to
+    /// the watching terminal window.
+    fn handle_term_frame(&self, from: &str, frame: TermFrame) {
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        let (hosts_here, views_here) = {
+            let st = self.state.lock();
+            let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
+                return;
+            };
+            if !(r.is_active()
+                && is_terminal_route(&r.route)
+                && pubkey_part(r.peer.as_str()) == pubkey_part(from))
+            {
+                tracing::debug!("terminal frame for {} refused (route not live here)", frame.route);
+                return;
+            }
+            (
+                node_of(r.route.from.as_str()) == me,
+                node_of(r.route.to.as_str()) == me,
+            )
+        };
+        if hosts_here {
+            if !self.sender_may_control(from) {
+                tracing::warn!("dropped terminal input from {from}: not an authorized controller");
+                return;
+            }
+            match frame.event {
+                TermEvent::Data { bytes } => {
+                    let _ = self.terminal.write(&frame.route, bytes);
+                }
+                TermEvent::Resize { cols, rows } => {
+                    let _ = self.terminal.resize(&frame.route, cols, rows);
+                }
+                // Ending the shell is the host's report, never the
+                // viewer's request — a viewer ends a session by tearing
+                // the route down.
+                TermEvent::Exit { .. } => {}
+            }
+        } else if views_here {
+            match frame.event {
+                TermEvent::Data { bytes } => {
+                    if self.terminal.enqueue(&frame.route, bytes) {
+                        // Queue went empty → non-empty: poke the window to
+                        // drain (a lost poke costs latency, never bytes —
+                        // the safety poll catches up).
+                        let _ = self.app.emit("allmystuff://term-ready", &frame.route);
+                    }
+                }
+                TermEvent::Exit { code } => {
+                    let _ = self.app.emit(
+                        "allmystuff://term-exit",
+                        json!({ "route": frame.route, "code": code }),
+                    );
+                }
+                TermEvent::Resize { .. } => {}
+            }
+        }
+    }
+
+    /// Front-end command: keystrokes/resizes from a terminal window down
+    /// its active terminal route. This machine must be the route's
+    /// *viewer* (its sink side); `Exit` is the host's word and is refused.
+    pub async fn term_send(
+        self: &Arc<Self>,
+        route_id: String,
+        event: TermEvent,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && is_terminal_route(&r.route)
+                && node_of(r.route.to.as_str()) == me)
+            {
+                return Err("route isn't an active terminal session here".into());
+            }
+            r.peer.to_string()
+        };
+        match event {
+            TermEvent::Data { bytes } => {
+                // A paste can be arbitrarily large: chunk to the channel
+                // budget and await each send, so big pastes throttle
+                // themselves instead of flooding the daemon.
+                let frames = TermFrame::data_frames(&route_id, 0, &bytes, MAX_TERM_DATA_BYTES);
+                let first = self
+                    .term_seq
+                    .fetch_add(frames.len() as u64, Ordering::Relaxed);
+                for (i, mut frame) in frames.into_iter().enumerate() {
+                    frame.seq = first + i as u64;
+                    let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
+                    self.send_media_value(&peer, payload).await?;
+                }
+                Ok(())
+            }
+            TermEvent::Resize { .. } => {
+                let seq = self.term_seq.fetch_add(1, Ordering::Relaxed);
+                let frame = TermFrame::new(&route_id, seq, event);
+                let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
+                self.send_media_value(&peer, payload).await
+            }
+            TermEvent::Exit { .. } => Err("exit is reported by the host, not sent".into()),
+        }
+    }
+
+    /// A terminal window claims an active route's buffered output (returns
+    /// the token scoping its unwatch). Pure plumbing to [`TerminalHost`].
+    pub fn term_watch(&self, route_id: &str) -> u64 {
+        self.terminal.watch_output(route_id)
+    }
+
+    pub fn term_unwatch(&self, route_id: &str, token: u64) {
+        self.terminal.unwatch(route_id, token);
+    }
+
+    /// Drain buffered terminal output (`[u32 le len][bytes]…`), emptied by
+    /// the window on each `allmystuff://term-ready` poke or safety poll.
+    pub fn term_poll(&self, route_id: &str) -> Vec<u8> {
+        self.terminal.poll(route_id)
     }
 
     /// Whether an inbound media frame is acceptable: its route is one this
@@ -2014,6 +2327,31 @@ fn node_of(cap_id: &str) -> String {
         .unwrap_or_else(|| cap_id.to_string())
 }
 
+/// Whether `route` is a mesh-native terminal session: generic media whose
+/// source endpoint is a machine's `…:terminal` handle. (Terminal
+/// endpoints are deliberately *not* catalog capabilities — generic would
+/// match every auto-wiring picker — so the shape of the route is the
+/// contract.)
+fn is_terminal_route(route: &Route) -> bool {
+    route.media == MediaKind::Generic && route.from.as_str().ends_with(":terminal")
+}
+
+/// Why an inbound terminal offer must be refused, if it must: it asks
+/// *this* machine to host a shell and the offerer isn't an authorized
+/// controller. `None` = fine (not a terminal offer, not our shell, or the
+/// sender is owner/fleet). Pure, so the rule that guards the most
+/// privileged thing on the mesh is unit-testable.
+fn terminal_offer_refusal(
+    route: &Route,
+    hosts_here: bool,
+    sender_may_control: bool,
+) -> Option<String> {
+    if !is_terminal_route(route) || !hosts_here || sender_may_control {
+        return None;
+    }
+    Some("not authorized: terminal access is owner/fleet only".into())
+}
+
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing
 /// 5-char display suffix (`-AB12C`). Mirrors the core's `signing::pubkey_part`,
 /// so a device id in display form (`pubkey-SUFFIX`, what `IdentityShow` and
@@ -2073,5 +2411,57 @@ fn parse_media(s: &str) -> MediaKind {
         "input" => MediaKind::Input,
         "storage" => MediaKind::Storage,
         _ => MediaKind::Generic,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn term_route(from: &str, to: &str, media: MediaKind) -> Route {
+        Route {
+            id: format!("route:{from}→{to}"),
+            from: from.into(),
+            to: to.into(),
+            media,
+            group: None,
+        }
+    }
+
+    #[test]
+    fn terminal_routes_are_recognized_by_shape() {
+        // Generic media + a `…:terminal` source = a terminal session.
+        let term = term_route("host:terminal", "me:term-view:1", MediaKind::Generic);
+        assert!(is_terminal_route(&term));
+
+        // Generic data that isn't a terminal stays untouched (the escape
+        // hatch keeps working for whatever apps wire through it)…
+        let generic = term_route("host:thing", "me:other", MediaKind::Generic);
+        assert!(!is_terminal_route(&generic));
+
+        // …and a `:terminal` id under any *other* media is not a terminal
+        // (the media is part of the contract, not just the suffix).
+        let display = term_route("host:terminal", "me:term-view:1", MediaKind::Display);
+        assert!(!is_terminal_route(&display));
+    }
+
+    #[test]
+    fn terminal_offers_are_refused_exactly_when_unauthorized() {
+        let term = term_route("me:terminal", "them:term-view:1", MediaKind::Generic);
+
+        // Our shell + an unauthorized sender = refusal with a human reason.
+        let refusal = terminal_offer_refusal(&term, true, false);
+        assert!(refusal.is_some_and(|r| r.contains("owner/fleet")));
+
+        // Owner/fleet senders pass.
+        assert_eq!(terminal_offer_refusal(&term, true, true), None);
+
+        // A terminal offer that doesn't ask for *our* shell (we'd be the
+        // viewer) is no grounds for refusal…
+        assert_eq!(terminal_offer_refusal(&term, false, false), None);
+
+        // …and non-terminal offers are never screened here, whoever asks.
+        let audio = term_route("me:mic", "them:speaker", MediaKind::Audio);
+        assert_eq!(terminal_offer_refusal(&audio, true, false), None);
     }
 }
