@@ -24,6 +24,8 @@ mod input_inject;
 mod mesh;
 mod ownership;
 mod video;
+mod video_decode;
+mod win_capture;
 
 use std::sync::Arc;
 
@@ -64,7 +66,11 @@ async fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
         "label": inv.host.hostname,
         "hostname": inv.host.hostname,
         "summary": allmystuff_bridge::node_summary(&inv),
-        "capabilities": allmystuff_bridge::capabilities_from_inventory(&inv, &node),
+        "capabilities": allmystuff_bridge::capabilities_with_screens(
+            &inv,
+            &node,
+            &video::extra_screens(),
+        ),
     }))
     .map_err(|e| e.to_string())
 }
@@ -126,10 +132,13 @@ async fn send_input(
 /// Packets queue backend-side from this moment; the window drains them
 /// with `video_poll` once per display refresh. (Pull, not push: a missed
 /// poll costs one tick, where a lost push on Tauri's ordered IPC channel
-/// silently froze the stream for good.)
+/// silently froze the stream for good.) `decode` asks the backend to run
+/// inbound H.264 through the native decoder and queue ready-to-paint RGBA
+/// frames — for webviews without WebCodecs, and the bottom rung of the
+/// console's decode ladder.
 #[tauri::command]
-fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
-    mesh.video_watch(route_id)
+fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String, decode: Option<bool>) -> u64 {
+    mesh.video_watch(route_id, decode.unwrap_or(false))
 }
 
 /// Drain the queued packets for a route as one raw batch:
@@ -146,6 +155,29 @@ fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Respo
 #[tauri::command]
 fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
     mesh.video_unwatch(&route_id, token);
+}
+
+/// Ask the sender of an inbound display route for a clean decode entry
+/// (IDR) now — the console's decoder hit an error. Rate-limited backend-
+/// side; safe to call from a decode-error handler.
+#[tauri::command]
+async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
+    mesh.inner().request_refresh(route_id).await
+}
+
+/// Ask the sender of an inbound display route to stream with these
+/// quality picks; absent values mean "automatic". The console's pills.
+#[tauri::command]
+async fn tune_route(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    max_edge: Option<u32>,
+    bitrate: Option<u32>,
+    fps: Option<u32>,
+) -> Result<(), String> {
+    mesh.inner()
+        .request_tune(route_id, max_edge, bitrate, fps)
+        .await
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -490,6 +522,8 @@ fn main() {
             video_watch,
             video_poll,
             video_unwatch,
+            video_refresh,
+            tune_route,
             open_console_window,
             session_snapshot,
             owned_roster,

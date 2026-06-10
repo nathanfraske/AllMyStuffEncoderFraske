@@ -12,22 +12,33 @@
 //!    output and drains a ring buffer that [`AudioBridge::feed`] fills from
 //!    inbound frames (linear-resampled to the device rate).
 //!
+//! Because "routes active, no sound" is invisible from the route handshake,
+//! both ends are deliberately loud about the things that go silently wrong
+//! in the field: each stream logs **which device** it opened (the default
+//! device may not be the one the user is thinking of), a capture that
+//! produces nothing but zeros for its first seconds names the OS
+//! microphone permission (macOS TCC and Windows privacy both deliver
+//! silence rather than an error), and a playback that never gets fed says
+//! so once instead of playing silence forever. The flowing-state counters
+//! (`audio out/in` lines) ride the same `ALLMYSTUFF_VIDEO_STATS` dial-in
+//! switch the video pipeline uses, at debug otherwise.
+//!
 //! v1 simplifications, called out honestly: it uses the *default* input /
 //! output device (mapping a specific scanned device to a cpal device by
 //! name is a follow-up), and transports mono. Both are noted in the README.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use allmystuff_session::AudioFrame;
 
-/// One running route's audio resources.
+/// One running route's audio resources (a capture or a playback thread).
 struct RouteAudio {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -36,10 +47,14 @@ struct RouteAudio {
     playback: Option<Playback>,
 }
 
-#[derive(Clone)]
 struct Playback {
     ring: Arc<Mutex<VecDeque<i16>>>,
     out_rate: Arc<AtomicU32>,
+    /// Frames `feed` has accepted — the playback thread warns once when
+    /// this is still zero seconds after the route went live.
+    fed: Arc<AtomicU64>,
+    /// Receive-side dial-in counters.
+    stats: Mutex<LevelStats>,
 }
 
 impl Drop for RouteAudio {
@@ -51,9 +66,58 @@ impl Drop for RouteAudio {
     }
 }
 
+/// Windowed frames/peak counters shared by the capture and feed sides —
+/// the audio equivalent of the video pipeline's dial-in lines.
+struct LevelStats {
+    since: Instant,
+    frames: u32,
+    peak: i16,
+    /// Whether the all-zeros warning fired (once per stream).
+    warned_silent: bool,
+}
+
+impl LevelStats {
+    fn new() -> Self {
+        LevelStats {
+            since: Instant::now(),
+            frames: 0,
+            peak: 0,
+            warned_silent: false,
+        }
+    }
+
+    /// Count one buffer; every ~5 s emit the dial-in line via `log` and
+    /// return whether the window was pure silence (for the caller's
+    /// one-shot permission warning).
+    fn note(&mut self, pcm: &[i16], log: impl FnOnce(String)) -> bool {
+        const EVERY: Duration = Duration::from_secs(5);
+        self.frames += 1;
+        let peak = pcm.iter().map(|s| s.saturating_abs()).max().unwrap_or(0);
+        self.peak = self.peak.max(peak);
+        if self.since.elapsed() < EVERY {
+            return false;
+        }
+        let secs = self.since.elapsed().as_secs_f64();
+        log(format!(
+            "{:.0} buffers/s · peak {:.0}%",
+            self.frames as f64 / secs,
+            self.peak as f64 * 100.0 / i16::MAX as f64,
+        ));
+        let silent = self.peak == 0;
+        self.since = Instant::now();
+        self.frames = 0;
+        self.peak = 0;
+        silent
+    }
+}
+
 #[derive(Default)]
 pub struct AudioBridge {
-    routes: Mutex<HashMap<String, RouteAudio>>,
+    // Capture and playback live in separate maps so a loopback route (this
+    // machine's mic to its own speakers) can run both under one route id —
+    // one map made the second insert silently stop the first's thread.
+    captures: Mutex<HashMap<String, RouteAudio>>,
+    playbacks: Mutex<HashMap<String, RouteAudio>>,
 }
 
 impl AudioBridge {
@@ -72,11 +136,11 @@ impl AudioBridge {
         let stop_thread = stop.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture(&stop_thread, on_frame) {
+            if let Err(e) = run_capture(&stop_thread, &id, on_frame) {
                 tracing::warn!("audio capture for {id} stopped: {e}");
             }
         });
-        self.routes.lock().insert(
+        self.captures.lock().insert(
             route_id,
             RouteAudio {
                 stop,
@@ -96,18 +160,27 @@ impl AudioBridge {
         // with the real device rate once the stream is built.
         let out_rate = Arc::new(AtomicU32::new(48_000));
         let out_rate_thread = out_rate.clone();
+        let fed = Arc::new(AtomicU64::new(0));
+        let fed_thread = fed.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_playback(&stop_thread, ring_thread, out_rate_thread) {
+            if let Err(e) =
+                run_playback(&stop_thread, &id, ring_thread, out_rate_thread, fed_thread)
+            {
                 tracing::warn!("audio playback for {id} stopped: {e}");
             }
         });
-        self.routes.lock().insert(
+        self.playbacks.lock().insert(
             route_id,
             RouteAudio {
                 stop,
                 thread: Some(thread),
-                playback: Some(Playback { ring, out_rate }),
+                playback: Some(Playback {
+                    ring,
+                    out_rate,
+                    fed,
+                    stats: Mutex::new(LevelStats::new()),
+                }),
             },
         );
     }
@@ -115,11 +188,25 @@ impl AudioBridge {
     /// Push an inbound frame into a playback route's ring (mono, resampled
     /// to the device rate). No-op if the route isn't a playback route.
     pub fn feed(&self, route_id: &str, frame: &AudioFrame) {
-        let routes = self.routes.lock();
+        let routes = self.playbacks.lock();
         let Some(pb) = routes.get(route_id).and_then(|r| r.playback.as_ref()) else {
             return;
         };
+        if pb.fed.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "first audio frame for {route_id} ({} Hz, {} ch)",
+                frame.sample_rate,
+                frame.channels
+            );
+        }
         let mono = downmix(&frame.pcm, frame.channels);
+        {
+            let mut stats = pb.stats.lock();
+            let id = route_id.to_string();
+            stats.note(&mono, move |line| {
+                stats_log(format!("audio in {id}: {line}"))
+            });
+        }
         let out_rate = pb.out_rate.load(Ordering::Relaxed);
         let samples = if frame.sample_rate == out_rate || frame.sample_rate == 0 {
             mono
@@ -137,21 +224,35 @@ impl AudioBridge {
 
     pub fn stop(&self, route_id: &str) {
         // Drop runs the thread join + stream teardown.
-        self.routes.lock().remove(route_id);
+        self.captures.lock().remove(route_id);
+        self.playbacks.lock().remove(route_id);
     }
 
+    #[allow(dead_code)]
     pub fn stop_all(&self) {
-        self.routes.lock().clear();
+        self.captures.lock().clear();
+        self.playbacks.lock().clear();
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self, route_id: &str) -> bool {
-        self.routes.lock().contains_key(route_id)
+        self.captures.lock().contains_key(route_id) || self.playbacks.lock().contains_key(route_id)
+    }
+}
+
+/// Route a dial-in line through the same switch as the video pipeline's:
+/// info while `ALLMYSTUFF_VIDEO_STATS` is set, debug otherwise.
+fn stats_log(line: String) {
+    if crate::video::stats_to_info() {
+        tracing::info!("{line}");
+    } else {
+        tracing::debug!("{line}");
     }
 }
 
 // ---- capture ----------------------------------------------------------
 
-fn run_capture<F>(stop: &AtomicBool, on_frame: F) -> Result<(), String>
+fn run_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: F) -> Result<(), String>
 where
     F: Fn(Vec<i16>, u32) + Send + 'static,
 {
@@ -164,7 +265,39 @@ where
     let channels = supported.channels();
     let config: cpal::StreamConfig = supported.config();
     let fmt = supported.sample_format();
+    // Name the device: "no sound" is regularly "the default input isn't
+    // the mic you think it is".
+    tracing::info!(
+        "audio capture for {route_id}: device \"{}\", {sample_rate} Hz, {channels} ch, {fmt:?}",
+        device.name().unwrap_or_else(|_| "unknown".into()),
+    );
     let err = |e| tracing::warn!("input stream error: {e}");
+
+    // Wrap the consumer with the level meter. A capture whose first
+    // five-second window is *pure zeros* is almost always the OS denying
+    // the microphone (macOS TCC / Windows privacy deliver silence, not an
+    // error) — say so once, loudly, instead of streaming silence.
+    let on_frame = {
+        let stats = Mutex::new(LevelStats::new());
+        let id = route_id.to_string();
+        move |pcm: Vec<i16>, rate: u32| {
+            {
+                let mut stats = stats.lock();
+                let line_id = id.clone();
+                let silent = stats.note(&pcm, move |line| {
+                    stats_log(format!("audio out {line_id}: {line}"));
+                });
+                if silent && !stats.warned_silent {
+                    stats.warned_silent = true;
+                    tracing::warn!(
+                        "audio capture for {id} is producing pure silence — check the OS \
+                         microphone permission for this app (and the default input device)"
+                    );
+                }
+            }
+            on_frame(pcm, rate);
+        }
+    };
 
     // `on_frame` is moved into whichever arm runs (match arms are mutually
     // exclusive, so a single move per arm is fine). `Fn` is callable
@@ -216,8 +349,10 @@ where
 
 fn run_playback(
     stop: &AtomicBool,
+    route_id: &str,
     ring: Arc<Mutex<VecDeque<i16>>>,
     out_rate: Arc<AtomicU32>,
+    fed: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
     let device = host
@@ -228,6 +363,11 @@ fn run_playback(
     let channels = supported.channels() as usize;
     let config: cpal::StreamConfig = supported.config();
     let fmt = supported.sample_format();
+    tracing::info!(
+        "audio playback for {route_id}: device \"{}\", {} Hz, {channels} ch, {fmt:?}",
+        device.name().unwrap_or_else(|_| "unknown".into()),
+        supported.sample_rate().0,
+    );
     let err = |e| tracing::warn!("output stream error: {e}");
 
     // Each output frame is `channels` interleaved samples; we hold mono in
@@ -268,7 +408,25 @@ fn run_playback(
     .map_err(|e| e.to_string())?;
 
     stream.play().map_err(|e| e.to_string())?;
-    park_until_stopped(stop);
+    // The route is live and the speaker is waiting: if nothing has been
+    // fed after a few seconds the problem is upstream (peer capturing
+    // silence, frames not arriving) — name it once, so "no sound" is
+    // attributable from this side's log alone.
+    let mut starve_check = Some(Instant::now());
+    while !stop.load(Ordering::SeqCst) {
+        if let Some(started) = starve_check {
+            if started.elapsed() >= Duration::from_secs(5) {
+                starve_check = None;
+                if fed.load(Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        "audio playback for {route_id} has received no frames after 5s — \
+                         the sending side is likely capturing silence or not capturing at all"
+                    );
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
 
@@ -343,5 +501,31 @@ mod tests {
         assert_eq!(f32_to_i16(0.0), 0);
         assert!(f32_to_i16(1.0) >= 32760);
         assert!((i16_to_f32(32767) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn level_stats_flag_a_pure_silence_window() {
+        let mut stats = LevelStats::new();
+        assert!(!stats.note(&[0, 0, 0], |_| {}), "window not elapsed yet");
+        stats.since = Instant::now() - Duration::from_secs(6);
+        assert!(stats.note(&[0, 0, 0], |_| {}), "all-zeros window is silent");
+
+        let mut loud = LevelStats::new();
+        loud.since = Instant::now() - Duration::from_secs(6);
+        assert!(!loud.note(&[0, 900, 0], |_| {}), "signal present");
+    }
+
+    #[test]
+    fn capture_and_playback_for_one_route_coexist() {
+        // A loopback route starts both; stopping must kill both. (The
+        // threads themselves bail instantly in CI — no audio devices —
+        // which is fine: this exercises the bookkeeping, not cpal.)
+        let bridge = AudioBridge::new();
+        bridge.start_capture("r".into(), |_, _| {});
+        bridge.start_playback("r".into());
+        assert!(bridge.captures.lock().contains_key("r"));
+        assert!(bridge.playbacks.lock().contains_key("r"));
+        bridge.stop("r");
+        assert!(!bridge.is_running("r"));
     }
 }

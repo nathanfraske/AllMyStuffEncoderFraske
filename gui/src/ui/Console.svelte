@@ -19,7 +19,7 @@
   // the control route.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { closeThisWindow, onThisWindowClose, watchVideo } from "../tauri";
+  import { closeThisWindow, onThisWindowClose, refreshRoute, watchVideo } from "../tauri";
   import {
     displayName,
     originIcon,
@@ -37,14 +37,23 @@
   const selected = $derived<Capability | null>(
     (selectedId ? app.capability(selectedId) : null) ?? null,
   );
+  // Which remote monitor the stage is showing (`<node>:screen:<id>`),
+  // undefined for the primary `screen` (and for cameras) — rides every
+  // mouse move so the remote lands the cursor on the screen being viewed.
+  const controlScreen = $derived.by(() => {
+    const m = selectedId?.match(/:screen:(\d+)$/);
+    return m ? Number(m[1]) : undefined;
+  });
 
   // ---- live video ---------------------------------------------------
   //
-  // The stage is a canvas with two decode paths: H.264 access units go
+  // The stage is a canvas with three decode paths: H.264 access units
   // through WebCodecs (hardware where the webview has it), JPEG frames
-  // through createImageBitmap — whichever the backend delivers, per
-  // packet. The H.264 decoder is created lazily on the first key unit
-  // and rebuilt on the next one after any error.
+  // through createImageBitmap, and — when this webview has no WebCodecs
+  // (Linux WebKitGTK) or its decoder stalled out — the backend's native
+  // openh264 decoder, which delivers ready-to-paint RGBA frames this
+  // component just blits. The WebCodecs decoder is created lazily on the
+  // first key unit and rebuilt on the next one after any error.
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let hasFrame = $state(false);
   let frameW = $state(0);
@@ -61,6 +70,86 @@
   let queuePeek = () => 0;
   let stallKick = () => {};
   let decodeModeNote = "";
+  // Whether the backend decodes for us (raw RGBA in, no webview codec).
+  // Starts true where WebCodecs doesn't exist at all; the decode ladder
+  // also lands here after WebCodecs stalls twice. Sticky for the session —
+  // a webview whose decoder wedged once isn't owed a third chance.
+  let nativeDecode = $state(typeof VideoDecoder === "undefined");
+
+  // ---- the quality pills ---------------------------------------------
+  //
+  // Resolution, frame rate, and bitrate ride a `Tune` ask to the machine
+  // being viewed (its capture restarts with the picks); the codec pill
+  // re-offers the route on the chosen transport and picks where H.264 is
+  // decoded. Auto everywhere = exactly the automatic pipeline.
+  type PillChoice = { label: string; value: number | null };
+  const RES_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "4K", value: 3840 },
+    { label: "1440p", value: 2560 },
+    { label: "1080p", value: 1920 },
+    { label: "720p", value: 1280 },
+  ];
+  const FPS_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "60", value: 60 },
+    { label: "30", value: 30 },
+    { label: "24", value: 24 },
+    { label: "15", value: 15 },
+  ];
+  const RATE_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "40 Mbps", value: 40_000_000 },
+    { label: "25 Mbps", value: 25_000_000 },
+    { label: "15 Mbps", value: 15_000_000 },
+    { label: "8 Mbps", value: 8_000_000 },
+    { label: "4 Mbps", value: 4_000_000 },
+  ];
+  type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
+  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice }> = [
+    { label: "Auto", value: "auto" },
+    { label: "H.264", value: "h264" },
+    { label: "H.264 · native decode", value: "native" },
+    { label: "MJPEG", value: "mjpeg" },
+  ];
+  let codecChoice = $state<CodecChoice>("auto");
+  let openPill = $state<"res" | "fps" | "rate" | "codec" | null>(null);
+
+  const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
+    choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
+
+  function pickRes(v: number | null) {
+    app.setConsoleTune({ maxEdge: v ?? undefined });
+    openPill = null;
+  }
+  function pickFps(v: number | null) {
+    app.setConsoleTune({ fps: v ?? undefined });
+    openPill = null;
+  }
+  function pickRate(v: number | null) {
+    app.setConsoleTune({ bitrate: v ?? undefined });
+    openPill = null;
+  }
+  function pickCodec(v: CodecChoice) {
+    codecChoice = v;
+    openPill = null;
+    // Where to decode is this window's choice; which transport to offer
+    // is the store's (it re-offers the route when that part changes).
+    nativeDecode = v === "native" || (v === "auto" && typeof VideoDecoder === "undefined");
+    app.setConsoleCodec(v === "mjpeg" ? "mjpeg" : v === "auto" ? "auto" : "h264");
+  }
+
+  // Decode errors ask the sender for a clean entry (rate-limited again
+  // backend-side) instead of sitting out the periodic IDR interval.
+  let lastRefreshAsk = 0;
+  function askRefresh() {
+    const route = app.consoleVideoLive;
+    if (!route) return;
+    const now = performance.now();
+    if (now - lastRefreshAsk < 700) return;
+    lastRefreshAsk = now;
+    void refreshRoute(route);
+  }
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -114,6 +203,9 @@
   // changes (input switch, session end).
   $effect(() => {
     const route = app.consoleVideoLive;
+    // Reading this here makes the ladder's last rung re-run the effect:
+    // flipping it tears the watch down and re-watches in native mode.
+    const native = nativeDecode;
     hasFrame = false;
     fps = 0;
     transport = "";
@@ -129,7 +221,9 @@
     // The decode ladder: hardware-preference first; any stall (born dead
     // *or* mid-stream — the hardware-pool failure shape is bursts, then a
     // growing queue with no output and no error) rebuilds the decoder one
-    // rung down on software decode. The chip's diag line records the step.
+    // rung down on software decode, and a stall *there* hands the stream
+    // to the backend's native decoder. The chip's diag line records the
+    // step.
     let decodeMode: HardwareAcceleration = "no-preference";
     let decodeCalls = 0;
     let decodeOutputs = 0;
@@ -140,12 +234,20 @@
     let pendingFrame: VideoFrame | null = null;
     let paintScheduled = false;
     queuePeek = () => decoder?.decodeQueueSize ?? 0;
-    decodeModeNote = "";
+    decodeModeNote = native ? "native" : "";
 
     const rebuildDecoder = () => {
       if (decodeMode === "no-preference") {
         decodeMode = "prefer-software";
         decodeModeNote = "sw";
+      } else {
+        // Software decode stalled too — hand the stream to the backend's
+        // openh264 decoder. Setting the flag re-runs this effect, which
+        // re-watches the route in native mode (and tears this rung down).
+        console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
+        nativeDecode = true;
+        askRefresh();
+        return;
       }
       console.warn(
         `video decoder (${codecString}) stalled — rebuilding with ${decodeMode}`,
@@ -199,6 +301,7 @@
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
       decodeFails += 1;
+      askRefresh();
       console.warn("video decode error:", why);
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
@@ -208,9 +311,11 @@
       decoder = null;
     };
 
-    void watchVideo(route, (f) => {
+    void watchVideo(
+      route,
+      (f) => {
       if (cancelled) return;
-      transport = f.kind === "h264" ? "H.264" : "MJPEG";
+      transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
         const blob = new Blob([f.data], { type: "image/jpeg" });
         drawChain = drawChain.then(async () => {
@@ -223,6 +328,15 @@
             // A torn frame decodes as nothing; the next one stands alone.
           }
         });
+        return;
+      }
+      if (f.kind === "raw") {
+        // The backend already decoded — RGBA in, one blit out.
+        inCount += 1;
+        if (f.data.byteLength !== f.width * f.height * 4) return;
+        const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
+        const img = new ImageData(pixels, f.width, f.height);
+        paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
         return;
       }
       // H.264 — decode entry is a key unit; deltas before one wait.
@@ -273,7 +387,9 @@
       // Born-dead decoders (key accepted, nothing ever out) get the same
       // rebuild as mid-stream stalls — without waiting for the 1s sweep.
       if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
-    }).then((u) => {
+      },
+      { decode: native },
+    ).then((u) => {
       // The route may have changed while the subscribe was in flight.
       if (cancelled) u();
       else unwatch = u;
@@ -341,7 +457,7 @@
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
-    app.sendConsoleInput({ kind: "mouse_move", ...p });
+    app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
@@ -350,7 +466,7 @@
     if (!p) return;
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
-    app.sendConsoleInput({ kind: "mouse_move", ...p });
+    app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
   }
 
@@ -382,7 +498,11 @@
   }
 </script>
 
-<svelte:window onkeydown={(e) => onKey(e, true)} onkeyup={(e) => onKey(e, false)} />
+<svelte:window
+  onkeydown={(e) => onKey(e, true)}
+  onkeyup={(e) => onKey(e, false)}
+  onclick={() => (openPill = null)}
+/>
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -475,6 +595,42 @@
       </div>
 
       <!-- Control / passthrough bar -->
+      {#snippet pillMenu(
+        key: "res" | "fps" | "rate",
+        name: string,
+        choices: PillChoice[],
+        current: number | null | undefined,
+        pick: (v: number | null) => void,
+      )}
+        <span class="pill-wrap">
+          <button
+            class="pill"
+            class:tuned={(current ?? null) !== null}
+            onclick={(e) => {
+              e.stopPropagation();
+              openPill = openPill === key ? null : key;
+            }}
+          >
+            {name} · {pillLabel(choices, current)} ▾
+          </button>
+          {#if openPill === key}
+            <div class="pill-menu" role="menu">
+              {#each choices as c (c.label)}
+                <button
+                  class="pill-item"
+                  class:sel={(current ?? null) === c.value}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    pick(c.value);
+                  }}
+                >
+                  {c.label}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </span>
+      {/snippet}
       <footer class="controls">
         <div class="toggles">
           <button
@@ -498,6 +654,42 @@
             <span class="pip" class:lit={app.consoleControl}></span>
           </button>
         </div>
+
+        {#if app.consoleVideoLive}
+          <div class="pills" role="group" aria-label="Stream quality">
+            {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
+            {@render pillMenu("fps", "FPS", FPS_CHOICES, app.consoleTune.fps, pickFps)}
+            {@render pillMenu("rate", "Rate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
+            <span class="pill-wrap">
+              <button
+                class="pill"
+                class:tuned={codecChoice !== "auto"}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  openPill = openPill === "codec" ? null : "codec";
+                }}
+              >
+                Codec · {CODEC_CHOICES.find((c) => c.value === codecChoice)?.label ?? "Auto"} ▾
+              </button>
+              {#if openPill === "codec"}
+                <div class="pill-menu" role="menu">
+                  {#each CODEC_CHOICES as c (c.value)}
+                    <button
+                      class="pill-item"
+                      class:sel={codecChoice === c.value}
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        pickCodec(c.value);
+                      }}
+                    >
+                      {c.label}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </span>
+          </div>
+        {/if}
 
         <div class="status">
           {#if hasFrame}
@@ -782,6 +974,68 @@
   }
   .t-icon {
     font-size: 0.95rem;
+  }
+  .pills {
+    display: flex;
+    gap: 0.3rem;
+    flex-shrink: 0;
+  }
+  .pill-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .pill {
+    border: 1px solid #322c47;
+    background: #14121f;
+    color: #c8c2e0;
+    border-radius: var(--r-pill);
+    padding: 0.32rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 0.12s ease;
+  }
+  .pill:hover {
+    border-color: var(--accent);
+  }
+  /* A dial off Auto reads as deliberately set. */
+  .pill.tuned {
+    border-color: var(--accent);
+    color: #e6e1ff;
+  }
+  .pill-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #1a1730;
+    border: 1px solid #322c47;
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg);
+    padding: 0.25rem;
+    z-index: 20;
+  }
+  .pill-item {
+    border: none;
+    background: transparent;
+    color: #c8c2e0;
+    text-align: left;
+    font-size: 0.76rem;
+    font-weight: 600;
+    padding: 0.32rem 0.6rem;
+    border-radius: var(--r-sm, 6px);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .pill-item:hover {
+    background: #241f38;
+    color: #fff;
+  }
+  .pill-item.sel {
+    color: var(--accent);
   }
   .pip {
     width: 8px;

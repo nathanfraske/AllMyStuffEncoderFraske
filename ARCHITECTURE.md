@@ -123,11 +123,17 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
 
 The one place hardware vocabulary meets graph vocabulary. Turns an
 `Inventory` into graph `Capability`s — physical devices (mic → audio source,
-monitor → display sink, …) plus a synthetic per-machine trio (**screen** =
-display source, **control** = input sink, **system audio** = duplex) so
-whole-computer flows (screen-share, RDC) have something to land on. Shared by
-the CLI and the Tauri backend so "what this machine exposes" is computed
-once.
+monitor → display sink, …) plus a synthetic per-machine set (**screen** =
+display source, **control** = input sink, **keyboard & mouse** = input
+source — a console forwards "whatever this machine's user does", never one
+scanned device, so driving a remote works even where the input scan finds
+nothing (macOS) — and **system audio** = duplex) so whole-computer flows
+(screen-share, RDC, remote control) have something to land on *and* start
+from. The GUI also passes its own monitor enumeration in
+(`capabilities_with_screens`): each monitor beyond the primary becomes a
+`screen:<id>` display source — one console tab per screen — with ids the
+capture side resolves back to the same monitor. Shared by the CLI and the
+Tauri backend so "what this machine exposes" is computed once.
 
 ## The GUI (`gui/`)
 
@@ -156,10 +162,18 @@ Tauri 2 + Svelte 5, a client of the daemon.
   console opens as its **own OS window** (`open_console_window` →
   `?console=<node>` → `ConsoleHost.svelte`), so several machines can be on
   screen at once; the web preview keeps the in-page popover. The stage is a
-  live MJPEG sink — it registers a per-route IPC channel (`video_watch`) and
-  the backend pushes each inbound frame as raw bytes (a fixed header + the
-  JPEG; no JSON or base64 on the per-frame path) to exactly the window
-  that's watching — and while control is on it captures pointer/key events,
+  live video sink — it registers a per-route IPC channel (`video_watch`) and
+  the backend queues each inbound packet as raw bytes (a fixed header + the
+  payload; no JSON or base64 on the per-frame path) for exactly the window
+  that's watching. Decode walks a ladder: WebCodecs with hardware
+  preference, rebuilt on software preference after a stall, and — after a
+  second stall, or from the start in a webview with no WebCodecs at all
+  (Linux WebKitGTK) — the watch re-registers with `decode: true` and the
+  **backend decodes natively** (`video_decode.rs`: openh264, one thread per
+  route), queueing ready-to-paint RGBA frames freshest-wins that the canvas
+  just blits. The tab bar shows one tab per video input the remote
+  advertises — its screen, each extra monitor (`screen:<id>`), and its
+  cameras. While control is on the stage captures pointer/key events,
   normalizes coordinates onto the streamed frame, and forwards them down
   the control route via `send_input`. The top bar's gear
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
@@ -197,27 +211,59 @@ Tauri 2 + Svelte 5, a client of the daemon.
 5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
    audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
-   over `CHANNEL_MEDIA`, and the sink plays them. A display route streams
-   the source's primary screen from a persistent capture session (`xcap`'s
-   recorder: PipeWire ScreenCast / DXGI / AVFoundation, with a paced
-   per-frame grab as the X11 path and universal fallback), unchanged frames
-   skipped, a bounded queue dropping stale packets under backpressure. The
-   *transport* is negotiated per route: when the viewer's offer advertises
-   `h264` (WebCodecs present) and the peer's lane is free, frames ride
-   **MyOwnMesh's H.264 video track lane** — openh264 in screen-content mode
-   at a 1920 edge, real RTP, no JSON/base64/64 KiB ceiling — and otherwise
-   fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA` (1280 edge,
-   chunked JPEGs), so any version skew degrades to working video. Either
-   way the console window renders packets it *pulls* per display tick
-   (raw bytes; WebCodecs decodes H.264, `createImageBitmap` the JPEGs).
+   over `CHANNEL_MEDIA`, and the sink plays them — and both ends log which
+   device they opened, a capture whose first seconds are pure zeros names
+   the OS microphone permission (macOS/Windows deny with silence, not an
+   error), and a playback that's never fed says so once. A display route
+   streams the routed screen — the primary for the synthetic `screen`, the
+   named monitor for a `screen:<id>` capability — from a persistent capture
+   session (in-house DXGI Output Duplication on Windows — xcap's recorder
+   duplicates every output it walks past and leaks the handle, so only the
+   first session per process ever worked — and `xcap`'s recorder elsewhere:
+   PipeWire ScreenCast / AVFoundation, retried once with a fresh monitor
+   handle before settling for the paced per-frame grab that is the X11 path
+   and universal fallback), unchanged frames skipped, a bounded queue
+   dropping stale packets under backpressure. The *transport* is negotiated
+   per route: the viewer always offers `h264` (decode is covered everywhere
+   — see below); when the peer's lane is free — a lane whose holding route
+   already ended is taken over, and the console serializes its tab switches
+   so the teardown precedes the next offer — frames ride **MyOwnMesh's
+   H.264 video track lane**: openh264 in screen-content mode at native
+   resolution up to 4K, bitrate budgeted from the monitor's true pixel
+   count (~0.16 bpp, 8–40 Mbps), real RTP, no JSON/base64/64 KiB ceiling.
+   Otherwise they fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA`
+   (1280 edge, chunked JPEGs), so any version skew degrades to working
+   video. Either way the console window renders packets it *pulls* per
+   display tick (raw bytes): WebCodecs decodes H.264 where the webview has
+   it, `createImageBitmap` the JPEGs, and otherwise the backend's **native
+   openh264 decoder** hands the window RGBA frames ready to blit — maximum
+   frames and minimum latency don't depend on the webview's codec support.
+   The console footer's **quality pills** (Resolution / FPS / Rate /
+   Codec, each defaulting to Auto) ride `RouteControl::Tune` to the
+   streaming side, which restarts its capture with the picks; the codec
+   pill re-offers the route on the chosen transport and picks where H.264
+   is decoded. A decoder that loses its place — a corrupt unit, a rebuilt
+   WebCodecs instance, a dumped native-decoder backlog — sends
+   `RouteControl::Refresh` and gets an IDR in ~one round trip instead of
+   sitting out the periodic interval (both asks are rate-limited and
+   silently dropped by older peers). Stream integrity itself is the
+   daemon's job: myownmesh ≥ 0.2.2 reassembles access units
+   sequence-aware, so packet loss or a late NACK retransmit costs one
+   frame, never a corrupt unit in a decoder.
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
-   pipeline counters (fps, scale/encode ms, bitrate, skip/drop causes)
-   every few seconds on both ends — quiet by default. An input
+   pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
+   skip/drop causes) every few seconds on both ends — quiet by default;
+   `ALLMYSTUFF_VIDEO_FPS` / `ALLMYSTUFF_VIDEO_MAX_EDGE` /
+   `ALLMYSTUFF_VIDEO_BITRATE` dial the H.264 stream without a rebuild. An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
-   buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
-   but only after the gate: the route must be live *and* the sender must be
-   the device's recorded owner or a co-owned fleet member, so a route that
-   merely auto-accepted can never type into your machine.
+   buttons / wheel / DOM-`key` values — each move naming which remote screen
+   it's normalized over, so control follows the console's selected tab —
+   injected at the sink with `enigo` (plus a hand-raised
+   `MOUSEEVENTF_VIRTUALDESK` move on Windows, where enigo's absolute
+   coordinates can't reach past the primary monitor) — but only after the
+   gate: the route must be live *and* the sender must be the device's
+   recorded owner or a co-owned fleet member, so a route that merely
+   auto-accepted can never type into your machine.
 
 ## Persistent state
 
@@ -252,11 +298,12 @@ goes to everyone.
 
 - **Camera video + storage transport** over the same route pipe that audio,
   screen, and input already use — each needs its capture backend feeding the
-  existing offer/accept/media plumbing.
-- **Per-device routing** — map a specific scanned device to a `cpal` device
-  or a specific monitor to the screen capture (v1 uses the default
-  input/output and the primary display), and an audio codec (Opus) so the
-  media channel isn't raw PCM.
+  existing offer/accept/media plumbing. (Cameras already show as console
+  tabs; selecting one says the transport is coming.)
+- **Per-device audio routing** — map a specific scanned device to a `cpal`
+  device (audio still uses the default input/output; monitors are routed
+  per-screen now), and an audio codec (Opus) so the media channel isn't
+  raw PCM.
 - **Share-grant-gated control** — input injection currently trusts only the
   device's owner/fleet; honouring a *shared* person's explicit control grant
   rides on the share-enforcement work.

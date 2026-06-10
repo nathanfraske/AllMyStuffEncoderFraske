@@ -183,7 +183,7 @@ export function connectGroup(
   return { ok: true, routes };
 }
 
-const MACHINE_ORIGINS = new Set(["screen", "control", "system"]);
+const MACHINE_ORIGINS = new Set(["screen", "control", "controller", "system"]);
 
 /** Sort key (lower = preferred), mirroring the Rust `endpoint_rank`: a
  *  synthetic machine endpoint first, then the category's current default

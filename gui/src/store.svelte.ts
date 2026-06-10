@@ -18,6 +18,8 @@ import {
   buildNetworkConfig,
   claimNode,
   connectRoute,
+  tuneRoute,
+  type StreamTune,
   consoleWindowTarget,
   disconnectRoute,
   fleetKick,
@@ -196,6 +198,13 @@ class AppStore {
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
   consoleVideoLive = $state<string | null>(null);
+  /** The console's codec pill: which transport to *offer* for its video
+   *  route. "auto" and "h264" both offer H.264 (auto lets the decode
+   *  ladder pick where it's decoded); "mjpeg" forces the fallback. */
+  consoleCodec = $state<"auto" | "h264" | "mjpeg">("auto");
+  /** The console's quality pills — absent fields are Automatic. Sent to
+   *  the streaming side, which restarts its capture with them. */
+  consoleTune = $state<StreamTune>({});
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
@@ -769,11 +778,11 @@ class AppStore {
 
   /** Try to wire `from` → `to`. On success the route appears; if it needs
    *  a shared person's permission, raises the share sheet instead. */
-  connect(from: string, to: string) {
+  connect(from: string, to: string, codec?: "auto" | "h264" | "mjpeg") {
     const res = proposeRoute(this.catalog, from, to);
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
-      this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
+      this.fireBackendConnect(res.route.from, res.route.to, res.route.media, codec);
       const f = this.capability(from)?.label ?? from;
       const t = this.capability(to)?.label ?? to;
       this.toast("ok", `Connected ${f} → ${t}`);
@@ -814,8 +823,13 @@ class AppStore {
   /** When a real backend is connected, fire the actual mesh route offer.
    *  The backend's session snapshots then keep the route's live state in
    *  sync; in web mode this is a no-op and the local route stands in. */
-  private fireBackendConnect(from: string, to: string, media: MediaKind) {
-    if (this.backendConnected) void connectRoute(from, to, media);
+  private fireBackendConnect(
+    from: string,
+    to: string,
+    media: MediaKind,
+    codec?: "auto" | "h264" | "mjpeg",
+  ) {
+    if (this.backendConnected) void connectRoute(from, to, media, codec);
   }
 
   private addRoute(from: string, to: string, group: string | null = null) {
@@ -886,7 +900,9 @@ class AppStore {
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
-    this.applyConsoleVideo();
+    this.consoleCodec = "auto";
+    this.consoleTune = {};
+    void this.applyConsoleVideo();
     this.toast("ok", `Console open on ${node!.label}`);
   }
 
@@ -946,28 +962,61 @@ class AppStore {
   /** Switch which remote source the console is showing. */
   setConsoleInput(capId: string) {
     this.consoleInput = capId;
-    this.applyConsoleVideo();
+    void this.applyConsoleVideo();
   }
 
-  private applyConsoleVideo() {
+  /** Bumped per video (re)wire; an apply that awaited a teardown checks it
+   *  before connecting, so rapid tab clicks can't interleave two wires. */
+  private consoleVideoEpoch = 0;
+
+  private async applyConsoleVideo() {
+    const epoch = ++this.consoleVideoEpoch;
     if (this.consoleVideoRouteId) {
-      this.disconnect(this.consoleVideoRouteId);
+      const old = this.consoleVideoRouteId;
       this.consoleVideoRouteId = null;
+      this.consoleVideoLive = null;
+      // Await the teardown so it's on the wire *before* the next offer:
+      // the sender frees its one H.264 lane per peer when the teardown
+      // arrives, and channel order then guarantees the next screen takes
+      // the lane over instead of racing it and landing on MJPEG.
+      await this.disconnect(old);
     }
     this.consoleVideoLive = null;
+    if (epoch !== this.consoleVideoEpoch) return; // a newer switch took over
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
     if (!inp) return;
     // The remote screen (display) lands on this machine's display sink — a
-    // real route the backend streams MJPEG frames down. A camera (video)
+    // real route the backend streams video frames down. A camera (video)
     // has no local sink yet, so it's view-only until camera transport
     // lands; the console is honest about that.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
     if (!sink) return;
-    const leg = this.consoleConnect(inp.id, sink.id);
+    const leg = this.consoleConnect(inp.id, sink.id, this.consoleCodec);
     // Render whatever's live; only own the route for teardown if this call
     // created it.
     this.consoleVideoLive = leg?.id ?? null;
     this.consoleVideoRouteId = leg?.created ? leg.id : null;
+    // Carry the quality pills onto the fresh route (the sender restarts
+    // its capture with them; harmless no-op when everything is Auto).
+    if (leg && this.hasTune()) void tuneRoute(leg.id, this.consoleTune);
+  }
+
+  private hasTune(): boolean {
+    const t = this.consoleTune;
+    return t.maxEdge != null || t.bitrate != null || t.fps != null;
+  }
+
+  /** One pill changed: remember it and re-tune the live stream. */
+  setConsoleTune(patch: StreamTune) {
+    this.consoleTune = { ...this.consoleTune, ...patch };
+    if (this.consoleVideoLive) void tuneRoute(this.consoleVideoLive, this.consoleTune);
+  }
+
+  /** The codec pill changed: re-offer the video route on that transport. */
+  setConsoleCodec(codec: "auto" | "h264" | "mjpeg") {
+    if (this.consoleCodec === codec) return;
+    this.consoleCodec = codec;
+    void this.applyConsoleVideo();
   }
 
   /** Audio passthrough: hear the remote *and* send it your audio. */
@@ -1031,10 +1080,14 @@ class AppStore {
    *  channel as on only when something is actually wired, and tears down only
    *  the routes it made (never a pre-existing one the user set up, and never
    *  a leg that was blocked behind a share prompt). */
-  private consoleConnect(from: string, to: string): { id: string; created: boolean } | null {
+  private consoleConnect(
+    from: string,
+    to: string,
+    codec?: "auto" | "h264" | "mjpeg",
+  ): { id: string; created: boolean } | null {
     const id = `route:${from}→${to}`;
     const existedBefore = this.catalog.routes.some((r) => r.id === id);
-    this.connect(from, to);
+    this.connect(from, to, codec);
     const existsNow = this.catalog.routes.some((r) => r.id === id);
     if (!existsNow) return null; // blocked / denied — nothing got wired
     return { id, created: !existedBefore };

@@ -76,6 +76,23 @@ base64 = "0.22"
 # builds optimize them — see the crate's manifest for the why.
 allmystuff-pixels = { path = "pixels" }
 
+# In-house DXGI Output Duplication for screen capture, and the
+# virtual-desktop absolute mouse move (enigo's Abs can only reach the
+# primary monitor). Same version the resolved tree already carries via
+# Tauri, so this adds features, not a second compile of the crate. See
+# `win_capture.rs` for why xcap's recorder can't be used here.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

@@ -14,9 +14,13 @@
 //!  * **Synthetic** — a small fixed set that represents "the machine
 //!    itself" so whole-computer flows work: its **screen** (a display
 //!    source you can cast or use as a remote desktop), **control** (an
-//!    input sink that lets a remote keyboard/mouse drive it), and
-//!    **system audio** (a duplex endpoint for its mixer). These are what an
-//!    RDC group lands on at the far end.
+//!    input sink that lets a remote keyboard/mouse drive it), its
+//!    **keyboard & mouse** (an input *source* — what a console window
+//!    forwards is "whatever this machine's user does", not one scanned
+//!    device, so driving a remote never depends on the input scan finding
+//!    hardware — macOS finds none), and **system audio** (a duplex
+//!    endpoint for its mixer). These are what an RDC group lands on at
+//!    the far end.
 //!
 //! This is the only place hardware vocabulary meets graph vocabulary, so
 //! it's small and thoroughly tested.
@@ -25,8 +29,31 @@ use allmystuff_graph::{Capability, Flow, MediaKind, NodeId};
 use allmystuff_inventory::{InputKind, Inventory};
 use allmystuff_protocol::InventorySummary;
 
+/// One additional capturable screen beyond the primary — supplied by the
+/// caller that actually owns a capture stack (the GUI, from its monitor
+/// enumeration), since the cross-platform inventory can't promise its
+/// display list maps onto what the capturer can grab. `id` must round-trip
+/// through the capability id (`<node>:screen:<id>`) back to the same
+/// monitor on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSource {
+    pub id: u32,
+    pub label: String,
+}
+
 /// Build every capability `node` should expose, given its scan.
 pub fn capabilities_from_inventory(inv: &Inventory, node: &NodeId) -> Vec<Capability> {
+    capabilities_with_screens(inv, node, &[])
+}
+
+/// [`capabilities_from_inventory`], plus one display source per extra
+/// capturable screen — so a multi-monitor machine offers each monitor as
+/// its own console tab. The primary stays the plain `screen` capability.
+pub fn capabilities_with_screens(
+    inv: &Inventory,
+    node: &NodeId,
+    screens: &[ScreenSource],
+) -> Vec<Capability> {
     let mut caps = Vec::new();
     let n = node.as_str();
     let mk = |id: String, label: String, media, flow, origin: &str| {
@@ -41,12 +68,28 @@ pub fn capabilities_from_inventory(inv: &Inventory, node: &NodeId) -> Vec<Capabi
         Flow::Source,
         "screen",
     ));
+    for s in screens {
+        caps.push(mk(
+            format!("{n}:screen:{}", s.id),
+            s.label.clone(),
+            MediaKind::Display,
+            Flow::Source,
+            "screen",
+        ));
+    }
     caps.push(mk(
         format!("{n}:control"),
         "Keyboard & mouse control".into(),
         MediaKind::Input,
         Flow::Sink,
         "control",
+    ));
+    caps.push(mk(
+        format!("{n}:keyboard-mouse"),
+        "Keyboard & mouse".into(),
+        MediaKind::Input,
+        Flow::Source,
+        "controller",
     ));
     caps.push(mk(
         format!("{n}:system-audio"),
@@ -217,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn every_machine_exposes_screen_control_and_system_audio() {
+    fn every_machine_exposes_screen_control_controller_and_system_audio() {
         let inv = empty_inventory();
         let caps = capabilities_from_inventory(&inv, &NodeId::this());
         let by_origin = |o: &str| caps.iter().find(|c| c.origin == o).cloned();
@@ -233,8 +276,53 @@ mod tests {
             (MediaKind::Input, Flow::Sink)
         );
 
+        // The outbound twin: every machine can *drive* a remote, even when
+        // the input scan found no devices (macOS today).
+        let controller = by_origin("controller").expect("keyboard & mouse source");
+        assert_eq!(
+            (controller.media, controller.flow),
+            (MediaKind::Input, Flow::Source)
+        );
+        assert_eq!(controller.id.as_str(), "this:keyboard-mouse");
+
         let sys = by_origin("system").expect("system audio");
         assert_eq!((sys.media, sys.flow), (MediaKind::Audio, Flow::Duplex));
+    }
+
+    #[test]
+    fn extra_screens_become_display_sources_after_the_primary() {
+        let inv = empty_inventory();
+        let screens = [
+            ScreenSource {
+                id: 7,
+                label: "Screen — DELL U2723QE".into(),
+            },
+            ScreenSource {
+                id: 12,
+                label: "Screen 3".into(),
+            },
+        ];
+        let caps = capabilities_with_screens(&inv, &NodeId::this(), &screens);
+        let sources: Vec<_> = caps
+            .iter()
+            .filter(|c| c.origin == "screen")
+            .map(|c| c.id.as_str().to_string())
+            .collect();
+        // Primary first (its id sorts first too — match_endpoint's
+        // tie-break keeps auto-picks landing on the primary).
+        assert_eq!(
+            sources,
+            vec!["this:screen", "this:screen:7", "this:screen:12"]
+        );
+        let named = caps
+            .iter()
+            .find(|c| c.id.as_str() == "this:screen:7")
+            .unwrap();
+        assert_eq!(named.label, "Screen — DELL U2723QE");
+        assert_eq!(
+            (named.media, named.flow),
+            (MediaKind::Display, Flow::Source)
+        );
     }
 
     #[test]

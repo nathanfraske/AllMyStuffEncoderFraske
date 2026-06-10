@@ -18,11 +18,13 @@ function cap(
   return { id: `${node}:${id}`, node, label, media, flow, origin, default: isDefault };
 }
 
-/** The synthetic "the machine itself" trio every node exposes. */
+/** The synthetic "the machine itself" set every node exposes (mirrors the
+ *  bridge crate: screen out, control in, keyboard & mouse out, audio both). */
 function machineCaps(node: string): Capability[] {
   return [
     cap(node, "screen", "Screen", "display", "source", "screen"),
-    cap(node, "control", "Keyboard & mouse", "input", "sink", "control"),
+    cap(node, "control", "Keyboard & mouse control", "input", "sink", "control"),
+    cap(node, "keyboard-mouse", "Keyboard & mouse", "input", "source", "controller"),
     cap(node, "system-audio", "System audio", "audio", "duplex", "system"),
   ];
 }
