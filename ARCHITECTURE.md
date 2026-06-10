@@ -238,6 +238,18 @@ Tauri 2 + Svelte 5, a client of the daemon.
    it, `createImageBitmap` the JPEGs, and otherwise the backend's **native
    openh264 decoder** hands the window RGBA frames ready to blit — maximum
    frames and minimum latency don't depend on the webview's codec support.
+   The console footer's **quality pills** (Resolution / FPS / Rate /
+   Codec, each defaulting to Auto) ride `RouteControl::Tune` to the
+   streaming side, which restarts its capture with the picks; the codec
+   pill re-offers the route on the chosen transport and picks where H.264
+   is decoded. A decoder that loses its place — a corrupt unit, a rebuilt
+   WebCodecs instance, a dumped native-decoder backlog — sends
+   `RouteControl::Refresh` and gets an IDR in ~one round trip instead of
+   sitting out the periodic interval (both asks are rate-limited and
+   silently dropped by older peers). Stream integrity itself is the
+   daemon's job: myownmesh ≥ 0.2.2 reassembles access units
+   sequence-aware, so packet loss or a late NACK retransmit costs one
+   frame, never a corrupt unit in a decoder.
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;

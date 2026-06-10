@@ -174,6 +174,30 @@ pub enum RouteControl {
     Reject { route_id: String, reason: String },
     /// "Stop" — either side can tear a live route down.
     Teardown { route_id: String },
+    /// "Give me a clean decode entry *now*" — the viewer's decoder lost
+    /// its place (a decode error, a rebuilt decoder) and shouldn't sit
+    /// out the rest of the periodic IDR interval. The streaming side
+    /// forces an IDR on its next capture. Unknown to v0.2.x peers (the
+    /// whole message fails their decode and is dropped): recovery then
+    /// simply waits for the periodic IDR, as before.
+    Refresh { route_id: String },
+    /// "Stream with these settings" — the viewer's quality picks for a
+    /// display route it consumes; the streaming side restarts its
+    /// capture with the overrides. `None` everywhere = automatic (the
+    /// streamer's own budget). Unknown to v0.2.x peers and dropped,
+    /// leaving their stream on automatic.
+    Tune {
+        route_id: String,
+        /// Longest output edge in pixels (e.g. 1920); `None` = native.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_edge: Option<u32>,
+        /// H.264 target bitrate in bits/second; `None` = pixel-budgeted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bitrate: Option<u32>,
+        /// Capture rate ceiling; `None` = the streamer's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<u32>,
+    },
 }
 
 /// Negotiating a *shared* relationship and its grants. This is how the

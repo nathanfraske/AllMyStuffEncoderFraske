@@ -94,6 +94,17 @@ pub enum Effect {
     StartMedia(Route),
     /// Stop carrying media for this route id.
     StopMedia(String),
+    /// Force a clean decode entry (an IDR / fresh frame) on a route this
+    /// machine streams — the viewer's decoder lost its place and asked.
+    RefreshMedia(String),
+    /// Restart a streamed route's capture with the viewer's quality
+    /// picks (`None` = that dial stays automatic).
+    TuneMedia {
+        route_id: String,
+        max_edge: Option<u32>,
+        bitrate: Option<u32>,
+        fps: Option<u32>,
+    },
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
     /// An ownership/claim message arrived; the backend applies it against
@@ -283,6 +294,38 @@ impl Session {
                 }
                 Vec::new()
             }
+            RouteControl::Refresh { route_id } => {
+                // Only honoured for a live route, asked by its own peer —
+                // anyone else has no business re-keying the stream.
+                if self
+                    .routes
+                    .get(&route_id)
+                    .is_some_and(|r| r.is_active() && r.peer == from)
+                {
+                    return vec![Effect::RefreshMedia(route_id)];
+                }
+                Vec::new()
+            }
+            RouteControl::Tune {
+                route_id,
+                max_edge,
+                bitrate,
+                fps,
+            } => {
+                if self
+                    .routes
+                    .get(&route_id)
+                    .is_some_and(|r| r.is_active() && r.peer == from)
+                {
+                    return vec![Effect::TuneMedia {
+                        route_id,
+                        max_edge,
+                        bitrate,
+                        fps,
+                    }];
+                }
+                Vec::new()
+            }
             RouteControl::Teardown { route_id } => {
                 let mut effects = Vec::new();
                 if let Some(r) = self.routes.get_mut(&route_id) {
@@ -459,6 +502,62 @@ mod tests {
         let effects = s.drop_peer(&"this".into());
         assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
         assert!(s.peer(&"this".into()).is_none());
+    }
+
+    #[test]
+    fn refresh_and_tune_act_only_on_live_routes_from_their_peer() {
+        let mut s = Session::new("desk");
+        s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+            }),
+        );
+        // The route's peer may re-key and tune it.
+        let fx = s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Refresh {
+                route_id: "r1".into(),
+            }),
+        );
+        assert!(matches!(fx.as_slice(), [Effect::RefreshMedia(id)] if id == "r1"));
+        let fx = s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Tune {
+                route_id: "r1".into(),
+                max_edge: Some(1920),
+                bitrate: None,
+                fps: Some(60),
+            }),
+        );
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60) }]
+                if route_id == "r1"
+        ));
+        // A bystander may not.
+        let fx = s.handle(
+            "stranger".into(),
+            ControlMessage::Route(RouteControl::Refresh {
+                route_id: "r1".into(),
+            }),
+        );
+        assert!(fx.is_empty());
+        // Nor anyone once the route ended.
+        s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Teardown {
+                route_id: "r1".into(),
+            }),
+        );
+        let fx = s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Refresh {
+                route_id: "r1".into(),
+            }),
+        );
+        assert!(fx.is_empty());
     }
 
     #[test]

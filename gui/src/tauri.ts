@@ -111,14 +111,45 @@ export function scanSelf(): Promise<ScanResult | null> {
 
 /** Offer a real connection over the mesh. Returns the route id, or null in
  *  web mode (the store falls back to a local route for the demo). A
- *  display route always advertises H.264 (the streaming side then uses the
- *  mesh's RTP track lane): decode is covered everywhere — WebCodecs where
- *  the webview has it, the backend's native openh264 decoder where it
- *  doesn't — and the backend still withholds the offer when the local
- *  daemon predates the track lane. MJPEG stays the floor both ends share. */
-export function connectRoute(from: string, to: string, media: MediaKind): Promise<string | null> {
-  const video = media === "display" ? ["h264"] : [];
+ *  display route advertises H.264 by default (the streaming side then uses
+ *  the mesh's RTP track lane): decode is covered everywhere — WebCodecs
+ *  where the webview has it, the backend's native openh264 decoder where
+ *  it doesn't — and the backend still withholds the offer when the local
+ *  daemon predates the track lane. MJPEG stays the floor both ends share,
+ *  and `codec: "mjpeg"` forces it (the console's codec pill). */
+export function connectRoute(
+  from: string,
+  to: string,
+  media: MediaKind,
+  codec?: "auto" | "h264" | "mjpeg",
+): Promise<string | null> {
+  const video = media === "display" && codec !== "mjpeg" ? ["h264"] : [];
   return tryInvoke<string>("connect_route", { from, to, media, video });
+}
+
+/** The console's quality picks for a stream it's watching — each absent
+ *  field means "automatic". The far end restarts its capture with these. */
+export interface StreamTune {
+  maxEdge?: number;
+  bitrate?: number;
+  fps?: number;
+}
+
+/** Ask the sender of `routeId` to stream with these picks. Best-effort:
+ *  an old peer drops the ask and stays on automatic. */
+export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
+  return tryInvoke("tune_route", {
+    routeId,
+    maxEdge: tune.maxEdge ?? null,
+    bitrate: tune.bitrate ?? null,
+    fps: tune.fps ?? null,
+  });
+}
+
+/** Ask the sender of `routeId` for a clean decode entry (IDR) now — call
+ *  from a decode-error handler. Rate-limited backend-side. */
+export function refreshRoute(routeId: string): Promise<null> {
+  return tryInvoke("video_refresh", { routeId });
 }
 
 export function disconnectRoute(routeId: string): Promise<null> {

@@ -157,6 +157,29 @@ fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
     mesh.video_unwatch(&route_id, token);
 }
 
+/// Ask the sender of an inbound display route for a clean decode entry
+/// (IDR) now — the console's decoder hit an error. Rate-limited backend-
+/// side; safe to call from a decode-error handler.
+#[tauri::command]
+async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
+    mesh.inner().request_refresh(route_id).await
+}
+
+/// Ask the sender of an inbound display route to stream with these
+/// quality picks; absent values mean "automatic". The console's pills.
+#[tauri::command]
+async fn tune_route(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    max_edge: Option<u32>,
+    bitrate: Option<u32>,
+    fps: Option<u32>,
+) -> Result<(), String> {
+    mesh.inner()
+        .request_tune(route_id, max_edge, bitrate, fps)
+        .await
+}
+
 /// Open (or focus) a dedicated console window for `node` — its own OS
 /// window, so several remote consoles can be on screen at once. The window
 /// loads the same app with `?console=<node>`, which renders just the
@@ -499,6 +522,8 @@ fn main() {
             video_watch,
             video_poll,
             video_unwatch,
+            video_refresh,
+            tune_route,
             open_console_window,
             session_snapshot,
             owned_roster,

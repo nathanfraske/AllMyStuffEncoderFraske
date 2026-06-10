@@ -101,6 +101,9 @@ pub struct Mesh {
     /// seconds — the receive half of the dial-in line the sender's
     /// `StreamStats` provides.
     video_in_stats: Mutex<HashMap<String, VideoInStats>>,
+    /// When each route last asked its sender for a clean decode entry —
+    /// decode errors arrive at frame rate; the asks must not.
+    refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -199,6 +202,7 @@ impl Mesh {
             video_lane_in: Mutex::new(HashMap::new()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             video_in_stats: Mutex::new(HashMap::new()),
+            refresh_asks: Mutex::new(HashMap::new()),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -747,6 +751,7 @@ impl Mesh {
         self.video_lane_out.lock().retain(|_, rid| rid != route_id);
         self.video_lane_in.lock().retain(|_, rid| rid != route_id);
         self.video_in_stats.lock().remove(route_id);
+        self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
     }
 
@@ -823,12 +828,28 @@ impl Mesh {
         if wants_decode {
             let mesh = Arc::downgrade(self);
             let rid = route_id.clone();
-            self.video_decode
-                .feed(&route_id, Au { ts_us, key, data }, move |packet| {
+            let glitch_mesh = Arc::downgrade(self);
+            let glitch_rid = route_id.clone();
+            self.video_decode.feed(
+                &route_id,
+                Au { ts_us, key, data },
+                move |packet| {
                     if let Some(mesh) = mesh.upgrade() {
                         mesh.enqueue_decoded(&rid, packet);
                     }
-                });
+                },
+                move || {
+                    // The native decoder hit a corrupt unit or dumped its
+                    // queue: ask the sender to re-key rather than waiting
+                    // out the periodic IDR (rate-limited inside).
+                    if let Some(mesh) = glitch_mesh.upgrade() {
+                        let rid = glitch_rid.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = mesh.request_refresh(rid).await;
+                        });
+                    }
+                },
+            );
         } else {
             self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
         }
@@ -1066,6 +1087,20 @@ impl Mesh {
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
                 Effect::StartMedia(route) => self.start_media(&route),
+                Effect::RefreshMedia(id) => self.video.force_idr(&id),
+                Effect::TuneMedia {
+                    route_id,
+                    max_edge,
+                    bitrate,
+                    fps,
+                } => self.video.retune(
+                    &route_id,
+                    crate::video::Tune {
+                        max_edge,
+                        bitrate,
+                        fps,
+                    },
+                ),
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
                     self.video.stop(&id);
@@ -1785,6 +1820,59 @@ impl Mesh {
                 .iter()
                 .any(|m| pubkey_part(m.device.as_str()) == canon)
         })
+    }
+
+    /// Ask the far end of an inbound display route for a clean decode
+    /// entry (IDR) *now* — the decoder here lost its place. Rate-limited
+    /// per route: decode errors arrive at frame rate, the asks must not.
+    /// Old peers don't know the message and drop it; recovery then waits
+    /// for the periodic IDR exactly as before.
+    pub async fn request_refresh(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        {
+            let mut asks = self.refresh_asks.lock();
+            let now = std::time::Instant::now();
+            if asks
+                .get(&route_id)
+                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(600))
+            {
+                return Ok(());
+            }
+            asks.insert(route_id.clone(), now);
+        }
+        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        tracing::debug!("asking {} to re-key {route_id}", short_id(&peer));
+        self.send_control(
+            &peer,
+            &ControlMessage::Route(RouteControl::Refresh { route_id }),
+        )
+        .await
+    }
+
+    /// Ask the far end of an inbound display route to stream with these
+    /// quality picks (`None` = that dial back on automatic). Old peers
+    /// drop the message and stay on automatic.
+    pub async fn request_tune(
+        self: &Arc<Self>,
+        route_id: String,
+        max_edge: Option<u32>,
+        bitrate: Option<u32>,
+        fps: Option<u32>,
+    ) -> Result<(), String> {
+        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        tracing::info!(
+            "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?}",
+            short_id(&peer)
+        );
+        self.send_control(
+            &peer,
+            &ControlMessage::Route(RouteControl::Tune {
+                route_id,
+                max_edge,
+                bitrate,
+                fps,
+            }),
+        )
+        .await
     }
 
     /// Front-end command: forward one keyboard/mouse event down an active

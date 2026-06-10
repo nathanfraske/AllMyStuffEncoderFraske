@@ -69,12 +69,14 @@ impl DecodeBridge {
 
     /// Feed one access unit to `route_id`'s decoder, starting it on first
     /// use. `on_frame` receives each decoded picture as a ready IPC packet
-    /// (see [`raw_ipc_packet`]); it's only captured when this call starts
-    /// the thread. A full queue dumps wholesale and re-keys — see module
-    /// docs.
-    pub fn feed<F>(&self, route_id: &str, au: Au, on_frame: F)
+    /// (see [`raw_ipc_packet`]); `on_glitch` fires when the decoder loses
+    /// its place (corrupt unit, dumped backlog) so the caller can ask the
+    /// sender to re-key. Both are only captured when this call starts the
+    /// thread. A full queue dumps wholesale and re-keys — see module docs.
+    pub fn feed<F, G>(&self, route_id: &str, au: Au, on_frame: F, on_glitch: G)
     where
         F: Fn(Vec<u8>) + Send + 'static,
+        G: Fn() + Send + 'static,
     {
         let mut routes = self.routes.lock();
         let entry = routes.entry(route_id.to_string()).or_insert_with(|| {
@@ -83,7 +85,8 @@ impl DecodeBridge {
             let stop = Arc::new(AtomicBool::new(false));
             let id = route_id.to_string();
             let (nk, st) = (need_key.clone(), stop.clone());
-            let thread = std::thread::spawn(move || run_decode(&st, &nk, &id, rx, on_frame));
+            let thread =
+                std::thread::spawn(move || run_decode(&st, &nk, &id, rx, on_frame, on_glitch));
             tracing::info!("native H.264 decoder started for {route_id}");
             RouteDecode {
                 tx,
@@ -113,14 +116,16 @@ impl DecodeBridge {
     }
 }
 
-fn run_decode<F>(
+fn run_decode<F, G>(
     stop: &AtomicBool,
     need_key: &AtomicBool,
     route_id: &str,
     rx: mpsc::Receiver<Au>,
     on_frame: F,
+    on_glitch: G,
 ) where
     F: Fn(Vec<u8>),
+    G: Fn(),
 {
     use openh264::decoder::{Decoder, DecoderConfig};
     use openh264::formats::YUVSource as _;
@@ -144,6 +149,7 @@ fn run_decode<F>(
             // the sender's next IDR — same recovery as a decode error.
             while rx.try_recv().is_ok() {}
             waiting_key = true;
+            on_glitch();
         }
         if waiting_key && !au.key {
             continue;
@@ -197,6 +203,7 @@ fn run_decode<F>(
                 }
                 decoder = None;
                 waiting_key = true;
+                on_glitch();
             }
         }
         let elapsed = since.elapsed();
@@ -268,6 +275,7 @@ mod tests {
                 move |packet| {
                     let _ = tx.send(packet);
                 },
+                || {},
             );
         }
 

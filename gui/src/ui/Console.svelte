@@ -19,7 +19,7 @@
   // the control route.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { closeThisWindow, onThisWindowClose, watchVideo } from "../tauri";
+  import { closeThisWindow, onThisWindowClose, refreshRoute, watchVideo } from "../tauri";
   import {
     displayName,
     originIcon,
@@ -75,6 +75,81 @@
   // also lands here after WebCodecs stalls twice. Sticky for the session —
   // a webview whose decoder wedged once isn't owed a third chance.
   let nativeDecode = $state(typeof VideoDecoder === "undefined");
+
+  // ---- the quality pills ---------------------------------------------
+  //
+  // Resolution, frame rate, and bitrate ride a `Tune` ask to the machine
+  // being viewed (its capture restarts with the picks); the codec pill
+  // re-offers the route on the chosen transport and picks where H.264 is
+  // decoded. Auto everywhere = exactly the automatic pipeline.
+  type PillChoice = { label: string; value: number | null };
+  const RES_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "4K", value: 3840 },
+    { label: "1440p", value: 2560 },
+    { label: "1080p", value: 1920 },
+    { label: "720p", value: 1280 },
+  ];
+  const FPS_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "60", value: 60 },
+    { label: "30", value: 30 },
+    { label: "24", value: 24 },
+    { label: "15", value: 15 },
+  ];
+  const RATE_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "40 Mbps", value: 40_000_000 },
+    { label: "25 Mbps", value: 25_000_000 },
+    { label: "15 Mbps", value: 15_000_000 },
+    { label: "8 Mbps", value: 8_000_000 },
+    { label: "4 Mbps", value: 4_000_000 },
+  ];
+  type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
+  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice }> = [
+    { label: "Auto", value: "auto" },
+    { label: "H.264", value: "h264" },
+    { label: "H.264 · native decode", value: "native" },
+    { label: "MJPEG", value: "mjpeg" },
+  ];
+  let codecChoice = $state<CodecChoice>("auto");
+  let openPill = $state<"res" | "fps" | "rate" | "codec" | null>(null);
+
+  const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
+    choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
+
+  function pickRes(v: number | null) {
+    app.setConsoleTune({ maxEdge: v ?? undefined });
+    openPill = null;
+  }
+  function pickFps(v: number | null) {
+    app.setConsoleTune({ fps: v ?? undefined });
+    openPill = null;
+  }
+  function pickRate(v: number | null) {
+    app.setConsoleTune({ bitrate: v ?? undefined });
+    openPill = null;
+  }
+  function pickCodec(v: CodecChoice) {
+    codecChoice = v;
+    openPill = null;
+    // Where to decode is this window's choice; which transport to offer
+    // is the store's (it re-offers the route when that part changes).
+    nativeDecode = v === "native" || (v === "auto" && typeof VideoDecoder === "undefined");
+    app.setConsoleCodec(v === "mjpeg" ? "mjpeg" : v === "auto" ? "auto" : "h264");
+  }
+
+  // Decode errors ask the sender for a clean entry (rate-limited again
+  // backend-side) instead of sitting out the periodic IDR interval.
+  let lastRefreshAsk = 0;
+  function askRefresh() {
+    const route = app.consoleVideoLive;
+    if (!route) return;
+    const now = performance.now();
+    if (now - lastRefreshAsk < 700) return;
+    lastRefreshAsk = now;
+    void refreshRoute(route);
+  }
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -171,6 +246,7 @@
         // re-watches the route in native mode (and tears this rung down).
         console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
         nativeDecode = true;
+        askRefresh();
         return;
       }
       console.warn(
@@ -225,6 +301,7 @@
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
       decodeFails += 1;
+      askRefresh();
       console.warn("video decode error:", why);
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
@@ -421,7 +498,11 @@
   }
 </script>
 
-<svelte:window onkeydown={(e) => onKey(e, true)} onkeyup={(e) => onKey(e, false)} />
+<svelte:window
+  onkeydown={(e) => onKey(e, true)}
+  onkeyup={(e) => onKey(e, false)}
+  onclick={() => (openPill = null)}
+/>
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -514,6 +595,42 @@
       </div>
 
       <!-- Control / passthrough bar -->
+      {#snippet pillMenu(
+        key: "res" | "fps" | "rate",
+        name: string,
+        choices: PillChoice[],
+        current: number | null | undefined,
+        pick: (v: number | null) => void,
+      )}
+        <span class="pill-wrap">
+          <button
+            class="pill"
+            class:tuned={(current ?? null) !== null}
+            onclick={(e) => {
+              e.stopPropagation();
+              openPill = openPill === key ? null : key;
+            }}
+          >
+            {name} · {pillLabel(choices, current)} ▾
+          </button>
+          {#if openPill === key}
+            <div class="pill-menu" role="menu">
+              {#each choices as c (c.label)}
+                <button
+                  class="pill-item"
+                  class:sel={(current ?? null) === c.value}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    pick(c.value);
+                  }}
+                >
+                  {c.label}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </span>
+      {/snippet}
       <footer class="controls">
         <div class="toggles">
           <button
@@ -537,6 +654,42 @@
             <span class="pip" class:lit={app.consoleControl}></span>
           </button>
         </div>
+
+        {#if app.consoleVideoLive}
+          <div class="pills" role="group" aria-label="Stream quality">
+            {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
+            {@render pillMenu("fps", "FPS", FPS_CHOICES, app.consoleTune.fps, pickFps)}
+            {@render pillMenu("rate", "Rate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
+            <span class="pill-wrap">
+              <button
+                class="pill"
+                class:tuned={codecChoice !== "auto"}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  openPill = openPill === "codec" ? null : "codec";
+                }}
+              >
+                Codec · {CODEC_CHOICES.find((c) => c.value === codecChoice)?.label ?? "Auto"} ▾
+              </button>
+              {#if openPill === "codec"}
+                <div class="pill-menu" role="menu">
+                  {#each CODEC_CHOICES as c (c.value)}
+                    <button
+                      class="pill-item"
+                      class:sel={codecChoice === c.value}
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        pickCodec(c.value);
+                      }}
+                    >
+                      {c.label}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </span>
+          </div>
+        {/if}
 
         <div class="status">
           {#if hasFrame}
@@ -821,6 +974,68 @@
   }
   .t-icon {
     font-size: 0.95rem;
+  }
+  .pills {
+    display: flex;
+    gap: 0.3rem;
+    flex-shrink: 0;
+  }
+  .pill-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .pill {
+    border: 1px solid #322c47;
+    background: #14121f;
+    color: #c8c2e0;
+    border-radius: var(--r-pill);
+    padding: 0.32rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color 0.12s ease;
+  }
+  .pill:hover {
+    border-color: var(--accent);
+  }
+  /* A dial off Auto reads as deliberately set. */
+  .pill.tuned {
+    border-color: var(--accent);
+    color: #e6e1ff;
+  }
+  .pill-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    min-width: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #1a1730;
+    border: 1px solid #322c47;
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg);
+    padding: 0.25rem;
+    z-index: 20;
+  }
+  .pill-item {
+    border: none;
+    background: transparent;
+    color: #c8c2e0;
+    text-align: left;
+    font-size: 0.76rem;
+    font-weight: 600;
+    padding: 0.32rem 0.6rem;
+    border-radius: var(--r-sm, 6px);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .pill-item:hover {
+    background: #241f38;
+    color: #fff;
+  }
+  .pill-item.sel {
+    color: var(--accent);
   }
   .pip {
     width: 8px;

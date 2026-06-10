@@ -27,7 +27,9 @@
 
 use std::sync::mpsc;
 
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(not(windows))]
+use enigo::Coordinate;
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use parking_lot::Mutex;
 
 use allmystuff_session::InputAction;
