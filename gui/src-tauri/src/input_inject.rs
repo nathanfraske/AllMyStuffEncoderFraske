@@ -65,11 +65,9 @@ fn run_injector(rx: mpsc::Receiver<InputAction>) {
     let (sw, sh) = enigo.main_display().unwrap_or((1920, 1080));
     while let Ok(action) = rx.recv() {
         let result = match action {
-            InputAction::MouseMove { x, y } => enigo.move_mouse(
-                denorm(x, sw),
-                denorm(y, sh),
-                Coordinate::Abs,
-            ),
+            InputAction::MouseMove { x, y } => {
+                enigo.move_mouse(denorm(x, sw), denorm(y, sh), Coordinate::Abs)
+            }
             InputAction::MouseButton { button, down } => match dom_button(button) {
                 Some(b) => enigo.button(b, direction(down)),
                 None => Ok(()),

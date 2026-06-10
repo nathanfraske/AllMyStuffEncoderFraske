@@ -12,7 +12,10 @@
 //!  3. **Self-updates** via `allmystuff-updater` (its own release feed —
 //!     not the daemon's).
 
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod audio;
 mod control_client;
@@ -50,7 +53,10 @@ fn unwrap_response(resp: Response) -> Result<Value, String> {
 /// hostname shown on the local node.
 #[tauri::command]
 async fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
-    let me = mesh.resolve_local_id().await.unwrap_or_else(|| "this".to_string());
+    let me = mesh
+        .resolve_local_id()
+        .await
+        .unwrap_or_else(|| "this".to_string());
     let node = allmystuff_graph::NodeId::from(me.as_str());
     let inv = allmystuff_inventory::scan();
     serde_json::to_value(json!({
@@ -141,7 +147,13 @@ async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), 
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
     node.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -163,23 +175,45 @@ fn owned_roster(mesh: State<'_, Arc<Mesh>>) -> Value {
 
 #[tauri::command]
 async fn mesh_status(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(state.client.request(&Request::Status).await.map_err(|e| e.to_string())?)
+    unwrap_response(
+        state
+            .client
+            .request(&Request::Status)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
 async fn mesh_identity(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(state.client.request(&Request::IdentityShow).await.map_err(|e| e.to_string())?)
+    unwrap_response(
+        state
+            .client
+            .request(&Request::IdentityShow)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
 async fn mesh_networks(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(state.client.request(&Request::NetworksList).await.map_err(|e| e.to_string())?)
+    unwrap_response(
+        state
+            .client
+            .request(&Request::NetworksList)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[tauri::command]
 async fn mesh_peers(state: State<'_, AppState>, network: String) -> Result<Value, String> {
     unwrap_response(
-        state.client.request(&Request::PeersList { network }).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::PeersList { network })
+            .await
+            .map_err(|e| e.to_string())?,
     )
 }
 
@@ -190,7 +224,11 @@ async fn mesh_network_add(
     config: Value,
 ) -> Result<Value, String> {
     let data = unwrap_response(
-        state.client.request(&Request::NetworkAdd { config }).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::NetworkAdd { config })
+            .await
+            .map_err(|e| e.to_string())?,
     )?;
     // Subscribe + advertise on the freshly-joined network now, not just at
     // next launch — so a network joined mid-session lights up immediately.
@@ -203,7 +241,13 @@ async fn mesh_network_add(
 /// (`NetworksList` only carries summaries).
 #[tauri::command]
 async fn mesh_config_show(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(state.client.request(&Request::ConfigShow).await.map_err(|e| e.to_string())?)
+    unwrap_response(
+        state
+            .client
+            .request(&Request::ConfigShow)
+            .await
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 /// Replace one network's config (its signaling / STUN / TURN servers, label,
@@ -216,7 +260,11 @@ async fn mesh_network_update(
     config: Value,
 ) -> Result<Value, String> {
     let data = unwrap_response(
-        state.client.request(&Request::NetworkUpdate { config }).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::NetworkUpdate { config })
+            .await
+            .map_err(|e| e.to_string())?,
     )?;
     mesh.inner().sync_networks().await;
     Ok(data)
@@ -232,7 +280,11 @@ async fn mesh_roster_approve(
     unwrap_response(
         state
             .client
-            .request(&Request::RosterApprove { network, device_id, label })
+            .request(&Request::RosterApprove {
+                network,
+                device_id,
+                label,
+            })
             .await
             .map_err(|e| e.to_string())?,
     )
@@ -256,7 +308,11 @@ async fn mesh_roster_remove(
 #[tauri::command]
 async fn mesh_roster_list(state: State<'_, AppState>, network: String) -> Result<Value, String> {
     unwrap_response(
-        state.client.request(&Request::RosterList { network }).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::RosterList { network })
+            .await
+            .map_err(|e| e.to_string())?,
     )
 }
 
@@ -265,7 +321,11 @@ async fn mesh_roster_list(state: State<'_, AppState>, network: String) -> Result
 #[tauri::command]
 async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<Value, String> {
     unwrap_response(
-        state.client.request(&Request::NetworkIdGenerate).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::NetworkIdGenerate)
+            .await
+            .map_err(|e| e.to_string())?,
     )
 }
 
@@ -276,7 +336,11 @@ async fn mesh_network_remove(
     network: String,
 ) -> Result<Value, String> {
     let data = unwrap_response(
-        state.client.request(&Request::NetworkRemove { network }).await.map_err(|e| e.to_string())?,
+        state
+            .client
+            .request(&Request::NetworkRemove { network })
+            .await
+            .map_err(|e| e.to_string())?,
     )?;
     mesh.inner().sync_networks().await;
     Ok(data)
@@ -294,7 +358,9 @@ async fn mesh_identity_set_label(
     let data = unwrap_response(
         state
             .client
-            .request(&Request::IdentitySetLabel { label: label.clone() })
+            .request(&Request::IdentitySetLabel {
+                label: label.clone(),
+            })
             .await
             .map_err(|e| e.to_string())?,
     )?;
@@ -312,7 +378,9 @@ async fn update_status() -> Result<Value, String> {
 
 #[tauri::command]
 async fn update_check() -> Result<Value, String> {
-    let outcome = allmystuff_updater::check_now(true).await.map_err(|e| e.to_string())?;
+    let outcome = allmystuff_updater::check_now(true)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::to_value(outcome).map_err(|e| e.to_string())
 }
 
@@ -406,7 +474,11 @@ fn main() {
                 match daemon_spawn::ensure_daemon_running(&client).await {
                     Ok(child) => {
                         if let Some(child) = child {
-                            handle.state::<AppState>().daemon_child.lock().replace(child);
+                            handle
+                                .state::<AppState>()
+                                .daemon_child
+                                .lock()
+                                .replace(child);
                         }
                     }
                     Err(e) => tracing::warn!("daemon auto-spawn skipped: {e:#}"),

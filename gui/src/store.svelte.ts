@@ -41,6 +41,7 @@ import {
   ownedRoster,
   scanSelf,
   sendInput,
+  sessionSnapshot,
   setClaimable,
   updateApply,
   updateCheck,
@@ -344,6 +345,11 @@ class AppStore {
     await this.loadIdentity();
     await this.refreshNetworks();
     await this.syncMeshGraph();
+    // Pull the *current* session state once — snapshots are otherwise only
+    // emitted on changes, so a freshly-opened window (a per-machine console)
+    // would see peers without their presence detail (no capabilities, no
+    // ownership) until something next changed, and wrongly refuse to open.
+    await this.pullSessionSnapshot();
     await this.loadOwnedFleet();
     await this.loadUpdateStatus();
     this.startMeshPolling();
@@ -355,6 +361,7 @@ class AppStore {
         void this.hydrateFromBackend();
         void this.loadIdentity();
         void this.refreshNetworks().then(() => this.syncMeshGraph());
+        void this.pullSessionSnapshot();
         void this.loadOwnedFleet();
       }
       this.backendConnected = live;
@@ -371,6 +378,14 @@ class AppStore {
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
     });
+  }
+
+  /** Fetch the live session state (peers' presence + routes) and merge it
+   *  into the graph — the on-demand twin of the `allmystuff://session`
+   *  event, for windows that opened after the last change was emitted. */
+  private async pullSessionSnapshot() {
+    const snap = await sessionSnapshot();
+    if (snap) this.applySessionSnapshot(snap);
   }
 
   /** Poll the daemon's mesh membership as a safety net (peer/roster changes
