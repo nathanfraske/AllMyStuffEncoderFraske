@@ -2,7 +2,7 @@
 //! [`allmystuff_session::Session`] state machine and the [`AudioBridge`].
 //!
 //! On start it subscribes to the AllMyStuff presence / control / media
-//! channels on the active network, broadcasts this node's
+//! channels on every joined network, broadcasts this node's
 //! [`NodeProfile`], and pumps inbound frames:
 //!
 //!  * **presence** → updates the peer set (the graph fills with real peers).
@@ -97,7 +97,7 @@ impl Mesh {
                         .request(&Request::ChannelSendTo {
                             network,
                             channel: CHANNEL_MEDIA.to_string(),
-                            peer,
+                            peer: pubkey_part(&peer).to_string(),
                             payload,
                         })
                         .await;
@@ -176,34 +176,16 @@ impl Mesh {
         if networks.is_empty() {
             self.emit_status("no_network", None);
         } else {
-            // Presence + the owned-fleet roster on *every* network so two
-            // machines discover each other (and converge their fleet) no
-            // matter which network the daemon lists first.
-            for network in &networks {
-                for channel in [CHANNEL_PRESENCE, CHANNEL_OWNED] {
-                    let _ = self
-                        .client
-                        .request(&Request::ChannelSubscribe {
-                            client_id,
-                            network: network.clone(),
-                            channel: channel.to_string(),
-                        })
-                        .await;
-                }
-            }
-            // Route control + media ride the primary network.
-            if let Some(primary) = &primary {
-                for channel in [CHANNEL_CONTROL, CHANNEL_MEDIA] {
-                    let _ = self
-                        .client
-                        .request(&Request::ChannelSubscribe {
-                            client_id,
-                            network: primary.clone(),
-                            channel: channel.to_string(),
-                        })
-                        .await;
-                }
-            }
+            // Every AllMyStuff channel on *every* network. Presence + the
+            // owned-fleet roster so two machines discover each other (and
+            // converge their fleet) no matter which network the daemon lists
+            // first — and control + media too, because point-to-point traffic
+            // is addressed to whichever network *we* last saw the peer on,
+            // which need not be the peer's first-listed one. With these on
+            // the primary only, a claim or route offer arriving on a shared
+            // secondary network had no subscriber on the receiving side and
+            // the daemon silently dropped it.
+            self.subscribe_channels(client_id, &networks).await;
             self.broadcast_presence().await;
             self.broadcast_owned().await;
             self.emit_status("live", None);
@@ -446,7 +428,15 @@ impl Mesh {
             let s = st.session.as_mut().ok_or("mesh not ready")?;
             s.offer(route.clone(), peer.as_str())
         };
-        self.send_control(&peer, &msg).await;
+        if let Err(e) = self.send_control(&peer, &msg).await {
+            // The peer never saw the offer — drop it rather than leave a
+            // phantom half-open route in the session.
+            let mut st = self.state.lock();
+            if let Some(s) = st.session.as_mut() {
+                let _ = s.teardown(&route.id);
+            }
+            return Err(e);
+        }
         self.emit_snapshot();
         Ok(route.id)
     }
@@ -458,7 +448,8 @@ impl Mesh {
         };
         self.audio.stop(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
-            self.send_control(&peer, msg).await;
+            // Best-effort: the route is gone locally either way.
+            let _ = self.send_control(&peer, msg).await;
         }
         self.emit_snapshot();
         Ok(())
@@ -493,7 +484,10 @@ impl Mesh {
     async fn process_effects(self: &Arc<Self>, effects: Vec<Effect>) {
         for e in effects {
             match e {
-                Effect::Send { peer, message } => self.send_control(&peer.to_string(), &message).await,
+                Effect::Send { peer, message } => {
+                    // Replies ride best-effort; the failure is already logged.
+                    let _ = self.send_control(&peer.to_string(), &message).await;
+                }
                 Effect::StartMedia(route) => self.start_media(&route),
                 Effect::StopMedia(id) => self.audio.stop(&id),
                 Effect::Share { from, message } => {
@@ -535,7 +529,8 @@ impl Mesh {
                         reason: "this device isn't in claim mode".into(),
                     }
                 };
-                self.send_control(&from.to_string(), &ControlMessage::Ownership(reply))
+                let _ = self
+                    .send_control(&from.to_string(), &ControlMessage::Ownership(reply))
                     .await;
             }
             OwnershipControl::Release => {
@@ -666,7 +661,7 @@ impl Mesh {
                 .request(&Request::ChannelSendTo {
                     network,
                     channel: CHANNEL_OWNED.to_string(),
-                    peer: peer.to_string(),
+                    peer: pubkey_part(peer).to_string(),
                     payload,
                 })
                 .await;
@@ -689,12 +684,14 @@ impl Mesh {
     }
 
     /// Front-end command: claim `node` as owned by this device. Only the
-    /// target deciding it's claimable makes it stick; we just send intent.
+    /// target deciding it's claimable makes it stick; we just send intent —
+    /// but a send the daemon couldn't deliver (device dropped offline, no
+    /// shared network) is surfaced so the UI can say so rather than leaving
+    /// "asking…" hanging forever.
     pub async fn claim(self: &Arc<Self>, node: String) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
-        self.send_control(&node, &msg).await;
-        Ok(())
+        self.send_control(&node, &msg).await
     }
 
     /// Front-end command: put *this* device into (or out of) claim mode, so
@@ -705,12 +702,12 @@ impl Mesh {
         Ok(self.ownership.claimable())
     }
 
-    /// Re-read the joined networks and (re)subscribe presence + owned on each,
-    /// control + media on the primary, then re-advertise. Called after the set
-    /// of networks changes (create / join / leave) or a network's transport is
-    /// restarted by a signaling/STUN/TURN edit — so the session follows the
-    /// user across *every* network they're on, not just the ones present at
-    /// launch. Re-subscribing an existing channel is idempotent on the daemon.
+    /// Re-read the joined networks, (re)subscribe every channel on each, then
+    /// re-advertise. Called after the set of networks changes (create / join /
+    /// leave) or a network's transport is restarted by a signaling/STUN/TURN
+    /// edit — so the session follows the user across *every* network they're
+    /// on, not just the ones present at launch. Re-subscribing an existing
+    /// channel is idempotent on the daemon.
     pub async fn sync_networks(self: &Arc<Self>) {
         let client_id = { self.state.lock().client_id };
         let Some(client_id) = client_id else { return };
@@ -721,8 +718,26 @@ impl Mesh {
             st.networks = networks.clone();
             st.network = primary.clone();
         }
-        for network in &networks {
-            for channel in [CHANNEL_PRESENCE, CHANNEL_OWNED] {
+        self.subscribe_channels(client_id, &networks).await;
+        self.broadcast_presence().await;
+        self.broadcast_owned().await;
+        self.emit_snapshot();
+    }
+
+    /// Subscribe presence, owned, control, and media on each given network.
+    /// All four ride every network: broadcasts (presence/owned) so peers are
+    /// found wherever they are, and point-to-point (control/media) so a frame
+    /// addressed to whichever network the *sender* last saw us on always has
+    /// a subscriber here.
+    async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
+        let channels = [
+            CHANNEL_PRESENCE,
+            CHANNEL_OWNED,
+            CHANNEL_CONTROL,
+            CHANNEL_MEDIA,
+        ];
+        for network in networks {
+            for channel in channels {
                 let _ = self
                     .client
                     .request(&Request::ChannelSubscribe {
@@ -733,21 +748,6 @@ impl Mesh {
                     .await;
             }
         }
-        if let Some(primary) = &primary {
-            for channel in [CHANNEL_CONTROL, CHANNEL_MEDIA] {
-                let _ = self
-                    .client
-                    .request(&Request::ChannelSubscribe {
-                        client_id,
-                        network: primary.clone(),
-                        channel: channel.to_string(),
-                    })
-                    .await;
-            }
-        }
-        self.broadcast_presence().await;
-        self.broadcast_owned().await;
-        self.emit_snapshot();
     }
 
     /// Begin carrying media for a now-active route. Only audio is wired
@@ -780,18 +780,34 @@ impl Mesh {
         }
     }
 
-    async fn send_control(&self, peer: &str, message: &ControlMessage) {
-        let Some(network) = self.network_for_peer(peer) else { return };
-        if let Ok(payload) = serde_json::to_value(message) {
-            let _ = self
-                .client
-                .request(&Request::ChannelSendTo {
-                    network,
-                    channel: CHANNEL_CONTROL.to_string(),
-                    peer: peer.to_string(),
-                    payload,
-                })
-                .await;
+    /// Send a control message to one peer, reporting whether the daemon
+    /// actually dispatched it. The daemon's peer set is keyed by the *bare
+    /// pubkey* (what signaling announces), while AllMyStuff mostly holds
+    /// display ids (`pubkey-SUFFIX`, what presence and `IdentityShow` carry)
+    /// — so the id is canonicalised here, at the daemon boundary. Addressing
+    /// the display form made every send come back "peer not found", an error
+    /// this used to swallow: a claim showed "asking…" and then nothing.
+    async fn send_control(&self, peer: &str, message: &ControlMessage) -> Result<(), String> {
+        let Some(network) = self.network_for_peer(peer) else {
+            return Err(format!("no shared network with {peer}"));
+        };
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network,
+                channel: CHANNEL_CONTROL.to_string(),
+                peer: pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.ok {
+            Ok(())
+        } else {
+            let err = resp.error.unwrap_or_else(|| "channel send failed".into());
+            tracing::warn!("control send to {peer} failed: {err}");
+            Err(err)
         }
     }
 

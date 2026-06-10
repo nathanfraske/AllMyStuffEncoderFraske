@@ -118,10 +118,14 @@ export function disconnectRoute(routeId: string): Promise<null> {
 }
 
 /** Claim a device as yours. The claim only takes if that device is in claim
- *  mode; its next presence advert (owner = us) confirms it. Returns null in
- *  web mode (the store simulates the claim on the demo graph). */
-export function claimNode(node: string): Promise<null> {
-  return tryInvoke("claim_node", { node });
+ *  mode; its next presence advert (owner = us) confirms it. Throws when the
+ *  backend couldn't deliver the ask (device dropped offline, no shared
+ *  network) so the UI can say so instead of waiting forever. No-op in web
+ *  mode (the store simulates the claim on the demo graph). */
+export async function claimNode(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("claim_node", { node });
 }
 
 /** Put this device into / out of claim mode so another of your machines can

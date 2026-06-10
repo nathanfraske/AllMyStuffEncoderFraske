@@ -20,7 +20,9 @@
   // A device on the mesh that isn't running AllMyStuff: nothing to wire.
   const meshonly = $derived(!!node && !isAppNode(node));
   // This device declares an owner that isn't us — it can't be adopted.
-  const ownedByOther = $derived(!!node?.owner && node.owner !== app.localId);
+  // Compare by canonical pubkey (`isMe`): presence carries the owner as a
+  // bare pubkey while our local id is the display form.
+  const ownedByOther = $derived(!!node?.owner && !app.isMe(node.owner));
   // A remote machine you can open a console session on.
   const isRemoteApp = $derived(!!node && node.kind !== "this" && !meshonly);
 
@@ -217,7 +219,7 @@
             {/if}
           </div>
         {/if}
-        {#if node.claimable || node.owner === app.localId}
+        {#if node.claimable || (node.owner && app.isMe(node.owner))}
           <button class="linklike" onclick={claimThis}>This is actually my own device →</button>
         {/if}
       {:else}
