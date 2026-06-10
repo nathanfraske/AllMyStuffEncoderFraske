@@ -276,6 +276,7 @@ mod tests {
             id: "input:input1".into(),
             name: "Keyboard".into(),
             kind: InputKind::Keyboard,
+            endpoints: 1,
         });
 
         let caps = capabilities_from_inventory(&inv, &NodeId::this());

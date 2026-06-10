@@ -172,10 +172,11 @@ This repository is a **working foundation**, honest about what's real:
 | Graph model + authorization | **Working** — pure Rust, fully unit-tested; mirrored in TS for the UI. Routing prefers a node's default device when auto-picking an endpoint |
 | Device ownership | **Working** — every device advertises its owner and whether it's *claimable*; you can only adopt a box that was started in claim mode, never flat-take one that's already owned |
 | Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data. Devices on the mesh that aren't running AllMyStuff are shown but quieted and un-targetable |
-| Remote console | **Working** — a pikvm-style session window for a remote machine: a video-inputs tab bar (its screen + cameras) and the handle for audio passthrough and keyboard/mouse control, wiring the real routes underneath |
+| Remote console | **Working** — a pikvm-style session in its **own OS window per machine** (open as many as you like): live screen, a video-inputs tab bar, audio passthrough and keyboard/mouse control, wiring the real routes underneath |
 | Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
 | Live audio streaming | **Working** — a mic → speakers route (and the console's audio passthrough) opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
-| Video / screen / input streaming | **Next** — the console already wires and shows the session; each medium still needs its capture/inject backend over the proven route pipe |
+| Live screen + input streaming | **Working** — a display route streams the remote's primary screen as MJPEG (`xcap` capture, ~12 fps, drop-on-backpressure); a control route forwards normalized keyboard/mouse events injected with `enigo`, gated to the device's owner/fleet. Primary screen + default devices in v1 |
+| Camera video / storage streaming | **Next** — the routes wire and show the session; these media still need their capture backends over the proven pipe |
 
 ## Lineage
 

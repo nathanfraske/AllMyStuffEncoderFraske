@@ -7,6 +7,7 @@ import type {
   Capability,
   CheckOutcome,
   IdentityInfo,
+  InputAction,
   InventorySummary,
   MediaKind,
   NetworkConfigFull,
@@ -16,6 +17,7 @@ import type {
   RosterPeer,
   UpdatePrefs,
   UpdateStatus,
+  VideoFrameMsg,
 } from "./types";
 
 interface ScanResult {
@@ -149,6 +151,58 @@ export async function onOwnership(
 
 export function sessionSnapshot(): Promise<SessionSnapshot | null> {
   return tryInvoke<SessionSnapshot>("session_snapshot");
+}
+
+// ---- remote console (per-machine windows + the media plane) ------------
+
+/** Open (or focus) the dedicated console window for `node`. Desktop only —
+ *  the web preview keeps its in-page console. */
+export async function openConsoleWindow(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_console_window", { node });
+}
+
+/** Which machine this window is a console for, when the window was opened
+ *  by `openConsoleWindow` (`?console=<node id>`). Null in the main window. */
+export function consoleWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("console");
+}
+
+/** Forward one keyboard/mouse event down an active outbound input route. */
+export function sendInput(routeId: string, action: InputAction): Promise<null> {
+  return tryInvoke("send_input", { routeId, action });
+}
+
+/** Subscribe to inbound display frames (every console window receives all
+ *  of them and filters by its own route). No-op unlisten in web mode. */
+export async function onVideoFrame(cb: (f: VideoFrameMsg) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<VideoFrameMsg>("allmystuff://video", (e) => cb(e.payload));
+}
+
+/** Tear this window down (a console window's "End session"). Uses
+ *  `destroy` rather than `close` so it never re-fires the close-requested
+ *  handler — route teardown has already run by the time this is called. */
+export async function closeThisWindow(): Promise<void> {
+  if (!isTauri()) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().destroy();
+}
+
+/** Run `cb` when the user closes this window via the OS chrome. The close
+ *  is *held* (preventDefault) so the console can tear its routes down
+ *  first and then finish the job with `closeThisWindow`. Returns an
+ *  unlisten fn. */
+export async function onThisWindowClose(cb: () => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().onCloseRequested((event) => {
+    event.preventDefault();
+    cb();
+  });
 }
 
 // ---- owned fleet (the "Owned" roster) ---------------------------------

@@ -17,8 +17,10 @@
 mod audio;
 mod control_client;
 mod daemon_spawn;
+mod input_inject;
 mod mesh;
 mod ownership;
+mod video;
 
 use std::sync::Arc;
 
@@ -96,6 +98,51 @@ async fn claim_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), Stri
 #[tauri::command]
 async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bool, String> {
     mesh.inner().set_claimable(claimable).await
+}
+
+/// Forward one keyboard/mouse event down an active outbound input route —
+/// the console window's control stream.
+#[tauri::command]
+async fn send_input(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    action: serde_json::Value,
+) -> Result<(), String> {
+    let action: allmystuff_session::InputAction =
+        serde_json::from_value(action).map_err(|e| e.to_string())?;
+    mesh.inner().send_input(route_id, action).await
+}
+
+/// Open (or focus) a dedicated console window for `node` — its own OS
+/// window, so several remote consoles can be on screen at once. The window
+/// loads the same app with `?console=<node>`, which renders just the
+/// console for that machine.
+#[tauri::command]
+async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
+    let label = format!("console-{}", window_slug(&node));
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(format!("index.html?console={node}").into()),
+    )
+    .title("AllMyStuff console")
+    .inner_size(1100.0, 740.0)
+    .min_inner_size(560.0, 380.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A node id reduced to the characters Tauri allows in a window label —
+/// one stable label per machine, so re-opening focuses instead of stacking.
+fn window_slug(node: &str) -> String {
+    node.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// Current peers + live route states.
@@ -328,6 +375,8 @@ fn main() {
             disconnect_route,
             claim_node,
             set_claimable,
+            send_input,
+            open_console_window,
             session_snapshot,
             owned_roster,
             mesh_status,

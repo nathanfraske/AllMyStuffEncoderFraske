@@ -174,11 +174,17 @@ pub fn render(inv: &Inventory) -> String {
         }
     }
 
-    // Input devices.
+    // Input devices. One line per *physical* device; a unit that exposes
+    // several HID interfaces says how many were folded in.
     if !inv.inputs.is_empty() {
         section(&mut s, "Input");
         for d in &inv.inputs {
-            item(&mut s, input_kind_str(d.kind), &d.name);
+            let detail = if d.endpoints > 1 {
+                format!("{}  ({} endpoints)", d.name, d.endpoints)
+            } else {
+                d.name.clone()
+            };
+            item(&mut s, input_kind_str(d.kind), &detail);
         }
     }
 

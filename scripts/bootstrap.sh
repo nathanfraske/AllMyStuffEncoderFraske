@@ -41,10 +41,13 @@ install_linux_deps() {
       log "Installing Tauri + audio build deps (apt)…"
       sudo apt-get update -qq
       # xdg-utils backs Tauri's AppImage bundler; libasound2-dev is the
-      # ALSA dev headers cpal links against.
+      # ALSA dev headers cpal links against; pipewire + xkbcommon + gbm
+      # back the console's screen capture (xcap) and input injection
+      # (enigo).
       sudo apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
         librsvg2-dev libssl-dev libasound2-dev xdg-utils curl wget file \
+        libpipewire-0.3-dev libxkbcommon-dev libgbm-dev \
         build-essential pkg-config
       ;;
     fedora|rhel|centos)
@@ -52,6 +55,7 @@ install_linux_deps() {
       sudo dnf install -y \
         webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
         librsvg2-devel openssl-devel alsa-lib-devel curl wget file gcc \
+        pipewire-devel libxkbcommon-devel mesa-libgbm-devel \
         gcc-c++ make pkgconf-pkg-config
       ;;
     arch|manjaro)

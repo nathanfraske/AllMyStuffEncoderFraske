@@ -1,12 +1,34 @@
 <script lang="ts">
-  // The remote console — a pikvm-style session window for another machine.
-  // A video-inputs tab bar across the top picks which of the remote's
-  // sources you're looking at (its screen, its cameras); the bar underneath
-  // is the handle for audio passthrough and keyboard/mouse control. It owns
-  // the real routes the session runs on, so toggles here actually wire (and
-  // unwire) the mesh.
+  // The remote console — a pikvm-style session for another machine. A
+  // video-inputs tab bar across the top picks which of the remote's
+  // sources you're looking at (its screen, its cameras); the bar
+  // underneath is the handle for audio passthrough and keyboard/mouse
+  // control. It owns the real routes the session runs on, so toggles here
+  // actually wire (and unwire) the mesh.
+  //
+  // Two skins, one component: the desktop renders it `windowed` — filling
+  // a dedicated per-machine OS window (see ConsoleHost) so several
+  // consoles can be open at once — while the web preview keeps the in-page
+  // popover.
+  //
+  // The stage is a live MJPEG sink: the backend emits one
+  // `allmystuff://video` event per inbound frame and this component shows
+  // the latest one for its route. When "Keyboard & mouse" is on, the stage
+  // captures pointer/key events, normalizes coordinates onto the streamed
+  // frame, and forwards them down the control route.
+  import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { displayName, originIcon, mediaColor, MEDIA, type Capability, type MediaKind } from "../types";
+  import { closeThisWindow, onThisWindowClose, onVideoFrame } from "../tauri";
+  import {
+    displayName,
+    originIcon,
+    mediaColor,
+    MEDIA,
+    type Capability,
+    type MediaKind,
+  } from "../types";
+
+  let { windowed = false }: { windowed?: boolean } = $props();
 
   const node = $derived(app.consoleNode);
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
@@ -15,38 +37,148 @@
     (selectedId ? app.capability(selectedId) : null) ?? null,
   );
 
-  // Routes running between this machine and the remote — the live session.
-  const sessionRoutes = $derived.by(() => {
-    const remote = app.consoleNodeId;
-    if (!remote) return [];
-    return app.catalog.routes.filter((r) => {
-      const f = app.capability(r.from);
-      const t = app.capability(r.to);
-      if (!f || !t) return false;
-      const ends = [f.node, t.node];
-      return ends.includes(remote) && ends.includes(app.localId);
-    });
+  // ---- live video ---------------------------------------------------
+  let frameSrc = $state<string | null>(null);
+  let frameW = $state(0);
+  let frameH = $state(0);
+  let fps = $state(0);
+  let frameCount = 0;
+  let imgEl = $state<HTMLImageElement | null>(null);
+
+  onMount(() => {
+    let unlistenFrames: (() => void) | undefined;
+    let unlistenClose: (() => void) | undefined;
+    void onVideoFrame((f) => {
+      // Every window hears every frame; show only our route's.
+      if (!app.consoleVideoLive || f.route !== app.consoleVideoLive) return;
+      frameSrc = `data:image/jpeg;base64,${f.jpeg}`;
+      frameW = f.width;
+      frameH = f.height;
+      frameCount += 1;
+    }).then((u) => (unlistenFrames = u));
+    const fpsTimer = setInterval(() => {
+      fps = frameCount;
+      frameCount = 0;
+    }, 1000);
+    if (windowed) {
+      // The OS chrome's ✕ must tear the session's routes down too — the
+      // close is held until they're on the wire (see onThisWindowClose).
+      void onThisWindowClose(() => void endSession()).then((u) => (unlistenClose = u));
+    }
+    return () => {
+      unlistenFrames?.();
+      unlistenClose?.();
+      clearInterval(fpsTimer);
+    };
   });
 
-  // The selected input streams pixels only once video transport lands; today
-  // the session is wired and audio flows, and we say so plainly.
-  const screenLive = $derived(
-    !!selected &&
-      selected.media === "display" &&
-      sessionRoutes.some((r) => r.from === selected.id && r.media === "display"),
-  );
+  // A switch of input (or session end) shows the placeholder again rather
+  // than a stale frame from the previous route.
+  $effect(() => {
+    void app.consoleVideoLive;
+    frameSrc = null;
+    fps = 0;
+  });
+
+  let closing = false;
+  async function endSession() {
+    if (closing) return;
+    closing = true;
+    // UI resets synchronously; the await is only so a console window's
+    // teardown reaches the backend before the webview dies. Bounded — a
+    // wedged daemon must never hold a closing window hostage.
+    const teardown = app.closeConsole();
+    if (windowed) {
+      await Promise.race([teardown, new Promise((r) => setTimeout(r, 600))]);
+      void closeThisWindow();
+    }
+    closing = false;
+  }
+
+  // ---- keyboard & mouse forwarding -----------------------------------
+  //
+  // Coordinates are normalized 0..1 over the *streamed frame's* content
+  // box (the <img> is letterboxed with object-fit: contain), which the
+  // remote denormalizes onto its own screen — neither side needs the
+  // other's resolution.
+  function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
+    const img = imgEl;
+    if (!img || !frameW || !frameH) return null;
+    const r = img.getBoundingClientRect();
+    const scale = Math.min(r.width / frameW, r.height / frameH);
+    const cw = frameW * scale;
+    const ch = frameH * scale;
+    const ox = r.left + (r.width - cw) / 2;
+    const oy = r.top + (r.height - ch) / 2;
+    const x = (e.clientX - ox) / cw;
+    const y = (e.clientY - oy) / ch;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x, y };
+  }
+
+  // Pointer moves stream constantly; ~30/s is plenty for a console.
+  let lastMoveAt = 0;
+  function onPointerMove(e: PointerEvent) {
+    if (!app.consoleControl) return;
+    const now = performance.now();
+    if (now - lastMoveAt < 33) return;
+    const p = normPoint(e);
+    if (!p) return;
+    lastMoveAt = now;
+    app.sendConsoleInput({ kind: "mouse_move", ...p });
+  }
+
+  function onPointerButton(e: PointerEvent, down: boolean) {
+    if (!app.consoleControl) return;
+    const p = normPoint(e);
+    if (!p) return;
+    e.preventDefault();
+    // Land the cursor exactly where the click happened, then click.
+    app.sendConsoleInput({ kind: "mouse_move", ...p });
+    app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
+  }
+
+  function onWheel(e: WheelEvent) {
+    if (!app.consoleControl || !normPoint(e)) return;
+    e.preventDefault();
+    // Normalize the browser's delta modes to wheel lines.
+    const lines = e.deltaMode === 1 ? 1 : 1 / 40;
+    app.sendConsoleInput({ kind: "wheel", dx: e.deltaX * lines, dy: e.deltaY * lines });
+  }
+
+  function onKey(e: KeyboardEvent, down: boolean) {
+    if (!node) return;
+    if (!app.consoleControl) {
+      // Without control, Escape closes the session (popover habit; in a
+      // window it closes the window too).
+      if (down && e.key === "Escape") endSession();
+      return;
+    }
+    // With control on, *every* key belongs to the remote — including
+    // Escape, exactly like sitting at the machine.
+    e.preventDefault();
+    if (e.repeat) return; // the remote OS does its own key repeat
+    app.sendConsoleInput({ kind: "key", key: e.key, down });
+  }
 
   function inputIcon(c: Capability): string {
     return originIcon(c.origin, c.media);
   }
 </script>
 
-<svelte:window onkeydown={(e) => node && e.key === "Escape" && app.closeConsole()} />
+<svelte:window onkeydown={(e) => onKey(e, true)} onkeyup={(e) => onKey(e, false)} />
 
 {#if node}
-  <div class="scrim">
-    <button class="backdrop" aria-label="Close console" onclick={() => app.closeConsole()}></button>
-    <div class="console" role="dialog" aria-modal="true" aria-label="Console for {displayName(node)}">
+  <div class="scrim" class:windowed>
+    {#if !windowed}
+      <button class="backdrop" aria-label="Close console" onclick={endSession}></button>
+    {/if}
+    <div
+      class="console"
+      role="dialog"
+      aria-modal={!windowed}
+      aria-label="Console for {displayName(node)}"
+    >
       <!-- Title bar -->
       <header class="bar">
         <div class="who">
@@ -79,24 +211,40 @@
             <span class="no-inputs">No video inputs advertised</span>
           {/if}
         </div>
-        <button class="x" onclick={() => app.closeConsole()} aria-label="Close">✕</button>
+        <button class="x" onclick={endSession} aria-label="Close">✕</button>
       </header>
 
       <!-- Video stage -->
-      <div class="stage">
-        {#if selected}
+      <!-- role=application: a remote-desktop surface — every pointer/key
+           event belongs to the far machine while control is on. -->
+      <div
+        class="stage"
+        class:grabbing={app.consoleControl}
+        role="application"
+        aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
+        onpointermove={onPointerMove}
+        onpointerdown={(e) => onPointerButton(e, true)}
+        onpointerup={(e) => onPointerButton(e, false)}
+        onwheel={onWheel}
+        oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
+      >
+        {#if frameSrc}
+          <img
+            bind:this={imgEl}
+            class="live"
+            src={frameSrc}
+            alt="Live screen of {displayName(node)}"
+            draggable="false"
+          />
+        {:else if selected}
           <div class="screen" style="--mc: {mediaColor(selected.media)}">
             <div class="screen-glyph">{inputIcon(selected)}</div>
             <div class="screen-title">{selected.label}</div>
             {#if selected.media === "display"}
-              <div class="screen-note">
-                {screenLive
-                  ? "Session connected — live pixel streaming is on the way."
-                  : "Connecting this machine's display…"}
-              </div>
+              <div class="screen-note">Connecting this machine's display…</div>
             {:else}
               <div class="screen-note">
-                Camera input selected — video streaming is the next transport to land.
+                Camera input selected — camera streaming is the next transport to land.
               </div>
             {/if}
           </div>
@@ -134,17 +282,22 @@
         </div>
 
         <div class="status">
-          {#each sessionRoutes as r (r.id)}
+          {#if frameSrc}
+            <span class="chip stream" title="Live stream — frame size · rate">
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps
+            </span>
+          {/if}
+          {#each app.consoleSessionRoutes as r (r.id)}
             <span class="chip" style="--mc: {mediaColor(r.media as MediaKind)}">
               <span class="chip-dot"></span>{MEDIA[r.media as MediaKind].label}
             </span>
           {/each}
-          {#if sessionRoutes.length === 0}
+          {#if app.consoleSessionRoutes.length === 0}
             <span class="muted">No active links yet</span>
           {/if}
         </div>
 
-        <button class="btn end" onclick={() => app.closeConsole()}>End session</button>
+        <button class="btn end" onclick={endSession}>End session</button>
       </footer>
     </div>
   </div>
@@ -160,6 +313,12 @@
     background: rgba(20, 18, 33, 0.55);
     backdrop-filter: blur(3px);
     padding: 1.5rem;
+  }
+  /* A dedicated console window: no overlay, the console *is* the window. */
+  .scrim.windowed {
+    background: #14121f;
+    backdrop-filter: none;
+    padding: 0;
   }
   .backdrop {
     position: absolute;
@@ -181,6 +340,14 @@
     box-shadow: var(--shadow-lg);
     overflow: hidden;
     animation: rise 0.16s ease;
+  }
+  .windowed .console {
+    width: 100%;
+    height: 100%;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    animation: none;
   }
   @keyframes rise {
     from {
@@ -302,6 +469,20 @@
       radial-gradient(1200px 400px at 50% -10%, rgba(108, 92, 231, 0.12), transparent),
       repeating-linear-gradient(0deg, #100e1a, #100e1a 2px, #12101c 2px, #12101c 4px);
   }
+  .stage.grabbing {
+    cursor: crosshair;
+  }
+  .live {
+    max-width: 100%;
+    max-height: 100%;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+    border-radius: 4px;
+    box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
+  }
   .screen {
     width: 100%;
     height: 100%;
@@ -406,6 +587,19 @@
     height: 8px;
     border-radius: 50%;
     background: var(--mc);
+  }
+  .chip.stream {
+    color: #c7efdb;
+    border-color: rgba(26, 160, 109, 0.5);
+  }
+  .live-dot {
+    background: var(--ok);
+    animation: blink 1.6s ease-in-out infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0.35;
+    }
   }
   .muted {
     color: #79739a;

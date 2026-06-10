@@ -27,16 +27,24 @@ use allmystuff_protocol::{
     ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RouteControl,
     CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
-use allmystuff_session::{AudioFrame, Effect, Session};
+use allmystuff_session::{AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, VideoFrame};
 
 use crate::audio::AudioBridge;
 use crate::control_client::ControlClient;
+use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::video::VideoBridge;
 
 pub struct Mesh {
     client: Arc<ControlClient>,
     app: AppHandle,
     audio: Arc<AudioBridge>,
+    /// Screen capture for display routes this machine sources (the far end
+    /// of a console session looking at us).
+    video: Arc<VideoBridge>,
+    /// Keyboard/mouse injection for input routes that sink here — gated on
+    /// the sender being our owner or a fleet member.
+    injector: Injector,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -44,6 +52,12 @@ pub struct Mesh {
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel.
     audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
+    /// Outbound video, deliberately *bounded*: when the link can't keep up
+    /// the capture side drops frames (each is a standalone JPEG, so a drop
+    /// costs nothing but freshness) instead of queueing stale ones.
+    video_out: mpsc::Sender<(String, VideoFrame)>,
+    /// Sequence for outbound input events (one stream per app run).
+    input_seq: AtomicU64,
 }
 
 struct State {
@@ -66,10 +80,15 @@ struct State {
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
         let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
+        // A shallow queue: at most a few frames in flight, so a slow link
+        // sheds load by dropping captures rather than growing latency.
+        let (video_out, mut video_rx) = mpsc::channel::<(String, VideoFrame)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
             app,
             audio: Arc::new(AudioBridge::new()),
+            video: Arc::new(VideoBridge::new()),
+            injector: Injector::new(),
             state: Mutex::new(State {
                 session: None,
                 network: None,
@@ -80,31 +99,46 @@ impl Mesh {
             }),
             ownership: Arc::new(Ownership::load()),
             audio_out,
+            video_out,
+            input_seq: AtomicU64::new(0),
         });
 
-        // Forwarder: drain captured frames out to peers on the media channel.
+        // Forwarders: drain captured frames out to peers on the media
+        // channel — audio unbounded (tiny, ordered), video bounded.
         {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some((peer, frame)) = audio_rx.recv().await {
-                    let Some(network) = mesh.network_for_peer(&peer) else { continue };
-                    let payload = match serde_json::to_value(&frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let _ = mesh
-                        .client
-                        .request(&Request::ChannelSendTo {
-                            network,
-                            channel: CHANNEL_MEDIA.to_string(),
-                            peer: pubkey_part(&peer).to_string(),
-                            payload,
-                        })
-                        .await;
+                    let Ok(payload) = serde_json::to_value(&frame) else { continue };
+                    mesh.send_media_value(&peer, payload).await;
+                }
+            });
+        }
+        {
+            let mesh = mesh.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some((peer, frame)) = video_rx.recv().await {
+                    let Ok(payload) = serde_json::to_value(&frame) else { continue };
+                    mesh.send_media_value(&peer, payload).await;
                 }
             });
         }
         mesh
+    }
+
+    /// Send one media-channel payload to `peer` (canonicalised to the bare
+    /// pubkey the daemon's peer set is keyed by).
+    async fn send_media_value(&self, peer: &str, payload: Value) {
+        let Some(network) = self.network_for_peer(peer) else { return };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network,
+                channel: CHANNEL_MEDIA.to_string(),
+                peer: pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await;
     }
 
     fn network(&self) -> Option<String> {
@@ -369,8 +403,34 @@ impl Mesh {
                 }
             }
             CHANNEL_MEDIA => {
-                if let Ok(frame) = serde_json::from_value::<AudioFrame>(payload) {
-                    self.audio.feed(&frame.route, &frame);
+                let Some(media) = MediaPayload::decode(payload) else { return };
+                match media {
+                    MediaPayload::Audio(frame) => self.audio.feed(&frame.route, &frame),
+                    MediaPayload::Video(frame) => {
+                        // Surface frames only for a route this session knows
+                        // is live, sinks here, and belongs to the sender —
+                        // the console window(s) render them.
+                        if self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
+                            let _ = self.app.emit("allmystuff://video", &frame);
+                        }
+                    }
+                    MediaPayload::Input(ev) => {
+                        // Injecting keystrokes is the most privileged thing
+                        // on the mesh, so it takes both gates: a live input
+                        // route from this exact sender, *and* the sender
+                        // being this device's recorded owner or a co-owned
+                        // fleet member. (Share-grant-based control rides on
+                        // the share enforcement work — not wired yet.)
+                        if self.inbound_media_ok(&ev.route, &from, MediaKind::Input)
+                            && self.sender_may_control(&from)
+                        {
+                            self.injector.apply(ev.action);
+                        } else {
+                            tracing::warn!(
+                                "dropped input event from {from}: not an authorized controller"
+                            );
+                        }
+                    }
                 }
             }
             CHANNEL_OWNED => {
@@ -447,6 +507,7 @@ impl Mesh {
             st.session.as_mut().and_then(|s| s.teardown(&route_id))
         };
         self.audio.stop(&route_id);
+        self.video.stop(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -489,7 +550,10 @@ impl Mesh {
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
                 Effect::StartMedia(route) => self.start_media(&route),
-                Effect::StopMedia(id) => self.audio.stop(&id),
+                Effect::StopMedia(id) => {
+                    self.audio.stop(&id);
+                    self.video.stop(&id);
+                }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
                         "allmystuff://share",
@@ -750,34 +814,110 @@ impl Mesh {
         }
     }
 
-    /// Begin carrying media for a now-active route. Only audio is wired
-    /// today; the route still shows active for other media so the UI is
-    /// honest about what's connected vs streaming.
+    /// Begin carrying media for a now-active route. Audio, display (screen
+    /// streaming), and input (remote control) are wired; camera video and
+    /// storage still show active without a transport, and the log says so.
     fn start_media(&self, route: &Route) {
-        if route.media != MediaKind::Audio {
-            tracing::info!("route {} active ({:?}); media transport for it is a follow-up", route.id, route.media);
-            return;
-        }
         let Some(me) = self.local_node_id() else { return };
         let from_node = node_of(route.from.as_str());
         let to_node = node_of(route.to.as_str());
 
-        // We source: capture the default mic and stream to the sink node.
-        if from_node == me {
-            let peer = to_node.clone();
-            let rid = route.id.clone();
-            let tx = self.audio_out.clone();
-            let seq = Arc::new(AtomicU64::new(0));
-            self.audio.start_capture(route.id.clone(), move |pcm, rate| {
-                let s = seq.fetch_add(1, Ordering::Relaxed);
-                let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
-                let _ = tx.send((peer.clone(), frame));
-            });
+        match route.media {
+            MediaKind::Audio => {
+                // We source: capture the default mic and stream to the sink.
+                if from_node == me {
+                    let peer = to_node.clone();
+                    let rid = route.id.clone();
+                    let tx = self.audio_out.clone();
+                    let seq = Arc::new(AtomicU64::new(0));
+                    self.audio.start_capture(route.id.clone(), move |pcm, rate| {
+                        let s = seq.fetch_add(1, Ordering::Relaxed);
+                        let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
+                        let _ = tx.send((peer.clone(), frame));
+                    });
+                }
+                // We sink: play inbound frames for this route.
+                if to_node == me {
+                    self.audio.start_playback(route.id.clone());
+                }
+            }
+            MediaKind::Display => {
+                // We're the screen being looked at: capture and stream
+                // MJPEG to the viewer. The viewer side starts nothing here
+                // — its console window renders the emitted frames.
+                if from_node == me && to_node != me {
+                    let peer = to_node.clone();
+                    let tx = self.video_out.clone();
+                    self.video.start_capture(route.id.clone(), move |frame| {
+                        // try_send: a full queue drops this frame; the next
+                        // capture carries a fresher picture.
+                        tx.try_send((peer.clone(), frame)).is_ok()
+                    });
+                }
+            }
+            MediaKind::Input => {
+                // The sink injects lazily per inbound event (behind the
+                // ownership gate); the source is driven by the console
+                // window via `send_input`. Nothing to start eagerly.
+            }
+            other => {
+                tracing::info!("route {} active ({other:?}); media transport for it is a follow-up", route.id);
+            }
         }
-        // We sink: play inbound frames for this route.
-        if to_node == me {
-            self.audio.start_playback(route.id.clone());
+    }
+
+    /// Whether an inbound media frame is acceptable: its route is one this
+    /// session knows, is live, carries `media`, sinks on this machine, and
+    /// the daemon-authenticated sender is the route's peer.
+    fn inbound_media_ok(&self, route_id: &str, sender: &str, media: MediaKind) -> bool {
+        let Some(me) = self.local_node_id() else { return false };
+        let st = self.state.lock();
+        let Some(r) = st.session.as_ref().and_then(|s| s.route(route_id)) else {
+            return false;
+        };
+        r.is_active()
+            && r.route.media == media
+            && node_of(r.route.to.as_str()) == me
+            && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
+    }
+
+    /// Whether `sender` may drive this machine's keyboard and mouse: it is
+    /// the recorded owner, or a member of the owned fleet this device
+    /// belongs to. Nobody else — not even a peer a route auto-accepted for.
+    fn sender_may_control(&self, sender: &str) -> bool {
+        let canon = pubkey_part(sender);
+        if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
+            return true;
         }
+        self.ownership
+            .fleet()
+            .is_some_and(|r| r.members.iter().any(|m| pubkey_part(m.device.as_str()) == canon))
+    }
+
+    /// Front-end command: forward one keyboard/mouse event down an active
+    /// outbound input route (the console window's control stream).
+    pub async fn send_input(self: &Arc<Self>, route_id: String, action: InputAction) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && r.route.media == MediaKind::Input
+                && node_of(r.route.from.as_str()) == me)
+            {
+                return Err("route isn't an active outbound control link".into());
+            }
+            r.peer.to_string()
+        };
+        let seq = self.input_seq.fetch_add(1, Ordering::Relaxed);
+        let ev = InputEvent::new(route_id, seq, action);
+        let payload = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
+        self.send_media_value(&peer, payload).await;
+        Ok(())
     }
 
     /// Send a control message to one peer, reporting whether the daemon
