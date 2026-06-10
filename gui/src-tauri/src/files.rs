@@ -1,0 +1,623 @@
+//! Mesh-native file sessions — the backend of "Open Files".
+//!
+//! Two halves, one struct (the `TerminalHost` shape):
+//!
+//!  * **Host** (the machine whose disk is browsed): [`FilesPlane::handle`]
+//!    executes one viewer request (list / read / mkdir / rename / delete)
+//!    against the local filesystem on its own blocking thread and streams
+//!    the response events back over a bounded channel, so a big download
+//!    is throttled by the mesh send, never ballooning memory. Uploads
+//!    ([`write_piece`]) are the one op handled inline: each piece must
+//!    land in arrival order, and a piece is one small append.
+//!  * **Viewer** (the machine looking at it): inbound response frames are
+//!    buffered per route and pulled by the files window with the same
+//!    poke-then-pull watcher pattern the terminal uses ([`ByteQueues`]).
+//!
+//! No credentials and no sandbox below the user: the mesh already proved
+//! who the peer is, the caller gates everything on the owner/fleet rule
+//! (the same gate as the terminal — which hands out a whole shell), and
+//! ops run as this user with this user's permissions.
+
+use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+
+use allmystuff_session::{FileEntry, FileEvent};
+use parking_lot::Mutex;
+
+use crate::byte_queues::ByteQueues;
+
+/// Raw bytes per `Chunk`/`Write` piece: base64 (×4/3) plus the JSON
+/// envelope stays under the daemon channel's ~64 KiB message ceiling.
+pub const CHUNK_BYTES: usize = 40 * 1024;
+/// Response events in flight per op before its thread blocks — bounded so
+/// a slow link applies backpressure to the disk read, not to memory.
+const OP_QUEUE: usize = 8;
+/// Viewer-side buffer cap. Generous — a preview can be megabytes — but
+/// finite, so a wedged window can't balloon; beyond it the oldest chunks
+/// go (the files window caps previews well below this anyway).
+const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
+
+pub struct FilesPlane {
+    /// Viewer half: response frames per route, drained by the files
+    /// window (the shared poke-then-pull queue plumbing).
+    queues: ByteQueues,
+    /// Host half: one cancel flag per route, checked between chunks by
+    /// in-flight ops — `stop` flips it so a teardown ends a download
+    /// mid-stream instead of pumping bytes at a gone peer.
+    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl Default for FilesPlane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FilesPlane {
+    pub fn new() -> Self {
+        FilesPlane {
+            queues: ByteQueues::new(MAX_QUEUED_BYTES),
+            cancels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // ---- host side ----------------------------------------------------
+
+    /// Execute one viewer request against this machine's filesystem,
+    /// streaming response events (most ops yield exactly one; `Read`
+    /// yields a chunk stream). The blocking fs work runs on its own
+    /// thread; dropping the receiver aborts the op at its next send.
+    /// `Write` pieces don't come here — see [`write_piece`].
+    pub fn handle(
+        &self,
+        route_id: &str,
+        event: FileEvent,
+    ) -> tokio::sync::mpsc::Receiver<FileEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<FileEvent>(OP_QUEUE);
+        let cancel = self.cancel_flag(route_id);
+        let rid = route_id.to_string();
+        let _ = std::thread::Builder::new()
+            .name(format!("amst-files-op {rid}"))
+            .spawn(move || {
+                if let Some(reply) = run_op(event, &tx, &cancel) {
+                    let _ = tx.blocking_send(reply);
+                }
+            });
+        rx
+    }
+
+    fn cancel_flag(&self, route_id: &str) -> Arc<AtomicBool> {
+        self.cancels
+            .lock()
+            .entry(route_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Tear down whatever this route had here — in-flight host ops
+    /// (cancelled at their next chunk) and/or the viewer buffer.
+    /// Idempotent; safe on either side.
+    pub fn stop(&self, route_id: &str) {
+        if let Some(flag) = self.cancels.lock().remove(route_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.queues.remove(route_id);
+    }
+
+    // ---- viewer side ----------------------------------------------------
+
+    /// Make sure a response buffer exists for `route_id` *before* the
+    /// window subscribes — called when the route goes active, so a reply
+    /// that races the window boot is kept, not dropped.
+    pub fn ensure_queue(&self, route_id: &str) {
+        self.queues.ensure(route_id);
+    }
+
+    pub fn watch(&self, route_id: &str) -> u64 {
+        self.queues.watch(route_id)
+    }
+
+    pub fn unwatch(&self, route_id: &str, token: u64) {
+        self.queues.unwatch(route_id, token);
+    }
+
+    pub fn poll(&self, route_id: &str) -> Vec<u8> {
+        self.queues.poll(route_id)
+    }
+
+    /// Buffer one inbound response frame (as its JSON bytes) for the
+    /// watching window. Returns `true` when the queue went empty →
+    /// non-empty — the caller's cue to poke the front-end.
+    pub fn enqueue(&self, route_id: &str, bytes: Vec<u8>) -> bool {
+        self.queues.enqueue(route_id, bytes)
+    }
+}
+
+/// Run one request, sending streamed events through `tx`; the returned
+/// event (if any) is the final reply. Pure fs + channel work — runs on
+/// the op thread.
+fn run_op(
+    event: FileEvent,
+    tx: &tokio::sync::mpsc::Sender<FileEvent>,
+    cancel: &AtomicBool,
+) -> Option<FileEvent> {
+    match event {
+        FileEvent::List { req, path } => Some(match list_dir(&path) {
+            Ok((path, entries)) => FileEvent::Entries {
+                req,
+                path,
+                home: home_dir_string(),
+                entries,
+            },
+            Err(reason) => FileEvent::Err { req, reason },
+        }),
+        FileEvent::Read { req, path } => match stream_read(req, &path, tx, cancel) {
+            Ok(()) => None, // the chunk stream (ending in eof) is the reply
+            Err(reason) => Some(FileEvent::Err { req, reason }),
+        },
+        FileEvent::Mkdir { req, path } => Some(reply(
+            req,
+            std::fs::create_dir_all(resolve(&path)).map_err(|e| e.to_string()),
+        )),
+        FileEvent::Rename { req, from, to } => {
+            let dst = resolve(&to);
+            let r = if dst.exists() {
+                Err("something already has that name".to_string())
+            } else {
+                std::fs::rename(resolve(&from), dst).map_err(|e| e.to_string())
+            };
+            Some(reply(req, r))
+        }
+        FileEvent::Delete { req, path } => {
+            let p = resolve(&path);
+            // Never follow a symlink into deleting what it points at —
+            // remove the link itself.
+            let r = match std::fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p),
+                Ok(_) => std::fs::remove_file(&p),
+                Err(e) => Err(e),
+            }
+            .map_err(|e| e.to_string());
+            Some(reply(req, r))
+        }
+        // Write pieces are handled inline by `write_piece`; response
+        // kinds landing here are a confused peer — answer nothing.
+        other => {
+            tracing::debug!("files op ignoring event: {other:?}");
+            None
+        }
+    }
+}
+
+fn reply(req: u64, r: Result<(), String>) -> FileEvent {
+    match r {
+        Ok(()) => FileEvent::Ok { req },
+        Err(reason) => FileEvent::Err { req, reason },
+    }
+}
+
+/// Apply one upload piece. Handled inline (not on an op thread) because
+/// pieces of one upload must land in arrival order — and one piece is one
+/// small append, comparable to the JSON work already done in line. The
+/// viewer sends pieces sequentially, so at most one is ever in flight.
+/// Returns the reply to send, if any (`Ok` only once the `eof` piece is
+/// on disk; errors always answer).
+pub fn write_piece(event: &FileEvent) -> Option<FileEvent> {
+    let FileEvent::Write {
+        req,
+        path,
+        data,
+        append,
+        eof,
+    } = event
+    else {
+        return None;
+    };
+    let p = resolve(path);
+    let r = (|| -> std::io::Result<()> {
+        let mut f = if *append {
+            std::fs::OpenOptions::new().append(true).open(&p)?
+        } else {
+            std::fs::File::create(&p)?
+        };
+        f.write_all(data)?;
+        f.flush()
+    })();
+    match r {
+        Ok(()) if *eof => Some(FileEvent::Ok { req: *req }),
+        Ok(()) => None,
+        Err(e) => Some(FileEvent::Err {
+            req: *req,
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Resolve a viewer path to a host path: `""`/`"~"` (and `~/…`) mean this
+/// user's home; relative paths hang off home too; absolute paths stand.
+fn resolve(path: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    if path.is_empty() || path == "~" {
+        return home;
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        home.join(p)
+    }
+}
+
+fn home_dir_string() -> String {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn list_dir(path: &str) -> Result<(String, Vec<FileEntry>), String> {
+    let dir = resolve(path);
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let p = entry.path();
+        let symlink = entry
+            .path()
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        // Follow links for dir-ness/size so a symlinked folder is
+        // navigable; a broken link reads as a 0-byte file.
+        let meta = std::fs::metadata(&p).ok();
+        let dir_flag = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        entries.push(FileEntry {
+            name,
+            dir: dir_flag,
+            size: if dir_flag {
+                0
+            } else {
+                meta.as_ref().map(|m| m.len()).unwrap_or(0)
+            },
+            modified: meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            symlink,
+        });
+    }
+    Ok((dir.to_string_lossy().into_owned(), entries))
+}
+
+/// Stream one file as `Chunk` events (the last marked `eof`), checking
+/// the route's cancel flag between pieces. `blocking_send` is the flow
+/// control: a slow mesh send fills the channel and parks the read here.
+fn stream_read(
+    req: u64,
+    path: &str,
+    tx: &tokio::sync::mpsc::Sender<FileEvent>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let p = resolve(path);
+    let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        return Err("that's a folder".into());
+    }
+    let total = meta.len();
+    let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut sent: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        let eof = n == 0 || sent + n as u64 >= total;
+        let chunk = FileEvent::Chunk {
+            req,
+            data: buf[..n].to_vec(),
+            total,
+            eof,
+        };
+        sent += n as u64;
+        if tx.blocking_send(chunk).is_err() {
+            // Receiver gone — the pump (and likely the route) ended.
+            return Ok(());
+        }
+        if eof {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn drain(mut rx: tokio::sync::mpsc::Receiver<FileEvent>) -> Vec<FileEvent> {
+        let mut out = Vec::new();
+        // Ops run on their own thread; blocking_recv waits for each event.
+        while let Some(ev) = rx.blocking_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "amst-files-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn list_read_roundtrip() {
+        let dir = tempdir("list");
+        std::fs::write(dir.join("hello.txt"), b"hello files").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        let plane = FilesPlane::new();
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::List {
+                req: 1,
+                path: dir.to_string_lossy().into_owned(),
+            },
+        ));
+        let [FileEvent::Entries {
+            req: 1, entries, ..
+        }] = events.as_slice()
+        else {
+            panic!("expected one Entries, got {events:?}");
+        };
+        let file = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert!(!file.dir);
+        assert_eq!(file.size, 11);
+        assert!(entries.iter().any(|e| e.name == "sub" && e.dir));
+
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Read {
+                req: 2,
+                path: dir.join("hello.txt").to_string_lossy().into_owned(),
+            },
+        ));
+        let mut bytes = Vec::new();
+        for ev in &events {
+            let FileEvent::Chunk { data, total, .. } = ev else {
+                panic!("expected chunks, got {ev:?}");
+            };
+            assert_eq!(*total, 11);
+            bytes.extend_from_slice(data);
+        }
+        assert_eq!(bytes, b"hello files");
+        assert!(matches!(
+            events.last(),
+            Some(FileEvent::Chunk { eof: true, .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_streams_big_files_in_capped_chunks() {
+        let dir = tempdir("big");
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &body).unwrap();
+
+        let plane = FilesPlane::new();
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Read {
+                req: 1,
+                path: dir.join("big.bin").to_string_lossy().into_owned(),
+            },
+        ));
+        assert!(events.len() > 1, "split into several chunks");
+        let mut bytes = Vec::new();
+        for ev in &events {
+            let FileEvent::Chunk { data, .. } = ev else {
+                panic!("expected chunks");
+            };
+            assert!(data.len() <= CHUNK_BYTES);
+            bytes.extend_from_slice(data);
+        }
+        assert_eq!(bytes, body, "byte-exact across chunks");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_pieces_assemble_in_order_and_reply_on_eof() {
+        let dir = tempdir("write");
+        let path = dir.join("up.bin").to_string_lossy().into_owned();
+
+        // First piece creates; later pieces append; only eof answers.
+        let first = write_piece(&FileEvent::Write {
+            req: 7,
+            path: path.clone(),
+            data: b"hello ".to_vec(),
+            append: false,
+            eof: false,
+        });
+        assert_eq!(first, None, "mid-upload pieces are silent");
+        let last = write_piece(&FileEvent::Write {
+            req: 7,
+            path: path.clone(),
+            data: b"upload".to_vec(),
+            append: true,
+            eof: true,
+        });
+        assert_eq!(last, Some(FileEvent::Ok { req: 7 }));
+        assert_eq!(std::fs::read(resolve(&path)).unwrap(), b"hello upload");
+
+        // A failing piece answers Err whatever its position.
+        let bad = write_piece(&FileEvent::Write {
+            req: 8,
+            path: dir.join("no/such/dir/x").to_string_lossy().into_owned(),
+            data: vec![1],
+            append: false,
+            eof: false,
+        });
+        assert!(matches!(bad, Some(FileEvent::Err { req: 8, .. })));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mkdir_rename_delete_roundtrip() {
+        let dir = tempdir("manage");
+        let plane = FilesPlane::new();
+
+        let sub = dir.join("made/here").to_string_lossy().into_owned();
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Mkdir {
+                req: 1,
+                path: sub.clone(),
+            },
+        ));
+        assert_eq!(events, vec![FileEvent::Ok { req: 1 }]);
+        assert!(resolve(&sub).is_dir());
+
+        let renamed = dir.join("made/there").to_string_lossy().into_owned();
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Rename {
+                req: 2,
+                from: sub.clone(),
+                to: renamed.clone(),
+            },
+        ));
+        assert_eq!(events, vec![FileEvent::Ok { req: 2 }]);
+        assert!(!resolve(&sub).exists());
+        assert!(resolve(&renamed).is_dir());
+
+        // Rename refuses to clobber something that already exists.
+        std::fs::create_dir_all(dir.join("occupied")).unwrap();
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Rename {
+                req: 3,
+                from: renamed.clone(),
+                to: dir.join("occupied").to_string_lossy().into_owned(),
+            },
+        ));
+        assert!(matches!(events.as_slice(), [FileEvent::Err { req: 3, .. }]));
+
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Delete {
+                req: 4,
+                path: dir.join("made").to_string_lossy().into_owned(),
+            },
+        ));
+        assert_eq!(events, vec![FileEvent::Ok { req: 4 }]);
+        assert!(!dir.join("made").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn errors_carry_the_reason_not_a_panic() {
+        let plane = FilesPlane::new();
+        let dir = tempdir("errs");
+        let missing = dir.join("nope").to_string_lossy().into_owned();
+        for (req, ev) in [
+            (
+                1,
+                FileEvent::List {
+                    req: 1,
+                    path: missing.clone(),
+                },
+            ),
+            (
+                2,
+                FileEvent::Read {
+                    req: 2,
+                    path: missing.clone(),
+                },
+            ),
+            (
+                3,
+                FileEvent::Delete {
+                    req: 3,
+                    path: missing.clone(),
+                },
+            ),
+        ] {
+            let events = drain(plane.handle("r1", ev));
+            assert!(
+                matches!(events.as_slice(), [FileEvent::Err { req: r, .. }] if *r == req),
+                "req {req}: {events:?}"
+            );
+        }
+        // Reading a directory is refused in the viewer's own terms.
+        let events = drain(plane.handle(
+            "r1",
+            FileEvent::Read {
+                req: 4,
+                path: dir.to_string_lossy().into_owned(),
+            },
+        ));
+        assert!(
+            matches!(events.as_slice(), [FileEvent::Err { req: 4, reason }] if reason.contains("folder"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stop_cancels_a_read_mid_stream() {
+        let dir = tempdir("cancel");
+        // Big enough that the bounded channel parks the reader.
+        let body = vec![7u8; CHUNK_BYTES * (OP_QUEUE + 4)];
+        std::fs::write(dir.join("big.bin"), &body).unwrap();
+
+        let plane = FilesPlane::new();
+        let mut rx = plane.handle(
+            "r1",
+            FileEvent::Read {
+                req: 1,
+                path: dir.join("big.bin").to_string_lossy().into_owned(),
+            },
+        );
+        // Take one chunk, then stop the route; the op must end (with a
+        // cancelled error or silence), never stream the whole file.
+        let first = rx.blocking_recv().expect("first chunk");
+        assert!(matches!(first, FileEvent::Chunk { .. }));
+        plane.stop("r1");
+        let mut chunks = 1;
+        while let Some(ev) = rx.blocking_recv() {
+            if matches!(ev, FileEvent::Chunk { .. }) {
+                chunks += 1;
+            }
+        }
+        assert!(
+            chunks <= OP_QUEUE + 2,
+            "stopped read kept streaming: {chunks} chunks"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paths_resolve_against_home() {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        assert_eq!(resolve(""), home);
+        assert_eq!(resolve("~"), home);
+        assert_eq!(resolve("~/docs"), home.join("docs"));
+        assert_eq!(resolve("plain"), home.join("plain"));
+        let abs = if cfg!(windows) { "C:\\x" } else { "/x" };
+        assert_eq!(resolve(abs), Path::new(abs));
+    }
+}

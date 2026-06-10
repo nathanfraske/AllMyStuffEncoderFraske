@@ -28,12 +28,13 @@ use allmystuff_protocol::{
     CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
-    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, TermEvent, TermFrame,
-    VideoAssembler, VideoFrame,
+    AudioFrame, Effect, FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session,
+    TermEvent, TermFrame, VideoAssembler, VideoFrame,
 };
 
 use crate::audio::AudioBridge;
 use crate::control_client::{ControlClient, MediaPipe};
+use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
 use crate::terminal::{OutMsg, TerminalHost};
@@ -64,6 +65,18 @@ pub struct Mesh {
     /// Sequence for viewer-side outbound terminal frames (keystrokes,
     /// resizes — one stream per app run, like `input_seq`).
     term_seq: AtomicU64,
+    /// Mesh-native file sessions: filesystem ops this machine hosts for
+    /// files routes sourcing here (gated like the terminal), and the
+    /// response buffers files windows drain for routes sinking here.
+    files: FilesPlane,
+    /// Sequence for outbound file frames (requests viewer-side, response
+    /// streams host-side — one stream per app run, like `term_seq`).
+    file_seq: AtomicU64,
+    /// Viewer-side download sinks: a `(route, req)` whose `Chunk`s should
+    /// stream straight to a local file (the Downloads folder) instead of
+    /// the window's queue — registered by `file_download` *before* the
+    /// Read request goes out, so the first chunk can't race it.
+    downloads: Mutex<HashMap<(String, u64), DownloadSink>>,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -126,6 +139,16 @@ struct VideoWatcher {
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
     queue: std::collections::VecDeque<Vec<u8>>,
+}
+
+/// One registered "save this download to disk" sink: the open file the
+/// chunks stream into, where it lives, and progress accounting for the
+/// `allmystuff://file-progress` events.
+struct DownloadSink {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    written: u64,
+    last_progress: std::time::Instant,
 }
 
 /// Receive-side counters for one route's stream.
@@ -203,6 +226,9 @@ impl Mesh {
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
+            files: FilesPlane::new(),
+            file_seq: AtomicU64::new(0),
+            downloads: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
                 session: None,
                 network: None,
@@ -531,8 +557,12 @@ impl Mesh {
             // This build can host mesh-native terminals on every OS the
             // app ships for (openpty / ConPTY) — advertise it so peers
             // know to offer one. Runtime spawn failures still degrade
-            // in-band (the viewer sees the error in its terminal).
-            features: vec![allmystuff_protocol::FEATURE_TERMINAL.to_string()],
+            // in-band (the viewer sees the error in its terminal). Same
+            // for file sessions: plain std::fs everywhere we ship.
+            features: vec![
+                allmystuff_protocol::FEATURE_TERMINAL.to_string(),
+                allmystuff_protocol::FEATURE_FILES.to_string(),
+            ],
         }
     }
 
@@ -671,21 +701,22 @@ impl Mesh {
             }
             CHANNEL_CONTROL => {
                 if let Ok(msg) = serde_json::from_value::<ControlMessage>(payload) {
-                    // Terminal offers are screened *before* the session sees
-                    // them: the session auto-accepts (Accept + StartMedia in
-                    // one step), and a shell is owner/fleet-only — same rule
-                    // as input injection, enforced before any reply exists.
+                    // Terminal and files offers are screened *before* the
+                    // session sees them: the session auto-accepts (Accept +
+                    // StartMedia in one step), and a shell — or this disk —
+                    // is owner/fleet-only, the same rule as input injection,
+                    // enforced before any reply exists.
                     if let ControlMessage::Route(RouteControl::Offer { route, .. }) = &msg {
                         let hosts_here = self
                             .local_node_id()
                             .is_some_and(|me| node_of(route.from.as_str()) == me);
-                        if let Some(reason) = terminal_offer_refusal(
+                        if let Some(reason) = privileged_offer_refusal(
                             route,
                             hosts_here,
                             self.sender_may_control(&from),
                         ) {
                             tracing::warn!(
-                                "terminal offer {} from {} refused: not owner/fleet",
+                                "privileged offer {} from {} refused: not owner/fleet",
                                 route.id,
                                 short_id(&from)
                             );
@@ -765,6 +796,7 @@ impl Mesh {
                         }
                     }
                     MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
+                    MediaPayload::File(frame) => self.handle_file_frame(&from, frame),
                 }
             }
             CHANNEL_OWNED => {
@@ -1103,6 +1135,8 @@ impl Mesh {
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
         self.terminal.stop(&route_id);
+        self.files.stop(&route_id);
+        self.drop_downloads(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -1165,6 +1199,8 @@ impl Mesh {
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
                     self.terminal.stop(&id);
+                    self.files.stop(&id);
+                    self.drop_downloads(&id);
                 }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
@@ -1858,6 +1894,26 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Generic if is_files_route(route) => {
+                if from_node == me && to_node != me {
+                    // We're the disk end: requests drive everything — the
+                    // owner/fleet gate re-clears per inbound frame.
+                    tracing::info!(
+                        "route {} active — hosting files for {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me && from_node != me {
+                    // We're the viewer: buffer responses from the first
+                    // frame, before the files window has subscribed.
+                    self.files.ensure_queue(&route.id);
+                    tracing::info!(
+                        "route {} active — files session from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             other => {
                 tracing::info!(
                     "route {} active ({other:?}); media transport for it is a follow-up",
@@ -2109,6 +2165,293 @@ impl Mesh {
         self.terminal.poll(route_id)
     }
 
+    /// One inbound file frame. Which side we are comes from the route
+    /// itself: requests landing on the *host* (the route sources here)
+    /// clear the same two gates as terminal input — live route from this
+    /// exact sender, and the sender being an authorized controller;
+    /// responses landing on the *viewer* (the route sinks here) go to the
+    /// watching files window — except chunks of a registered download,
+    /// which stream straight to disk.
+    fn handle_file_frame(self: &Arc<Self>, from: &str, frame: FileFrame) {
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        let (hosts_here, views_here) = {
+            let st = self.state.lock();
+            let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
+                return;
+            };
+            if !(r.is_active()
+                && is_files_route(&r.route)
+                && pubkey_part(r.peer.as_str()) == pubkey_part(from))
+            {
+                tracing::debug!(
+                    "file frame for {} refused (route not live here)",
+                    frame.route
+                );
+                return;
+            }
+            (
+                node_of(r.route.from.as_str()) == me,
+                node_of(r.route.to.as_str()) == me,
+            )
+        };
+        if hosts_here {
+            if !self.sender_may_control(from) {
+                tracing::warn!("dropped file request from {from}: not an authorized controller");
+                return;
+            }
+            match &frame.event {
+                // Upload pieces are applied inline: pieces of one upload
+                // must land in arrival order (the viewer sends them
+                // sequentially), and a piece is one small append.
+                FileEvent::Write { .. } => {
+                    if let Some(reply) = crate::files::write_piece(&frame.event) {
+                        self.send_file_event(frame.route.clone(), from.to_string(), reply);
+                    }
+                }
+                FileEvent::List { .. }
+                | FileEvent::Read { .. }
+                | FileEvent::Mkdir { .. }
+                | FileEvent::Rename { .. }
+                | FileEvent::Delete { .. } => {
+                    self.start_files_request(&frame.route, from, frame.event);
+                }
+                // Response kinds landing on the host are a confused peer.
+                _ => {}
+            }
+        } else if views_here {
+            // A chunk of a registered download streams to disk, not to
+            // the window; everything else is queued for the window.
+            if let FileEvent::Chunk { req, .. } = &frame.event {
+                if self.feed_download(&frame.route, *req, &frame.event) {
+                    return;
+                }
+            }
+            if let FileEvent::Err { req, .. } = &frame.event {
+                // A failed request that had a download registered: close
+                // and discard the partial file, then let the window see
+                // the error too.
+                self.fail_download(&frame.route, *req, &frame.event);
+            }
+            let Ok(bytes) = serde_json::to_vec(&frame) else {
+                return;
+            };
+            if self.files.enqueue(&frame.route, bytes) {
+                let _ = self.app.emit("allmystuff://file-ready", &frame.route);
+            }
+        }
+    }
+
+    /// Host side: run one request against the local filesystem and pump
+    /// its response events back to the viewer. A send failure aborts the
+    /// pump (dropping the receiver cancels the op at its next chunk) —
+    /// unlike a shell, a request/response op is simply retried by the
+    /// viewer.
+    fn start_files_request(self: &Arc<Self>, route_id: &str, peer: &str, event: FileEvent) {
+        let mut rx = self.files.handle(route_id, event);
+        let mesh = self.clone();
+        let rid = route_id.to_string();
+        let peer = peer.to_string();
+        tauri::async_runtime::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
+                let frame = FileFrame::new(&rid, seq, ev);
+                let Ok(payload) = serde_json::to_value(&frame) else {
+                    continue;
+                };
+                if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                    tracing::warn!("file response to {} failed: {e}", short_id(&peer));
+                    return; // dropping rx cancels the op
+                }
+            }
+        });
+    }
+
+    /// Send one host-side file event (an upload piece's reply) to the
+    /// viewer, fire-and-forget.
+    fn send_file_event(self: &Arc<Self>, route_id: String, peer: String, event: FileEvent) {
+        let mesh = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
+            let frame = FileFrame::new(&route_id, seq, event);
+            if let Ok(payload) = serde_json::to_value(&frame) {
+                if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                    tracing::warn!("file reply to {} failed: {e}", short_id(&peer));
+                }
+            }
+        });
+    }
+
+    /// Front-end command: one file *request* from a files window down its
+    /// active files route. This machine must be the route's *viewer* (its
+    /// sink side); response kinds are the host's word and are refused.
+    pub async fn file_send(
+        self: &Arc<Self>,
+        route_id: String,
+        event: FileEvent,
+    ) -> Result<(), String> {
+        match event {
+            FileEvent::List { .. }
+            | FileEvent::Read { .. }
+            | FileEvent::Write { .. }
+            | FileEvent::Mkdir { .. }
+            | FileEvent::Rename { .. }
+            | FileEvent::Delete { .. } => {}
+            _ => return Err("responses come from the host, not the viewer".into()),
+        }
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active() && is_files_route(&r.route) && node_of(r.route.to.as_str()) == me) {
+                return Err("route isn't an active files session here".into());
+            }
+            r.peer.to_string()
+        };
+        let seq = self.file_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = FileFrame::new(&route_id, seq, event);
+        let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
+        self.send_media_value(&peer, payload).await
+    }
+
+    /// A files window claims an active route's buffered responses (returns
+    /// the token scoping its unwatch). Pure plumbing to [`FilesPlane`].
+    pub fn file_watch(&self, route_id: &str) -> u64 {
+        self.files.watch(route_id)
+    }
+
+    pub fn file_unwatch(&self, route_id: &str, token: u64) {
+        self.files.unwatch(route_id, token);
+    }
+
+    /// Drain buffered file responses (`[u32 le len][frame json]…`), emptied
+    /// by the window on each `allmystuff://file-ready` poke or safety poll.
+    pub fn file_poll(&self, route_id: &str) -> Vec<u8> {
+        self.files.poll(route_id)
+    }
+
+    /// Register a download sink: the `Chunk`s of `(route_id, req)` stream
+    /// into this machine's Downloads folder under `name` (unique-ified)
+    /// instead of the window's queue. Called *before* the Read request is
+    /// sent, so the first chunk can't race the registration. Returns the
+    /// destination path.
+    pub fn file_download(&self, route_id: String, req: u64, name: &str) -> Result<String, String> {
+        // The name comes from the remote listing — keep only its final
+        // component so it can't steer the write outside Downloads.
+        let base = std::path::Path::new(name)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty() && n != "." && n != "..")
+            .unwrap_or_else(|| "download".to_string());
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .ok_or("no Downloads folder here")?;
+        let path = unique_path(&dir, &base);
+        let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        self.downloads.lock().insert(
+            (route_id, req),
+            DownloadSink {
+                file,
+                path: path.clone(),
+                written: 0,
+                last_progress: std::time::Instant::now(),
+            },
+        );
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Stream one chunk into its registered download, if any. Returns
+    /// `true` when the chunk was consumed here (don't queue it). Finishing
+    /// (or failing) emits `allmystuff://file-saved` so the window can say
+    /// where it landed.
+    fn feed_download(&self, route_id: &str, req: u64, event: &FileEvent) -> bool {
+        use std::io::Write as _;
+        let FileEvent::Chunk {
+            data, total, eof, ..
+        } = event
+        else {
+            return false;
+        };
+        let key = (route_id.to_string(), req);
+        let mut map = self.downloads.lock();
+        let Some(sink) = map.get_mut(&key) else {
+            return false;
+        };
+        if let Err(e) = sink.file.write_all(data) {
+            let path = sink.path.clone();
+            map.remove(&key);
+            drop(map);
+            let _ = std::fs::remove_file(&path);
+            let _ = self.app.emit(
+                "allmystuff://file-saved",
+                json!({ "route": route_id, "req": req, "path": null, "error": e.to_string() }),
+            );
+            return true;
+        }
+        sink.written += data.len() as u64;
+        if *eof {
+            let Some(sink) = map.remove(&key) else {
+                return true;
+            };
+            drop(map);
+            let _ = sink.file.sync_all();
+            let _ = self.app.emit(
+                "allmystuff://file-saved",
+                json!({
+                    "route": route_id, "req": req,
+                    "path": sink.path.to_string_lossy(), "error": null,
+                }),
+            );
+        } else if sink.last_progress.elapsed() >= std::time::Duration::from_millis(250) {
+            sink.last_progress = std::time::Instant::now();
+            let written = sink.written;
+            drop(map);
+            let _ = self.app.emit(
+                "allmystuff://file-progress",
+                json!({ "route": route_id, "req": req, "written": written, "total": total }),
+            );
+        }
+        true
+    }
+
+    /// The host answered a registered download with an error: discard the
+    /// partial file and tell the window.
+    fn fail_download(&self, route_id: &str, req: u64, event: &FileEvent) {
+        let FileEvent::Err { reason, .. } = event else {
+            return;
+        };
+        let key = (route_id.to_string(), req);
+        let Some(sink) = self.downloads.lock().remove(&key) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&sink.path);
+        let _ = self.app.emit(
+            "allmystuff://file-saved",
+            json!({ "route": route_id, "req": req, "path": null, "error": reason }),
+        );
+    }
+
+    /// Discard every download sink a route had (it ended) — partial files
+    /// are deleted, never left half-written in Downloads.
+    fn drop_downloads(&self, route_id: &str) {
+        let mut map = self.downloads.lock();
+        let keys: Vec<_> = map
+            .keys()
+            .filter(|(rid, _)| rid == route_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(sink) = map.remove(&key) {
+                let _ = std::fs::remove_file(&sink.path);
+            }
+        }
+    }
+
     /// Whether an inbound media frame is acceptable: its route is one this
     /// session knows, is live, carries `media`, sinks on this machine, and
     /// the daemon-authenticated sender is the route's peer.
@@ -2342,20 +2685,59 @@ fn is_terminal_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":terminal")
 }
 
-/// Why an inbound terminal offer must be refused, if it must: it asks
-/// *this* machine to host a shell and the offerer isn't an authorized
-/// controller. `None` = fine (not a terminal offer, not our shell, or the
-/// sender is owner/fleet). Pure, so the rule that guards the most
-/// privileged thing on the mesh is unit-testable.
-fn terminal_offer_refusal(
+/// Whether `route` is a mesh-native file session: generic media whose
+/// source endpoint is a machine's `…:files` handle — the same shape-as-
+/// contract scheme the terminal uses.
+fn is_files_route(route: &Route) -> bool {
+    route.media == MediaKind::Generic && route.from.as_str().ends_with(":files")
+}
+
+/// Why an inbound terminal/files offer must be refused, if it must: it
+/// asks *this* machine to host a shell (or hand over its disk) and the
+/// offerer isn't an authorized controller. `None` = fine (not a
+/// privileged offer, not our side to host, or the sender is owner/fleet).
+/// Pure, so the rule that guards the most privileged things on the mesh
+/// is unit-testable.
+fn privileged_offer_refusal(
     route: &Route,
     hosts_here: bool,
     sender_may_control: bool,
 ) -> Option<String> {
-    if !is_terminal_route(route) || !hosts_here || sender_may_control {
+    if !hosts_here || sender_may_control {
         return None;
     }
-    Some("not authorized: terminal access is owner/fleet only".into())
+    if is_terminal_route(route) {
+        return Some("not authorized: terminal access is owner/fleet only".into());
+    }
+    if is_files_route(route) {
+        return Some("not authorized: file access is owner/fleet only".into());
+    }
+    None
+}
+
+/// `dir/name`, made unique the Finder way: `name (2).ext`, `name (3).ext`…
+/// when something already sits there.
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = std::path::Path::new(name);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = p.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 2.. {
+        let candidate = match &ext {
+            Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
+            None => dir.join(format!("{stem} ({n})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing
@@ -2452,22 +2834,59 @@ mod tests {
     }
 
     #[test]
-    fn terminal_offers_are_refused_exactly_when_unauthorized() {
-        let term = term_route("me:terminal", "them:term-view:1", MediaKind::Generic);
+    fn files_routes_are_recognized_by_shape() {
+        let files = term_route("host:files", "me:files-view:1", MediaKind::Generic);
+        assert!(is_files_route(&files));
+        assert!(!is_terminal_route(&files), "files ≠ terminal");
 
-        // Our shell + an unauthorized sender = refusal with a human reason.
-        let refusal = terminal_offer_refusal(&term, true, false);
-        assert!(refusal.is_some_and(|r| r.contains("owner/fleet")));
+        let generic = term_route("host:thing", "me:other", MediaKind::Generic);
+        assert!(!is_files_route(&generic));
+
+        let storage = term_route("host:files", "me:files-view:1", MediaKind::Storage);
+        assert!(!is_files_route(&storage), "media is part of the contract");
+    }
+
+    #[test]
+    fn privileged_offers_are_refused_exactly_when_unauthorized() {
+        let term = term_route("me:terminal", "them:term-view:1", MediaKind::Generic);
+        let files = term_route("me:files", "them:files-view:1", MediaKind::Generic);
+
+        // Our shell/disk + an unauthorized sender = refusal with a human
+        // reason naming the right plane.
+        let refusal = privileged_offer_refusal(&term, true, false);
+        assert!(refusal.is_some_and(|r| r.contains("terminal") && r.contains("owner/fleet")));
+        let refusal = privileged_offer_refusal(&files, true, false);
+        assert!(refusal.is_some_and(|r| r.contains("file") && r.contains("owner/fleet")));
 
         // Owner/fleet senders pass.
-        assert_eq!(terminal_offer_refusal(&term, true, true), None);
+        assert_eq!(privileged_offer_refusal(&term, true, true), None);
+        assert_eq!(privileged_offer_refusal(&files, true, true), None);
 
-        // A terminal offer that doesn't ask for *our* shell (we'd be the
-        // viewer) is no grounds for refusal…
-        assert_eq!(terminal_offer_refusal(&term, false, false), None);
+        // An offer that doesn't ask us to host (we'd be the viewer) is no
+        // grounds for refusal…
+        assert_eq!(privileged_offer_refusal(&term, false, false), None);
+        assert_eq!(privileged_offer_refusal(&files, false, false), None);
 
-        // …and non-terminal offers are never screened here, whoever asks.
+        // …and unprivileged offers are never screened here, whoever asks.
         let audio = term_route("me:mic", "them:speaker", MediaKind::Audio);
-        assert_eq!(terminal_offer_refusal(&audio, true, false), None);
+        assert_eq!(privileged_offer_refusal(&audio, true, false), None);
+    }
+
+    #[test]
+    fn unique_path_counts_the_finder_way() {
+        let dir = std::env::temp_dir().join(format!(
+            "amst-unique-test-{}-{}",
+            std::process::id(),
+            fresh_boot_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a.txt"));
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a (2).txt"));
+        std::fs::write(dir.join("a (2).txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.txt"), dir.join("a (3).txt"));
+        std::fs::write(dir.join("noext"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "noext"), dir.join("noext (2)"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

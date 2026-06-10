@@ -49,6 +49,12 @@ pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 /// advertise this.
 pub const FEATURE_TERMINAL: &str = "terminal";
 
+/// Feature tag a node advertises in [`NodeProfile::features`] when it can
+/// host mesh-native file sessions (browse, read and manage its filesystem
+/// over the media channel — the "Open Files" console). A peer only offers
+/// a files route to nodes that advertise this.
+pub const FEATURE_FILES: &str = "files";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
