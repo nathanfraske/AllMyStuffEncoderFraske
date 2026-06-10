@@ -15,7 +15,7 @@ Built on [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh). Pure-Rust core,
 Tauri + Svelte app, auto-updating — the same family as
 [MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM).
 
-[The idea](#the-idea) · [The graph](#the-graph) · [Yours vs shared](#yours-vs-shared--authorization-not-authentication) · [Architecture](#architecture) · [Run it](#run-it)
+[The idea](#the-idea) · [Install](#install) · [The graph](#the-graph) · [Yours vs shared](#yours-vs-shared--authorization-not-authentication) · [Architecture](#architecture) · [Run it](#build--run) · [Releases](https://github.com/mrjeeves/AllMyStuff/releases)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Built on MyOwnMesh](https://img.shields.io/badge/mesh-MyOwnMesh-6c5ce7.svg)](https://github.com/mrjeeves/MyOwnMesh)
@@ -40,6 +40,41 @@ is built for everyone else. It does three things:
    each device is, cryptographically — you never see a key. AllMyStuff only
    asks the question a human actually has: **is this mine, or am I sharing
    with someone?**
+
+## Install
+
+One command — detects platform, fetches the binaries from
+[GitHub Releases](https://github.com/mrjeeves/AllMyStuff/releases),
+verifies SHA-256, drops `allmystuff` **and** the `allmystuff-gui`
+desktop app on your PATH (so a bare `allmystuff` opens the app).
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.ps1 | iex
+```
+
+The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
+writable) on Unix and `%LOCALAPPDATA%\Programs\AllMyStuff` on
+Windows, and adds the directory to PATH if it isn't already there.
+The desktop app goes in by default; pass `--no-gui` (Unix) or
+`-NoGui` (Windows) for a CLI-only install on a headless box. The
+app opens into a populated demo graph with no mesh at all; for live
+machines it uses a `myownmesh` daemon found on PATH — one
+[MyOwnMesh install command](https://github.com/mrjeeves/MyOwnMesh#install)
+away. The GUI binary relies on the system webview (libwebkit2gtk /
+WebView2 / WKWebView); for full OS integration (menu entry, icon,
+the mesh daemon bundled in) grab the `.deb` / `.AppImage` / `.dmg` /
+`.msi` bundle from Releases instead.
+
+Prefer a tarball directly? The portable binaries
+(`allmystuff-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
+[Releases](https://github.com/mrjeeves/AllMyStuff/releases) for the
+[same five platforms as MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh#platforms).
 
 ## The graph
 
