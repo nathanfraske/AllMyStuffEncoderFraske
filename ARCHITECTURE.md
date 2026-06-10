@@ -217,30 +217,41 @@ Tauri 2 + Svelte 5, a client of the daemon.
    error), and a playback that's never fed says so once. A display route
    streams the routed screen — the primary for the synthetic `screen`, the
    named monitor for a `screen:<id>` capability — from a persistent capture
-   session (`xcap`'s recorder: PipeWire ScreenCast / DXGI / AVFoundation,
-   retried once with a fresh monitor handle before settling for the paced
-   per-frame grab that is the X11 path and universal fallback), unchanged
-   frames skipped, a bounded queue dropping stale packets under
-   backpressure. The *transport* is negotiated per route: the viewer always
-   offers `h264` (decode is covered everywhere — see below); when the peer's
-   lane is free, frames ride **MyOwnMesh's H.264 video track lane** —
-   openh264 in screen-content mode at a 1920 edge, real RTP, no
-   JSON/base64/64 KiB ceiling — and otherwise fall back to the v1 **MJPEG
-   stream** over `CHANNEL_MEDIA` (1280 edge, chunked JPEGs), so any version
-   skew degrades to working video. Either way the console window renders
-   packets it *pulls* per display tick (raw bytes): WebCodecs decodes H.264
-   where the webview has it, `createImageBitmap` the JPEGs, and otherwise
-   the backend's **native openh264 decoder** hands the window RGBA frames
-   ready to blit — maximum frames and minimum latency don't depend on the
-   webview's codec support.
+   session (in-house DXGI Output Duplication on Windows — xcap's recorder
+   duplicates every output it walks past and leaks the handle, so only the
+   first session per process ever worked — and `xcap`'s recorder elsewhere:
+   PipeWire ScreenCast / AVFoundation, retried once with a fresh monitor
+   handle before settling for the paced per-frame grab that is the X11 path
+   and universal fallback), unchanged frames skipped, a bounded queue
+   dropping stale packets under backpressure. The *transport* is negotiated
+   per route: the viewer always offers `h264` (decode is covered everywhere
+   — see below); when the peer's lane is free — a lane whose holding route
+   already ended is taken over, and the console serializes its tab switches
+   so the teardown precedes the next offer — frames ride **MyOwnMesh's
+   H.264 video track lane**: openh264 in screen-content mode at native
+   resolution up to 4K, bitrate budgeted from the monitor's true pixel
+   count (~0.16 bpp, 8–40 Mbps), real RTP, no JSON/base64/64 KiB ceiling.
+   Otherwise they fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA`
+   (1280 edge, chunked JPEGs), so any version skew degrades to working
+   video. Either way the console window renders packets it *pulls* per
+   display tick (raw bytes): WebCodecs decodes H.264 where the webview has
+   it, `createImageBitmap` the JPEGs, and otherwise the backend's **native
+   openh264 decoder** hands the window RGBA frames ready to blit — maximum
+   frames and minimum latency don't depend on the webview's codec support.
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
-   skip/drop causes) every few seconds on both ends — quiet by default. An input
+   skip/drop causes) every few seconds on both ends — quiet by default;
+   `ALLMYSTUFF_VIDEO_FPS` / `ALLMYSTUFF_VIDEO_MAX_EDGE` /
+   `ALLMYSTUFF_VIDEO_BITRATE` dial the H.264 stream without a rebuild. An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
-   buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
-   but only after the gate: the route must be live *and* the sender must be
-   the device's recorded owner or a co-owned fleet member, so a route that
-   merely auto-accepted can never type into your machine.
+   buttons / wheel / DOM-`key` values — each move naming which remote screen
+   it's normalized over, so control follows the console's selected tab —
+   injected at the sink with `enigo` (plus a hand-raised
+   `MOUSEEVENTF_VIRTUALDESK` move on Windows, where enigo's absolute
+   coordinates can't reach past the primary monitor) — but only after the
+   gate: the route must be live *and* the sender must be the device's
+   recorded owner or a co-owned fleet member, so a route that merely
+   auto-accepted can never type into your machine.
 
 ## Persistent state
 

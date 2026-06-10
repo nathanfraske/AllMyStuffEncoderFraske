@@ -886,7 +886,7 @@ class AppStore {
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
-    this.applyConsoleVideo();
+    void this.applyConsoleVideo();
     this.toast("ok", `Console open on ${node!.label}`);
   }
 
@@ -946,19 +946,31 @@ class AppStore {
   /** Switch which remote source the console is showing. */
   setConsoleInput(capId: string) {
     this.consoleInput = capId;
-    this.applyConsoleVideo();
+    void this.applyConsoleVideo();
   }
 
-  private applyConsoleVideo() {
+  /** Bumped per video (re)wire; an apply that awaited a teardown checks it
+   *  before connecting, so rapid tab clicks can't interleave two wires. */
+  private consoleVideoEpoch = 0;
+
+  private async applyConsoleVideo() {
+    const epoch = ++this.consoleVideoEpoch;
     if (this.consoleVideoRouteId) {
-      this.disconnect(this.consoleVideoRouteId);
+      const old = this.consoleVideoRouteId;
       this.consoleVideoRouteId = null;
+      this.consoleVideoLive = null;
+      // Await the teardown so it's on the wire *before* the next offer:
+      // the sender frees its one H.264 lane per peer when the teardown
+      // arrives, and channel order then guarantees the next screen takes
+      // the lane over instead of racing it and landing on MJPEG.
+      await this.disconnect(old);
     }
     this.consoleVideoLive = null;
+    if (epoch !== this.consoleVideoEpoch) return; // a newer switch took over
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
     if (!inp) return;
     // The remote screen (display) lands on this machine's display sink — a
-    // real route the backend streams MJPEG frames down. A camera (video)
+    // real route the backend streams video frames down. A camera (video)
     // has no local sink yet, so it's view-only until camera transport
     // lands; the console is honest about that.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");

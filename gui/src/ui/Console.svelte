@@ -37,6 +37,13 @@
   const selected = $derived<Capability | null>(
     (selectedId ? app.capability(selectedId) : null) ?? null,
   );
+  // Which remote monitor the stage is showing (`<node>:screen:<id>`),
+  // undefined for the primary `screen` (and for cameras) — rides every
+  // mouse move so the remote lands the cursor on the screen being viewed.
+  const controlScreen = $derived.by(() => {
+    const m = selectedId?.match(/:screen:(\d+)$/);
+    return m ? Number(m[1]) : undefined;
+  });
 
   // ---- live video ---------------------------------------------------
   //
@@ -373,7 +380,7 @@
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
-    app.sendConsoleInput({ kind: "mouse_move", ...p });
+    app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
@@ -382,7 +389,7 @@
     if (!p) return;
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
-    app.sendConsoleInput({ kind: "mouse_move", ...p });
+    app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
   }
 

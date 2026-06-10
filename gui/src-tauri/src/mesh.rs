@@ -1635,15 +1635,37 @@ impl Mesh {
                         );
                     }
                     let mode = if accepts_h264 && daemon_video {
-                        let mut lanes = self.video_lane_out.lock();
-                        if lanes.contains_key(&canon) {
+                        // The lane is busy only while its holder is still
+                        // an *active* route — a torn-down or superseded
+                        // one (the common case: the viewer switched
+                        // console tabs) is taken over, not deferred to.
+                        let holder = self.video_lane_out.lock().get(&canon).cloned();
+                        let holder_active = holder.as_deref().is_some_and(|rid| {
+                            rid != route.id
+                                && self
+                                    .state
+                                    .lock()
+                                    .session
+                                    .as_ref()
+                                    .and_then(|s| s.route(rid))
+                                    .is_some_and(|r| r.is_active())
+                        });
+                        if holder_active {
                             tracing::info!(
                                 "route {} — peer's track lane busy; falling back to MJPEG",
                                 route.id
                             );
                             VideoMode::Mjpeg
                         } else {
-                            lanes.insert(canon.clone(), route.id.clone());
+                            if let Some(h) = holder.filter(|h| h != &route.id) {
+                                tracing::info!(
+                                    "route {} takes the track lane over from ended route {h}",
+                                    route.id
+                                );
+                            }
+                            self.video_lane_out
+                                .lock()
+                                .insert(canon.clone(), route.id.clone());
                             VideoMode::H264
                         }
                     } else {

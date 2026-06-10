@@ -74,23 +74,20 @@ pub enum InputAction {
     MouseMove {
         x: f64,
         y: f64,
+        /// Which of the remote's monitors the coordinates are normalized
+        /// over — the `screen:<id>` capability's id, so control follows
+        /// the screen the console is showing. `None` = the primary (and
+        /// what an older sender's events decode to).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<u32>,
     },
     /// `button`: 0 left, 1 middle, 2 right (the DOM convention).
-    MouseButton {
-        button: u8,
-        down: bool,
-    },
+    MouseButton { button: u8, down: bool },
     /// Scroll in wheel lines (positive = down / right).
-    Wheel {
-        dx: f64,
-        dy: f64,
-    },
+    Wheel { dx: f64, dy: f64 },
     /// `key` is the DOM `KeyboardEvent.key` value — a printable character
     /// ("a", "?") or a named key ("Enter", "ArrowLeft", "Shift").
-    Key {
-        key: String,
-        down: bool,
-    },
+    Key { key: String, down: bool },
 }
 
 /// Everything that can arrive on the media channel, demuxed by the `t`
@@ -339,7 +336,16 @@ mod tests {
     #[test]
     fn input_event_round_trips_each_action() {
         let actions = [
-            InputAction::MouseMove { x: 0.25, y: 0.75 },
+            InputAction::MouseMove {
+                x: 0.25,
+                y: 0.75,
+                screen: None,
+            },
+            InputAction::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                screen: Some(131_073),
+            },
             InputAction::MouseButton {
                 button: 2,
                 down: true,
@@ -448,6 +454,28 @@ mod tests {
         out_of_range.chunks = 4;
         out_of_range.chunk = 4; // index == count
         assert!(asm.push(out_of_range).is_none());
+    }
+
+    #[test]
+    fn a_screenless_mouse_move_still_decodes() {
+        // The exact shape an older sender (no per-screen control) emits.
+        let legacy = serde_json::json!({
+            "t": "input", "route": "r", "seq": 1,
+            "kind": "mouse_move", "x": 0.5, "y": 0.5
+        });
+        let ev: InputEvent = serde_json::from_value(legacy).expect("legacy decodes");
+        assert_eq!(
+            ev.action,
+            InputAction::MouseMove {
+                x: 0.5,
+                y: 0.5,
+                screen: None
+            }
+        );
+        // And the screenless shape serializes without the field, so an
+        // older *receiver* isn't handed a key it never knew.
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.get("screen").is_none());
     }
 
     #[test]

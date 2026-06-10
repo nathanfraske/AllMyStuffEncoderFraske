@@ -25,6 +25,7 @@ mod mesh;
 mod ownership;
 mod video;
 mod video_decode;
+mod win_capture;
 
 use std::sync::Arc;
 

@@ -1,25 +1,32 @@
-//! The display media plane: MJPEG capture of this machine's screen, so an
-//! active display route actually streams pixels — the piKVM transport
-//! (every frame a standalone JPEG; losing one costs one frame and there's
-//! no codec state to desync).
+//! The display media plane: capture of this machine's screens, so an
+//! active display route actually streams pixels — H.264 on the mesh's
+//! track lane, MJPEG as the compatibility floor (the piKVM transport:
+//! every frame a standalone JPEG, no codec state to desync).
 //!
 //! Mirrors [`crate::audio::AudioBridge`]'s shape: each sourcing route runs
-//! a dedicated thread that captures the **primary monitor**, downscales to
-//! a sane streaming size, JPEG-encodes, and hands the frame to a callback
-//! the mesh forwards on the media channel.
+//! a dedicated thread that captures **the monitor its source capability
+//! names** (the synthetic `screen` is the primary, `screen:<id>` one of
+//! the others), fits it to the transport's ceiling, encodes, and hands
+//! the packet to a callback the mesh forwards.
 //!
-//! Capture prefers a **persistent session** (`xcap`'s `VideoRecorder`:
-//! PipeWire ScreenCast on Wayland, DXGI duplication on Windows,
-//! AVFoundation on macOS): the OS negotiates the stream once per route and
-//! pushes frames, often only on damage. The alternative — one
-//! `capture_image()` screenshot per tick — pays the platform's full
-//! one-shot cost every frame (the Wayland portal literally has the
-//! compositor write a PNG to disk per call), which is what made v1's
-//! framerate so dire. The paced one-shot loop remains as the X11 path
+//! Capture prefers a **persistent session**: our own DXGI Output
+//! Duplication on Windows (see [`crate::win_capture`] for why xcap's
+//! recorder can't carry it), `xcap`'s `VideoRecorder` elsewhere (PipeWire
+//! ScreenCast on Wayland, AVFoundation on macOS). The OS negotiates the
+//! stream once per route and pushes frames, often only on damage. The
+//! alternative — one `capture_image()` screenshot per tick — pays the
+//! platform's full one-shot cost every frame (the Wayland portal literally
+//! has the compositor write a PNG to disk per call), which is what made
+//! v1's framerate so dire. The paced one-shot loop remains as the X11 path
 //! (xcap's X11 "recorder" is that same screenshot in an unpaced hot loop)
 //! and as the fallback wherever a session can't start (denied portal,
-//! headless session) — so the stream degrades to v1 behaviour, never to
-//! nothing.
+//! headless session, an output another session holds) — so the stream
+//! degrades to v1 behaviour, never to nothing.
+//!
+//! The H.264 encoder budgets its bitrate from the monitor's true pixel
+//! count and runs native resolution up to 4K by default; the edge, rate,
+//! and bitrate are env-dialable for dial-in sessions (see the knobs by
+//! [`target_fps`]).
 //!
 //! Two costs are skipped outright when they buy nothing: a frame whose
 //! pixels match the previous one isn't re-encoded or re-sent (an idle
@@ -27,9 +34,7 @@
 //! late joiners aren't stranded), and when the link can't keep up the
 //! bounded forwarder drops captures rather than queueing stale ones.
 //!
-//! v1 simplifications still standing, called out honestly: it captures the
-//! *primary* monitor (per-monitor selection is a follow-up — the synthetic
-//! `screen` capability is "the machine's screen"), and on Wayland each
+//! v1 simplification still standing, called out honestly: on Wayland each
 //! route start runs the compositor's share-picker dialog (the portal's
 //! one-time consent; restore tokens are a follow-up).
 
@@ -147,41 +152,85 @@ impl StreamStats {
     }
 }
 
-/// Streaming ceiling on the longest frame edge. 1280 keeps a 1080p/4K
+/// MJPEG ceiling on the longest frame edge. 1280 keeps a 1080p/4K
 /// desktop readable while a frame stays ~60-150 KB at [`JPEG_QUALITY`] —
-/// comfortably inside a LAN data channel at [`TARGET_FPS`].
+/// comfortably inside a LAN data channel at the target rate. (MJPEG is
+/// the compatibility floor; the H.264 path carries the full picture.)
 const MAX_EDGE: u32 = 1280;
 /// Mid-range JPEG quality — piKVM's default neighbourhood; text stays
 /// legible, photos stay cheap.
 const JPEG_QUALITY: u8 = 60;
-/// Capture cadence to aim for — a ceiling, not a promise. Session capture
-/// sustains it; the one-shot fallback runs at whatever rate the platform's
-/// screenshot path allows (the budget math self-limits, as before).
-const TARGET_FPS: u32 = 30;
 /// An unchanged screen still re-sends one frame this often, so a viewer
 /// that lost a frame (or joined a quiet stream) is never stranded on a
 /// stale picture. Every tick in between costs one buffer compare.
 const STATIC_REFRESH: Duration = Duration::from_secs(2);
-
-/// H.264 ceiling on the longest edge — sharper than the MJPEG cap
-/// because inter-frame compression pays for the pixels. 1920 keeps a 4K
-/// desktop at a crisp 2:1 and software encode comfortably real-time;
-/// also inside openh264's 3840×2160 hard limit. Dimensions are forced
-/// even (4:2:0 chroma needs it).
-const H264_MAX_EDGE: u32 = 1920;
-/// Target bitrate for the track lane. 10 Mbps keeps 1920-edge desktop
-/// content crisp through motion in screen-content mode and is trivial on
-/// a LAN (where direct peers live); link-adaptive rate is the follow-up
-/// for relayed/WAN paths.
-const H264_BITRATE_BPS: u32 = 10_000_000;
 /// Forced IDR cadence — bounds how long a viewer that joined mid-stream,
 /// lost an unrepaired packet, or rebuilt its decoder waits for a clean
-/// decode entry. 2 s costs ~0.3-0.6 Mbps at a 1920 edge: cheap insurance
+/// decode entry. 2 s costs a fraction of the stream: cheap insurance
 /// next to a multi-second freeze.
 const H264_IDR_EVERY: Duration = Duration::from_secs(2);
 /// How often each stream logs its pipeline counters — the dial-in line:
 /// effective fps, where the per-frame milliseconds go, and the bitrate.
 const STATS_EVERY: Duration = Duration::from_secs(5);
+
+// The performance dials, each overridable for dial-in sessions without a
+// rebuild (read once per process). Defaults aim at "the screen, full
+// fidelity": H.264 carries up to a native 4K frame at a rate budgeted
+// from its true pixel count.
+
+/// Capture cadence to aim for — a ceiling, not a promise. Session capture
+/// sustains it (damage-driven backends produce less on quiet screens);
+/// the one-shot fallback runs at whatever the platform's screenshot path
+/// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
+pub(crate) fn target_fps() -> u32 {
+    static FPS: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_FPS", 30).clamp(1, 120));
+    *FPS
+}
+
+/// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
+/// downscale on anything up to a UHD monitor (openh264's own hard limit
+/// is 3840×2160). Dimensions are forced even (4:2:0 chroma needs it).
+/// Override: `ALLMYSTUFF_VIDEO_MAX_EDGE`.
+fn h264_max_edge() -> u32 {
+    static EDGE: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_MAX_EDGE", 3840).clamp(320, 3840));
+    *EDGE
+}
+
+/// Target bitrate for one stream's encode, budgeted from what it actually
+/// carries: ~0.16 bits per pixel per frame — the density 1080p30 was
+/// tuned crisp at (10 Mbps) — clamped to 8–40 Mbps. A 4K30 desktop lands
+/// at the 40 Mbps cap: trivial on a LAN, where direct peers live;
+/// link-adaptive rate remains the follow-up for relayed/WAN paths.
+/// Override (a fixed bps for every stream): `ALLMYSTUFF_VIDEO_BITRATE`.
+fn h264_bitrate_for(w: u32, h: u32, fps: u32) -> u32 {
+    static OVERRIDE: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_BITRATE", 0));
+    if *OVERRIDE > 0 {
+        return *OVERRIDE;
+    }
+    let px = u64::from(w) * u64::from(h);
+    let bps = px * u64::from(fps) * 16 / 100;
+    bps.clamp(8_000_000, 40_000_000) as u32
+}
+
+/// A `u32` env dial; `default` when unset or unparseable.
+fn env_u32(key: &str, default: u32) -> u32 {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse() {
+            Ok(n) => {
+                tracing::info!("{key}={n} (override)");
+                n
+            }
+            Err(_) => {
+                tracing::warn!("{key}={v} isn't a number — using {default}");
+                default
+            }
+        },
+        _ => default,
+    }
+}
 
 /// Whether the periodic pipeline stats print at info. Off by default —
 /// steady-state runs stay quiet; set `ALLMYSTUFF_VIDEO_STATS=1` while
@@ -266,25 +315,74 @@ fn run_capture<F>(
 where
     F: Fn(VideoPacket) -> bool + Send + 'static,
 {
+    // The monitor up front: its resolution budgets the encoder's bitrate.
+    let monitor = select_monitor(monitor_id)?;
+    let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
     // An encoder that can't init (openh264 build/runtime trouble) must
     // cost quality, not the stream: fall back to MJPEG and say so.
-    let (mut encoder, mode) = match StreamEncoder::new(route_id, mode) {
+    let (mut encoder, mode) = match StreamEncoder::new(route_id, mode, source_hint) {
         Ok(enc) => (enc, mode),
         Err(e) => {
             tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
             (
-                StreamEncoder::new(route_id, VideoMode::Mjpeg)?,
+                StreamEncoder::new(route_id, VideoMode::Mjpeg, source_hint)?,
                 VideoMode::Mjpeg,
             )
         }
     };
     let mut stats = StreamStats::new(route_id, mode);
+
+    // Windows: our own DXGI Output Duplication session — damage-driven,
+    // per-monitor, releasable (see `win_capture` for why xcap's recorder
+    // can't carry this). A failed start (output held elsewhere, RDP
+    // session) falls through to the screenshot loop.
+    #[cfg(windows)]
+    {
+        match monitor.id() {
+            Ok(mid) => match crate::win_capture::start(mid) {
+                Ok((session, frames)) => {
+                    tracing::info!("DXGI duplication started for {route_id} (monitor {mid:#x})");
+                    let result = pump_frames(
+                        stop,
+                        &frames,
+                        |f: crate::win_capture::RawFrame| (f.rgba, f.width, f.height),
+                        &on_packet,
+                        &mut encoder,
+                        &mut stats,
+                    );
+                    drop(session);
+                    match result {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            if stop.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            tracing::warn!(
+                                "DXGI duplication for {route_id} ended ({e}); \
+                                 falling back to per-frame screenshots"
+                            );
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "DXGI duplication for {route_id} unavailable ({e}); \
+                     falling back to per-frame screenshots"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                "monitor id unreadable for {route_id} ({e}); \
+                 falling back to per-frame screenshots"
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
     if prefer_session_capture() {
         // Two attempts, each with a freshly enumerated monitor: a route
-        // that restarts can hand DXGI/the portal a stale display handle
-        // ("The parameter is incorrect"), and re-enumerating is exactly
-        // what heals that. Only then do we settle for per-frame
-        // screenshots — the dire-framerate path of last resort.
+        // that restarts can hand the portal a stale display handle, and
+        // re-enumerating is exactly what heals that. Only then do we
+        // settle for per-frame screenshots — the dire-framerate path of
+        // last resort.
         for attempt in 0..2 {
             let monitor = select_monitor(monitor_id)?;
             match run_session_capture(
@@ -330,8 +428,10 @@ where
 /// Whether to try a persistent capture session first. On Linux only
 /// Wayland has a real one (PipeWire ScreenCast); under X11 xcap's recorder
 /// is the same per-frame screenshot in an unpaced hot loop, so our paced
-/// one-shot loop is strictly better there. Everywhere else the session
-/// backend (DXGI duplication / AVFoundation) is the right default.
+/// one-shot loop is strictly better there. macOS's session backend
+/// (AVFoundation) is the right default. (Windows runs its own DXGI path
+/// and never asks.)
+#[cfg(not(windows))]
 fn prefer_session_capture() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -352,11 +452,64 @@ fn wayland_session() -> bool {
     session.eq_ignore_ascii_case("wayland") || display.to_lowercase().contains("wayland")
 }
 
-/// Stream from a persistent OS capture session. Set-up (portal consent,
-/// duplication handles) happens once; frames arrive on `frames` as the OS
-/// produces them — damage-driven backends send nothing while the screen is
-/// still. Each tick encodes the *freshest* pending frame; a backlog is
-/// skipped, never transcoded late.
+/// Drain a session's frame channel into the encoder, paced to the target
+/// rate: each tick encodes the *freshest* pending frame; a backlog is
+/// skipped, never transcoded late. Generic over the session's frame type
+/// (`raw` extracts RGBA + dimensions) so the platform backends — our DXGI
+/// duplication, xcap's recorders — share one pump.
+fn pump_frames<T, X, F>(
+    stop: &AtomicBool,
+    frames: &mpsc::Receiver<T>,
+    raw: X,
+    on_packet: &F,
+    encoder: &mut StreamEncoder,
+    stats: &mut StreamStats,
+) -> Result<(), String>
+where
+    X: Fn(T) -> (Vec<u8>, u32, u32),
+    F: Fn(VideoPacket) -> bool + Send + 'static,
+{
+    let budget = Duration::from_secs(1) / target_fps();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // A bounded wait keeps the stop flag responsive on idle screens.
+        let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
+            Ok(f) => f,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("capture session ended".to_string());
+            }
+        };
+        let started = Instant::now();
+        while let Ok(newer) = frames.try_recv() {
+            frame = newer;
+        }
+        let (rgba, w, h) = raw(frame);
+        match encoder.encode(rgba, w, h, stats) {
+            Ok(Some(out)) => {
+                if on_packet(out) {
+                    stats.sent += 1;
+                } else {
+                    stats.dropped += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        stats.maybe_log();
+        if let Some(rest) = budget.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+}
+
+/// Stream from a persistent OS capture session (PipeWire ScreenCast on
+/// Wayland, AVFoundation on macOS). Set-up (portal consent) happens once;
+/// frames arrive as the OS produces them — damage-driven backends send
+/// nothing while the screen is still.
+#[cfg(not(windows))]
 fn run_session_capture<F>(
     stop: &AtomicBool,
     route_id: &str,
@@ -371,39 +524,14 @@ where
     let (recorder, frames) = monitor.video_recorder().map_err(|e| e.to_string())?;
     recorder.start().map_err(|e| e.to_string())?;
     tracing::info!("screen capture session started for {route_id}");
-    let budget = Duration::from_secs(1) / TARGET_FPS;
-    let result = loop {
-        if stop.load(Ordering::SeqCst) {
-            break Ok(());
-        }
-        // A bounded wait keeps the stop flag responsive on idle screens.
-        let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
-            Ok(f) => f,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err("capture session ended".to_string());
-            }
-        };
-        let started = Instant::now();
-        while let Ok(newer) = frames.try_recv() {
-            frame = newer;
-        }
-        match encoder.encode(frame.raw, frame.width, frame.height, stats) {
-            Ok(Some(out)) => {
-                if on_packet(out) {
-                    stats.sent += 1;
-                } else {
-                    stats.dropped += 1;
-                }
-            }
-            Ok(None) => {}
-            Err(e) => break Err(e),
-        }
-        stats.maybe_log();
-        if let Some(rest) = budget.checked_sub(started.elapsed()) {
-            std::thread::sleep(rest);
-        }
-    };
+    let result = pump_frames(
+        stop,
+        &frames,
+        |f| (f.raw, f.width, f.height),
+        on_packet,
+        encoder,
+        stats,
+    );
     let _ = recorder.stop();
     result
 }
@@ -423,7 +551,7 @@ fn run_oneshot_capture<F>(
 where
     F: Fn(VideoPacket) -> bool + Send + 'static,
 {
-    let budget = Duration::from_secs(1) / TARGET_FPS;
+    let budget = Duration::from_secs(1) / target_fps();
     let mut failures = 0u64;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
@@ -597,10 +725,12 @@ enum StreamEncoder {
 }
 
 impl StreamEncoder {
-    fn new(route_id: &str, mode: VideoMode) -> Result<Self, String> {
+    /// `source_hint` is the capture source's expected resolution (the
+    /// monitor's), which budgets the H.264 bitrate; `(0, 0)` = unknown.
+    fn new(route_id: &str, mode: VideoMode, source_hint: (u32, u32)) -> Result<Self, String> {
         match mode {
             VideoMode::Mjpeg => Ok(StreamEncoder::Mjpeg(FrameEncoder::new(route_id))),
-            VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new()?))),
+            VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new(source_hint)?))),
         }
     }
 
@@ -621,11 +751,12 @@ impl StreamEncoder {
 }
 
 /// The H.264 encode stage of one route's stream — openh264 in
-/// screen-content mode, scaled to [`H264_MAX_EDGE`] (even dimensions for
-/// 4:2:0), with the same unchanged-frame gate as MJPEG and a forced IDR
-/// every [`H264_IDR_EVERY`] so a viewer always has a decode entry point
-/// within seconds. A resolution change (monitor swap) re-initializes the
-/// encoder inside openh264; the next unit out is an IDR.
+/// screen-content mode, scaled to the [`h264_max_edge`] ceiling (even
+/// dimensions for 4:2:0, native up to 4K by default), with the same
+/// unchanged-frame gate as MJPEG and a forced IDR every [`H264_IDR_EVERY`]
+/// so a viewer always has a decode entry point within seconds. A
+/// resolution change (monitor swap) re-initializes the encoder inside
+/// openh264; the next unit out is an IDR.
 struct H264Stream {
     encoder: openh264::encoder::Encoder,
     prev: Vec<u8>,
@@ -635,15 +766,29 @@ struct H264Stream {
 }
 
 impl H264Stream {
-    fn new() -> Result<Self, String> {
+    fn new(source_hint: (u32, u32)) -> Result<Self, String> {
         use openh264::encoder::{
             BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
         };
+        let fps = target_fps();
+        // Budget the bitrate from what the stream will actually carry —
+        // the source resolution fitted to the edge ceiling. An unknown
+        // source budgets as 1080p (the old fixed default's density).
+        let (bw, bh) = if source_hint.0 == 0 || source_hint.1 == 0 {
+            (1920, 1080)
+        } else {
+            fit_within_even(source_hint.0, source_hint.1, h264_max_edge())
+        };
+        let bitrate = h264_bitrate_for(bw, bh, fps);
+        tracing::info!(
+            "H.264 encoder ready: {bw}×{bh} target · {:.1} Mbps @ {fps} fps",
+            bitrate as f64 / 1e6
+        );
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
-            .bitrate(BitRate::from_bps(H264_BITRATE_BPS))
-            .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32));
+            .bitrate(BitRate::from_bps(bitrate))
+            .max_frame_rate(FrameRate::from_hz(fps as f32));
         let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
             .map_err(|e| format!("openh264 init: {e}"))?;
         Ok(H264Stream {
@@ -665,7 +810,7 @@ impl H264Stream {
         if sw == 0 || sh == 0 {
             return Ok(None);
         }
-        let (dw, dh) = fit_within_even(sw, sh, H264_MAX_EDGE);
+        let (dw, dh) = fit_within_even(sw, sh, h264_max_edge());
         // Scale and strip alpha in one pass: the encoder's fast RGB→YUV
         // path wants tightly packed 3-byte pixels, and the unchanged-
         // frame compare gets 25% cheaper for free.
@@ -714,7 +859,7 @@ impl H264Stream {
         stats.bytes += data.len() as u64;
         Ok(Some(VideoPacket::H264 {
             data,
-            duration_us: 1_000_000u64 / TARGET_FPS as u64,
+            duration_us: 1_000_000u64 / u64::from(target_fps()),
         }))
     }
 }
@@ -827,7 +972,7 @@ mod tests {
     #[test]
     fn h264_stream_emits_annexb_with_a_leading_idr() {
         let mut stats = StreamStats::new("r", VideoMode::H264);
-        let mut enc = H264Stream::new().expect("openh264 init");
+        let mut enc = H264Stream::new((64, 64)).expect("openh264 init");
         // A 64×64 solid frame → first unit out must be a key (IDR + SPS/PPS
         // in-band), Annex-B framed.
         let rgba = vec![128u8; 64 * 64 * 4];
