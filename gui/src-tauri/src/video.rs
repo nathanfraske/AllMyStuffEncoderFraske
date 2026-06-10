@@ -98,17 +98,27 @@ where
     let monitor = primary_monitor()?;
     let budget = Duration::from_secs(1) / TARGET_FPS;
     let mut seq = 0u64;
+    let mut failures = 0u64;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
         match capture_frame(&monitor, route_id, seq) {
             Ok(frame) => {
                 seq += 1;
+                failures = 0;
                 let _ = on_frame(frame);
             }
             Err(e) => {
                 // A transient grab failure (screen lock, monitor sleep)
-                // shouldn't end the stream; log and try again next tick.
-                tracing::debug!("screen grab failed for {route_id}: {e}");
+                // shouldn't end the stream — but a *persistent* one (a
+                // denied screen-recording permission, a Wayland portal
+                // that never granted) must be loud, not a debug whisper:
+                // it reads as "connected but no pixels" at the far end.
+                failures += 1;
+                if failures == 1 || failures % 100 == 0 {
+                    tracing::warn!("screen grab failing for {route_id} ({failures}x): {e}");
+                } else {
+                    tracing::debug!("screen grab failed for {route_id}: {e}");
+                }
             }
         }
         if let Some(rest) = budget.checked_sub(started.elapsed()) {

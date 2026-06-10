@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::AudioFrame;
 
-/// One JPEG-encoded frame of a display route's stream.
+/// One JPEG-encoded frame of a display route's stream — or one *chunk* of
+/// it: the mesh's data channel caps a message at ~64 KiB (the WebRTC SCTP
+/// transport's maximum message size), and a desktop frame routinely beats
+/// that, so a large frame travels as several messages sharing a `seq`,
+/// reassembled by [`VideoAssembler`] at the sink. Losing any chunk just
+/// loses that frame — the next one stands alone, MJPEG's whole virtue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoFrame {
     /// Tag for demuxing off the shared media channel. Always `"video"`.
@@ -33,9 +38,20 @@ pub struct VideoFrame {
     /// coordinates map back onto.
     pub source_width: u32,
     pub source_height: u32,
-    /// The JPEG bytes, base64 on the wire (the daemon channel is JSON).
+    /// This piece's index within `chunks`. Defaults (0 of 1) mean "the
+    /// whole frame in one message" — the common case for small frames.
+    #[serde(default)]
+    pub chunk: u16,
+    #[serde(default = "one_chunk")]
+    pub chunks: u16,
+    /// The JPEG bytes (of this chunk), base64 on the wire (the daemon
+    /// channel is JSON).
     #[serde(with = "bytes_b64")]
     pub jpeg: Vec<u8>,
+}
+
+fn one_chunk() -> u16 {
+    1
 }
 
 /// One keyboard / mouse event of an input route's stream.
@@ -150,7 +166,131 @@ impl VideoFrame {
             height,
             source_width,
             source_height,
+            chunk: 0,
+            chunks: 1,
             jpeg,
+        }
+    }
+
+    /// Split this frame into channel-sized pieces: each piece's JPEG slice
+    /// is at most `max_jpeg_bytes`, so the full JSON message (base64 +
+    /// envelope) stays under the transport's message ceiling. A frame that
+    /// already fits comes back whole.
+    pub fn into_chunks(self, max_jpeg_bytes: usize) -> Vec<VideoFrame> {
+        let max = max_jpeg_bytes.max(1);
+        if self.jpeg.len() <= max {
+            return vec![self];
+        }
+        let pieces: Vec<&[u8]> = self.jpeg.chunks(max).collect();
+        let total = pieces.len() as u16;
+        pieces
+            .into_iter()
+            .enumerate()
+            .map(|(i, piece)| VideoFrame {
+                t: MediaTagVideo::Video,
+                route: self.route.clone(),
+                seq: self.seq,
+                width: self.width,
+                height: self.height,
+                source_width: self.source_width,
+                source_height: self.source_height,
+                chunk: i as u16,
+                chunks: total,
+                jpeg: piece.to_vec(),
+            })
+            .collect()
+    }
+}
+
+/// Reassembles chunked [`VideoFrame`]s per route. Frames are independent:
+/// a newer `seq` discards any half-built older frame (that frame is simply
+/// lost, never shown torn), and hostile shapes (absurd chunk counts,
+/// out-of-range indices, ballooning totals) are dropped wholesale.
+#[derive(Debug, Default)]
+pub struct VideoAssembler {
+    partial: std::collections::HashMap<String, PartialFrame>,
+}
+
+#[derive(Debug)]
+struct PartialFrame {
+    seq: u64,
+    parts: Vec<Option<Vec<u8>>>,
+    received: u16,
+}
+
+/// Upper bounds a frame may occupy mid-assembly — far above anything the
+/// sender produces, low enough that a misbehaving peer can't balloon us.
+const MAX_CHUNKS: u16 = 64;
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+impl VideoAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one inbound frame (or chunk). Returns the complete frame once
+    /// every piece has arrived — immediately, for unchunked frames.
+    pub fn push(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
+        if frame.chunks <= 1 {
+            self.partial.remove(&frame.route);
+            return Some(frame);
+        }
+        if frame.chunks > MAX_CHUNKS || frame.chunk >= frame.chunks {
+            return None;
+        }
+        let entry = self.partial.entry(frame.route.clone());
+        let p = match entry {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                if o.get().seq < frame.seq || o.get().parts.len() != frame.chunks as usize {
+                    *o.get_mut() = PartialFrame::new(frame.seq, frame.chunks);
+                } else if o.get().seq > frame.seq {
+                    return None; // a stale chunk of an abandoned frame
+                }
+                o.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(PartialFrame::new(frame.seq, frame.chunks))
+            }
+        };
+        let slot = &mut p.parts[frame.chunk as usize];
+        if slot.is_none() {
+            p.received += 1;
+        }
+        *slot = Some(frame.jpeg);
+        let assembled_len: usize = p.parts.iter().flatten().map(Vec::len).sum();
+        if assembled_len > MAX_FRAME_BYTES {
+            self.partial.remove(&frame.route);
+            return None;
+        }
+        if p.received < frame.chunks {
+            return None;
+        }
+        let p = self.partial.remove(&frame.route)?;
+        let mut jpeg = Vec::with_capacity(assembled_len);
+        for part in p.parts.into_iter().flatten() {
+            jpeg.extend_from_slice(&part);
+        }
+        Some(VideoFrame {
+            t: MediaTagVideo::Video,
+            route: frame.route,
+            seq: frame.seq,
+            width: frame.width,
+            height: frame.height,
+            source_width: frame.source_width,
+            source_height: frame.source_height,
+            chunk: 0,
+            chunks: 1,
+            jpeg,
+        })
+    }
+}
+
+impl PartialFrame {
+    fn new(seq: u64, chunks: u16) -> Self {
+        PartialFrame {
+            seq,
+            parts: vec![None; chunks as usize],
+            received: 0,
         }
     }
 }
@@ -252,6 +392,62 @@ mod tests {
             MediaPayload::decode(serde_json::json!({ "t": "hologram", "route": "r" })),
             None
         );
+    }
+
+    #[test]
+    fn chunking_splits_big_frames_and_reassembles_them_byte_exact() {
+        let jpeg: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let frame = VideoFrame::new("r", 7, 1280, 720, 1920, 1080, jpeg.clone());
+        let chunks = frame.into_chunks(40_000);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
+            .iter()
+            .all(|c| c.jpeg.len() <= 40_000 && c.chunks == 3));
+
+        let mut asm = VideoAssembler::new();
+        // Out-of-order arrival still assembles.
+        assert!(asm.push(chunks[2].clone()).is_none());
+        assert!(asm.push(chunks[0].clone()).is_none());
+        let full = asm.push(chunks[1].clone()).expect("complete");
+        assert_eq!(full.jpeg, jpeg);
+        assert_eq!((full.seq, full.chunk, full.chunks), (7, 0, 1));
+
+        // A small frame passes through untouched and unsplit.
+        let small = VideoFrame::new("r", 8, 8, 8, 8, 8, vec![1, 2, 3]);
+        assert_eq!(small.clone().into_chunks(40_000).len(), 1);
+        assert_eq!(asm.push(small).unwrap().jpeg, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_newer_frame_discards_a_half_built_older_one() {
+        let old = VideoFrame::new("r", 1, 8, 8, 8, 8, vec![0u8; 100]).into_chunks(40);
+        let new = VideoFrame::new("r", 2, 8, 8, 8, 8, vec![1u8; 100]).into_chunks(40);
+        let mut asm = VideoAssembler::new();
+        assert!(asm.push(old[0].clone()).is_none());
+        // The newer frame arrives; the old partial is abandoned.
+        for c in &new[..new.len() - 1] {
+            assert!(asm.push(c.clone()).is_none());
+        }
+        // A stale chunk of the abandoned frame can't corrupt the new one.
+        assert!(asm.push(old[1].clone()).is_none());
+        let full = asm
+            .push(new[new.len() - 1].clone())
+            .expect("new frame completes");
+        assert!(full.jpeg.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn hostile_chunk_shapes_are_dropped() {
+        let mut asm = VideoAssembler::new();
+        let mut absurd = VideoFrame::new("r", 1, 8, 8, 8, 8, vec![0]);
+        absurd.chunks = 60_000;
+        absurd.chunk = 5;
+        assert!(asm.push(absurd).is_none());
+
+        let mut out_of_range = VideoFrame::new("r", 1, 8, 8, 8, 8, vec![0]);
+        out_of_range.chunks = 4;
+        out_of_range.chunk = 4; // index == count
+        assert!(asm.push(out_of_range).is_none());
     }
 
     #[test]

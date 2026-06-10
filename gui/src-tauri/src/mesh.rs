@@ -28,7 +28,7 @@ use allmystuff_protocol::{
     CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
-    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, VideoFrame,
+    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, VideoAssembler, VideoFrame,
 };
 
 use crate::audio::AudioBridge;
@@ -63,7 +63,18 @@ pub struct Mesh {
     /// This app run's random presence boot id — how peers detect that we
     /// (re)started and answer with their state (see `NodeProfile::boot`).
     boot_id: u64,
+    /// Reassembles chunked inbound video frames (a frame bigger than the
+    /// data channel's ~64 KiB message ceiling arrives in pieces).
+    video_in: Mutex<VideoAssembler>,
 }
+
+/// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
+/// envelope, a chunk message stays comfortably under the data channel's
+/// ~64 KiB ceiling (the WebRTC SCTP max message size).
+const MAX_JPEG_CHUNK_BYTES: usize = 40 * 1024;
+
+/// Media-plane send failures repeat at frame rate; warn at most this often.
+const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct State {
     session: Option<Session>,
@@ -113,29 +124,49 @@ impl Mesh {
             video_out,
             input_seq: AtomicU64::new(0),
             boot_id: fresh_boot_id(),
+            video_in: Mutex::new(VideoAssembler::new()),
         });
 
         // Forwarders: drain captured frames out to peers on the media
-        // channel — audio unbounded (tiny, ordered), video bounded.
+        // channel — audio unbounded (tiny, ordered), video bounded. Send
+        // failures are *surfaced* (rate-limited): a silently-dying media
+        // plane is exactly the "connected but nothing arrives" mystery.
         {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
+                let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, frame)) = audio_rx.recv().await {
                     let Ok(payload) = serde_json::to_value(&frame) else {
                         continue;
                     };
-                    mesh.send_media_value(&peer, payload).await;
+                    if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                        if last_warn.elapsed() >= WARN_EVERY {
+                            last_warn = std::time::Instant::now();
+                            tracing::warn!("audio frame to {} failed: {e}", short_id(&peer));
+                        }
+                    }
                 }
             });
         }
         {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
+                let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, frame)) = video_rx.recv().await {
-                    let Ok(payload) = serde_json::to_value(&frame) else {
-                        continue;
-                    };
-                    mesh.send_media_value(&peer, payload).await;
+                    // A frame above the data channel's message ceiling
+                    // travels as several chunks sharing its seq.
+                    for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
+                        let Ok(payload) = serde_json::to_value(&chunk) else {
+                            continue;
+                        };
+                        if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                            if last_warn.elapsed() >= WARN_EVERY {
+                                last_warn = std::time::Instant::now();
+                                tracing::warn!("video frame to {} failed: {e}", short_id(&peer));
+                            }
+                            break; // rest of this frame is pointless
+                        }
+                    }
                 }
             });
         }
@@ -143,12 +174,14 @@ impl Mesh {
     }
 
     /// Send one media-channel payload to `peer` (canonicalised to the bare
-    /// pubkey the daemon's peer set is keyed by).
-    async fn send_media_value(&self, peer: &str, payload: Value) {
+    /// pubkey the daemon's peer set is keyed by), reporting the daemon's
+    /// verdict — a transport refusal (peer gone, message too large) must
+    /// reach a log, not vanish.
+    async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
-            return;
+            return Err("no shared network".into());
         };
-        let _ = self
+        let resp = self
             .client
             .request(&Request::ChannelSendTo {
                 network,
@@ -156,7 +189,13 @@ impl Mesh {
                 peer: pubkey_part(peer).to_string(),
                 payload,
             })
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp.error.unwrap_or_else(|| "channel send failed".into()))
+        }
     }
 
     fn network(&self) -> Option<String> {
@@ -499,15 +538,29 @@ impl Mesh {
                     MediaPayload::Video(frame) => {
                         // Surface frames only for a route this session knows
                         // is live, sinks here, and belongs to the sender —
-                        // the console window(s) render them.
-                        if self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
-                            let _ = self.app.emit("allmystuff://video", &frame);
-                        } else {
+                        // the console window(s) render them. Chunked frames
+                        // reassemble first; the first complete frame of a
+                        // stream is logged so "connected but no pixels" is
+                        // attributable from this side too.
+                        if !self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
                             tracing::debug!(
                                 "dropped video frame for {} from {} (route not live here)",
                                 frame.route,
                                 short_id(&from)
                             );
+                            return;
+                        }
+                        let full = { self.video_in.lock().push(frame) };
+                        if let Some(full) = full {
+                            if full.seq == 0 {
+                                tracing::info!(
+                                    "first screen frame for {} ({}×{})",
+                                    full.route,
+                                    full.width,
+                                    full.height
+                                );
+                            }
+                            let _ = self.app.emit("allmystuff://video", &full);
                         }
                     }
                     MediaPayload::Input(ev) => {
@@ -1161,6 +1214,11 @@ impl Mesh {
             MediaKind::Audio => {
                 // We source: capture the default mic and stream to the sink.
                 if from_node == me {
+                    tracing::info!(
+                        "route {} active — streaming audio to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
                     let peer = to_node.clone();
                     let rid = route.id.clone();
                     let tx = self.audio_out.clone();
@@ -1174,6 +1232,11 @@ impl Mesh {
                 }
                 // We sink: play inbound frames for this route.
                 if to_node == me {
+                    tracing::info!(
+                        "route {} active — playing audio from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
                     self.audio.start_playback(route.id.clone());
                 }
             }
@@ -1205,7 +1268,22 @@ impl Mesh {
             MediaKind::Input => {
                 // The sink injects lazily per inbound event (behind the
                 // ownership gate); the source is driven by the console
-                // window via `send_input`. Nothing to start eagerly.
+                // window via `send_input`. Nothing to start eagerly — but
+                // say the link is live, so "awaiting accept" is never the
+                // last word on a working control route.
+                if from_node == me {
+                    tracing::info!(
+                        "route {} active — keyboard/mouse control to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me {
+                    tracing::info!(
+                        "route {} active — accepting control from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
             }
             other => {
                 tracing::info!(
