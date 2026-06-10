@@ -93,7 +93,7 @@
   function newTab() {
     const id = nextTabId++;
     const routeId = app.terminalConnect(host);
-    console.info(`[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}`);
+    console.debug(`[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}`);
     tabs.push({
       id,
       routeId,
@@ -278,7 +278,7 @@
     if (rt.started || !meta.routeId) return;
     rt.started = true;
     const routeId = meta.routeId;
-    console.info(`[terminal] wiring output for ${routeId}`);
+    console.debug(`[terminal] wiring output for ${routeId}`);
     void watchTerminal(routeId, (bytes) => rt.term.write(bytes)).then((stop) => {
       // The tab may have died while the watch was being wired.
       if (runtimes.get(meta.id) !== rt) {
@@ -314,7 +314,7 @@
       const rt = runtimes.get(t.id);
       if (st?.state === "active") {
         if (t.status === "connecting") {
-          console.info(`[terminal] route live: ${t.routeId}`);
+          console.debug(`[terminal] route live: ${t.routeId}`);
           t.status = "live";
         }
         if (t.status === "live" && rt && !rt.started) startSession(t, rt);
@@ -330,7 +330,7 @@
         // ended it) or before it ever delivered one (the host's shell
         // failed to spawn). An exit report usually lands first and is the
         // better story; this is the fallback either way.
-        console.info(`[terminal] route torn down: ${t.routeId} (was ${t.status})`);
+        console.debug(`[terminal] route torn down: ${t.routeId} (was ${t.status})`);
         const early = t.status === "connecting";
         t.status = "ended";
         if (!t.note)

@@ -32,7 +32,7 @@ use allmystuff_session::{
     TermEvent, TermFrame, VideoAssembler, VideoFrame,
 };
 
-use crate::audio::AudioBridge;
+use crate::audio::{AudioBridge, CaptureSource};
 use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
@@ -809,23 +809,33 @@ impl Mesh {
                         return;
                     };
                     let structural = self.ownership.merge_fleet(&me, &roster);
-                    let outcome = if structural {
-                        "merged"
-                    } else if self.ownership.fleet().is_some_and(|f| f.key == roster.key) {
-                        "in sync"
-                    } else {
-                        "ignored (not our fleet)"
-                    };
-                    tracing::info!(
-                        "owned roster from {}: key …{} v{} ({} members) → {outcome}",
-                        short_id(&from),
-                        key_tail(&roster.key),
-                        roster.version,
-                        roster.members.len(),
-                    );
+                    // Gossip echoes after every presence answer and
+                    // re-broadcast; only a roster that *changed* something
+                    // is worth a line at the default level.
                     if structural {
+                        tracing::info!(
+                            "owned roster from {}: key …{} v{} ({} members) → merged",
+                            short_id(&from),
+                            key_tail(&roster.key),
+                            roster.version,
+                            roster.members.len(),
+                        );
                         self.broadcast_owned().await;
                         self.emit_owned();
+                    } else {
+                        let outcome = if self.ownership.fleet().is_some_and(|f| f.key == roster.key)
+                        {
+                            "in sync"
+                        } else {
+                            "ignored (not our fleet)"
+                        };
+                        tracing::debug!(
+                            "owned roster from {}: key …{} v{} ({} members) → {outcome}",
+                            short_id(&from),
+                            key_tail(&roster.key),
+                            roster.version,
+                            roster.members.len(),
+                        );
                     }
                 }
             }
@@ -1060,7 +1070,9 @@ impl Mesh {
             }
             return Err(e);
         }
-        tracing::info!(
+        // The accept lands moments later as the route's "active" line; an
+        // offer that goes nowhere has its own warns above and below.
+        tracing::debug!(
             "route {} offered to {} — awaiting accept",
             route.id,
             short_id(&peer)
@@ -1711,11 +1723,19 @@ impl Mesh {
 
         match route.media {
             MediaKind::Audio => {
-                // We source: capture the default mic and stream to the sink.
+                // We source: capture what the routed capability names — the
+                // machine's own playback for the synthetic `system-audio`,
+                // the default mic for a scanned input device — and stream
+                // it to the sink.
                 if from_node == me {
+                    let source = audio_capture_source(route);
                     tracing::info!(
-                        "route {} active — streaming audio to {}",
+                        "route {} active — streaming {} to {}",
                         route.id,
+                        match source {
+                            CaptureSource::System => "system audio",
+                            CaptureSource::Mic => "mic audio",
+                        },
                         short_id(&to_node)
                     );
                     let peer = to_node.clone();
@@ -1723,7 +1743,7 @@ impl Mesh {
                     let tx = self.audio_out.clone();
                     let seq = Arc::new(AtomicU64::new(0));
                     self.audio
-                        .start_capture(route.id.clone(), move |pcm, rate| {
+                        .start_capture(route.id.clone(), source, move |pcm, rate| {
                             let s = seq.fetch_add(1, Ordering::Relaxed);
                             let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
                             let _ = tx.send((peer.clone(), frame));
@@ -1787,8 +1807,10 @@ impl Mesh {
                             );
                             VideoMode::Mjpeg
                         } else {
+                            // Routine on every console tab switch — lane
+                            // bookkeeping, not an event.
                             if let Some(h) = holder.filter(|h| h != &route.id) {
-                                tracing::info!(
+                                tracing::debug!(
                                     "route {} takes the track lane over from ended route {h}",
                                     route.id
                                 );
@@ -1849,7 +1871,10 @@ impl Mesh {
                             .lock()
                             .insert(pubkey_part(&from_node).to_string(), route.id.clone());
                     }
-                    tracing::info!(
+                    // The "first screen frame" line is the signal worth a
+                    // default-level entry on this side; this one only
+                    // matters when that line never follows.
+                    tracing::debug!(
                         "route {} active — expecting screen frames from {}",
                         route.id,
                         short_id(&from_node)
@@ -2521,7 +2546,9 @@ impl Mesh {
         fps: Option<u32>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
-        tracing::info!(
+        // The streaming side logs the retune it actually applies — one
+        // line per pill change across the pair is plenty.
+        tracing::debug!(
             "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?}",
             short_id(&peer)
         );
@@ -2690,6 +2717,18 @@ fn is_terminal_route(route: &Route) -> bool {
 /// contract scheme the terminal uses.
 fn is_files_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":files")
+}
+
+/// What an audio route this machine sources should capture: the synthetic
+/// `system-audio` capability advertises "what this machine plays", so it
+/// captures the machine's own output (loopback); every other audio source
+/// is a scanned input device — the default mic in v1. Pure, so the rule
+/// that decides between "your room" and "your sound" is unit-testable.
+fn audio_capture_source(route: &Route) -> CaptureSource {
+    match route.from.as_str().split_once(':') {
+        Some((_, "system-audio")) => CaptureSource::System,
+        _ => CaptureSource::Mic,
+    }
 }
 
 /// Why an inbound terminal/files offer must be refused, if it must: it
@@ -2888,5 +2927,20 @@ mod tests {
         std::fs::write(dir.join("noext"), b"x").unwrap();
         assert_eq!(unique_path(&dir, "noext"), dir.join("noext (2)"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn system_audio_routes_capture_the_machines_own_output() {
+        // The synthetic `system-audio` capability = "what this machine
+        // plays" — its routes loop the output back…
+        let system = term_route("me:system-audio", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&system), CaptureSource::System);
+
+        // …while a scanned input device (and anything unrecognized,
+        // including a bare node id) captures the mic, exactly as before.
+        let mic = term_route("me:mic:array-1", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&mic), CaptureSource::Mic);
+        let bare = term_route("me", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&bare), CaptureSource::Mic);
     }
 }

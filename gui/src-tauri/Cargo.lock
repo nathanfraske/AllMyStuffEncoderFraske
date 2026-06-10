@@ -55,6 +55,7 @@ dependencies = [
  "interprocess",
  "jpeg-encoder",
  "libc",
+ "libloading 0.8.9",
  "openh264",
  "parking_lot",
  "portable-pty",

@@ -1121,7 +1121,12 @@ class AppStore {
     void this.applyConsoleVideo();
   }
 
-  /** Audio passthrough: hear the remote *and* send it your audio. */
+  /** Audio passthrough: hear what the remote machine is *playing* — its
+   *  system audio, which the far side loopback-captures — and talk to it
+   *  through your mic. The talk leg deliberately anchors on a real
+   *  microphone, never this machine's own system-audio: looping our
+   *  output back would ship the remote's sound straight back at it as
+   *  echo. No mic here simply means the session is listen-only. */
   toggleConsoleAudio() {
     const remote = this.consoleNodeId;
     if (!remote) return;
@@ -1131,14 +1136,13 @@ class AppStore {
       this.consoleAudio = false;
       return;
     }
-    // Two legs: hear the remote, and send it your audio. The channel reads
-    // as on when either leg is live; only legs this call created are owned
-    // for teardown.
+    // Two legs. The channel reads as on when either leg is live; only
+    // legs this call created are owned for teardown.
     const owned: string[] = [];
     let anyLive = false;
     const legs: Array<[Capability | undefined, Capability | undefined]> = [
       [matchEndpoint(this.catalog, remote, "audio", "provide"), matchEndpoint(this.catalog, this.localId, "audio", "consume")],
-      [matchEndpoint(this.catalog, this.localId, "audio", "provide"), matchEndpoint(this.catalog, remote, "audio", "consume")],
+      [this.defaultMicrophone(this.localId), matchEndpoint(this.catalog, remote, "audio", "consume")],
     ];
     for (const [from, to] of legs) {
       if (!from || !to) continue;
@@ -1150,6 +1154,19 @@ class AppStore {
     this.consoleAudioRouteIds = owned;
     this.consoleAudio = anyLive;
     if (!anyLive) this.toast("warn", "No audio path to that machine");
+  }
+
+  /** A node's scanned microphone to speak through — the flagged default
+   *  first. Distinct from `matchEndpoint`, which prefers the synthetic
+   *  machine endpoint (`system-audio`) that means "this machine's sound",
+   *  exactly what a talk leg must not source. */
+  private defaultMicrophone(nodeId: string): Capability | undefined {
+    return this.capsOf(nodeId)
+      .filter((c) => c.media === "audio" && canSource(c.flow) && c.origin === "microphone")
+      .sort(
+        (a, b) =>
+          Number(b.default ?? false) - Number(a.default ?? false) || a.id.localeCompare(b.id),
+      )[0];
   }
 
   /** Send this machine's keyboard & mouse to the remote (input injection on

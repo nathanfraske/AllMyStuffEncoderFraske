@@ -1,13 +1,19 @@
-//! The audio media plane: capture from a mic and play to speakers with
-//! `cpal`, so an active audio route actually moves sound across the mesh.
+//! The audio media plane: capture and playback with `cpal` (plus the
+//! platform loopback paths), so an active audio route actually moves sound
+//! across the mesh.
 //!
 //! cpal's `Stream` is `!Send`, so each route runs on its own dedicated
 //! thread that builds the stream, keeps it alive, and drops it on stop. The
 //! mesh layer never touches a stream directly — it calls [`AudioBridge`]:
 //!
-//!  * **source side** — [`AudioBridge::start_capture`] grabs the default
-//!    input, down-mixes to mono i16, and hands each buffer to a callback the
-//!    mesh forwards as an [`AudioFrame`].
+//!  * **source side** — [`AudioBridge::start_capture`] records what the
+//!    routed capability names ([`CaptureSource`]): the default microphone
+//!    for a scanned input device, or — for the synthetic `system-audio`
+//!    capability, "what this machine is playing" — the OS loopback of the
+//!    default output (WASAPI loopback on Windows, the pulse server's
+//!    monitor source on Linux; macOS has no OS loopback API and degrades
+//!    to the default input, loudly). Buffers are down-mixed to mono i16
+//!    and handed to a callback the mesh forwards as an [`AudioFrame`].
 //!  * **sink side** — [`AudioBridge::start_playback`] opens the default
 //!    output and drains a ring buffer that [`AudioBridge::feed`] fills from
 //!    inbound frames (linear-resampled to the device rate).
@@ -15,17 +21,20 @@
 //! Because "routes active, no sound" is invisible from the route handshake,
 //! both ends are deliberately loud about the things that go silently wrong
 //! in the field: each stream logs **which device** it opened (the default
-//! device may not be the one the user is thinking of), a capture that
+//! device may not be the one the user is thinking of), a mic capture that
 //! produces nothing but zeros for its first seconds names the OS
 //! microphone permission (macOS TCC and Windows privacy both deliver
-//! silence rather than an error), and a playback that never gets fed says
-//! so once instead of playing silence forever. The flowing-state counters
-//! (`audio out/in` lines) ride the same `ALLMYSTUFF_VIDEO_STATS` dial-in
-//! switch the video pipeline uses, at debug otherwise.
+//! silence rather than an error — a silent *system* capture is just a
+//! quiet desktop, so that source never warns), and a playback that never
+//! gets fed says so once instead of playing silence forever. The
+//! flowing-state counters (`audio out/in` lines) ride the same
+//! `ALLMYSTUFF_VIDEO_STATS` dial-in switch the video pipeline uses, at
+//! debug otherwise.
 //!
-//! v1 simplifications, called out honestly: it uses the *default* input /
-//! output device (mapping a specific scanned device to a cpal device by
-//! name is a follow-up), and transports mono. Both are noted in the README.
+//! v1 simplifications, called out honestly: capture uses the category's
+//! *default* device (mapping a specific scanned device to a cpal device by
+//! name is a follow-up), and transport is mono. Both are noted in the
+//! README.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -37,6 +46,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 
 use allmystuff_session::AudioFrame;
+
+/// What a sourcing audio route records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSource {
+    /// The default input device — a scanned microphone capability.
+    Mic,
+    /// This machine's own playback (the synthetic `system-audio`
+    /// capability): the loopback of the default output.
+    System,
+}
 
 /// One running route's audio resources (a capture or a playback thread).
 struct RouteAudio {
@@ -125,18 +144,18 @@ impl AudioBridge {
         Self::default()
     }
 
-    /// Begin capturing the default input for `route_id`. `on_frame(mono_pcm,
+    /// Begin capturing `source` for `route_id`. `on_frame(mono_pcm,
     /// sample_rate)` is called for every captured buffer; the mesh wraps it
     /// into an [`AudioFrame`] and sends it to the peer.
-    pub fn start_capture<F>(&self, route_id: String, on_frame: F)
+    pub fn start_capture<F>(&self, route_id: String, source: CaptureSource, on_frame: F)
     where
-        F: Fn(Vec<i16>, u32) + Send + 'static,
+        F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture(&stop_thread, &id, on_frame) {
+            if let Err(e) = run_capture(&stop_thread, &id, source, on_frame) {
                 tracing::warn!("audio capture for {id} stopped: {e}");
             }
         });
@@ -252,90 +271,207 @@ fn stats_log(line: String) {
 
 // ---- capture ----------------------------------------------------------
 
-fn run_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: F) -> Result<(), String>
+fn run_capture<F>(
+    stop: &AtomicBool,
+    route_id: &str,
+    source: CaptureSource,
+    on_frame: F,
+) -> Result<(), String>
 where
-    F: Fn(Vec<i16>, u32) + Send + 'static,
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    // The meter wraps every path; the `Arc` is so a failed loopback can
+    // hand the same consumer to its fallback (cpal consumes the callback
+    // even when the stream build fails).
+    let on_frame = Arc::new(metered(route_id, source, on_frame));
+    match source {
+        CaptureSource::Mic => run_capture_cpal(stop, route_id, false, on_frame),
+        CaptureSource::System => run_system_capture(stop, route_id, on_frame),
+    }
+}
+
+/// Wrap a capture consumer with the level meter: the ~5 s dial-in line,
+/// plus the one-shot pure-silence warning. The warning names the OS
+/// microphone permission and only fires for [`CaptureSource::Mic`] —
+/// macOS TCC / Windows privacy deliver silence rather than an error,
+/// while a silent *system* capture is just a quiet desktop.
+fn metered<F>(
+    route_id: &str,
+    source: CaptureSource,
+    on_frame: F,
+) -> impl Fn(Vec<i16>, u32) + Send + Sync + 'static
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    let stats = Mutex::new(LevelStats::new());
+    let id = route_id.to_string();
+    move |pcm: Vec<i16>, rate: u32| {
+        {
+            let mut stats = stats.lock();
+            let line_id = id.clone();
+            let silent = stats.note(&pcm, move |line| {
+                stats_log(format!("audio out {line_id}: {line}"));
+            });
+            if silent && source == CaptureSource::Mic && !stats.warned_silent {
+                stats.warned_silent = true;
+                tracing::warn!(
+                    "audio capture for {id} is producing pure silence — check the OS \
+                     microphone permission for this app (and the default input device)"
+                );
+            }
+        }
+        on_frame(pcm, rate);
+    }
+}
+
+/// System-audio capture on Windows: WASAPI loopback. An *input* stream
+/// built on the default *output* device captures the machine's playback
+/// mix (cpal raises `AUDCLNT_STREAMFLAGS_LOOPBACK` for render-device
+/// input streams). One quirk to know when reading logs: loopback delivers
+/// buffers only while something renders, so a fully silent desktop
+/// produces no frames at all — that's normal, not a stall.
+#[cfg(windows)]
+fn run_system_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: Arc<F>) -> Result<(), String>
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    match run_capture_cpal(stop, route_id, true, on_frame.clone()) {
+        Err(e) => {
+            tracing::warn!(
+                "system-audio loopback for {route_id} failed ({e}) — capturing the default \
+                 input instead"
+            );
+            run_capture_cpal(stop, route_id, false, on_frame)
+        }
+        done => done,
+    }
+}
+
+/// System-audio capture on Linux: the pulse server's monitor of the
+/// default sink (PulseAudio natively, PipeWire via pipewire-pulse — i.e.
+/// effectively every desktop). A box without a pulse server (bare ALSA)
+/// degrades to the default input, loudly.
+#[cfg(target_os = "linux")]
+fn run_system_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: Arc<F>) -> Result<(), String>
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    match pulse_monitor::Monitor::open(route_id) {
+        Ok(monitor) => {
+            tracing::info!(
+                "audio capture for {route_id}: system audio (monitor of the default output, \
+                 via the pulse server)"
+            );
+            monitor.pump(stop, &*on_frame)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "system-audio capture for {route_id} unavailable ({e}) — capturing the \
+                 default input instead"
+            );
+            run_capture_cpal(stop, route_id, false, on_frame)
+        }
+    }
+}
+
+/// System-audio capture on macOS: there is no OS loopback API — capturing
+/// the played mix needs a virtual output device (BlackHole et al.). Until
+/// that's wired, the honest degradation is the default input, named in
+/// the log.
+#[cfg(target_os = "macos")]
+fn run_system_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: Arc<F>) -> Result<(), String>
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    tracing::warn!(
+        "system-audio capture isn't available on macOS without a virtual loopback device — \
+         capturing the default input for {route_id} instead"
+    );
+    run_capture_cpal(stop, route_id, false, on_frame)
+}
+
+fn run_capture_cpal<F>(
+    stop: &AtomicBool,
+    route_id: &str,
+    loopback: bool,
+    on_frame: Arc<F>,
+) -> Result<(), String>
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
 {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default input device".to_string())?;
-    let supported = device.default_input_config().map_err(|e| e.to_string())?;
+    // Loopback (Windows only — see `run_system_capture`) records the
+    // default *output* device with its render mix format; everything else
+    // records the default input.
+    let (device, supported, what) = if loopback {
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "no default output device to capture".to_string())?;
+        let supported = device.default_output_config().map_err(|e| e.to_string())?;
+        (device, supported, "system audio (loopback)")
+    } else {
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| "no default input device".to_string())?;
+        let supported = device.default_input_config().map_err(|e| e.to_string())?;
+        (device, supported, "default input")
+    };
     let sample_rate = supported.sample_rate().0;
     let channels = supported.channels();
     let config: cpal::StreamConfig = supported.config();
     let fmt = supported.sample_format();
-    // Name the device: "no sound" is regularly "the default input isn't
-    // the mic you think it is".
+    // Name the device: "no sound" is regularly "the default device isn't
+    // the one you think it is".
     tracing::info!(
-        "audio capture for {route_id}: device \"{}\", {sample_rate} Hz, {channels} ch, {fmt:?}",
+        "audio capture for {route_id}: {what} — device \"{}\", {sample_rate} Hz, {channels} ch, {fmt:?}",
         device.name().unwrap_or_else(|_| "unknown".into()),
     );
     let err = |e| tracing::warn!("input stream error: {e}");
 
-    // Wrap the consumer with the level meter. A capture whose first
-    // five-second window is *pure zeros* is almost always the OS denying
-    // the microphone (macOS TCC / Windows privacy deliver silence, not an
-    // error) — say so once, loudly, instead of streaming silence.
-    let on_frame = {
-        let stats = Mutex::new(LevelStats::new());
-        let id = route_id.to_string();
-        move |pcm: Vec<i16>, rate: u32| {
-            {
-                let mut stats = stats.lock();
-                let line_id = id.clone();
-                let silent = stats.note(&pcm, move |line| {
-                    stats_log(format!("audio out {line_id}: {line}"));
-                });
-                if silent && !stats.warned_silent {
-                    stats.warned_silent = true;
-                    tracing::warn!(
-                        "audio capture for {id} is producing pure silence — check the OS \
-                         microphone permission for this app (and the default input device)"
-                    );
-                }
-            }
-            on_frame(pcm, rate);
-        }
-    };
-
-    // `on_frame` is moved into whichever arm runs (match arms are mutually
-    // exclusive, so a single move per arm is fine). `Fn` is callable
-    // directly — no `Arc` wrapper.
+    // Only one arm runs; each gets its own handle on the shared consumer.
     let stream = match fmt {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &_| {
-                let pcm: Vec<i16> = downmix(
-                    &data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(),
-                    channels,
-                );
-                on_frame(pcm, sample_rate);
-            },
-            err,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _: &_| on_frame(downmix(data, channels), sample_rate),
-            err,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config,
-            move |data: &[u16], _: &_| {
-                let pcm: Vec<i16> = downmix(
-                    &data
-                        .iter()
-                        .map(|&u| (u as i32 - 32768) as i16)
-                        .collect::<Vec<_>>(),
-                    channels,
-                );
-                on_frame(pcm, sample_rate);
-            },
-            err,
-            None,
-        ),
+        cpal::SampleFormat::F32 => {
+            let on_frame = on_frame.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &_| {
+                    let pcm: Vec<i16> = downmix(
+                        &data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(),
+                        channels,
+                    );
+                    on_frame(pcm, sample_rate);
+                },
+                err,
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let on_frame = on_frame.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[i16], _: &_| on_frame(downmix(data, channels), sample_rate),
+                err,
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let on_frame = on_frame.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[u16], _: &_| {
+                    let pcm: Vec<i16> = downmix(
+                        &data
+                            .iter()
+                            .map(|&u| (u as i32 - 32768) as i16)
+                            .collect::<Vec<_>>(),
+                        channels,
+                    );
+                    on_frame(pcm, sample_rate);
+                },
+                err,
+                None,
+            )
+        }
         other => return Err(format!("unsupported input sample format: {other:?}")),
     }
     .map_err(|e| e.to_string())?;
@@ -343,6 +479,170 @@ where
     stream.play().map_err(|e| e.to_string())?;
     park_until_stopped(stop);
     Ok(())
+}
+
+/// Recording the pulse server's monitor source — Linux's "what this
+/// machine is playing". Uses PulseAudio's **simple** API, dlopen'd at
+/// runtime so machines without `libpulse` (a bare-ALSA box, a container)
+/// degrade to the caller's fallback instead of failing to load the app.
+/// The server side resamples and downmixes to the requested spec, so this
+/// asks for the route's wire shape (48 kHz mono S16) directly.
+#[cfg(target_os = "linux")]
+mod pulse_monitor {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `pa_sample_spec` — pulse/sample.h.
+    #[repr(C)]
+    struct SampleSpec {
+        format: c_int,
+        rate: u32,
+        channels: u8,
+    }
+
+    /// `pa_buffer_attr` — pulse/def.h. `u32::MAX` means "server default".
+    #[repr(C)]
+    struct BufferAttr {
+        maxlength: u32,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        fragsize: u32,
+    }
+
+    const PA_SAMPLE_S16LE: c_int = 3;
+    const PA_STREAM_RECORD: c_int = 2;
+    const RATE: u32 = 48_000;
+    /// 20 ms per blocking read — the same order as a cpal capture buffer.
+    const SAMPLES_PER_READ: usize = RATE as usize / 50;
+
+    type PaSimpleNew = unsafe extern "C" fn(
+        *const c_char, // server (null = default)
+        *const c_char, // application name
+        c_int,         // direction
+        *const c_char, // device
+        *const c_char, // stream name
+        *const SampleSpec,
+        *const c_void, // channel map (null = default)
+        *const BufferAttr,
+        *mut c_int, // error out
+    ) -> *mut c_void;
+    type PaSimpleRead = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_int) -> c_int;
+    type PaSimpleFree = unsafe extern "C" fn(*mut c_void);
+
+    struct Api {
+        new: PaSimpleNew,
+        read: PaSimpleRead,
+        free: PaSimpleFree,
+    }
+
+    /// dlopen once per process. The library handle is deliberately leaked
+    /// so the extracted function pointers stay valid for the app's life.
+    fn api() -> Option<&'static Api> {
+        static API: std::sync::OnceLock<Option<Api>> = std::sync::OnceLock::new();
+        API.get_or_init(|| unsafe {
+            let lib = ["libpulse-simple.so.0", "libpulse-simple.so"]
+                .iter()
+                .find_map(|name| libloading::Library::new(name).ok())?;
+            let api = {
+                let new: libloading::Symbol<PaSimpleNew> = lib.get(b"pa_simple_new\0").ok()?;
+                let read: libloading::Symbol<PaSimpleRead> = lib.get(b"pa_simple_read\0").ok()?;
+                let free: libloading::Symbol<PaSimpleFree> = lib.get(b"pa_simple_free\0").ok()?;
+                Api {
+                    new: *new,
+                    read: *read,
+                    free: *free,
+                }
+            };
+            std::mem::forget(lib);
+            Some(api)
+        })
+        .as_ref()
+    }
+
+    pub(super) struct Monitor {
+        api: &'static Api,
+        stream: *mut c_void,
+    }
+
+    impl Monitor {
+        /// Open a recording stream on the monitor of the default sink.
+        /// `@DEFAULT_MONITOR@` is resolved server-side, so it lands on
+        /// whatever the default output is at open time.
+        pub(super) fn open(route_id: &str) -> Result<Self, String> {
+            let api = api().ok_or("libpulse-simple isn't available")?;
+            let spec = SampleSpec {
+                format: PA_SAMPLE_S16LE,
+                rate: RATE,
+                channels: 1,
+            };
+            let attr = BufferAttr {
+                maxlength: u32::MAX,
+                tlength: u32::MAX,
+                prebuf: u32::MAX,
+                minreq: u32::MAX,
+                // Small fragments keep the route's added latency at ~one
+                // read instead of the server's roomy record default.
+                fragsize: (SAMPLES_PER_READ * std::mem::size_of::<i16>()) as u32,
+            };
+            let app = CString::new("AllMyStuff").expect("static name");
+            let stream_name =
+                CString::new(route_id).map_err(|_| "route id contains a NUL".to_string())?;
+            let device = CString::new("@DEFAULT_MONITOR@").expect("static name");
+            let mut error: c_int = 0;
+            let stream = unsafe {
+                (api.new)(
+                    std::ptr::null(),
+                    app.as_ptr(),
+                    PA_STREAM_RECORD,
+                    device.as_ptr(),
+                    stream_name.as_ptr(),
+                    &spec,
+                    std::ptr::null(),
+                    &attr,
+                    &mut error,
+                )
+            };
+            if stream.is_null() {
+                return Err(format!("pa_simple_new failed (error {error})"));
+            }
+            Ok(Monitor { api, stream })
+        }
+
+        /// Blocking read loop: hand each ~20 ms of mono PCM to `on_frame`
+        /// until `stop` flips. A monitor source streams continuously
+        /// (zeros while the desktop is silent), so the stop flag is seen
+        /// within one read.
+        pub(super) fn pump(
+            &self,
+            stop: &AtomicBool,
+            on_frame: &(impl Fn(Vec<i16>, u32) + Send + Sync),
+        ) -> Result<(), String> {
+            let mut buf = vec![0i16; SAMPLES_PER_READ];
+            while !stop.load(Ordering::SeqCst) {
+                let mut error: c_int = 0;
+                let rc = unsafe {
+                    (self.api.read)(
+                        self.stream,
+                        buf.as_mut_ptr().cast(),
+                        buf.len() * std::mem::size_of::<i16>(),
+                        &mut error,
+                    )
+                };
+                if rc < 0 {
+                    return Err(format!("pa_simple_read failed (error {error})"));
+                }
+                on_frame(buf.clone(), RATE);
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Monitor {
+        fn drop(&mut self) {
+            unsafe { (self.api.free)(self.stream) };
+        }
+    }
 }
 
 // ---- playback ---------------------------------------------------------
@@ -521,7 +821,7 @@ mod tests {
         // threads themselves bail instantly in CI — no audio devices —
         // which is fine: this exercises the bookkeeping, not cpal.)
         let bridge = AudioBridge::new();
-        bridge.start_capture("r".into(), |_, _| {});
+        bridge.start_capture("r".into(), CaptureSource::Mic, |_, _| {});
         bridge.start_playback("r".into());
         assert!(bridge.captures.lock().contains_key("r"));
         assert!(bridge.playbacks.lock().contains_key("r"));

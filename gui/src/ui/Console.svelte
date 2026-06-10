@@ -637,7 +637,7 @@
             class="toggle"
             class:on={app.consoleAudio}
             onclick={() => app.toggleConsoleAudio()}
-            title="Hear the remote and send it your audio"
+            title="Hear what that machine is playing — and talk to it through your mic"
           >
             <span class="t-icon">🔊</span>
             Audio passthrough

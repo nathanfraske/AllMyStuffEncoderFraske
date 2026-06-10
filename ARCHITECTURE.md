@@ -147,8 +147,10 @@ Tauri 2 + Svelte 5, a client of the daemon.
 - **Backend** (`src-tauri/`) — `scan_self` (inventory + bridge), the live
   `mesh::Mesh` (subscribes to the presence/control/media channels, drives the
   `allmystuff-session` state machine, emits `allmystuff://session`
-  snapshots), the `audio` cpal bridge (capture → mesh → playback for active
-  audio routes), `connect_route`/`disconnect_route` commands, and
+  snapshots), the `audio` bridge (capture → mesh → playback for active
+  audio routes: cpal for mics and playback, the OS loopback — WASAPI /
+  pulse monitor — when the source is the machine's `system-audio`),
+  `connect_route`/`disconnect_route` commands, and
   `daemon_spawn`. The `myownmesh` daemon ships **bundled with the app**:
   `build.rs` fetches the rev pinned in `.myownmesh-rev` and stages it as a
   Tauri sidecar (`binaries/myownmesh-<triple>`, `externalBin`), so the mesh
@@ -229,11 +231,19 @@ Tauri 2 + Svelte 5, a client of the daemon.
    and completes the connection.
 5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
-   audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
-   over `CHANNEL_MEDIA`, and the sink plays them — and both ends log which
-   device they opened, a capture whose first seconds are pure zeros names
-   the OS microphone permission (macOS/Windows deny with silence, not an
-   error), and a playback that's never fed says so once. A display route
+   audio route, the source captures what its capability names — the
+   machine's own playback for the synthetic `system-audio` (WASAPI
+   loopback on Windows, the pulse server's monitor of the default sink on
+   Linux, the default input as macOS's honest stand-in), the default
+   input for a scanned mic — streams `AudioFrame`s over `CHANNEL_MEDIA`,
+   and the sink plays them. Both ends log which device they opened, a
+   *mic* capture whose first seconds are pure zeros names the OS
+   microphone permission (macOS/Windows deny with silence, not an error —
+   a silent system capture is just a quiet desktop), and a playback
+   that's never fed says so once. The console's audio passthrough wires
+   exactly this pair: the remote's `system-audio` to your speakers, your
+   default mic (never your own `system-audio`, which would echo the
+   remote's sound back at it) to its speakers. A display route
    streams the routed screen — the primary for the synthetic `screen`, the
    named monitor for a `screen:<id>` capability — from a persistent capture
    session (in-house DXGI Output Duplication on Windows — xcap's recorder
