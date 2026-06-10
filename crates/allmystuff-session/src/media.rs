@@ -90,6 +90,90 @@ pub enum InputAction {
     Key { key: String, down: bool },
 }
 
+/// One event of a terminal route's stream — the byte-level conversation
+/// between an xterm.js viewer and the PTY a host spawned for it. Bytes are
+/// opaque to the wire (the emulator and the PTY speak VT between
+/// themselves); the frame just carries them, plus the two control events a
+/// session needs: the viewer resizing its emulator, and the host reporting
+/// the shell's end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermFrame {
+    /// Tag for demuxing off the shared media channel. Always `"term"`.
+    pub t: MediaTagTerm,
+    pub route: String,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: TermEvent,
+}
+
+/// What happened on the terminal route. `Data` flows both ways (keystrokes
+/// up, PTY output down); `Resize` only viewer → host; `Exit` only host →
+/// viewer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TermEvent {
+    /// Raw PTY bytes, base64 on the wire (the daemon channel is JSON).
+    Data {
+        #[serde(with = "bytes_b64")]
+        bytes: Vec<u8>,
+    },
+    /// The viewer's emulator was resized; the host resizes the PTY so the
+    /// shell relays out at the right dimensions.
+    Resize { cols: u16, rows: u16 },
+    /// The shell ended. `None` = killed / no status to report.
+    Exit {
+        #[serde(default)]
+        code: Option<i32>,
+    },
+}
+
+impl TermFrame {
+    pub fn new(route: impl Into<String>, seq: u64, event: TermEvent) -> Self {
+        TermFrame {
+            t: MediaTagTerm::Term,
+            route: route.into(),
+            seq,
+            event,
+        }
+    }
+
+    /// Split `bytes` into channel-sized [`TermEvent::Data`] frames — each
+    /// carries at most `max_bytes` so the full JSON message (base64 +
+    /// envelope) stays under the transport's ceiling. Sequence numbers
+    /// increment per piece starting at `first_seq`; an empty payload still
+    /// yields one (empty) frame so a write is never silently dropped.
+    pub fn data_frames(
+        route: &str,
+        first_seq: u64,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Vec<TermFrame> {
+        let max = max_bytes.max(1);
+        if bytes.len() <= max {
+            return vec![TermFrame::new(
+                route,
+                first_seq,
+                TermEvent::Data {
+                    bytes: bytes.to_vec(),
+                },
+            )];
+        }
+        bytes
+            .chunks(max)
+            .enumerate()
+            .map(|(i, piece)| {
+                TermFrame::new(
+                    route,
+                    first_seq + i as u64,
+                    TermEvent::Data {
+                        bytes: piece.to_vec(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 /// Everything that can arrive on the media channel, demuxed by the `t`
 /// tag (no tag = audio, the original frame shape).
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +181,7 @@ pub enum MediaPayload {
     Audio(AudioFrame),
     Video(VideoFrame),
     Input(InputEvent),
+    Terminal(TermFrame),
 }
 
 impl MediaPayload {
@@ -110,6 +195,9 @@ impl MediaPayload {
             Some("input") => serde_json::from_value(payload)
                 .ok()
                 .map(MediaPayload::Input),
+            Some("term") => serde_json::from_value(payload)
+                .ok()
+                .map(MediaPayload::Terminal),
             Some(_) => None,
             None => serde_json::from_value(payload)
                 .ok()
@@ -123,6 +211,7 @@ impl MediaPayload {
             MediaPayload::Audio(f) => &f.route,
             MediaPayload::Video(f) => &f.route,
             MediaPayload::Input(f) => &f.route,
+            MediaPayload::Terminal(f) => &f.route,
         }
     }
 }
@@ -142,6 +231,13 @@ pub enum MediaTagInput {
     #[default]
     #[serde(rename = "input")]
     Input,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaTagTerm {
+    #[default]
+    #[serde(rename = "term")]
+    Term,
 }
 
 impl VideoFrame {
@@ -393,11 +489,87 @@ mod tests {
             Some(MediaPayload::Input(_))
         ));
 
+        let term =
+            serde_json::to_value(TermFrame::new("r", 1, TermEvent::Data { bytes: vec![27] }))
+                .unwrap();
+        assert!(matches!(
+            MediaPayload::decode(term),
+            Some(MediaPayload::Terminal(_))
+        ));
+
         // A future kind we don't know is dropped, not an error.
         assert_eq!(
             MediaPayload::decode(serde_json::json!({ "t": "hologram", "route": "r" })),
             None
         );
+    }
+
+    #[test]
+    fn term_frame_round_trips_each_event() {
+        let events = [
+            TermEvent::Data {
+                bytes: b"ls -la\r".to_vec(),
+            },
+            TermEvent::Resize {
+                cols: 120,
+                rows: 40,
+            },
+            TermEvent::Exit { code: Some(3) },
+            TermEvent::Exit { code: None },
+        ];
+        for event in events {
+            let f = TermFrame::new("route:a:terminal→b:term-view:1", 9, event);
+            let v = serde_json::to_value(&f).unwrap();
+            assert_eq!(v["t"], "term");
+            let back: TermFrame = serde_json::from_value(v).unwrap();
+            assert_eq!(f, back);
+        }
+        // Data bytes travel as base64, never raw.
+        let f = TermFrame::new("r", 0, TermEvent::Data { bytes: vec![0xFF] });
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"bytes\":\"/w==\""));
+    }
+
+    #[test]
+    fn term_frame_with_an_unknown_kind_drops_alone() {
+        // A newer peer's new event kind fails *that frame only* — decode
+        // returns None and the stream's surviving frames are unaffected.
+        assert_eq!(
+            MediaPayload::decode(serde_json::json!({
+                "t": "term", "route": "r", "seq": 4, "kind": "hologram"
+            })),
+            None
+        );
+        let ok = serde_json::to_value(TermFrame::new("r", 5, TermEvent::Data { bytes: vec![1] }))
+            .unwrap();
+        assert!(matches!(
+            MediaPayload::decode(ok),
+            Some(MediaPayload::Terminal(f)) if f.seq == 5
+        ));
+    }
+
+    #[test]
+    fn term_data_chunks_split_byte_exact_and_number_sequentially() {
+        let bytes: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let frames = TermFrame::data_frames("r", 7, &bytes, 16 * 1024);
+        assert_eq!(frames.len(), 4);
+        let mut rebuilt = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.seq, 7 + i as u64);
+            match &f.event {
+                TermEvent::Data { bytes } => {
+                    assert!(bytes.len() <= 16 * 1024);
+                    rebuilt.extend_from_slice(bytes);
+                }
+                other => panic!("expected Data, got {other:?}"),
+            }
+        }
+        assert_eq!(rebuilt, bytes);
+
+        // A small write passes through as exactly one frame; an empty one
+        // still yields a frame rather than vanishing.
+        assert_eq!(TermFrame::data_frames("r", 0, b"hi", 16 * 1024).len(), 1);
+        assert_eq!(TermFrame::data_frames("r", 0, b"", 16 * 1024).len(), 1);
     }
 
     #[test]

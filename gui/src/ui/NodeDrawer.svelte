@@ -54,13 +54,16 @@
     ].filter((c) => c.items.length > 0);
   }
 
-  // Routes touching this node, with the far end + direction.
+  // Routes touching this node, with the far end + direction. Resolved
+  // through the display fallback so terminal sessions (whose endpoints
+  // are deliberately not catalog capabilities) still show — and can be
+  // disconnected — here.
   const connections = $derived.by(() => {
     if (!node) return [];
     const out: { id: string; label: string; media: MediaKind; dir: "out" | "in" }[] = [];
     for (const r of app.catalog.routes) {
-      const from = app.capability(r.from);
-      const to = app.capability(r.to);
+      const from = app.capabilityForDisplay(r.from);
+      const to = app.capabilityForDisplay(r.to);
       if (!from || !to) continue;
       if (from.node === node.id) {
         out.push({ id: r.id, label: `${from.label} → ${to.label}`, media: r.media, dir: "out" });
@@ -163,11 +166,20 @@
       <button class="btn small rescan" onclick={() => app.hydrateFromBackend()}>↻ Re-scan this machine</button>
     {/if}
 
-    <!-- Open a remote console session: the pikvm-style handle for this
+    <!-- Open a remote control session: the pikvm-style handle for this
          machine's screen, audio passthrough and control. -->
     {#if isRemoteApp && (node.relationship.kind === "mine" || node.relationship.kind === "shared")}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
-        🖥 Open console
+        🖥 Remote Control
+      </button>
+    {/if}
+
+    <!-- Open a terminal: a real shell on that machine, over the mesh.
+         Only for machines that advertise the feature *and* are effectively
+         yours (owner/fleet — the same rule the far side enforces). -->
+    {#if isRemoteApp && app.terminalAllowed(node)}
+      <button class="btn console-open" onclick={() => app.openTerminal(node.id)}>
+        📟 Open Terminal
       </button>
     {/if}
 

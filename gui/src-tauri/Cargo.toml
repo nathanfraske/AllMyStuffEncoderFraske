@@ -25,6 +25,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
 
 # Async runtime — control-socket client + Tauri commands.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
@@ -60,6 +61,10 @@ allmystuff-updater = { path = "../../crates/allmystuff-updater" }
 # on macOS, WASAPI on Windows, ALSA on Linux. Same crate (and version)
 # MyOwnLLM uses for its audio.
 cpal = "0.15"
+# Cross-platform PTY for the mesh-native terminal — openpty on Unix,
+# ConPTY on Windows — so a terminal session behaves the same across the
+# whole OS matrix without an sshd anywhere. WezTerm's own PTY layer.
+portable-pty = "0.9"
 xcap = "0.9"
 # `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
 # speed on typical x86-64 desktops, plain safe Rust elsewhere.
@@ -76,11 +81,20 @@ base64 = "0.22"
 # builds optimize them — see the crate's manifest for the why.
 allmystuff-pixels = { path = "pixels" }
 
+# PR_SET_PDEATHSIG for the daemon lifetime tie (see
+# daemon_spawn::tie_daemon_lifetime) — the kernel SIGKILLs the daemon
+# when a crashed or force-killed app can no longer clean up after itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # In-house DXGI Output Duplication for screen capture, and the
 # virtual-desktop absolute mouse move (enigo's Abs can only reach the
 # primary monitor). Same version the resolved tree already carries via
 # Tauri, so this adds features, not a second compile of the crate. See
 # `win_capture.rs` for why xcap's recorder can't be used here.
+# windows-sys backs the daemon lifetime tie (a job object with
+# kill-on-close — daemon_spawn::tie_daemon_lifetime), same story: the
+# version the tree already resolves.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -91,6 +105,11 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
 ] }
 
 [profile.release]

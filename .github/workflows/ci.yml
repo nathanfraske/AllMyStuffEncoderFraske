@@ -102,3 +102,8 @@ jobs:
       - name: cargo check backend
         working-directory: gui/src-tauri
         run: cargo check
+      # The backend has real unit tests now (the terminal's PTY host runs a
+      # live openpty/ConPTY round-trip per OS) — run them where they run.
+      - name: cargo test backend
+        working-directory: gui/src-tauri
+        run: cargo test

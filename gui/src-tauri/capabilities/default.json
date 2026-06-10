@@ -1,14 +1,20 @@
 {
   "$schema": "https://schema.tauri.app/capabilities/2",
   "identifier": "default",
-  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console window)",
-  "windows": ["main", "console-*"],
+  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console and terminal window)",
+  "windows": [
+    "main",
+    "console-*",
+    "terminal-*"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
     "core:window:allow-close",
     "core:window:allow-destroy",
     "shell:allow-open",
-    "dialog:default"
+    "dialog:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

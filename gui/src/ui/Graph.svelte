@@ -61,13 +61,15 @@
 
   // Edges: one per route, connecting the two nodes the capabilities live
   // on. Curved + coloured by media, with parallel routes fanned apart.
+  // Endpoints resolve through the display fallback so a live terminal
+  // session (whose endpoints aren't catalog capabilities) draws its wire.
   type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string; group: boolean };
   const edges = $derived.by((): Edge[] => {
     const pairCount = new Map<string, number>();
     const out: Edge[] = [];
     for (const r of app.catalog.routes) {
-      const from = app.catalog.capabilities.find((c) => c.id === r.from);
-      const to = app.catalog.capabilities.find((c) => c.id === r.to);
+      const from = app.capabilityForDisplay(r.from);
+      const to = app.capabilityForDisplay(r.to);
       if (!from || !to) continue;
       const a = posOf.get(from.node);
       const b = posOf.get(to.node);

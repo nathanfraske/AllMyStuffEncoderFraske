@@ -7,6 +7,7 @@
 import {
   canSink,
   canSource,
+  capabilityForDisplay,
   connectGroup,
   matchEndpoint,
   proposeRoute,
@@ -42,6 +43,7 @@ import {
   onSession,
   onSubscription,
   openConsoleWindow,
+  openTerminalWindow,
   ownedRoster,
   scanSelf,
   sendInput,
@@ -55,6 +57,7 @@ import {
 } from "./tauri";
 import {
   BUNDLE_TEMPLATES,
+  FEATURE_TERMINAL,
   isAppNode,
   networkDisplayName,
   type Capability,
@@ -73,6 +76,7 @@ import {
   type Relationship,
   type RosterPeer,
   type Route,
+  type RouteLiveState,
   type TurnEntry,
   type UpdatePrefs,
   type UpdateStatus,
@@ -207,6 +211,19 @@ class AppStore {
   consoleTune = $state<StreamTune>({});
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
+
+  // ---- terminal (the mesh-native shell) ----------------------------
+  /** The remote machine the in-page terminal popover is open on (web
+   *  preview only — the desktop opens a dedicated window per machine). */
+  terminalNodeId = $state<string | null>(null);
+  /** Live negotiation state per route id, straight from the last session
+   *  snapshot. A terminal tab watches its own route here to tell
+   *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
+  routeStates = $state<Record<string, RouteLiveState>>({});
+  /** Per-app-run counter so each terminal tab mints a unique viewer-side
+   *  endpoint (`{me}:term-view:…`) — unique endpoint, unique route id. */
+  private termViewSeq = 0;
+
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
   localId = $state("this");
@@ -343,6 +360,13 @@ class AppStore {
     return this.catalog.capabilities.find((c) => c.id === id);
   }
 
+  /** Like `capability`, but synthesizes display stand-ins for terminal
+   *  endpoints (which are never real catalog entries) — used by the views
+   *  that render routes, so a live terminal session shows up. */
+  capabilityForDisplay(id: string): Capability | undefined {
+    return capabilityForDisplay(this.catalog, id);
+  }
+
   // ---- lifecycle ---------------------------------------------------
 
   /** Wire up live backend data, if there is a backend. No-op (keeps the
@@ -398,6 +422,15 @@ class AppStore {
   private async pullSessionSnapshot() {
     const snap = await sessionSnapshot();
     if (snap) this.applySessionSnapshot(snap);
+  }
+
+  /** Pull a fresh session snapshot now. For views whose state hangs off
+   *  route negotiation (a terminal tab's connecting → live → ended): the
+   *  `allmystuff://session` event is the latency win, but a pull is the
+   *  truth — the same doctrine the video plane settled on after lost
+   *  pushes froze streams. */
+  refreshSession(): Promise<void> {
+    return this.pullSessionSnapshot();
   }
 
   /** Poll the daemon's mesh membership as a safety net (peer/roster changes
@@ -657,6 +690,9 @@ class AppStore {
       // Ownership the device advertises about itself (Task 4).
       node.owner = p.owner ?? null;
       node.claimable = p.claimable ?? false;
+      // App features it supports ("terminal", …) — absent from an older
+      // peer means none, and the matching buttons stay hidden.
+      node.features = p.features ?? [];
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -677,8 +713,12 @@ class AppStore {
       ];
     }
 
-    // Reflect live routes (active ones become catalog routes).
+    // Reflect live routes (active ones become catalog routes), and keep
+    // the per-route negotiation states for whoever watches one (a
+    // terminal tab telling "connecting" from "rejected" by its reason).
+    const states: Record<string, RouteLiveState> = {};
     for (const lr of snap.routes ?? []) {
+      states[lr.route.id] = lr.state;
       const active = lr.state.state === "active";
       const id = lr.route.id;
       const exists = this.catalog.routes.some((r) => r.id === id);
@@ -688,6 +728,7 @@ class AppStore {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
       }
     }
+    this.routeStates = states;
 
     this.reconcileFleetRelationships();
   }
@@ -1091,6 +1132,82 @@ class AppStore {
     const existsNow = this.catalog.routes.some((r) => r.id === id);
     if (!existsNow) return null; // blocked / denied — nothing got wired
     return { id, created: !existedBefore };
+  }
+
+  // ---- terminal (the mesh-native shell) ----------------------------
+
+  /** Whether `node` can host a terminal at all: it runs AllMyStuff and its
+   *  presence advertises the feature (an older build simply doesn't). */
+  terminalSupported(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_TERMINAL);
+  }
+
+  /** The gate for "Open Terminal" — a mirror of the host's own rule
+   *  (`sender_may_control`): only the node's recorded owner or a co-owned
+   *  fleet member gets a shell. Deliberately *not* `relationship.kind`,
+   *  which is a local label the user can set freely; this checks the same
+   *  facts the far side will enforce, so the button never promises what
+   *  the host would refuse. */
+  terminalAllowed(node: MeshNode | undefined): boolean {
+    if (!node || this.isMe(node.id) || !this.terminalSupported(node)) return false;
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet;
+  }
+
+  /** Open a terminal on a remote machine. On the desktop this opens (or
+   *  focuses) the machine's dedicated terminal window — tabs inside it are
+   *  separate shells; the web preview keeps an in-page popover. */
+  openTerminal(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (this.isMe(nodeId)) {
+      this.toast("warn", "That's this device");
+      return;
+    }
+    if (!this.terminalSupported(node)) {
+      this.toast("warn", `${node.label} doesn't support terminals (older AllMyStuff?)`);
+      return;
+    }
+    if (!this.terminalAllowed(node)) {
+      this.toast("warn", `Terminals are owner/fleet only — ${node.label} isn't yours`);
+      return;
+    }
+    if (isTauri()) {
+      void openTerminalWindow(nodeId);
+      return;
+    }
+    this.terminalNodeId = nodeId;
+  }
+
+  /** Close the in-page terminal popover (web preview). The desktop's
+   *  terminal windows close themselves, tearing their tabs down first. */
+  closeTerminal() {
+    this.terminalNodeId = null;
+  }
+
+  /** Open one terminal *session* (a tab) to `hostNodeId`: a generic route
+   *  from the host's `…:terminal` endpoint to a viewer endpoint minted for
+   *  this tab — unique endpoint, unique route id, so tabs to one machine
+   *  never collide. Deliberately not `connect()`/`proposeRoute`: terminal
+   *  endpoints aren't catalog capabilities (see `capabilityForDisplay`),
+   *  and the binding authorization runs host-side against the owner/fleet
+   *  rule. Returns the route id the tab watches, or null in web mode
+   *  (no backend — nothing can flow). */
+  terminalConnect(hostNodeId: string): string | null {
+    if (!this.backendConnected) return null;
+    const from = `${hostNodeId}:terminal`;
+    const n = ++this.termViewSeq;
+    const to = `${this.localId}:term-view:${Date.now().toString(36)}-${n}`;
+    void connectRoute(from, to, "generic");
+    return `route:${from}→${to}`;
+  }
+
+  /** Tear one terminal session down (tab closed / window closing). The
+   *  returned promise settles when the disconnect is on the wire, so a
+   *  closing window can hold its close until then. */
+  terminalDisconnect(routeId: string): Promise<unknown> {
+    return this.disconnect(routeId);
   }
 
   // ---- ownership / claiming ---------------------------------------

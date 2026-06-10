@@ -23,6 +23,7 @@ mod daemon_spawn;
 mod input_inject;
 mod mesh;
 mod ownership;
+mod terminal;
 mod video;
 mod video_decode;
 mod win_capture;
@@ -178,6 +179,67 @@ async fn tune_route(
     mesh.inner()
         .request_tune(route_id, max_edge, bitrate, fps)
         .await
+}
+
+// ---- terminal (the mesh-native shell) ----------------------------------
+
+/// Forward keystrokes or a resize from a terminal window down its active
+/// terminal route (the viewer side of a mesh-native shell).
+#[tauri::command]
+async fn term_send(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    event: serde_json::Value,
+) -> Result<(), String> {
+    let event: allmystuff_session::TermEvent =
+        serde_json::from_value(event).map_err(|e| e.to_string())?;
+    mesh.inner().term_send(route_id, event).await
+}
+
+/// Register the calling terminal window's interest in a route's output.
+/// Bytes buffer backend-side from route-activation (so the shell's first
+/// prompt is never lost); the window drains them with `term_poll` on each
+/// `allmystuff://term-ready` poke. Same pull-not-push shape as video.
+#[tauri::command]
+fn term_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
+    mesh.term_watch(&route_id)
+}
+
+/// Drain the queued output for a terminal route as one raw batch:
+/// `[u32 le len][bytes]…`, empty when nothing arrived.
+#[tauri::command]
+fn term_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
+    tauri::ipc::Response::new(mesh.term_poll(&route_id))
+}
+
+/// Release a terminal window's claim on a route's output (tab closed).
+/// Token-scoped and idempotent, like `video_unwatch`.
+#[tauri::command]
+fn term_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
+    mesh.term_unwatch(&route_id, token);
+}
+
+/// Open (or focus) the dedicated terminal window for `node` — one OS
+/// window per machine, holding that machine's terminal tabs. The window
+/// loads the same app with `?terminal=<node>`.
+#[tauri::command]
+async fn open_terminal_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
+    let label = format!("terminal-{}", window_slug(&node));
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(format!("index.html?terminal={node}").into()),
+    )
+    .title("AllMyStuff terminal")
+    .inner_size(940.0, 600.0)
+    .min_inner_size(480.0, 320.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -507,6 +569,9 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // Terminal copy/paste: the async clipboard API is unreliable in
+        // WebKitGTK, so the terminal windows use the plugin instead.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
@@ -525,6 +590,11 @@ fn main() {
             video_refresh,
             tune_route,
             open_console_window,
+            term_send,
+            term_watch,
+            term_poll,
+            term_unwatch,
+            open_terminal_window,
             session_snapshot,
             owned_roster,
             fleet_leave,

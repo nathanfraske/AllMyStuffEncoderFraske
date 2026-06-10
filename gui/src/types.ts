@@ -83,11 +83,18 @@ export interface MeshNode {
   /** `true` when the device is in claim mode and unowned — it's offering
    *  itself for adoption, the only state in which a claim takes. */
   claimable?: boolean;
+  /** App features this node advertises in presence ("terminal", …).
+   *  Absent (an older peer) means none — the matching buttons stay hidden. */
+  features?: string[];
   /** Friendly names of the networks this device has been seen on. You can be
    *  on several networks at once and a device may share only some of them, so
    *  the graph shows which — it's never just "the" mesh. */
   networks?: string[];
 }
+
+/** The presence feature tag for mesh-native terminal hosting (mirrors the
+ *  Rust `FEATURE_TERMINAL`). */
+export const FEATURE_TERMINAL = "terminal";
 
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
  *  The local node and any node we've had presence from count as app nodes. */
@@ -288,6 +295,22 @@ export type InputAction =
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; down: boolean };
 
+/** One terminal event a terminal window sends down its route. Tagged
+ *  exactly like the Rust `TermEvent` (serde `kind`, snake_case); `bytes`
+ *  is base64 (the wire is JSON). `exit` is the host's word only — it never
+ *  travels viewer → host. */
+export type TermEvent =
+  | { kind: "data"; bytes: string }
+  | { kind: "resize"; cols: number; rows: number }
+  | { kind: "exit"; code?: number | null };
+
+/** A route's live negotiation state from the session snapshot — what a
+ *  terminal tab watches to tell "connecting" from "rejected (reason)". */
+export interface RouteLiveState {
+  state: string;
+  reason?: string;
+}
+
 /** One video packet of a display route, decoded off its IPC channel (a
  *  fixed binary header + the payload — see `watchVideo`). Either a
  *  standalone JPEG frame (the MJPEG transport) or one H.264 access unit
@@ -398,6 +421,8 @@ export function originIcon(origin: string, media: MediaKind): string {
     screen: "🪟",
     control: "🕹",
     controller: "⌨️",
+    terminal: "📟",
+    "terminal-view": "📟",
     keyboard: "⌨️",
     mouse: "🖱",
     touchpad: "🖱",

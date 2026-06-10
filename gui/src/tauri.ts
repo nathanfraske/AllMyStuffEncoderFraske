@@ -15,6 +15,7 @@ import type {
   OwnedRoster,
   PeerInfo,
   RosterPeer,
+  TermEvent,
   UpdatePrefs,
   UpdateStatus,
   VideoFrameMsg,
@@ -47,6 +48,9 @@ export interface SessionSnapshot {
      *  it's currently offering itself for adoption. */
     owner?: string | null;
     claimable?: boolean;
+    /** App features the peer advertises ("terminal", …). Absent from an
+     *  older peer — same as empty. */
+    features?: string[];
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -291,6 +295,125 @@ export async function watchVideo(
     unlisten();
     void invoke("video_unwatch", { routeId, token }).catch(() => {});
   };
+}
+
+// ---- terminal (the mesh-native shell) ----------------------------------
+
+/** Open (or focus) the dedicated terminal window for `node` — one window
+ *  per machine, holding its terminal tabs. Desktop only; the web preview
+ *  keeps its in-page terminal. */
+export async function openTerminalWindow(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_terminal_window", { node });
+}
+
+/** Which machine this window is a terminal for, when the window was opened
+ *  by `openTerminalWindow` (`?terminal=<node id>`). Null in the main window. */
+export function terminalWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("terminal");
+}
+
+/** Send keystrokes or a resize down an active terminal route (this window
+ *  is the viewer; the far end feeds the PTY). Throws when the backend
+ *  refuses, so a dead tab is told apart from a slow one. */
+export async function termSend(routeId: string, event: TermEvent): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("term_send", { routeId, event });
+}
+
+/** Stream one terminal route's output into this window by *pulling* —
+ *  the exact shape `watchVideo` uses (the backend buffers from
+ *  route-activation, pokes `allmystuff://term-ready` when the queue goes
+ *  non-empty, and a safety interval catches lost pokes). The callback gets
+ *  raw PTY bytes ready for `Terminal.write`. Returns an unwatch fn. */
+export async function watchTerminal(
+  routeId: string,
+  cb: (bytes: Uint8Array) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { listen } = await import("@tauri-apps/api/event");
+  const token = (await invoke("term_watch", { routeId })) as number;
+  let stopped = false;
+  let inFlight = false;
+  const tick = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const batch = (await invoke("term_poll", { routeId })) as ArrayBuffer;
+      if (stopped || !(batch instanceof ArrayBuffer)) return;
+      const view = new DataView(batch);
+      let offset = 0;
+      while (offset + 4 <= batch.byteLength) {
+        const len = view.getUint32(offset, true);
+        offset += 4;
+        if (offset + len > batch.byteLength) break;
+        if (len > 0) cb(new Uint8Array(batch.slice(offset, offset + len)));
+        offset += len;
+      }
+    } catch {
+      // One missed poll; the next tick drains everything queued.
+    } finally {
+      inFlight = false;
+    }
+  };
+  const unlisten = await listen<string>("allmystuff://term-ready", (e) => {
+    if (e.payload === routeId) void tick();
+  });
+  const timer = setInterval(() => void tick(), 50);
+  void tick(); // drain whatever buffered before this window subscribed
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    unlisten();
+    void invoke("term_unwatch", { routeId, token }).catch(() => {});
+  };
+}
+
+/** The far shell ended (`allmystuff://term-exit`): which route, and the
+ *  exit code when there was one (null = killed / no status). */
+export async function onTermExit(
+  cb: (e: { route: string; code: number | null }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; code: number | null }>("allmystuff://term-exit", (e) =>
+    cb(e.payload),
+  );
+}
+
+/** Clipboard for the terminal: WebKitGTK's async clipboard API is flaky,
+ *  so under Tauri these ride the clipboard-manager plugin; the web preview
+ *  falls back to `navigator.clipboard`. */
+export async function clipboardWrite(text: string): Promise<void> {
+  if (isTauri()) {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(text);
+    return;
+  }
+  await navigator.clipboard.writeText(text);
+}
+
+export async function clipboardRead(): Promise<string> {
+  if (isTauri()) {
+    const { readText } = await import("@tauri-apps/plugin-clipboard-manager");
+    return (await readText()) ?? "";
+  }
+  return navigator.clipboard.readText();
+}
+
+/** Open a link in the system browser (terminal web-links). Tauri routes it
+ *  through the shell plugin; the web preview just opens a tab. */
+export async function openExternal(url: string): Promise<void> {
+  if (isTauri()) {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener");
 }
 
 /** Tear this window down (a console window's "End session"). Uses
