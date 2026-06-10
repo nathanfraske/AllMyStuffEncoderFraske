@@ -61,6 +61,11 @@
   let bell = $state(false);
   let nextTabId = 1;
   const runtimes = new Map<number, TabRuntime>();
+  // Bumped when an emulator mounts (or disposes). The `runtimes` Map isn't
+  // reactive, so the status effect reads this to re-run the instant a
+  // tab's emulator is ready — otherwise a route that went live before its
+  // pane mounted would wait for the next snapshot poll to get wired.
+  let runtimesReady = $state(0);
   let unlistenExit: (() => void) | null = null;
   let unlistenClose: (() => void) | null = null;
   let bellTimer: ReturnType<typeof setTimeout> | null = null;
@@ -148,6 +153,7 @@
 
     const rt: TabRuntime = { term, fit, started: false, stopWatch: null, cleanup: [] };
     runtimes.set(tabId, rt);
+    runtimesReady++; // nudge the status effect — this tab can wire now
 
     term.open(el);
     // GPU rendering where the webview offers WebGL2; the DOM renderer is
@@ -259,6 +265,7 @@
     const rt = runtimes.get(tabId);
     if (!rt) return;
     runtimes.delete(tabId);
+    runtimesReady++;
     rt.stopWatch?.();
     for (const fn of rt.cleanup) fn();
     rt.term.dispose();
@@ -291,10 +298,19 @@
   // status flips on the route alone; wiring the byte stream additionally
   // needs the emulator runtime, and is retried each pass so a slow mount
   // can never strand a live route on "connecting".
+  //
+  // Both reactive sources are read *unconditionally up front*: an effect's
+  // dependencies are whatever it read on its last run, so reading them
+  // only inside the `tabs` loop meant an empty first run (before onMount's
+  // first tab) subscribed to neither — and then only a `tabs` change, like
+  // opening a *second* tab, would ever re-run it. That's why the first tab
+  // sat on "connecting" until a sibling was added.
   $effect(() => {
+    const states = app.routeStates;
+    void runtimesReady;
     for (const t of tabs) {
       if (!t.routeId) continue;
-      const st = app.routeStates[t.routeId];
+      const st = states[t.routeId];
       const rt = runtimes.get(t.id);
       if (st?.state === "active") {
         if (t.status === "connecting") {
