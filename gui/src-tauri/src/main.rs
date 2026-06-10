@@ -83,8 +83,11 @@ async fn connect_route(
     from: String,
     to: String,
     media: String,
+    video: Option<Vec<String>>,
 ) -> Result<String, String> {
-    mesh.inner().connect(from, to, media).await
+    mesh.inner()
+        .connect(from, to, media, video.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]
@@ -117,6 +120,32 @@ async fn send_input(
     let action: allmystuff_session::InputAction =
         serde_json::from_value(action).map_err(|e| e.to_string())?;
     mesh.inner().send_input(route_id, action).await
+}
+
+/// Register the calling window's interest in a route's inbound video.
+/// Packets queue backend-side from this moment; the window drains them
+/// with `video_poll` once per display refresh. (Pull, not push: a missed
+/// poll costs one tick, where a lost push on Tauri's ordered IPC channel
+/// silently froze the stream for good.)
+#[tauri::command]
+fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
+    mesh.video_watch(route_id)
+}
+
+/// Drain the queued packets for a route as one raw batch:
+/// `[u32 len][28-byte header + payload]…`, empty when nothing arrived.
+#[tauri::command]
+fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
+    tauri::ipc::Response::new(mesh.video_poll(&route_id))
+}
+
+/// Stop streaming a route's frames to the front-end (console closed or
+/// switched input). The token scopes the release to the claim that made
+/// it, so a late unwatch can't tear down a newer watcher of the same
+/// route. Idempotent.
+#[tauri::command]
+fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
+    mesh.video_unwatch(&route_id, token);
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -458,6 +487,9 @@ fn main() {
             claim_node,
             set_claimable,
             send_input,
+            video_watch,
+            video_poll,
+            video_unwatch,
             open_console_window,
             session_snapshot,
             owned_roster,

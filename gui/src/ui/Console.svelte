@@ -11,14 +11,15 @@
   // consoles can be open at once — while the web preview keeps the in-page
   // popover.
   //
-  // The stage is a live MJPEG sink: the backend emits one
-  // `allmystuff://video` event per inbound frame and this component shows
-  // the latest one for its route. When "Keyboard & mouse" is on, the stage
-  // captures pointer/key events, normalizes coordinates onto the streamed
-  // frame, and forwards them down the control route.
+  // The stage is a live MJPEG sink: the backend pushes each inbound frame
+  // for the watched route over a per-route IPC channel (raw JPEG bytes —
+  // see `watchVideo`), and this component shows the latest one. When
+  // "Keyboard & mouse" is on, the stage captures pointer/key events,
+  // normalizes coordinates onto the streamed frame, and forwards them down
+  // the control route.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { closeThisWindow, onThisWindowClose, onVideoFrame } from "../tauri";
+  import { closeThisWindow, onThisWindowClose, watchVideo } from "../tauri";
   import {
     displayName,
     originIcon,
@@ -38,27 +39,46 @@
   );
 
   // ---- live video ---------------------------------------------------
-  let frameSrc = $state<string | null>(null);
+  //
+  // The stage is a canvas with two decode paths: H.264 access units go
+  // through WebCodecs (hardware where the webview has it), JPEG frames
+  // through createImageBitmap — whichever the backend delivers, per
+  // packet. The H.264 decoder is created lazily on the first key unit
+  // and rebuilt on the next one after any error.
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
+  let hasFrame = $state(false);
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
+  let transport = $state("");
+  let decodeFails = $state(0);
+  /// Pipeline anomaly readout — empty while healthy, e.g.
+  /// "in 14/s · out 0/s · q 38 · sw" when packets arrive but frames
+  /// don't, so a stall names its stage on the chip itself.
+  let pipeDiag = $state("");
   let frameCount = 0;
-  let imgEl = $state<HTMLImageElement | null>(null);
+  let inCount = 0;
+  let queuePeek = () => 0;
+  let stallKick = () => {};
+  let decodeModeNote = "";
 
   onMount(() => {
-    let unlistenFrames: (() => void) | undefined;
     let unlistenClose: (() => void) | undefined;
-    void onVideoFrame((f) => {
-      // Every window hears every frame; show only our route's.
-      if (!app.consoleVideoLive || f.route !== app.consoleVideoLive) return;
-      frameSrc = `data:image/jpeg;base64,${f.jpeg}`;
-      frameW = f.width;
-      frameH = f.height;
-      frameCount += 1;
-    }).then((u) => (unlistenFrames = u));
     const fpsTimer = setInterval(() => {
       fps = frameCount;
+      const inRate = inCount;
       frameCount = 0;
+      inCount = 0;
+      // Healthy: most of what arrives gets painted. Anything else is an
+      // anomaly worth wearing on the chip.
+      pipeDiag =
+        inRate > 2 && fps < inRate / 2
+          ? `in ${inRate}/s · out ${fps}/s · q ${queuePeek()}${decodeModeNote ? ` · ${decodeModeNote}` : ""}`
+          : "";
+      // Chunks flowing in, paints collapsed, queue deep: the decoder
+      // stopped consuming (the hardware-pool stall). Rebuild it — the
+      // ladder steps to software decode on the way.
+      if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
     }, 1000);
     if (windowed) {
       // The OS chrome's ✕ must tear the session's routes down too — the
@@ -66,18 +86,213 @@
       void onThisWindowClose(() => void endSession()).then((u) => (unlistenClose = u));
     }
     return () => {
-      unlistenFrames?.();
       unlistenClose?.();
       clearInterval(fpsTimer);
     };
   });
 
-  // A switch of input (or session end) shows the placeholder again rather
-  // than a stale frame from the previous route.
+  // The exact codec string for the incoming stream, read off its SPS
+  // (profile/constraints/level are the three bytes after the NAL header)
+  // — a guessed string risks the decoder sizing reorder buffers for a
+  // stream we're not sending.
+  function spsCodecString(au: Uint8Array): string | null {
+    for (let i = 0; i + 4 < au.length; i++) {
+      if (au[i] !== 0 || au[i + 1] !== 0) continue;
+      const off = au[i + 2] === 1 ? i + 3 : au[i + 2] === 0 && au[i + 3] === 1 ? i + 4 : 0;
+      if (!off) continue;
+      if ((au[off] & 0x1f) === 7 && off + 3 < au.length) {
+        const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
+        return `avc1.${hex(au[off + 1])}${hex(au[off + 2])}${hex(au[off + 3])}`;
+      }
+      i = off;
+    }
+    return null;
+  }
+
+  // Follow the live video route: watch its packet channel while it's up,
+  // and show the placeholder rather than a stale frame whenever it
+  // changes (input switch, session end).
   $effect(() => {
-    void app.consoleVideoLive;
-    frameSrc = null;
+    const route = app.consoleVideoLive;
+    hasFrame = false;
     fps = 0;
+    transport = "";
+    decodeFails = 0;
+    pipeDiag = "";
+    frameCount = 0;
+    inCount = 0;
+    if (!route) return;
+    let cancelled = false;
+    let unwatch: (() => void) | undefined;
+    let decoder: VideoDecoder | null = null;
+    let codecString: string | null = null;
+    // The decode ladder: hardware-preference first; any stall (born dead
+    // *or* mid-stream — the hardware-pool failure shape is bursts, then a
+    // growing queue with no output and no error) rebuilds the decoder one
+    // rung down on software decode. The chip's diag line records the step.
+    let decodeMode: HardwareAcceleration = "no-preference";
+    let decodeCalls = 0;
+    let decodeOutputs = 0;
+    // Decoded frames don't paint inside the output callback: the freshest
+    // one is parked here (superseded frames close immediately — freshness
+    // over completeness) and a rAF paints it. The decoder's frame pool can
+    // never be starved by the paint path, throttled window or not.
+    let pendingFrame: VideoFrame | null = null;
+    let paintScheduled = false;
+    queuePeek = () => decoder?.decodeQueueSize ?? 0;
+    decodeModeNote = "";
+
+    const rebuildDecoder = () => {
+      if (decodeMode === "no-preference") {
+        decodeMode = "prefer-software";
+        decodeModeNote = "sw";
+      }
+      console.warn(
+        `video decoder (${codecString}) stalled — rebuilding with ${decodeMode}`,
+      );
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null; // re-created on the next key unit (≤2s away)
+    };
+    stallKick = () => {
+      if (!cancelled && decoder) rebuildDecoder();
+    };
+
+    const paintPending = () => {
+      paintScheduled = false;
+      const frame = pendingFrame;
+      pendingFrame = null;
+      if (!frame) return;
+      try {
+        if (!cancelled) {
+          paint(frame.displayWidth, frame.displayHeight, (ctx) =>
+            ctx.drawImage(frame, 0, 0),
+          );
+        }
+      } finally {
+        frame.close();
+      }
+    };
+
+    // JPEG bitmap decodes are async — chain them so frames paint in
+    // arrival order.
+    let drawChain = Promise.resolve();
+
+    const paint = (w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
+      const c = canvasEl;
+      if (cancelled || !c) return;
+      if (c.width !== w) c.width = w;
+      if (c.height !== h) c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      draw(ctx);
+      frameW = w;
+      frameH = h;
+      hasFrame = true;
+      frameCount += 1;
+    };
+
+    const dropDecoder = (why: unknown) => {
+      // Surfaced, not swallowed: the chip counts these and the console
+      // log names them — a decoder that quietly dies reads as a freeze.
+      decodeFails += 1;
+      console.warn("video decode error:", why);
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null;
+    };
+
+    void watchVideo(route, (f) => {
+      if (cancelled) return;
+      transport = f.kind === "h264" ? "H.264" : "MJPEG";
+      if (f.kind === "jpeg") {
+        const blob = new Blob([f.data], { type: "image/jpeg" });
+        drawChain = drawChain.then(async () => {
+          if (cancelled) return;
+          try {
+            const bmp = await createImageBitmap(blob);
+            paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            bmp.close();
+          } catch {
+            // A torn frame decodes as nothing; the next one stands alone.
+          }
+        });
+        return;
+      }
+      // H.264 — decode entry is a key unit; deltas before one wait.
+      inCount += 1;
+      if (!decoder || decoder.state === "closed") {
+        if (!f.key) return;
+        codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";
+        decoder = new VideoDecoder({
+          output: (frame) => {
+            decodeOutputs += 1;
+            if (pendingFrame) pendingFrame.close();
+            pendingFrame = frame;
+            if (!paintScheduled) {
+              paintScheduled = true;
+              requestAnimationFrame(paintPending);
+            }
+          },
+          // Recovery is the sender's periodic IDR: drop the decoder,
+          // re-init on the next key unit.
+          error: dropDecoder,
+        });
+        try {
+          decoder.configure({
+            codec: codecString,
+            optimizeForLatency: true,
+            hardwareAcceleration: decodeMode,
+          });
+          decodeCalls = 0;
+          decodeOutputs = 0;
+        } catch (e) {
+          dropDecoder(e);
+          return;
+        }
+      }
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: f.key ? "key" : "delta",
+            timestamp: f.seq,
+            data: f.data,
+          }),
+        );
+        decodeCalls += 1;
+      } catch (e) {
+        dropDecoder(e);
+        return;
+      }
+      // Born-dead decoders (key accepted, nothing ever out) get the same
+      // rebuild as mid-stream stalls — without waiting for the 1s sweep.
+      if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
+    }).then((u) => {
+      // The route may have changed while the subscribe was in flight.
+      if (cancelled) u();
+      else unwatch = u;
+    });
+    return () => {
+      cancelled = true;
+      unwatch?.();
+      stallKick = () => {};
+      if (pendingFrame) {
+        pendingFrame.close();
+        pendingFrame = null;
+      }
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null;
+    };
   });
 
   let closing = false;
@@ -98,11 +313,11 @@
   // ---- keyboard & mouse forwarding -----------------------------------
   //
   // Coordinates are normalized 0..1 over the *streamed frame's* content
-  // box (the <img> is letterboxed with object-fit: contain), which the
+  // box (the canvas is letterboxed with object-fit: contain), which the
   // remote denormalizes onto its own screen — neither side needs the
   // other's resolution.
   function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
-    const img = imgEl;
+    const img = canvasEl;
     if (!img || !frameW || !frameH) return null;
     const r = img.getBoundingClientRect();
     const scale = Math.min(r.width / frameW, r.height / frameH);
@@ -116,12 +331,13 @@
     return { x, y };
   }
 
-  // Pointer moves stream constantly; ~30/s is plenty for a console.
+  // Pointer moves stream constantly; cap at ~60/s — the events are tiny
+  // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!app.consoleControl) return;
     const now = performance.now();
-    if (now - lastMoveAt < 33) return;
+    if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
@@ -228,14 +444,16 @@
         onwheel={onWheel}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
-        {#if frameSrc}
-          <img
-            bind:this={imgEl}
+        {#if app.consoleVideoLive}
+          <canvas
+            bind:this={canvasEl}
             class="live"
-            src={frameSrc}
-            alt="Live screen of {displayName(node)}"
-            draggable="false"
-          />
+            class:waiting={!hasFrame}
+            aria-label="Live screen of {displayName(node)}"
+          ></canvas>
+        {/if}
+        {#if hasFrame}
+          <!-- the canvas above is the stage -->
         {:else if selected}
           <div class="screen" style="--mc: {mediaColor(selected.media)}">
             <div class="screen-glyph">{inputIcon(selected)}</div>
@@ -282,9 +500,11 @@
         </div>
 
         <div class="status">
-          {#if frameSrc}
+          {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{decodeFails
+                ? ` · ${decodeFails} decode-err`
+                : ""}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
             </span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}
@@ -463,6 +683,12 @@
     flex: 1;
     min-height: 0;
     display: grid;
+    /* The single track must be the stage's size, never the content's:
+       an auto track grows to the canvas's intrinsic width (1920), which
+       overflowed narrower windows and clipped the sides — the letterbox
+       must come from object-fit inside the element, both axes. */
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 1rem;
     background:
@@ -482,6 +708,12 @@
     -webkit-user-drag: none;
     border-radius: 4px;
     box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
+  }
+  /* Mounted (so the first frame has somewhere to land) but invisible
+     until it does — the placeholder shows through. */
+  .live.waiting {
+    visibility: hidden;
+    position: absolute;
   }
   .screen {
     width: 100%;

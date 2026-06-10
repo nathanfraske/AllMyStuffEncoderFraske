@@ -3,14 +3,18 @@
 //! `control.rs`); this module is just the transport — connect, write one
 //! line, read one line — over the local socket (`interprocess`).
 //!
-//! Two shapes, exactly like the MyOwnMesh GUI's client:
+//! Three shapes — the first two exactly like the MyOwnMesh GUI's client:
 //!
 //!  * [`ControlClient::request`] — short-lived round trip for every
 //!    one-shot command.
 //!  * [`ControlClient::subscribe_events`] — a long-lived stream that
 //!    forwards each `ServerOut` line to a channel until the daemon
 //!    disconnects.
+//!  * [`MediaPipe`] — a long-lived *request* connection for the media
+//!    plane, where per-send connect + round-trip would sit inside every
+//!    frame.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -50,7 +54,9 @@ impl ControlClient {
         #[cfg(not(unix))]
         {
             Ok(Self {
-                addr: SocketAddr::Name(allmystuff_protocol::control::default_pipe_name().to_string()),
+                addr: SocketAddr::Name(
+                    allmystuff_protocol::control::default_pipe_name().to_string(),
+                ),
             })
         }
     }
@@ -168,4 +174,86 @@ impl ControlClient {
             .await
             .context("connect daemon socket — is `myownmesh serve` running?")
     }
+}
+
+/// A persistent connection dedicated to the media plane's sends.
+///
+/// [`ControlClient::request`]'s connect-send-await-close shape is right
+/// for one-shot commands and wrong for a 24 fps frame stream: every ≤40 KiB
+/// video chunk paid a socket connect plus a full round trip, *serially* —
+/// several RTTs of dead air inside each frame. The daemon serves a
+/// connection's request lines in order (`handle_client` loops), so this
+/// pipe writes them back-to-back and drains the responses on a background
+/// reader, which logs daemon refusals (rate-limited) instead of stalling
+/// the send path to hear them.
+///
+/// Backpressure survives: when the daemon stops keeping up, the socket
+/// buffer fills, `send` awaits, the bounded video queue behind it fills,
+/// and the capture side drops frames — freshness over latency, unchanged.
+/// Any write failure drops the connection; the next send reconnects.
+pub struct MediaPipe {
+    client: Arc<ControlClient>,
+    writer: tokio::sync::Mutex<Option<interprocess::local_socket::tokio::SendHalf>>,
+}
+
+impl MediaPipe {
+    pub fn new(client: Arc<ControlClient>) -> Self {
+        MediaPipe {
+            client,
+            writer: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Queue one request down the pipe, (re)connecting first if needed.
+    /// `Ok` means the bytes reached the socket; the daemon's verdict
+    /// arrives later via the reader task's (rate-limited) log line.
+    pub async fn send(&self, req: &Request) -> Result<()> {
+        let line = serde_json::to_string(req)? + "\n";
+        let mut writer = self.writer.lock().await;
+        if writer.is_none() {
+            let stream = self.client.connect().await?;
+            let (reader, send_half) = stream.split();
+            spawn_response_drain(reader);
+            *writer = Some(send_half);
+        }
+        let w = writer.as_mut().expect("connected above");
+        if let Err(e) = w.write_all(line.as_bytes()).await {
+            *writer = None;
+            return Err(anyhow!("media pipe write: {e}"));
+        }
+        if let Err(e) = w.flush().await {
+            *writer = None;
+            return Err(anyhow!("media pipe flush: {e}"));
+        }
+        Ok(())
+    }
+}
+
+/// Drain one pipe connection's response lines, surfacing refusals. Media
+/// send failures repeat at frame rate when a peer drops mid-stream, so
+/// warnings are rate-limited; the task ends with its socket.
+fn spawn_response_drain(reader: interprocess::local_socket::tokio::RecvHalf) {
+    tokio::spawn(async move {
+        const WARN_EVERY: Duration = Duration::from_secs(5);
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let mut last_warn: Option<std::time::Instant> = None;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(resp) = serde_json::from_str::<Response>(line.trim()) else {
+                continue;
+            };
+            if !resp.ok && last_warn.is_none_or(|t| t.elapsed() >= WARN_EVERY) {
+                last_warn = Some(std::time::Instant::now());
+                tracing::warn!(
+                    "media send refused by daemon: {}",
+                    resp.error.unwrap_or_else(|| "(no error)".into())
+                );
+            }
+        }
+    });
 }

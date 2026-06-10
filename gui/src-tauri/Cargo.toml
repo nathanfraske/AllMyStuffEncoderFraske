@@ -61,8 +61,20 @@ allmystuff-updater = { path = "../../crates/allmystuff-updater" }
 # MyOwnLLM uses for its audio.
 cpal = "0.15"
 xcap = "0.9"
-jpeg-encoder = "0.7"
+# `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
+# speed on typical x86-64 desktops, plain safe Rust elsewhere.
+jpeg-encoder = { version = "0.7", features = ["simd"] }
 enigo = "0.6"
+# H.264 encode for the mesh's video track lane (Cisco's encoder, built
+# from source — needs only a C/C++ toolchain). MJPEG stays as the
+# fallback wherever this can't run or the peer can't decode.
+openh264 = "0.9"
+# Access units ride the daemon control socket as base64 (same encoding
+# the session crate's media frames use).
+base64 = "0.22"
+# The per-pixel hot loops (frame downscale/strip), split out so dev
+# builds optimize them — see the crate's manifest for the why.
+allmystuff-pixels = { path = "pixels" }
 
 [profile.release]
 panic = "abort"
@@ -70,3 +82,39 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# The media plane touches every screen pixel every frame; the crates doing
+# that work get speed while the rest of the app keeps optimizing for size —
+# and dev builds get the same treatment so `just dev` streams at a usable
+# rate instead of running the pixel loops unoptimized.
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+[profile.release.package.openh264]
+opt-level = 3
+[profile.release.package.openh264-sys2]
+opt-level = 3
+[profile.release.package.xcap]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+# The media plane's framing also leans on these every packet (JSON lines
+# on the control socket, base64 payloads) — worth optimizing in dev too.
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3

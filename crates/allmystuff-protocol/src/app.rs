@@ -155,7 +155,19 @@ pub enum RouteControl {
     /// "I'd like to connect this." Carries the full route so the receiver
     /// can show exactly what's being asked and check it against its own
     /// catalog before accepting.
-    Offer { route: Route },
+    Offer {
+        route: Route,
+        /// Video transports the *offerer* can consume for a display
+        /// route, best first (today: `"h264"` — the mesh's RTP track
+        /// lane). The accepting side — the machine whose screen will
+        /// stream — picks the best one it can produce, falling back to
+        /// MJPEG over the media channel when the list is empty or
+        /// nothing matches. Absent on v0.1.x offers (`default`) and
+        /// ignored by v0.1.x receivers: both skews degrade to MJPEG,
+        /// never to a broken stream.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        video: Vec<String>,
+    },
     /// "Go ahead" — media may start.
     Accept { route_id: String },
     /// "No" — with a human reason ("not authorized", "device busy").
@@ -244,6 +256,35 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn route_offer_video_accepts_skew_both_ways() {
+        // A v0.1.x offer has no `video` field — it decodes as "MJPEG
+        // only" rather than failing.
+        let legacy = r#"{"kind":"offer","route":{
+            "id":"r1","from":"a:screen","to":"b:view","media":"display"
+        }}"#;
+        let rc: RouteControl = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(rc, RouteControl::Offer { ref video, .. } if video.is_empty()));
+
+        // An empty accepts list serializes *without* the field, so a
+        // v0.1.x receiver sees exactly the shape it always did.
+        let s = serde_json::to_string(&rc).unwrap();
+        assert!(!s.contains("video"));
+
+        // A populated list round-trips.
+        let offered = match rc {
+            RouteControl::Offer { route, .. } => RouteControl::Offer {
+                route,
+                video: vec!["h264".into()],
+            },
+            _ => unreachable!(),
+        };
+        let s = serde_json::to_string(&offered).unwrap();
+        assert!(s.contains("\"video\":[\"h264\"]"));
+        let back: RouteControl = serde_json::from_str(&s).unwrap();
+        assert_eq!(offered, back);
     }
 
     #[test]

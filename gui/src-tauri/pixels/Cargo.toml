@@ -1,0 +1,12 @@
+# The media plane's per-pixel hot loops, split out so dev builds can give
+# them `opt-level = 3` (see the profile overrides in ../Cargo.toml) while
+# the app crate itself stays unoptimized for fast compiles. At opt 0 the
+# scaler alone costs tens of ms per 1920-edge frame — a single-digit-fps
+# ceiling that has nothing to do with the pipeline being measured.
+[package]
+name = "allmystuff-pixels"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]

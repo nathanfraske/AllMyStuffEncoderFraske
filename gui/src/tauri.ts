@@ -110,9 +110,15 @@ export function scanSelf(): Promise<ScanResult | null> {
 }
 
 /** Offer a real connection over the mesh. Returns the route id, or null in
- *  web mode (the store falls back to a local route for the demo). */
+ *  web mode (the store falls back to a local route for the demo). For a
+ *  display route the offer advertises which video transports this side
+ *  can consume — H.264 when the webview has WebCodecs (the streaming side
+ *  then uses the mesh's RTP track lane), with MJPEG as the floor both
+ *  ends always share. */
 export function connectRoute(from: string, to: string, media: MediaKind): Promise<string | null> {
-  return tryInvoke<string>("connect_route", { from, to, media });
+  const video =
+    media === "display" && typeof VideoDecoder !== "undefined" ? ["h264"] : [];
+  return tryInvoke<string>("connect_route", { from, to, media, video });
 }
 
 export function disconnectRoute(routeId: string): Promise<null> {
@@ -175,12 +181,78 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
   return tryInvoke("send_input", { routeId, action });
 }
 
-/** Subscribe to inbound display frames (every console window receives all
- *  of them and filters by its own route). No-op unlisten in web mode. */
-export async function onVideoFrame(cb: (f: VideoFrameMsg) => void): Promise<() => void> {
+/** Decode one wire packet (28-byte little-endian header + payload) out
+ *  of a poll batch. Returns null for shapes we don't recognize. */
+function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoFrameMsg | null {
+  if (len < 28) return null;
+  const head = new DataView(buf, offset, 28);
+  const kindByte = head.getUint8(0);
+  if (kindByte !== 1 && kindByte !== 2) return null;
+  return {
+    kind: kindByte === 2 ? "h264" : "jpeg",
+    key: (head.getUint8(1) & 1) === 1,
+    width: head.getUint32(4, true),
+    height: head.getUint32(8, true),
+    sourceWidth: head.getUint32(12, true),
+    sourceHeight: head.getUint32(16, true),
+    seq: Number(head.getBigUint64(20, true)),
+    data: new Uint8Array(buf.slice(offset + 28, offset + len)),
+  };
+}
+
+/** Stream one route's inbound video into this window by *pulling*: the
+ *  backend queues raw packets per route and this drains them every
+ *  display tick (`video_poll` → `[u32 len][packet]…`). A failed poll
+ *  costs one tick and the next one recovers — unlike a push channel,
+ *  where ordered delivery means one lost message silently freezes the
+ *  stream while the backend keeps sending. Returns an unwatch fn (a
+ *  no-op in web mode, where no frames can arrive anyway). */
+export async function watchVideo(
+  routeId: string,
+  cb: (f: VideoFrameMsg) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
+  const { invoke } = await import("@tauri-apps/api/core");
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<VideoFrameMsg>("allmystuff://video", (e) => cb(e.payload));
+  const token = (await invoke("video_watch", { routeId })) as number;
+  let stopped = false;
+  let inFlight = false;
+  const tick = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const batch = (await invoke("video_poll", { routeId })) as ArrayBuffer;
+      if (stopped || !(batch instanceof ArrayBuffer)) return;
+      const view = new DataView(batch);
+      let offset = 0;
+      while (offset + 4 <= batch.byteLength) {
+        const len = view.getUint32(offset, true);
+        offset += 4;
+        if (len === 0 || offset + len > batch.byteLength) break;
+        const packet = parseVideoPacket(batch, offset, len);
+        offset += len;
+        if (packet) cb(packet);
+      }
+    } catch {
+      // One missed poll; the next tick drains everything queued.
+    } finally {
+      inFlight = false;
+    }
+  };
+  // Drain on the backend's "queue went non-empty" poke — event delivery
+  // isn't timer-throttled, so an occluded (non-maximized) console keeps
+  // painting at full rate, and arrival-driven pulls beat the interval's
+  // worst-case 16 ms. The interval stays as the safety net.
+  const unlisten = await listen<string>("allmystuff://video-ready", (e) => {
+    if (e.payload === routeId) void tick();
+  });
+  const timer = setInterval(() => void tick(), 16);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    unlisten();
+    void invoke("video_unwatch", { routeId, token }).catch(() => {});
+  };
 }
 
 /** Tear this window down (a console window's "End session"). Uses
