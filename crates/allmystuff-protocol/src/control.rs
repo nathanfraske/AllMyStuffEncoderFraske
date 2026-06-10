@@ -112,6 +112,10 @@ pub enum Request {
     ChannelSendTo {
         network: String,
         channel: String,
+        /// The peer's **bare pubkey** (`public_id`). The daemon's peer set is
+        /// keyed by what signaling announces — a display id (`pubkey-SUFFIX`,
+        /// the form `IdentityShow` and presence carry) misses it and the
+        /// daemon replies "peer not found". Strip the suffix before sending.
         peer: String,
         payload: Value,
     },

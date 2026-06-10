@@ -942,8 +942,12 @@ class AppStore {
       return;
     }
     if (this.backendConnected) {
-      // The device confirms by re-advertising presence with owner = us.
-      void claimNode(nodeId);
+      // The device confirms by re-advertising presence with owner = us (the
+      // `claimed` ownership event toasts the success); a delivery failure
+      // rejects, so the ask never silently goes nowhere.
+      claimNode(nodeId).catch((e) => {
+        this.toast("warn", `Couldn't ask ${n.label} to join: ${String(e)}`);
+      });
       this.toast("info", `Asking ${n.label} to join your fleet…`);
     } else {
       // Demo/web: the claimable device accepts and joins the fleet, so the
