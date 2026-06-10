@@ -424,6 +424,15 @@ class AppStore {
     if (snap) this.applySessionSnapshot(snap);
   }
 
+  /** Pull a fresh session snapshot now. For views whose state hangs off
+   *  route negotiation (a terminal tab's connecting → live → ended): the
+   *  `allmystuff://session` event is the latency win, but a pull is the
+   *  truth — the same doctrine the video plane settled on after lost
+   *  pushes froze streams. */
+  refreshSession(): Promise<void> {
+    return this.pullSessionSnapshot();
+  }
+
   /** Poll the daemon's mesh membership as a safety net (peer/roster changes
    *  don't all arrive as session snapshots). Mirrors the MyOwnMesh client. */
   private startMeshPolling() {

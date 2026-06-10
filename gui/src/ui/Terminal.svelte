@@ -407,6 +407,11 @@
 
   onMount(() => {
     newTab();
+    // Tab statuses hang off route negotiation states from session
+    // snapshots. Snapshot *events* are the latency win but can be lost
+    // (this codebase's video plane moved to pull for exactly that
+    // reason) — so pull the snapshot on a short interval as the truth.
+    const sessionPoll = setInterval(() => void app.refreshSession(), 1000);
     void onTermExit((ev) => {
       const t = tabs.find((x) => x.routeId === ev.route);
       if (!t) return;
@@ -422,6 +427,7 @@
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
     return () => {
+      clearInterval(sessionPoll);
       unlistenExit?.();
       unlistenClose?.();
       if (bellTimer) clearTimeout(bellTimer);
@@ -490,10 +496,13 @@
               <div class="veil">
                 <p>Connecting to <b>{displayName(node)}</b>…</p>
                 <!-- The raw negotiation state, so a stall names its stage:
-                     "offered" = the far side never answered; no state at
-                     all = the offer never reached the backend. -->
+                     "offered" = the far side never answered; "not
+                     negotiated yet" with other routes known = this route
+                     id is missing from the snapshot (a key bug); with 0
+                     known = snapshots aren't reaching this window. -->
                 <p class="diag">
                   route {app.routeStates[t.routeId ?? ""]?.state ?? "not negotiated yet"}
+                  · {Object.keys(app.routeStates).length} known
                 </p>
               </div>
             {:else if t.status === "offline"}
