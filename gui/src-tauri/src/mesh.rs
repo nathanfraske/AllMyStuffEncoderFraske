@@ -513,17 +513,19 @@ impl Mesh {
                         return;
                     };
                     let structural = self.ownership.merge_fleet(&me, &roster);
+                    let outcome = if structural {
+                        "merged"
+                    } else if self.ownership.fleet().is_some_and(|f| f.key == roster.key) {
+                        "in sync"
+                    } else {
+                        "ignored (not our fleet)"
+                    };
                     tracing::info!(
-                        "owned roster from {}: key …{} v{} ({} members) → {}",
+                        "owned roster from {}: key …{} v{} ({} members) → {outcome}",
                         short_id(&from),
                         key_tail(&roster.key),
                         roster.version,
                         roster.members.len(),
-                        if structural {
-                            "merged"
-                        } else {
-                            "no change / not for us"
-                        }
                     );
                     if structural {
                         self.broadcast_owned().await;

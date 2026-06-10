@@ -373,6 +373,7 @@ class AppStore {
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
       this.ownedFleet = r;
+      this.reconcileFleetRelationships();
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
@@ -676,6 +677,29 @@ class AppStore {
         this.catalog.routes.push({ ...lr.route, group: null });
       } else if (!active && exists) {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
+      }
+    }
+
+    this.reconcileFleetRelationships();
+  }
+
+  /** Fleet membership implies the relationship. Ownership is *directional*
+   *  — your owner machine advertises no owner of its own — so on a claimed
+   *  device its owner would read "unclaimed" forever even while wearing the
+   *  fleet badge (mutually exclusive states on screen). Any co-member of
+   *  your fleet is *yours*; one that left (or kicked you) and doesn't claim
+   *  us as owner reverts to unclaimed. A relationship the user set to
+   *  `shared` is never touched. */
+  private reconcileFleetRelationships() {
+    const meInFleet = this.isFleetMember(this.localId);
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this" || this.isMe(n.id)) continue;
+      const inFleet = meInFleet && this.isFleetMember(n.id);
+      const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
+      if (n.relationship.kind === "unclaimed" && inFleet) {
+        n.relationship = { kind: "mine" };
+      } else if (n.relationship.kind === "mine" && !inFleet && !ownedByMe) {
+        n.relationship = { kind: "unclaimed" };
       }
     }
   }
@@ -1469,7 +1493,10 @@ class AppStore {
     if (!isTauri()) return;
     try {
       const r = await ownedRoster();
-      if (r) this.ownedFleet = r;
+      if (r) {
+        this.ownedFleet = r;
+        this.reconcileFleetRelationships();
+      }
     } catch {
       /* no daemon yet — claim still simulates a fleet in demo mode */
     }
