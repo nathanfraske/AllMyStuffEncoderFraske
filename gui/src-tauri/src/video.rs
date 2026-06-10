@@ -174,9 +174,11 @@ const H264_MAX_EDGE: u32 = 1920;
 /// a LAN (where direct peers live); link-adaptive rate is the follow-up
 /// for relayed/WAN paths.
 const H264_BITRATE_BPS: u32 = 10_000_000;
-/// Forced IDR cadence — bounds how long a viewer that joined mid-stream
-/// (or lost an unrepaired packet) waits for a clean decode entry.
-const H264_IDR_EVERY: Duration = Duration::from_secs(4);
+/// Forced IDR cadence — bounds how long a viewer that joined mid-stream,
+/// lost an unrepaired packet, or rebuilt its decoder waits for a clean
+/// decode entry. 2 s costs ~0.3-0.6 Mbps at a 1920 edge: cheap insurance
+/// next to a multi-second freeze.
+const H264_IDR_EVERY: Duration = Duration::from_secs(2);
 /// How often each stream logs its pipeline counters — the dial-in line:
 /// effective fps, where the per-frame milliseconds go, and the bitrate.
 const STATS_EVERY: Duration = Duration::from_secs(5);

@@ -59,6 +59,7 @@
   let frameCount = 0;
   let inCount = 0;
   let queuePeek = () => 0;
+  let stallKick = () => {};
   let decodeModeNote = "";
 
   onMount(() => {
@@ -74,6 +75,10 @@
         inRate > 2 && fps < inRate / 2
           ? `in ${inRate}/s · out ${fps}/s · q ${queuePeek()}${decodeModeNote ? ` · ${decodeModeNote}` : ""}`
           : "";
+      // Chunks flowing in, paints collapsed, queue deep: the decoder
+      // stopped consuming (the hardware-pool stall). Rebuild it — the
+      // ladder steps to software decode on the way.
+      if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
     }, 1000);
     if (windowed) {
       // The OS chrome's ✕ must tear the session's routes down too — the
@@ -121,15 +126,57 @@
     let unwatch: (() => void) | undefined;
     let decoder: VideoDecoder | null = null;
     let codecString: string | null = null;
-    // The decode ladder: hardware-preference first; if chunks go in and
-    // nothing comes out for ~1.5s, rebuild with software decode (the
-    // hardware paths are where low-latency output is flakiest). The
-    // chip's diag line records the step.
+    // The decode ladder: hardware-preference first; any stall (born dead
+    // *or* mid-stream — the hardware-pool failure shape is bursts, then a
+    // growing queue with no output and no error) rebuilds the decoder one
+    // rung down on software decode. The chip's diag line records the step.
     let decodeMode: HardwareAcceleration = "no-preference";
     let decodeCalls = 0;
     let decodeOutputs = 0;
+    // Decoded frames don't paint inside the output callback: the freshest
+    // one is parked here (superseded frames close immediately — freshness
+    // over completeness) and a rAF paints it. The decoder's frame pool can
+    // never be starved by the paint path, throttled window or not.
+    let pendingFrame: VideoFrame | null = null;
+    let paintScheduled = false;
     queuePeek = () => decoder?.decodeQueueSize ?? 0;
     decodeModeNote = "";
+
+    const rebuildDecoder = () => {
+      if (decodeMode === "no-preference") {
+        decodeMode = "prefer-software";
+        decodeModeNote = "sw";
+      }
+      console.warn(
+        `video decoder (${codecString}) stalled — rebuilding with ${decodeMode}`,
+      );
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null; // re-created on the next key unit (≤2s away)
+    };
+    stallKick = () => {
+      if (!cancelled && decoder) rebuildDecoder();
+    };
+
+    const paintPending = () => {
+      paintScheduled = false;
+      const frame = pendingFrame;
+      pendingFrame = null;
+      if (!frame) return;
+      try {
+        if (!cancelled) {
+          paint(frame.displayWidth, frame.displayHeight, (ctx) =>
+            ctx.drawImage(frame, 0, 0),
+          );
+        }
+      } finally {
+        frame.close();
+      }
+    };
+
     // JPEG bitmap decodes are async — chain them so frames paint in
     // arrival order.
     let drawChain = Promise.resolve();
@@ -186,10 +233,12 @@
         decoder = new VideoDecoder({
           output: (frame) => {
             decodeOutputs += 1;
-            paint(frame.displayWidth, frame.displayHeight, (ctx) =>
-              ctx.drawImage(frame, 0, 0),
-            );
-            frame.close();
+            if (pendingFrame) pendingFrame.close();
+            pendingFrame = frame;
+            if (!paintScheduled) {
+              paintScheduled = true;
+              requestAnimationFrame(paintPending);
+            }
           },
           // Recovery is the sender's periodic IDR: drop the decoder,
           // re-init on the next key unit.
@@ -221,26 +270,9 @@
         dropDecoder(e);
         return;
       }
-      // Chunks in, nothing out: step the ladder down to software decode
-      // once; the next key (≤4s away) rebuilds. If software stalls too,
-      // the diag chip keeps saying so rather than pretending.
-      if (
-        decodeOutputs === 0 &&
-        decodeCalls >= 20 &&
-        decodeMode === "no-preference"
-      ) {
-        decodeMode = "prefer-software";
-        decodeModeNote = "sw";
-        console.warn(
-          `video decoder (${codecString}) consumed ${decodeCalls} chunks without output — retrying with software decode`,
-        );
-        try {
-          if (decoder.state !== "closed") decoder.close();
-        } catch {
-          // already closed
-        }
-        decoder = null;
-      }
+      // Born-dead decoders (key accepted, nothing ever out) get the same
+      // rebuild as mid-stream stalls — without waiting for the 1s sweep.
+      if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
     }).then((u) => {
       // The route may have changed while the subscribe was in flight.
       if (cancelled) u();
@@ -249,6 +281,11 @@
     return () => {
       cancelled = true;
       unwatch?.();
+      stallKick = () => {};
+      if (pendingFrame) {
+        pendingFrame.close();
+        pendingFrame = null;
+      }
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
       } catch {
