@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS bundle by tauri-build. Without these usage
+     strings macOS silently denies the device (the capture stream runs and
+     delivers pure zeros — no error, no prompt), which reads as "audio
+     route active, no sound". In `just dev` the permission attaches to the
+     terminal that launched cargo instead; the bundle needs its own. -->
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AllMyStuff streams this machine's microphone to the devices you wire it to.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>AllMyStuff streams this machine's cameras to the devices you wire them to.</string>
+</dict>
+</plist>

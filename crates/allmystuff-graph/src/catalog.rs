@@ -315,10 +315,11 @@ impl Catalog {
 
     /// Pick the target capability that can play `role` for `media`.
     /// Preference order: a synthetic machine capability (origin
-    /// `screen`/`control`/`system`) first, so an RDC group lands on "this
-    /// computer" rather than a stray device; then the category's **current
-    /// default** device, so a plain "connect audio here" lands on the mic
-    /// the machine actually uses; then the first physical match by id order.
+    /// `screen`/`control`/`controller`/`system`) first, so an RDC group
+    /// lands on "this computer" rather than a stray device; then the
+    /// category's **current default** device, so a plain "connect audio
+    /// here" lands on the mic the machine actually uses; then the first
+    /// physical match by id order.
     fn match_endpoint(
         &self,
         node: &NodeId,
@@ -380,7 +381,7 @@ fn flow_word(f: Flow) -> &'static str {
 }
 
 fn is_machine_origin(origin: &str) -> bool {
-    matches!(origin, "screen" | "control" | "system")
+    matches!(origin, "screen" | "control" | "controller" | "system")
 }
 
 /// Sort key for [`Catalog::match_endpoint`] (lower = preferred): a

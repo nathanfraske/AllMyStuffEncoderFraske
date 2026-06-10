@@ -36,6 +36,7 @@ use crate::control_client::{ControlClient, MediaPipe};
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
 use crate::video::{VideoBridge, VideoMode, VideoPacket};
+use crate::video_decode::{Au, DecodeBridge};
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -47,6 +48,10 @@ pub struct Mesh {
     /// Screen capture for display routes this machine sources (the far end
     /// of a console session looking at us).
     video: Arc<VideoBridge>,
+    /// Native H.264 decode for inbound display routes whose console window
+    /// asked for ready-to-paint frames (no WebCodecs in its webview, or its
+    /// decoder stalled out).
+    video_decode: Arc<DecodeBridge>,
     /// Keyboard/mouse injection for input routes that sink here — gated on
     /// the sender being our owner or a fleet member.
     injector: Injector,
@@ -105,6 +110,9 @@ pub struct Mesh {
 /// can't delete its successor's queue.
 struct VideoWatcher {
     token: u64,
+    /// Whether this window asked the backend to decode H.264 for it
+    /// (raw RGBA frames out) instead of passing access units through.
+    decode: bool,
     queue: std::collections::VecDeque<Vec<u8>>,
 }
 
@@ -169,6 +177,7 @@ impl Mesh {
             app,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
+            video_decode: Arc::new(DecodeBridge::new()),
             injector: Injector::new(),
             state: Mutex::new(State {
                 session: None,
@@ -483,7 +492,11 @@ impl Mesh {
             label,
             hostname,
             summary: allmystuff_bridge::node_summary(&inv),
-            capabilities: allmystuff_bridge::capabilities_from_inventory(&inv, &node),
+            capabilities: allmystuff_bridge::capabilities_with_screens(
+                &inv,
+                &node,
+                &crate::video::extra_screens(),
+            ),
             // Tell peers who owns this device and whether it's up for
             // adoption, so they can't silently grab a box that's already
             // spoken for (or one that was never put into claim mode).
@@ -729,11 +742,12 @@ impl Mesh {
 
     /// Free any track-lane claims held by a route that just ended, in
     /// both directions — the next display route to that peer can take
-    /// the lane over.
+    /// the lane over. The route's native decoder (if any) goes with it.
     fn release_video_lanes(&self, route_id: &str) {
         self.video_lane_out.lock().retain(|_, rid| rid != route_id);
         self.video_lane_in.lock().retain(|_, rid| rid != route_id);
         self.video_in_stats.lock().remove(route_id);
+        self.video_decode.stop(route_id);
     }
 
     /// Count one inbound video payload for `route_id` and emit the
@@ -772,7 +786,16 @@ impl Mesh {
     /// It belongs to whichever of our routes claimed that peer's inbound
     /// lane — gated exactly like MJPEG frames (route live, sinks here,
     /// sender is the route's peer) before it reaches a console window.
-    fn handle_video_inbound(&self, from: &str, rtp_timestamp: u32, key: bool, data_b64: &str) {
+    /// Where it goes next is the watcher's choice: access units straight
+    /// through (the webview decodes — WebCodecs), or through the native
+    /// decoder, which hands the window ready-to-paint RGBA frames.
+    fn handle_video_inbound(
+        self: &Arc<Self>,
+        from: &str,
+        rtp_timestamp: u32,
+        key: bool,
+        data_b64: &str,
+    ) {
         use base64::Engine as _;
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_lane_in.lock().get(&canon).cloned() else {
@@ -792,7 +815,23 @@ impl Mesh {
         self.note_video_in(&route_id, "H.264", data.len());
         // 90 kHz RTP clock → µs for the decoder's timestamps.
         let ts_us = rtp_timestamp as u64 * 1000 / 90;
-        self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
+        let wants_decode = self
+            .video_watchers
+            .lock()
+            .get(&route_id)
+            .is_some_and(|w| w.decode);
+        if wants_decode {
+            let mesh = Arc::downgrade(self);
+            let rid = route_id.clone();
+            self.video_decode
+                .feed(&route_id, Au { ts_us, key, data }, move |packet| {
+                    if let Some(mesh) = mesh.upgrade() {
+                        mesh.enqueue_decoded(&rid, packet);
+                    }
+                });
+        } else {
+            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
+        }
     }
 
     /// Queue one packet for a watching console window; drop the packet
@@ -824,6 +863,22 @@ impl Mesh {
         }
     }
 
+    /// Queue one natively decoded frame, freshest-wins: a decoded picture
+    /// supersedes anything the window hasn't pulled yet (each is a complete
+    /// screen — painting two per tick buys nothing but latency). Encoded
+    /// packets append instead, because H.264 deltas must all reach their
+    /// decoder; that distinction is the whole reason for two enqueues.
+    fn enqueue_decoded(&self, route_id: &str, packet: Vec<u8>) {
+        let mut map = self.video_watchers.lock();
+        let Some(w) = map.get_mut(route_id) else {
+            tracing::debug!("no console window watching {route_id} — decoded frame dropped");
+            return;
+        };
+        w.queue.clear();
+        w.queue.push_back(packet);
+        let _ = self.app.emit("allmystuff://video-ready", route_id);
+    }
+
     /// Front-end command: offer a route from `from` to `to`.
     pub async fn connect(
         self: &Arc<Self>,
@@ -832,10 +887,11 @@ impl Mesh {
         media: String,
         video: Vec<String>,
     ) -> Result<String, String> {
-        // Only advertise transports the *whole* local stack can consume:
-        // the webview said it can decode, but inbound samples arrive via
-        // the daemon — an old one would negotiate a stream it can't
-        // deliver.
+        // Only advertise transports the *whole* local stack can consume.
+        // H.264 decode is always covered (WebCodecs where the webview has
+        // it, the native decoder where it doesn't) — but inbound samples
+        // arrive via the daemon, and an old one would negotiate a stream
+        // it can't deliver.
         let video = if self.daemon_video.load(Ordering::SeqCst) {
             video
         } else {
@@ -906,14 +962,24 @@ impl Mesh {
     /// Register interest in one route's inbound frames (replacing any
     /// previous watcher — the route shows in one window). Packets queue
     /// from this moment; the window drains them with [`Self::video_poll`].
-    /// Returns the claim token to pass back to [`Self::video_unwatch`].
-    pub fn video_watch(&self, route_id: String) -> u64 {
+    /// `decode` asks the backend to run inbound H.264 through the native
+    /// decoder and queue ready-to-paint RGBA frames instead of access
+    /// units — for webviews without WebCodecs, and the last rung of the
+    /// console's decode ladder. Returns the claim token to pass back to
+    /// [`Self::video_unwatch`].
+    pub fn video_watch(&self, route_id: String, decode: bool) -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        if !decode {
+            // A pass-through watcher replacing a decoding one (input
+            // switch, ladder reset) leaves no orphan decoder behind.
+            self.video_decode.stop(&route_id);
+        }
         self.video_watchers.lock().insert(
             route_id,
             VideoWatcher {
                 token,
+                decode,
                 queue: std::collections::VecDeque::new(),
             },
         );
@@ -927,6 +993,8 @@ impl Mesh {
         let mut map = self.video_watchers.lock();
         if map.get(route_id).is_some_and(|w| w.token == token) {
             map.remove(route_id);
+            drop(map);
+            self.video_decode.stop(route_id);
         }
     }
 
@@ -1581,9 +1649,23 @@ impl Mesh {
                     } else {
                         VideoMode::Mjpeg
                     };
+                    // Which monitor: the synthetic `screen` is the primary;
+                    // a `screen:<id>` capability names one of the others
+                    // (the ids come from this machine's own monitor
+                    // enumeration — see `video::extra_screens`).
+                    let monitor = route
+                        .from
+                        .as_str()
+                        .split_once(':')
+                        .and_then(|(_, dev)| dev.strip_prefix("screen:"))
+                        .and_then(|id| id.parse::<u32>().ok());
                     tracing::info!(
-                        "route {} active — streaming this screen to {} ({})",
+                        "route {} active — streaming this {} to {} ({})",
                         route.id,
+                        match monitor {
+                            Some(id) => format!("monitor {id}"),
+                            None => "screen".to_string(),
+                        },
                         short_id(&to_node),
                         match mode {
                             VideoMode::H264 => "H.264 track",
@@ -1593,7 +1675,7 @@ impl Mesh {
                     let peer = to_node.clone();
                     let tx = self.video_out.clone();
                     self.video
-                        .start_capture(route.id.clone(), mode, move |packet| {
+                        .start_capture(route.id.clone(), mode, monitor, move |packet| {
                             // try_send: a full queue drops this packet; the next
                             // capture carries a fresher picture.
                             tx.try_send((peer.clone(), packet)).is_ok()
@@ -1762,20 +1844,29 @@ fn empty_owned() -> Value {
 
 // The shape video takes on a console window's IPC channel: a fixed
 // 28-byte little-endian header, then the payload. No JSON, no base64;
-// the webview hands the bytes straight to a decoder. The route isn't
-// carried — the channel itself is per-route.
+// the webview hands the bytes straight to a decoder (or, for kind 3,
+// straight to the canvas). The route isn't carried — the channel itself
+// is per-route.
 //
-//   [0]      kind: 1 = JPEG frame, 2 = H.264 access unit
+//   [0]      kind: 1 = JPEG frame, 2 = H.264 access unit, 3 = raw RGBA
 //   [1]      flags: bit 0 = key (H.264 IDR)
 //   [2..4]   reserved
-//   [4..8]   width  (JPEG only — H.264 carries its size in the SPS)
+//   [4..8]   width  (JPEG/raw — an H.264 unit carries its size in the SPS)
 //   [8..12]  height
-//   [12..16] source_width
+//   [12..16] source_width  (JPEG only)
 //   [16..20] source_height
-//   [20..28] JPEG: frame seq · H.264: timestamp in µs
+//   [20..28] JPEG: frame seq · H.264/raw: timestamp in µs
 
-fn video_ipc_header(kind: u8, flags: u8, dims: [u32; 4], tail: u64, payload_len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(28 + payload_len);
+pub(crate) const VIDEO_IPC_HEADER_LEN: usize = 28;
+
+pub(crate) fn video_ipc_header(
+    kind: u8,
+    flags: u8,
+    dims: [u32; 4],
+    tail: u64,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VIDEO_IPC_HEADER_LEN + payload_len);
     out.push(kind);
     out.push(flags);
     out.extend_from_slice(&[0u8; 2]);

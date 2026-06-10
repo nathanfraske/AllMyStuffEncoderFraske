@@ -218,19 +218,27 @@ impl VideoBridge {
         Self::default()
     }
 
-    /// Begin streaming the primary screen for `route_id`, encoding for
-    /// `mode`. `on_packet` is called with each encoded packet; it returns
-    /// `false` when the packet was dropped downstream (backpressure),
-    /// which is fine — the next capture simply carries the newer picture.
-    pub fn start_capture<F>(&self, route_id: String, mode: VideoMode, on_packet: F)
-    where
+    /// Begin streaming a screen for `route_id`, encoding for `mode`.
+    /// `monitor` picks which: `None` = the primary (the synthetic `screen`
+    /// capability), `Some(id)` = the monitor with that enumeration id (a
+    /// `screen:<id>` capability — see [`extra_screens`]). `on_packet` is
+    /// called with each encoded packet; it returns `false` when the packet
+    /// was dropped downstream (backpressure), which is fine — the next
+    /// capture simply carries the newer picture.
+    pub fn start_capture<F>(
+        &self,
+        route_id: String,
+        mode: VideoMode,
+        monitor: Option<u32>,
+        on_packet: F,
+    ) where
         F: Fn(VideoPacket) -> bool + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture(&stop_thread, &id, mode, on_packet) {
+            if let Err(e) = run_capture(&stop_thread, &id, mode, monitor, on_packet) {
                 tracing::warn!("screen capture for {id} stopped: {e}");
             }
         });
@@ -252,12 +260,12 @@ fn run_capture<F>(
     stop: &AtomicBool,
     route_id: &str,
     mode: VideoMode,
+    monitor_id: Option<u32>,
     on_packet: F,
 ) -> Result<(), String>
 where
     F: Fn(VideoPacket) -> bool + Send + 'static,
 {
-    let monitor = primary_monitor()?;
     // An encoder that can't init (openh264 build/runtime trouble) must
     // cost quality, not the stream: fall back to MJPEG and say so.
     let (mut encoder, mode) = match StreamEncoder::new(route_id, mode) {
@@ -272,26 +280,43 @@ where
     };
     let mut stats = StreamStats::new(route_id, mode);
     if prefer_session_capture() {
-        match run_session_capture(
-            stop,
-            route_id,
-            &monitor,
-            &on_packet,
-            &mut encoder,
-            &mut stats,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(());
+        // Two attempts, each with a freshly enumerated monitor: a route
+        // that restarts can hand DXGI/the portal a stale display handle
+        // ("The parameter is incorrect"), and re-enumerating is exactly
+        // what heals that. Only then do we settle for per-frame
+        // screenshots — the dire-framerate path of last resort.
+        for attempt in 0..2 {
+            let monitor = select_monitor(monitor_id)?;
+            match run_session_capture(
+                stop,
+                route_id,
+                &monitor,
+                &on_packet,
+                &mut encoder,
+                &mut stats,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if stop.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    if attempt == 0 {
+                        tracing::warn!(
+                            "capture session for {route_id} unavailable ({e}); \
+                             retrying with a fresh monitor handle"
+                        );
+                        std::thread::sleep(Duration::from_millis(300));
+                    } else {
+                        tracing::warn!(
+                            "capture session for {route_id} unavailable ({e}); \
+                             falling back to per-frame screenshots"
+                        );
+                    }
                 }
-                tracing::warn!(
-                    "capture session for {route_id} unavailable ({e}); \
-                     falling back to per-frame screenshots"
-                );
             }
         }
     }
+    let monitor = select_monitor(monitor_id)?;
     run_oneshot_capture(
         stop,
         route_id,
@@ -441,8 +466,20 @@ where
     Ok(())
 }
 
-fn primary_monitor() -> Result<xcap::Monitor, String> {
+/// The monitor a capture should run on: by enumeration id when the route
+/// names one, else the primary. A named monitor that's gone (unplugged
+/// since the scan) degrades to the primary with a note — a stream beats
+/// an error.
+fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
+    if let Some(id) = monitor_id {
+        for m in &monitors {
+            if m.id().ok() == Some(id) {
+                return Ok(m.clone());
+            }
+        }
+        tracing::warn!("monitor {id} not found (unplugged?); capturing the primary instead");
+    }
     let mut first = None;
     for m in monitors {
         if m.is_primary().unwrap_or(false) {
@@ -451,6 +488,43 @@ fn primary_monitor() -> Result<xcap::Monitor, String> {
         first.get_or_insert(m);
     }
     first.ok_or_else(|| "no monitor to capture".to_string())
+}
+
+/// Every monitor beyond the primary, as `(id, label)` for the bridge's
+/// per-monitor `screen:<id>` capabilities — so a multi-monitor machine
+/// gets one console tab per screen. The primary stays the synthetic
+/// `screen` capability (and the universal fallback), so a single-monitor
+/// machine advertises exactly what it did before. Ids are xcap's own
+/// enumeration ids: stable for this app run, and resolved back to the
+/// same monitor by [`select_monitor`] when a route starts.
+pub fn extra_screens() -> Vec<allmystuff_bridge::ScreenSource> {
+    let Ok(monitors) = xcap::Monitor::all() else {
+        return Vec::new();
+    };
+    // Mirror select_monitor's primary choice (first flagged, else first
+    // listed) so the two views of "which one is the primary" can't drift.
+    let primary = monitors
+        .iter()
+        .position(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(0);
+    monitors
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != primary)
+        .filter_map(|(i, m)| {
+            let id = m.id().ok()?;
+            // Windows reports device paths (`\\.\DISPLAY2`); strip the
+            // prefix so the tab reads as a name, not an escape sequence.
+            let name = m.name().unwrap_or_default();
+            let name = name.trim_start_matches(r"\\.\").trim();
+            let label = if name.is_empty() {
+                format!("Screen {}", i + 1)
+            } else {
+                format!("Screen — {name}")
+            };
+            Some(allmystuff_bridge::ScreenSource { id, label })
+        })
+        .collect()
 }
 
 /// The downscale + JPEG stage of one route's stream, with the

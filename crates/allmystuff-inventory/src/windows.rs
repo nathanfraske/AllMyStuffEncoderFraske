@@ -186,8 +186,20 @@ pub fn collect_audio() -> (Vec<AudioDevice>, Vec<AudioDevice>) {
 }
 
 pub fn collect_cameras() -> Vec<Camera> {
-    rows("Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Camera'\" | Select-Object Name | ConvertTo-Json -Compress")
+    // Webcams register under PNPClass 'Camera' on most modern drivers but
+    // 'Image' on plenty of others (UVC devices especially) — query both.
+    // 'Image' also covers scanners, so those rows only count when the name
+    // says camera; 'Camera'-class rows are taken at their word.
+    rows("Get-CimInstance Win32_PnPEntity -Filter \"PNPClass='Camera' OR PNPClass='Image'\" | Select-Object Name,PNPClass | ConvertTo-Json -Compress")
         .into_iter()
+        .filter(|v| {
+            let class = s(v, "PNPClass").unwrap_or_default();
+            if class.eq_ignore_ascii_case("camera") {
+                return true;
+            }
+            let name = s(v, "Name").unwrap_or_default().to_lowercase();
+            name.contains("cam") || name.contains("video")
+        })
         .enumerate()
         .filter_map(|(i, v)| {
             Some(Camera {

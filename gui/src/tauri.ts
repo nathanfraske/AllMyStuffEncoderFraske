@@ -110,14 +110,14 @@ export function scanSelf(): Promise<ScanResult | null> {
 }
 
 /** Offer a real connection over the mesh. Returns the route id, or null in
- *  web mode (the store falls back to a local route for the demo). For a
- *  display route the offer advertises which video transports this side
- *  can consume — H.264 when the webview has WebCodecs (the streaming side
- *  then uses the mesh's RTP track lane), with MJPEG as the floor both
- *  ends always share. */
+ *  web mode (the store falls back to a local route for the demo). A
+ *  display route always advertises H.264 (the streaming side then uses the
+ *  mesh's RTP track lane): decode is covered everywhere — WebCodecs where
+ *  the webview has it, the backend's native openh264 decoder where it
+ *  doesn't — and the backend still withholds the offer when the local
+ *  daemon predates the track lane. MJPEG stays the floor both ends share. */
 export function connectRoute(from: string, to: string, media: MediaKind): Promise<string | null> {
-  const video =
-    media === "display" && typeof VideoDecoder !== "undefined" ? ["h264"] : [];
+  const video = media === "display" ? ["h264"] : [];
   return tryInvoke<string>("connect_route", { from, to, media, video });
 }
 
@@ -187,9 +187,9 @@ function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoF
   if (len < 28) return null;
   const head = new DataView(buf, offset, 28);
   const kindByte = head.getUint8(0);
-  if (kindByte !== 1 && kindByte !== 2) return null;
+  if (kindByte !== 1 && kindByte !== 2 && kindByte !== 3) return null;
   return {
-    kind: kindByte === 2 ? "h264" : "jpeg",
+    kind: kindByte === 3 ? "raw" : kindByte === 2 ? "h264" : "jpeg",
     key: (head.getUint8(1) & 1) === 1,
     width: head.getUint32(4, true),
     height: head.getUint32(8, true),
@@ -205,16 +205,23 @@ function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoF
  *  display tick (`video_poll` → `[u32 len][packet]…`). A failed poll
  *  costs one tick and the next one recovers — unlike a push channel,
  *  where ordered delivery means one lost message silently freezes the
- *  stream while the backend keeps sending. Returns an unwatch fn (a
- *  no-op in web mode, where no frames can arrive anyway). */
+ *  stream while the backend keeps sending. `opts.decode` asks the backend
+ *  to decode H.264 natively and deliver ready-to-paint RGBA (`raw`)
+ *  packets — for webviews without WebCodecs, and the bottom rung of the
+ *  console's decode ladder. Returns an unwatch fn (a no-op in web mode,
+ *  where no frames can arrive anyway). */
 export async function watchVideo(
   routeId: string,
   cb: (f: VideoFrameMsg) => void,
+  opts?: { decode?: boolean },
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { invoke } = await import("@tauri-apps/api/core");
   const { listen } = await import("@tauri-apps/api/event");
-  const token = (await invoke("video_watch", { routeId })) as number;
+  const token = (await invoke("video_watch", {
+    routeId,
+    decode: opts?.decode ?? false,
+  })) as number;
   let stopped = false;
   let inFlight = false;
   const tick = async () => {

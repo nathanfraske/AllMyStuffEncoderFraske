@@ -290,15 +290,16 @@ export type InputAction =
  *  standalone JPEG frame (the MJPEG transport) or one H.264 access unit
  *  from the mesh's track lane, for WebCodecs. */
 export interface VideoFrameMsg {
-  kind: "jpeg" | "h264";
+  /** `raw` = RGBA the backend already decoded (paint it, no codec). */
+  kind: "jpeg" | "h264" | "raw";
   /** H.264: this unit is an IDR — a safe decoder entry point. */
   key: boolean;
-  /** JPEG only — H.264 carries its dimensions in the stream (SPS). */
+  /** JPEG/raw only — an H.264 unit carries its dimensions in the SPS. */
   width: number;
   height: number;
   sourceWidth: number;
   sourceHeight: number;
-  /** JPEG: the frame's seq. H.264: presentation timestamp in µs. */
+  /** JPEG: the frame's seq. H.264/raw: presentation timestamp in µs. */
   seq: number;
   /** The payload bytes — never base64. */
   data: Uint8Array<ArrayBuffer>;
@@ -393,6 +394,7 @@ export function originIcon(origin: string, media: MediaKind): string {
     display: "🖥",
     screen: "🪟",
     control: "🕹",
+    controller: "⌨️",
     keyboard: "⌨️",
     mouse: "🖱",
     touchpad: "🖱",
