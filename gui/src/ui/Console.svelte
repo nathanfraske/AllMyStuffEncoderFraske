@@ -51,6 +51,7 @@
   let frameH = $state(0);
   let fps = $state(0);
   let transport = $state("");
+  let decodeFails = $state(0);
   let frameCount = 0;
 
   onMount(() => {
@@ -78,6 +79,7 @@
     hasFrame = false;
     fps = 0;
     transport = "";
+    decodeFails = 0;
     frameCount = 0;
     if (!route) return;
     let cancelled = false;
@@ -101,7 +103,11 @@
       frameCount += 1;
     };
 
-    const dropDecoder = () => {
+    const dropDecoder = (why: unknown) => {
+      // Surfaced, not swallowed: the chip counts these and the console
+      // log names them — a decoder that quietly dies reads as a freeze.
+      decodeFails += 1;
+      console.warn("video decode error:", why);
       try {
         if (decoder && decoder.state !== "closed") decoder.close();
       } catch {
@@ -141,10 +147,15 @@
           // re-init on the next key unit.
           error: dropDecoder,
         });
-        // Constrained baseline (what openh264 emits), level 5.1 — high
-        // enough that 1920-edge 30 fps streams configure everywhere; the
-        // decoder reads the real parameters from the SPS in-band.
-        decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true });
+        try {
+          // Constrained baseline (what openh264 emits), level 5.1 — high
+          // enough that 1920-edge 30 fps streams configure everywhere;
+          // the decoder reads the real parameters from the SPS in-band.
+          decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true });
+        } catch (e) {
+          dropDecoder(e);
+          return;
+        }
       }
       try {
         decoder.decode(
@@ -154,8 +165,8 @@
             data: f.data,
           }),
         );
-      } catch {
-        dropDecoder();
+      } catch (e) {
+        dropDecoder(e);
       }
     }).then((u) => {
       // The route may have changed while the subscribe was in flight.
@@ -165,7 +176,12 @@
     return () => {
       cancelled = true;
       unwatch?.();
-      dropDecoder();
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null;
     };
   });
 
@@ -376,7 +392,9 @@
         <div class="status">
           {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{decodeFails
+                ? ` · ${decodeFails} decode-err`
+                : ""}
             </span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}
@@ -555,6 +573,12 @@
     flex: 1;
     min-height: 0;
     display: grid;
+    /* The single track must be the stage's size, never the content's:
+       an auto track grows to the canvas's intrinsic width (1920), which
+       overflowed narrower windows and clipped the sides — the letterbox
+       must come from object-fit inside the element, both axes. */
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 1rem;
     background:

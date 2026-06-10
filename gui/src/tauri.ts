@@ -181,36 +181,67 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
   return tryInvoke("send_input", { routeId, action });
 }
 
-/** Stream one route's inbound video into this window. Packets ride a
- *  Tauri IPC channel as raw bytes — a 28-byte little-endian header (kind,
- *  flags, dimensions, seq/timestamp) followed by the payload (JPEG bytes
- *  or one H.264 access unit) — so the per-frame path has no JSON and no
- *  base64, and only the watching window pays for delivery. Returns an
- *  unwatch fn (a no-op in web mode, where no frames can arrive anyway). */
+/** Decode one wire packet (28-byte little-endian header + payload) out
+ *  of a poll batch. Returns null for shapes we don't recognize. */
+function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoFrameMsg | null {
+  if (len < 28) return null;
+  const head = new DataView(buf, offset, 28);
+  const kindByte = head.getUint8(0);
+  if (kindByte !== 1 && kindByte !== 2) return null;
+  return {
+    kind: kindByte === 2 ? "h264" : "jpeg",
+    key: (head.getUint8(1) & 1) === 1,
+    width: head.getUint32(4, true),
+    height: head.getUint32(8, true),
+    sourceWidth: head.getUint32(12, true),
+    sourceHeight: head.getUint32(16, true),
+    seq: Number(head.getBigUint64(20, true)),
+    data: new Uint8Array(buf.slice(offset + 28, offset + len)),
+  };
+}
+
+/** Stream one route's inbound video into this window by *pulling*: the
+ *  backend queues raw packets per route and this drains them every
+ *  display tick (`video_poll` → `[u32 len][packet]…`). A failed poll
+ *  costs one tick and the next one recovers — unlike a push channel,
+ *  where ordered delivery means one lost message silently freezes the
+ *  stream while the backend keeps sending. Returns an unwatch fn (a
+ *  no-op in web mode, where no frames can arrive anyway). */
 export async function watchVideo(
   routeId: string,
   cb: (f: VideoFrameMsg) => void,
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { invoke, Channel } = await import("@tauri-apps/api/core");
-  const channel = new Channel<ArrayBuffer>((buf) => {
-    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 28) return;
-    const head = new DataView(buf);
-    const kindByte = head.getUint8(0);
-    if (kindByte !== 1 && kindByte !== 2) return;
-    cb({
-      kind: kindByte === 2 ? "h264" : "jpeg",
-      key: (head.getUint8(1) & 1) === 1,
-      width: head.getUint32(4, true),
-      height: head.getUint32(8, true),
-      sourceWidth: head.getUint32(12, true),
-      sourceHeight: head.getUint32(16, true),
-      seq: Number(head.getBigUint64(20, true)),
-      data: new Uint8Array(buf, 28),
-    });
-  });
-  await invoke("video_watch", { routeId, onFrame: channel });
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("video_watch", { routeId });
+  let stopped = false;
+  let inFlight = false;
+  const tick = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const batch = (await invoke("video_poll", { routeId })) as ArrayBuffer;
+      if (stopped || !(batch instanceof ArrayBuffer)) return;
+      const view = new DataView(batch);
+      let offset = 0;
+      while (offset + 4 <= batch.byteLength) {
+        const len = view.getUint32(offset, true);
+        offset += 4;
+        if (len === 0 || offset + len > batch.byteLength) break;
+        const packet = parseVideoPacket(batch, offset, len);
+        offset += len;
+        if (packet) cb(packet);
+      }
+    } catch {
+      // One missed poll; the next tick drains everything queued.
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setInterval(() => void tick(), 16);
   return () => {
+    stopped = true;
+    clearInterval(timer);
     void invoke("video_unwatch", { routeId }).catch(() => {});
   };
 }

@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
@@ -71,10 +70,13 @@ pub struct Mesh {
     /// Reassembles chunked inbound video frames (a frame bigger than the
     /// data channel's ~64 KiB message ceiling arrives in pieces).
     video_in: Mutex<VideoAssembler>,
-    /// Per-route IPC channels to the console windows watching inbound
-    /// video. A frame goes as raw bytes straight to the one webview that
-    /// wants it — not as base64 JSON eval'd into every open window.
-    video_watchers: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
+    /// Per-route queues of ready-to-ship packets (28-byte header +
+    /// payload) for the console windows watching inbound video. The
+    /// webview *pulls* these (`video_poll`, one drain per display
+    /// refresh): a pull that fails costs one tick, where the previous
+    /// push channel's ordered delivery meant one lost message silently
+    /// froze the stream forever while the backend kept counting frames.
+    video_watchers: Mutex<HashMap<String, std::collections::VecDeque<Vec<u8>>>>,
     /// The H.264 track lane is one per peer connection: which route is
     /// streaming *out* on it (peer pubkey → route id). A second display
     /// route to the same peer falls back to MJPEG until the lane frees.
@@ -659,25 +661,7 @@ impl Mesh {
                                 );
                             }
                             self.note_video_in(&full.route, "MJPEG", full.jpeg.len());
-                            // Raw bytes over the route's IPC channel, to the
-                            // one window that registered for it. A failed
-                            // send means that webview is gone — forget the
-                            // watcher; a reopened console re-registers.
-                            let watcher = { self.video_watchers.lock().get(&full.route).cloned() };
-                            match watcher {
-                                Some(ch) => {
-                                    if ch
-                                        .send(InvokeResponseBody::Raw(video_ipc_bytes(&full)))
-                                        .is_err()
-                                    {
-                                        self.video_watchers.lock().remove(&full.route);
-                                    }
-                                }
-                                None => tracing::debug!(
-                                    "no console window watching {} — frame dropped",
-                                    full.route
-                                ),
-                            }
+                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full));
                         }
                     }
                     MediaPayload::Input(ev) => {
@@ -791,20 +775,29 @@ impl Mesh {
             return;
         };
         self.note_video_in(&route_id, "H.264", data.len());
-        let watcher = { self.video_watchers.lock().get(&route_id).cloned() };
-        match watcher {
-            Some(ch) => {
-                // 90 kHz RTP clock → µs for the decoder's timestamps.
-                let ts_us = rtp_timestamp as u64 * 1000 / 90;
-                if ch
-                    .send(InvokeResponseBody::Raw(h264_ipc_bytes(ts_us, key, &data)))
-                    .is_err()
-                {
-                    self.video_watchers.lock().remove(&route_id);
-                }
-            }
-            None => tracing::debug!("no console window watching {route_id} — sample dropped"),
+        // 90 kHz RTP clock → µs for the decoder's timestamps.
+        let ts_us = rtp_timestamp as u64 * 1000 / 90;
+        self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
+    }
+
+    /// Queue one packet for a watching console window; drop the packet
+    /// (with a debug note) when no window watches the route. A queue
+    /// nobody drains (webview wedged or closing) caps at a few seconds
+    /// of stream and is then cleared wholesale — the decoder re-keys on
+    /// the sender's next IDR, and `video_unwatch`/route teardown remove
+    /// the entry entirely.
+    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>) {
+        const MAX_QUEUED: usize = 120;
+        let mut map = self.video_watchers.lock();
+        let Some(queue) = map.get_mut(route_id) else {
+            tracing::debug!("no console window watching {route_id} — packet dropped");
+            return;
+        };
+        if queue.len() >= MAX_QUEUED {
+            tracing::debug!("video queue for {route_id} unread for seconds — cleared");
+            queue.clear();
         }
+        queue.push_back(packet);
     }
 
     /// Front-end command: offer a route from `from` to `to`.
@@ -886,15 +879,34 @@ impl Mesh {
         Ok(route.id)
     }
 
-    /// Register a console window's IPC channel for one route's inbound
-    /// frames (replacing any previous watcher — the route shows in one
-    /// window).
-    pub fn video_watch(&self, route_id: String, channel: Channel<InvokeResponseBody>) {
-        self.video_watchers.lock().insert(route_id, channel);
+    /// Register interest in one route's inbound frames (replacing any
+    /// previous watcher — the route shows in one window). Packets queue
+    /// from this moment; the window drains them with [`Self::video_poll`].
+    pub fn video_watch(&self, route_id: String) {
+        self.video_watchers
+            .lock()
+            .insert(route_id, std::collections::VecDeque::new());
     }
 
     pub fn video_unwatch(&self, route_id: &str) {
         self.video_watchers.lock().remove(route_id);
+    }
+
+    /// Drain everything queued for `route_id` into one length-prefixed
+    /// batch: `[u32 len][packet]…` — empty (and cheap) when nothing
+    /// arrived since the last poll.
+    pub fn video_poll(&self, route_id: &str) -> Vec<u8> {
+        let mut map = self.video_watchers.lock();
+        let Some(queue) = map.get_mut(route_id) else {
+            return Vec::new();
+        };
+        let total: usize = queue.iter().map(|p| 4 + p.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for packet in queue.drain(..) {
+            out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            out.extend_from_slice(&packet);
+        }
+        out
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {

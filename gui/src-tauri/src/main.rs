@@ -122,17 +122,21 @@ async fn send_input(
     mesh.inner().send_input(route_id, action).await
 }
 
-/// Stream one route's inbound display frames into the calling window over
-/// an IPC channel, as raw bytes (a fixed header + the JPEG) — no JSON or
-/// base64 on the per-frame path, and only the window that's actually
-/// watching pays for delivery. Replaces any previous watcher of the route.
+/// Register the calling window's interest in a route's inbound video.
+/// Packets queue backend-side from this moment; the window drains them
+/// with `video_poll` once per display refresh. (Pull, not push: a missed
+/// poll costs one tick, where a lost push on Tauri's ordered IPC channel
+/// silently froze the stream for good.)
 #[tauri::command]
-fn video_watch(
-    mesh: State<'_, Arc<Mesh>>,
-    route_id: String,
-    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
-) {
-    mesh.video_watch(route_id, on_frame);
+fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) {
+    mesh.video_watch(route_id);
+}
+
+/// Drain the queued packets for a route as one raw batch:
+/// `[u32 len][28-byte header + payload]…`, empty when nothing arrived.
+#[tauri::command]
+fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
+    tauri::ipc::Response::new(mesh.video_poll(&route_id))
 }
 
 /// Stop streaming a route's frames to the front-end (console closed or
@@ -482,6 +486,7 @@ fn main() {
             set_claimable,
             send_input,
             video_watch,
+            video_poll,
             video_unwatch,
             open_console_window,
             session_snapshot,
