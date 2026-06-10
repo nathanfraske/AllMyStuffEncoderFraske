@@ -419,6 +419,7 @@ mod tests {
 
     /// Collect Data until `pred` matches the transcript (or panic at the
     /// deadline). Returns the transcript so far.
+    #[cfg(unix)]
     fn read_until(
         rx: &mut tokio::sync::mpsc::Receiver<OutMsg>,
         pred: impl Fn(&[u8]) -> bool,
@@ -444,6 +445,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn wait_exit(rx: &mut tokio::sync::mpsc::Receiver<OutMsg>) -> Option<i32> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -521,6 +523,24 @@ mod tests {
         assert_eq!(wait_exit(&mut rx), None);
     }
 
+    /// How many CSI 6 n (cursor-position) probes the transcript holds —
+    /// what a ConPTY-backed shell sends its terminal before painting.
+    fn dsr_probes(hay: &[u8]) -> usize {
+        const QUERY: &[u8] = b"\x1b[6n";
+        hay.windows(QUERY.len()).filter(|w| *w == QUERY).count()
+    }
+
+    #[test]
+    fn dsr_probe_counting_finds_each_query() {
+        assert_eq!(dsr_probes(b""), 0);
+        assert_eq!(dsr_probes(b"plain output"), 0);
+        assert_eq!(dsr_probes(b"\x1b[6n"), 1);
+        assert_eq!(dsr_probes(b"a\x1b[6nb\x1b[6nc"), 2);
+        // A truncated probe (chunk boundary) doesn't count until the rest
+        // arrives — the caller re-counts over the whole transcript.
+        assert_eq!(dsr_probes(b"\x1b["), 0);
+    }
+
     #[cfg(windows)]
     #[test]
     fn spawn_cmd_echo_and_exit() {
@@ -529,12 +549,42 @@ mod tests {
         cmd.arg("echo hello-from-conpty");
         let host = TerminalHost::new();
         let mut rx = host.spawn_with("rw", vec![cmd]).unwrap();
-        read_until(
-            &mut rx,
-            |b| String::from_utf8_lossy(b).contains("hello-from-conpty"),
-            "conpty echo",
+
+        // ConPTY probes its "terminal" with CSI 6 n (report cursor
+        // position) and holds output until something answers — in the
+        // real app xterm.js answers and the reply rides the route back.
+        // The test plays the emulator: answer every probe it sees.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen: Vec<u8> = Vec::new();
+        let mut answered = 0usize;
+        let mut exit: Option<Option<i32>> = None;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(OutMsg::Data(b)) => {
+                    seen.extend_from_slice(&b);
+                    while answered < dsr_probes(&seen) {
+                        assert!(host.write("rw", b"\x1b[1;1R".to_vec()));
+                        answered += 1;
+                    }
+                }
+                Ok(OutMsg::Exit(code)) => {
+                    exit = Some(code);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        // The exit linger orders Data before Exit, but drain any tail
+        // that was already queued before asserting on the transcript.
+        while let Ok(OutMsg::Data(b)) = rx.try_recv() {
+            seen.extend_from_slice(&b);
+        }
+        let transcript = String::from_utf8_lossy(&seen);
+        assert!(
+            transcript.contains("hello-from-conpty"),
+            "transcript: {transcript:?}"
         );
-        assert_eq!(wait_exit(&mut rx), Some(0));
+        assert_eq!(exit, Some(Some(0)));
     }
 
     #[test]
