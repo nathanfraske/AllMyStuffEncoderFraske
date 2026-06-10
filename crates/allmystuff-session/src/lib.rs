@@ -311,6 +311,7 @@ mod tests {
             )],
             owner: None,
             claimable: false,
+            boot: 0,
         }
     }
 

@@ -60,6 +60,9 @@ pub struct Mesh {
     video_out: mpsc::Sender<(String, VideoFrame)>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
+    /// This app run's random presence boot id — how peers detect that we
+    /// (re)started and answer with their state (see `NodeProfile::boot`).
+    boot_id: u64,
 }
 
 struct State {
@@ -75,6 +78,11 @@ struct State {
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
     peer_networks: HashMap<String, String>,
+    /// Last presence boot id seen per peer (canonical pubkey). A boot id we
+    /// haven't recorded means the peer just (re)started and missed our
+    /// adverts — we answer with our state directly. This is what lets
+    /// gossip be event-driven instead of a heartbeat.
+    peer_boots: HashMap<String, u64>,
     client_id: Option<ClientId>,
     profile: Option<NodeProfile>,
 }
@@ -96,6 +104,7 @@ impl Mesh {
                 network: None,
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
+                peer_boots: HashMap::new(),
                 client_id: None,
                 profile: None,
             }),
@@ -103,6 +112,7 @@ impl Mesh {
             audio_out,
             video_out,
             input_seq: AtomicU64::new(0),
+            boot_id: fresh_boot_id(),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -245,19 +255,12 @@ impl Mesh {
             self.emit_status("live", None);
         }
 
-        // Periodic presence + owned-roster re-broadcast so late joiners see us
-        // and the fleet converges.
-        {
-            let mesh = self.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
-                loop {
-                    tick.tick().await;
-                    mesh.broadcast_presence().await;
-                    mesh.broadcast_owned().await;
-                }
-            });
-        }
+        // No periodic re-broadcast: gossip is event-driven. Late joiners are
+        // covered twice over — the daemon's "peer approved" event triggers a
+        // targeted ownership check at them, and a presence advert carrying a
+        // boot id we haven't recorded (their app just started while the
+        // daemon link stayed up) gets answered with our state directly. The
+        // mesh carries traffic when something *happens*, not on a heartbeat.
 
         // Event loop.
         let mesh = self.clone();
@@ -349,6 +352,7 @@ impl Mesh {
             // spoken for (or one that was never put into claim mode).
             owner: self.ownership.owner().map(NodeId::from),
             claimable: self.ownership.claimable(),
+            boot: self.boot_id,
         }
     }
 
@@ -400,8 +404,7 @@ impl Mesh {
                     // Connection establishment is a claim-status trigger: a
                     // peer just went live for app traffic ("approved"), so
                     // re-assert presence + fleet roster straight at it —
-                    // both sides converge now instead of waiting for the
-                    // next periodic broadcast.
+                    // there is no heartbeat to catch it up later.
                     let approved = event.get("event_kind").and_then(|v| v.as_str()) == Some("peer")
                         && event.get("kind").and_then(|v| v.as_str()) == Some("approved");
                     if approved {
@@ -439,6 +442,22 @@ impl Mesh {
         match channel {
             CHANNEL_PRESENCE => {
                 if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
+                    // A boot id we haven't recorded for this peer means its
+                    // app just (re)started and missed our adverts — answer
+                    // with our presence + roster directly. This (plus the
+                    // connection-approved trigger) is what replaced the
+                    // periodic re-broadcast; the reply can't loop because
+                    // the peer then knows our boot id and stays quiet.
+                    // `boot == 0` is an older heartbeating peer: no reply
+                    // needed. Our own echo never replies to itself.
+                    let canon = pubkey_part(profile.node.as_str()).to_string();
+                    let is_self = self
+                        .local_node_id()
+                        .is_some_and(|me| pubkey_part(&me) == canon);
+                    let new_boot = profile.boot != 0 && !is_self && {
+                        let mut st = self.state.lock();
+                        st.peer_boots.insert(canon, profile.boot) != Some(profile.boot)
+                    };
                     let changed = {
                         let mut st = self.state.lock();
                         st.session
@@ -446,6 +465,13 @@ impl Mesh {
                             .map(|s| s.apply_presence(profile))
                             .unwrap_or(false)
                     };
+                    if new_boot {
+                        tracing::info!(
+                            "peer {} (re)started — answering with our presence + roster",
+                            short_id(&from)
+                        );
+                        self.ownership_check(Some(&from)).await;
+                    }
                     if changed {
                         self.emit_snapshot();
                     }
@@ -874,9 +900,9 @@ impl Mesh {
         }
     }
 
-    /// Send this device's fleet roster straight to one peer — used right after
-    /// a claim so the new device gets the key + membership immediately, before
-    /// the next periodic broadcast.
+    /// Send this device's fleet roster straight to one peer — used right
+    /// after a claim (and on the targeted ownership check) so the device
+    /// gets the key + membership the moment it matters.
     async fn send_owned_to(&self, peer: &str) {
         let Some(roster) = self.ownership.fleet() else {
             return;
@@ -885,8 +911,8 @@ impl Mesh {
     }
 
     /// Send one explicit roster straight to a peer — a kick hands the
-    /// kicked device the roster it's no longer in, so it drops out now
-    /// rather than at the next periodic broadcast.
+    /// kicked device the roster it's no longer in, so it drops out
+    /// immediately.
     async fn send_roster_to(&self, peer: &str, roster: &OwnedRoster) {
         let Some(network) = self.network_for_peer(peer) else {
             tracing::warn!("no network to hand the fleet roster to {}", short_id(peer));
@@ -957,9 +983,10 @@ impl Mesh {
     /// true, and does everyone else know it?" Drops incoherent fleet
     /// residue, re-stamps the live profile from the ownership store, then
     /// re-asserts presence + roster. Runs **targeted** at one peer right
-    /// after its connection establishes (so the two sides converge now, not
-    /// at the next 20-second tick) and **broadcast** on the local triggers:
-    /// session start, a claim/release, and fleet membership changes.
+    /// after its connection establishes or its app (re)starts — so the two
+    /// sides converge on the event itself; there is no heartbeat — and
+    /// **broadcast** on the local triggers: session start, a claim/release,
+    /// and fleet membership changes.
     pub async fn ownership_check(self: &Arc<Self>, peer: Option<&str>) {
         let Some(me) = self.local_node_id() else {
             return;
@@ -976,12 +1003,19 @@ impl Mesh {
         }
         match peer {
             Some(peer) => {
-                tracing::debug!(
-                    "ownership check → {} (connection established)",
-                    short_id(peer)
-                );
+                tracing::debug!("ownership check → {}", short_id(peer));
                 self.send_presence_to(peer).await;
-                self.send_owned_to(peer).await;
+                // The roster (it carries the fleet's grouping key) goes only
+                // to peers that are actually in the fleet — presence is for
+                // everyone, the key is not.
+                let member = self.ownership.fleet().is_some_and(|f| {
+                    f.members
+                        .iter()
+                        .any(|m| pubkey_part(m.device.as_str()) == pubkey_part(peer))
+                });
+                if member {
+                    self.send_owned_to(peer).await;
+                }
             }
             None => {
                 self.broadcast_presence().await;
@@ -994,7 +1028,7 @@ impl Mesh {
 
     /// Send this node's presence profile straight to one peer — the
     /// targeted half of `broadcast_presence`, for a peer that just
-    /// connected and hasn't heard our periodic advert yet.
+    /// connected or restarted and so has never heard us.
     async fn send_presence_to(&self, peer: &str) {
         let profile = { self.state.lock().profile.clone() };
         let Some(profile) = profile else { return };
@@ -1313,6 +1347,22 @@ fn pubkey_part(id: &str) -> &str {
         }
     }
     id
+}
+
+/// A fresh random boot id for this app run — never 0, which presence
+/// reserves for older peers without the field.
+fn fresh_boot_id() -> u64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // RNG unavailable (vanishingly rare): fall back to wall-clock nanos
+        // — uniqueness across restarts is all this id needs.
+        return std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
+            .max(1);
+    }
+    u64::from_le_bytes(bytes).max(1)
 }
 
 /// Log-friendly head of a mesh id — enough to tell two machines apart in a

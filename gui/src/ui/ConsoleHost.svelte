@@ -1,9 +1,16 @@
 <script lang="ts">
   // The body of a dedicated console window (opened with `?console=<node>`):
-  // boot the store, wait for the target machine to appear (the scan and
-  // presence land asynchronously), open the session in *this* window, and
+  // boot the store, wait for the target machine to be *ready* — found on
+  // the mesh, its AllMyStuff presence landed, and its relationship
+  // resolved (yours / shared) — then open the session in this window and
   // keep the OS window title naming the machine. The main window never
   // renders this — it opens console windows instead of popovers.
+  //
+  // Readiness is staged, never a one-shot gate: this window's store boots
+  // from nothing, and the facts arrive in order (mesh node → presence →
+  // fleet roster, which is what flips your owner machine to "yours"). A
+  // gate that fired on the first stage would refuse machines that are
+  // perfectly yours a beat later.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import { setWindowTitle } from "../tauri";
@@ -13,31 +20,30 @@
 
   let { target }: { target: string } = $props();
 
-  // One attempt per window: if the gate refuses (machine vanished, not
-  // yours any more) we show the failure instead of retrying into a toast
-  // storm.
   let attempted = $state(false);
   const node = $derived(app.machineByAnyId(target));
+
+  const stage = $derived.by(() => {
+    const n = node;
+    if (!n) return "finding" as const;
+    if (!isAppNode(n)) return "presence" as const;
+    if (n.relationship.kind === "unclaimed") return "relationship" as const;
+    return "ready" as const;
+  });
 
   onMount(() => {
     void app.init();
   });
 
   $effect(() => {
-    if (attempted || app.consoleNodeId) return;
-    const n = node;
-    if (!n) return; // still discovering — keep waiting
-    // Hold until its presence detail has landed too (init pulls a session
-    // snapshot, so this resolves in moments when the machine is really
-    // there) — a half-hydrated node would be refused as "not on AllMyStuff".
-    if (!isAppNode(n)) return;
+    if (attempted || app.consoleNodeId || stage !== "ready") return;
     attempted = true;
-    app.openConsoleHere(n.id);
+    app.openConsoleHere(node!.id);
   });
 
   $effect(() => {
-    const node = app.consoleNode;
-    if (node) void setWindowTitle(`${displayName(node)} — AllMyStuff console`);
+    const n = app.consoleNode;
+    if (n) void setWindowTitle(`${displayName(n)} — AllMyStuff console`);
   });
 </script>
 
@@ -50,10 +56,17 @@
       <p>Couldn't open a console for this machine — see the message that just
         popped for the reason. Close this window and try again from the graph.</p>
     </div>
-  {:else if node && !isAppNode(node)}
+  {:else if stage === "relationship"}
+    <div class="notice">
+      <div class="glyph">🔗</div>
+      <p><b>{displayName(node!)}</b> is here — resolving whether it's yours
+        (fleet roster loading)… If this machine was never claimed or shared,
+        do that from the graph first and this window will pick it up.</p>
+    </div>
+  {:else if stage === "presence"}
     <div class="notice">
       <div class="glyph">📡</div>
-      <p><b>{displayName(node)}</b> is on the mesh — waiting for its
+      <p><b>{displayName(node!)}</b> is on the mesh — waiting for its
         AllMyStuff presence (its devices and ownership) to land…</p>
     </div>
   {:else}
@@ -88,5 +101,8 @@
     max-width: 26rem;
     font-size: 0.9rem;
     line-height: 1.5;
+  }
+  .notice b {
+    color: #d7d2ec;
   }
 </style>

@@ -226,7 +226,13 @@ kick devices from a fleet you aren't in. A **claim-status check** (sanitize
 stale fleet residue → re-stamp the live profile → re-assert presence + roster)
 runs at session start, after every claim/release/fleet change, and *targeted*
 at each peer the moment its connection is approved — so two machines agree on
-who owns what within a handshake, not a polling interval.
+who owns what within a handshake, not a polling interval. Gossip is
+**event-driven, with no heartbeat**: presence carries a per-run `boot` id, and
+a peer seeing a boot it hasn't recorded (your app restarted while the daemon
+link stayed up) answers with its own presence + roster directly — the mesh
+carries traffic when something happens, never on a timer. The fleet roster
+(it holds the grouping key) is only ever *handed* to fleet members; presence
+goes to everyone.
 
 ## Next milestones
 
