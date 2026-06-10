@@ -213,7 +213,7 @@ export async function watchVideo(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("video_watch", { routeId });
+  const token = (await invoke("video_watch", { routeId })) as number;
   let stopped = false;
   let inFlight = false;
   const tick = async () => {
@@ -242,7 +242,7 @@ export async function watchVideo(
   return () => {
     stopped = true;
     clearInterval(timer);
-    void invoke("video_unwatch", { routeId }).catch(() => {});
+    void invoke("video_unwatch", { routeId, token }).catch(() => {});
   };
 }
 

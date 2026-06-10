@@ -76,7 +76,7 @@ pub struct Mesh {
     /// refresh): a pull that fails costs one tick, where the previous
     /// push channel's ordered delivery meant one lost message silently
     /// froze the stream forever while the backend kept counting frames.
-    video_watchers: Mutex<HashMap<String, std::collections::VecDeque<Vec<u8>>>>,
+    video_watchers: Mutex<HashMap<String, VideoWatcher>>,
     /// The H.264 track lane is one per peer connection: which route is
     /// streaming *out* on it (peer pubkey → route id). A second display
     /// route to the same peer falls back to MJPEG until the lane frees.
@@ -96,6 +96,16 @@ pub struct Mesh {
     /// seconds — the receive half of the dial-in line the sender's
     /// `StreamStats` provides.
     video_in_stats: Mutex<HashMap<String, VideoInStats>>,
+}
+
+/// One console window's claim on a route's inbound packets: the queue it
+/// drains plus the token that claim was made with — `video_unwatch`
+/// removes the queue only when the token still matches, so a stale
+/// unwatch (a torn-down watcher racing the next one over async IPC)
+/// can't delete its successor's queue.
+struct VideoWatcher {
+    token: u64,
+    queue: std::collections::VecDeque<Vec<u8>>,
 }
 
 /// Receive-side counters for one route's stream.
@@ -741,12 +751,17 @@ impl Mesh {
         let elapsed = st.since.elapsed();
         if elapsed >= EVERY {
             let secs = elapsed.as_secs_f64();
-            tracing::info!(
+            let line = format!(
                 "video in {route_id}: {:.1} fps · {:.1} Mbps · {}",
                 st.frames as f64 / secs,
                 (st.bytes as f64 * 8.0) / secs / 1_000_000.0,
                 st.label,
             );
+            if crate::video::stats_to_info() {
+                tracing::info!("{line}");
+            } else {
+                tracing::debug!("{line}");
+            }
             st.since = std::time::Instant::now();
             st.frames = 0;
             st.bytes = 0;
@@ -789,15 +804,15 @@ impl Mesh {
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>) {
         const MAX_QUEUED: usize = 120;
         let mut map = self.video_watchers.lock();
-        let Some(queue) = map.get_mut(route_id) else {
+        let Some(w) = map.get_mut(route_id) else {
             tracing::debug!("no console window watching {route_id} — packet dropped");
             return;
         };
-        if queue.len() >= MAX_QUEUED {
+        if w.queue.len() >= MAX_QUEUED {
             tracing::debug!("video queue for {route_id} unread for seconds — cleared");
-            queue.clear();
+            w.queue.clear();
         }
-        queue.push_back(packet);
+        w.queue.push_back(packet);
     }
 
     /// Front-end command: offer a route from `from` to `to`.
@@ -882,14 +897,28 @@ impl Mesh {
     /// Register interest in one route's inbound frames (replacing any
     /// previous watcher — the route shows in one window). Packets queue
     /// from this moment; the window drains them with [`Self::video_poll`].
-    pub fn video_watch(&self, route_id: String) {
-        self.video_watchers
-            .lock()
-            .insert(route_id, std::collections::VecDeque::new());
+    /// Returns the claim token to pass back to [`Self::video_unwatch`].
+    pub fn video_watch(&self, route_id: String) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.video_watchers.lock().insert(
+            route_id,
+            VideoWatcher {
+                token,
+                queue: std::collections::VecDeque::new(),
+            },
+        );
+        token
     }
 
-    pub fn video_unwatch(&self, route_id: &str) {
-        self.video_watchers.lock().remove(route_id);
+    /// Release a watch claim — only if `token` still owns the route. A
+    /// late unwatch from a replaced watcher is a no-op instead of
+    /// deleting its successor's queue.
+    pub fn video_unwatch(&self, route_id: &str, token: u64) {
+        let mut map = self.video_watchers.lock();
+        if map.get(route_id).is_some_and(|w| w.token == token) {
+            map.remove(route_id);
+        }
     }
 
     /// Drain everything queued for `route_id` into one length-prefixed
@@ -897,12 +926,12 @@ impl Mesh {
     /// arrived since the last poll.
     pub fn video_poll(&self, route_id: &str) -> Vec<u8> {
         let mut map = self.video_watchers.lock();
-        let Some(queue) = map.get_mut(route_id) else {
+        let Some(w) = map.get_mut(route_id) else {
             return Vec::new();
         };
-        let total: usize = queue.iter().map(|p| 4 + p.len()).sum();
+        let total: usize = w.queue.iter().map(|p| 4 + p.len()).sum();
         let mut out = Vec::with_capacity(total);
-        for packet in queue.drain(..) {
+        for packet in w.queue.drain(..) {
             out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
             out.extend_from_slice(&packet);
         }

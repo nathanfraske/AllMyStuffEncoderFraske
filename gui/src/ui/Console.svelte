@@ -52,13 +52,28 @@
   let fps = $state(0);
   let transport = $state("");
   let decodeFails = $state(0);
+  /// Pipeline anomaly readout — empty while healthy, e.g.
+  /// "in 14/s · out 0/s · q 38 · sw" when packets arrive but frames
+  /// don't, so a stall names its stage on the chip itself.
+  let pipeDiag = $state("");
   let frameCount = 0;
+  let inCount = 0;
+  let queuePeek = () => 0;
+  let decodeModeNote = "";
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
     const fpsTimer = setInterval(() => {
       fps = frameCount;
+      const inRate = inCount;
       frameCount = 0;
+      inCount = 0;
+      // Healthy: most of what arrives gets painted. Anything else is an
+      // anomaly worth wearing on the chip.
+      pipeDiag =
+        inRate > 2 && fps < inRate / 2
+          ? `in ${inRate}/s · out ${fps}/s · q ${queuePeek()}${decodeModeNote ? ` · ${decodeModeNote}` : ""}`
+          : "";
     }, 1000);
     if (windowed) {
       // The OS chrome's ✕ must tear the session's routes down too — the
@@ -71,6 +86,24 @@
     };
   });
 
+  // The exact codec string for the incoming stream, read off its SPS
+  // (profile/constraints/level are the three bytes after the NAL header)
+  // — a guessed string risks the decoder sizing reorder buffers for a
+  // stream we're not sending.
+  function spsCodecString(au: Uint8Array): string | null {
+    for (let i = 0; i + 4 < au.length; i++) {
+      if (au[i] !== 0 || au[i + 1] !== 0) continue;
+      const off = au[i + 2] === 1 ? i + 3 : au[i + 2] === 0 && au[i + 3] === 1 ? i + 4 : 0;
+      if (!off) continue;
+      if ((au[off] & 0x1f) === 7 && off + 3 < au.length) {
+        const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
+        return `avc1.${hex(au[off + 1])}${hex(au[off + 2])}${hex(au[off + 3])}`;
+      }
+      i = off;
+    }
+    return null;
+  }
+
   // Follow the live video route: watch its packet channel while it's up,
   // and show the placeholder rather than a stale frame whenever it
   // changes (input switch, session end).
@@ -80,11 +113,23 @@
     fps = 0;
     transport = "";
     decodeFails = 0;
+    pipeDiag = "";
     frameCount = 0;
+    inCount = 0;
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
     let decoder: VideoDecoder | null = null;
+    let codecString: string | null = null;
+    // The decode ladder: hardware-preference first; if chunks go in and
+    // nothing comes out for ~1.5s, rebuild with software decode (the
+    // hardware paths are where low-latency output is flakiest). The
+    // chip's diag line records the step.
+    let decodeMode: HardwareAcceleration = "no-preference";
+    let decodeCalls = 0;
+    let decodeOutputs = 0;
+    queuePeek = () => decoder?.decodeQueueSize ?? 0;
+    decodeModeNote = "";
     // JPEG bitmap decodes are async — chain them so frames paint in
     // arrival order.
     let drawChain = Promise.resolve();
@@ -134,10 +179,13 @@
         return;
       }
       // H.264 — decode entry is a key unit; deltas before one wait.
+      inCount += 1;
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
+        codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";
         decoder = new VideoDecoder({
           output: (frame) => {
+            decodeOutputs += 1;
             paint(frame.displayWidth, frame.displayHeight, (ctx) =>
               ctx.drawImage(frame, 0, 0),
             );
@@ -148,10 +196,13 @@
           error: dropDecoder,
         });
         try {
-          // Constrained baseline (what openh264 emits), level 5.1 — high
-          // enough that 1920-edge 30 fps streams configure everywhere;
-          // the decoder reads the real parameters from the SPS in-band.
-          decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true });
+          decoder.configure({
+            codec: codecString,
+            optimizeForLatency: true,
+            hardwareAcceleration: decodeMode,
+          });
+          decodeCalls = 0;
+          decodeOutputs = 0;
         } catch (e) {
           dropDecoder(e);
           return;
@@ -165,8 +216,30 @@
             data: f.data,
           }),
         );
+        decodeCalls += 1;
       } catch (e) {
         dropDecoder(e);
+        return;
+      }
+      // Chunks in, nothing out: step the ladder down to software decode
+      // once; the next key (≤4s away) rebuilds. If software stalls too,
+      // the diag chip keeps saying so rather than pretending.
+      if (
+        decodeOutputs === 0 &&
+        decodeCalls >= 20 &&
+        decodeMode === "no-preference"
+      ) {
+        decodeMode = "prefer-software";
+        decodeModeNote = "sw";
+        console.warn(
+          `video decoder (${codecString}) consumed ${decodeCalls} chunks without output — retrying with software decode`,
+        );
+        try {
+          if (decoder.state !== "closed") decoder.close();
+        } catch {
+          // already closed
+        }
+        decoder = null;
       }
     }).then((u) => {
       // The route may have changed while the subscribe was in flight.
@@ -394,7 +467,7 @@
             <span class="chip stream" title="Live stream — frame size · rate">
               <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{decodeFails
                 ? ` · ${decodeFails} decode-err`
-                : ""}
+                : ""}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
             </span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}

@@ -128,8 +128,8 @@ async fn send_input(
 /// poll costs one tick, where a lost push on Tauri's ordered IPC channel
 /// silently froze the stream for good.)
 #[tauri::command]
-fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) {
-    mesh.video_watch(route_id);
+fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
+    mesh.video_watch(route_id)
 }
 
 /// Drain the queued packets for a route as one raw batch:
@@ -140,10 +140,12 @@ fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Respo
 }
 
 /// Stop streaming a route's frames to the front-end (console closed or
-/// switched input). Idempotent.
+/// switched input). The token scopes the release to the claim that made
+/// it, so a late unwatch can't tear down a newer watcher of the same
+/// route. Idempotent.
 #[tauri::command]
-fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String) {
-    mesh.video_unwatch(&route_id);
+fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
+    mesh.video_unwatch(&route_id, token);
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
