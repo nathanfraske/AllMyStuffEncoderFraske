@@ -90,6 +90,15 @@ pub struct NodeProfile {
     /// hasn't been put up for adoption (it defines its own owner instead).
     #[serde(default)]
     pub claimable: bool,
+    /// Random id minted once per app run. Gossip is **event-driven, not a
+    /// heartbeat**: a receiver that sees a boot id it hasn't recorded for
+    /// this peer knows the peer just (re)started and missed our earlier
+    /// adverts, and answers with its own presence + roster directly — so
+    /// state converges on the events that change it, with no periodic
+    /// re-broadcast bloating the mesh. `0` = an older peer without the
+    /// field (those still heartbeat, so no reply is needed).
+    #[serde(default)]
+    pub boot: u64,
 }
 
 /// One device in an owned fleet — a machine the same owner has claimed, so
@@ -230,6 +239,7 @@ mod tests {
             )],
             owner: Some("my-laptop".into()),
             claimable: false,
+            boot: 7,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
@@ -246,6 +256,10 @@ mod tests {
         let p: NodeProfile = serde_json::from_str(json).unwrap();
         assert_eq!(p.owner, None);
         assert!(!p.claimable);
+        assert_eq!(
+            p.boot, 0,
+            "an older peer reads as boot 0 (heartbeats instead)"
+        );
     }
 
     #[test]

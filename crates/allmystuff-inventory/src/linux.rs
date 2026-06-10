@@ -549,12 +549,20 @@ pub fn collect_inputs() -> Vec<InputDevice> {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };
-    parse_input_devices(&text)
+    merged_input_devices(&text)
+}
+
+/// Parse, filter, and merge: every kernel endpoint block, minus the
+/// virtual/system pseudo-inputs (power button, lid switch, PC speaker… —
+/// not "things you plugged in"), collapsed to one entry per *physical*
+/// device by [`crate::dedupe::merge_inputs`] — so a gaming mouse's three
+/// HID interfaces or a unifying receiver's five read as one thing.
+fn merged_input_devices(text: &str) -> Vec<InputDevice> {
+    let endpoints = parse_input_endpoints(text)
         .into_iter()
-        // Drop the kernel's virtual/system pseudo-inputs (power button,
-        // lid switch, PC speaker…) — they're not "things you plugged in."
-        .filter(|d| !is_system_input(&d.name))
-        .collect()
+        .filter(|e| !is_system_input(&e.name))
+        .collect();
+    crate::dedupe::merge_inputs(endpoints)
 }
 
 fn is_system_input(name: &str) -> bool {
@@ -574,19 +582,27 @@ fn is_system_input(name: &str) -> bool {
 }
 
 /// Parse the blank-line-separated device blocks of
-/// `/proc/bus/input/devices`, classifying each from its `Name=` and
-/// `Handlers=` lines (with `js*` → gamepad, `kbd` → keyboard, `mouse` →
-/// mouse/touchpad). Returns every device; the live collector applies the
-/// system-input denylist.
-fn parse_input_devices(text: &str) -> Vec<InputDevice> {
+/// `/proc/bus/input/devices` into raw endpoints, classifying each from its
+/// `Name=` and `Handlers=` lines (with `js*` → gamepad, `kbd` → keyboard,
+/// `mouse` → mouse/touchpad). Each endpoint carries its physical-unit
+/// group key — `vendor:product` plus the port path from `Phys=` (which
+/// keeps two identical units apart while collapsing one unit's several
+/// interfaces). Endpoints with no usable identity pass through unmerged.
+fn parse_input_endpoints(text: &str) -> Vec<crate::dedupe::RawInput> {
     let mut out = Vec::new();
     for block in text.split("\n\n") {
         let mut name = None;
         let mut handlers = "";
         let mut sysfs = "";
+        let mut phys = "";
+        let mut ids = None;
         for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("N: Name=") {
+            if let Some(rest) = line.strip_prefix("I:") {
+                ids = parse_input_id_line(rest);
+            } else if let Some(rest) = line.strip_prefix("N: Name=") {
                 name = Some(rest.trim().trim_matches('"').to_string());
+            } else if let Some(rest) = line.strip_prefix("P: Phys=") {
+                phys = rest.trim();
             } else if let Some(rest) = line.strip_prefix("H: Handlers=") {
                 handlers = rest.trim();
             } else if let Some(rest) = line.strip_prefix("S: Sysfs=") {
@@ -595,17 +611,54 @@ fn parse_input_devices(text: &str) -> Vec<InputDevice> {
         }
         let Some(name) = name else { continue };
         let kind = classify_input(&name, handlers);
-        // Stable id from the sysfs leaf when present, else the slugged
-        // name, so two identically-named devices don't collide.
+        // Stable fallback id from the sysfs leaf when present, else the
+        // slugged name, so two identically-named devices don't collide.
         let leaf = sysfs.rsplit('/').next().unwrap_or("");
-        let id = if leaf.is_empty() {
-            format!("input:{}", slug(&name))
+        let fallback_id = if leaf.is_empty() {
+            format!("input:{}", crate::dedupe::slug(&name))
         } else {
             format!("input:{leaf}")
         };
-        out.push(InputDevice { id, name, kind });
+        let group = match (&ids, phys_port(phys)) {
+            (Some((vendor, product)), Some(port)) => Some(format!("{vendor}:{product}:{port}")),
+            _ => None,
+        };
+        out.push(crate::dedupe::RawInput {
+            name,
+            kind,
+            group,
+            fallback_id,
+        });
     }
     out
+}
+
+/// `Bus=0003 Vendor=046d Product=c52b Version=0111` → `("046d", "c52b")`.
+fn parse_input_id_line(rest: &str) -> Option<(String, String)> {
+    let mut vendor = None;
+    let mut product = None;
+    for field in rest.split_whitespace() {
+        if let Some(v) = field.strip_prefix("Vendor=") {
+            vendor = Some(v.to_lowercase());
+        } else if let Some(p) = field.strip_prefix("Product=") {
+            product = Some(p.to_lowercase());
+        }
+    }
+    Some((vendor?, product?))
+}
+
+/// The physical port a device hangs off: its `Phys=` path with the
+/// trailing per-interface `/inputN` segment stripped, so every interface
+/// of one unit shares it — `usb-0000:00:14.0-2/input1` →
+/// `usb-0000:00:14.0-2`. `None` for devices with no phys (virtual).
+fn phys_port(phys: &str) -> Option<&str> {
+    if phys.is_empty() {
+        return None;
+    }
+    match phys.rsplit_once('/') {
+        Some((head, tail)) if tail.starts_with("input") && !head.is_empty() => Some(head),
+        _ => Some(phys),
+    }
 }
 
 fn classify_input(name: &str, handlers: &str) -> InputKind {
@@ -808,20 +861,6 @@ fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-fn slug(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 // =======================================================================
 // tests — pure parsers against real-world fixtures
 // =======================================================================
@@ -969,6 +1008,8 @@ mod tests {
 
     #[test]
     fn input_classification_covers_the_common_peripherals() {
+        // No Phys lines → no group identity → endpoints pass through
+        // unmerged, with sysfs-leaf ids (the pre-merge behaviour).
         let text = "I: Bus=0011 Vendor=0001 Product=0001\n\
                     N: Name=\"AT Translated Set 2 keyboard\"\n\
                     S: Sysfs=/devices/platform/i8042/serio0/input/input1\n\
@@ -988,13 +1029,63 @@ mod tests {
                     N: Name=\"Microsoft X-Box 360 pad\"\n\
                     S: Sysfs=/devices/pci0000:00/usb2/2-1/input/input20\n\
                     H: Handlers=event20 js0 \n";
-        let devs = parse_input_devices(text);
+        let devs = merged_input_devices(text);
         assert_eq!(devs.len(), 4);
         assert_eq!(devs[0].kind, InputKind::Keyboard);
         assert_eq!(devs[0].id, "input:input1");
         assert_eq!(devs[1].kind, InputKind::Mouse);
         assert_eq!(devs[2].kind, InputKind::Touchpad);
         assert_eq!(devs[3].kind, InputKind::Gamepad);
+        assert!(devs.iter().all(|d| d.endpoints == 1));
+    }
+
+    #[test]
+    fn one_physical_devices_interfaces_merge_to_one_entry() {
+        // A unifying receiver's interfaces share Vendor/Product and the
+        // Phys port (only the trailing /inputN differs) → one combined
+        // entry. The AT keyboard sits on its own port and stays itself.
+        let text = "I: Bus=0003 Vendor=046d Product=c52b Version=0111\n\
+                    N: Name=\"Logitech USB Receiver\"\n\
+                    P: Phys=usb-0000:00:14.0-2/input0\n\
+                    S: Sysfs=/devices/pci0000:00/usb1/1-2/input/input4\n\
+                    H: Handlers=sysrq kbd event4 \n\
+                    \n\
+                    I: Bus=0003 Vendor=046d Product=c52b Version=0111\n\
+                    N: Name=\"Logitech USB Receiver Mouse\"\n\
+                    P: Phys=usb-0000:00:14.0-2/input1\n\
+                    S: Sysfs=/devices/pci0000:00/usb1/1-2/input/input5\n\
+                    H: Handlers=mouse0 event5 \n\
+                    \n\
+                    I: Bus=0003 Vendor=046d Product=c52b Version=0111\n\
+                    N: Name=\"Logitech USB Receiver Consumer Control\"\n\
+                    P: Phys=usb-0000:00:14.0-2/input2\n\
+                    S: Sysfs=/devices/pci0000:00/usb1/1-2/input/input6\n\
+                    H: Handlers=kbd event6 \n\
+                    \n\
+                    I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n\
+                    N: Name=\"AT Translated Set 2 keyboard\"\n\
+                    P: Phys=isa0060/serio0/input0\n\
+                    S: Sysfs=/devices/platform/i8042/serio0/input/input1\n\
+                    H: Handlers=sysrq kbd event1 \n";
+        let devs = merged_input_devices(text);
+        assert_eq!(devs.len(), 2, "{devs:?}");
+        assert_eq!(devs[0].name, "Logitech USB Receiver (keyboard + mouse)");
+        assert_eq!(devs[0].kind, InputKind::Keyboard);
+        assert_eq!(devs[0].endpoints, 3);
+        assert_eq!(devs[1].name, "AT Translated Set 2 keyboard");
+        assert_eq!(devs[1].endpoints, 1);
+    }
+
+    #[test]
+    fn phys_port_strips_the_interface_segment() {
+        assert_eq!(
+            phys_port("usb-0000:00:14.0-2/input1"),
+            Some("usb-0000:00:14.0-2")
+        );
+        assert_eq!(phys_port("isa0060/serio0/input0"), Some("isa0060/serio0"));
+        // No interface suffix → the whole path is the port.
+        assert_eq!(phys_port("ALSA"), Some("ALSA"));
+        assert_eq!(phys_port(""), None);
     }
 
     #[test]

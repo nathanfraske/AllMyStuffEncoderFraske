@@ -27,16 +27,26 @@ use allmystuff_protocol::{
     ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RouteControl,
     CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
 };
-use allmystuff_session::{AudioFrame, Effect, Session};
+use allmystuff_session::{
+    AudioFrame, Effect, InputAction, InputEvent, MediaPayload, Session, VideoAssembler, VideoFrame,
+};
 
 use crate::audio::AudioBridge;
 use crate::control_client::ControlClient;
+use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::video::VideoBridge;
 
 pub struct Mesh {
     client: Arc<ControlClient>,
     app: AppHandle,
     audio: Arc<AudioBridge>,
+    /// Screen capture for display routes this machine sources (the far end
+    /// of a console session looking at us).
+    video: Arc<VideoBridge>,
+    /// Keyboard/mouse injection for input routes that sink here — gated on
+    /// the sender being our owner or a fleet member.
+    injector: Injector,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -44,7 +54,27 @@ pub struct Mesh {
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel.
     audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
+    /// Outbound video, deliberately *bounded*: when the link can't keep up
+    /// the capture side drops frames (each is a standalone JPEG, so a drop
+    /// costs nothing but freshness) instead of queueing stale ones.
+    video_out: mpsc::Sender<(String, VideoFrame)>,
+    /// Sequence for outbound input events (one stream per app run).
+    input_seq: AtomicU64,
+    /// This app run's random presence boot id — how peers detect that we
+    /// (re)started and answer with their state (see `NodeProfile::boot`).
+    boot_id: u64,
+    /// Reassembles chunked inbound video frames (a frame bigger than the
+    /// data channel's ~64 KiB message ceiling arrives in pieces).
+    video_in: Mutex<VideoAssembler>,
 }
+
+/// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
+/// envelope, a chunk message stays comfortably under the data channel's
+/// ~64 KiB ceiling (the WebRTC SCTP max message size).
+const MAX_JPEG_CHUNK_BYTES: usize = 40 * 1024;
+
+/// Media-plane send failures repeat at frame rate; warn at most this often.
+const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct State {
     session: Option<Session>,
@@ -59,6 +89,11 @@ struct State {
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
     peer_networks: HashMap<String, String>,
+    /// Last presence boot id seen per peer (canonical pubkey). A boot id we
+    /// haven't recorded means the peer just (re)started and missed our
+    /// adverts — we answer with our state directly. This is what lets
+    /// gossip be event-driven instead of a heartbeat.
+    peer_boots: HashMap<String, u64>,
     client_id: Option<ClientId>,
     profile: Option<NodeProfile>,
 }
@@ -66,45 +101,101 @@ struct State {
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
         let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
+        // A shallow queue: at most a few frames in flight, so a slow link
+        // sheds load by dropping captures rather than growing latency.
+        let (video_out, mut video_rx) = mpsc::channel::<(String, VideoFrame)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
             app,
             audio: Arc::new(AudioBridge::new()),
+            video: Arc::new(VideoBridge::new()),
+            injector: Injector::new(),
             state: Mutex::new(State {
                 session: None,
                 network: None,
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
+                peer_boots: HashMap::new(),
                 client_id: None,
                 profile: None,
             }),
             ownership: Arc::new(Ownership::load()),
             audio_out,
+            video_out,
+            input_seq: AtomicU64::new(0),
+            boot_id: fresh_boot_id(),
+            video_in: Mutex::new(VideoAssembler::new()),
         });
 
-        // Forwarder: drain captured frames out to peers on the media channel.
+        // Forwarders: drain captured frames out to peers on the media
+        // channel — audio unbounded (tiny, ordered), video bounded. Send
+        // failures are *surfaced* (rate-limited): a silently-dying media
+        // plane is exactly the "connected but nothing arrives" mystery.
         {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
+                let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, frame)) = audio_rx.recv().await {
-                    let Some(network) = mesh.network_for_peer(&peer) else { continue };
-                    let payload = match serde_json::to_value(&frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Ok(payload) = serde_json::to_value(&frame) else {
+                        continue;
                     };
-                    let _ = mesh
-                        .client
-                        .request(&Request::ChannelSendTo {
-                            network,
-                            channel: CHANNEL_MEDIA.to_string(),
-                            peer: pubkey_part(&peer).to_string(),
-                            payload,
-                        })
-                        .await;
+                    if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                        if last_warn.elapsed() >= WARN_EVERY {
+                            last_warn = std::time::Instant::now();
+                            tracing::warn!("audio frame to {} failed: {e}", short_id(&peer));
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let mesh = mesh.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut last_warn = std::time::Instant::now() - WARN_EVERY;
+                while let Some((peer, frame)) = video_rx.recv().await {
+                    // A frame above the data channel's message ceiling
+                    // travels as several chunks sharing its seq.
+                    for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
+                        let Ok(payload) = serde_json::to_value(&chunk) else {
+                            continue;
+                        };
+                        if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                            if last_warn.elapsed() >= WARN_EVERY {
+                                last_warn = std::time::Instant::now();
+                                tracing::warn!("video frame to {} failed: {e}", short_id(&peer));
+                            }
+                            break; // rest of this frame is pointless
+                        }
+                    }
                 }
             });
         }
         mesh
+    }
+
+    /// Send one media-channel payload to `peer` (canonicalised to the bare
+    /// pubkey the daemon's peer set is keyed by), reporting the daemon's
+    /// verdict — a transport refusal (peer gone, message too large) must
+    /// reach a log, not vanish.
+    async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
+        let Some(network) = self.network_for_peer(peer) else {
+            return Err("no shared network".into());
+        };
+        let resp = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network,
+                channel: CHANNEL_MEDIA.to_string(),
+                peer: pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp.error.unwrap_or_else(|| "channel send failed".into()))
+        }
     }
 
     fn network(&self) -> Option<String> {
@@ -124,7 +215,11 @@ impl Mesh {
 
     /// This node's mesh id once known (the daemon device id), else `None`.
     pub fn local_node_id(&self) -> Option<String> {
-        self.state.lock().session.as_ref().map(|s| s.me().to_string())
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .map(|s| s.me().to_string())
     }
 
     /// This node's mesh id, resolved even before the live session starts: the
@@ -157,7 +252,10 @@ impl Mesh {
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
-        let me = self.fetch_identity().await.unwrap_or_else(|| NodeId::this().to_string());
+        let me = self
+            .fetch_identity()
+            .await
+            .unwrap_or_else(|| NodeId::this().to_string());
         let label = self.fetch_identity_label().await;
         let profile = self.build_profile(&me, label);
         // Every joined network; route control/media operate on the primary.
@@ -174,6 +272,10 @@ impl Mesh {
         }
 
         if networks.is_empty() {
+            // Still run the claim-status check (it sanitizes stale fleet
+            // residue and refreshes the UI); the broadcasts inside are
+            // no-ops with no networks to send on.
+            self.ownership_check(None).await;
             self.emit_status("no_network", None);
         } else {
             // Every AllMyStuff channel on *every* network. Presence + the
@@ -186,24 +288,18 @@ impl Mesh {
             // secondary network had no subscriber on the receiving side and
             // the daemon silently dropped it.
             self.subscribe_channels(client_id, &networks).await;
-            self.broadcast_presence().await;
-            self.broadcast_owned().await;
+            // App-load trigger of the claim-status check: sanitize stale
+            // fleet residue, then assert presence + roster to everyone.
+            self.ownership_check(None).await;
             self.emit_status("live", None);
         }
 
-        // Periodic presence + owned-roster re-broadcast so late joiners see us
-        // and the fleet converges.
-        {
-            let mesh = self.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
-                loop {
-                    tick.tick().await;
-                    mesh.broadcast_presence().await;
-                    mesh.broadcast_owned().await;
-                }
-            });
-        }
+        // No periodic re-broadcast: gossip is event-driven. Late joiners are
+        // covered twice over — the daemon's "peer approved" event triggers a
+        // targeted ownership check at them, and a presence advert carrying a
+        // boot id we haven't recorded (their app just started while the
+        // daemon link stayed up) gets answered with our state directly. The
+        // mesh carries traffic when something *happens*, not on a heartbeat.
 
         // Event loop.
         let mesh = self.clone();
@@ -265,7 +361,11 @@ impl Mesh {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|n| n.get("config_id").and_then(|v| v.as_str()).map(str::to_string))
+                    .filter_map(|n| {
+                        n.get("config_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -291,6 +391,7 @@ impl Mesh {
             // spoken for (or one that was never put into claim mode).
             owner: self.ownership.owner().map(NodeId::from),
             claimable: self.ownership.claimable(),
+            boot: self.boot_id,
         }
     }
 
@@ -300,7 +401,9 @@ impl Mesh {
             (st.networks.clone(), st.profile.clone())
         };
         let Some(profile) = profile else { return };
-        let Ok(payload) = serde_json::to_value(&profile) else { return };
+        let Ok(payload) = serde_json::to_value(&profile) else {
+            return;
+        };
         for network in networks {
             let _ = self
                 .client
@@ -320,15 +423,38 @@ impl Mesh {
         match kind {
             "channel_inbound" => {
                 let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-                let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let from = value
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 // The network this frame arrived on — so we learn which network
                 // each peer lives on and can address replies back to it.
-                let network = value.get("network").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let network = value
+                    .get("network")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let payload = value.get("payload").cloned().unwrap_or(Value::Null);
                 self.handle_channel(channel, from, network, payload).await;
             }
             "event" => {
                 if let Some(event) = value.get("event") {
+                    // Connection establishment is a claim-status trigger: a
+                    // peer just went live for app traffic ("approved"), so
+                    // re-assert presence + fleet roster straight at it —
+                    // there is no heartbeat to catch it up later.
+                    let approved = event.get("event_kind").and_then(|v| v.as_str()) == Some("peer")
+                        && event.get("kind").and_then(|v| v.as_str()) == Some("approved");
+                    if approved {
+                        if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
+                            let mesh = self.clone();
+                            let device = device.to_string();
+                            tauri::async_runtime::spawn(async move {
+                                mesh.ownership_check(Some(&device)).await;
+                            });
+                        }
+                    }
                     let _ = self.app.emit("allmystuff://event", event.clone());
                 }
             }
@@ -336,20 +462,55 @@ impl Mesh {
         }
     }
 
-    async fn handle_channel(self: &Arc<Self>, channel: &str, from: String, network: String, payload: Value) {
+    async fn handle_channel(
+        self: &Arc<Self>,
+        channel: &str,
+        from: String,
+        network: String,
+        payload: Value,
+    ) {
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
         // several networks we're on).
         if !network.is_empty() && !from.is_empty() {
-            self.state.lock().peer_networks.insert(pubkey_part(&from).to_string(), network);
+            self.state
+                .lock()
+                .peer_networks
+                .insert(pubkey_part(&from).to_string(), network);
         }
         match channel {
             CHANNEL_PRESENCE => {
                 if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
+                    // A boot id we haven't recorded for this peer means its
+                    // app just (re)started and missed our adverts — answer
+                    // with our presence + roster directly. This (plus the
+                    // connection-approved trigger) is what replaced the
+                    // periodic re-broadcast; the reply can't loop because
+                    // the peer then knows our boot id and stays quiet.
+                    // `boot == 0` is an older heartbeating peer: no reply
+                    // needed. Our own echo never replies to itself.
+                    let canon = pubkey_part(profile.node.as_str()).to_string();
+                    let is_self = self
+                        .local_node_id()
+                        .is_some_and(|me| pubkey_part(&me) == canon);
+                    let new_boot = profile.boot != 0 && !is_self && {
+                        let mut st = self.state.lock();
+                        st.peer_boots.insert(canon, profile.boot) != Some(profile.boot)
+                    };
                     let changed = {
                         let mut st = self.state.lock();
-                        st.session.as_mut().map(|s| s.apply_presence(profile)).unwrap_or(false)
+                        st.session
+                            .as_mut()
+                            .map(|s| s.apply_presence(profile))
+                            .unwrap_or(false)
                     };
+                    if new_boot {
+                        tracing::info!(
+                            "peer {} (re)started — answering with our presence + roster",
+                            short_id(&from)
+                        );
+                        self.ownership_check(Some(&from)).await;
+                    }
                     if changed {
                         self.emit_snapshot();
                     }
@@ -369,8 +530,56 @@ impl Mesh {
                 }
             }
             CHANNEL_MEDIA => {
-                if let Ok(frame) = serde_json::from_value::<AudioFrame>(payload) {
-                    self.audio.feed(&frame.route, &frame);
+                let Some(media) = MediaPayload::decode(payload) else {
+                    return;
+                };
+                match media {
+                    MediaPayload::Audio(frame) => self.audio.feed(&frame.route, &frame),
+                    MediaPayload::Video(frame) => {
+                        // Surface frames only for a route this session knows
+                        // is live, sinks here, and belongs to the sender —
+                        // the console window(s) render them. Chunked frames
+                        // reassemble first; the first complete frame of a
+                        // stream is logged so "connected but no pixels" is
+                        // attributable from this side too.
+                        if !self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
+                            tracing::debug!(
+                                "dropped video frame for {} from {} (route not live here)",
+                                frame.route,
+                                short_id(&from)
+                            );
+                            return;
+                        }
+                        let full = { self.video_in.lock().push(frame) };
+                        if let Some(full) = full {
+                            if full.seq == 0 {
+                                tracing::info!(
+                                    "first screen frame for {} ({}×{})",
+                                    full.route,
+                                    full.width,
+                                    full.height
+                                );
+                            }
+                            let _ = self.app.emit("allmystuff://video", &full);
+                        }
+                    }
+                    MediaPayload::Input(ev) => {
+                        // Injecting keystrokes is the most privileged thing
+                        // on the mesh, so it takes both gates: a live input
+                        // route from this exact sender, *and* the sender
+                        // being this device's recorded owner or a co-owned
+                        // fleet member. (Share-grant-based control rides on
+                        // the share enforcement work — not wired yet.)
+                        if self.inbound_media_ok(&ev.route, &from, MediaKind::Input)
+                            && self.sender_may_control(&from)
+                        {
+                            self.injector.apply(ev.action);
+                        } else {
+                            tracing::warn!(
+                                "dropped input event from {from}: not an authorized controller"
+                            );
+                        }
+                    }
                 }
             }
             CHANNEL_OWNED => {
@@ -379,7 +588,25 @@ impl Mesh {
                 // adopted device), re-broadcast so the fleet converges and
                 // tell the front-end.
                 if let Ok(roster) = serde_json::from_value::<OwnedRoster>(payload) {
-                    if self.ownership.merge_fleet(&roster) {
+                    let Some(me) = self.local_node_id() else {
+                        return;
+                    };
+                    let structural = self.ownership.merge_fleet(&me, &roster);
+                    let outcome = if structural {
+                        "merged"
+                    } else if self.ownership.fleet().is_some_and(|f| f.key == roster.key) {
+                        "in sync"
+                    } else {
+                        "ignored (not our fleet)"
+                    };
+                    tracing::info!(
+                        "owned roster from {}: key …{} v{} ({} members) → {outcome}",
+                        short_id(&from),
+                        key_tail(&roster.key),
+                        roster.version,
+                        roster.members.len(),
+                    );
+                    if structural {
                         self.broadcast_owned().await;
                         self.emit_owned();
                     }
@@ -390,7 +617,12 @@ impl Mesh {
     }
 
     /// Front-end command: offer a route from `from` to `to`.
-    pub async fn connect(self: &Arc<Self>, from: String, to: String, media: String) -> Result<String, String> {
+    pub async fn connect(
+        self: &Arc<Self>,
+        from: String,
+        to: String,
+        media: String,
+    ) -> Result<String, String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let media = parse_media(&media);
         let route = Route {
@@ -415,7 +647,9 @@ impl Mesh {
                 let _ = s.offer(route.clone(), me.as_str());
                 s.handle(
                     NodeId::from(me.as_str()),
-                    ControlMessage::Route(RouteControl::Accept { route_id: route.id.clone() }),
+                    ControlMessage::Route(RouteControl::Accept {
+                        route_id: route.id.clone(),
+                    }),
                 )
             };
             self.process_effects(effects).await;
@@ -431,12 +665,22 @@ impl Mesh {
         if let Err(e) = self.send_control(&peer, &msg).await {
             // The peer never saw the offer — drop it rather than leave a
             // phantom half-open route in the session.
+            tracing::warn!(
+                "route {} offer to {} undeliverable: {e}",
+                route.id,
+                short_id(&peer)
+            );
             let mut st = self.state.lock();
             if let Some(s) = st.session.as_mut() {
                 let _ = s.teardown(&route.id);
             }
             return Err(e);
         }
+        tracing::info!(
+            "route {} offered to {} — awaiting accept",
+            route.id,
+            short_id(&peer)
+        );
         self.emit_snapshot();
         Ok(route.id)
     }
@@ -447,6 +691,7 @@ impl Mesh {
             st.session.as_mut().and_then(|s| s.teardown(&route_id))
         };
         self.audio.stop(&route_id);
+        self.video.stop(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -489,7 +734,10 @@ impl Mesh {
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
                 Effect::StartMedia(route) => self.start_media(&route),
-                Effect::StopMedia(id) => self.audio.stop(&id),
+                Effect::StopMedia(id) => {
+                    self.audio.stop(&id);
+                    self.video.stop(&id);
+                }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
                         "allmystuff://share",
@@ -520,26 +768,47 @@ impl Mesh {
                         reason: "a claim must be self-asserted".into(),
                     }
                 } else if self.ownership.try_accept_claim(from.as_str()) {
-                    // The claim took — re-advertise with the new owner so the
-                    // claimer (and everyone) sees it's now spoken for.
-                    self.refresh_profile_ownership().await;
+                    // The claim took — a claim change runs the full status
+                    // check: re-advertise with the new owner so the claimer
+                    // (and everyone) sees it's now spoken for. Any stale
+                    // fleet state was reset by the accept; the owner's
+                    // roster lands next on the owned channel.
+                    tracing::info!(
+                        "claim accepted: {} now owns this device",
+                        short_id(from.as_str())
+                    );
+                    self.ownership_check(None).await;
                     OwnershipControl::Claimed { owner }
                 } else {
+                    tracing::info!(
+                        "claim from {} declined: not in claim mode",
+                        short_id(from.as_str())
+                    );
                     OwnershipControl::Declined {
                         reason: "this device isn't in claim mode".into(),
                     }
                 };
-                let _ = self
+                if let Err(e) = self
                     .send_control(&from.to_string(), &ControlMessage::Ownership(reply))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        "couldn't send the claim reply to {}: {e}",
+                        short_id(from.as_str())
+                    );
+                }
             }
             OwnershipControl::Release => {
                 // The recorded owner is letting this device go (compare by
                 // pubkey — same display-vs-bare id reconciliation as Claim).
+                // A claim change → run the full status check (the release
+                // also cleared our fleet membership, so the empty roster
+                // reaches the UI).
                 let owner = self.ownership.owner();
                 if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
+                    tracing::info!("released by {} — unowned again", short_id(from.as_str()));
                     self.ownership.set_owner(None);
-                    self.refresh_profile_ownership().await;
+                    self.ownership_check(None).await;
                 }
             }
             OwnershipControl::Claimed { owner } => {
@@ -557,6 +826,15 @@ impl Mesh {
                 }
                 let label = self.peer_label(&from);
                 self.ownership.upsert_member(from.as_str(), &label);
+                if let Some(r) = self.ownership.fleet() {
+                    tracing::info!(
+                        "claim confirmed by {}; fleet key …{} now {} members (v{})",
+                        short_id(from.as_str()),
+                        key_tail(&r.key),
+                        r.members.len(),
+                        r.version
+                    );
+                }
                 self.send_owned_to(from.as_str()).await;
                 self.broadcast_owned().await;
                 self.emit_owned();
@@ -571,6 +849,11 @@ impl Mesh {
             }
             other => {
                 // Declined — feedback for the claimer's UI.
+                tracing::info!(
+                    "ownership reply from {}: {:?}",
+                    short_id(from.as_str()),
+                    other
+                );
                 let _ = self.app.emit(
                     "allmystuff://ownership",
                     json!({ "from": from.to_string(), "message": other }),
@@ -629,48 +912,94 @@ impl Mesh {
         let Some(roster) = self.ownership.fleet() else {
             return;
         };
+        self.broadcast_roster(&roster).await;
+    }
+
+    /// Broadcast one explicit roster on every network — used for the final
+    /// minus-self roster of a leave (our own store is already cleared) and
+    /// the bumped roster of a kick. Logs how many peers each network's
+    /// broadcast actually reached, so "the roster never arrived" is
+    /// diagnosable from this side's log.
+    async fn broadcast_roster(&self, roster: &OwnedRoster) {
         let networks = { self.state.lock().networks.clone() };
-        let Ok(payload) = serde_json::to_value(&roster) else {
+        let Ok(payload) = serde_json::to_value(roster) else {
             return;
         };
         for network in networks {
-            let _ = self
+            let resp = self
                 .client
                 .request(&Request::ChannelSendAll {
-                    network,
+                    network: network.clone(),
                     channel: CHANNEL_OWNED.to_string(),
                     payload: payload.clone(),
                 })
                 .await;
+            match resp {
+                Ok(r) if r.ok => {
+                    let n = r
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("dispatched_to"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    tracing::debug!("owned roster broadcast on {network} reached {n} peer(s)");
+                }
+                Ok(r) => tracing::warn!(
+                    "owned roster broadcast on {network} refused: {}",
+                    r.error.unwrap_or_else(|| "(no error)".into())
+                ),
+                Err(e) => tracing::warn!("owned roster broadcast on {network} failed: {e}"),
+            }
         }
     }
 
-    /// Send this device's fleet roster straight to one peer — used right after
-    /// a claim so the new device gets the key + membership immediately, before
-    /// the next periodic broadcast.
+    /// Send this device's fleet roster straight to one peer — used right
+    /// after a claim (and on the targeted ownership check) so the device
+    /// gets the key + membership the moment it matters.
     async fn send_owned_to(&self, peer: &str) {
         let Some(roster) = self.ownership.fleet() else {
             return;
         };
+        self.send_roster_to(peer, &roster).await;
+    }
+
+    /// Send one explicit roster straight to a peer — a kick hands the
+    /// kicked device the roster it's no longer in, so it drops out
+    /// immediately.
+    async fn send_roster_to(&self, peer: &str, roster: &OwnedRoster) {
         let Some(network) = self.network_for_peer(peer) else {
+            tracing::warn!("no network to hand the fleet roster to {}", short_id(peer));
             return;
         };
-        if let Ok(payload) = serde_json::to_value(&roster) {
-            let _ = self
+        if let Ok(payload) = serde_json::to_value(roster) {
+            let resp = self
                 .client
                 .request(&Request::ChannelSendTo {
-                    network,
+                    network: network.clone(),
                     channel: CHANNEL_OWNED.to_string(),
                     peer: pubkey_part(peer).to_string(),
                     payload,
                 })
                 .await;
+            match resp {
+                Ok(r) if r.ok => {
+                    tracing::info!("fleet roster handed to {} on {network}", short_id(peer));
+                }
+                Ok(r) => tracing::warn!(
+                    "fleet roster to {} refused by daemon: {}",
+                    short_id(peer),
+                    r.error.unwrap_or_else(|| "(no error)".into())
+                ),
+                Err(e) => tracing::warn!("fleet roster to {} failed: {e}", short_id(peer)),
+            }
         }
     }
 
     /// Push the current fleet roster to the front-end.
     fn emit_owned(&self) {
-        let _ = self.app.emit("allmystuff://owned", self.owned_roster_value());
+        let _ = self
+            .app
+            .emit("allmystuff://owned", self.owned_roster_value());
     }
 
     /// The current fleet roster as JSON — for the `owned_roster` command and
@@ -690,6 +1019,7 @@ impl Mesh {
     /// "asking…" hanging forever.
     pub async fn claim(self: &Arc<Self>, node: String) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
+        tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
         self.send_control(&node, &msg).await
     }
@@ -700,6 +1030,126 @@ impl Mesh {
         self.ownership.set_claim_mode(on);
         self.refresh_profile_ownership().await;
         Ok(self.ownership.claimable())
+    }
+
+    /// The claim-status check — "is what we believe about ownership still
+    /// true, and does everyone else know it?" Drops incoherent fleet
+    /// residue, re-stamps the live profile from the ownership store, then
+    /// re-asserts presence + roster. Runs **targeted** at one peer right
+    /// after its connection establishes or its app (re)starts — so the two
+    /// sides converge on the event itself; there is no heartbeat — and
+    /// **broadcast** on the local triggers: session start, a claim/release,
+    /// and fleet membership changes.
+    pub async fn ownership_check(self: &Arc<Self>, peer: Option<&str>) {
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        if self.ownership.sanitize_fleet(&me) {
+            tracing::info!("ownership check dropped a stale fleet roster");
+        }
+        {
+            let mut st = self.state.lock();
+            if let Some(p) = st.profile.as_mut() {
+                p.owner = self.ownership.owner().map(NodeId::from);
+                p.claimable = self.ownership.claimable();
+            }
+        }
+        match peer {
+            Some(peer) => {
+                tracing::debug!("ownership check → {}", short_id(peer));
+                self.send_presence_to(peer).await;
+                // The roster (it carries the fleet's grouping key) goes only
+                // to peers that are actually in the fleet — presence is for
+                // everyone, the key is not.
+                let member = self.ownership.fleet().is_some_and(|f| {
+                    f.members
+                        .iter()
+                        .any(|m| pubkey_part(m.device.as_str()) == pubkey_part(peer))
+                });
+                if member {
+                    self.send_owned_to(peer).await;
+                }
+            }
+            None => {
+                self.broadcast_presence().await;
+                self.broadcast_owned().await;
+            }
+        }
+        self.emit_owned();
+        self.emit_snapshot();
+    }
+
+    /// Send this node's presence profile straight to one peer — the
+    /// targeted half of `broadcast_presence`, for a peer that just
+    /// connected or restarted and so has never heard us.
+    async fn send_presence_to(&self, peer: &str) {
+        let profile = { self.state.lock().profile.clone() };
+        let Some(profile) = profile else { return };
+        let Some(network) = self.network_for_peer(peer) else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_value(&profile) {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_PRESENCE.to_string(),
+                    peer: pubkey_part(peer).to_string(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    /// Front-end command: leave the fleet this device belongs to. The
+    /// remaining members get the bumped minus-us roster (replacement
+    /// semantics drop us everywhere), our own fleet state clears, and —
+    /// since membership follows ownership — any recorded owner is let go
+    /// and presence re-advertises unowned.
+    pub async fn fleet_leave(self: &Arc<Self>) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let roster = self
+            .ownership
+            .leave_fleet(&me)
+            .ok_or("this device isn't in a fleet")?;
+        tracing::info!(
+            "leaving the fleet — broadcasting roster v{} ({} members remain)",
+            roster.version,
+            roster.members.len()
+        );
+        self.broadcast_roster(&roster).await;
+        if self.ownership.owner().is_some() {
+            self.ownership.set_owner(None);
+        }
+        self.refresh_profile_ownership().await;
+        self.emit_owned();
+        Ok(())
+    }
+
+    /// Front-end command: kick `device` out of the fleet. The store
+    /// enforces the rule — only a member may kick, and never itself — and
+    /// the kicked device learns immediately: it gets a best-effort
+    /// ownership release (honoured when we're its recorded owner) plus the
+    /// new roster it's absent from, which its merge treats as "kicked".
+    pub async fn fleet_kick(self: &Arc<Self>, device: String) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let roster = self.ownership.kick_member(&me, &device)?;
+        tracing::info!(
+            "kicked {} from the fleet (roster now v{}, {} members)",
+            short_id(&device),
+            roster.version,
+            roster.members.len()
+        );
+        self.broadcast_roster(&roster).await;
+        let _ = self
+            .send_control(
+                &device,
+                &ControlMessage::Ownership(OwnershipControl::Release),
+            )
+            .await;
+        self.send_roster_to(&device, &roster).await;
+        self.emit_owned();
+        Ok(())
     }
 
     /// Re-read the joined networks, (re)subscribe every channel on each, then
@@ -750,34 +1200,160 @@ impl Mesh {
         }
     }
 
-    /// Begin carrying media for a now-active route. Only audio is wired
-    /// today; the route still shows active for other media so the UI is
-    /// honest about what's connected vs streaming.
+    /// Begin carrying media for a now-active route. Audio, display (screen
+    /// streaming), and input (remote control) are wired; camera video and
+    /// storage still show active without a transport, and the log says so.
     fn start_media(&self, route: &Route) {
-        if route.media != MediaKind::Audio {
-            tracing::info!("route {} active ({:?}); media transport for it is a follow-up", route.id, route.media);
+        let Some(me) = self.local_node_id() else {
             return;
-        }
-        let Some(me) = self.local_node_id() else { return };
+        };
         let from_node = node_of(route.from.as_str());
         let to_node = node_of(route.to.as_str());
 
-        // We source: capture the default mic and stream to the sink node.
-        if from_node == me {
-            let peer = to_node.clone();
-            let rid = route.id.clone();
-            let tx = self.audio_out.clone();
-            let seq = Arc::new(AtomicU64::new(0));
-            self.audio.start_capture(route.id.clone(), move |pcm, rate| {
-                let s = seq.fetch_add(1, Ordering::Relaxed);
-                let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
-                let _ = tx.send((peer.clone(), frame));
-            });
+        match route.media {
+            MediaKind::Audio => {
+                // We source: capture the default mic and stream to the sink.
+                if from_node == me {
+                    tracing::info!(
+                        "route {} active — streaming audio to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                    let peer = to_node.clone();
+                    let rid = route.id.clone();
+                    let tx = self.audio_out.clone();
+                    let seq = Arc::new(AtomicU64::new(0));
+                    self.audio
+                        .start_capture(route.id.clone(), move |pcm, rate| {
+                            let s = seq.fetch_add(1, Ordering::Relaxed);
+                            let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
+                            let _ = tx.send((peer.clone(), frame));
+                        });
+                }
+                // We sink: play inbound frames for this route.
+                if to_node == me {
+                    tracing::info!(
+                        "route {} active — playing audio from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                    self.audio.start_playback(route.id.clone());
+                }
+            }
+            MediaKind::Display => {
+                // We're the screen being looked at: capture and stream
+                // MJPEG to the viewer. The viewer side starts nothing here
+                // — its console window renders the emitted frames.
+                if from_node == me && to_node != me {
+                    tracing::info!(
+                        "route {} active — streaming this screen to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                    let peer = to_node.clone();
+                    let tx = self.video_out.clone();
+                    self.video.start_capture(route.id.clone(), move |frame| {
+                        // try_send: a full queue drops this frame; the next
+                        // capture carries a fresher picture.
+                        tx.try_send((peer.clone(), frame)).is_ok()
+                    });
+                } else if to_node == me {
+                    tracing::info!(
+                        "route {} active — expecting screen frames from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
+            MediaKind::Input => {
+                // The sink injects lazily per inbound event (behind the
+                // ownership gate); the source is driven by the console
+                // window via `send_input`. Nothing to start eagerly — but
+                // say the link is live, so "awaiting accept" is never the
+                // last word on a working control route.
+                if from_node == me {
+                    tracing::info!(
+                        "route {} active — keyboard/mouse control to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me {
+                    tracing::info!(
+                        "route {} active — accepting control from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
+            other => {
+                tracing::info!(
+                    "route {} active ({other:?}); media transport for it is a follow-up",
+                    route.id
+                );
+            }
         }
-        // We sink: play inbound frames for this route.
-        if to_node == me {
-            self.audio.start_playback(route.id.clone());
+    }
+
+    /// Whether an inbound media frame is acceptable: its route is one this
+    /// session knows, is live, carries `media`, sinks on this machine, and
+    /// the daemon-authenticated sender is the route's peer.
+    fn inbound_media_ok(&self, route_id: &str, sender: &str, media: MediaKind) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let st = self.state.lock();
+        let Some(r) = st.session.as_ref().and_then(|s| s.route(route_id)) else {
+            return false;
+        };
+        r.is_active()
+            && r.route.media == media
+            && node_of(r.route.to.as_str()) == me
+            && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
+    }
+
+    /// Whether `sender` may drive this machine's keyboard and mouse: it is
+    /// the recorded owner, or a member of the owned fleet this device
+    /// belongs to. Nobody else — not even a peer a route auto-accepted for.
+    fn sender_may_control(&self, sender: &str) -> bool {
+        let canon = pubkey_part(sender);
+        if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
+            return true;
         }
+        self.ownership.fleet().is_some_and(|r| {
+            r.members
+                .iter()
+                .any(|m| pubkey_part(m.device.as_str()) == canon)
+        })
+    }
+
+    /// Front-end command: forward one keyboard/mouse event down an active
+    /// outbound input route (the console window's control stream).
+    pub async fn send_input(
+        self: &Arc<Self>,
+        route_id: String,
+        action: InputAction,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && r.route.media == MediaKind::Input
+                && node_of(r.route.from.as_str()) == me)
+            {
+                return Err("route isn't an active outbound control link".into());
+            }
+            r.peer.to_string()
+        };
+        let seq = self.input_seq.fetch_add(1, Ordering::Relaxed);
+        let ev = InputEvent::new(route_id, seq, action);
+        let payload = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
+        self.send_media_value(&peer, payload).await;
+        Ok(())
     }
 
     /// Send a control message to one peer, reporting whether the daemon
@@ -831,7 +1407,10 @@ fn empty_owned() -> Value {
 /// Node id from a capability id (`"<node>:<device>"`). The node segment is
 /// everything before the first colon.
 fn node_of(cap_id: &str) -> String {
-    cap_id.split_once(':').map(|(n, _)| n.to_string()).unwrap_or_else(|| cap_id.to_string())
+    cap_id
+        .split_once(':')
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_else(|| cap_id.to_string())
 }
 
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing
@@ -846,6 +1425,43 @@ fn pubkey_part(id: &str) -> &str {
         }
     }
     id
+}
+
+/// A fresh random boot id for this app run — never 0, which presence
+/// reserves for older peers without the field.
+fn fresh_boot_id() -> u64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // RNG unavailable (vanishingly rare): fall back to wall-clock nanos
+        // — uniqueness across restarts is all this id needs.
+        return std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1)
+            .max(1);
+    }
+    u64::from_le_bytes(bytes).max(1)
+}
+
+/// Log-friendly head of a mesh id — enough to tell two machines apart in a
+/// trace without drowning it in base32.
+fn short_id(id: &str) -> String {
+    if id.len() > 10 {
+        format!("{}…", &id[..10])
+    } else {
+        id.to_string()
+    }
+}
+
+/// Log-friendly tail of a fleet key — enough to compare two machines' logs
+/// ("do we hold the same key?") without printing the grouping secret.
+fn key_tail(key: &str) -> &str {
+    let n = key.len();
+    if n > 6 {
+        &key[n - 6..]
+    } else {
+        key
+    }
 }
 
 fn parse_media(s: &str) -> MediaKind {

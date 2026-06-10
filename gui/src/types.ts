@@ -274,6 +274,30 @@ export interface UpdatePrefs {
   beta_url?: string;
 }
 
+// ---- console media (mirrors `allmystuff-session`'s media frames) ------
+
+/** One keyboard/mouse event the console forwards down an input route.
+ *  Tagged exactly like the Rust `InputAction` (serde `kind`, snake_case).
+ *  Mouse coordinates are normalized 0..1 over the remote's screen. */
+export type InputAction =
+  | { kind: "mouse_move"; x: number; y: number }
+  | { kind: "mouse_button"; button: number; down: boolean }
+  | { kind: "wheel"; dx: number; dy: number }
+  | { kind: "key"; key: string; down: boolean };
+
+/** One MJPEG frame of a display route, as the `allmystuff://video` event
+ *  delivers it (the Rust `VideoFrame`; `jpeg` is base64). */
+export interface VideoFrameMsg {
+  t: "video";
+  route: string;
+  seq: number;
+  width: number;
+  height: number;
+  source_width: number;
+  source_height: number;
+  jpeg: string;
+}
+
 // ---- bundles (pre-set kits with category slots) -----------------------
 
 /** One slot in a bundle template — a category of local device to include.

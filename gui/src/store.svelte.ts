@@ -18,7 +18,10 @@ import {
   buildNetworkConfig,
   claimNode,
   connectRoute,
+  consoleWindowTarget,
   disconnectRoute,
+  fleetKick,
+  fleetLeave,
   isTauri,
   meshIdentity,
   meshIdentitySetLabel,
@@ -36,8 +39,11 @@ import {
   onOwnership,
   onSession,
   onSubscription,
+  openConsoleWindow,
   ownedRoster,
   scanSelf,
+  sendInput,
+  sessionSnapshot,
   setClaimable,
   updateApply,
   updateCheck,
@@ -55,6 +61,7 @@ import {
   type Flow,
   type Grant,
   type IdentityInfo,
+  type InputAction,
   type MediaKind,
   type MeshNode,
   type NetworkConfigFull,
@@ -63,6 +70,7 @@ import {
   type PeerInfo,
   type Relationship,
   type RosterPeer,
+  type Route,
   type TurnEntry,
   type UpdatePrefs,
   type UpdateStatus,
@@ -185,6 +193,11 @@ class AppStore {
   private consoleVideoRouteId: string | null = null;
   private consoleAudioRouteIds: string[] = [];
   private consoleControlRouteId: string | null = null;
+  /** The *live* display route the console renders frames for — also set when
+   *  the route pre-existed (owned-for-teardown is tracked separately). */
+  consoleVideoLive = $state<string | null>(null);
+  /** The live outbound control route console input events ride on. */
+  consoleControlLive = $state<string | null>(null);
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
   localId = $state("this");
@@ -242,6 +255,20 @@ class AppStore {
   consoleNode = $derived(
     this.consoleNodeId ? this.catalog.nodes.find((n) => n.id === this.consoleNodeId) ?? null : null,
   );
+
+  /** Routes running between this machine and the console's remote — the
+   *  live session the console's footer chips show. */
+  consoleSessionRoutes = $derived.by(() => {
+    const remote = this.consoleNodeId;
+    if (!remote) return [] as Route[];
+    return this.catalog.routes.filter((r) => {
+      const f = this.capability(r.from);
+      const t = this.capability(r.to);
+      if (!f || !t) return false;
+      const ends = [f.node, t.node];
+      return ends.includes(remote) && ends.includes(this.localId);
+    });
+  });
 
   mineCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "mine").length);
   sharedCount = $derived(this.catalog.nodes.filter((n) => n.relationship.kind === "shared").length);
@@ -320,6 +347,11 @@ class AppStore {
     await this.loadIdentity();
     await this.refreshNetworks();
     await this.syncMeshGraph();
+    // Pull the *current* session state once — snapshots are otherwise only
+    // emitted on changes, so a freshly-opened window (a per-machine console)
+    // would see peers without their presence detail (no capabilities, no
+    // ownership) until something next changed, and wrongly refuse to open.
+    await this.pullSessionSnapshot();
     await this.loadOwnedFleet();
     await this.loadUpdateStatus();
     this.startMeshPolling();
@@ -331,6 +363,7 @@ class AppStore {
         void this.hydrateFromBackend();
         void this.loadIdentity();
         void this.refreshNetworks().then(() => this.syncMeshGraph());
+        void this.pullSessionSnapshot();
         void this.loadOwnedFleet();
       }
       this.backendConnected = live;
@@ -340,6 +373,7 @@ class AppStore {
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
       this.ownedFleet = r;
+      this.reconcileFleetRelationships();
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
@@ -347,6 +381,14 @@ class AppStore {
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
     });
+  }
+
+  /** Fetch the live session state (peers' presence + routes) and merge it
+   *  into the graph — the on-demand twin of the `allmystuff://session`
+   *  event, for windows that opened after the last change was emitted. */
+  private async pullSessionSnapshot() {
+    const snap = await sessionSnapshot();
+    if (snap) this.applySessionSnapshot(snap);
   }
 
   /** Poll the daemon's mesh membership as a safety net (peer/roster changes
@@ -537,7 +579,9 @@ class AppStore {
       ...scan.capabilities,
       ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
-    this.toast("ok", "Scanned this machine");
+    // A console window scans too (it needs the local sinks to wire routes),
+    // but only the main window announces it.
+    if (!consoleWindowTarget()) this.toast("ok", "Scanned this machine");
   }
 
   /** Point the graph's local identity at `id`, re-homing the "this" node and
@@ -633,6 +677,29 @@ class AppStore {
         this.catalog.routes.push({ ...lr.route, group: null });
       } else if (!active && exists) {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
+      }
+    }
+
+    this.reconcileFleetRelationships();
+  }
+
+  /** Fleet membership implies the relationship. Ownership is *directional*
+   *  — your owner machine advertises no owner of its own — so on a claimed
+   *  device its owner would read "unclaimed" forever even while wearing the
+   *  fleet badge (mutually exclusive states on screen). Any co-member of
+   *  your fleet is *yours*; one that left (or kicked you) and doesn't claim
+   *  us as owner reverts to unclaimed. A relationship the user set to
+   *  `shared` is never touched. */
+  private reconcileFleetRelationships() {
+    const meInFleet = this.isFleetMember(this.localId);
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this" || this.isMe(n.id)) continue;
+      const inFleet = meInFleet && this.isFleetMember(n.id);
+      const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
+      if (n.relationship.kind === "unclaimed" && inFleet) {
+        n.relationship = { kind: "mine" };
+      } else if (n.relationship.kind === "mine" && !inFleet && !ownedByMe) {
+        n.relationship = { kind: "unclaimed" };
       }
     }
   }
@@ -758,8 +825,12 @@ class AppStore {
     this.catalog.routes.push({ id, from, to, media: cap?.media ?? "generic", group });
   }
 
-  disconnect(routeId: string) {
-    if (this.backendConnected) void disconnectRoute(routeId);
+  /** Tear a route down. The local catalog updates synchronously; the
+   *  returned promise settles when the backend disconnect has been sent —
+   *  callers that must outlive the call (a closing console window) await
+   *  it, everyone else ignores it. */
+  disconnect(routeId: string): Promise<unknown> {
+    const sent = this.backendConnected ? disconnectRoute(routeId) : Promise.resolve(null);
     const route = this.catalog.routes.find((r) => r.id === routeId);
     this.catalog.routes = this.catalog.routes.filter((r) => r.id !== routeId);
     // Tearing one leg of a group tears the whole bundle — it's one thing.
@@ -767,6 +838,7 @@ class AppStore {
       this.catalog.routes = this.catalog.routes.filter((r) => r.group !== route.group);
       this.toast("info", "Disconnected the group");
     }
+    return sent;
   }
 
   // ---- remote console (the pikvm-style session) -------------------
@@ -784,47 +856,91 @@ class AppStore {
   }
 
   /** Open a console session on a remote machine — the single handle for its
-   *  screen, its audio passthrough and keyboard/mouse control. Wires the
-   *  backbone video route to this machine's display now; audio and control
-   *  are toggled from inside the console. */
+   *  screen, its audio passthrough and keyboard/mouse control. On the
+   *  desktop this opens a *dedicated OS window* per machine (so several
+   *  consoles can be up side by side); the web preview keeps the in-page
+   *  popover. */
   openConsole(nodeId: string) {
     const node = this.node(nodeId);
-    if (!node) return;
-    if (nodeId === this.localId) {
-      this.toast("warn", "That's this device");
+    if (!this.consoleAllowed(node, nodeId)) return;
+    if (isTauri()) {
+      void openConsoleWindow(nodeId);
       return;
     }
-    if (!isAppNode(node)) {
-      this.toast("warn", `${node.label} isn't running AllMyStuff`);
-      return;
-    }
-    if (node.relationship.kind === "unclaimed") {
-      this.toast("warn", `Claim ${node.label} first, or mark it shared`);
-      return;
-    }
+    this.openConsoleHere(nodeId);
+  }
+
+  /** Start the console session *in this window* — the body of a console
+   *  window (and the web preview's popover). Wires the backbone video route
+   *  to this machine's display now; audio and control are toggled from
+   *  inside the console. */
+  openConsoleHere(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!this.consoleAllowed(node, nodeId)) return;
     this.consoleNodeId = nodeId;
     this.consoleAudio = false;
     this.consoleControl = false;
     this.consoleVideoRouteId = null;
     this.consoleAudioRouteIds = [];
     this.consoleControlRouteId = null;
+    this.consoleVideoLive = null;
+    this.consoleControlLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.applyConsoleVideo();
-    this.toast("ok", `Console open on ${node.label}`);
+    this.toast("ok", `Console open on ${node!.label}`);
   }
 
-  /** Close the console, tearing down exactly the routes it created. */
-  closeConsole() {
-    if (this.consoleVideoRouteId) this.disconnect(this.consoleVideoRouteId);
-    for (const id of this.consoleAudioRouteIds) this.disconnect(id);
-    if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
+  /** The gate both console entries share: a known remote machine that runs
+   *  AllMyStuff and is yours (or shared with you). */
+  private consoleAllowed(node: MeshNode | undefined, nodeId: string): node is MeshNode {
+    if (!node) return false;
+    if (nodeId === this.localId) {
+      this.toast("warn", "That's this device");
+      return false;
+    }
+    if (!isAppNode(node)) {
+      this.toast("warn", `${node.label} isn't running AllMyStuff`);
+      return false;
+    }
+    if (node.relationship.kind === "unclaimed") {
+      this.toast("warn", `Claim ${node.label} first, or mark it shared`);
+      return false;
+    }
+    return true;
+  }
+
+  /** Find the machine node `id` refers to, under any id form (exact, or the
+   *  same canonical pubkey) — how a console window resolves its target. */
+  machineByAnyId(id: string): MeshNode | undefined {
+    return this.nodeByCanonical(id);
+  }
+
+  /** Close the console, tearing down exactly the routes it created. The UI
+   *  state resets synchronously; the returned promise settles once the
+   *  backend disconnects are on the wire, so a console *window* can hold
+   *  its close until then. */
+  closeConsole(): Promise<unknown> {
+    const pending: Promise<unknown>[] = [];
+    if (this.consoleVideoRouteId) pending.push(this.disconnect(this.consoleVideoRouteId));
+    for (const id of this.consoleAudioRouteIds) pending.push(this.disconnect(id));
+    if (this.consoleControlRouteId) pending.push(this.disconnect(this.consoleControlRouteId));
     this.consoleVideoRouteId = null;
     this.consoleAudioRouteIds = [];
     this.consoleControlRouteId = null;
+    this.consoleVideoLive = null;
+    this.consoleControlLive = null;
     this.consoleNodeId = null;
     this.consoleInput = null;
     this.consoleAudio = false;
     this.consoleControl = false;
+    return Promise.allSettled(pending);
+  }
+
+  /** Forward one keyboard/mouse event down the console's control route.
+   *  Fire-and-forget — at pointer-move rates a lost event is meaningless. */
+  sendConsoleInput(action: InputAction) {
+    if (!this.consoleControlLive) return;
+    void sendInput(this.consoleControlLive, action);
   }
 
   /** Switch which remote source the console is showing. */
@@ -838,15 +954,19 @@ class AppStore {
       this.disconnect(this.consoleVideoRouteId);
       this.consoleVideoRouteId = null;
     }
+    this.consoleVideoLive = null;
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
     if (!inp) return;
     // The remote screen (display) lands on this machine's display sink — a
-    // real route. A camera (video) has no local sink yet, so it's view-only
-    // until video transport lands; the console is honest about that.
+    // real route the backend streams MJPEG frames down. A camera (video)
+    // has no local sink yet, so it's view-only until camera transport
+    // lands; the console is honest about that.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
     if (!sink) return;
     const leg = this.consoleConnect(inp.id, sink.id);
-    // Only own the route for teardown if this call created it.
+    // Render whatever's live; only own the route for teardown if this call
+    // created it.
+    this.consoleVideoLive = leg?.id ?? null;
     this.consoleVideoRouteId = leg?.created ? leg.id : null;
   }
 
@@ -889,6 +1009,7 @@ class AppStore {
     if (this.consoleControl) {
       if (this.consoleControlRouteId) this.disconnect(this.consoleControlRouteId);
       this.consoleControlRouteId = null;
+      this.consoleControlLive = null;
       this.consoleControl = false;
       return;
     }
@@ -897,6 +1018,7 @@ class AppStore {
     const leg = mySrc && remoteSink ? this.consoleConnect(mySrc.id, remoteSink.id) : null;
     if (leg) {
       this.consoleControlRouteId = leg.created ? leg.id : null;
+      this.consoleControlLive = leg.id;
       this.consoleControl = true;
     } else {
       this.toast("warn", "No control path to that machine");
@@ -1371,10 +1493,66 @@ class AppStore {
     if (!isTauri()) return;
     try {
       const r = await ownedRoster();
-      if (r) this.ownedFleet = r;
+      if (r) {
+        this.ownedFleet = r;
+        this.reconcileFleetRelationships();
+      }
     } catch {
       /* no daemon yet — claim still simulates a fleet in demo mode */
     }
+  }
+
+  /** Leave the fleet this device is in. The backend broadcasts the bumped
+   *  roster (the others drop us), releases our owner, and pushes the now-
+   *  empty roster back via `allmystuff://owned`. */
+  async leaveFleet() {
+    if (this.backendConnected) {
+      try {
+        await fleetLeave();
+        this.toast("ok", "Left the fleet");
+      } catch (e) {
+        this.toast("warn", `Couldn't leave the fleet: ${String(e)}`);
+      }
+      return;
+    }
+    // Demo/web: drop ourselves from the simulated roster.
+    if (!this.ownedFleet) return;
+    const members = this.ownedFleet.members.filter((m) => !this.isMe(m.device));
+    this.ownedFleet = members.length
+      ? { ...this.ownedFleet, version: this.ownedFleet.version + 1, members }
+      : null;
+    this.toast("ok", "Left the fleet");
+  }
+
+  /** Kick a member out of the fleet — allowed only while we're a member
+   *  ourselves (the backend enforces it; the demo mirrors the rule). */
+  async kickFleetMember(device: string) {
+    if (this.isMe(device)) {
+      void this.leaveFleet();
+      return;
+    }
+    const label =
+      this.ownedFleet?.members.find((m) => sameMachine(m.device, device))?.label || "that device";
+    if (this.backendConnected) {
+      try {
+        await fleetKick(device);
+        this.toast("ok", `Kicked ${label} from the fleet`);
+      } catch (e) {
+        this.toast("warn", `Couldn't kick ${label}: ${String(e)}`);
+      }
+      return;
+    }
+    // Demo/web: mirror the membership rule, then drop them.
+    if (!this.ownedFleet || !this.isFleetMember(this.localId)) {
+      this.toast("warn", "You can't kick devices from a fleet you aren't in");
+      return;
+    }
+    this.ownedFleet = {
+      ...this.ownedFleet,
+      version: this.ownedFleet.version + 1,
+      members: this.ownedFleet.members.filter((m) => !sameMachine(m.device, device)),
+    };
+    this.toast("ok", `Kicked ${label} from the fleet`);
   }
 
   async loadUpdateStatus() {

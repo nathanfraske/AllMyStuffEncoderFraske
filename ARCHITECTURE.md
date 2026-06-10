@@ -152,7 +152,14 @@ Tauri 2 + Svelte 5, a client of the daemon.
   shown but quieted and un-targetable, since it exposes no capabilities. The
   **remote console** (`Console.svelte`) is the pikvm-style session handle for
   a machine: a video-inputs tab bar over its screen + cameras, plus audio and
-  control toggles, each owning the real route it set up. The top bar's gear
+  control toggles, each owning the real route it set up. On the desktop each
+  console opens as its **own OS window** (`open_console_window` →
+  `?console=<node>` → `ConsoleHost.svelte`), so several machines can be on
+  screen at once; the web preview keeps the in-page popover. The stage is a
+  live MJPEG sink (`allmystuff://video` events, one per inbound frame), and
+  while control is on it captures pointer/key events, normalizes coordinates
+  onto the streamed frame, and forwards them down the control route via
+  `send_input`. The top bar's gear
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
   Fleet (the owned roster's shared key + members), and Updates (the
   `allmystuff-updater` controls). The **Networks** tab is itself split into
@@ -188,7 +195,15 @@ Tauri 2 + Svelte 5, a client of the daemon.
 5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
    audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
-   over `CHANNEL_MEDIA`, and the sink plays them.
+   over `CHANNEL_MEDIA`, and the sink plays them. A display route streams the
+   source's primary screen the same way — `xcap` grab → downscale → JPEG →
+   `VideoFrame` (~12 fps, a bounded queue drops stale frames under
+   backpressure) — and the console window renders the latest frame. An input
+   route carries `InputEvent`s the other direction: normalized mouse moves /
+   buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
+   but only after the gate: the route must be live *and* the sender must be
+   the device's recorded owner or a co-owned fleet member, so a route that
+   merely auto-accepted can never type into your machine.
 
 ## Persistent state
 
@@ -201,18 +216,36 @@ survives restarts, while claim mode is deliberately transient (re-asserted
 each start by the flag) so a box never sits silently adoptable across reboots.
 That same record now also holds the **owned fleet** — the shared key and the
 roster of co-owned devices — so a fleet survives restarts and re-converges via
-gossip on the next start.
+gossip on the next start. Roster convergence is by version with *replacement*
+on a strictly newer copy (that's how a **leave or kick** propagates — a union
+could only ever add), equal versions union, and a newer roster that no longer
+lists this device means it was kicked: the fleet drops locally and ownership
+is released. Membership is the permission: the Fleet pane offers **Leave**
+(and per-member **Kick**) only while this device is in the roster — you can't
+kick devices from a fleet you aren't in. A **claim-status check** (sanitize
+stale fleet residue → re-stamp the live profile → re-assert presence + roster)
+runs at session start, after every claim/release/fleet change, and *targeted*
+at each peer the moment its connection is approved — so two machines agree on
+who owns what within a handshake, not a polling interval. Gossip is
+**event-driven, with no heartbeat**: presence carries a per-run `boot` id, and
+a peer seeing a boot it hasn't recorded (your app restarted while the daemon
+link stayed up) answers with its own presence + roster directly — the mesh
+carries traffic when something happens, never on a timer. The fleet roster
+(it holds the grouping key) is only ever *handed* to fleet members; presence
+goes to everyone.
 
 ## Next milestones
 
-- **Video / screen / input transport** over the same route pipe that audio
-  already uses — each needs a capture/inject backend (screen grab, camera,
-  input injection) feeding the existing offer/accept/media plumbing. The
-  remote console already establishes and shows these routes; what's left is
-  the pixels and the input events on the wire.
+- **Camera video + storage transport** over the same route pipe that audio,
+  screen, and input already use — each needs its capture backend feeding the
+  existing offer/accept/media plumbing.
 - **Per-device routing** — map a specific scanned device to a `cpal` device
-  (v1 uses the default input/output), and an audio codec (Opus) so the media
-  channel isn't raw PCM.
+  or a specific monitor to the screen capture (v1 uses the default
+  input/output and the primary display), and an audio codec (Opus) so the
+  media channel isn't raw PCM.
+- **Share-grant-gated control** — input injection currently trusts only the
+  device's owner/fleet; honouring a *shared* person's explicit control grant
+  rides on the share-enforcement work.
 - **Persisted relationships + grants** — remember per peer whether it's
   *mine* or a *guest*, and its grants, across restarts (today a freshly
   discovered peer defaults to "mine" and is reclassified from its drawer).

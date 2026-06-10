@@ -20,6 +20,7 @@
 //! ```
 
 mod audio;
+mod media;
 
 use std::collections::HashMap;
 
@@ -30,6 +31,7 @@ use allmystuff_protocol::{
 
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
+pub use media::{InputAction, InputEvent, MediaPayload, VideoAssembler, VideoFrame};
 
 /// Which side of a route we are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -309,6 +311,7 @@ mod tests {
             )],
             owner: None,
             claimable: false,
+            boot: 0,
         }
     }
 

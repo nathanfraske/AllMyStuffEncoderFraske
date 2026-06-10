@@ -288,6 +288,16 @@ pub struct InputDevice {
     pub id: String,
     pub name: String,
     pub kind: InputKind,
+    /// How many OS-level input endpoints (HID interfaces) merged into this
+    /// one physical device — a gaming mouse or a unifying receiver exposes
+    /// several. `1` for a plain device; defaulted so older snapshots and
+    /// peers still decode.
+    #[serde(default = "default_endpoints")]
+    pub endpoints: u32,
+}
+
+fn default_endpoints() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

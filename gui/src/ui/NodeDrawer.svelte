@@ -5,7 +5,6 @@
     displayName,
     isAppNode,
     originIcon,
-    flowWord,
     humanBytes,
     mediaColor,
     type Capability,
@@ -36,6 +35,24 @@
     }
     return [...m.entries()];
   });
+
+  // Within a media group, sends (sources) and receives (sinks) are listed
+  // apart — "what this can give you" vs "what you can give it" — with
+  // duplex endpoints in their own cluster.
+  type FlowCluster = { key: string; label: string; arrow: string; items: Capability[] };
+  function byFlow(list: Capability[]): FlowCluster[] {
+    const cluster = (key: string, label: string, arrow: string, flow: string) => ({
+      key,
+      label,
+      arrow,
+      items: list.filter((c) => c.flow === flow),
+    });
+    return [
+      cluster("sends", "Sends", "↥", "source"),
+      cluster("receives", "Receives", "↧", "sink"),
+      cluster("both", "Both ways", "⇅", "duplex"),
+    ].filter((c) => c.items.length > 0);
+  }
 
   // Routes touching this node, with the far end + direction.
   const connections = $derived.by(() => {
@@ -274,25 +291,32 @@
           <div class="cap-group-head" style="color: {mediaColor(media)}">
             {MEDIA[media].icon} {MEDIA[media].label}
           </div>
-          {#each list as c (c.id)}
-            <div class="cap" class:is-default={c.default}>
-              <span class="cap-icon">{originIcon(c.origin, c.media)}</span>
-              <div class="cap-id">
-                <div class="cap-label">
-                  {c.label}
-                  {#if c.default}<span class="def" title="This category's current default">default</span>{/if}
-                </div>
-                <div class="cap-flow">{flowWord(c.flow)}</div>
+          {#each byFlow(list) as cluster (cluster.key)}
+            <div class="flow-cluster" class:receives={cluster.key === "receives"}>
+              <div class="flow-head">
+                <span class="flow-arrow">{cluster.arrow}</span>
+                {cluster.label}
               </div>
-              <button
-                class="connect-dot"
-                style="--mc: {mediaColor(c.media)}"
-                title="Connect this somewhere"
-                onclick={() => app.startCapConnect(c.id)}
-                aria-label="Connect {c.label}"
-              >
-                ⟶
-              </button>
+              {#each cluster.items as c (c.id)}
+                <div class="cap" class:is-default={c.default}>
+                  <span class="cap-icon">{originIcon(c.origin, c.media)}</span>
+                  <div class="cap-id">
+                    <div class="cap-label">
+                      {c.label}
+                      {#if c.default}<span class="def" title="This category's current default">default</span>{/if}
+                    </div>
+                  </div>
+                  <button
+                    class="connect-dot"
+                    style="--mc: {mediaColor(c.media)}"
+                    title="Connect this somewhere"
+                    onclick={() => app.startCapConnect(c.id)}
+                    aria-label="Connect {c.label}"
+                  >
+                    ⟶
+                  </button>
+                </div>
+              {/each}
             </div>
           {/each}
         </div>
@@ -594,9 +618,30 @@
   .cap.is-default .cap-icon {
     filter: drop-shadow(0 0 0.5px #e0a13a);
   }
-  .cap-flow {
-    font-size: 0.72rem;
+  /* Sends vs Receives clusters inside a media group — visually distinct
+     columns of direction, so "what it gives" never reads as "what it takes". */
+  .flow-cluster {
+    margin: 0.15rem 0 0.35rem;
+    padding-left: 0.45rem;
+    border-left: 2px solid #cfe9dc;
+  }
+  .flow-cluster.receives {
+    border-left-color: #f6d9c4;
+  }
+  .flow-head {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
     color: var(--ink-faint);
+    margin: 0.25rem 0 0.05rem;
+  }
+  .flow-arrow {
+    font-size: 0.8rem;
+    line-height: 1;
   }
   .connect-dot {
     flex-shrink: 0;

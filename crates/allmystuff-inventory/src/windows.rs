@@ -201,15 +201,25 @@ pub fn collect_cameras() -> Vec<Camera> {
 }
 
 pub fn collect_inputs() -> Vec<InputDevice> {
-    let mut out = Vec::new();
-    for (i, v) in rows("Get-CimInstance Win32_Keyboard | Select-Object Name,Description | ConvertTo-Json -Compress")
+    // One physical device registers a WMI row per HID interface ("HID
+    // Keyboard Device" three times over); merge them by the PnP VID:PID.
+    // WMI rows carry no stable per-port path, so two identical units of
+    // one model merge too — an accepted trade for a readable list (these
+    // entries are display-only input sources).
+    let mut raw = Vec::new();
+    for (i, v) in rows("Get-CimInstance Win32_Keyboard | Select-Object Name,Description,PNPDeviceID | ConvertTo-Json -Compress")
         .into_iter()
         .enumerate()
     {
         let name = s(&v, "Name").or_else(|| s(&v, "Description")).unwrap_or_else(|| "Keyboard".into());
-        out.push(InputDevice { id: format!("input:kbd:{i}"), name, kind: InputKind::Keyboard });
+        raw.push(crate::dedupe::RawInput {
+            group: s(&v, "PNPDeviceID").as_deref().and_then(pnp_vid_pid),
+            fallback_id: format!("input:kbd:{i}"),
+            name,
+            kind: InputKind::Keyboard,
+        });
     }
-    for (i, v) in rows("Get-CimInstance Win32_PointingDevice | Select-Object Name,Description | ConvertTo-Json -Compress")
+    for (i, v) in rows("Get-CimInstance Win32_PointingDevice | Select-Object Name,Description,PNPDeviceID | ConvertTo-Json -Compress")
         .into_iter()
         .enumerate()
     {
@@ -220,9 +230,21 @@ pub fn collect_inputs() -> Vec<InputDevice> {
         } else {
             InputKind::Mouse
         };
-        out.push(InputDevice { id: format!("input:pt:{i}"), name, kind });
+        raw.push(crate::dedupe::RawInput {
+            group: s(&v, "PNPDeviceID").as_deref().and_then(pnp_vid_pid),
+            fallback_id: format!("input:pt:{i}"),
+            name,
+            kind,
+        });
     }
-    out
+    crate::dedupe::merge_inputs(raw)
+}
+
+/// `HID\VID_046D&PID_C52B&MI_01\8&2f662e1&0&0000` → `046d:c52b` — the
+/// physical unit's identity, shared by all its interfaces.
+fn pnp_vid_pid(id: &str) -> Option<String> {
+    let (vid, pid) = parse_usb_id(id)?;
+    Some(format!("{vid}:{pid}"))
 }
 
 pub fn collect_usb() -> Vec<UsbDevice> {
@@ -268,6 +290,20 @@ mod tests {
             Some(("046d".into(), "c52b".into()))
         );
         assert_eq!(parse_usb_id("HID\\nope"), None);
+    }
+
+    #[test]
+    fn pnp_id_yields_the_units_group_key() {
+        // The MI_xx interface suffix differs per endpoint; the key doesn't.
+        assert_eq!(
+            pnp_vid_pid("HID\\VID_046D&PID_C52B&MI_00\\8&2f662e1&0&0000").as_deref(),
+            Some("046d:c52b")
+        );
+        assert_eq!(
+            pnp_vid_pid("HID\\VID_046D&PID_C52B&MI_01\\9&aaaa&0&0000").as_deref(),
+            Some("046d:c52b")
+        );
+        assert_eq!(pnp_vid_pid("ACPI\\PNP0303\\4&1ab2c3d&0"), None);
     }
 
     #[test]

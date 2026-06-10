@@ -60,6 +60,9 @@ allmystuff-updater = { path = "../../crates/allmystuff-updater" }
 # on macOS, WASAPI on Windows, ALSA on Linux. Same crate (and version)
 # MyOwnLLM uses for its audio.
 cpal = "0.15"
+xcap = "0.9"
+jpeg-encoder = "0.7"
+enigo = "0.6"
 
 [profile.release]
 panic = "abort"

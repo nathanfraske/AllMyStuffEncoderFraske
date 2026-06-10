@@ -31,6 +31,12 @@
 //!   isolated into pure functions tested against real-world samples, so
 //!   correctness doesn't depend on the hardware being present.
 
+// The HID endpoint→physical-device merge. Linux and Windows feed their
+// collectors through it; macOS doesn't enumerate inputs yet (the cfg keeps
+// the module from reading as dead code there, while `test` keeps its unit
+// tests running on every platform).
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+mod dedupe;
 mod sys;
 mod types;
 
