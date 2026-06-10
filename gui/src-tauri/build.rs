@@ -89,46 +89,79 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     let sidecar = sidecar_path();
     let sentinel = bin_dir.join(".bundled-rev");
 
-    // Idempotency: skip if the slot is already the requested rev + non-empty.
-    if let Some(want) = &rev {
-        let have = fs::read_to_string(&sentinel)
-            .map(|s| s.trim().to_string())
-            .ok();
-        let present = sidecar.metadata().map(|m| m.len() > 0).unwrap_or(false);
-        if present && have.as_deref() == Some(want.as_str()) {
-            return Ok(());
-        }
-    }
-
     if env::var_os("ALLMYSTUFF_SKIP_SIDECAR").is_some() {
         return Err("ALLMYSTUFF_SKIP_SIDECAR set".into());
     }
 
+    // Resolve what we *would* stage before copying anything, as a cache
+    // signature — so the idempotency check can't be fooled by a source
+    // that changed meaning (the old sentinel recorded the pin even when
+    // the bytes came from a sibling build, which made a stale sibling
+    // stick around forever once stamped).
+    //
     // 1. Explicit override.
     if let Ok(p) = env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
-            stage(&p, &sidecar)?;
-            if let Some(r) = &rev {
-                let _ = fs::write(&sentinel, r);
+            let sig = format!("bin:{}:{}", p.display(), file_mtime(&p));
+            if !staged_matches(&sidecar, &sentinel, &sig) {
+                stage(&p, &sidecar)?;
+                let _ = fs::write(&sentinel, &sig);
+                println!("cargo:warning=[sidecar] bundled daemon from MYOWNMESH_BIN");
             }
-            println!("cargo:warning=[sidecar] bundled daemon from MYOWNMESH_BIN");
             return Ok(());
         }
     }
 
-    // 2. Sibling checkout (release first, then debug).
+    // 2. Sibling checkout (release first, then debug) — but only when its
+    // build can actually satisfy the pin. A sibling *ahead* of the pin is
+    // the active-development loop and wins; a sibling *behind* it is a
+    // stale artifact that would silently mask the very features the pin
+    // bump was for (a v0.2.0 leftover shadowing the v0.2.1 video lane,
+    // say), so it's skipped with a note and the pinned release is fetched.
     if let Some(p) = sibling_daemon() {
-        stage(&p, &sidecar)?;
-        if let Some(r) = &rev {
-            let _ = fs::write(&sentinel, r);
+        let sibling_ver = binary_version(&p);
+        let pin_ver = rev
+            .as_deref()
+            .and_then(|r| r.strip_prefix('v'))
+            .and_then(parse_semver);
+        let acceptable = match (sibling_ver, pin_ver) {
+            (Some(s), Some(want)) => s >= want,
+            // Unknown version (no --version? exec failed): trust the dev
+            // setup rather than break its loop, but say so.
+            (None, _) => {
+                println!(
+                    "cargo:warning=[sidecar] couldn't read the sibling daemon's                      version; using it anyway"
+                );
+                true
+            }
+            // No (parseable) pin → the sibling is the best truth we have.
+            (Some(_), None) => true,
+        };
+        if acceptable {
+            let sig = format!("sib:{}:{}", p.display(), file_mtime(&p));
+            if !staged_matches(&sidecar, &sentinel, &sig) {
+                stage(&p, &sidecar)?;
+                let _ = fs::write(&sentinel, &sig);
+                println!("cargo:warning=[sidecar] bundled daemon from sibling MyOwnMesh checkout");
+            }
+            return Ok(());
         }
-        println!("cargo:warning=[sidecar] bundled daemon from sibling MyOwnMesh checkout");
-        return Ok(());
+        println!(
+            "cargo:warning=[sidecar] sibling MyOwnMesh build is v{} but the pin wants {} —              ignoring it (rebuild the sibling to use it); fetching the pinned release",
+            sibling_ver
+                .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                .unwrap_or_default(),
+            rev.as_deref().unwrap_or("?"),
+        );
     }
 
     // 3. Prebuilt release asset (tagged rev), else cargo install.
     let rev = rev.ok_or("no .myownmesh-rev pin and no override/sibling daemon")?;
+    let sig = format!("rev:{rev}");
+    if staged_matches(&sidecar, &sentinel, &sig) {
+        return Ok(());
+    }
     let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(|e| e.to_string())?);
     let staging = out_dir.join("myownmesh-staging");
     fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
@@ -148,12 +181,58 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     };
 
     stage(&staged_bin, &sidecar)?;
-    let _ = fs::write(&sentinel, &rev);
+    let _ = fs::write(&sentinel, &sig);
     println!(
         "cargo:warning=[sidecar] daemon ready ({} bytes)",
         fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0)
     );
     Ok(())
+}
+
+/// True when the sidecar slot is non-empty and the sentinel records
+/// exactly this staging signature — the skip condition.
+fn staged_matches(sidecar: &Path, sentinel: &Path, sig: &str) -> bool {
+    let present = sidecar.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    present
+        && fs::read_to_string(sentinel)
+            .map(|s| s.trim() == sig)
+            .unwrap_or(false)
+}
+
+/// A file's mtime in unix seconds (0 when unreadable) — enough cache key
+/// for "the sibling was rebuilt".
+fn file_mtime(p: &Path) -> u64 {
+    p.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Ask a daemon binary its version (`myownmesh 0.2.1` → `(0, 2, 1)`).
+fn binary_version(p: &Path) -> Option<(u64, u64, u64)> {
+    let out = Command::new(p).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_semver(text.split_whitespace().last()?)
+}
+
+/// `"0.2.1"` → `(0, 2, 1)` (tolerates a trailing pre-release/build tag on
+/// the patch segment by ignoring it).
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.trim().splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
 }
 
 /// Copy `src` into the sidecar slot and mark it executable.
