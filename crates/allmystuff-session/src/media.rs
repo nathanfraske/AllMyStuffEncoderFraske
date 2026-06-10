@@ -489,12 +489,9 @@ mod tests {
             Some(MediaPayload::Input(_))
         ));
 
-        let term = serde_json::to_value(TermFrame::new(
-            "r",
-            1,
-            TermEvent::Data { bytes: vec![27] },
-        ))
-        .unwrap();
+        let term =
+            serde_json::to_value(TermFrame::new("r", 1, TermEvent::Data { bytes: vec![27] }))
+                .unwrap();
         assert!(matches!(
             MediaPayload::decode(term),
             Some(MediaPayload::Terminal(_))
@@ -513,7 +510,10 @@ mod tests {
             TermEvent::Data {
                 bytes: b"ls -la\r".to_vec(),
             },
-            TermEvent::Resize { cols: 120, rows: 40 },
+            TermEvent::Resize {
+                cols: 120,
+                rows: 40,
+            },
             TermEvent::Exit { code: Some(3) },
             TermEvent::Exit { code: None },
         ];
@@ -540,12 +540,8 @@ mod tests {
             })),
             None
         );
-        let ok = serde_json::to_value(TermFrame::new(
-            "r",
-            5,
-            TermEvent::Data { bytes: vec![1] },
-        ))
-        .unwrap();
+        let ok = serde_json::to_value(TermFrame::new("r", 5, TermEvent::Data { bytes: vec![1] }))
+            .unwrap();
         assert!(matches!(
             MediaPayload::decode(ok),
             Some(MediaPayload::Terminal(f)) if f.seq == 5

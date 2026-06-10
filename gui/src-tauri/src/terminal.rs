@@ -170,7 +170,10 @@ impl TerminalHost {
                     // only once the master drops (the control thread's job).
                     Ok(0) => break,
                     Ok(n) => {
-                        if reader_tx.blocking_send(OutMsg::Data(buf[..n].to_vec())).is_err() {
+                        if reader_tx
+                            .blocking_send(OutMsg::Data(buf[..n].to_vec()))
+                            .is_err()
+                        {
                             break; // pump gone — session is over
                         }
                     }
@@ -189,7 +192,11 @@ impl TerminalHost {
                 match msg {
                     CtlMsg::Data(bytes) => {
                         use std::io::Write as _;
-                        if writer.write_all(&bytes).and_then(|()| writer.flush()).is_err() {
+                        if writer
+                            .write_all(&bytes)
+                            .and_then(|()| writer.flush())
+                            .is_err()
+                        {
                             // Writer dead = shell gone; the wait thread
                             // reports it. Stop accepting input.
                             break;
@@ -347,7 +354,9 @@ impl TerminalHost {
         w.queued_bytes += bytes.len();
         w.queue.push_back(bytes);
         while w.queued_bytes > MAX_QUEUED_BYTES {
-            let Some(old) = w.queue.pop_front() else { break };
+            let Some(old) = w.queue.pop_front() else {
+                break;
+            };
             w.queued_bytes -= old.len();
             tracing::warn!("terminal queue for {route_id} unread — oldest chunk dropped");
         }
@@ -463,11 +472,16 @@ mod tests {
         assert!(host.write("r1", b"hello\n".to_vec()));
         // `cat` echoes back (and the PTY echoes the typing) — either way
         // the bytes round-tripped through a real PTY.
-        read_until(&mut rx, |b| {
-            String::from_utf8_lossy(b).contains("hello")
-        }, "echo");
+        read_until(
+            &mut rx,
+            |b| String::from_utf8_lossy(b).contains("hello"),
+            "echo",
+        );
         host.stop("r1");
-        assert!(!host.write("r1", b"x".to_vec()), "stopped session takes no input");
+        assert!(
+            !host.write("r1", b"x".to_vec()),
+            "stopped session takes no input"
+        );
     }
 
     #[cfg(unix)]
@@ -479,9 +493,11 @@ mod tests {
         assert!(host.resize("r2", 100, 40));
         std::thread::sleep(Duration::from_millis(150));
         assert!(host.write("r2", b"\n".to_vec()));
-        read_until(&mut rx, |b| {
-            String::from_utf8_lossy(b).contains("40 100")
-        }, "stty size 40 100");
+        read_until(
+            &mut rx,
+            |b| String::from_utf8_lossy(b).contains("40 100"),
+            "stty size 40 100",
+        );
         host.stop("r2");
     }
 
@@ -513,9 +529,11 @@ mod tests {
         cmd.arg("echo hello-from-conpty");
         let host = TerminalHost::new();
         let mut rx = host.spawn_with("rw", vec![cmd]).unwrap();
-        read_until(&mut rx, |b| {
-            String::from_utf8_lossy(b).contains("hello-from-conpty")
-        }, "conpty echo");
+        read_until(
+            &mut rx,
+            |b| String::from_utf8_lossy(b).contains("hello-from-conpty"),
+            "conpty echo",
+        );
         assert_eq!(wait_exit(&mut rx), Some(0));
     }
 

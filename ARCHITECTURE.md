@@ -161,7 +161,12 @@ Tauri 2 + Svelte 5, a client of the daemon.
   control toggles, each owning the real route it set up. On the desktop each
   console opens as its **own OS window** (`open_console_window` →
   `?console=<node>` → `ConsoleHost.svelte`), so several machines can be on
-  screen at once; the web preview keeps the in-page popover. The stage is a
+  screen at once; the web preview keeps the in-page popover. The **remote
+  terminal** (`Terminal.svelte`) is its sibling: the drawer's **Open
+  Terminal** opens a tabbed xterm.js window per machine
+  (`open_terminal_window` → `?terminal=<node>` → `TerminalHost.svelte`),
+  where every tab is its own mesh route to a PTY the far side spawns — see
+  the terminal paragraph under the data flow below. The stage is a
   live video sink — it registers a per-route IPC channel (`video_watch`) and
   the backend queues each inbound packet as raw bytes (a fixed header + the
   payload; no JSON or base64 on the per-frame path) for exactly the window
@@ -264,6 +269,36 @@ Tauri 2 + Svelte 5, a client of the daemon.
    gate: the route must be live *and* the sender must be the device's
    recorded owner or a co-owned fleet member, so a route that merely
    auto-accepted can never type into your machine.
+
+**A terminal session** is one more route on the same plumbing — and no sshd
+anywhere. A node that can host shells advertises `"terminal"` in its
+presence `features` (an additive field older peers ignore; they never show
+the button). Opening a tab offers a **generic** route from the host's
+virtual `…:terminal` endpoint to a viewer endpoint minted per tab — these
+are deliberately *not* catalog capabilities (generic would match every
+auto-wiring picker), so the graph and "Connected now" render them through a
+display-only stand-in (`capabilityForDisplay`). Because a shell is exactly
+as privileged as input injection, the same rule guards it **before
+auto-accept can answer**: a terminal offer from a sender who isn't the
+device's owner/fleet is `Reject`ed in the control handler without the
+session ever seeing it, the spawn re-checks, and every inbound byte
+re-checks. On accept the host spawns the user's shell in a real PTY
+(`terminal.rs`, `portable-pty`: openpty on Unix, **ConPTY** on Windows;
+`$SHELL -l` with fallbacks, `pwsh` → `powershell` → `cmd` on Windows) and
+pumps output as `"term"`-tagged frames over `CHANNEL_MEDIA` (≤16 KiB
+chunks, base64 like every media frame; unknown tags are dropped by older
+peers, never errors). Flow control is end-to-end by construction: reader
+thread → bounded channel → awaited sends — a slow viewer fills the queue,
+blocks the reader, fills the kernel PTY buffer, and stalls the shell,
+exactly like ssh. The viewer window *pulls* bytes with the video plane's
+poke-then-pull watcher (`term_watch`/`term_poll` + `allmystuff://term-ready`
+— the queue is created eagerly when the route activates, so the prompt that
+races the window boot is buffered, not dropped) and feeds xterm.js;
+keystrokes and resizes ride back as the same frames via `term_send`. The
+shell's exit (a dedicated wait-thread — ConPTY readers don't EOF until the
+master drops) reports `Exit { code }` to the viewer's overlay and tears the
+route down; a host whose viewer vanished silently kills the session after
+60 s of failed sends.
 
 ## Persistent state
 

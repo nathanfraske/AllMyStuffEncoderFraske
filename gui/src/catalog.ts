@@ -34,6 +34,33 @@ export function capability(cat: Catalog, id: string): Capability | undefined {
   return cat.capabilities.find((c) => c.id === id);
 }
 
+/** Resolve a capability *for display*, synthesizing a stand-in for the
+ *  terminal endpoints that are deliberately never in the catalog (a
+ *  persistent generic capability would match every auto-wiring picker —
+ *  `matchEndpoint` treats generic as compatible with everything). This
+ *  keeps a live terminal session visible in "Connected now" and on the
+ *  graph without making it a wireable thing. */
+export function capabilityForDisplay(cat: Catalog, id: string): Capability | undefined {
+  const real = capability(cat, id);
+  if (real) return real;
+  const sep = id.indexOf(":");
+  if (sep < 0) return undefined;
+  const node = id.slice(0, sep);
+  const tail = id.slice(sep + 1);
+  if (tail === "terminal")
+    return { id, node, label: "Terminal", media: "generic", flow: "source", origin: "terminal" };
+  if (tail.startsWith("term-view"))
+    return {
+      id,
+      node,
+      label: "Terminal viewer",
+      media: "generic",
+      flow: "sink",
+      origin: "terminal-view",
+    };
+  return undefined;
+}
+
 export function mediaCompatible(a: MediaKind, b: MediaKind): boolean {
   return a === b || a === "generic" || b === "generic";
 }

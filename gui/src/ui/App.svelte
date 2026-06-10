@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { appVersion, consoleWindowTarget, setWindowTitle } from "../tauri";
+  import { appVersion, consoleWindowTarget, setWindowTitle, terminalWindowTarget } from "../tauri";
   import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
@@ -11,12 +11,16 @@
   import ShareSheet from "./ShareSheet.svelte";
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
+  import Terminal from "./Terminal.svelte";
+  import TerminalHost from "./TerminalHost.svelte";
   import Toasts from "./Toasts.svelte";
 
-  // When this webview is a dedicated console window (`?console=<node>`),
-  // it renders just the console for that machine — ConsoleHost boots the
-  // store itself, so everything below the split is main-window only.
+  // When this webview is a dedicated console window (`?console=<node>`)
+  // or terminal window (`?terminal=<node>`), it renders just that session
+  // for that machine — the host components boot the store themselves, so
+  // everything below the split is main-window only.
   const consoleTarget = consoleWindowTarget();
+  const terminalTarget = terminalWindowTarget();
 
   // Which build this is. Comes from gui/src-tauri/Cargo.toml via Tauri
   // (kept in sync by scripts/bump-version.sh); empty in the in-browser
@@ -24,7 +28,7 @@
   let version = $state("");
 
   onMount(() => {
-    if (consoleTarget) return;
+    if (consoleTarget || terminalTarget) return;
     // Wire up live backend data (scan + presence + routes) if the Tauri
     // backend is here; otherwise the demo graph stands in so the app is
     // never empty.
@@ -41,7 +45,9 @@
   });
 </script>
 
-{#if consoleTarget}
+{#if terminalTarget}
+  <TerminalHost target={terminalTarget} />
+{:else if consoleTarget}
   <ConsoleHost target={consoleTarget} />
 {:else}
 <div class="shell">
@@ -107,9 +113,14 @@
   {#if app.approvalsOpen}
     <ApprovalsPopup />
   {/if}
-  <!-- The web preview's in-page console; on the desktop sessions open in
-       their own windows instead and this never activates. -->
+  <!-- The web preview's in-page console + terminal; on the desktop these
+       sessions open in their own windows instead and never activate here. -->
   <Console />
+  {#if app.terminalNodeId}
+    {#key app.terminalNodeId}
+      <Terminal host={app.terminalNodeId} windowed={false} />
+    {/key}
+  {/if}
   <ShareSheet />
   <Toasts />
 </div>

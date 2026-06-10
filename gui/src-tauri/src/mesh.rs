@@ -679,9 +679,11 @@ impl Mesh {
                         let hosts_here = self
                             .local_node_id()
                             .is_some_and(|me| node_of(route.from.as_str()) == me);
-                        if let Some(reason) =
-                            terminal_offer_refusal(route, hosts_here, self.sender_may_control(&from))
-                        {
+                        if let Some(reason) = terminal_offer_refusal(
+                            route,
+                            hosts_here,
+                            self.sender_may_control(&from),
+                        ) {
                             tracing::warn!(
                                 "terminal offer {} from {} refused: not owner/fleet",
                                 route.id,
@@ -1899,12 +1901,9 @@ impl Mesh {
                     while let Some(msg) = out_rx.recv().await {
                         match msg {
                             OutMsg::Data(bytes) => {
-                                for frame in TermFrame::data_frames(
-                                    &rid,
-                                    seq,
-                                    &bytes,
-                                    MAX_TERM_DATA_BYTES,
-                                ) {
+                                for frame in
+                                    TermFrame::data_frames(&rid, seq, &bytes, MAX_TERM_DATA_BYTES)
+                                {
                                     seq = frame.seq + 1;
                                     let Ok(payload) = serde_json::to_value(&frame) else {
                                         continue;
@@ -1959,7 +1958,13 @@ impl Mesh {
                 tauri::async_runtime::spawn(async move {
                     let note = format!("[couldn't start a shell here: {e}]\r\n");
                     for frame in [
-                        TermFrame::new(&rid, 0, TermEvent::Data { bytes: note.into_bytes() }),
+                        TermFrame::new(
+                            &rid,
+                            0,
+                            TermEvent::Data {
+                                bytes: note.into_bytes(),
+                            },
+                        ),
                         TermFrame::new(&rid, 1, TermEvent::Exit { code: None }),
                     ] {
                         if let Ok(payload) = serde_json::to_value(&frame) {
@@ -1991,7 +1996,10 @@ impl Mesh {
                 && is_terminal_route(&r.route)
                 && pubkey_part(r.peer.as_str()) == pubkey_part(from))
             {
-                tracing::debug!("terminal frame for {} refused (route not live here)", frame.route);
+                tracing::debug!(
+                    "terminal frame for {} refused (route not live here)",
+                    frame.route
+                );
                 return;
             }
             (
@@ -2053,9 +2061,7 @@ impl Mesh {
                 .as_ref()
                 .and_then(|s| s.route(&route_id))
                 .ok_or("unknown route")?;
-            if !(r.is_active()
-                && is_terminal_route(&r.route)
-                && node_of(r.route.to.as_str()) == me)
+            if !(r.is_active() && is_terminal_route(&r.route) && node_of(r.route.to.as_str()) == me)
             {
                 return Err("route isn't an active terminal session here".into());
             }
