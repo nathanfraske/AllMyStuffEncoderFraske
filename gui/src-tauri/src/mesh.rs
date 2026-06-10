@@ -813,6 +813,15 @@ impl Mesh {
             w.queue.clear();
         }
         w.queue.push_back(packet);
+        // Poke the watcher when the queue goes non-empty: the console
+        // pulls on a timer, but Chromium throttles timers in occluded
+        // windows (a non-maximized console behind the main window paints
+        // ~1 fps) — the event rides eval, which isn't throttled, and it
+        // also shaves the poll interval off delivery latency. Coalesced
+        // by construction: no further pokes until the queue drains.
+        if w.queue.len() == 1 {
+            let _ = self.app.emit("allmystuff://video-ready", route_id);
+        }
     }
 
     /// Front-end command: offer a route from `from` to `to`.

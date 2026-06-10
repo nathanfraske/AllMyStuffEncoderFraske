@@ -213,6 +213,7 @@ export async function watchVideo(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { invoke } = await import("@tauri-apps/api/core");
+  const { listen } = await import("@tauri-apps/api/event");
   const token = (await invoke("video_watch", { routeId })) as number;
   let stopped = false;
   let inFlight = false;
@@ -238,10 +239,18 @@ export async function watchVideo(
       inFlight = false;
     }
   };
+  // Drain on the backend's "queue went non-empty" poke — event delivery
+  // isn't timer-throttled, so an occluded (non-maximized) console keeps
+  // painting at full rate, and arrival-driven pulls beat the interval's
+  // worst-case 16 ms. The interval stays as the safety net.
+  const unlisten = await listen<string>("allmystuff://video-ready", (e) => {
+    if (e.payload === routeId) void tick();
+  });
   const timer = setInterval(() => void tick(), 16);
   return () => {
     stopped = true;
     clearInterval(timer);
+    unlisten();
     void invoke("video_unwatch", { routeId, token }).catch(() => {});
   };
 }
