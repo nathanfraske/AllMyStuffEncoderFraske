@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
+  import { appVersion, setWindowTitle } from "../tauri";
   import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
@@ -11,11 +12,25 @@
   import Console from "./Console.svelte";
   import Toasts from "./Toasts.svelte";
 
+  // Which build this is. Comes from gui/src-tauri/Cargo.toml via Tauri
+  // (kept in sync by scripts/bump-version.sh); empty in the in-browser
+  // preview, where the badge below simply doesn't render.
+  let version = $state("");
+
   onMount(() => {
     // Wire up live backend data (scan + presence + routes) if the Tauri
     // backend is here; otherwise the demo graph stands in so the app is
     // never empty.
     void app.init();
+
+    // Surface the running version like MyOwnMesh / MyOwnLLM — in the brand
+    // and stamped into the window title.
+    void appVersion().then((v) => {
+      if (v) {
+        version = v;
+        void setWindowTitle(`AllMyStuff ${v}`);
+      }
+    });
   });
 </script>
 
@@ -24,7 +39,9 @@
     <div class="brand">
       <span class="logo">🧦</span>
       <div class="brandtext">
-        <div class="name">AllMyStuff</div>
+        <div class="name">
+          AllMyStuff{#if version}<span class="ver" title="Running version">v{version}</span>{/if}
+        </div>
         <div class="tag">everything you own, wired together</div>
       </div>
     </div>
@@ -116,6 +133,14 @@
     font-weight: 800;
     font-size: 1.1rem;
     letter-spacing: -0.01em;
+  }
+  .ver {
+    margin-left: 0.4rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--ink-faint);
+    vertical-align: 0.12em;
+    letter-spacing: 0;
   }
   .tag {
     font-size: 0.72rem;

@@ -58,6 +58,38 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+// ---- app metadata -----------------------------------------------------
+//
+// The running build's version, for showing in the UI like MyOwnMesh /
+// MyOwnLLM do. Tauri's source of truth is `gui/src-tauri/Cargo.toml`
+// (kept in sync with `gui/package.json` by `scripts/bump-version.sh`), so
+// this stays correct after every `just release`. Both helpers degrade to a
+// no-op in web mode — the in-browser preview has no Tauri runtime.
+
+/** The running app's version (e.g. "0.1.0"), or null in web mode. */
+export async function appVersion(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return await getVersion();
+  } catch (e) {
+    console.warn("app version unavailable:", e);
+    return null;
+  }
+}
+
+/** Stamp the native window title so the running build is identifiable at a
+ *  glance. No-op (and harmless) in web mode. */
+export async function setWindowTitle(title: string): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().setTitle(title);
+  } catch (e) {
+    console.warn("set window title failed:", e);
+  }
+}
+
 async function tryInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   if (!isTauri()) return null;
   try {
