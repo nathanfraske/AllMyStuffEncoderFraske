@@ -197,13 +197,20 @@ Tauri 2 + Svelte 5, a client of the daemon.
 5. With a live daemon, the backend sends a `RouteControl::Offer` to the peer
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
    audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
-   over `CHANNEL_MEDIA`, and the sink plays them. A display route streams the
-   source's primary screen the same way — a persistent capture session
-   (`xcap`'s recorder: PipeWire ScreenCast / DXGI / AVFoundation, with a
-   paced per-frame grab as the X11 path and universal fallback) → downscale
-   → JPEG, up to ~24 fps with unchanged frames skipped and a bounded queue
-   dropping stale ones under backpressure — and the console window renders
-   the latest frame, delivered over its per-route IPC channel. An input
+   over `CHANNEL_MEDIA`, and the sink plays them. A display route streams
+   the source's primary screen from a persistent capture session (`xcap`'s
+   recorder: PipeWire ScreenCast / DXGI / AVFoundation, with a paced
+   per-frame grab as the X11 path and universal fallback), unchanged frames
+   skipped, a bounded queue dropping stale packets under backpressure. The
+   *transport* is negotiated per route: when the viewer's offer advertises
+   `h264` (WebCodecs present) and the peer's lane is free, frames ride
+   **MyOwnMesh's H.264 video track lane** — openh264 in screen-content mode
+   at a 1920 edge, real RTP, no JSON/base64/64 KiB ceiling — and otherwise
+   fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA` (1280 edge,
+   chunked JPEGs), so any version skew degrades to working video. Either
+   way the console window renders packets delivered over its per-route IPC
+   channel (raw bytes; WebCodecs decodes H.264, `createImageBitmap` the
+   JPEGs). An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
    buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
    but only after the gate: the route must be live *and* the sender must be

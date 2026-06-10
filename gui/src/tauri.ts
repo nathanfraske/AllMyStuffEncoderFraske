@@ -110,9 +110,15 @@ export function scanSelf(): Promise<ScanResult | null> {
 }
 
 /** Offer a real connection over the mesh. Returns the route id, or null in
- *  web mode (the store falls back to a local route for the demo). */
+ *  web mode (the store falls back to a local route for the demo). For a
+ *  display route the offer advertises which video transports this side
+ *  can consume — H.264 when the webview has WebCodecs (the streaming side
+ *  then uses the mesh's RTP track lane), with MJPEG as the floor both
+ *  ends always share. */
 export function connectRoute(from: string, to: string, media: MediaKind): Promise<string | null> {
-  return tryInvoke<string>("connect_route", { from, to, media });
+  const video =
+    media === "display" && typeof VideoDecoder !== "undefined" ? ["h264"] : [];
+  return tryInvoke<string>("connect_route", { from, to, media, video });
 }
 
 export function disconnectRoute(routeId: string): Promise<null> {
@@ -175,12 +181,12 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
   return tryInvoke("send_input", { routeId, action });
 }
 
-/** Stream one route's inbound display frames into this window. Frames ride
- *  a Tauri IPC channel as raw bytes — a 24-byte little-endian header
- *  (width, height, source width/height as u32, seq as u64) followed by the
- *  JPEG — so the per-frame path has no JSON and no base64, and only the
- *  watching window pays for delivery. Returns an unwatch fn (a no-op in
- *  web mode, where no frames can arrive anyway). */
+/** Stream one route's inbound video into this window. Packets ride a
+ *  Tauri IPC channel as raw bytes — a 28-byte little-endian header (kind,
+ *  flags, dimensions, seq/timestamp) followed by the payload (JPEG bytes
+ *  or one H.264 access unit) — so the per-frame path has no JSON and no
+ *  base64, and only the watching window pays for delivery. Returns an
+ *  unwatch fn (a no-op in web mode, where no frames can arrive anyway). */
 export async function watchVideo(
   routeId: string,
   cb: (f: VideoFrameMsg) => void,
@@ -188,15 +194,19 @@ export async function watchVideo(
   if (!isTauri()) return () => {};
   const { invoke, Channel } = await import("@tauri-apps/api/core");
   const channel = new Channel<ArrayBuffer>((buf) => {
-    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 24) return;
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 28) return;
     const head = new DataView(buf);
+    const kindByte = head.getUint8(0);
+    if (kindByte !== 1 && kindByte !== 2) return;
     cb({
-      width: head.getUint32(0, true),
-      height: head.getUint32(4, true),
-      sourceWidth: head.getUint32(8, true),
-      sourceHeight: head.getUint32(12, true),
-      seq: Number(head.getBigUint64(16, true)),
-      jpeg: new Uint8Array(buf, 24),
+      kind: kindByte === 2 ? "h264" : "jpeg",
+      key: (head.getUint8(1) & 1) === 1,
+      width: head.getUint32(4, true),
+      height: head.getUint32(8, true),
+      sourceWidth: head.getUint32(12, true),
+      sourceHeight: head.getUint32(16, true),
+      seq: Number(head.getBigUint64(20, true)),
+      data: new Uint8Array(buf, 28),
     });
   });
   await invoke("video_watch", { routeId, onFrame: channel });

@@ -125,6 +125,28 @@ pub enum Request {
         payload: Value,
     },
 
+    // ---- video track lane (real RTP media, not the data channel) -----
+    /// Write one encoded H.264 access unit (Annex-B, base64) onto the
+    /// video track lane to `peer` (bare pubkey, like `ChannelSendTo`).
+    /// The lane is provisioned on every connection at negotiation;
+    /// `duration_us` paces the RTP clock (1/fps).
+    VideoSend {
+        network: String,
+        peer: String,
+        duration_us: u64,
+        data: String,
+    },
+    /// Route assembled video access units from this network's peers to
+    /// this client's event socket as `video_inbound` frames.
+    VideoSubscribe {
+        client_id: ClientId,
+        network: String,
+    },
+    VideoUnsubscribe {
+        client_id: ClientId,
+        network: String,
+    },
+
     // ---- generic RPC (request/response with one peer) ----------------
     RpcRegister {
         client_id: ClientId,

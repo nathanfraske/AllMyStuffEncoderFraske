@@ -36,7 +36,7 @@ use crate::audio::AudioBridge;
 use crate::control_client::{ControlClient, MediaPipe};
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
-use crate::video::VideoBridge;
+use crate::video::{VideoBridge, VideoMode, VideoPacket};
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -59,9 +59,10 @@ pub struct Mesh {
     /// task sends them on the media channel.
     audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
     /// Outbound video, deliberately *bounded*: when the link can't keep up
-    /// the capture side drops frames (each is a standalone JPEG, so a drop
-    /// costs nothing but freshness) instead of queueing stale ones.
-    video_out: mpsc::Sender<(String, VideoFrame)>,
+    /// the capture side drops frames instead of queueing stale ones (an
+    /// MJPEG drop costs freshness only; an H.264 drop is healed by the
+    /// next forced IDR).
+    video_out: mpsc::Sender<(String, VideoPacket)>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// This app run's random presence boot id — how peers detect that we
@@ -74,6 +75,15 @@ pub struct Mesh {
     /// video. A frame goes as raw bytes straight to the one webview that
     /// wants it — not as base64 JSON eval'd into every open window.
     video_watchers: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
+    /// The H.264 track lane is one per peer connection: which route is
+    /// streaming *out* on it (peer pubkey → route id). A second display
+    /// route to the same peer falls back to MJPEG until the lane frees.
+    video_lane_out: Mutex<HashMap<String, String>>,
+    /// Which inbound route consumes each peer's track lane here (peer
+    /// pubkey → route id) — set when our offered display route goes
+    /// active with `h264` accepted, so `video_inbound` events route to
+    /// the right console window.
+    video_lane_in: Mutex<HashMap<String, String>>,
 }
 
 /// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
@@ -111,7 +121,7 @@ impl Mesh {
         let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
         // A shallow queue: at most a few frames in flight, so a slow link
         // sheds load by dropping captures rather than growing latency.
-        let (video_out, mut video_rx) = mpsc::channel::<(String, VideoFrame)>(4);
+        let (video_out, mut video_rx) = mpsc::channel::<(String, VideoPacket)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -135,6 +145,8 @@ impl Mesh {
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
+            video_lane_out: Mutex::new(HashMap::new()),
+            video_lane_in: Mutex::new(HashMap::new()),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -162,19 +174,33 @@ impl Mesh {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, frame)) = video_rx.recv().await {
-                    // A frame above the data channel's message ceiling
-                    // travels as several chunks sharing its seq.
-                    for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
-                        let Ok(payload) = serde_json::to_value(&chunk) else {
-                            continue;
-                        };
-                        if let Err(e) = mesh.send_media_value(&peer, payload).await {
-                            if last_warn.elapsed() >= WARN_EVERY {
-                                last_warn = std::time::Instant::now();
-                                tracing::warn!("video frame to {} failed: {e}", short_id(&peer));
+                while let Some((peer, packet)) = video_rx.recv().await {
+                    let outcome = match packet {
+                        // An MJPEG frame above the data channel's message
+                        // ceiling travels as several chunks sharing a seq.
+                        VideoPacket::Jpeg(frame) => {
+                            let mut result = Ok(());
+                            for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
+                                let Ok(payload) = serde_json::to_value(&chunk) else {
+                                    continue;
+                                };
+                                if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                                    result = Err(e);
+                                    break; // rest of this frame is pointless
+                                }
                             }
-                            break; // rest of this frame is pointless
+                            result
+                        }
+                        // An H.264 access unit rides the mesh's RTP track
+                        // lane — no chunking (RTP packetizes), no ceiling.
+                        VideoPacket::H264 { data, duration_us } => {
+                            mesh.send_video_track(&peer, data, duration_us).await
+                        }
+                    };
+                    if let Err(e) = outcome {
+                        if last_warn.elapsed() >= WARN_EVERY {
+                            last_warn = std::time::Instant::now();
+                            tracing::warn!("video to {} failed: {e}", short_id(&peer));
                         }
                     }
                 }
@@ -199,6 +225,29 @@ impl Mesh {
                 channel: CHANNEL_MEDIA.to_string(),
                 peer: pubkey_part(peer).to_string(),
                 payload,
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Send one H.264 access unit to `peer` over the daemon's video
+    /// track lane (base64 on the control socket, RTP on the wire).
+    async fn send_video_track(
+        &self,
+        peer: &str,
+        data: Vec<u8>,
+        duration_us: u64,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+        let Some(network) = self.network_for_peer(peer) else {
+            return Err("no shared network".into());
+        };
+        self.media_pipe
+            .send(&Request::VideoSend {
+                network,
+                peer: pubkey_part(peer).to_string(),
+                duration_us,
+                data: base64::engine::general_purpose::STANDARD.encode(&data),
             })
             .await
             .map_err(|e| e.to_string())
@@ -444,6 +493,18 @@ impl Mesh {
                 let payload = value.get("payload").cloned().unwrap_or(Value::Null);
                 self.handle_channel(channel, from, network, payload).await;
             }
+            "video_inbound" => {
+                let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                let key = value.get("key").and_then(|v| v.as_bool()).unwrap_or(false);
+                let rtp_timestamp = value
+                    .get("rtp_timestamp")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                self.handle_video_inbound(from, rtp_timestamp, key, data);
+            }
             "event" => {
                 if let Some(event) = value.get("event") {
                     // Connection establishment is a claim-status trigger: a
@@ -640,12 +701,58 @@ impl Mesh {
         }
     }
 
+    /// Free any track-lane claims held by a route that just ended, in
+    /// both directions — the next display route to that peer can take
+    /// the lane over.
+    fn release_video_lanes(&self, route_id: &str) {
+        self.video_lane_out.lock().retain(|_, rid| rid != route_id);
+        self.video_lane_in.lock().retain(|_, rid| rid != route_id);
+    }
+
+    /// One assembled H.264 access unit arrived on a peer's track lane.
+    /// It belongs to whichever of our routes claimed that peer's inbound
+    /// lane — gated exactly like MJPEG frames (route live, sinks here,
+    /// sender is the route's peer) before it reaches a console window.
+    fn handle_video_inbound(&self, from: &str, rtp_timestamp: u32, key: bool, data_b64: &str) {
+        use base64::Engine as _;
+        let canon = pubkey_part(from).to_string();
+        let Some(route_id) = self.video_lane_in.lock().get(&canon).cloned() else {
+            tracing::debug!(
+                "video sample from {} with no claimed inbound lane — dropped",
+                short_id(from)
+            );
+            return;
+        };
+        if !self.inbound_media_ok(&route_id, from, MediaKind::Display) {
+            tracing::debug!("video sample for {route_id} refused (route not live here)");
+            return;
+        }
+        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
+            return;
+        };
+        let watcher = { self.video_watchers.lock().get(&route_id).cloned() };
+        match watcher {
+            Some(ch) => {
+                // 90 kHz RTP clock → µs for the decoder's timestamps.
+                let ts_us = rtp_timestamp as u64 * 1000 / 90;
+                if ch
+                    .send(InvokeResponseBody::Raw(h264_ipc_bytes(ts_us, key, &data)))
+                    .is_err()
+                {
+                    self.video_watchers.lock().remove(&route_id);
+                }
+            }
+            None => tracing::debug!("no console window watching {route_id} — sample dropped"),
+        }
+    }
+
     /// Front-end command: offer a route from `from` to `to`.
     pub async fn connect(
         self: &Arc<Self>,
         from: String,
         to: String,
         media: String,
+        video: Vec<String>,
     ) -> Result<String, String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let media = parse_media(&media);
@@ -668,7 +775,7 @@ impl Mesh {
             let effects = {
                 let mut st = self.state.lock();
                 let s = st.session.as_mut().ok_or("mesh not ready")?;
-                let _ = s.offer(route.clone(), me.as_str());
+                let _ = s.offer(route.clone(), me.as_str(), Vec::new());
                 s.handle(
                     NodeId::from(me.as_str()),
                     ControlMessage::Route(RouteControl::Accept {
@@ -684,7 +791,7 @@ impl Mesh {
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
-            s.offer(route.clone(), peer.as_str())
+            s.offer(route.clone(), peer.as_str(), video)
         };
         if let Err(e) = self.send_control(&peer, &msg).await {
             // The peer never saw the offer — drop it rather than leave a
@@ -728,6 +835,7 @@ impl Mesh {
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
+        self.release_video_lanes(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -774,6 +882,7 @@ impl Mesh {
                     self.audio.stop(&id);
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
+                    self.release_video_lanes(&id);
                 }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
@@ -1234,6 +1343,17 @@ impl Mesh {
                     })
                     .await;
             }
+            // The video track lane's inbound side: assembled H.264
+            // access units arrive as `video_inbound` events. Subscribing
+            // on a daemon that predates the lane just fails — and every
+            // sender to us would also pick MJPEG, so nothing is lost.
+            let _ = self
+                .client
+                .request(&Request::VideoSubscribe {
+                    client_id,
+                    network: network.clone(),
+                })
+                .await;
         }
     }
 
@@ -1278,23 +1398,72 @@ impl Mesh {
                 }
             }
             MediaKind::Display => {
-                // We're the screen being looked at: capture and stream
-                // MJPEG to the viewer. The viewer side starts nothing here
-                // — its console window renders the emitted frames.
+                // We're the screen being looked at: capture and stream to
+                // the viewer. The transport comes from the offer: when the
+                // viewer can decode H.264 and this peer's track lane is
+                // free, the stream rides RTP; otherwise MJPEG over the
+                // media channel, exactly as v1. The viewer side starts no
+                // capture — it claims the inbound lane so arriving samples
+                // route to its console window.
                 if from_node == me && to_node != me {
+                    let accepts_h264 = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&route.id))
+                        .map(|r| r.video.iter().any(|v| v == "h264"))
+                        .unwrap_or(false);
+                    let canon = pubkey_part(&to_node).to_string();
+                    let mode = if accepts_h264 {
+                        let mut lanes = self.video_lane_out.lock();
+                        if lanes.contains_key(&canon) {
+                            tracing::info!(
+                                "route {} — peer's track lane busy; falling back to MJPEG",
+                                route.id
+                            );
+                            VideoMode::Mjpeg
+                        } else {
+                            lanes.insert(canon.clone(), route.id.clone());
+                            VideoMode::H264
+                        }
+                    } else {
+                        VideoMode::Mjpeg
+                    };
                     tracing::info!(
-                        "route {} active — streaming this screen to {}",
+                        "route {} active — streaming this screen to {} ({})",
                         route.id,
-                        short_id(&to_node)
+                        short_id(&to_node),
+                        match mode {
+                            VideoMode::H264 => "H.264 track",
+                            VideoMode::Mjpeg => "MJPEG",
+                        }
                     );
                     let peer = to_node.clone();
                     let tx = self.video_out.clone();
-                    self.video.start_capture(route.id.clone(), move |frame| {
-                        // try_send: a full queue drops this frame; the next
-                        // capture carries a fresher picture.
-                        tx.try_send((peer.clone(), frame)).is_ok()
-                    });
+                    self.video
+                        .start_capture(route.id.clone(), mode, move |packet| {
+                            // try_send: a full queue drops this packet; the next
+                            // capture carries a fresher picture.
+                            tx.try_send((peer.clone(), packet)).is_ok()
+                        });
                 } else if to_node == me {
+                    // Claim the peer's inbound lane for this route if we
+                    // offered H.264 — the sender may still pick MJPEG, in
+                    // which case the claim simply never sees a sample.
+                    let offered_h264 = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&route.id))
+                        .map(|r| r.video.iter().any(|v| v == "h264"))
+                        .unwrap_or(false);
+                    if offered_h264 {
+                        self.video_lane_in
+                            .lock()
+                            .insert(pubkey_part(&from_node).to_string(), route.id.clone());
+                    }
                     tracing::info!(
                         "route {} active — expecting screen frames from {}",
                         route.id,
@@ -1440,19 +1609,47 @@ fn empty_owned() -> Value {
     json!({ "key": "", "version": 0, "members": [] })
 }
 
-/// The shape a frame takes on a console window's IPC channel: a fixed
-/// 24-byte little-endian header — width, height, source_width,
-/// source_height (`u32`), seq (`u64`) — followed by the raw JPEG. No JSON,
-/// no base64; the webview hands the bytes straight to its native decoder.
-/// The route isn't carried — the channel itself is per-route.
+// The shape video takes on a console window's IPC channel: a fixed
+// 28-byte little-endian header, then the payload. No JSON, no base64;
+// the webview hands the bytes straight to a decoder. The route isn't
+// carried — the channel itself is per-route.
+//
+//   [0]      kind: 1 = JPEG frame, 2 = H.264 access unit
+//   [1]      flags: bit 0 = key (H.264 IDR)
+//   [2..4]   reserved
+//   [4..8]   width  (JPEG only — H.264 carries its size in the SPS)
+//   [8..12]  height
+//   [12..16] source_width
+//   [16..20] source_height
+//   [20..28] JPEG: frame seq · H.264: timestamp in µs
+
+fn video_ipc_header(kind: u8, flags: u8, dims: [u32; 4], tail: u64, payload_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(28 + payload_len);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&[0u8; 2]);
+    for d in dims {
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    out.extend_from_slice(&tail.to_le_bytes());
+    out
+}
+
 fn video_ipc_bytes(f: &VideoFrame) -> Vec<u8> {
-    let mut out = Vec::with_capacity(24 + f.jpeg.len());
-    out.extend_from_slice(&f.width.to_le_bytes());
-    out.extend_from_slice(&f.height.to_le_bytes());
-    out.extend_from_slice(&f.source_width.to_le_bytes());
-    out.extend_from_slice(&f.source_height.to_le_bytes());
-    out.extend_from_slice(&f.seq.to_le_bytes());
+    let mut out = video_ipc_header(
+        1,
+        0,
+        [f.width, f.height, f.source_width, f.source_height],
+        f.seq,
+        f.jpeg.len(),
+    );
     out.extend_from_slice(&f.jpeg);
+    out
+}
+
+fn h264_ipc_bytes(ts_us: u64, key: bool, data: &[u8]) -> Vec<u8> {
+    let mut out = video_ipc_header(2, key as u8, [0; 4], ts_us, data.len());
+    out.extend_from_slice(data);
     out
 }
 

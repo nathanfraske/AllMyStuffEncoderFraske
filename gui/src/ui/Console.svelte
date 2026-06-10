@@ -39,16 +39,18 @@
   );
 
   // ---- live video ---------------------------------------------------
-  let frameSrc = $state<string | null>(null);
+  //
+  // The stage is a canvas with two decode paths: H.264 access units go
+  // through WebCodecs (hardware where the webview has it), JPEG frames
+  // through createImageBitmap — whichever the backend delivers, per
+  // packet. The H.264 decoder is created lazily on the first key unit
+  // and rebuilt on the next one after any error.
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
+  let hasFrame = $state(false);
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
   let frameCount = 0;
-  let imgEl = $state<HTMLImageElement | null>(null);
-  // The object URL behind frameSrc — plain (untracked) so revoking the
-  // previous frame's URL inside the frame callback can't retrigger the
-  // effect below.
-  let frameUrl: string | null = null;
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -67,28 +69,91 @@
     };
   });
 
-  // Follow the live video route: watch its frame channel while it's up,
+  // Follow the live video route: watch its packet channel while it's up,
   // and show the placeholder rather than a stale frame whenever it
-  // changes (input switch, session end). Each frame arrives as raw JPEG
-  // bytes → a Blob URL the <img> decodes natively; the previous frame's
-  // URL is revoked so memory stays flat.
+  // changes (input switch, session end).
   $effect(() => {
     const route = app.consoleVideoLive;
-    frameSrc = null;
+    hasFrame = false;
     fps = 0;
     frameCount = 0;
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
+    let decoder: VideoDecoder | null = null;
+    // JPEG bitmap decodes are async — chain them so frames paint in
+    // arrival order.
+    let drawChain = Promise.resolve();
+
+    const paint = (w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
+      const c = canvasEl;
+      if (cancelled || !c) return;
+      if (c.width !== w) c.width = w;
+      if (c.height !== h) c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) return;
+      draw(ctx);
+      frameW = w;
+      frameH = h;
+      hasFrame = true;
+      frameCount += 1;
+    };
+
+    const dropDecoder = () => {
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null;
+    };
+
     void watchVideo(route, (f) => {
       if (cancelled) return;
-      const url = URL.createObjectURL(new Blob([f.jpeg], { type: "image/jpeg" }));
-      if (frameUrl) URL.revokeObjectURL(frameUrl);
-      frameUrl = url;
-      frameSrc = url;
-      frameW = f.width;
-      frameH = f.height;
-      frameCount += 1;
+      if (f.kind === "jpeg") {
+        const blob = new Blob([f.data], { type: "image/jpeg" });
+        drawChain = drawChain.then(async () => {
+          if (cancelled) return;
+          try {
+            const bmp = await createImageBitmap(blob);
+            paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            bmp.close();
+          } catch {
+            // A torn frame decodes as nothing; the next one stands alone.
+          }
+        });
+        return;
+      }
+      // H.264 — decode entry is a key unit; deltas before one wait.
+      if (!decoder || decoder.state === "closed") {
+        if (!f.key) return;
+        decoder = new VideoDecoder({
+          output: (frame) => {
+            paint(frame.displayWidth, frame.displayHeight, (ctx) =>
+              ctx.drawImage(frame, 0, 0),
+            );
+            frame.close();
+          },
+          // Recovery is the sender's periodic IDR: drop the decoder,
+          // re-init on the next key unit.
+          error: dropDecoder,
+        });
+        // Constrained baseline (what openh264 emits), level 5.1 — high
+        // enough that 1920-edge 30 fps streams configure everywhere; the
+        // decoder reads the real parameters from the SPS in-band.
+        decoder.configure({ codec: "avc1.42E033", optimizeForLatency: true });
+      }
+      try {
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: f.key ? "key" : "delta",
+            timestamp: f.seq,
+            data: f.data,
+          }),
+        );
+      } catch {
+        dropDecoder();
+      }
     }).then((u) => {
       // The route may have changed while the subscribe was in flight.
       if (cancelled) u();
@@ -97,10 +162,7 @@
     return () => {
       cancelled = true;
       unwatch?.();
-      if (frameUrl) {
-        URL.revokeObjectURL(frameUrl);
-        frameUrl = null;
-      }
+      dropDecoder();
     };
   });
 
@@ -122,11 +184,11 @@
   // ---- keyboard & mouse forwarding -----------------------------------
   //
   // Coordinates are normalized 0..1 over the *streamed frame's* content
-  // box (the <img> is letterboxed with object-fit: contain), which the
+  // box (the canvas is letterboxed with object-fit: contain), which the
   // remote denormalizes onto its own screen — neither side needs the
   // other's resolution.
   function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
-    const img = imgEl;
+    const img = canvasEl;
     if (!img || !frameW || !frameH) return null;
     const r = img.getBoundingClientRect();
     const scale = Math.min(r.width / frameW, r.height / frameH);
@@ -252,14 +314,16 @@
         onwheel={onWheel}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
-        {#if frameSrc}
-          <img
-            bind:this={imgEl}
+        {#if app.consoleVideoLive}
+          <canvas
+            bind:this={canvasEl}
             class="live"
-            src={frameSrc}
-            alt="Live screen of {displayName(node)}"
-            draggable="false"
-          />
+            class:waiting={!hasFrame}
+            aria-label="Live screen of {displayName(node)}"
+          ></canvas>
+        {/if}
+        {#if hasFrame}
+          <!-- the canvas above is the stage -->
         {:else if selected}
           <div class="screen" style="--mc: {mediaColor(selected.media)}">
             <div class="screen-glyph">{inputIcon(selected)}</div>
@@ -306,7 +370,7 @@
         </div>
 
         <div class="status">
-          {#if frameSrc}
+          {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
               <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps
             </span>
@@ -506,6 +570,12 @@
     -webkit-user-drag: none;
     border-radius: 4px;
     box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
+  }
+  /* Mounted (so the first frame has somewhere to land) but invisible
+     until it does — the placeholder shows through. */
+  .live.waiting {
+    visibility: hidden;
+    position: absolute;
   }
   .screen {
     width: 100%;

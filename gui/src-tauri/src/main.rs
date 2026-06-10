@@ -83,8 +83,11 @@ async fn connect_route(
     from: String,
     to: String,
     media: String,
+    video: Option<Vec<String>>,
 ) -> Result<String, String> {
-    mesh.inner().connect(from, to, media).await
+    mesh.inner()
+        .connect(from, to, media, video.unwrap_or_default())
+        .await
 }
 
 #[tauri::command]

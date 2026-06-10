@@ -43,6 +43,31 @@ use parking_lot::Mutex;
 
 use allmystuff_session::VideoFrame;
 
+/// Which transport a display route's stream encodes for — picked by the
+/// mesh from the offer's `video` accepts (see `RouteControl::Offer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoMode {
+    /// Standalone JPEG frames over the media channel — the v1 transport
+    /// and the universal fallback.
+    Mjpeg,
+    /// H.264 access units for the mesh's RTP track lane.
+    H264,
+}
+
+/// One capture tick's output, headed for the forwarder. (H.264 units
+/// carry no key flag — the receiving daemon re-derives IDR-ness from the
+/// NAL stream itself when it reassembles units off RTP.)
+#[derive(Debug, Clone)]
+pub enum VideoPacket {
+    Jpeg(VideoFrame),
+    H264 {
+        /// Annex-B access unit.
+        data: Vec<u8>,
+        /// Capture-tick pacing for the RTP clock (1/fps).
+        duration_us: u64,
+    },
+}
+
 /// Streaming ceiling on the longest frame edge. 1280 keeps a 1080p/4K
 /// desktop readable while a frame stays ~60-150 KB at [`JPEG_QUALITY`] —
 /// comfortably inside a LAN data channel at [`TARGET_FPS`].
@@ -53,11 +78,24 @@ const JPEG_QUALITY: u8 = 60;
 /// Capture cadence to aim for — a ceiling, not a promise. Session capture
 /// sustains it; the one-shot fallback runs at whatever rate the platform's
 /// screenshot path allows (the budget math self-limits, as before).
-const TARGET_FPS: u32 = 24;
+const TARGET_FPS: u32 = 30;
 /// An unchanged screen still re-sends one frame this often, so a viewer
 /// that lost a frame (or joined a quiet stream) is never stranded on a
 /// stale picture. Every tick in between costs one buffer compare.
 const STATIC_REFRESH: Duration = Duration::from_secs(2);
+
+/// H.264 ceiling on the longest edge — sharper than the MJPEG cap
+/// because inter-frame compression pays for the pixels. 1920 keeps a 4K
+/// desktop at a crisp 2:1 and software encode comfortably real-time;
+/// also inside openh264's 3840×2160 hard limit. Dimensions are forced
+/// even (4:2:0 chroma needs it).
+const H264_MAX_EDGE: u32 = 1920;
+/// Target bitrate for the track lane. ~6 Mbps carries 1920-edge desktop
+/// content well in screen-content mode and stays trivial on a LAN.
+const H264_BITRATE_BPS: u32 = 6_000_000;
+/// Forced IDR cadence — bounds how long a viewer that joined mid-stream
+/// (or lost an unrepaired packet) waits for a clean decode entry.
+const H264_IDR_EVERY: Duration = Duration::from_secs(4);
 
 struct RouteVideo {
     stop: Arc<AtomicBool>,
@@ -83,19 +121,19 @@ impl VideoBridge {
         Self::default()
     }
 
-    /// Begin streaming the primary screen for `route_id`. `on_frame` is
-    /// called with each encoded frame; it returns `false` when the frame
-    /// was dropped downstream (backpressure), which is fine — the next
-    /// capture simply carries the newer picture.
-    pub fn start_capture<F>(&self, route_id: String, on_frame: F)
+    /// Begin streaming the primary screen for `route_id`, encoding for
+    /// `mode`. `on_packet` is called with each encoded packet; it returns
+    /// `false` when the packet was dropped downstream (backpressure),
+    /// which is fine — the next capture simply carries the newer picture.
+    pub fn start_capture<F>(&self, route_id: String, mode: VideoMode, on_packet: F)
     where
-        F: Fn(VideoFrame) -> bool + Send + 'static,
+        F: Fn(VideoPacket) -> bool + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture(&stop_thread, &id, on_frame) {
+            if let Err(e) = run_capture(&stop_thread, &id, mode, on_packet) {
                 tracing::warn!("screen capture for {id} stopped: {e}");
             }
         });
@@ -113,14 +151,19 @@ impl VideoBridge {
     }
 }
 
-fn run_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: F) -> Result<(), String>
+fn run_capture<F>(
+    stop: &AtomicBool,
+    route_id: &str,
+    mode: VideoMode,
+    on_packet: F,
+) -> Result<(), String>
 where
-    F: Fn(VideoFrame) -> bool + Send + 'static,
+    F: Fn(VideoPacket) -> bool + Send + 'static,
 {
     let monitor = primary_monitor()?;
-    let mut encoder = FrameEncoder::new(route_id);
+    let mut encoder = StreamEncoder::new(route_id, mode)?;
     if prefer_session_capture() {
-        match run_session_capture(stop, route_id, &monitor, &on_frame, &mut encoder) {
+        match run_session_capture(stop, route_id, &monitor, &on_packet, &mut encoder) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if stop.load(Ordering::SeqCst) {
@@ -133,7 +176,7 @@ where
             }
         }
     }
-    run_oneshot_capture(stop, route_id, &monitor, &on_frame, &mut encoder)
+    run_oneshot_capture(stop, route_id, &monitor, &on_packet, &mut encoder)
 }
 
 /// Whether to try a persistent capture session first. On Linux only
@@ -170,11 +213,11 @@ fn run_session_capture<F>(
     stop: &AtomicBool,
     route_id: &str,
     monitor: &xcap::Monitor,
-    on_frame: &F,
-    encoder: &mut FrameEncoder,
+    on_packet: &F,
+    encoder: &mut StreamEncoder,
 ) -> Result<(), String>
 where
-    F: Fn(VideoFrame) -> bool + Send + 'static,
+    F: Fn(VideoPacket) -> bool + Send + 'static,
 {
     let (recorder, frames) = monitor.video_recorder().map_err(|e| e.to_string())?;
     recorder.start().map_err(|e| e.to_string())?;
@@ -198,7 +241,7 @@ where
         }
         match encoder.encode(frame.raw, frame.width, frame.height) {
             Ok(Some(out)) => {
-                let _ = on_frame(out);
+                let _ = on_packet(out);
             }
             Ok(None) => {}
             Err(e) => break Err(e),
@@ -219,11 +262,11 @@ fn run_oneshot_capture<F>(
     stop: &AtomicBool,
     route_id: &str,
     monitor: &xcap::Monitor,
-    on_frame: &F,
-    encoder: &mut FrameEncoder,
+    on_packet: &F,
+    encoder: &mut StreamEncoder,
 ) -> Result<(), String>
 where
-    F: Fn(VideoFrame) -> bool + Send + 'static,
+    F: Fn(VideoPacket) -> bool + Send + 'static,
 {
     let budget = Duration::from_secs(1) / TARGET_FPS;
     let mut failures = 0u64;
@@ -237,9 +280,9 @@ where
                 encoder.encode(image.into_raw(), sw, sh)
             });
         match outcome {
-            Ok(Some(frame)) => {
+            Ok(Some(packet)) => {
                 failures = 0;
-                let _ = on_frame(frame);
+                let _ = on_packet(packet);
             }
             Ok(None) => failures = 0,
             Err(e) => {
@@ -321,6 +364,138 @@ impl FrameEncoder {
         self.seq += 1;
         Ok(Some(frame))
     }
+}
+
+/// The per-route encode stage, dispatching on the negotiated transport.
+/// (The H.264 arm boxes openh264's chunky encoder state.)
+enum StreamEncoder {
+    Mjpeg(FrameEncoder),
+    H264(Box<H264Stream>),
+}
+
+impl StreamEncoder {
+    fn new(route_id: &str, mode: VideoMode) -> Result<Self, String> {
+        match mode {
+            VideoMode::Mjpeg => Ok(StreamEncoder::Mjpeg(FrameEncoder::new(route_id))),
+            VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new()?))),
+        }
+    }
+
+    fn encode(&mut self, rgba: Vec<u8>, sw: u32, sh: u32) -> Result<Option<VideoPacket>, String> {
+        match self {
+            StreamEncoder::Mjpeg(enc) => Ok(enc.encode(rgba, sw, sh)?.map(VideoPacket::Jpeg)),
+            StreamEncoder::H264(enc) => enc.encode(rgba, sw, sh),
+        }
+    }
+}
+
+/// The H.264 encode stage of one route's stream — openh264 in
+/// screen-content mode, scaled to [`H264_MAX_EDGE`] (even dimensions for
+/// 4:2:0), with the same unchanged-frame gate as MJPEG and a forced IDR
+/// every [`H264_IDR_EVERY`] so a viewer always has a decode entry point
+/// within seconds. A resolution change (monitor swap) re-initializes the
+/// encoder inside openh264; the next unit out is an IDR.
+struct H264Stream {
+    encoder: openh264::encoder::Encoder,
+    prev: Vec<u8>,
+    prev_size: (u32, u32),
+    last_sent: Option<Instant>,
+    last_idr: Option<Instant>,
+}
+
+impl H264Stream {
+    fn new() -> Result<Self, String> {
+        use openh264::encoder::{
+            BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
+        };
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(H264_BITRATE_BPS))
+            .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32));
+        let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+            .map_err(|e| format!("openh264 init: {e}"))?;
+        Ok(H264Stream {
+            encoder,
+            prev: Vec::new(),
+            prev_size: (0, 0),
+            last_sent: None,
+            last_idr: None,
+        })
+    }
+
+    fn encode(&mut self, rgba: Vec<u8>, sw: u32, sh: u32) -> Result<Option<VideoPacket>, String> {
+        if sw == 0 || sh == 0 {
+            return Ok(None);
+        }
+        let (dw, dh) = fit_within_even(sw, sh, H264_MAX_EDGE);
+        // Scale and strip alpha in one pass: the encoder's fast RGB→YUV
+        // path wants tightly packed 3-byte pixels, and the unchanged-
+        // frame compare gets 25% cheaper for free.
+        let scaled = scale_rgba_to_rgb(&rgba, sw, sh, dw, dh);
+        let refresh_due = self
+            .last_sent
+            .is_none_or(|sent| sent.elapsed() >= STATIC_REFRESH);
+        if !refresh_due && self.prev_size == (dw, dh) && self.prev == scaled {
+            return Ok(None);
+        }
+        if self
+            .last_idr
+            .is_none_or(|idr| idr.elapsed() >= H264_IDR_EVERY)
+        {
+            self.encoder.force_intra_frame();
+        }
+        let yuv = openh264::formats::YUVBuffer::from_rgb8_source(
+            openh264::formats::RgbSliceU8::new(&scaled, (dw as usize, dh as usize)),
+        );
+        let stream = self
+            .encoder
+            .encode(&yuv)
+            .map_err(|e| format!("h264 encode: {e}"))?;
+        let key = matches!(
+            stream.frame_type(),
+            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+        );
+        let data = stream.to_vec();
+        self.prev = scaled;
+        self.prev_size = (dw, dh);
+        self.last_sent = Some(Instant::now());
+        if key {
+            self.last_idr = Some(Instant::now());
+        }
+        if data.is_empty() {
+            // Rate control may skip a frame outright; nothing to send.
+            return Ok(None);
+        }
+        Ok(Some(VideoPacket::H264 {
+            data,
+            duration_us: 1_000_000u64 / TARGET_FPS as u64,
+        }))
+    }
+}
+
+/// [`fit_within`], then force both edges even (4:2:0 chroma subsampling
+/// needs it; a 1-pixel crop is invisible at these sizes).
+fn fit_within_even(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
+    let (w, h) = fit_within(w, h, max_edge);
+    ((w & !1).max(2), (h & !1).max(2))
+}
+
+/// Nearest-neighbour scale straight from RGBA capture to tightly packed
+/// RGB (alpha dropped). Same row-sliced structure as [`scale_rgba`]; also
+/// serves as the plain strip pass when no scaling is needed.
+fn scale_rgba_to_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let xmap: Vec<usize> = (0..dw).map(|x| (x * sw / dw) * 4).collect();
+    let mut out = vec![0u8; dw * dh * 3];
+    for (y, drow) in out.chunks_exact_mut(dw * 3).enumerate() {
+        let sy = y * sh / dh;
+        let srow = &src[sy * sw * 4..][..sw * 4];
+        for (dst, &sx) in drow.chunks_exact_mut(3).zip(&xmap) {
+            dst.copy_from_slice(&srow[sx..sx + 3]);
+        }
+    }
+    out
 }
 
 fn encode_jpeg(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {

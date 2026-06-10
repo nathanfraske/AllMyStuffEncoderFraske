@@ -285,16 +285,23 @@ export type InputAction =
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; down: boolean };
 
-/** One MJPEG frame of a display route, decoded off its IPC channel (a
- *  fixed binary header + the raw JPEG bytes — see `watchVideo`). */
+/** One video packet of a display route, decoded off its IPC channel (a
+ *  fixed binary header + the payload — see `watchVideo`). Either a
+ *  standalone JPEG frame (the MJPEG transport) or one H.264 access unit
+ *  from the mesh's track lane, for WebCodecs. */
 export interface VideoFrameMsg {
-  seq: number;
+  kind: "jpeg" | "h264";
+  /** H.264: this unit is an IDR — a safe decoder entry point. */
+  key: boolean;
+  /** JPEG only — H.264 carries its dimensions in the stream (SPS). */
   width: number;
   height: number;
   sourceWidth: number;
   sourceHeight: number;
-  /** The JPEG itself — ready for a `Blob`, never base64. */
-  jpeg: Uint8Array<ArrayBuffer>;
+  /** JPEG: the frame's seq. H.264: presentation timestamp in µs. */
+  seq: number;
+  /** The payload bytes — never base64. */
+  data: Uint8Array<ArrayBuffer>;
 }
 
 // ---- bundles (pre-set kits with category slots) -----------------------

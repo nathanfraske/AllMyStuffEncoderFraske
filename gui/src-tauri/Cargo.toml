@@ -65,6 +65,13 @@ xcap = "0.9"
 # speed on typical x86-64 desktops, plain safe Rust elsewhere.
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 enigo = "0.6"
+# H.264 encode for the mesh's video track lane (Cisco's encoder, built
+# from source — needs only a C/C++ toolchain). MJPEG stays as the
+# fallback wherever this can't run or the peer can't decode.
+openh264 = "0.9"
+# Access units ride the daemon control socket as base64 (same encoding
+# the session crate's media frames use).
+base64 = "0.22"
 
 [profile.release]
 panic = "abort"
@@ -79,12 +86,20 @@ strip = true
 # rate instead of running the pixel loops unoptimized.
 [profile.release.package.jpeg-encoder]
 opt-level = 3
+[profile.release.package.openh264]
+opt-level = 3
+[profile.release.package.openh264-sys2]
+opt-level = 3
 [profile.release.package.xcap]
 opt-level = 3
 [profile.release.package.image]
 opt-level = 3
 
 [profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
 opt-level = 3
 [profile.dev.package.xcap]
 opt-level = 3

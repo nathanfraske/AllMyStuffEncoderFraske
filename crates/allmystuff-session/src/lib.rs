@@ -67,6 +67,12 @@ pub struct LiveRoute {
     pub peer: NodeId,
     pub origin: Origin,
     pub state: RouteState,
+    /// Video transports the offerer can consume (display routes; see
+    /// [`RouteControl::Offer`]). On an outbound route these are what we
+    /// asked for; on an inbound one, what the peer can decode — the
+    /// side that streams reads them to pick the transport.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video: Vec<String>,
 }
 
 impl LiveRoute {
@@ -171,8 +177,15 @@ impl Session {
     // ---- routes ------------------------------------------------------
 
     /// Offer a route to the peer that owns its other endpoint. Records it
-    /// as `Outbound`/`Offered` and returns the message to send.
-    pub fn offer(&mut self, route: Route, peer: impl Into<NodeId>) -> ControlMessage {
+    /// as `Outbound`/`Offered` and returns the message to send. `video`
+    /// names the transports this side can consume for a display route
+    /// (see [`RouteControl::Offer`]); empty means MJPEG only.
+    pub fn offer(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+    ) -> ControlMessage {
         let peer = peer.into();
         self.routes.insert(
             route.id.clone(),
@@ -181,9 +194,10 @@ impl Session {
                 peer,
                 origin: Origin::Outbound,
                 state: RouteState::Offered,
+                video: video.clone(),
             },
         );
-        ControlMessage::Route(RouteControl::Offer { route })
+        ControlMessage::Route(RouteControl::Offer { route, video })
     }
 
     /// Locally tear a route down. Returns the message to send the peer (if
@@ -223,7 +237,7 @@ impl Session {
 
     fn handle_route(&mut self, from: NodeId, rc: RouteControl) -> Vec<Effect> {
         match rc {
-            RouteControl::Offer { route } => {
+            RouteControl::Offer { route, video } => {
                 let accept = self.auto_accept;
                 let state = if accept {
                     RouteState::Active
@@ -237,6 +251,7 @@ impl Session {
                         peer: from.clone(),
                         origin: Origin::Inbound,
                         state,
+                        video,
                     },
                 );
                 if accept {
@@ -338,7 +353,7 @@ mod tests {
     #[test]
     fn outbound_offer_goes_active_on_accept_and_starts_media() {
         let mut s = Session::new("this");
-        let msg = s.offer(route("r1"), "desk");
+        let msg = s.offer(route("r1"), "desk", Vec::new());
         assert!(matches!(
             msg,
             ControlMessage::Route(RouteControl::Offer { .. })
@@ -360,7 +375,10 @@ mod tests {
         let mut s = Session::new("desk");
         let effects = s.handle(
             "this".into(),
-            ControlMessage::Route(RouteControl::Offer { route: route("r1") }),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+            }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
         // Replies Accept and starts media.
@@ -379,7 +397,10 @@ mod tests {
         s.auto_accept = false;
         let effects = s.handle(
             "this".into(),
-            ControlMessage::Route(RouteControl::Offer { route: route("r1") }),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+            }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Incoming);
         assert!(effects.is_empty());
@@ -388,7 +409,7 @@ mod tests {
     #[test]
     fn reject_marks_rejected_with_reason() {
         let mut s = Session::new("this");
-        s.offer(route("r1"), "desk");
+        s.offer(route("r1"), "desk", Vec::new());
         s.handle(
             "desk".into(),
             ControlMessage::Route(RouteControl::Reject {
@@ -410,7 +431,10 @@ mod tests {
         let mut s = Session::new("desk");
         s.handle(
             "this".into(),
-            ControlMessage::Route(RouteControl::Offer { route: route("r1") }),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+            }),
         );
         let effects = s.handle(
             "this".into(),
@@ -427,7 +451,10 @@ mod tests {
         let mut s = Session::new("desk");
         s.handle(
             "this".into(),
-            ControlMessage::Route(RouteControl::Offer { route: route("r1") }),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+            }),
         );
         let effects = s.drop_peer(&"this".into());
         assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
