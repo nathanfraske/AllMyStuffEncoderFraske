@@ -219,13 +219,19 @@ fn enrich_nvidia(gpus: &mut [Gpu]) {
     if !gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
         return;
     }
-    let Ok(out) = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-    else {
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    // From the windowless GUI a console child would flash up its own
+    // console window on Windows; run it without one.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(out) = cmd.output() else {
         return;
     };
     if !out.status.success() {

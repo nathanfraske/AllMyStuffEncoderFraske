@@ -8,9 +8,16 @@
 
 #![cfg(target_os = "windows")]
 
+use std::os::windows::process::CommandExt as _;
 use std::process::Command;
 
 use crate::types::*;
+
+/// Each console-subsystem child of a windowless (GUI-subsystem) parent
+/// gets a fresh visible console on Windows — one flashing window per
+/// probe when the app scans. CREATE_NO_WINDOW runs the child with no
+/// console window; `.output()` pipes stdio, so nothing else changes.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Run a PowerShell snippet that ends in `ConvertTo-Json` and parse the
 /// result. `ConvertTo-Json` emits a bare object for a single row and an
@@ -25,6 +32,7 @@ fn ps_json(script: &str) -> Option<serde_json::Value> {
             "-Command",
             script,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !out.status.success() {
