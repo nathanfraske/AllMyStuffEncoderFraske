@@ -88,6 +88,7 @@
   function newTab() {
     const id = nextTabId++;
     const routeId = app.terminalConnect(host);
+    console.info(`[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}`);
     tabs.push({
       id,
       routeId,
@@ -98,10 +99,23 @@
     activeId = id;
   }
 
-  /** Svelte action: a tab's pane is in the DOM — build its emulator. */
+  /** Svelte action: a tab's pane is in the DOM — build its emulator. A
+   *  failure here must *show itself* (the tab would otherwise sit on
+   *  "connecting" forever with a perfectly live route behind it). */
   function mountTerm(el: HTMLElement, tabId: number) {
     const meta = tabs.find((t) => t.id === tabId);
     if (!meta) return;
+    try {
+      return mountTermInner(el, tabId, meta);
+    } catch (e) {
+      console.error("[terminal] emulator failed to start:", e);
+      meta.status = "rejected";
+      meta.note = `the terminal emulator failed to start here: ${e}`;
+      return;
+    }
+  }
+
+  function mountTermInner(el: HTMLElement, tabId: number, meta: TabMeta) {
     const term = new XTerm({
       allowProposedApi: true,
       cursorBlink: true,
@@ -131,20 +145,21 @@
         void openExternal(uri);
       }),
     );
-    // GPU rendering where the webview offers WebGL2; the DOM renderer is
-    // the silent fallback (WebKitGTK without GL, lost contexts, …).
-    try {
-      const gl = new WebglAddon();
-      gl.onContextLoss(() => gl.dispose());
-      term.loadAddon(gl);
-    } catch {
-      // DOM renderer it is.
-    }
 
     const rt: TabRuntime = { term, fit, started: false, stopWatch: null, cleanup: [] };
     runtimes.set(tabId, rt);
 
     term.open(el);
+    // GPU rendering where the webview offers WebGL2; the DOM renderer is
+    // the silent fallback (WebKitGTK without GL, lost contexts, …). The
+    // addon needs an opened terminal — load it strictly after `open`.
+    try {
+      const gl = new WebglAddon();
+      gl.onContextLoss(() => gl.dispose());
+      term.loadAddon(gl);
+    } catch (e) {
+      console.info("[terminal] WebGL renderer unavailable, using DOM:", e);
+    }
     fit.fit();
     term.focus();
 
@@ -256,6 +271,7 @@
     if (rt.started || !meta.routeId) return;
     rt.started = true;
     const routeId = meta.routeId;
+    console.info(`[terminal] wiring output for ${routeId}`);
     void watchTerminal(routeId, (bytes) => rt.term.write(bytes)).then((stop) => {
       // The tab may have died while the watch was being wired.
       if (runtimes.get(meta.id) !== rt) {
@@ -271,29 +287,40 @@
   }
 
   // Drive each tab's status off its route's live state from the session
-  // snapshots — the same source of truth the rest of the app reads.
+  // snapshots — the same source of truth the rest of the app reads. The
+  // status flips on the route alone; wiring the byte stream additionally
+  // needs the emulator runtime, and is retried each pass so a slow mount
+  // can never strand a live route on "connecting".
   $effect(() => {
     for (const t of tabs) {
       if (!t.routeId) continue;
       const st = app.routeStates[t.routeId];
       const rt = runtimes.get(t.id);
       if (st?.state === "active") {
-        if (rt && !rt.started) {
+        if (t.status === "connecting") {
+          console.info(`[terminal] route live: ${t.routeId}`);
           t.status = "live";
-          startSession(t, rt);
         }
+        if (t.status === "live" && rt && !rt.started) startSession(t, rt);
       } else if (st?.state === "rejected") {
         if (t.status !== "rejected") {
+          console.warn(`[terminal] route rejected: ${t.routeId} (${st.reason ?? "no reason"})`);
           t.status = "rejected";
           t.note = st.reason || "the far side refused the session";
           rt?.term.write(`\r\n\x1b[31m[offer rejected: ${t.note}]\x1b[0m\r\n`);
         }
-      } else if (st?.state === "torn_down" && t.status === "live") {
-        // The route closed under a live shell (host app quit, or the far
-        // side ended it). An exit report usually lands first and is the
-        // better story; this is the fallback.
+      } else if (st?.state === "torn_down" && (t.status === "live" || t.status === "connecting")) {
+        // The route closed — under a live shell (host app quit, far side
+        // ended it) or before it ever delivered one (the host's shell
+        // failed to spawn). An exit report usually lands first and is the
+        // better story; this is the fallback either way.
+        console.info(`[terminal] route torn down: ${t.routeId} (was ${t.status})`);
+        const early = t.status === "connecting";
         t.status = "ended";
-        if (!t.note) t.note = "session ended by the far side";
+        if (!t.note)
+          t.note = early
+            ? "the far side closed the session before it started"
+            : "session ended by the far side";
       }
     }
   });
@@ -462,6 +489,12 @@
             {#if t.status === "connecting"}
               <div class="veil">
                 <p>Connecting to <b>{displayName(node)}</b>…</p>
+                <!-- The raw negotiation state, so a stall names its stage:
+                     "offered" = the far side never answered; no state at
+                     all = the offer never reached the backend. -->
+                <p class="diag">
+                  route {app.routeStates[t.routeId ?? ""]?.state ?? "not negotiated yet"}
+                </p>
               </div>
             {:else if t.status === "offline"}
               <div class="veil">
@@ -712,6 +745,10 @@
   }
   .veil b {
     color: #e8e4f8;
+  }
+  .veil .diag {
+    font-size: 0.68rem;
+    color: #7d76a0;
   }
   .veil-actions {
     display: flex;
