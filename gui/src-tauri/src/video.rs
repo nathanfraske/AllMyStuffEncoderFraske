@@ -68,6 +68,80 @@ pub enum VideoPacket {
     },
 }
 
+/// Pipeline counters for one outbound stream, logged every
+/// [`STATS_EVERY`] — the dial-in line: effective fps out, where each
+/// frame's milliseconds went (scale vs encode), payload bitrate, and the
+/// three ways a tick can produce nothing (unchanged screen, downstream
+/// drop, rate-control skip). Times accumulate; the log shows per-frame
+/// averages over the window.
+pub struct StreamStats {
+    route_id: String,
+    label: &'static str,
+    since: Instant,
+    sent: u32,
+    keyframes: u32,
+    static_skipped: u32,
+    dropped: u32,
+    bytes: u64,
+    scale: Duration,
+    encode: Duration,
+    out_w: u32,
+    out_h: u32,
+}
+
+impl StreamStats {
+    fn new(route_id: &str, mode: VideoMode) -> Self {
+        StreamStats {
+            route_id: route_id.to_string(),
+            label: match mode {
+                VideoMode::H264 => "H.264",
+                VideoMode::Mjpeg => "MJPEG",
+            },
+            since: Instant::now(),
+            sent: 0,
+            keyframes: 0,
+            static_skipped: 0,
+            dropped: 0,
+            bytes: 0,
+            scale: Duration::ZERO,
+            encode: Duration::ZERO,
+            out_w: 0,
+            out_h: 0,
+        }
+    }
+
+    fn maybe_log(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < STATS_EVERY {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        let frames = self.sent.max(1) as f64;
+        tracing::info!(
+            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms · encode {:.1}ms ·              {} key · {} static-skip · {} dropped",
+            self.route_id,
+            self.sent as f64 / secs,
+            self.label,
+            self.out_w,
+            self.out_h,
+            (self.bytes as f64 * 8.0) / secs / 1_000_000.0,
+            self.scale.as_secs_f64() * 1000.0 / frames,
+            self.encode.as_secs_f64() * 1000.0 / frames,
+            self.keyframes,
+            self.static_skipped,
+            self.dropped,
+        );
+        self.since = Instant::now();
+        self.sent = 0;
+        self.keyframes = 0;
+        self.static_skipped = 0;
+        self.dropped = 0;
+        self.bytes = 0;
+        self.scale = Duration::ZERO;
+        self.encode = Duration::ZERO;
+    }
+}
+
 /// Streaming ceiling on the longest frame edge. 1280 keeps a 1080p/4K
 /// desktop readable while a frame stays ~60-150 KB at [`JPEG_QUALITY`] —
 /// comfortably inside a LAN data channel at [`TARGET_FPS`].
@@ -90,12 +164,17 @@ const STATIC_REFRESH: Duration = Duration::from_secs(2);
 /// also inside openh264's 3840×2160 hard limit. Dimensions are forced
 /// even (4:2:0 chroma needs it).
 const H264_MAX_EDGE: u32 = 1920;
-/// Target bitrate for the track lane. ~6 Mbps carries 1920-edge desktop
-/// content well in screen-content mode and stays trivial on a LAN.
-const H264_BITRATE_BPS: u32 = 6_000_000;
+/// Target bitrate for the track lane. 10 Mbps keeps 1920-edge desktop
+/// content crisp through motion in screen-content mode and is trivial on
+/// a LAN (where direct peers live); link-adaptive rate is the follow-up
+/// for relayed/WAN paths.
+const H264_BITRATE_BPS: u32 = 10_000_000;
 /// Forced IDR cadence — bounds how long a viewer that joined mid-stream
 /// (or lost an unrepaired packet) waits for a clean decode entry.
 const H264_IDR_EVERY: Duration = Duration::from_secs(4);
+/// How often each stream logs its pipeline counters — the dial-in line:
+/// effective fps, where the per-frame milliseconds go, and the bitrate.
+const STATS_EVERY: Duration = Duration::from_secs(5);
 
 struct RouteVideo {
     stop: Arc<AtomicBool>,
@@ -163,15 +242,26 @@ where
     let monitor = primary_monitor()?;
     // An encoder that can't init (openh264 build/runtime trouble) must
     // cost quality, not the stream: fall back to MJPEG and say so.
-    let mut encoder = match StreamEncoder::new(route_id, mode) {
-        Ok(enc) => enc,
+    let (mut encoder, mode) = match StreamEncoder::new(route_id, mode) {
+        Ok(enc) => (enc, mode),
         Err(e) => {
             tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
-            StreamEncoder::new(route_id, VideoMode::Mjpeg)?
+            (
+                StreamEncoder::new(route_id, VideoMode::Mjpeg)?,
+                VideoMode::Mjpeg,
+            )
         }
     };
+    let mut stats = StreamStats::new(route_id, mode);
     if prefer_session_capture() {
-        match run_session_capture(stop, route_id, &monitor, &on_packet, &mut encoder) {
+        match run_session_capture(
+            stop,
+            route_id,
+            &monitor,
+            &on_packet,
+            &mut encoder,
+            &mut stats,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if stop.load(Ordering::SeqCst) {
@@ -184,7 +274,14 @@ where
             }
         }
     }
-    run_oneshot_capture(stop, route_id, &monitor, &on_packet, &mut encoder)
+    run_oneshot_capture(
+        stop,
+        route_id,
+        &monitor,
+        &on_packet,
+        &mut encoder,
+        &mut stats,
+    )
 }
 
 /// Whether to try a persistent capture session first. On Linux only
@@ -223,6 +320,7 @@ fn run_session_capture<F>(
     monitor: &xcap::Monitor,
     on_packet: &F,
     encoder: &mut StreamEncoder,
+    stats: &mut StreamStats,
 ) -> Result<(), String>
 where
     F: Fn(VideoPacket) -> bool + Send + 'static,
@@ -247,13 +345,18 @@ where
         while let Ok(newer) = frames.try_recv() {
             frame = newer;
         }
-        match encoder.encode(frame.raw, frame.width, frame.height) {
+        match encoder.encode(frame.raw, frame.width, frame.height, stats) {
             Ok(Some(out)) => {
-                let _ = on_packet(out);
+                if on_packet(out) {
+                    stats.sent += 1;
+                } else {
+                    stats.dropped += 1;
+                }
             }
             Ok(None) => {}
             Err(e) => break Err(e),
         }
+        stats.maybe_log();
         if let Some(rest) = budget.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -272,6 +375,7 @@ fn run_oneshot_capture<F>(
     monitor: &xcap::Monitor,
     on_packet: &F,
     encoder: &mut StreamEncoder,
+    stats: &mut StreamStats,
 ) -> Result<(), String>
 where
     F: Fn(VideoPacket) -> bool + Send + 'static,
@@ -285,12 +389,16 @@ where
             .map_err(|e| e.to_string())
             .and_then(|image| {
                 let (sw, sh) = (image.width(), image.height());
-                encoder.encode(image.into_raw(), sw, sh)
+                encoder.encode(image.into_raw(), sw, sh, stats)
             });
         match outcome {
             Ok(Some(packet)) => {
                 failures = 0;
-                let _ = on_packet(packet);
+                if on_packet(packet) {
+                    stats.sent += 1;
+                } else {
+                    stats.dropped += 1;
+                }
             }
             Ok(None) => failures = 0,
             Err(e) => {
@@ -307,6 +415,7 @@ where
                 }
             }
         }
+        stats.maybe_log();
         if let Some(rest) = budget.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -351,20 +460,34 @@ impl FrameEncoder {
         }
     }
 
-    fn encode(&mut self, rgba: Vec<u8>, sw: u32, sh: u32) -> Result<Option<VideoFrame>, String> {
+    fn encode(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+    ) -> Result<Option<VideoFrame>, String> {
         let (dw, dh) = fit_within(sw, sh, MAX_EDGE);
+        let t0 = Instant::now();
         let scaled = if (dw, dh) == (sw, sh) {
             rgba
         } else {
             scale_rgba(&rgba, sw, sh, dw, dh)
         };
+        stats.scale += t0.elapsed();
+        (stats.out_w, stats.out_h) = (dw, dh);
         let refresh_due = self
             .last_sent
             .is_none_or(|sent| sent.elapsed() >= STATIC_REFRESH);
         if !refresh_due && self.prev_size == (dw, dh) && self.prev == scaled {
+            stats.static_skipped += 1;
             return Ok(None);
         }
+        let t1 = Instant::now();
         let jpeg = encode_jpeg(&scaled, dw, dh)?;
+        stats.encode += t1.elapsed();
+        stats.bytes += jpeg.len() as u64;
+        stats.keyframes += 1; // every MJPEG frame is standalone
         self.prev = scaled;
         self.prev_size = (dw, dh);
         self.last_sent = Some(Instant::now());
@@ -389,10 +512,18 @@ impl StreamEncoder {
         }
     }
 
-    fn encode(&mut self, rgba: Vec<u8>, sw: u32, sh: u32) -> Result<Option<VideoPacket>, String> {
+    fn encode(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+    ) -> Result<Option<VideoPacket>, String> {
         match self {
-            StreamEncoder::Mjpeg(enc) => Ok(enc.encode(rgba, sw, sh)?.map(VideoPacket::Jpeg)),
-            StreamEncoder::H264(enc) => enc.encode(rgba, sw, sh),
+            StreamEncoder::Mjpeg(enc) => {
+                Ok(enc.encode(rgba, sw, sh, stats)?.map(VideoPacket::Jpeg))
+            }
+            StreamEncoder::H264(enc) => enc.encode(rgba, sw, sh, stats),
         }
     }
 }
@@ -432,7 +563,13 @@ impl H264Stream {
         })
     }
 
-    fn encode(&mut self, rgba: Vec<u8>, sw: u32, sh: u32) -> Result<Option<VideoPacket>, String> {
+    fn encode(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+    ) -> Result<Option<VideoPacket>, String> {
         if sw == 0 || sh == 0 {
             return Ok(None);
         }
@@ -440,11 +577,15 @@ impl H264Stream {
         // Scale and strip alpha in one pass: the encoder's fast RGB→YUV
         // path wants tightly packed 3-byte pixels, and the unchanged-
         // frame compare gets 25% cheaper for free.
+        let t0 = Instant::now();
         let scaled = scale_rgba_to_rgb(&rgba, sw, sh, dw, dh);
+        stats.scale += t0.elapsed();
+        (stats.out_w, stats.out_h) = (dw, dh);
         let refresh_due = self
             .last_sent
             .is_none_or(|sent| sent.elapsed() >= STATIC_REFRESH);
         if !refresh_due && self.prev_size == (dw, dh) && self.prev == scaled {
+            stats.static_skipped += 1;
             return Ok(None);
         }
         if self
@@ -453,6 +594,7 @@ impl H264Stream {
         {
             self.encoder.force_intra_frame();
         }
+        let t1 = Instant::now();
         let yuv = openh264::formats::YUVBuffer::from_rgb8_source(
             openh264::formats::RgbSliceU8::new(&scaled, (dw as usize, dh as usize)),
         );
@@ -465,16 +607,19 @@ impl H264Stream {
             openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
         );
         let data = stream.to_vec();
+        stats.encode += t1.elapsed();
         self.prev = scaled;
         self.prev_size = (dw, dh);
         self.last_sent = Some(Instant::now());
         if key {
             self.last_idr = Some(Instant::now());
+            stats.keyframes += 1;
         }
         if data.is_empty() {
             // Rate control may skip a frame outright; nothing to send.
             return Ok(None);
         }
+        stats.bytes += data.len() as u64;
         Ok(Some(VideoPacket::H264 {
             data,
             duration_us: 1_000_000u64 / TARGET_FPS as u64,
@@ -487,23 +632,6 @@ impl H264Stream {
 fn fit_within_even(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     let (w, h) = fit_within(w, h, max_edge);
     ((w & !1).max(2), (h & !1).max(2))
-}
-
-/// Nearest-neighbour scale straight from RGBA capture to tightly packed
-/// RGB (alpha dropped). Same row-sliced structure as [`scale_rgba`]; also
-/// serves as the plain strip pass when no scaling is needed.
-fn scale_rgba_to_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
-    let xmap: Vec<usize> = (0..dw).map(|x| (x * sw / dw) * 4).collect();
-    let mut out = vec![0u8; dw * dh * 3];
-    for (y, drow) in out.chunks_exact_mut(dw * 3).enumerate() {
-        let sy = y * sh / dh;
-        let srow = &src[sy * sw * 4..][..sw * 4];
-        for (dst, &sx) in drow.chunks_exact_mut(3).zip(&xmap) {
-            dst.copy_from_slice(&srow[sx..sx + 3]);
-        }
-    }
-    out
 }
 
 fn encode_jpeg(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
@@ -535,24 +663,10 @@ fn fit_within(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     )
 }
 
-/// Nearest-neighbour RGBA downscale. At streaming sizes the JPEG pass
-/// dominates visually, so the cheapest resampler wins — but it runs on
-/// every frame, so the source column for each output column is computed
-/// once and the inner loop is pure row-sliced copies, not per-pixel
-/// index arithmetic.
-fn scale_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
-    let xmap: Vec<usize> = (0..dw).map(|x| (x * sw / dw) * 4).collect();
-    let mut out = vec![0u8; dw * dh * 4];
-    for (y, drow) in out.chunks_exact_mut(dw * 4).enumerate() {
-        let sy = y * sh / dh;
-        let srow = &src[sy * sw * 4..][..sw * 4];
-        for (dst, &sx) in drow.chunks_exact_mut(4).zip(&xmap) {
-            dst.copy_from_slice(&srow[sx..sx + 4]);
-        }
-    }
-    out
-}
+// The scalers live in `allmystuff-pixels` (path crate) purely so dev
+// builds run them at opt-level 3 — at opt 0 they alone cap the stream at
+// single-digit fps on a Retina/4K source.
+use allmystuff_pixels::{scale_rgba, scale_rgba_to_rgb};
 
 #[cfg(test)]
 mod tests {
@@ -568,17 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn scale_rgba_samples_the_right_pixels() {
-        // 2x1 image: red then blue. Downscale to 1x1 keeps the left pixel.
-        let src = [255, 0, 0, 255, 0, 0, 255, 255];
-        assert_eq!(scale_rgba(&src, 2, 1, 1, 1), vec![255, 0, 0, 255]);
-        // Upscaling 1x1 to 2x2 repeats it (the fn never errors on growth
-        // even though fit_within never asks for it).
-        let one = [9, 8, 7, 255];
-        assert_eq!(scale_rgba(&one, 1, 1, 2, 2), one.repeat(4));
-    }
-
-    #[test]
     fn jpeg_encoder_produces_a_jpeg() {
         let rgba = vec![128u8; 8 * 8 * 4];
         let jpeg = encode_jpeg(&rgba, 8, 8).expect("encode");
@@ -588,25 +691,63 @@ mod tests {
 
     #[test]
     fn encoder_skips_unchanged_frames_and_keeps_seq_for_sent_ones() {
+        let mut stats = StreamStats::new("r", VideoMode::Mjpeg);
         let mut enc = FrameEncoder::new("r");
         let a = vec![10u8; 8 * 8 * 4];
-        let first = enc.encode(a.clone(), 8, 8).unwrap().expect("first sends");
+        let first = enc
+            .encode(a.clone(), 8, 8, &mut stats)
+            .unwrap()
+            .expect("first sends");
         assert_eq!(first.seq, 0);
         // Same pixels again, inside the refresh window → skipped.
-        assert!(enc.encode(a.clone(), 8, 8).unwrap().is_none());
+        assert!(enc.encode(a.clone(), 8, 8, &mut stats).unwrap().is_none());
+        assert_eq!(stats.static_skipped, 1, "the skip is counted");
         // Changed pixels → sent, with the next seq (skips don't burn one).
         let b = vec![200u8; 8 * 8 * 4];
-        let second = enc.encode(b, 8, 8).unwrap().expect("change sends");
+        let second = enc
+            .encode(b, 8, 8, &mut stats)
+            .unwrap()
+            .expect("change sends");
         assert_eq!(second.seq, 1);
+        assert!(stats.bytes > 0, "emitted bytes are counted");
     }
 
     #[test]
     fn encoder_resends_after_the_refresh_interval() {
+        let mut stats = StreamStats::new("r", VideoMode::Mjpeg);
         let mut enc = FrameEncoder::new("r");
         let a = vec![10u8; 8 * 8 * 4];
-        enc.encode(a.clone(), 8, 8).unwrap().expect("first sends");
+        enc.encode(a.clone(), 8, 8, &mut stats)
+            .unwrap()
+            .expect("first sends");
         enc.last_sent = Some(Instant::now() - STATIC_REFRESH);
-        let refreshed = enc.encode(a, 8, 8).unwrap();
+        let refreshed = enc.encode(a, 8, 8, &mut stats).unwrap();
         assert_eq!(refreshed.expect("refresh resends").seq, 1);
+    }
+
+    #[test]
+    fn fit_within_even_forces_even_edges() {
+        assert_eq!(fit_within_even(3024, 1964, 1920), (1920, 1246));
+        assert_eq!(fit_within_even(1919, 1081, 1920), (1918, 1080));
+        assert_eq!(fit_within_even(1, 1, 1920), (2, 2));
+    }
+
+    #[test]
+    fn h264_stream_emits_annexb_with_a_leading_idr() {
+        let mut stats = StreamStats::new("r", VideoMode::H264);
+        let mut enc = H264Stream::new().expect("openh264 init");
+        // A 64×64 solid frame → first unit out must be a key (IDR + SPS/PPS
+        // in-band), Annex-B framed.
+        let rgba = vec![128u8; 64 * 64 * 4];
+        let packet = enc
+            .encode(rgba, 64, 64, &mut stats)
+            .expect("encode")
+            .expect("first frame emits");
+        let VideoPacket::H264 { data, .. } = packet else {
+            panic!("h264 stream emitted a jpeg");
+        };
+        assert!(data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]));
+        assert_eq!(stats.keyframes, 1, "first unit is a key");
+        assert!(stats.bytes > 0);
     }
 }

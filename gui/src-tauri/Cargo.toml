@@ -72,6 +72,9 @@ openh264 = "0.9"
 # Access units ride the daemon control socket as base64 (same encoding
 # the session crate's media frames use).
 base64 = "0.22"
+# The per-pixel hot loops (frame downscale/strip), split out so dev
+# builds optimize them — see the crate's manifest for the why.
+allmystuff-pixels = { path = "pixels" }
 
 [profile.release]
 panic = "abort"
@@ -94,6 +97,8 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.image]
 opt-level = 3
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
 
 [profile.dev.package.jpeg-encoder]
 opt-level = 3
@@ -104,4 +109,12 @@ opt-level = 3
 [profile.dev.package.xcap]
 opt-level = 3
 [profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+# The media plane's framing also leans on these every packet (JSON lines
+# on the control socket, base64 payloads) — worth optimizing in dev too.
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
 opt-level = 3

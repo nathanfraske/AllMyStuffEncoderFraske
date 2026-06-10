@@ -50,6 +50,7 @@
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
+  let transport = $state("");
   let frameCount = 0;
 
   onMount(() => {
@@ -76,6 +77,7 @@
     const route = app.consoleVideoLive;
     hasFrame = false;
     fps = 0;
+    transport = "";
     frameCount = 0;
     if (!route) return;
     let cancelled = false;
@@ -110,6 +112,7 @@
 
     void watchVideo(route, (f) => {
       if (cancelled) return;
+      transport = f.kind === "h264" ? "H.264" : "MJPEG";
       if (f.kind === "jpeg") {
         const blob = new Blob([f.data], { type: "image/jpeg" });
         drawChain = drawChain.then(async () => {
@@ -202,12 +205,13 @@
     return { x, y };
   }
 
-  // Pointer moves stream constantly; ~30/s is plenty for a console.
+  // Pointer moves stream constantly; cap at ~60/s — the events are tiny
+  // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!app.consoleControl) return;
     const now = performance.now();
-    if (now - lastMoveAt < 33) return;
+    if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
@@ -372,7 +376,7 @@
         <div class="status">
           {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}
             </span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}

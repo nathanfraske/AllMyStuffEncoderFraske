@@ -42,6 +42,7 @@ dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
@@ -75,6 +76,10 @@ dependencies = [
  "serde_json",
  "sysinfo",
 ]
+
+[[package]]
+name = "allmystuff-pixels"
+version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"

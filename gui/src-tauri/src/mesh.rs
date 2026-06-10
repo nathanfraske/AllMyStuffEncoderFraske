@@ -90,6 +90,29 @@ pub struct Mesh {
     /// a single loud log says why. This is what keeps a stale daemon a
     /// slow stream instead of a black one.
     daemon_video: std::sync::atomic::AtomicBool,
+    /// Inbound per-route counters (frames, bytes), logged every few
+    /// seconds — the receive half of the dial-in line the sender's
+    /// `StreamStats` provides.
+    video_in_stats: Mutex<HashMap<String, VideoInStats>>,
+}
+
+/// Receive-side counters for one route's stream.
+struct VideoInStats {
+    since: std::time::Instant,
+    frames: u32,
+    bytes: u64,
+    label: &'static str,
+}
+
+impl VideoInStats {
+    fn new(label: &'static str) -> Self {
+        VideoInStats {
+            since: std::time::Instant::now(),
+            frames: 0,
+            bytes: 0,
+            label,
+        }
+    }
 }
 
 /// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
@@ -154,6 +177,7 @@ impl Mesh {
             video_lane_out: Mutex::new(HashMap::new()),
             video_lane_in: Mutex::new(HashMap::new()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
+            video_in_stats: Mutex::new(HashMap::new()),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -634,6 +658,7 @@ impl Mesh {
                                     full.height
                                 );
                             }
+                            self.note_video_in(&full.route, "MJPEG", full.jpeg.len());
                             // Raw bytes over the route's IPC channel, to the
                             // one window that registered for it. A failed
                             // send means that webview is gone — forget the
@@ -714,6 +739,34 @@ impl Mesh {
     fn release_video_lanes(&self, route_id: &str) {
         self.video_lane_out.lock().retain(|_, rid| rid != route_id);
         self.video_lane_in.lock().retain(|_, rid| rid != route_id);
+        self.video_in_stats.lock().remove(route_id);
+    }
+
+    /// Count one inbound video payload for `route_id` and emit the
+    /// receive-side dial-in line every few seconds:
+    /// `video in <route>: 28.4 fps · 4.1 Mbps · H.264`.
+    fn note_video_in(&self, route_id: &str, label: &'static str, bytes: usize) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut map = self.video_in_stats.lock();
+        let st = map
+            .entry(route_id.to_string())
+            .or_insert_with(|| VideoInStats::new(label));
+        st.label = label;
+        st.frames += 1;
+        st.bytes += bytes as u64;
+        let elapsed = st.since.elapsed();
+        if elapsed >= EVERY {
+            let secs = elapsed.as_secs_f64();
+            tracing::info!(
+                "video in {route_id}: {:.1} fps · {:.1} Mbps · {}",
+                st.frames as f64 / secs,
+                (st.bytes as f64 * 8.0) / secs / 1_000_000.0,
+                st.label,
+            );
+            st.since = std::time::Instant::now();
+            st.frames = 0;
+            st.bytes = 0;
+        }
     }
 
     /// One assembled H.264 access unit arrived on a peer's track lane.
@@ -737,6 +790,7 @@ impl Mesh {
         let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
             return;
         };
+        self.note_video_in(&route_id, "H.264", data.len());
         let watcher = { self.video_watchers.lock().get(&route_id).cloned() };
         match watcher {
             Some(ch) => {
