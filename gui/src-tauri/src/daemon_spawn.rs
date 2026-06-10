@@ -41,6 +41,34 @@ pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
 }
 
+/// Compare the answering daemon's version against the app's pin and log
+/// the verdict — loudly on mismatch. A stale daemon is the #1 way "the
+/// app updated but a feature didn't appear" happens: the sidecar
+/// resolution prefers a sibling dev build, and a long-lived daemon
+/// process survives app upgrades entirely. Only meaningful when the pin
+/// is a version tag (`vX.Y.Z`); a sha pin can't be compared.
+pub async fn log_daemon_version(client: &ControlClient) {
+    let Some(pin) = option_env!("MYOWNMESH_PIN") else {
+        return;
+    };
+    let Some(pinned) = pin.strip_prefix('v').filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let running = client
+        .request(&Request::Status)
+        .await
+        .ok()
+        .and_then(|r| r.data)
+        .and_then(|d| d.get("version").and_then(|v| v.as_str()).map(String::from));
+    match running {
+        Some(v) if v == pinned => tracing::info!("myownmesh daemon v{v} (matches the {pin} pin)"),
+        Some(v) => tracing::warn!(
+            "myownmesh daemon is v{v} but this app pins {pin} — features the newer              daemon carries (e.g. the video track lane) will be unavailable. If this              is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its              stale binary so build.rs fetches the pinned release) and restart the app."
+        ),
+        None => tracing::warn!("couldn't read the daemon version to compare against the {pin} pin"),
+    }
+}
+
 /// The target triple `build.rs` bundled the sidecar for. In a dev build
 /// Tauri keeps the `-<triple>` suffix on the staged sidecar; a production
 /// bundle strips it to plain `myownmesh{.exe}`.
@@ -49,7 +77,9 @@ const DAEMON_SIDECAR_TRIPLE: &str = env!("DAEMON_SIDECAR_TRIPLE");
 /// True when a path is a real, non-empty binary (not a zero-byte sidecar
 /// stub `build.rs` wrote when it couldn't fetch the daemon).
 fn usable(p: &std::path::Path) -> bool {
-    p.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+    p.metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Locate the `myownmesh` daemon. It normally ships *with the app* — bundled
@@ -65,7 +95,11 @@ fn usable(p: &std::path::Path) -> bool {
 /// 4. Side-by-side `../MyOwnMesh` source build.
 /// 5. `myownmesh` on `$PATH`.
 pub fn find_daemon_binary() -> Result<PathBuf> {
-    let exe = if cfg!(windows) { "myownmesh.exe" } else { "myownmesh" };
+    let exe = if cfg!(windows) {
+        "myownmesh.exe"
+    } else {
+        "myownmesh"
+    };
     let exe_triple = if cfg!(windows) {
         format!("myownmesh-{DAEMON_SIDECAR_TRIPLE}.exe")
     } else {
@@ -147,6 +181,7 @@ fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
 pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<DaemonChild>> {
     if probe(client).await {
         tracing::info!("existing myownmesh daemon found on the control socket");
+        log_daemon_version(client).await;
         return Ok(None);
     }
 
@@ -167,9 +202,12 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         tokio::time::sleep(Duration::from_millis(150)).await;
         if probe(client).await {
             tracing::info!("myownmesh daemon up");
+            log_daemon_version(client).await;
             return Ok(Some(handle));
         }
     }
-    tracing::warn!("daemon did not answer within 8s; leaving it running — the event pump will retry");
+    tracing::warn!(
+        "daemon did not answer within 8s; leaving it running — the event pump will retry"
+    );
     Ok(Some(handle))
 }

@@ -161,7 +161,15 @@ where
     F: Fn(VideoPacket) -> bool + Send + 'static,
 {
     let monitor = primary_monitor()?;
-    let mut encoder = StreamEncoder::new(route_id, mode)?;
+    // An encoder that can't init (openh264 build/runtime trouble) must
+    // cost quality, not the stream: fall back to MJPEG and say so.
+    let mut encoder = match StreamEncoder::new(route_id, mode) {
+        Ok(enc) => enc,
+        Err(e) => {
+            tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
+            StreamEncoder::new(route_id, VideoMode::Mjpeg)?
+        }
+    };
     if prefer_session_capture() {
         match run_session_capture(stop, route_id, &monitor, &on_packet, &mut encoder) {
             Ok(()) => return Ok(()),

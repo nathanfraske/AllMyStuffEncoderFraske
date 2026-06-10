@@ -78,7 +78,11 @@ impl AudioBridge {
         });
         self.routes.lock().insert(
             route_id,
-            RouteAudio { stop, thread: Some(thread), playback: None },
+            RouteAudio {
+                stop,
+                thread: Some(thread),
+                playback: None,
+            },
         );
     }
 
@@ -169,8 +173,10 @@ where
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _: &_| {
-                let pcm: Vec<i16> =
-                    downmix(&data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(), channels);
+                let pcm: Vec<i16> = downmix(
+                    &data.iter().map(|&f| f32_to_i16(f)).collect::<Vec<_>>(),
+                    channels,
+                );
                 on_frame(pcm, sample_rate);
             },
             err,
@@ -186,7 +192,10 @@ where
             &config,
             move |data: &[u16], _: &_| {
                 let pcm: Vec<i16> = downmix(
-                    &data.iter().map(|&u| (u as i32 - 32768) as i16).collect::<Vec<_>>(),
+                    &data
+                        .iter()
+                        .map(|&u| (u as i32 - 32768) as i16)
+                        .collect::<Vec<_>>(),
                     channels,
                 );
                 on_frame(pcm, sample_rate);

@@ -91,7 +91,9 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
 
     // Idempotency: skip if the slot is already the requested rev + non-empty.
     if let Some(want) = &rev {
-        let have = fs::read_to_string(&sentinel).map(|s| s.trim().to_string()).ok();
+        let have = fs::read_to_string(&sentinel)
+            .map(|s| s.trim().to_string())
+            .ok();
         let present = sidecar.metadata().map(|m| m.len() > 0).unwrap_or(false);
         if present && have.as_deref() == Some(want.as_str()) {
             return Ok(());
@@ -135,7 +137,9 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
         match download_release_asset(&rev, &staging) {
             Ok(bin) => bin,
             Err(dl_err) => {
-                println!("cargo:warning=release download failed ({dl_err}); building via cargo install");
+                println!(
+                    "cargo:warning=release download failed ({dl_err}); building via cargo install"
+                );
                 cargo_install(&rev, &staging)?
             }
         }
@@ -224,7 +228,10 @@ fn download_release_asset(tag: &str, staging: &Path) -> Result<PathBuf, String> 
             .output()
             .map_err(|e| format!("Expand-Archive spawn failed: {e}"))?;
         if !out.status.success() {
-            return Err(format!("Expand-Archive failed: {}", String::from_utf8_lossy(&out.stderr)));
+            return Err(format!(
+                "Expand-Archive failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
         }
     } else {
         let out = Command::new("tar")
@@ -235,7 +242,10 @@ fn download_release_asset(tag: &str, staging: &Path) -> Result<PathBuf, String> 
             .output()
             .map_err(|e| format!("tar spawn failed: {e}"))?;
         if !out.status.success() {
-            return Err(format!("tar failed: {}", String::from_utf8_lossy(&out.stderr)));
+            return Err(format!(
+                "tar failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
         }
     }
 
@@ -274,8 +284,11 @@ fn cargo_install(rev: &str, staging: &Path) -> Result<PathBuf, String> {
     } else {
         cmd.args(["--rev", rev]);
     }
-    cmd.args(["--bin", "myownmesh", "--locked", "--root"]).arg(&root);
-    let status = cmd.status().map_err(|e| format!("cargo install spawn failed: {e}"))?;
+    cmd.args(["--bin", "myownmesh", "--locked", "--root"])
+        .arg(&root);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("cargo install spawn failed: {e}"))?;
     if !status.success() {
         return Err(format!("cargo install --git failed for rev {rev}"));
     }

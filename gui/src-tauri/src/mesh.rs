@@ -84,6 +84,12 @@ pub struct Mesh {
     /// active with `h264` accepted, so `video_inbound` events route to
     /// the right console window.
     video_lane_in: Mutex<HashMap<String, String>>,
+    /// Whether the local daemon speaks the video track lane (`video_*`
+    /// ops, myownmesh ≥ 0.2.1). Probed at session start; while false the
+    /// app neither offers nor picks H.264 — screen shares ride MJPEG and
+    /// a single loud log says why. This is what keeps a stale daemon a
+    /// slow stream instead of a black one.
+    daemon_video: std::sync::atomic::AtomicBool,
 }
 
 /// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
@@ -147,6 +153,7 @@ impl Mesh {
             video_watchers: Mutex::new(HashMap::new()),
             video_lane_out: Mutex::new(HashMap::new()),
             video_lane_in: Mutex::new(HashMap::new()),
+            daemon_video: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -754,6 +761,15 @@ impl Mesh {
         media: String,
         video: Vec<String>,
     ) -> Result<String, String> {
+        // Only advertise transports the *whole* local stack can consume:
+        // the webview said it can decode, but inbound samples arrive via
+        // the daemon — an old one would negotiate a stream it can't
+        // deliver.
+        let video = if self.daemon_video.load(Ordering::SeqCst) {
+            video
+        } else {
+            Vec::new()
+        };
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let media = parse_media(&media);
         let route = Route {
@@ -1344,16 +1360,40 @@ impl Mesh {
                     .await;
             }
             // The video track lane's inbound side: assembled H.264
-            // access units arrive as `video_inbound` events. Subscribing
-            // on a daemon that predates the lane just fails — and every
-            // sender to us would also pick MJPEG, so nothing is lost.
-            let _ = self
+            // access units arrive as `video_inbound` events. The verdict
+            // doubles as the capability probe: a daemon that predates the
+            // lane refuses the op, and we pin `daemon_video` accordingly
+            // so every transport choice (ours and what we ask peers for)
+            // degrades to MJPEG instead of a stream nobody can carry.
+            match self
                 .client
                 .request(&Request::VideoSubscribe {
                     client_id,
                     network: network.clone(),
                 })
-                .await;
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    self.daemon_video.store(true, Ordering::SeqCst);
+                }
+                _ => {
+                    if !self.daemon_video.load(Ordering::SeqCst) {
+                        let version = self
+                            .client
+                            .request(&Request::Status)
+                            .await
+                            .ok()
+                            .and_then(|r| r.data)
+                            .and_then(|d| {
+                                d.get("version").and_then(|v| v.as_str()).map(String::from)
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        tracing::warn!(
+                            "daemon v{version} doesn't speak the video track lane                              (needs myownmesh ≥ 0.2.1) — screen shares fall back to MJPEG"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1415,7 +1455,14 @@ impl Mesh {
                         .map(|r| r.video.iter().any(|v| v == "h264"))
                         .unwrap_or(false);
                     let canon = pubkey_part(&to_node).to_string();
-                    let mode = if accepts_h264 {
+                    let daemon_video = self.daemon_video.load(Ordering::SeqCst);
+                    if accepts_h264 && !daemon_video {
+                        tracing::warn!(
+                            "route {} — viewer accepts H.264 but the local daemon                              predates the track lane (needs myownmesh ≥ 0.2.1);                              streaming MJPEG",
+                            route.id
+                        );
+                    }
+                    let mode = if accepts_h264 && daemon_video {
                         let mut lanes = self.video_lane_out.lock();
                         if lanes.contains_key(&canon) {
                             tracing::info!(
