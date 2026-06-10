@@ -221,6 +221,23 @@ export async function onOwned(cb: (r: OwnedRoster) => void): Promise<() => void>
   return listen<OwnedRoster>("allmystuff://owned", (e) => cb(e.payload));
 }
 
+/** Leave the fleet this device belongs to (also releases its owner).
+ *  Throws with the backend's reason when refused. No-op in web mode —
+ *  the store simulates it on the demo roster. */
+export async function fleetLeave(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_leave");
+}
+
+/** Kick a device out of the fleet. The backend enforces the rule — only a
+ *  member may kick, never itself. Throws with the reason when refused. */
+export async function fleetKick(device: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_kick", { device });
+}
+
 // ---- self-update -------------------------------------------------------
 //
 // These degrade to null in web mode (no backend), so the Updates settings

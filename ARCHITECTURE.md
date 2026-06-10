@@ -216,7 +216,17 @@ survives restarts, while claim mode is deliberately transient (re-asserted
 each start by the flag) so a box never sits silently adoptable across reboots.
 That same record now also holds the **owned fleet** — the shared key and the
 roster of co-owned devices — so a fleet survives restarts and re-converges via
-gossip on the next start.
+gossip on the next start. Roster convergence is by version with *replacement*
+on a strictly newer copy (that's how a **leave or kick** propagates — a union
+could only ever add), equal versions union, and a newer roster that no longer
+lists this device means it was kicked: the fleet drops locally and ownership
+is released. Membership is the permission: the Fleet pane offers **Leave**
+(and per-member **Kick**) only while this device is in the roster — you can't
+kick devices from a fleet you aren't in. A **claim-status check** (sanitize
+stale fleet residue → re-stamp the live profile → re-assert presence + roster)
+runs at session start, after every claim/release/fleet change, and *targeted*
+at each peer the moment its connection is approved — so two machines agree on
+who owns what within a handshake, not a polling interval.
 
 ## Next milestones
 

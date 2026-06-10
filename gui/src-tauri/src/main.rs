@@ -171,6 +171,20 @@ fn owned_roster(mesh: State<'_, Arc<Mesh>>) -> Value {
     mesh.owned_roster_value()
 }
 
+/// Leave the fleet this device belongs to (and release its owner) — the
+/// remaining members converge on the bumped roster without us.
+#[tauri::command]
+async fn fleet_leave(mesh: State<'_, Arc<Mesh>>) -> Result<(), String> {
+    mesh.inner().fleet_leave().await
+}
+
+/// Kick a device out of the fleet. Only a member may kick (the backend
+/// enforces it), and never itself — that's `fleet_leave`.
+#[tauri::command]
+async fn fleet_kick(mesh: State<'_, Arc<Mesh>>, device: String) -> Result<(), String> {
+    mesh.inner().fleet_kick(device).await
+}
+
 // ---- mesh control passthroughs ----------------------------------------
 
 #[tauri::command]
@@ -447,6 +461,8 @@ fn main() {
             open_console_window,
             session_snapshot,
             owned_roster,
+            fleet_leave,
+            fleet_kick,
             mesh_status,
             mesh_identity,
             mesh_networks,

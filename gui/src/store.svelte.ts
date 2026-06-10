@@ -20,6 +20,8 @@ import {
   connectRoute,
   consoleWindowTarget,
   disconnectRoute,
+  fleetKick,
+  fleetLeave,
   isTauri,
   meshIdentity,
   meshIdentitySetLabel,
@@ -1471,6 +1473,59 @@ class AppStore {
     } catch {
       /* no daemon yet — claim still simulates a fleet in demo mode */
     }
+  }
+
+  /** Leave the fleet this device is in. The backend broadcasts the bumped
+   *  roster (the others drop us), releases our owner, and pushes the now-
+   *  empty roster back via `allmystuff://owned`. */
+  async leaveFleet() {
+    if (this.backendConnected) {
+      try {
+        await fleetLeave();
+        this.toast("ok", "Left the fleet");
+      } catch (e) {
+        this.toast("warn", `Couldn't leave the fleet: ${String(e)}`);
+      }
+      return;
+    }
+    // Demo/web: drop ourselves from the simulated roster.
+    if (!this.ownedFleet) return;
+    const members = this.ownedFleet.members.filter((m) => !this.isMe(m.device));
+    this.ownedFleet = members.length
+      ? { ...this.ownedFleet, version: this.ownedFleet.version + 1, members }
+      : null;
+    this.toast("ok", "Left the fleet");
+  }
+
+  /** Kick a member out of the fleet — allowed only while we're a member
+   *  ourselves (the backend enforces it; the demo mirrors the rule). */
+  async kickFleetMember(device: string) {
+    if (this.isMe(device)) {
+      void this.leaveFleet();
+      return;
+    }
+    const label =
+      this.ownedFleet?.members.find((m) => sameMachine(m.device, device))?.label || "that device";
+    if (this.backendConnected) {
+      try {
+        await fleetKick(device);
+        this.toast("ok", `Kicked ${label} from the fleet`);
+      } catch (e) {
+        this.toast("warn", `Couldn't kick ${label}: ${String(e)}`);
+      }
+      return;
+    }
+    // Demo/web: mirror the membership rule, then drop them.
+    if (!this.ownedFleet || !this.isFleetMember(this.localId)) {
+      this.toast("warn", "You can't kick devices from a fleet you aren't in");
+      return;
+    }
+    this.ownedFleet = {
+      ...this.ownedFleet,
+      version: this.ownedFleet.version + 1,
+      members: this.ownedFleet.members.filter((m) => !sameMachine(m.device, device)),
+    };
+    this.toast("ok", `Kicked ${label} from the fleet`);
   }
 
   async loadUpdateStatus() {

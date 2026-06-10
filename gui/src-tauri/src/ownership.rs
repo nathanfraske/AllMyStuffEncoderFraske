@@ -240,21 +240,28 @@ impl Ownership {
     /// hold none **and the roster actually lists us** — gossip is broadcast,
     /// and a bystander on the network must not join itself to someone else's
     /// fleet just by hearing it. Once we have a key we only merge rosters
-    /// that share it (a foreign fleet's gossip is ignored). Members are
-    /// unioned by canonical pubkey and the version converges upward.
+    /// that share it (a foreign fleet's gossip is ignored).
     ///
-    /// `me` is this device's own id (any suffix form), for the membership
-    /// check on adoption.
+    /// Convergence is by version, with *replacement* semantics on a newer
+    /// roster: a strictly newer copy replaces our member set wholesale —
+    /// that's how a **leave or kick propagates** (a union can only ever
+    /// add). If the newer set no longer lists us, we've been kicked and
+    /// drop the fleet entirely. Equal versions union (two members adding
+    /// concurrently heal into one set, label refreshes ride along); older
+    /// gossip is ignored — our next broadcast corrects the sender.
     ///
-    /// Returns whether the merge was **structural** — we adopted the key or
-    /// gained a member — which is the signal to re-broadcast so the rest of
-    /// the fleet converges. A label-only refresh is still saved but does *not*
-    /// re-broadcast, so two peers that disagree on a member's label can't
+    /// `me` is this device's own id (any suffix form).
+    ///
+    /// Returns whether the merge was **structural** — key adopted, member
+    /// set changed, or we were kicked — the signal to re-broadcast (when a
+    /// fleet remains) and refresh the UI. A label-only refresh is saved but
+    /// does *not* re-broadcast, so two peers that disagree on a label can't
     /// ping-pong gossip forever.
     pub fn merge_fleet(&self, me: &str, incoming: &OwnedRoster) -> bool {
         if incoming.key.is_empty() {
             return false;
         }
+        let me_canon = pubkey_part(me).to_string();
         let mut i = self.inner.lock();
         // A foreign fleet's gossip (a key we don't share) is ignored once we
         // hold one. Done before any mutation so the borrow doesn't conflict.
@@ -263,7 +270,6 @@ impl Ownership {
                 return false;
             }
         } else {
-            let me_canon = pubkey_part(me);
             let listed = incoming
                 .members
                 .iter()
@@ -272,12 +278,53 @@ impl Ownership {
                 return false;
             }
         }
-        // Adopt the key if we hold none — that's a structural change.
-        let mut structural = i.fleet_key.is_none();
-        if structural {
+        let adopting = i.fleet_key.is_none();
+
+        if adopting || incoming.version > i.fleet_version {
+            // Newer truth. Not listed any more → we've been kicked (or our
+            // leave echoed back): drop the fleet outright.
+            let listed = incoming
+                .members
+                .iter()
+                .any(|m| pubkey_part(m.device.as_str()) == me_canon);
+            if !listed {
+                i.fleet_key = None;
+                i.fleet_version = 0;
+                i.fleet_members.clear();
+                persist(&self.path, &i);
+                return true;
+            }
+            let new_members: Vec<OwnedMember> = incoming
+                .members
+                .iter()
+                .map(|m| OwnedMember {
+                    device: NodeId::from(pubkey_part(m.device.as_str())),
+                    label: m.label.clone(),
+                })
+                .collect();
+            let same_set = i.fleet_members.len() == new_members.len()
+                && i.fleet_members.iter().all(|x| {
+                    new_members
+                        .iter()
+                        .any(|n| n.device.as_str() == x.device.as_str())
+                });
             i.fleet_key = Some(incoming.key.clone());
+            i.fleet_members = new_members;
+            i.fleet_version = incoming.version;
+            persist(&self.path, &i);
+            return adopting || !same_set;
         }
-        let mut dirty = structural;
+
+        if incoming.version < i.fleet_version {
+            // Stale gossip; our next broadcast brings the sender forward.
+            return false;
+        }
+
+        // Equal versions: union members (concurrent adds heal), refresh
+        // labels. A gained member makes ours strictly newer so our next
+        // gossip out-ranks the copy we just merged.
+        let mut structural = false;
+        let mut dirty = false;
         for m in &incoming.members {
             let canon = pubkey_part(m.device.as_str());
             match i
@@ -301,20 +348,80 @@ impl Ownership {
                 }
             }
         }
-        // Converge the version upward; a structural change makes ours strictly
-        // newer so our next gossip out-ranks the copy we just merged.
-        let mut target = incoming.version.max(i.fleet_version);
         if structural {
-            target = target.max(i.fleet_version + 1);
-        }
-        if target != i.fleet_version {
-            i.fleet_version = target;
-            dirty = true;
+            i.fleet_version += 1;
         }
         if dirty {
             persist(&self.path, &i);
         }
         structural
+    }
+
+    /// Leave the fleet: returns the bumped roster *without us* — broadcast
+    /// it so the remaining members converge on our absence — and clears our
+    /// own fleet state. `None` when we weren't in a fleet to begin with.
+    pub fn leave_fleet(&self, me: &str) -> Option<OwnedRoster> {
+        let me_canon = pubkey_part(me).to_string();
+        let mut i = self.inner.lock();
+        let key = i.fleet_key.clone()?;
+        if !i
+            .fleet_members
+            .iter()
+            .any(|m| pubkey_part(m.device.as_str()) == me_canon)
+        {
+            return None;
+        }
+        let members: Vec<OwnedMember> = i
+            .fleet_members
+            .iter()
+            .filter(|m| pubkey_part(m.device.as_str()) != me_canon)
+            .cloned()
+            .collect();
+        let roster = OwnedRoster {
+            key,
+            version: i.fleet_version + 1,
+            members,
+        };
+        i.fleet_key = None;
+        i.fleet_version = 0;
+        i.fleet_members.clear();
+        persist(&self.path, &i);
+        Some(roster)
+    }
+
+    /// Remove `device` from the fleet. Only a member may kick — you can't
+    /// kick others from a fleet you aren't in — and removing *yourself* is
+    /// [`Ownership::leave_fleet`]. Returns the bumped roster to broadcast.
+    pub fn kick_member(&self, me: &str, device: &str) -> Result<OwnedRoster, String> {
+        let mut i = self.inner.lock();
+        let Some(key) = i.fleet_key.clone() else {
+            return Err("this device isn't in a fleet".into());
+        };
+        let listed = |members: &[OwnedMember], id: &str| {
+            let canon = pubkey_part(id);
+            members
+                .iter()
+                .any(|m| pubkey_part(m.device.as_str()) == canon)
+        };
+        if !listed(&i.fleet_members, me) {
+            return Err("you can't kick devices from a fleet you aren't in".into());
+        }
+        if pubkey_part(me) == pubkey_part(device) {
+            return Err("use Leave to remove this device".into());
+        }
+        if !listed(&i.fleet_members, device) {
+            return Err("that device isn't in the fleet".into());
+        }
+        let canon = pubkey_part(device).to_string();
+        i.fleet_members
+            .retain(|m| pubkey_part(m.device.as_str()) != canon);
+        i.fleet_version += 1;
+        persist(&self.path, &i);
+        Ok(OwnedRoster {
+            key,
+            version: i.fleet_version,
+            members: i.fleet_members.clone(),
+        })
     }
 }
 
@@ -538,6 +645,87 @@ mod tests {
         };
         assert!(dev.merge_fleet("this-dev", &roster));
         assert_eq!(dev.fleet().unwrap().key, "fresh-key");
+    }
+
+    fn roster(key: &str, version: u64, devices: &[&str]) -> OwnedRoster {
+        OwnedRoster {
+            key: key.into(),
+            version,
+            members: devices
+                .iter()
+                .map(|d| OwnedMember {
+                    device: (*d).into(),
+                    label: (*d).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_newer_roster_replaces_membership_so_removals_propagate() {
+        // A member holds [owner, a, b] at v3; the owner kicks `b` and
+        // gossips v4 without it. Union semantics could never drop `b`.
+        let dev = memory();
+        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+        assert_eq!(dev.fleet().unwrap().members.len(), 3);
+
+        assert!(dev.merge_fleet("a", &roster("k", 4, &["owner", "a"])));
+        let f = dev.fleet().unwrap();
+        assert_eq!(f.version, 4);
+        assert_eq!(f.members.len(), 2);
+        assert!(!f.members.iter().any(|m| m.device.as_str() == "b"));
+
+        // Stale gossip (the kicked copy echoing back at v3) is ignored.
+        assert!(!dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+        assert_eq!(dev.fleet().unwrap().members.len(), 2);
+    }
+
+    #[test]
+    fn a_newer_roster_without_us_means_we_were_kicked() {
+        let dev = memory();
+        assert!(dev.merge_fleet("b", &roster("k", 3, &["owner", "a", "b"])));
+        // v4 arrives without us → drop the fleet entirely (and report it as
+        // structural so the UI refreshes).
+        assert!(dev.merge_fleet("b", &roster("k", 4, &["owner", "a"])));
+        assert!(dev.fleet().is_none());
+    }
+
+    #[test]
+    fn leaving_returns_the_minus_self_roster_and_clears_local_state() {
+        let dev = memory();
+        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a"])));
+
+        let out = dev.leave_fleet("a-AB12C").expect("was a member");
+        assert_eq!(out.version, 4, "bumped so the leave out-ranks v3 copies");
+        assert!(!out.members.iter().any(|m| m.device.as_str() == "a"));
+        assert!(dev.fleet().is_none());
+        // Not in a fleet any more → leaving again is a no-op.
+        assert!(dev.leave_fleet("a").is_none());
+    }
+
+    #[test]
+    fn kicking_needs_membership_and_skips_self() {
+        let dev = memory();
+        assert!(dev.merge_fleet("a", &roster("k", 3, &["owner", "a", "b"])));
+
+        let out = dev.kick_member("a", "b").expect("member may kick");
+        assert_eq!(out.version, 4);
+        assert!(!out.members.iter().any(|m| m.device.as_str() == "b"));
+
+        // Kicking yourself is Leave's job.
+        assert!(dev.kick_member("a", "a-AB12C").is_err());
+        // A device that's not in the roster can't be kicked.
+        assert!(dev.kick_member("a", "stranger").is_err());
+
+        // And a non-member can't kick at all — "you can't kick others from
+        // fleets you aren't in".
+        let outsider = memory();
+        outsider.inner.lock().fleet_key = Some("k".into());
+        outsider.inner.lock().fleet_members.push(OwnedMember {
+            device: "owner".into(),
+            label: "Owner".into(),
+        });
+        assert!(outsider.kick_member("not-a-member", "owner").is_err());
     }
 
     #[test]

@@ -222,15 +222,11 @@ impl Mesh {
             st.networks = networks.clone();
         }
 
-        // Now that we know who we are, drop any fleet roster left over from
-        // an earlier life (old ownership, re-minted identity) — holding its
-        // key would silently ignore the real fleet's gossip.
-        if self.ownership.sanitize_fleet(&me) {
-            tracing::info!("dropped a stale fleet roster (this device wasn't coherent with it)");
-            self.emit_owned();
-        }
-
         if networks.is_empty() {
+            // Still run the claim-status check (it sanitizes stale fleet
+            // residue and refreshes the UI); the broadcasts inside are
+            // no-ops with no networks to send on.
+            self.ownership_check(None).await;
             self.emit_status("no_network", None);
         } else {
             // Every AllMyStuff channel on *every* network. Presence + the
@@ -243,8 +239,9 @@ impl Mesh {
             // secondary network had no subscriber on the receiving side and
             // the daemon silently dropped it.
             self.subscribe_channels(client_id, &networks).await;
-            self.broadcast_presence().await;
-            self.broadcast_owned().await;
+            // App-load trigger of the claim-status check: sanitize stale
+            // fleet residue, then assert presence + roster to everyone.
+            self.ownership_check(None).await;
             self.emit_status("live", None);
         }
 
@@ -400,6 +397,22 @@ impl Mesh {
             }
             "event" => {
                 if let Some(event) = value.get("event") {
+                    // Connection establishment is a claim-status trigger: a
+                    // peer just went live for app traffic ("approved"), so
+                    // re-assert presence + fleet roster straight at it —
+                    // both sides converge now instead of waiting for the
+                    // next periodic broadcast.
+                    let approved = event.get("event_kind").and_then(|v| v.as_str()) == Some("peer")
+                        && event.get("kind").and_then(|v| v.as_str()) == Some("approved");
+                    if approved {
+                        if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
+                            let mesh = self.clone();
+                            let device = device.to_string();
+                            tauri::async_runtime::spawn(async move {
+                                mesh.ownership_check(Some(&device)).await;
+                            });
+                        }
+                    }
                     let _ = self.app.emit("allmystuff://event", event.clone());
                 }
             }
@@ -674,15 +687,16 @@ impl Mesh {
                         reason: "a claim must be self-asserted".into(),
                     }
                 } else if self.ownership.try_accept_claim(from.as_str()) {
-                    // The claim took — re-advertise with the new owner so the
-                    // claimer (and everyone) sees it's now spoken for. Any
-                    // stale fleet state was reset by the accept; the owner's
+                    // The claim took — a claim change runs the full status
+                    // check: re-advertise with the new owner so the claimer
+                    // (and everyone) sees it's now spoken for. Any stale
+                    // fleet state was reset by the accept; the owner's
                     // roster lands next on the owned channel.
                     tracing::info!(
                         "claim accepted: {} now owns this device",
                         short_id(from.as_str())
                     );
-                    self.refresh_profile_ownership().await;
+                    self.ownership_check(None).await;
                     OwnershipControl::Claimed { owner }
                 } else {
                     tracing::info!(
@@ -706,10 +720,14 @@ impl Mesh {
             OwnershipControl::Release => {
                 // The recorded owner is letting this device go (compare by
                 // pubkey — same display-vs-bare id reconciliation as Claim).
+                // A claim change → run the full status check (the release
+                // also cleared our fleet membership, so the empty roster
+                // reaches the UI).
                 let owner = self.ownership.owner();
                 if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
+                    tracing::info!("released by {} — unowned again", short_id(from.as_str()));
                     self.ownership.set_owner(None);
-                    self.refresh_profile_ownership().await;
+                    self.ownership_check(None).await;
                 }
             }
             OwnershipControl::Claimed { owner } => {
@@ -809,14 +827,21 @@ impl Mesh {
 
     /// Broadcast this device's fleet roster (if any) on the owned channel to
     /// every network, so co-owned devices converge on one key + membership.
-    /// Logs how many peers each network's broadcast actually reached, so
-    /// "the roster never arrived" is diagnosable from this side's log.
     async fn broadcast_owned(&self) {
         let Some(roster) = self.ownership.fleet() else {
             return;
         };
+        self.broadcast_roster(&roster).await;
+    }
+
+    /// Broadcast one explicit roster on every network — used for the final
+    /// minus-self roster of a leave (our own store is already cleared) and
+    /// the bumped roster of a kick. Logs how many peers each network's
+    /// broadcast actually reached, so "the roster never arrived" is
+    /// diagnosable from this side's log.
+    async fn broadcast_roster(&self, roster: &OwnedRoster) {
         let networks = { self.state.lock().networks.clone() };
-        let Ok(payload) = serde_json::to_value(&roster) else {
+        let Ok(payload) = serde_json::to_value(roster) else {
             return;
         };
         for network in networks {
@@ -854,11 +879,18 @@ impl Mesh {
         let Some(roster) = self.ownership.fleet() else {
             return;
         };
+        self.send_roster_to(peer, &roster).await;
+    }
+
+    /// Send one explicit roster straight to a peer — a kick hands the
+    /// kicked device the roster it's no longer in, so it drops out now
+    /// rather than at the next periodic broadcast.
+    async fn send_roster_to(&self, peer: &str, roster: &OwnedRoster) {
         let Some(network) = self.network_for_peer(peer) else {
             tracing::warn!("no network to hand the fleet roster to {}", short_id(peer));
             return;
         };
-        if let Ok(payload) = serde_json::to_value(&roster) {
+        if let Ok(payload) = serde_json::to_value(roster) {
             let resp = self
                 .client
                 .request(&Request::ChannelSendTo {
@@ -917,6 +949,118 @@ impl Mesh {
         self.ownership.set_claim_mode(on);
         self.refresh_profile_ownership().await;
         Ok(self.ownership.claimable())
+    }
+
+    /// The claim-status check — "is what we believe about ownership still
+    /// true, and does everyone else know it?" Drops incoherent fleet
+    /// residue, re-stamps the live profile from the ownership store, then
+    /// re-asserts presence + roster. Runs **targeted** at one peer right
+    /// after its connection establishes (so the two sides converge now, not
+    /// at the next 20-second tick) and **broadcast** on the local triggers:
+    /// session start, a claim/release, and fleet membership changes.
+    pub async fn ownership_check(self: &Arc<Self>, peer: Option<&str>) {
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        if self.ownership.sanitize_fleet(&me) {
+            tracing::info!("ownership check dropped a stale fleet roster");
+        }
+        {
+            let mut st = self.state.lock();
+            if let Some(p) = st.profile.as_mut() {
+                p.owner = self.ownership.owner().map(NodeId::from);
+                p.claimable = self.ownership.claimable();
+            }
+        }
+        match peer {
+            Some(peer) => {
+                tracing::debug!(
+                    "ownership check → {} (connection established)",
+                    short_id(peer)
+                );
+                self.send_presence_to(peer).await;
+                self.send_owned_to(peer).await;
+            }
+            None => {
+                self.broadcast_presence().await;
+                self.broadcast_owned().await;
+            }
+        }
+        self.emit_owned();
+        self.emit_snapshot();
+    }
+
+    /// Send this node's presence profile straight to one peer — the
+    /// targeted half of `broadcast_presence`, for a peer that just
+    /// connected and hasn't heard our periodic advert yet.
+    async fn send_presence_to(&self, peer: &str) {
+        let profile = { self.state.lock().profile.clone() };
+        let Some(profile) = profile else { return };
+        let Some(network) = self.network_for_peer(peer) else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_value(&profile) {
+            let _ = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_PRESENCE.to_string(),
+                    peer: pubkey_part(peer).to_string(),
+                    payload,
+                })
+                .await;
+        }
+    }
+
+    /// Front-end command: leave the fleet this device belongs to. The
+    /// remaining members get the bumped minus-us roster (replacement
+    /// semantics drop us everywhere), our own fleet state clears, and —
+    /// since membership follows ownership — any recorded owner is let go
+    /// and presence re-advertises unowned.
+    pub async fn fleet_leave(self: &Arc<Self>) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let roster = self
+            .ownership
+            .leave_fleet(&me)
+            .ok_or("this device isn't in a fleet")?;
+        tracing::info!(
+            "leaving the fleet — broadcasting roster v{} ({} members remain)",
+            roster.version,
+            roster.members.len()
+        );
+        self.broadcast_roster(&roster).await;
+        if self.ownership.owner().is_some() {
+            self.ownership.set_owner(None);
+        }
+        self.refresh_profile_ownership().await;
+        self.emit_owned();
+        Ok(())
+    }
+
+    /// Front-end command: kick `device` out of the fleet. The store
+    /// enforces the rule — only a member may kick, and never itself — and
+    /// the kicked device learns immediately: it gets a best-effort
+    /// ownership release (honoured when we're its recorded owner) plus the
+    /// new roster it's absent from, which its merge treats as "kicked".
+    pub async fn fleet_kick(self: &Arc<Self>, device: String) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let roster = self.ownership.kick_member(&me, &device)?;
+        tracing::info!(
+            "kicked {} from the fleet (roster now v{}, {} members)",
+            short_id(&device),
+            roster.version,
+            roster.members.len()
+        );
+        self.broadcast_roster(&roster).await;
+        let _ = self
+            .send_control(
+                &device,
+                &ControlMessage::Ownership(OwnershipControl::Release),
+            )
+            .await;
+        self.send_roster_to(&device, &roster).await;
+        self.emit_owned();
+        Ok(())
     }
 
     /// Re-read the joined networks, (re)subscribe every channel on each, then
