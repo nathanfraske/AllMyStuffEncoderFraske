@@ -36,6 +36,64 @@ impl Drop for DaemonChild {
     }
 }
 
+/// Tie the spawned daemon's lifetime to this process at the OS level —
+/// the `Drop` kill above only covers a *clean* exit, and an app that
+/// crashes or is force-killed (taskkill, a dev-loop Ctrl-C that doesn't
+/// reach us, an OOM kill) orphans the daemon. An orphan is worse than a
+/// leak: it keeps this machine's identity live on the mesh and silently
+/// swallows control traffic addressed to the dead app, and on Windows it
+/// also holds the sidecar exe locked so the *next build* fails copying it.
+/// Only ever called for a daemon **we spawned** — an externally-started
+/// daemon we merely reuse is never touched.
+///
+///  * **Windows**: assign the child to a job object with
+///    `KILL_ON_JOB_CLOSE`. The job handle is deliberately leaked — the
+///    kernel closes it when this process ends (any way at all), and that
+///    closure kills the daemon.
+///  * **Linux**: `PR_SET_PDEATHSIG(SIGKILL)` (set in `pre_exec` at spawn).
+///  * **macOS**: no kernel-level parent-death signal exists; the `Drop`
+///    kill remains the cover for clean exits.
+#[cfg(windows)]
+fn tie_daemon_lifetime(child: &Child) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            tracing::warn!("couldn't create a job object for the daemon — a crash may orphan it");
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+            && AssignProcessToJobObject(job, child.as_raw_handle() as _) != 0;
+        if ok {
+            tracing::info!("daemon tied to this process (job object, kill-on-close)");
+            // The job handle must live exactly as long as this process:
+            // leaking it hands the close — and so the kill — to the kernel.
+        } else {
+            tracing::warn!("couldn't tie the daemon to this process — a crash may orphan it");
+            CloseHandle(job);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn tie_daemon_lifetime(_child: &Child) {
+    // Linux is handled in `pre_exec` (PR_SET_PDEATHSIG); macOS has no
+    // kernel-level equivalent.
+}
+
 /// True when a daemon is already answering on the control socket.
 pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
@@ -202,9 +260,22 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         use std::os::windows::process::CommandExt as _;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    // Linux half of the lifetime tie (see `tie_daemon_lifetime`): SIGKILL
+    // the daemon the moment this process dies, however it dies.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
+    tie_daemon_lifetime(&child);
     let handle = DaemonChild::new(child);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);

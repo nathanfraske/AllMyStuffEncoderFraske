@@ -54,6 +54,7 @@ dependencies = [
  "getrandom 0.2.17",
  "interprocess",
  "jpeg-encoder",
+ "libc",
  "openh264",
  "parking_lot",
  "portable-pty",
@@ -68,6 +69,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows 0.61.3",
+ "windows-sys 0.60.2",
  "xcap",
 ]
 
