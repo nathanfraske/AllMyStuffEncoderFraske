@@ -222,6 +222,14 @@ impl Mesh {
             st.networks = networks.clone();
         }
 
+        // Now that we know who we are, drop any fleet roster left over from
+        // an earlier life (old ownership, re-minted identity) — holding its
+        // key would silently ignore the real fleet's gossip.
+        if self.ownership.sanitize_fleet(&me) {
+            tracing::info!("dropped a stale fleet roster (this device wasn't coherent with it)");
+            self.emit_owned();
+        }
+
         if networks.is_empty() {
             self.emit_status("no_network", None);
         } else {

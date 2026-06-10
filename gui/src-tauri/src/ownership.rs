@@ -167,6 +167,39 @@ impl Ownership {
     // fleet is the same set everywhere. For now this only groups devices
     // internally — a later edition links the key to other things.
 
+    /// Drop the held fleet when it's incoherent with who we are now: a
+    /// roster this device isn't even a member of, or (when owned) one that
+    /// doesn't include our owner. Either is residue from an earlier life —
+    /// an old ownership, a re-minted identity, a pre-fix bystander adoption
+    /// — and holding its key would leave this device deaf to the real
+    /// fleet's gossip. Run once at session start, when `me` is known.
+    /// Returns whether anything was dropped.
+    pub fn sanitize_fleet(&self, me: &str) -> bool {
+        let mut i = self.inner.lock();
+        if i.fleet_key.is_none() {
+            return false;
+        }
+        let listed = |id: &str| {
+            let canon = pubkey_part(id);
+            i.fleet_members
+                .iter()
+                .any(|m| pubkey_part(m.device.as_str()) == canon)
+        };
+        let coherent = listed(me)
+            && match &i.owner {
+                Some(o) => listed(o),
+                None => true,
+            };
+        if coherent {
+            return false;
+        }
+        i.fleet_key = None;
+        i.fleet_version = 0;
+        i.fleet_members.clear();
+        persist(&self.path, &i);
+        true
+    }
+
     /// The fleet roster this device currently holds, if it belongs to a fleet.
     pub fn fleet(&self) -> Option<OwnedRoster> {
         let i = self.inner.lock();
@@ -505,6 +538,51 @@ mod tests {
         };
         assert!(dev.merge_fleet("this-dev", &roster));
         assert_eq!(dev.fleet().unwrap().key, "fresh-key");
+    }
+
+    #[test]
+    fn sanitize_drops_incoherent_fleets_and_keeps_real_ones() {
+        let member = |d: &str| OwnedMember {
+            device: d.into(),
+            label: d.into(),
+        };
+
+        // Residue: a roster this device isn't in at all (pre-fix bystander
+        // adoption, or an identity re-mint on our side) → dropped.
+        let dev = memory();
+        dev.inner.lock().fleet_key = Some("k-old".into());
+        dev.inner.lock().fleet_members.push(member("somebody-else"));
+        assert!(dev.sanitize_fleet("me"));
+        assert!(dev.fleet().is_none());
+        // Idempotent once clean.
+        assert!(!dev.sanitize_fleet("me"));
+
+        // Residue: owned by a *new* owner, holding the roster of an old life
+        // (we're listed, the new owner isn't) → dropped. This is the exact
+        // "claimed, but the fleet never appears on the device" stale state.
+        let dev = memory();
+        dev.inner.lock().owner = Some("new-owner".into());
+        dev.inner.lock().fleet_key = Some("k-old".into());
+        dev.inner.lock().fleet_members.push(member("me"));
+        dev.inner.lock().fleet_members.push(member("old-owner"));
+        assert!(dev.sanitize_fleet("me"));
+        assert!(dev.fleet().is_none());
+
+        // Healthy claimed device: we and our owner are both listed → kept.
+        let dev = memory();
+        dev.inner.lock().owner = Some("owner".into());
+        dev.inner.lock().fleet_key = Some("k".into());
+        dev.inner.lock().fleet_members.push(member("owner"));
+        dev.inner.lock().fleet_members.push(member("me-AB12C"));
+        assert!(!dev.sanitize_fleet("me")); // display vs bare form collapses
+        assert!(dev.fleet().is_some());
+
+        // Healthy owner machine: unowned itself, member of its own fleet → kept.
+        let dev = memory();
+        dev.inner.lock().fleet_key = Some("k".into());
+        dev.inner.lock().fleet_members.push(member("me"));
+        assert!(!dev.sanitize_fleet("me-AB12C"));
+        assert!(dev.fleet().is_some());
     }
 
     #[test]
