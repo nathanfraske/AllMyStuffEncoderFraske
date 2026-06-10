@@ -6,6 +6,7 @@
 import type {
   Capability,
   CheckOutcome,
+  FileEvent,
   IdentityInfo,
   InputAction,
   InventorySummary,
@@ -382,6 +383,124 @@ export async function onTermExit(
   const { listen } = await import("@tauri-apps/api/event");
   return listen<{ route: string; code: number | null }>("allmystuff://term-exit", (e) =>
     cb(e.payload),
+  );
+}
+
+// ---- files (the mesh-native file manager) -------------------------------
+
+/** Open (or focus) the dedicated files window for `node` — one window per
+ *  machine, the finder-like view of its disk. Desktop only; the web
+ *  preview keeps an in-page popover. */
+export async function openFilesWindow(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_files_window", { node });
+}
+
+/** Which machine this window is a file manager for, when the window was
+ *  opened by `openFilesWindow` (`?files=<node id>`). Null in the main
+ *  window. */
+export function filesWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("files");
+}
+
+/** Send one file request down an active files route (this window is the
+ *  viewer; the far end owns the disk). Throws when the backend refuses. */
+export async function fileSend(routeId: string, event: FileEvent): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("file_send", { routeId, event });
+}
+
+/** Stream one files route's responses into this window by *pulling* —
+ *  the exact shape `watchTerminal` uses (the backend buffers from
+ *  route-activation, pokes `allmystuff://file-ready` when the queue goes
+ *  non-empty, and a safety interval catches lost pokes). Each buffered
+ *  chunk is one JSON `FileEvent` frame; the callback gets it parsed.
+ *  Returns an unwatch fn. */
+export async function watchFiles(
+  routeId: string,
+  cb: (event: FileEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { listen } = await import("@tauri-apps/api/event");
+  const token = (await invoke("file_watch", { routeId })) as number;
+  const decoder = new TextDecoder();
+  let stopped = false;
+  let inFlight = false;
+  const tick = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const batch = (await invoke("file_poll", { routeId })) as ArrayBuffer;
+      if (stopped || !(batch instanceof ArrayBuffer)) return;
+      const view = new DataView(batch);
+      let offset = 0;
+      while (offset + 4 <= batch.byteLength) {
+        const len = view.getUint32(offset, true);
+        offset += 4;
+        if (len === 0 || offset + len > batch.byteLength) break;
+        try {
+          cb(JSON.parse(decoder.decode(new Uint8Array(batch, offset, len))) as FileEvent);
+        } catch {
+          // One unparseable frame; the stream's surviving frames stand.
+        }
+        offset += len;
+      }
+    } catch {
+      // One missed poll; the next tick drains everything queued.
+    } finally {
+      inFlight = false;
+    }
+  };
+  const unlisten = await listen<string>("allmystuff://file-ready", (e) => {
+    if (e.payload === routeId) void tick();
+  });
+  const timer = setInterval(() => void tick(), 100);
+  void tick(); // drain whatever buffered before this window subscribed
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    unlisten();
+    void invoke("file_unwatch", { routeId, token }).catch(() => {});
+  };
+}
+
+/** Route the coming `read` request's chunks straight into this machine's
+ *  Downloads folder. Returns the destination path; completion lands as
+ *  `allmystuff://file-saved`. Call *before* `fileSend`-ing the read so
+ *  the first chunk can't race the registration. */
+export async function fileDownload(routeId: string, req: number, name: string): Promise<string> {
+  if (!isTauri()) throw new Error("Downloads need the desktop app");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("file_download", { routeId, req, name })) as string;
+}
+
+/** A registered download finished (`allmystuff://file-saved`): where it
+ *  landed, or the error that stopped it. */
+export async function onFileSaved(
+  cb: (e: { route: string; req: number; path: string | null; error: string | null }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; req: number; path: string | null; error: string | null }>(
+    "allmystuff://file-saved",
+    (e) => cb(e.payload),
+  );
+}
+
+/** Progress of a registered download (`allmystuff://file-progress`),
+ *  throttled backend-side. */
+export async function onFileProgress(
+  cb: (e: { route: string; req: number; written: number; total: number }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; req: number; written: number; total: number }>(
+    "allmystuff://file-progress",
+    (e) => cb(e.payload),
   );
 }
 

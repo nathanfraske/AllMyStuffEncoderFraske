@@ -119,6 +119,20 @@ export function demoCatalog(): Catalog {
         ],
       },
     },
+    {
+      // A second machine of Alex's that hasn't been marked shared yet: it
+      // declares an owner that isn't us, so its chip reads "someone
+      // else's" (not "unclaimed") — and marking it shared folds it into
+      // the same Alex connection, where the existing grants already apply.
+      id: "alex-tablet",
+      label: "Alex's tablet",
+      kind: "machine",
+      online: true,
+      app: true,
+      owner: "alex",
+      relationship: { kind: "unclaimed" },
+      summary: { os: "Android 15", cpu: "Snapdragon 8", ram_bytes: 8 * 2 ** 30, device_count: 6 },
+    },
   ];
 
   const capabilities: Capability[] = [
@@ -154,6 +168,9 @@ export function demoCatalog(): Catalog {
     cap("alex", "cam", "Alex's webcam", "video", "source", "camera", true),
     cap("alex", "monitor", "Alex's monitor", "display", "sink", "display", true),
     cap("alex", "mic", "Alex's headset mic", "audio", "source", "microphone", true),
+    // Alex's tablet (owned by Alex, not yet marked shared).
+    ...machineCaps("alex-tablet"),
+    cap("alex-tablet", "screen-tab", "Tablet screen", "display", "sink", "display", true),
   ];
 
   // A few pre-wired routes (all between things I own, so all valid).

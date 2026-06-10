@@ -7,10 +7,12 @@
   import NetworksSection from "./settings/NetworksSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
+  import SharingSection from "./settings/SharingSection.svelte";
 
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
     { id: "networks", label: "Networks", icon: "🌐" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
+    { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "updates", label: "Updates", icon: "⬆️" },
   ];
 
@@ -49,6 +51,8 @@
         <NetworksSection />
       {:else if app.settingsTab === "fleet"}
         <FleetSection />
+      {:else if app.settingsTab === "sharing"}
+        <SharingSection />
       {:else if app.settingsTab === "updates"}
         <UpdatesSection />
       {/if}

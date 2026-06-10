@@ -82,8 +82,13 @@ rules, no I/O.
 - **Relationship** — `Mine` (a device you own or manage) or `Shared { person,
   grants }`. A `Grant` authorizes a shared endpoint to play one role
   (`Provide` = they source, `Consume` = they sink) for one media, optionally
-  pinned to one capability. `required_grants` returns the minimal grant that
-  would unblock a denied route — the "one-tap allow."
+  pinned to one capability. A grant is **to the person, not one machine**:
+  authorization unions the grants across every node shared with the same
+  person (people bring fleets — what you allow works to whichever of their
+  devices is handy), and the GUI keys the person by the *owner* the devices
+  advertise, so a machine of theirs that appears later folds into the same
+  share. `required_grants` returns the minimal grant that would unblock a
+  denied route — the "one-tap allow."
 - **Ownership** (in `allmystuff-protocol` + the GUI) — distinct from a
   relationship: a device *advertises* who owns it and whether it's
   *claimable*. You can't flat-take a box — a claim only lands if the device
@@ -166,7 +171,12 @@ Tauri 2 + Svelte 5, a client of the daemon.
   Terminal** opens a tabbed xterm.js window per machine
   (`open_terminal_window` → `?terminal=<node>` → `TerminalHost.svelte`),
   where every tab is its own mesh route to a PTY the far side spawns — see
-  the terminal paragraph under the data flow below. The stage is a
+  the terminal paragraph under the data flow below. The **remote files**
+  window (`Files.svelte`) completes the console family: the drawer's **Open
+  Files** (between Remote Control and Open Terminal) opens a finder-like
+  window per machine (`open_files_window` → `?files=<node>` →
+  `FilesHost.svelte`) — browse, preview, upload, download, rename, delete
+  over one mesh route — see the files paragraph below. The stage is a
   live video sink — it registers a per-route IPC channel (`video_watch`) and
   the backend queues each inbound packet as raw bytes (a fixed header + the
   payload; no JSON or base64 on the per-frame path) for exactly the window
@@ -209,7 +219,11 @@ Tauri 2 + Svelte 5, a client of the daemon.
 1. User taps a capability's connect dot → `store.startCapConnect(capId)`.
 2. User taps a target node → `store.connectCapToNode` finds the matching
    endpoint and calls `catalog.proposeRoute`.
-3. If both ends are **mine**, a `Route` appears immediately.
+3. If both ends are **mine**, a `Route` appears immediately — and the
+   console that manages that kind of session pops for the far machine
+   (`popConsoleFor`: remote control for screen/audio/control media, the
+   file manager for storage), so sending something *to* a node hands you
+   its session.
 4. If a **shared** endpoint isn't covered, `requiredGrants` raises the share
    sheet ("Let Alex receive your screen?"). Approving adds exactly that grant
    and completes the connection.
@@ -299,6 +313,28 @@ shell's exit (a dedicated wait-thread — ConPTY readers don't EOF until the
 master drops) reports `Exit { code }` to the viewer's overlay and tears the
 route down; a host whose viewer vanished silently kills the session after
 60 s of failed sends.
+
+**A files session** rides the very same plumbing, request/response instead
+of byte-stream. A node that can serve its disk advertises `"files"` in
+presence `features`; opening the window offers a generic route from the
+host's virtual `…:files` endpoint to a per-window viewer endpoint (display
+stand-ins again — never catalog capabilities). Handing over a disk is as
+privileged as a shell, so the identical owner/fleet gate screens the offer
+before auto-accept, and every inbound request re-checks. Requests (`list`,
+`read`, `write`, `mkdir`, `rename`, `delete`) and responses (`entries`,
+`chunk`, `ok`, `err`) travel as `"file"`-tagged frames on `CHANNEL_MEDIA`,
+each carrying a viewer-minted `req` id so a listing, a preview and an
+upload never tangle. Host-side (`files.rs`) each op runs on its own
+blocking thread feeding a bounded channel — a big `read` is throttled by
+the mesh send, with a per-route cancel flag so teardown ends it mid-stream;
+upload pieces are the one inline op (they must apply in arrival order, and
+each is one small append). Viewer-side the window pulls frames with the
+same poke-then-pull watcher (`file_watch`/`file_poll` +
+`allmystuff://file-ready`) — except **downloads, which never cross the
+webview**: `file_download` registers a backend sink first, the chunks
+stream straight into the local Downloads folder (unique-ified names,
+partials deleted on failure or teardown), and the window just renders
+`allmystuff://file-progress` / `file-saved` events.
 
 ## Persistent state
 

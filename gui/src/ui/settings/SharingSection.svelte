@@ -1,0 +1,303 @@
+<script lang="ts">
+  // Sharing pane — every person/fleet you're connected with: which of
+  // their machines you can see, and exactly what you've allowed them
+  // (grants apply to the *person*, so anything you grant works to any of
+  // their devices). Each grant can be taken back one at a time, or the
+  // whole connection rescinded.
+  import { app } from "../../store.svelte";
+  import { displayName, mediaColor, MEDIA } from "../../types";
+
+  const partners = $derived(app.sharePartners);
+
+  /** Which partners are expanded to show their grants/devices. */
+  let open = $state<string[]>([]);
+  function toggle(personId: string) {
+    open = open.includes(personId) ? open.filter((id) => id !== personId) : [...open, personId];
+  }
+
+  // Two-step confirm for "stop sharing" (the Fleet pattern).
+  let armed = $state<string | null>(null);
+  function stopSharing(personId: string) {
+    if (armed === personId) {
+      armed = null;
+      app.stopSharingWith(personId);
+    } else {
+      armed = personId;
+      setTimeout(() => {
+        if (armed === personId) armed = null;
+      }, 3500);
+    }
+  }
+</script>
+
+<div class="section">
+  <h3>Sharing</h3>
+  <p class="lead">
+    The people and fleets you're <b>connected</b> with. A grant is to the
+    person, not one machine — what you allow works to any of their devices —
+    and you can take back any grant, or the whole connection, any time.
+  </p>
+
+  {#if partners.length === 0}
+    <div class="empty">
+      <div class="glyph">🤝</div>
+      <p>
+        You aren't sharing with anyone yet. Open a device on the graph that
+        belongs to someone else and mark it
+        <i>“I'm sharing with its owner”</i> to start.
+      </p>
+    </div>
+  {:else}
+    <ul class="partners">
+      {#each partners as p (p.person.id)}
+        {@const expanded = open.includes(p.person.id)}
+        <li class="partner">
+          <button class="p-head" onclick={() => toggle(p.person.id)} aria-expanded={expanded}>
+            <span class="chev" class:open={expanded} aria-hidden="true">▸</span>
+            <span class="p-avatar" aria-hidden="true">🧑</span>
+            <span class="p-name">{p.person.name}</span>
+            <span class="p-sums">
+              <span class="sum">{p.nodes.length} device{p.nodes.length === 1 ? "" : "s"}</span>
+              <span class="sum" class:none={p.grants.length === 0}>
+                {p.grants.length === 0 ? "nothing allowed" : `${p.grants.length} grant${p.grants.length === 1 ? "" : "s"}`}
+              </span>
+            </span>
+          </button>
+
+          {#if expanded}
+            <div class="p-body">
+              <div class="p-block">
+                <h4>Their devices</h4>
+                <ul class="nodes">
+                  {#each p.nodes as n (n.id)}
+                    <li>
+                      <span class="n-dot" class:on={n.online}></span>
+                      <span class="n-name">{displayName(n)}</span>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+
+              <div class="p-block">
+                <h4>What they can do</h4>
+                {#if p.grants.length === 0}
+                  <p class="muted">
+                    Nothing — they can't reach any of your stuff until you allow
+                    something from one of their devices on the graph.
+                  </p>
+                {:else}
+                  <ul class="grants">
+                    {#each p.grants as { node: holder, grant: g } (g.id)}
+                      <li>
+                        <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
+                        <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
+                        <button
+                          class="revoke"
+                          title="Take this back"
+                          onclick={() => app.revokeGrant(holder.id, g.id)}
+                        >✕</button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+
+              <div class="p-actions">
+                <button
+                  class="btn small stop"
+                  class:armed={armed === p.person.id}
+                  title="Rescind the whole connection — every grant goes, and any connection riding one stops"
+                  onclick={() => stopSharing(p.person.id)}
+                >
+                  {armed === p.person.id ? "Stop sharing — sure?" : `Stop sharing with ${p.person.name}`}
+                </button>
+              </div>
+            </div>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  {/if}
+</div>
+
+<style>
+  .section h3 {
+    margin: 0 0 0.4rem;
+    font-size: 1.15rem;
+  }
+  .lead {
+    color: var(--ink-soft);
+    font-size: 0.84rem;
+    line-height: 1.5;
+    margin: 0 0 1.1rem;
+  }
+  .empty {
+    text-align: center;
+    color: var(--ink-faint);
+    padding: 2.5rem 1rem;
+  }
+  .empty .glyph {
+    font-size: 2.4rem;
+    margin-bottom: 0.4rem;
+  }
+  .empty p {
+    max-width: 24rem;
+    margin: 0 auto;
+    font-size: 0.86rem;
+    line-height: 1.5;
+  }
+  .partners {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .partner {
+    border: 1px solid var(--line);
+    border-radius: var(--r-md, 10px);
+    overflow: hidden;
+  }
+  .p-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    width: 100%;
+    border: none;
+    background: var(--surface);
+    padding: 0.65rem 0.8rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .p-head:hover {
+    background: var(--surface-2);
+  }
+  .chev {
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    transition: transform 0.12s ease;
+  }
+  .chev.open {
+    transform: rotate(90deg);
+  }
+  .p-avatar {
+    font-size: 1.15rem;
+  }
+  .p-name {
+    font-weight: 700;
+    font-size: 0.92rem;
+  }
+  .p-sums {
+    margin-left: auto;
+    display: flex;
+    gap: 0.35rem;
+  }
+  .sum {
+    font-size: 0.68rem;
+    font-weight: 650;
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    border-radius: var(--r-pill);
+    padding: 0.12rem 0.5rem;
+  }
+  .sum.none {
+    color: var(--ink-faint);
+  }
+  .p-body {
+    border-top: 1px solid var(--line);
+    padding: 0.7rem 0.9rem 0.8rem;
+    background: var(--surface);
+  }
+  .p-block + .p-block {
+    margin-top: 0.7rem;
+  }
+  h4 {
+    margin: 0 0 0.4rem;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    font-weight: 700;
+  }
+  .nodes,
+  .grants {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .nodes li,
+  .grants li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--surface-2);
+    border-radius: var(--r-sm);
+    padding: 0.38rem 0.55rem;
+    font-size: 0.82rem;
+  }
+  .n-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--line-strong);
+    flex-shrink: 0;
+  }
+  .n-dot.on {
+    background: var(--ok);
+  }
+  .n-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .g-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .g-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .revoke {
+    border: none;
+    background: transparent;
+    color: var(--ink-faint);
+    width: 1.4rem;
+    height: 1.4rem;
+    border-radius: 50%;
+    font-size: 0.72rem;
+  }
+  .revoke:hover {
+    background: #fdeaee;
+    color: var(--danger);
+  }
+  .muted {
+    color: var(--ink-faint);
+    font-size: 0.8rem;
+    margin: 0.2rem 0 0.3rem;
+    line-height: 1.45;
+  }
+  .p-actions {
+    margin-top: 0.8rem;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .stop {
+    color: var(--danger);
+    border-color: #f4c7d0;
+  }
+  .stop:hover,
+  .stop.armed {
+    background: #fdeaee;
+  }
+</style>
