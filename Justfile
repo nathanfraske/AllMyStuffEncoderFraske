@@ -93,3 +93,20 @@ gui-check:
 
 # Everything CI runs: Rust fmt + clippy + test, then the GUI typecheck/build.
 check: fmt-check lint test gui-check
+
+# Cut a release: bump every crate's version (+ the GUI sub-workspace),
+# commit, push, trigger the workflow. Mirrors MyOwnMesh / MyOwnLLM — the
+# user runs `just release 0.2.0` and the release.yml workflow verifies the
+# manifests, builds the per-platform bundles + portable binaries, and
+# publishes the GitHub release. Bash script — the release flow runs from a
+# Linux/macOS box.
+[unix]
+[doc("Cut a release: bump versions, commit, push, trigger the workflow.")]
+release VERSION:
+    @./scripts/bump-version.sh {{VERSION}}
+    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; then \
+        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; \
+        git commit -m "chore(release): {{VERSION}}"; \
+    fi
+    @git push
+    @gh workflow run release.yml -f tag=v{{VERSION}}
