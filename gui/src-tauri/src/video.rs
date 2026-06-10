@@ -117,8 +117,8 @@ impl StreamStats {
         }
         let secs = elapsed.as_secs_f64();
         let frames = self.sent.max(1) as f64;
-        tracing::info!(
-            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms · encode {:.1}ms ·              {} key · {} static-skip · {} dropped",
+        let line = format!(
+            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms · encode {:.1}ms · {} key · {} static-skip · {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
@@ -131,6 +131,11 @@ impl StreamStats {
             self.static_skipped,
             self.dropped,
         );
+        if stats_to_info() {
+            tracing::info!("{line}");
+        } else {
+            tracing::debug!("{line}");
+        }
         self.since = Instant::now();
         self.sent = 0;
         self.keyframes = 0;
@@ -175,6 +180,17 @@ const H264_IDR_EVERY: Duration = Duration::from_secs(4);
 /// How often each stream logs its pipeline counters — the dial-in line:
 /// effective fps, where the per-frame milliseconds go, and the bitrate.
 const STATS_EVERY: Duration = Duration::from_secs(5);
+
+/// Whether the periodic pipeline stats print at info. Off by default —
+/// steady-state runs stay quiet; set `ALLMYSTUFF_VIDEO_STATS=1` while
+/// dialing performance in (without it the same lines land at debug, so
+/// the `ALLMYSTUFF_GUI_LOG` filter can also reach them).
+pub(crate) fn stats_to_info() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("ALLMYSTUFF_VIDEO_STATS").is_ok_and(|v| !v.is_empty() && v != "0")
+    });
+    *ON
+}
 
 struct RouteVideo {
     stop: Arc<AtomicBool>,

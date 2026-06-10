@@ -208,9 +208,11 @@ Tauri 2 + Svelte 5, a client of the daemon.
    at a 1920 edge, real RTP, no JSON/base64/64 KiB ceiling — and otherwise
    fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA` (1280 edge,
    chunked JPEGs), so any version skew degrades to working video. Either
-   way the console window renders packets delivered over its per-route IPC
-   channel (raw bytes; WebCodecs decodes H.264, `createImageBitmap` the
-   JPEGs). An input
+   way the console window renders packets it *pulls* per display tick
+   (raw bytes; WebCodecs decodes H.264, `createImageBitmap` the JPEGs).
+   Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
+   pipeline counters (fps, scale/encode ms, bitrate, skip/drop causes)
+   every few seconds on both ends — quiet by default. An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
    buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
    but only after the gate: the route must be live *and* the sender must be

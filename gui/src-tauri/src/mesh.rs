@@ -1455,7 +1455,7 @@ impl Mesh {
                             })
                             .unwrap_or_else(|| "unknown".into());
                         tracing::warn!(
-                            "daemon v{version} doesn't speak the video track lane                              (needs myownmesh ≥ 0.2.1) — screen shares fall back to MJPEG"
+                            "daemon v{version} doesn't speak the video track lane (needs myownmesh ≥ 0.2.1) — screen shares fall back to MJPEG"
                         );
                     }
                 }
@@ -1524,7 +1524,7 @@ impl Mesh {
                     let daemon_video = self.daemon_video.load(Ordering::SeqCst);
                     if accepts_h264 && !daemon_video {
                         tracing::warn!(
-                            "route {} — viewer accepts H.264 but the local daemon                              predates the track lane (needs myownmesh ≥ 0.2.1);                              streaming MJPEG",
+                            "route {} — viewer accepts H.264 but the local daemon predates the track lane (needs myownmesh ≥ 0.2.1); streaming MJPEG",
                             route.id
                         );
                     }

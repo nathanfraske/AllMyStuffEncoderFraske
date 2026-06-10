@@ -63,7 +63,7 @@ pub async fn log_daemon_version(client: &ControlClient) {
     match running {
         Some(v) if v == pinned => tracing::info!("myownmesh daemon v{v} (matches the {pin} pin)"),
         Some(v) => tracing::warn!(
-            "myownmesh daemon is v{v} but this app pins {pin} — features the newer              daemon carries (e.g. the video track lane) will be unavailable. If this              is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its              stale binary so build.rs fetches the pinned release) and restart the app."
+            "myownmesh daemon is v{v} but this app pins {pin} — features the newer daemon carries (e.g. the video track lane) will be unavailable. If this is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its stale binary so build.rs fetches the pinned release) and restart the app."
         ),
         None => tracing::warn!("couldn't read the daemon version to compare against the {pin} pin"),
     }

@@ -131,7 +131,7 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
             // setup rather than break its loop, but say so.
             (None, _) => {
                 println!(
-                    "cargo:warning=[sidecar] couldn't read the sibling daemon's                      version; using it anyway"
+                    "cargo:warning=[sidecar] couldn't read the sibling daemon's version; using it anyway"
                 );
                 true
             }
@@ -148,7 +148,7 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
             return Ok(());
         }
         println!(
-            "cargo:warning=[sidecar] sibling MyOwnMesh build is v{} but the pin wants {} —              ignoring it (rebuild the sibling to use it); fetching the pinned release",
+            "cargo:warning=[sidecar] sibling MyOwnMesh build is v{} but the pin wants {} — ignoring it (rebuild the sibling to use it); fetching the pinned release",
             sibling_ver
                 .map(|(a, b, c)| format!("{a}.{b}.{c}"))
                 .unwrap_or_default(),
