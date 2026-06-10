@@ -11,14 +11,15 @@
   // consoles can be open at once — while the web preview keeps the in-page
   // popover.
   //
-  // The stage is a live MJPEG sink: the backend emits one
-  // `allmystuff://video` event per inbound frame and this component shows
-  // the latest one for its route. When "Keyboard & mouse" is on, the stage
-  // captures pointer/key events, normalizes coordinates onto the streamed
-  // frame, and forwards them down the control route.
+  // The stage is a live MJPEG sink: the backend pushes each inbound frame
+  // for the watched route over a per-route IPC channel (raw JPEG bytes —
+  // see `watchVideo`), and this component shows the latest one. When
+  // "Keyboard & mouse" is on, the stage captures pointer/key events,
+  // normalizes coordinates onto the streamed frame, and forwards them down
+  // the control route.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { closeThisWindow, onThisWindowClose, onVideoFrame } from "../tauri";
+  import { closeThisWindow, onThisWindowClose, watchVideo } from "../tauri";
   import {
     displayName,
     originIcon,
@@ -44,18 +45,13 @@
   let fps = $state(0);
   let frameCount = 0;
   let imgEl = $state<HTMLImageElement | null>(null);
+  // The object URL behind frameSrc — plain (untracked) so revoking the
+  // previous frame's URL inside the frame callback can't retrigger the
+  // effect below.
+  let frameUrl: string | null = null;
 
   onMount(() => {
-    let unlistenFrames: (() => void) | undefined;
     let unlistenClose: (() => void) | undefined;
-    void onVideoFrame((f) => {
-      // Every window hears every frame; show only our route's.
-      if (!app.consoleVideoLive || f.route !== app.consoleVideoLive) return;
-      frameSrc = `data:image/jpeg;base64,${f.jpeg}`;
-      frameW = f.width;
-      frameH = f.height;
-      frameCount += 1;
-    }).then((u) => (unlistenFrames = u));
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       frameCount = 0;
@@ -66,18 +62,46 @@
       void onThisWindowClose(() => void endSession()).then((u) => (unlistenClose = u));
     }
     return () => {
-      unlistenFrames?.();
       unlistenClose?.();
       clearInterval(fpsTimer);
     };
   });
 
-  // A switch of input (or session end) shows the placeholder again rather
-  // than a stale frame from the previous route.
+  // Follow the live video route: watch its frame channel while it's up,
+  // and show the placeholder rather than a stale frame whenever it
+  // changes (input switch, session end). Each frame arrives as raw JPEG
+  // bytes → a Blob URL the <img> decodes natively; the previous frame's
+  // URL is revoked so memory stays flat.
   $effect(() => {
-    void app.consoleVideoLive;
+    const route = app.consoleVideoLive;
     frameSrc = null;
     fps = 0;
+    frameCount = 0;
+    if (!route) return;
+    let cancelled = false;
+    let unwatch: (() => void) | undefined;
+    void watchVideo(route, (f) => {
+      if (cancelled) return;
+      const url = URL.createObjectURL(new Blob([f.jpeg], { type: "image/jpeg" }));
+      if (frameUrl) URL.revokeObjectURL(frameUrl);
+      frameUrl = url;
+      frameSrc = url;
+      frameW = f.width;
+      frameH = f.height;
+      frameCount += 1;
+    }).then((u) => {
+      // The route may have changed while the subscribe was in flight.
+      if (cancelled) u();
+      else unwatch = u;
+    });
+    return () => {
+      cancelled = true;
+      unwatch?.();
+      if (frameUrl) {
+        URL.revokeObjectURL(frameUrl);
+        frameUrl = null;
+      }
+    };
   });
 
   let closing = false;

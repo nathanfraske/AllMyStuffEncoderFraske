@@ -285,17 +285,16 @@ export type InputAction =
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; down: boolean };
 
-/** One MJPEG frame of a display route, as the `allmystuff://video` event
- *  delivers it (the Rust `VideoFrame`; `jpeg` is base64). */
+/** One MJPEG frame of a display route, decoded off its IPC channel (a
+ *  fixed binary header + the raw JPEG bytes — see `watchVideo`). */
 export interface VideoFrameMsg {
-  t: "video";
-  route: string;
   seq: number;
   width: number;
   height: number;
-  source_width: number;
-  source_height: number;
-  jpeg: string;
+  sourceWidth: number;
+  sourceHeight: number;
+  /** The JPEG itself — ready for a `Blob`, never base64. */
+  jpeg: Uint8Array<ArrayBuffer>;
 }
 
 // ---- bundles (pre-set kits with category slots) -----------------------

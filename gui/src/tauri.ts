@@ -175,12 +175,34 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
   return tryInvoke("send_input", { routeId, action });
 }
 
-/** Subscribe to inbound display frames (every console window receives all
- *  of them and filters by its own route). No-op unlisten in web mode. */
-export async function onVideoFrame(cb: (f: VideoFrameMsg) => void): Promise<() => void> {
+/** Stream one route's inbound display frames into this window. Frames ride
+ *  a Tauri IPC channel as raw bytes — a 24-byte little-endian header
+ *  (width, height, source width/height as u32, seq as u64) followed by the
+ *  JPEG — so the per-frame path has no JSON and no base64, and only the
+ *  watching window pays for delivery. Returns an unwatch fn (a no-op in
+ *  web mode, where no frames can arrive anyway). */
+export async function watchVideo(
+  routeId: string,
+  cb: (f: VideoFrameMsg) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
-  const { listen } = await import("@tauri-apps/api/event");
-  return listen<VideoFrameMsg>("allmystuff://video", (e) => cb(e.payload));
+  const { invoke, Channel } = await import("@tauri-apps/api/core");
+  const channel = new Channel<ArrayBuffer>((buf) => {
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 24) return;
+    const head = new DataView(buf);
+    cb({
+      width: head.getUint32(0, true),
+      height: head.getUint32(4, true),
+      sourceWidth: head.getUint32(8, true),
+      sourceHeight: head.getUint32(12, true),
+      seq: Number(head.getBigUint64(16, true)),
+      jpeg: new Uint8Array(buf, 24),
+    });
+  });
+  await invoke("video_watch", { routeId, onFrame: channel });
+  return () => {
+    void invoke("video_unwatch", { routeId }).catch(() => {});
+  };
 }
 
 /** Tear this window down (a console window's "End session"). Uses

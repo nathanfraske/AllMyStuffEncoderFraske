@@ -156,10 +156,12 @@ Tauri 2 + Svelte 5, a client of the daemon.
   console opens as its **own OS window** (`open_console_window` →
   `?console=<node>` → `ConsoleHost.svelte`), so several machines can be on
   screen at once; the web preview keeps the in-page popover. The stage is a
-  live MJPEG sink (`allmystuff://video` events, one per inbound frame), and
-  while control is on it captures pointer/key events, normalizes coordinates
-  onto the streamed frame, and forwards them down the control route via
-  `send_input`. The top bar's gear
+  live MJPEG sink — it registers a per-route IPC channel (`video_watch`) and
+  the backend pushes each inbound frame as raw bytes (a fixed header + the
+  JPEG; no JSON or base64 on the per-frame path) to exactly the window
+  that's watching — and while control is on it captures pointer/key events,
+  normalizes coordinates onto the streamed frame, and forwards them down
+  the control route via `send_input`. The top bar's gear
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
   Fleet (the owned roster's shared key + members), and Updates (the
   `allmystuff-updater` controls). The **Networks** tab is itself split into
@@ -196,9 +198,12 @@ Tauri 2 + Svelte 5, a client of the daemon.
    over `CHANNEL_CONTROL`. The peer accepts; both sides go `Active`. For an
    audio route, the source captures its mic (`cpal`), streams `AudioFrame`s
    over `CHANNEL_MEDIA`, and the sink plays them. A display route streams the
-   source's primary screen the same way — `xcap` grab → downscale → JPEG →
-   `VideoFrame` (~12 fps, a bounded queue drops stale frames under
-   backpressure) — and the console window renders the latest frame. An input
+   source's primary screen the same way — a persistent capture session
+   (`xcap`'s recorder: PipeWire ScreenCast / DXGI / AVFoundation, with a
+   paced per-frame grab as the X11 path and universal fallback) → downscale
+   → JPEG, up to ~24 fps with unchanged frames skipped and a bounded queue
+   dropping stale ones under backpressure — and the console window renders
+   the latest frame, delivered over its per-route IPC channel. An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
    buttons / wheel / DOM-`key` values, injected at the sink with `enigo` —
    but only after the gate: the route must be live *and* the sender must be

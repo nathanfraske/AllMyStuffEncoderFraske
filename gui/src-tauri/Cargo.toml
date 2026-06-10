@@ -61,7 +61,9 @@ allmystuff-updater = { path = "../../crates/allmystuff-updater" }
 # MyOwnLLM uses for its audio.
 cpal = "0.15"
 xcap = "0.9"
-jpeg-encoder = "0.7"
+# `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
+# speed on typical x86-64 desktops, plain safe Rust elsewhere.
+jpeg-encoder = { version = "0.7", features = ["simd"] }
 enigo = "0.6"
 
 [profile.release]
@@ -70,3 +72,21 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# The media plane touches every screen pixel every frame; the crates doing
+# that work get speed while the rest of the app keeps optimizing for size —
+# and dev builds get the same treatment so `just dev` streams at a usable
+# rate instead of running the pixel loops unoptimized.
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+[profile.release.package.xcap]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3

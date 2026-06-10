@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
@@ -32,13 +33,16 @@ use allmystuff_session::{
 };
 
 use crate::audio::AudioBridge;
-use crate::control_client::ControlClient;
+use crate::control_client::{ControlClient, MediaPipe};
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
 use crate::video::VideoBridge;
 
 pub struct Mesh {
     client: Arc<ControlClient>,
+    /// The media plane's dedicated daemon connection: frame chunks ride it
+    /// back-to-back instead of paying a connect + round trip each.
+    media_pipe: MediaPipe,
     app: AppHandle,
     audio: Arc<AudioBridge>,
     /// Screen capture for display routes this machine sources (the far end
@@ -66,6 +70,10 @@ pub struct Mesh {
     /// Reassembles chunked inbound video frames (a frame bigger than the
     /// data channel's ~64 KiB message ceiling arrives in pieces).
     video_in: Mutex<VideoAssembler>,
+    /// Per-route IPC channels to the console windows watching inbound
+    /// video. A frame goes as raw bytes straight to the one webview that
+    /// wants it — not as base64 JSON eval'd into every open window.
+    video_watchers: Mutex<HashMap<String, Channel<InvokeResponseBody>>>,
 }
 
 /// Raw JPEG bytes per video chunk: after base64 (+33%) and the JSON
@@ -106,6 +114,7 @@ impl Mesh {
         let (video_out, mut video_rx) = mpsc::channel::<(String, VideoFrame)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
+            media_pipe: MediaPipe::new(client.clone()),
             app,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
@@ -125,6 +134,7 @@ impl Mesh {
             input_seq: AtomicU64::new(0),
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
+            video_watchers: Mutex::new(HashMap::new()),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -174,28 +184,24 @@ impl Mesh {
     }
 
     /// Send one media-channel payload to `peer` (canonicalised to the bare
-    /// pubkey the daemon's peer set is keyed by), reporting the daemon's
-    /// verdict — a transport refusal (peer gone, message too large) must
-    /// reach a log, not vanish.
+    /// pubkey the daemon's peer set is keyed by) down the pipelined media
+    /// pipe. `Ok` means the daemon has the bytes; its verdict (peer gone,
+    /// message too large) still reaches a log — the pipe's response drain
+    /// warns on refusals instead of this path stalling a round trip per
+    /// chunk to hear them.
     async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        let resp = self
-            .client
-            .request(&Request::ChannelSendTo {
+        self.media_pipe
+            .send(&Request::ChannelSendTo {
                 network,
                 channel: CHANNEL_MEDIA.to_string(),
                 peer: pubkey_part(peer).to_string(),
                 payload,
             })
             .await
-            .map_err(|e| e.to_string())?;
-        if resp.ok {
-            Ok(())
-        } else {
-            Err(resp.error.unwrap_or_else(|| "channel send failed".into()))
-        }
+            .map_err(|e| e.to_string())
     }
 
     fn network(&self) -> Option<String> {
@@ -538,10 +544,10 @@ impl Mesh {
                     MediaPayload::Video(frame) => {
                         // Surface frames only for a route this session knows
                         // is live, sinks here, and belongs to the sender —
-                        // the console window(s) render them. Chunked frames
-                        // reassemble first; the first complete frame of a
-                        // stream is logged so "connected but no pixels" is
-                        // attributable from this side too.
+                        // the watching console window renders them. Chunked
+                        // frames reassemble first; the first complete frame
+                        // of a stream is logged so "connected but no pixels"
+                        // is attributable from this side too.
                         if !self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
                             tracing::debug!(
                                 "dropped video frame for {} from {} (route not live here)",
@@ -560,7 +566,25 @@ impl Mesh {
                                     full.height
                                 );
                             }
-                            let _ = self.app.emit("allmystuff://video", &full);
+                            // Raw bytes over the route's IPC channel, to the
+                            // one window that registered for it. A failed
+                            // send means that webview is gone — forget the
+                            // watcher; a reopened console re-registers.
+                            let watcher = { self.video_watchers.lock().get(&full.route).cloned() };
+                            match watcher {
+                                Some(ch) => {
+                                    if ch
+                                        .send(InvokeResponseBody::Raw(video_ipc_bytes(&full)))
+                                        .is_err()
+                                    {
+                                        self.video_watchers.lock().remove(&full.route);
+                                    }
+                                }
+                                None => tracing::debug!(
+                                    "no console window watching {} — frame dropped",
+                                    full.route
+                                ),
+                            }
                         }
                     }
                     MediaPayload::Input(ev) => {
@@ -685,6 +709,17 @@ impl Mesh {
         Ok(route.id)
     }
 
+    /// Register a console window's IPC channel for one route's inbound
+    /// frames (replacing any previous watcher — the route shows in one
+    /// window).
+    pub fn video_watch(&self, route_id: String, channel: Channel<InvokeResponseBody>) {
+        self.video_watchers.lock().insert(route_id, channel);
+    }
+
+    pub fn video_unwatch(&self, route_id: &str) {
+        self.video_watchers.lock().remove(route_id);
+    }
+
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
         let msg = {
             let mut st = self.state.lock();
@@ -692,6 +727,7 @@ impl Mesh {
         };
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
+        self.video_watchers.lock().remove(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
             let _ = self.send_control(&peer, msg).await;
@@ -737,6 +773,7 @@ impl Mesh {
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
                     self.video.stop(&id);
+                    self.video_watchers.lock().remove(&id);
                 }
                 Effect::Share { from, message } => {
                     let _ = self.app.emit(
@@ -1352,8 +1389,7 @@ impl Mesh {
         let seq = self.input_seq.fetch_add(1, Ordering::Relaxed);
         let ev = InputEvent::new(route_id, seq, action);
         let payload = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
-        self.send_media_value(&peer, payload).await;
-        Ok(())
+        self.send_media_value(&peer, payload).await
     }
 
     /// Send a control message to one peer, reporting whether the daemon
@@ -1402,6 +1438,22 @@ impl Mesh {
 /// A well-formed but empty owned roster (no fleet yet).
 fn empty_owned() -> Value {
     json!({ "key": "", "version": 0, "members": [] })
+}
+
+/// The shape a frame takes on a console window's IPC channel: a fixed
+/// 24-byte little-endian header — width, height, source_width,
+/// source_height (`u32`), seq (`u64`) — followed by the raw JPEG. No JSON,
+/// no base64; the webview hands the bytes straight to its native decoder.
+/// The route isn't carried — the channel itself is per-route.
+fn video_ipc_bytes(f: &VideoFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + f.jpeg.len());
+    out.extend_from_slice(&f.width.to_le_bytes());
+    out.extend_from_slice(&f.height.to_le_bytes());
+    out.extend_from_slice(&f.source_width.to_le_bytes());
+    out.extend_from_slice(&f.source_height.to_le_bytes());
+    out.extend_from_slice(&f.seq.to_le_bytes());
+    out.extend_from_slice(&f.jpeg);
+    out
 }
 
 /// Node id from a capability id (`"<node>:<device>"`). The node segment is

@@ -175,7 +175,7 @@ This repository is a **working foundation**, honest about what's real:
 | Remote console | **Working** — a pikvm-style session in its **own OS window per machine** (open as many as you like): live screen, a video-inputs tab bar, audio passthrough and keyboard/mouse control, wiring the real routes underneath |
 | Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
 | Live audio streaming | **Working** — a mic → speakers route (and the console's audio passthrough) opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
-| Live screen + input streaming | **Working** — a display route streams the remote's primary screen as MJPEG (`xcap` capture, ~12 fps, drop-on-backpressure); a control route forwards normalized keyboard/mouse events injected with `enigo`, gated to the device's owner/fleet. Primary screen + default devices in v1 |
+| Live screen + input streaming | **Working** — a display route streams the remote's primary screen as MJPEG (a persistent `xcap` capture session — PipeWire / DXGI / AVFoundation, paced per-frame grabs on X11 — up to ~24 fps, unchanged frames skipped, drop-on-backpressure); a control route forwards normalized keyboard/mouse events injected with `enigo`, gated to the device's owner/fleet. Primary screen + default devices in v1 |
 | Camera video / storage streaming | **Next** — the routes wire and show the session; these media still need their capture backends over the proven pipe |
 
 ## Lineage

@@ -119,6 +119,26 @@ async fn send_input(
     mesh.inner().send_input(route_id, action).await
 }
 
+/// Stream one route's inbound display frames into the calling window over
+/// an IPC channel, as raw bytes (a fixed header + the JPEG) — no JSON or
+/// base64 on the per-frame path, and only the window that's actually
+/// watching pays for delivery. Replaces any previous watcher of the route.
+#[tauri::command]
+fn video_watch(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) {
+    mesh.video_watch(route_id, on_frame);
+}
+
+/// Stop streaming a route's frames to the front-end (console closed or
+/// switched input). Idempotent.
+#[tauri::command]
+fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String) {
+    mesh.video_unwatch(&route_id);
+}
+
 /// Open (or focus) a dedicated console window for `node` — its own OS
 /// window, so several remote consoles can be on screen at once. The window
 /// loads the same app with `?console=<node>`, which renders just the
@@ -458,6 +478,8 @@ fn main() {
             claim_node,
             set_claimable,
             send_input,
+            video_watch,
+            video_unwatch,
             open_console_window,
             session_snapshot,
             owned_roster,
