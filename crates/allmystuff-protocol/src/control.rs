@@ -147,6 +147,28 @@ pub enum Request {
         network: String,
     },
 
+    // ---- audio track lane (real RTP media, not the data channel) -----
+    /// Write one encoded Opus frame (base64) onto the audio track lane
+    /// to `peer` (bare pubkey, like `ChannelSendTo`). The lane is
+    /// provisioned on every connection at negotiation; `duration_us` is
+    /// the frame length (20 000 for the canonical Opus frame).
+    AudioSend {
+        network: String,
+        peer: String,
+        duration_us: u64,
+        data: String,
+    },
+    /// Route audio frames from this network's peers to this client's
+    /// event socket as `audio_inbound` frames.
+    AudioSubscribe {
+        client_id: ClientId,
+        network: String,
+    },
+    AudioUnsubscribe {
+        client_id: ClientId,
+        network: String,
+    },
+
     // ---- generic RPC (request/response with one peer) ----------------
     RpcRegister {
         client_id: ClientId,

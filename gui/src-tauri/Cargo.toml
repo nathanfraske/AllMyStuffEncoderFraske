@@ -74,6 +74,10 @@ enigo = "0.6"
 # from source — needs only a C/C++ toolchain). MJPEG stays as the
 # fallback wherever this can't run or the peer can't decode.
 openh264 = "0.9"
+# Opus encode/decode for the mesh's audio track lane (libopus, built
+# from source like openh264). The PCM-over-channel stream stays as the
+# fallback for older daemons/peers, exactly like MJPEG for video.
+opus = "0.3"
 # Access units ride the daemon control socket as base64 (same encoding
 # the session crate's media frames use).
 base64 = "0.22"

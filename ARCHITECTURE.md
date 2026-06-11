@@ -235,8 +235,14 @@ Tauri 2 + Svelte 5, a client of the daemon.
    machine's own playback for the synthetic `system-audio` (WASAPI
    loopback on Windows, the pulse server's monitor of the default sink on
    Linux, the default input as macOS's honest stand-in), the default
-   input for a scanned mic — streams `AudioFrame`s over `CHANNEL_MEDIA`,
-   and the sink plays them. Both ends log which device they opened, a
+   input for a scanned mic — and streams it
+   to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
+   mono, 20 ms frames) when the offer asked for it and both daemons
+   speak the lane (myownmesh > 0.2.3), as PCM `AudioFrame`s over
+   `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
+   sound exactly like video's MJPEG floor. The sink's playout ring aims
+   ~80 ms behind the live edge and trims itself, so audio keeps step
+   with the video stream. Both ends log which device they opened, a
    *mic* capture whose first seconds are pure zeros names the OS
    microphone permission (macOS/Windows deny with silence, not an error —
    a silent system capture is just a quiet desktop), and a playback
