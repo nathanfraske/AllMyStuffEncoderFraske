@@ -18,8 +18,10 @@
 )]
 
 mod audio;
+mod byte_queues;
 mod control_client;
 mod daemon_spawn;
+mod files;
 mod input_inject;
 mod mesh;
 mod ownership;
@@ -236,6 +238,81 @@ async fn open_terminal_window(app: tauri::AppHandle, node: String) -> Result<(),
     )
     .title("AllMyStuff terminal")
     .inner_size(940.0, 600.0)
+    .min_inner_size(480.0, 320.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---- files (the mesh-native file manager) -------------------------------
+
+/// Forward one file request from a files window down its active files
+/// route (the viewer side of a mesh-native file session).
+#[tauri::command]
+async fn file_send(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    event: serde_json::Value,
+) -> Result<(), String> {
+    let event: allmystuff_session::FileEvent =
+        serde_json::from_value(event).map_err(|e| e.to_string())?;
+    mesh.inner().file_send(route_id, event).await
+}
+
+/// Register the calling files window's interest in a route's responses.
+/// Frames buffer backend-side from route-activation; the window drains
+/// them with `file_poll` on each `allmystuff://file-ready` poke. Same
+/// pull-not-push shape as the terminal and video planes.
+#[tauri::command]
+fn file_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
+    mesh.file_watch(&route_id)
+}
+
+/// Drain the queued responses for a files route as one raw batch:
+/// `[u32 le len][frame json]…`, empty when nothing arrived.
+#[tauri::command]
+fn file_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
+    tauri::ipc::Response::new(mesh.file_poll(&route_id))
+}
+
+/// Release a files window's claim on a route's responses (window closed).
+/// Token-scoped and idempotent, like `term_unwatch`.
+#[tauri::command]
+fn file_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
+    mesh.file_unwatch(&route_id, token);
+}
+
+/// Route the coming `Read` request's chunks straight into this machine's
+/// Downloads folder (instead of the window). Returns the destination path;
+/// completion lands as `allmystuff://file-saved`. Call *before* sending
+/// the request so the first chunk can't race the registration.
+#[tauri::command]
+fn file_download(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    req: u64,
+    name: String,
+) -> Result<String, String> {
+    mesh.file_download(route_id, req, &name)
+}
+
+/// Open (or focus) the dedicated files window for `node` — one OS window
+/// per machine, the finder-like view of its disk. The window loads the
+/// same app with `?files=<node>`.
+#[tauri::command]
+async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
+    let label = format!("files-{}", window_slug(&node));
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(format!("index.html?files={node}").into()),
+    )
+    .title("AllMyStuff files")
+    .inner_size(940.0, 640.0)
     .min_inner_size(480.0, 320.0)
     .build()
     .map_err(|e| e.to_string())?;
@@ -595,6 +672,12 @@ fn main() {
             term_poll,
             term_unwatch,
             open_terminal_window,
+            file_send,
+            file_watch,
+            file_poll,
+            file_unwatch,
+            file_download,
+            open_files_window,
             session_snapshot,
             owned_roster,
             fleet_leave,

@@ -85,15 +85,26 @@
     { label: "Share files both ways", media: "storage", role: "both" },
   ];
 
-  const grants = $derived(
-    node && node.relationship.kind === "shared" ? node.relationship.grants : [],
+  // The share partner this node belongs to, with the *person-wide* grant
+  // list (a grant covers every node they bring, wherever it's recorded)
+  // and their other machines for the "applies to all of these" hint.
+  const partner = $derived(
+    node && node.relationship.kind === "shared"
+      ? app.sharePartners.find(
+          (p) => node.relationship.kind === "shared" && p.person.id === node.relationship.person.id,
+        ) ?? null
+      : null,
   );
+  const grants = $derived(partner?.grants ?? []);
 
   const availablePresets = $derived(
-    PRESETS.filter((p) => !grants.some((g) => g.media === p.media && g.role === p.role)),
+    PRESETS.filter((p) => !grants.some(({ grant: g }) => g.media === p.media && g.role === p.role)),
   );
 
   let addingGrant = $state(false);
+  /** Whether the capability list is expanded — starts folded so the drawer
+   *  leads with the relationship, not a wall of devices. */
+  let stuffOpen = $state(false);
 
   function addGrant(p: Preset) {
     if (!node) return;
@@ -110,11 +121,7 @@
 
   function makeShared() {
     if (!node) return;
-    app.setRelationship(node.id, {
-      kind: "shared",
-      person: { id: `person:${node.id}`, name: node.label },
-      grants: [],
-    });
+    app.markShared(node.id);
   }
   /** Adopt this device — gated: only takes if it's in claim mode (Task 4). */
   function claimThis() {
@@ -136,7 +143,14 @@
           {:else if shared && node.relationship.kind === "shared"}
             <span class="pill guest">shared with {node.relationship.person.name}</span>
           {:else if node.relationship.kind === "unclaimed"}
-            <span class="pill soft">{node.claimable ? "claimable" : "unclaimed"}</span>
+            <!-- A device that declares an owner that isn't us was claimed
+                 by someone else — that's a fact, not a blank slate, so the
+                 chip says so instead of "unclaimed". -->
+            {#if ownedByOther}
+              <span class="pill theirs">someone else's</span>
+            {:else}
+              <span class="pill soft">{node.claimable ? "claimable" : "unclaimed"}</span>
+            {/if}
           {:else}
             <span class="pill mine">yours</span>
           {/if}
@@ -171,6 +185,15 @@
     {#if isRemoteApp && (node.relationship.kind === "mine" || node.relationship.kind === "shared")}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
+      </button>
+    {/if}
+
+    <!-- Open the file manager: a finder-like view of that machine's disk,
+         over the mesh. Owner/fleet only — the same rule as the terminal,
+         enforced again on the far side. -->
+    {#if isRemoteApp && app.filesAllowed(node)}
+      <button class="btn console-open" onclick={() => app.openFiles(node.id)}>
+        🗂 Open Files
       </button>
     {/if}
 
@@ -225,13 +248,18 @@
         </div>
         {#if grants.length === 0}
           <p class="muted">Nothing yet — they can't reach any of your stuff until you allow it.</p>
+        {:else if (partner?.nodes.length ?? 0) > 1}
+          <p class="muted">
+            You're sharing with {node.relationship.person.name}, not one machine — these work to
+            any of their {partner?.nodes.length} devices.
+          </p>
         {/if}
         <ul class="grants">
-          {#each grants as g (g.id)}
+          {#each grants as { node: holder, grant: g } (g.id)}
             <li>
               <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
               <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
-              <button class="revoke" title="Remove" onclick={() => app.revokeGrant(node.id, g.id)}>✕</button>
+              <button class="revoke" title="Remove" onclick={() => app.revokeGrant(holder.id, g.id)}>✕</button>
             </li>
           {/each}
         </ul>
@@ -295,9 +323,19 @@
       </section>
     {/if}
 
-    <!-- Capabilities -->
+    <!-- Capabilities — folded by default: the count is the summary, the
+         full device list is a click away instead of a wall. -->
     <section class="block">
-      <h4>Its stuff</h4>
+      <button
+        class="stuff-toggle"
+        onclick={() => (stuffOpen = !stuffOpen)}
+        aria-expanded={stuffOpen}
+      >
+        <span class="stuff-chevron" class:open={stuffOpen} aria-hidden="true">▸</span>
+        <h4 class="stuff-title">Its stuff</h4>
+        <span class="stuff-count">{caps.length} thing{caps.length === 1 ? "" : "s"}</span>
+      </button>
+      {#if stuffOpen}
       {#each grouped as [media, list]}
         <div class="cap-group">
           <div class="cap-group-head" style="color: {mediaColor(media)}">
@@ -333,6 +371,7 @@
           {/each}
         </div>
       {/each}
+      {/if}
     </section>
     {/if}
   </aside>
@@ -402,6 +441,10 @@
   .pill.soft {
     background: var(--surface-2);
     color: var(--ink-soft);
+  }
+  .pill.theirs {
+    background: #f3e8fd;
+    color: #7a3bc0;
   }
   .pill.fleet {
     background: var(--accent-soft);
@@ -581,6 +624,42 @@
   }
   .linklike:hover {
     text-decoration: underline;
+  }
+  /* The "Its stuff" fold: a full-width header row that reads as a count
+     until expanded. */
+  .stuff-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    width: 100%;
+    border: none;
+    background: none;
+    padding: 0.1rem 0 0.45rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .stuff-toggle:hover .stuff-title {
+    color: var(--accent-ink);
+  }
+  .stuff-title {
+    margin: 0;
+  }
+  .stuff-chevron {
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    transition: transform 0.12s ease;
+  }
+  .stuff-chevron.open {
+    transform: rotate(90deg);
+  }
+  .stuff-count {
+    margin-left: auto;
+    font-size: 0.68rem;
+    font-weight: 650;
+    color: var(--ink-soft);
+    background: var(--surface-2);
+    border-radius: var(--r-pill);
+    padding: 0.1rem 0.5rem;
   }
   .cap-group {
     margin-bottom: 0.7rem;

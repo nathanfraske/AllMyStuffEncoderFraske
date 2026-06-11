@@ -174,6 +174,125 @@ impl TermFrame {
     }
 }
 
+/// One message of a files route's stream — the request/response
+/// conversation between a file-manager viewer and the host whose disk it
+/// browses. Requests flow viewer → host, responses host → viewer; every
+/// event carries the viewer-minted request id (`req`) it belongs to, so
+/// concurrent operations (a directory listing while a download streams)
+/// never tangle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFrame {
+    /// Tag for demuxing off the shared media channel. Always `"file"`.
+    pub t: MediaTagFile,
+    pub route: String,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: FileEvent,
+}
+
+/// One directory entry of a [`FileEvent::Entries`] listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    /// `true` for a directory (what the listing navigates into).
+    pub dir: bool,
+    /// Byte size (0 for directories).
+    #[serde(default)]
+    pub size: u64,
+    /// Last-modified time, seconds since the Unix epoch. `None` when the
+    /// filesystem couldn't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    /// `true` when the entry is a symlink (shown, never followed for ops).
+    #[serde(default)]
+    pub symlink: bool,
+}
+
+/// What happened on the files route. The viewer asks (`List`, `Read`,
+/// `Write`, `Mkdir`, `Rename`, `Delete`); the host answers (`Entries`,
+/// `Chunk`, `Ok`, `Err`). Paths are the host's own (absolute once the
+/// first `Entries` reply tells the viewer where home is; `""` or `"~"`
+/// mean the host's home directory).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileEvent {
+    /// List a directory. Answered with `Entries` or `Err`.
+    List { req: u64, path: String },
+    /// Read a whole file. Answered with a stream of `Chunk`s (the last
+    /// has `eof: true`) or `Err`.
+    Read { req: u64, path: String },
+    /// Write one piece of a file. The first piece (`append: false`)
+    /// creates/truncates; later pieces append. The host answers `Ok` once
+    /// the piece with `eof: true` is on disk (or `Err` at any point).
+    Write {
+        req: u64,
+        path: String,
+        #[serde(with = "bytes_b64")]
+        data: Vec<u8>,
+        #[serde(default)]
+        append: bool,
+        #[serde(default)]
+        eof: bool,
+    },
+    /// Create a directory (parents included). Answered with `Ok`/`Err`.
+    Mkdir { req: u64, path: String },
+    /// Rename/move within the host. Answered with `Ok`/`Err`.
+    Rename { req: u64, from: String, to: String },
+    /// Delete a file or directory (recursively). Answered with `Ok`/`Err`.
+    Delete { req: u64, path: String },
+    /// A directory listing. `home` is the host's home directory — sent on
+    /// every listing so the viewer can mark it and start there.
+    Entries {
+        req: u64,
+        path: String,
+        home: String,
+        entries: Vec<FileEntry>,
+    },
+    /// One piece of a `Read`. `total` is the file's full size (so the
+    /// viewer can show progress); `eof` marks the last piece.
+    Chunk {
+        req: u64,
+        #[serde(with = "bytes_b64")]
+        data: Vec<u8>,
+        total: u64,
+        #[serde(default)]
+        eof: bool,
+    },
+    /// The request succeeded (`Write`/`Mkdir`/`Rename`/`Delete`).
+    Ok { req: u64 },
+    /// The request failed, with the host's reason.
+    Err { req: u64, reason: String },
+}
+
+impl FileEvent {
+    /// The request id this event belongs to, whatever its kind.
+    pub fn req(&self) -> u64 {
+        match self {
+            FileEvent::List { req, .. }
+            | FileEvent::Read { req, .. }
+            | FileEvent::Write { req, .. }
+            | FileEvent::Mkdir { req, .. }
+            | FileEvent::Rename { req, .. }
+            | FileEvent::Delete { req, .. }
+            | FileEvent::Entries { req, .. }
+            | FileEvent::Chunk { req, .. }
+            | FileEvent::Ok { req }
+            | FileEvent::Err { req, .. } => *req,
+        }
+    }
+}
+
+impl FileFrame {
+    pub fn new(route: impl Into<String>, seq: u64, event: FileEvent) -> Self {
+        FileFrame {
+            t: MediaTagFile::File,
+            route: route.into(),
+            seq,
+            event,
+        }
+    }
+}
+
 /// Everything that can arrive on the media channel, demuxed by the `t`
 /// tag (no tag = audio, the original frame shape).
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +301,7 @@ pub enum MediaPayload {
     Video(VideoFrame),
     Input(InputEvent),
     Terminal(TermFrame),
+    File(FileFrame),
 }
 
 impl MediaPayload {
@@ -198,6 +318,7 @@ impl MediaPayload {
             Some("term") => serde_json::from_value(payload)
                 .ok()
                 .map(MediaPayload::Terminal),
+            Some("file") => serde_json::from_value(payload).ok().map(MediaPayload::File),
             Some(_) => None,
             None => serde_json::from_value(payload)
                 .ok()
@@ -212,6 +333,7 @@ impl MediaPayload {
             MediaPayload::Video(f) => &f.route,
             MediaPayload::Input(f) => &f.route,
             MediaPayload::Terminal(f) => &f.route,
+            MediaPayload::File(f) => &f.route,
         }
     }
 }
@@ -238,6 +360,13 @@ pub enum MediaTagTerm {
     #[default]
     #[serde(rename = "term")]
     Term,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaTagFile {
+    #[default]
+    #[serde(rename = "file")]
+    File,
 }
 
 impl VideoFrame {
@@ -528,6 +657,109 @@ mod tests {
         let f = TermFrame::new("r", 0, TermEvent::Data { bytes: vec![0xFF] });
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("\"bytes\":\"/w==\""));
+    }
+
+    #[test]
+    fn file_frame_round_trips_each_event() {
+        let events = [
+            FileEvent::List {
+                req: 1,
+                path: "~".into(),
+            },
+            FileEvent::Read {
+                req: 2,
+                path: "/home/u/notes.txt".into(),
+            },
+            FileEvent::Write {
+                req: 3,
+                path: "/home/u/up.bin".into(),
+                data: vec![0xFF, 0x00],
+                append: true,
+                eof: true,
+            },
+            FileEvent::Mkdir {
+                req: 4,
+                path: "/home/u/new".into(),
+            },
+            FileEvent::Rename {
+                req: 5,
+                from: "/home/u/a".into(),
+                to: "/home/u/b".into(),
+            },
+            FileEvent::Delete {
+                req: 6,
+                path: "/home/u/old".into(),
+            },
+            FileEvent::Entries {
+                req: 7,
+                path: "/home/u".into(),
+                home: "/home/u".into(),
+                entries: vec![FileEntry {
+                    name: "docs".into(),
+                    dir: true,
+                    size: 0,
+                    modified: Some(1_700_000_000),
+                    symlink: false,
+                }],
+            },
+            FileEvent::Chunk {
+                req: 8,
+                data: vec![1, 2, 3],
+                total: 3,
+                eof: true,
+            },
+            FileEvent::Ok { req: 9 },
+            FileEvent::Err {
+                req: 10,
+                reason: "no such file".into(),
+            },
+        ];
+        for event in events {
+            let req = event.req();
+            let f = FileFrame::new("route:a:files→b:files-view:1", 9, event);
+            let v = serde_json::to_value(&f).unwrap();
+            assert_eq!(v["t"], "file");
+            assert_eq!(v["req"], req);
+            let back: FileFrame = serde_json::from_value(v).unwrap();
+            assert_eq!(f, back);
+        }
+        // Bytes travel as base64, never raw.
+        let f = FileFrame::new(
+            "r",
+            0,
+            FileEvent::Chunk {
+                req: 1,
+                data: vec![0xFF],
+                total: 1,
+                eof: false,
+            },
+        );
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"data\":\"/w==\""));
+    }
+
+    #[test]
+    fn file_frames_demux_and_unknown_kinds_drop_alone() {
+        let ok = serde_json::to_value(FileFrame::new(
+            "r",
+            5,
+            FileEvent::List {
+                req: 1,
+                path: "~".into(),
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            MediaPayload::decode(ok),
+            Some(MediaPayload::File(f)) if f.seq == 5
+        ));
+        // A newer peer's new event kind fails *that frame only*.
+        assert_eq!(
+            MediaPayload::decode(serde_json::json!({
+                "t": "file", "route": "r", "seq": 4, "kind": "teleport"
+            })),
+            None
+        );
     }
 
     #[test]

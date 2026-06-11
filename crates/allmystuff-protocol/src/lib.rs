@@ -23,6 +23,6 @@ pub mod control;
 pub use app::{
     ControlMessage, InventorySummary, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
     RouteControl, ShareControl, APP_ID, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED,
-    CHANNEL_PRESENCE, FEATURE_TERMINAL, PROTOCOL_VERSION,
+    CHANNEL_PRESENCE, FEATURE_FILES, FEATURE_TERMINAL, PROTOCOL_VERSION,
 };
 pub use control::{ClientId, Request, Response, ServerOut};

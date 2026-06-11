@@ -96,6 +96,10 @@ export interface MeshNode {
  *  Rust `FEATURE_TERMINAL`). */
 export const FEATURE_TERMINAL = "terminal";
 
+/** The presence feature tag for mesh-native file hosting — the "Open
+ *  Files" console (mirrors the Rust `FEATURE_FILES`). */
+export const FEATURE_FILES = "files";
+
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
  *  The local node and any node we've had presence from count as app nodes. */
 export function isAppNode(n: { kind?: NodeKind; app?: boolean }): boolean {
@@ -304,6 +308,32 @@ export type TermEvent =
   | { kind: "resize"; cols: number; rows: number }
   | { kind: "exit"; code?: number | null };
 
+/** One entry of a remote directory listing (mirrors the Rust `FileEntry`). */
+export interface FileEntry {
+  name: string;
+  dir: boolean;
+  size: number;
+  modified?: number | null;
+  symlink?: boolean;
+}
+
+/** One event of a files route — the request/response conversation between
+ *  the file-manager viewer and the host whose disk it browses. Tagged
+ *  exactly like the Rust `FileEvent` (serde `kind`, snake_case); `data`
+ *  is base64 (the wire is JSON). Every event carries the viewer-minted
+ *  request id (`req`) it belongs to. */
+export type FileEvent =
+  | { kind: "list"; req: number; path: string }
+  | { kind: "read"; req: number; path: string }
+  | { kind: "write"; req: number; path: string; data: string; append?: boolean; eof?: boolean }
+  | { kind: "mkdir"; req: number; path: string }
+  | { kind: "rename"; req: number; from: string; to: string }
+  | { kind: "delete"; req: number; path: string }
+  | { kind: "entries"; req: number; path: string; home: string; entries: FileEntry[] }
+  | { kind: "chunk"; req: number; data: string; total: number; eof?: boolean }
+  | { kind: "ok"; req: number }
+  | { kind: "err"; req: number; reason: string };
+
 /** A route's live negotiation state from the session snapshot — what a
  *  terminal tab watches to tell "connecting" from "rejected (reason)". */
 export interface RouteLiveState {
@@ -423,6 +453,8 @@ export function originIcon(origin: string, media: MediaKind): string {
     controller: "⌨️",
     terminal: "📟",
     "terminal-view": "📟",
+    files: "🗂",
+    "files-view": "🗂",
     keyboard: "⌨️",
     mouse: "🖱",
     touchpad: "🖱",

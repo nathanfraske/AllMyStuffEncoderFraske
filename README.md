@@ -81,11 +81,13 @@ Prefer a tarball directly? The portable binaries
 The whole app is one canvas. Your machines orbit *this device*; the people
 you share with sit on the outside.
 
-- **Click a node** → a drawer with its hardware, its devices grouped by kind,
-  and the live connections running through it.
+- **Click a node** → a drawer with its hardware, the session buttons
+  (**Remote Control · Open Files · Open Terminal**), the live connections
+  running through it, and its devices folded under a count.
 - **Connect a device** → tap its dot, then tap where it should go. AllMyStuff
   picks the matching endpoint (your mic → that PC's audio-in; that PC's
-  screen → your monitor) and draws a glowing wire.
+  screen → your monitor), draws a glowing wire — and pops the console that
+  manages that kind of session on the far machine.
 - **Bundle a group** → make an *isolatable* set — your monitor + keyboard +
   mouse + mic + speakers — and beam the whole thing at one machine, turning
   your desk into its terminal (the "RDC" move). The bundle connects and
@@ -114,6 +116,13 @@ Try to wire your screen to a friend before you've allowed it and you don't
 get an error — you get a friendly sheet: *"Let Alex receive your screen?"*
 Approve it and **only that** becomes reachable. Revoke it later and any
 connection that depended on it stops immediately.
+
+A share is with the **person, not one machine**: what you allow Alex works
+to whichever of Alex's devices is handy (their fleet shares one owner), and
+a device of theirs that appears later joins the same connection. Everything
+you're sharing — every person, every grant — lives under **Settings →
+Sharing**, where any single grant, or the whole connection, can be taken
+back.
 
 The mesh handles identity. You handle permission. That split is the whole
 product.
@@ -209,6 +218,7 @@ This repository is a **working foundation**, honest about what's real:
 | Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data. Devices on the mesh that aren't running AllMyStuff are shown but quieted and un-targetable |
 | Remote console | **Working** — a pikvm-style session in its **own OS window per machine** (open as many as you like): live screen, a video-inputs tab bar, audio passthrough and keyboard/mouse control, wiring the real routes underneath |
 | Remote terminal | **Working** — a real shell on any of your machines, **no sshd anywhere**: the node drawer's **Open Terminal** opens a tabbed xterm.js window per machine; each tab is its own mesh route to a PTY the far side spawns (`portable-pty`: openpty on Linux/macOS, ConPTY on Windows — same behavior on every OS). Gated to the device's **owner/fleet** exactly like keyboard injection, enforced host-side; advertised via presence `features`, so older peers simply never see the button |
+| Remote files | **Working** — a finder-like file manager on any of your machines, **no smb/sftp anywhere**: the node drawer's **Open Files** (between Remote Control and Open Terminal) opens a window per machine — browse, preview text/images in place, upload, download straight into this machine's Downloads, rename, delete, new folder. One mesh route per window, request/response frames over the same media channel; gated to the device's **owner/fleet** exactly like the terminal, enforced host-side, advertised via presence `features` |
 | Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
 | Live audio streaming | **Working** — a mic → speakers route (and the console's audio passthrough) opens a real `cpal` audio stream across the mesh (default devices, mono in v1) |
 | Live screen + input streaming | **Working** — a display route streams the remote's screen (the routed monitor: every screen is its own console tab) over MyOwnMesh's **H.264 video track lane** (openh264 screen-content encode at a 1920 edge → RTP, ~30 fps) negotiated per route, with the v1 MJPEG-over-channel stream as the automatic fallback for older peers. Decode is covered on every platform: WebCodecs where the webview has it, the backend's **native openh264 decoder** (ready-to-paint RGBA over IPC) where it doesn't or when WebCodecs stalls. Capture is a persistent `xcap` session (PipeWire / DXGI / AVFoundation, paced grabs on X11), unchanged frames skipped, drop-on-backpressure. A control route forwards normalized keyboard/mouse events (sourced from the synthetic per-machine **keyboard & mouse**, so any platform can drive any other) injected with `enigo`, gated to the device's owner/fleet. Default audio devices in v1 |

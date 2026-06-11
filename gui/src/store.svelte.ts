@@ -26,6 +26,7 @@ import {
   fleetKick,
   fleetLeave,
   isTauri,
+  openFilesWindow,
   meshIdentity,
   meshIdentitySetLabel,
   meshConfigShow,
@@ -57,6 +58,7 @@ import {
 } from "./tauri";
 import {
   BUNDLE_TEMPLATES,
+  FEATURE_FILES,
   FEATURE_TERMINAL,
   isAppNode,
   networkDisplayName,
@@ -73,6 +75,7 @@ import {
   type NetworkSummary,
   type OwnedRoster,
   type PeerInfo,
+  type Person,
   type Relationship,
   type RosterPeer,
   type Route,
@@ -83,7 +86,7 @@ import {
 } from "./types";
 
 /** Which pane the settings panel is showing. */
-export type SettingsTab = "networks" | "updates" | "fleet";
+export type SettingsTab = "networks" | "updates" | "fleet" | "sharing";
 
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
@@ -150,6 +153,15 @@ export interface PendingGroupShare {
   groupId: string;
   target: string;
   requests: GrantRequest[];
+}
+
+/** One person/fleet you're sharing with, gathered for the Sharing settings
+ *  pane: who they are, which of their nodes you know, and every grant
+ *  you've given them (with the node it's recorded on, for revocation). */
+export interface SharePartner {
+  person: Person;
+  nodes: MeshNode[];
+  grants: { node: MeshNode; grant: Grant }[];
 }
 
 /** A graph with nothing in it — the starting point under the real backend,
@@ -223,6 +235,14 @@ class AppStore {
   /** Per-app-run counter so each terminal tab mints a unique viewer-side
    *  endpoint (`{me}:term-view:…`) — unique endpoint, unique route id. */
   private termViewSeq = 0;
+
+  // ---- files (the mesh-native file manager) -------------------------
+  /** The remote machine the in-page files popover is open on (web preview
+   *  only — the desktop opens a dedicated window per machine). */
+  filesNodeId = $state<string | null>(null);
+  /** Per-app-run counter so each files session mints a unique viewer-side
+   *  endpoint (`{me}:files-view:…`) — unique endpoint, unique route id. */
+  private filesViewSeq = 0;
 
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
@@ -556,6 +576,9 @@ class AppStore {
         n.online = false;
       }
     }
+    // A freshly-discovered device may belong to someone we already share
+    // with — fold it into that share.
+    this.reconcileShares();
   }
 
   /** Whether `id` names this machine — by the live local id or the daemon
@@ -731,6 +754,7 @@ class AppStore {
     this.routeStates = states;
 
     this.reconcileFleetRelationships();
+    this.reconcileShares();
   }
 
   /** Fleet membership implies the relationship. Ownership is *directional*
@@ -790,7 +814,11 @@ class AppStore {
   }
 
   /** Wire one capability to whichever endpoint on `nodeId` fits — a source
-   *  reaches the node's matching sink, a sink is fed by its source. */
+   *  reaches the node's matching sink, a sink is fed by its source. A
+   *  connection that lands pops the console that manages it (the remote
+   *  control for screens/audio/control, the file manager for storage), so
+   *  sending something *to* a machine immediately hands you its session.
+   */
   connectCapToNode(capId: string, nodeId: string) {
     const cap = this.capability(capId);
     if (!cap) return;
@@ -805,21 +833,49 @@ class AppStore {
       this.toast("warn", `${target.label} isn't running AllMyStuff`);
       return;
     }
+    // The console belongs to whichever end of the wire isn't this machine.
+    const remote = !this.isMe(nodeId) ? nodeId : !this.isMe(cap.node) ? cap.node : null;
     if (canSource(cap.flow)) {
       const sink = matchEndpoint(this.catalog, nodeId, cap.media, "consume");
-      if (sink) return this.connect(capId, sink.id);
+      if (sink) {
+        if (this.connect(capId, sink.id) && remote) this.popConsoleFor(remote, cap.media);
+        return;
+      }
     }
     if (canSink(cap.flow)) {
       const src = matchEndpoint(this.catalog, nodeId, cap.media, "provide");
-      if (src) return this.connect(src.id, capId);
+      if (src) {
+        if (this.connect(src.id, capId) && remote) this.popConsoleFor(remote, cap.media);
+        return;
+      }
     }
     const where = this.node(nodeId)?.label ?? "that device";
     this.toast("warn", `${where} has nowhere to put ${cap.label}`);
   }
 
-  /** Try to wire `from` → `to`. On success the route appears; if it needs
-   *  a shared person's permission, raises the share sheet instead. */
-  connect(from: string, to: string, codec?: "auto" | "h264" | "mjpeg") {
+  /** Open the console that manages connections of this kind with `nodeId`
+   *  — the pikvm-style remote control for screen/audio/control media, the
+   *  file manager for storage. Quiet when that console isn't right for the
+   *  node (no gate-failure toasts after a *successful* connect) — and only
+   *  for machines that are *yours*: the remote-control console pulls the
+   *  far screen, which on a guest's machine would surprise both of you
+   *  with a fresh permission ask. */
+  private popConsoleFor(nodeId: string, media: MediaKind) {
+    const node = this.node(nodeId);
+    if (!node || this.isMe(nodeId) || !isAppNode(node)) return;
+    if (media === "storage") {
+      if (this.filesAllowed(node)) this.openFiles(nodeId);
+      return;
+    }
+    if (media === "display" || media === "video" || media === "input" || media === "audio") {
+      if (node.relationship.kind === "mine") this.openConsole(nodeId);
+    }
+  }
+
+  /** Try to wire `from` → `to`. On success the route appears (and `true`
+   *  comes back); if it needs a shared person's permission, raises the
+   *  share sheet instead. */
+  connect(from: string, to: string, codec?: "auto" | "h264" | "mjpeg"): boolean {
     const res = proposeRoute(this.catalog, from, to);
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
@@ -827,7 +883,7 @@ class AppStore {
       const f = this.capability(from)?.label ?? from;
       const t = this.capability(to)?.label ?? to;
       this.toast("ok", `Connected ${f} → ${t}`);
-      return;
+      return true;
     }
     if (res.denied && res.denied.length) {
       this.pendingShare = {
@@ -837,13 +893,15 @@ class AppStore {
         toLabel: this.capability(to)?.label ?? to,
         requests: res.denied,
       };
-      return;
+      return false;
     }
     this.toast("warn", res.reason);
+    return false;
   }
 
   /** User approved the pending share: add exactly the requested grants,
-   *  then complete the connection. */
+   *  then complete the connection (popping the session's console, the same
+   *  as a connect that never needed to ask). */
   approvePendingShare() {
     const p = this.pendingShare;
     if (!p) return;
@@ -853,6 +911,9 @@ class AppStore {
       this.addRoute(res.route.from, res.route.to);
       this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
       this.toast("ok", `Shared — connected ${p.fromLabel} → ${p.toLabel}`);
+      const ends = [this.capability(p.from)?.node, this.capability(p.to)?.node];
+      const remote = ends.find((n) => n && !this.isMe(n));
+      if (remote) this.popConsoleFor(remote, res.route.media);
     }
     this.pendingShare = null;
   }
@@ -1210,6 +1271,76 @@ class AppStore {
     return this.disconnect(routeId);
   }
 
+  // ---- files (the mesh-native file manager) -------------------------
+
+  /** Whether `node` can host a files session at all: it runs AllMyStuff
+   *  and its presence advertises the feature (an older build doesn't). */
+  filesSupported(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_FILES);
+  }
+
+  /** The gate for "Open Files" — the same owner/fleet rule as the
+   *  terminal (browsing a disk is as privileged as a shell), checked
+   *  against the facts the far side will enforce. */
+  filesAllowed(node: MeshNode | undefined): boolean {
+    if (!node || this.isMe(node.id) || !this.filesSupported(node)) return false;
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet;
+  }
+
+  /** Open the file manager on a remote machine. On the desktop this opens
+   *  (or focuses) the machine's dedicated files window; the web preview
+   *  keeps an in-page popover. */
+  openFiles(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (this.isMe(nodeId)) {
+      this.toast("warn", "That's this device");
+      return;
+    }
+    if (!this.filesSupported(node)) {
+      this.toast("warn", `${node.label} doesn't support file browsing (older AllMyStuff?)`);
+      return;
+    }
+    if (!this.filesAllowed(node)) {
+      this.toast("warn", `Files are owner/fleet only — ${node.label} isn't yours`);
+      return;
+    }
+    if (isTauri()) {
+      void openFilesWindow(nodeId);
+      return;
+    }
+    this.filesNodeId = nodeId;
+  }
+
+  /** Close the in-page files popover (web preview). The desktop's files
+   *  windows close themselves, tearing their route down first. */
+  closeFiles() {
+    this.filesNodeId = null;
+  }
+
+  /** Open one files *session* to `hostNodeId`: a generic route from the
+   *  host's `…:files` endpoint to a viewer endpoint minted for this
+   *  window. Deliberately not `connect()`/`proposeRoute` — files
+   *  endpoints aren't catalog capabilities (see `capabilityForDisplay`),
+   *  and the binding authorization runs host-side against the owner/fleet
+   *  rule. Returns the route id the window watches, or null in web mode. */
+  filesConnect(hostNodeId: string): string | null {
+    if (!this.backendConnected) return null;
+    const from = `${hostNodeId}:files`;
+    const n = ++this.filesViewSeq;
+    const to = `${this.localId}:files-view:${Date.now().toString(36)}-${n}`;
+    void connectRoute(from, to, "generic");
+    return `route:${from}→${to}`;
+  }
+
+  /** Tear one files session down (window closing). The returned promise
+   *  settles when the disconnect is on the wire. */
+  filesDisconnect(routeId: string): Promise<unknown> {
+    return this.disconnect(routeId);
+  }
+
   // ---- ownership / claiming ---------------------------------------
 
   /** Adopt a device as one of yours. Honours Task 4: this only works when
@@ -1363,6 +1494,11 @@ class AppStore {
       const name = this.catalog.groups.find((g) => g.id === groupId)?.name ?? "group";
       const tlabel = this.node(target)?.label ?? target;
       this.toast("ok", `“${name}” is now using ${tlabel}`);
+      // Sending a bundle at a machine pops its session console too — the
+      // first route's media picks which one (a desk/call kit is console
+      // media; a storage bundle would open files).
+      const lead = res.routes[0];
+      if (lead && !this.isMe(target)) this.popConsoleFor(target, lead.media);
       return;
     }
     if (res.denied && res.denied.length) {
@@ -1813,12 +1949,100 @@ class AppStore {
     this.reauthorize();
   }
 
+  /** The person a share with this node is *really* with: its owner. The
+   *  person is keyed by the owner's canonical pubkey (the node's own when
+   *  it advertises no owner — an owner machine doesn't), so every node
+   *  one owner brings resolves to the same person. An existing share with
+   *  that person lends its identity, so names stay stable. */
+  personFor(node: MeshNode): Person {
+    const ownerKey = canonicalNodeId(node.owner ?? node.id);
+    const id = `person:${ownerKey}`;
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === id) {
+        return n.relationship.person;
+      }
+    }
+    const ownerNode = this.catalog.nodes.find((n) => sameMachine(n.id, ownerKey));
+    return { id, name: ownerNode?.label ?? node.label };
+  }
+
+  /** Mark a node shared — a connection with its *owner*, not just this
+   *  machine: every node that owner brings joins the same share, so what
+   *  you grant them works to any of their devices. */
+  markShared(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    const person = this.personFor(n);
+    n.relationship = { kind: "shared", person, grants: [] };
+    this.reconcileShares();
+    this.reauthorize();
+  }
+
+  /** Sharing follows the person across their fleet: any unclaimed node
+   *  whose owner is already a share partner joins that share (so a second
+   *  machine of theirs appearing later is covered without re-asking). A
+   *  relationship the user set is never touched. */
+  private reconcileShares() {
+    const partners = new Map<string, Person>();
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared") {
+        partners.set(n.relationship.person.id, n.relationship.person);
+      }
+    }
+    if (partners.size === 0) return;
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this" || this.isMe(n.id)) continue;
+      if (n.relationship.kind !== "unclaimed") continue;
+      const person = partners.get(`person:${canonicalNodeId(n.owner ?? n.id)}`);
+      if (person) n.relationship = { kind: "shared", person, grants: [] };
+    }
+  }
+
+  /** Everyone you're sharing with, one entry per person/fleet: their
+   *  nodes and every grant you've given them (with the node each grant is
+   *  recorded on). Drives the Sharing settings pane. */
+  sharePartners = $derived.by((): SharePartner[] => {
+    const map = new Map<string, SharePartner>();
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind !== "shared") continue;
+      const share = n.relationship;
+      const p = map.get(share.person.id) ?? { person: share.person, nodes: [], grants: [] };
+      p.nodes.push(n);
+      for (const g of share.grants) p.grants.push({ node: n, grant: g });
+      map.set(share.person.id, p);
+    }
+    return [...map.values()].sort((a, b) => a.person.name.localeCompare(b.person.name));
+  });
+
+  /** Rescind the whole connection with a person: every node of theirs
+   *  goes back to unclaimed, every grant (and any route riding one) goes
+   *  with it. */
+  stopSharingWith(personId: string) {
+    let name = "";
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === personId) {
+        name = n.relationship.person.name;
+        n.relationship = { kind: "unclaimed" };
+      }
+    }
+    this.reauthorize();
+    if (name) this.toast("info", `Stopped sharing with ${name}`);
+  }
+
   grant(nodeId: string, grant: Grant) {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
-    // De-dupe by (media, role, capability).
-    const exists = n.relationship.grants.some(
-      (g) => g.media === grant.media && g.role === grant.role && g.capability === grant.capability,
+    const pid = n.relationship.person.id;
+    // De-dupe by (media, role, capability) across the *person* — a grant
+    // authorizes them wherever it happens to be recorded.
+    const exists = this.catalog.nodes.some(
+      (x) =>
+        x.relationship.kind === "shared" &&
+        x.relationship.person.id === pid &&
+        x.relationship.grants.some(
+          (g) =>
+            g.media === grant.media && g.role === grant.role && g.capability === grant.capability,
+        ),
     );
     if (!exists) n.relationship.grants.push(grant);
   }

@@ -18,12 +18,13 @@
 //! the caller gates everything on the owner/fleet rule before any of this
 //! runs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+
+use crate::byte_queues::ByteQueues;
 
 /// What a hosted PTY produces for the mesh pump.
 #[derive(Debug)]
@@ -62,33 +63,24 @@ struct PtySession {
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
-/// Viewer-side buffer of PTY output for one route, drained by the
-/// terminal window. Mirrors the video plane's `VideoWatcher`: the `token`
-/// scopes `unwatch` to the claim that made it, so a late unwatch can't
-/// tear down a newer watcher. Token `0` is the *eager* queue `start_media`
-/// creates the moment the route goes active — the shell's first prompt
-/// arrives before the window has subscribed, and unlike a video frame a
-/// dropped byte never heals.
-struct TermWatcher {
-    token: u64,
-    queue: VecDeque<Vec<u8>>,
-    queued_bytes: usize,
-}
-
-#[derive(Default)]
 pub struct TerminalHost {
     sessions: Mutex<HashMap<String, PtySession>>,
-    watchers: Mutex<HashMap<String, TermWatcher>>,
-    watch_tokens: AtomicU64,
+    /// Viewer-side buffers of PTY output per route, drained by the
+    /// terminal window (the shared poke-then-pull queue plumbing).
+    output: ByteQueues,
+}
+
+impl Default for TerminalHost {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TerminalHost {
     pub fn new() -> Self {
         TerminalHost {
             sessions: Mutex::new(HashMap::new()),
-            watchers: Mutex::new(HashMap::new()),
-            // 0 is the eager queue's reserved token.
-            watch_tokens: AtomicU64::new(1),
+            output: ByteQueues::new(MAX_QUEUED_BYTES),
         }
     }
 
@@ -280,87 +272,36 @@ impl TerminalHost {
             let _ = s.killer.kill();
             let _ = s.ctl_tx.try_send(CtlMsg::Shutdown);
         }
-        self.watchers.lock().remove(route_id);
+        self.output.remove(route_id);
     }
 
     // ---- viewer side ----------------------------------------------------
+    //
+    // Thin delegation to the shared [`ByteQueues`]: an output buffer per
+    // route exists from route-activation (so the shell's first prompt is
+    // never lost), claimed/drained/released by the terminal window.
 
-    /// Make sure an output buffer exists for `route_id` *before* the
-    /// window subscribes — called when the route goes active, so the
-    /// host's first prompt bytes (which arrive immediately) are kept, not
-    /// dropped. Token 0 marks it adoptable.
     pub fn ensure_queue(&self, route_id: &str) {
-        self.watchers
-            .lock()
-            .entry(route_id.to_string())
-            .or_insert(TermWatcher {
-                token: 0,
-                queue: VecDeque::new(),
-                queued_bytes: 0,
-            });
+        self.output.ensure(route_id);
     }
 
-    /// The terminal window claims `route_id`'s output. Adopts the eager
-    /// queue (keeping anything buffered) or replaces a previous watcher;
-    /// returns the token that scopes the matching `unwatch`.
     pub fn watch_output(&self, route_id: &str) -> u64 {
-        let token = self.watch_tokens.fetch_add(1, Ordering::Relaxed);
-        let mut map = self.watchers.lock();
-        let w = map.entry(route_id.to_string()).or_insert(TermWatcher {
-            token: 0,
-            queue: VecDeque::new(),
-            queued_bytes: 0,
-        });
-        w.token = token;
-        token
+        self.output.watch(route_id)
     }
 
-    /// Release a watch claim. The token scopes it: a late unwatch from a
-    /// closed tab can't remove the queue a newer watcher owns. Idempotent.
     pub fn unwatch(&self, route_id: &str, token: u64) {
-        let mut map = self.watchers.lock();
-        if map.get(route_id).is_some_and(|w| w.token == token) {
-            map.remove(route_id);
-        }
+        self.output.unwatch(route_id, token);
     }
 
-    /// Drain everything queued for `route_id` into one length-prefixed
-    /// buffer (`[u32 le len][bytes]…`) for a single IPC hop. Empty when
-    /// there's nothing (or no such watcher).
     pub fn poll(&self, route_id: &str) -> Vec<u8> {
-        let mut map = self.watchers.lock();
-        let Some(w) = map.get_mut(route_id) else {
-            return Vec::new();
-        };
-        let mut out = Vec::with_capacity(w.queued_bytes + 4 * w.queue.len());
-        for chunk in w.queue.drain(..) {
-            out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-            out.extend_from_slice(&chunk);
-        }
-        w.queued_bytes = 0;
-        out
+        self.output.poll(route_id)
     }
 
     /// Buffer one inbound output chunk for the watching window. Returns
     /// `true` when the queue went empty → non-empty — the caller's cue to
     /// poke the front-end (mirroring `allmystuff://video-ready`).
     pub fn enqueue(&self, route_id: &str, bytes: Vec<u8>) -> bool {
-        let mut map = self.watchers.lock();
-        let Some(w) = map.get_mut(route_id) else {
-            tracing::debug!("no terminal watcher for {route_id} — bytes dropped");
-            return false;
-        };
-        let was_empty = w.queue.is_empty();
-        w.queued_bytes += bytes.len();
-        w.queue.push_back(bytes);
-        while w.queued_bytes > MAX_QUEUED_BYTES {
-            let Some(old) = w.queue.pop_front() else {
-                break;
-            };
-            w.queued_bytes -= old.len();
-            tracing::warn!("terminal queue for {route_id} unread — oldest chunk dropped");
-        }
-        was_empty
+        self.output.enqueue(route_id, bytes)
     }
 }
 
@@ -615,50 +556,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn watcher_framing_is_byte_exact() {
-        let host = TerminalHost::new();
-        host.ensure_queue("w1");
-        assert!(host.enqueue("w1", vec![1, 2, 3]), "empty → non-empty pokes");
-        assert!(!host.enqueue("w1", vec![4]), "already non-empty: no poke");
-        let buf = host.poll("w1");
-        assert_eq!(
-            buf,
-            vec![3, 0, 0, 0, 1, 2, 3, 1, 0, 0, 0, 4],
-            "[u32 le len][bytes] per chunk"
-        );
-        assert!(host.poll("w1").is_empty(), "drained");
-        assert!(host.enqueue("w1", vec![9]), "poke again after a drain");
-    }
-
-    #[test]
-    fn watch_adopts_the_eager_queue_and_scopes_unwatch() {
-        let host = TerminalHost::new();
-        host.ensure_queue("w2");
-        host.enqueue("w2", b"early prompt".to_vec());
-        let token = host.watch_output("w2");
-        assert_eq!(host.poll("w2")[4..], b"early prompt"[..], "buffer kept");
-
-        // A stale token can't remove the live watcher…
-        host.unwatch("w2", token + 999);
-        assert!(host.enqueue("w2", vec![1]));
-        // …the right one can.
-        host.unwatch("w2", token);
-        assert!(!host.enqueue("w2", vec![2]), "no watcher — dropped");
-    }
-
-    #[test]
-    fn overflow_drops_oldest_not_newest() {
-        let host = TerminalHost::new();
-        host.ensure_queue("w3");
-        let chunk = vec![0u8; 1024 * 1024];
-        for _ in 0..4 {
-            host.enqueue("w3", chunk.clone());
-        }
-        host.enqueue("w3", b"newest".to_vec());
-        let buf = host.poll("w3");
-        let tail = &buf[buf.len() - 6..];
-        assert_eq!(tail, b"newest");
-        assert!(buf.len() <= MAX_QUEUED_BYTES + 6 + 5 * 4);
-    }
+    // The watcher-queue behaviours (framing, eager-queue adoption, token
+    // scoping, overflow) are tested where they now live: `byte_queues`.
 }

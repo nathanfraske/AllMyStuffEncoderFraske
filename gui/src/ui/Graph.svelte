@@ -285,7 +285,14 @@
           {#if n.kind === "this"}<span class="tag you">this device</span>{/if}
           {#if meshonly}<span class="tag meshonly">not on AllMyStuff</span>
           {:else if shared}<span class="tag guest">guest</span>
-          {:else if unclaimed}<span class="tag unclaimed">{n.claimable ? "claimable" : "unclaimed"}</span>
+          {:else if unclaimed}
+            <!-- A device whose advert names an owner that isn't us is
+                 claimed by someone else — say that, not "unclaimed". -->
+            {#if n.owner && !app.isMe(n.owner)}
+              <span class="tag theirs">someone else's</span>
+            {:else}
+              <span class="tag unclaimed">{n.claimable ? "claimable" : "unclaimed"}</span>
+            {/if}
           {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
           {#if app.isFleetMember(n.id)}<span class="tag fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
@@ -527,6 +534,10 @@
     background: var(--surface-2);
     color: var(--ink-soft);
     border: 1px dashed var(--line-strong);
+  }
+  .tag.theirs {
+    background: #f3e8fd;
+    color: #7a3bc0;
   }
   .tag.fleet {
     background: var(--accent-soft);

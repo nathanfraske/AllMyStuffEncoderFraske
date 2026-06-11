@@ -35,11 +35,11 @@ export function capability(cat: Catalog, id: string): Capability | undefined {
 }
 
 /** Resolve a capability *for display*, synthesizing a stand-in for the
- *  terminal endpoints that are deliberately never in the catalog (a
- *  persistent generic capability would match every auto-wiring picker —
+ *  terminal and files endpoints that are deliberately never in the catalog
+ *  (a persistent generic capability would match every auto-wiring picker —
  *  `matchEndpoint` treats generic as compatible with everything). This
- *  keeps a live terminal session visible in "Connected now" and on the
- *  graph without making it a wireable thing. */
+ *  keeps a live terminal/files session visible in "Connected now" and on
+ *  the graph without making it a wireable thing. */
 export function capabilityForDisplay(cat: Catalog, id: string): Capability | undefined {
   const real = capability(cat, id);
   if (real) return real;
@@ -57,6 +57,17 @@ export function capabilityForDisplay(cat: Catalog, id: string): Capability | und
       media: "generic",
       flow: "sink",
       origin: "terminal-view",
+    };
+  if (tail === "files")
+    return { id, node, label: "Files", media: "generic", flow: "source", origin: "files" };
+  if (tail.startsWith("files-view"))
+    return {
+      id,
+      node,
+      label: "Files viewer",
+      media: "generic",
+      flow: "sink",
+      origin: "files-view",
     };
   return undefined;
 }
@@ -81,7 +92,11 @@ function grantPermits(g: Grant, media: MediaKind, role: GrantRole, capId: string
 }
 
 /** Returns a GrantRequest if the endpoint is on a shared node lacking
- *  coverage, otherwise null (mine, or already granted). */
+ *  coverage, otherwise null (mine, or already granted). A grant authorizes
+ *  the *person*, not one machine — sharing with someone lets them route
+ *  the granted thing to any of their nodes — so coverage is the union of
+ *  grants across every node shared with the same person (mirrors the Rust
+ *  `Catalog::check_endpoint`). */
 function checkEndpoint(
   cat: Catalog,
   capId: string,
@@ -93,7 +108,12 @@ function checkEndpoint(
   const node = cat.nodes.find((n) => n.id === cap.node);
   if (!node || node.relationship.kind !== "shared") return null;
   const share = node.relationship;
-  const ok = share.grants.some((g) => grantPermits(g, media, role, capId));
+  const ok = cat.nodes.some(
+    (n) =>
+      n.relationship.kind === "shared" &&
+      n.relationship.person.id === share.person.id &&
+      n.relationship.grants.some((g) => grantPermits(g, media, role, capId)),
+  );
   if (ok) return null;
   return {
     node: cap.node,

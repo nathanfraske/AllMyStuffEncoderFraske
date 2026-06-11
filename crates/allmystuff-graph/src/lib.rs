@@ -342,6 +342,74 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_covers_every_node_the_same_person_brings() {
+        // Sharing authorizes the *person*: a grant recorded on one of
+        // Alex's machines lets Alex route the granted thing to any of
+        // their nodes — here, a second laptop that arrived later.
+        let mut cat = fixture();
+        cat.nodes.push(MeshNode {
+            id: "alex2".into(),
+            label: "Alex's studio PC".into(),
+            kind: NodeKind::Machine,
+            relationship: Relationship::Shared(Share {
+                person: alex(), // same person, second machine
+                grants: vec![],
+            }),
+            online: true,
+        });
+        cat.capabilities.push(Capability::new(
+            "alex2",
+            "alex2:display",
+            "Studio monitor",
+            MediaKind::Display,
+            Flow::Sink,
+            "display",
+        ));
+        // The grant lives on the *first* node's share…
+        grant(
+            &mut cat,
+            "alex",
+            Grant {
+                id: "g1".into(),
+                media: MediaKind::Display,
+                role: GrantRole::Consume,
+                capability: None,
+                label: "Receive your screen".into(),
+            },
+        );
+        // …and authorizes the same person's *other* machine too.
+        cat.propose_route(&"this:screen".into(), &"alex2:display".into())
+            .expect("the person is granted, whichever of their nodes receives");
+
+        // A different person with their own node is still denied.
+        cat.nodes.push(MeshNode {
+            id: "sam".into(),
+            label: "Sam's laptop".into(),
+            kind: NodeKind::Machine,
+            relationship: Relationship::Shared(Share {
+                person: Person {
+                    id: "person:sam".into(),
+                    name: "Sam".into(),
+                },
+                grants: vec![],
+            }),
+            online: true,
+        });
+        cat.capabilities.push(Capability::new(
+            "sam",
+            "sam:display",
+            "Sam's monitor",
+            MediaKind::Display,
+            Flow::Sink,
+            "display",
+        ));
+        let err = cat
+            .propose_route(&"this:screen".into(), &"sam:display".into())
+            .unwrap_err();
+        assert!(matches!(err, ConnectError::Denied(_)), "{err:?}");
+    }
+
+    #[test]
     fn required_grants_describes_the_one_tap_fix() {
         let mut cat = fixture();
         cat.capabilities.push(Capability::new(

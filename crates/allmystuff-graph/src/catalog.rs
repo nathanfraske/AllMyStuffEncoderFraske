@@ -193,7 +193,17 @@ impl Catalog {
         let Some(share) = node.relationship.share() else {
             return Ok(()); // Mine — always allowed.
         };
-        let permitted = share.grants.iter().any(|g| g.permits(media, role, cap_id));
+        // A grant authorizes the *person*, not one machine: sharing with
+        // someone lets them route the granted thing to any of their nodes.
+        // So coverage is the union of grants across every node shared with
+        // the same person — wherever the grant happened to be recorded.
+        let permitted = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.relationship.share())
+            .filter(|s| s.person.id == share.person.id)
+            .flat_map(|s| s.grants.iter())
+            .any(|g| g.permits(media, role, cap_id));
         if permitted {
             Ok(())
         } else {

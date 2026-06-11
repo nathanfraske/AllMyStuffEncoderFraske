@@ -1,11 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/capabilities/2",
   "identifier": "default",
-  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console and terminal window)",
+  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console, terminal and files window)",
   "windows": [
     "main",
     "console-*",
-    "terminal-*"
+    "terminal-*",
+    "files-*"
   ],
   "permissions": [
     "core:default",
