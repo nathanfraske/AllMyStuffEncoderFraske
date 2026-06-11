@@ -1,0 +1,11 @@
+# Build-script environment for the GUI workspace.
+#
+# CMAKE_POLICY_VERSION_MINIMUM: audiopus_sys (the opus crate's libopus
+# build) vendors a CMakeLists whose `cmake_minimum_required` predates
+# 3.5, which CMake 4.x refuses outright (macos-latest runners and any
+# homebrew cmake hit this; CMake 3.x only warns). This is CMake's own
+# documented escape hatch and is read from the environment since 4.0 —
+# older cmakes ignore it. Drop this when audiopus_sys ships a fixed
+# CMakeLists.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
