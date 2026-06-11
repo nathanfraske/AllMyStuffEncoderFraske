@@ -32,7 +32,7 @@ use allmystuff_session::{
     TermEvent, TermFrame, VideoAssembler, VideoFrame,
 };
 
-use crate::audio::AudioBridge;
+use crate::audio::{AudioBridge, CaptureSource};
 use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
@@ -82,8 +82,10 @@ pub struct Mesh {
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
-    /// task sends them on the media channel.
-    audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
+    /// task sends them on the media channel. Bounded like video: a stalled
+    /// link sheds buffers (a brief skip) instead of queueing a backlog the
+    /// listener then hears seconds late.
+    audio_out: mpsc::Sender<AudioOut>,
     /// Outbound video, deliberately *bounded*: when the link can't keep up
     /// the capture side drops frames instead of queueing stale ones (an
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
@@ -126,6 +128,29 @@ pub struct Mesh {
     /// When each route last asked its sender for a clean decode entry —
     /// decode errors arrive at frame rate; the asks must not.
     refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
+    /// The Opus audio lane mirrors the video lane's bookkeeping: one
+    /// outbound stream per peer connection (peer pubkey → route id)…
+    audio_lane_out: Mutex<HashMap<String, String>>,
+    /// …and which inbound route consumes each peer's audio lane here —
+    /// claimed when our offered audio route goes active with `opus`
+    /// accepted, so `audio_inbound` frames decode into the right ring.
+    audio_lane_in: Mutex<HashMap<String, String>>,
+    /// Per-route Opus decoders for inbound lane audio (stateful across
+    /// frames; dropped with the route).
+    audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
+    /// Whether the local daemon speaks the audio track lane (`audio_*`
+    /// ops, myownmesh ≥ 0.2.4) — the audio twin of `daemon_video`.
+    /// While false, audio rides PCM frames over the media channel.
+    daemon_audio: std::sync::atomic::AtomicBool,
+}
+
+/// One captured-audio packet headed for the forwarder, in whichever
+/// shape its route negotiated.
+enum AudioOut {
+    /// A PCM frame for `CHANNEL_MEDIA` — the floor every peer speaks.
+    Channel(String, AudioFrame),
+    /// One encoded Opus frame for the daemon's audio track lane.
+    Lane { peer: String, data: Vec<u8> },
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -212,9 +237,10 @@ struct State {
 
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
-        let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
-        // A shallow queue: at most a few frames in flight, so a slow link
-        // sheds load by dropping captures rather than growing latency.
+        // Shallow queues both: at most a few frames in flight, so a slow
+        // link sheds load by dropping captures rather than growing latency.
+        // Audio's 8 buffers are ~160 ms of slack.
+        let (audio_out, mut audio_rx) = mpsc::channel::<AudioOut>(8);
         let (video_out, mut video_rx) = mpsc::channel::<(String, VideoPacket)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
@@ -250,21 +276,35 @@ impl Mesh {
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             video_in_stats: Mutex::new(HashMap::new()),
             refresh_asks: Mutex::new(HashMap::new()),
+            audio_lane_out: Mutex::new(HashMap::new()),
+            audio_lane_in: Mutex::new(HashMap::new()),
+            audio_decoders: Mutex::new(HashMap::new()),
+            daemon_audio: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Forwarders: drain captured frames out to peers on the media
-        // channel — audio unbounded (tiny, ordered), video bounded. Send
+        // channel, both bounded (see the field docs). Send
         // failures are *surfaced* (rate-limited): a silently-dying media
         // plane is exactly the "connected but nothing arrives" mystery.
         {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, frame)) = audio_rx.recv().await {
-                    let Ok(payload) = serde_json::to_value(&frame) else {
-                        continue;
+                while let Some(out) = audio_rx.recv().await {
+                    let (peer, result) = match out {
+                        AudioOut::Channel(peer, frame) => {
+                            let Ok(payload) = serde_json::to_value(&frame) else {
+                                continue;
+                            };
+                            let r = mesh.send_media_value(&peer, payload).await;
+                            (peer, r)
+                        }
+                        AudioOut::Lane { peer, data } => {
+                            let r = mesh.send_audio_track(&peer, data).await;
+                            (peer, r)
+                        }
                     };
-                    if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                    if let Err(e) = result {
                         if last_warn.elapsed() >= WARN_EVERY {
                             last_warn = std::time::Instant::now();
                             tracing::warn!("audio frame to {} failed: {e}", short_id(&peer));
@@ -350,6 +390,24 @@ impl Mesh {
                 network,
                 peer: pubkey_part(peer).to_string(),
                 duration_us,
+                data: base64::engine::general_purpose::STANDARD.encode(&data),
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Send one encoded Opus frame to `peer` over the daemon's audio
+    /// track lane (base64 on the control socket, RTP on the wire).
+    async fn send_audio_track(&self, peer: &str, data: Vec<u8>) -> Result<(), String> {
+        use base64::Engine as _;
+        let Some(network) = self.network_for_peer(peer) else {
+            return Err("no shared network".into());
+        };
+        self.media_pipe
+            .send(&Request::AudioSend {
+                network,
+                peer: pubkey_part(peer).to_string(),
+                duration_us: crate::audio::OPUS_FRAME_US,
                 data: base64::engine::general_purpose::STANDARD.encode(&data),
             })
             .await
@@ -621,6 +679,13 @@ impl Mesh {
                     .unwrap_or(0) as u32;
                 self.handle_video_inbound(from, rtp_timestamp, key, data);
             }
+            "audio_inbound" => {
+                let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                self.handle_audio_inbound(from, data);
+            }
             "event" => {
                 if let Some(event) = value.get("event") {
                     // Connection establishment is a claim-status trigger: a
@@ -809,23 +874,33 @@ impl Mesh {
                         return;
                     };
                     let structural = self.ownership.merge_fleet(&me, &roster);
-                    let outcome = if structural {
-                        "merged"
-                    } else if self.ownership.fleet().is_some_and(|f| f.key == roster.key) {
-                        "in sync"
-                    } else {
-                        "ignored (not our fleet)"
-                    };
-                    tracing::info!(
-                        "owned roster from {}: key …{} v{} ({} members) → {outcome}",
-                        short_id(&from),
-                        key_tail(&roster.key),
-                        roster.version,
-                        roster.members.len(),
-                    );
+                    // Gossip echoes after every presence answer and
+                    // re-broadcast; only a roster that *changed* something
+                    // is worth a line at the default level.
                     if structural {
+                        tracing::info!(
+                            "owned roster from {}: key …{} v{} ({} members) → merged",
+                            short_id(&from),
+                            key_tail(&roster.key),
+                            roster.version,
+                            roster.members.len(),
+                        );
                         self.broadcast_owned().await;
                         self.emit_owned();
+                    } else {
+                        let outcome = if self.ownership.fleet().is_some_and(|f| f.key == roster.key)
+                        {
+                            "in sync"
+                        } else {
+                            "ignored (not our fleet)"
+                        };
+                        tracing::debug!(
+                            "owned roster from {}: key …{} v{} ({} members) → {outcome}",
+                            short_id(&from),
+                            key_tail(&roster.key),
+                            roster.version,
+                            roster.members.len(),
+                        );
                     }
                 }
             }
@@ -842,6 +917,69 @@ impl Mesh {
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
+    }
+
+    /// The audio twin of [`Self::release_video_lanes`]: free the route's
+    /// audio-lane claims in both directions and drop its Opus decoder.
+    fn release_audio_lanes(&self, route_id: &str) {
+        self.audio_lane_out.lock().retain(|_, rid| rid != route_id);
+        self.audio_lane_in.lock().retain(|_, rid| rid != route_id);
+        self.audio_decoders.lock().remove(route_id);
+    }
+
+    /// One Opus frame arrived on a peer's audio lane. It belongs to
+    /// whichever of our routes claimed that peer's inbound lane — gated
+    /// exactly like every other media frame (route live, sinks here,
+    /// sender is the route's peer) — then decodes straight into the
+    /// route's playback ring.
+    fn handle_audio_inbound(self: &Arc<Self>, from: &str, data_b64: &str) {
+        use base64::Engine as _;
+        let route_id = {
+            let lanes = self.audio_lane_in.lock();
+            lanes.get(pubkey_part(from)).cloned()
+        };
+        let Some(route_id) = route_id else {
+            tracing::debug!(
+                "audio frame from {} with no claimed inbound lane — dropped",
+                short_id(from)
+            );
+            return;
+        };
+        if !self.inbound_media_ok(&route_id, from, MediaKind::Audio) {
+            tracing::debug!("audio frame for {route_id} refused (route not live here)");
+            return;
+        }
+        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
+            return;
+        };
+        // Up to 120 ms per packet is legal Opus; ours are 20 ms.
+        let mut pcm = vec![0i16; crate::audio::OPUS_FRAME_SAMPLES * 6];
+        let decoded = {
+            let mut decoders = self.audio_decoders.lock();
+            let dec = match decoders.entry(route_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    match opus::Decoder::new(crate::audio::OPUS_RATE, opus::Channels::Mono) {
+                        Ok(d) => v.insert(d),
+                        Err(e) => {
+                            tracing::warn!("opus decoder for {route_id} failed: {e}");
+                            return;
+                        }
+                    }
+                }
+            };
+            match dec.decode(&data, &mut pcm, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    // One bad frame costs 20 ms; the next stands alone.
+                    tracing::debug!("opus decode for {route_id} failed: {e}");
+                    return;
+                }
+            }
+        };
+        pcm.truncate(decoded);
+        let frame = AudioFrame::new(route_id.clone(), 0, crate::audio::OPUS_RATE, 1, pcm);
+        self.audio.feed(&route_id, &frame);
     }
 
     /// Count one inbound video payload for `route_id` and emit the
@@ -1018,6 +1156,18 @@ impl Mesh {
         };
         let from_node = node_of(&from);
         let to_node = node_of(&to);
+        // Audio accepts mirror video's: when we're the *sink* of an audio
+        // route and our daemon speaks the audio lane, ask for Opus — the
+        // source side picks the lane when its own stack can carry it,
+        // and PCM frames over the media channel stay the floor.
+        let audio = if media == MediaKind::Audio
+            && to_node == me
+            && self.daemon_audio.load(Ordering::SeqCst)
+        {
+            vec!["opus".to_string()]
+        } else {
+            Vec::new()
+        };
         let peer = if from_node == me { to_node } else { from_node };
 
         if peer == me {
@@ -1028,7 +1178,7 @@ impl Mesh {
             let effects = {
                 let mut st = self.state.lock();
                 let s = st.session.as_mut().ok_or("mesh not ready")?;
-                let _ = s.offer(route.clone(), me.as_str(), Vec::new());
+                let _ = s.offer(route.clone(), me.as_str(), Vec::new(), Vec::new());
                 s.handle(
                     NodeId::from(me.as_str()),
                     ControlMessage::Route(RouteControl::Accept {
@@ -1044,7 +1194,7 @@ impl Mesh {
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
-            s.offer(route.clone(), peer.as_str(), video)
+            s.offer(route.clone(), peer.as_str(), video, audio)
         };
         if let Err(e) = self.send_control(&peer, &msg).await {
             // The peer never saw the offer — drop it rather than leave a
@@ -1060,7 +1210,9 @@ impl Mesh {
             }
             return Err(e);
         }
-        tracing::info!(
+        // The accept lands moments later as the route's "active" line; an
+        // offer that goes nowhere has its own warns above and below.
+        tracing::debug!(
             "route {} offered to {} — awaiting accept",
             route.id,
             short_id(&peer)
@@ -1134,6 +1286,7 @@ impl Mesh {
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
+        self.release_audio_lanes(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
         self.drop_downloads(&route_id);
@@ -1198,6 +1351,7 @@ impl Mesh {
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
+                    self.release_audio_lanes(&id);
                     self.terminal.stop(&id);
                     self.files.stop(&id);
                     self.drop_downloads(&id);
@@ -1696,6 +1850,28 @@ impl Mesh {
                     }
                 }
             }
+            // The audio lane's inbound side + capability probe, exactly
+            // like video's: a daemon that predates the lane refuses the
+            // op, and audio rides PCM frames over the media channel.
+            match self
+                .client
+                .request(&Request::AudioSubscribe {
+                    client_id,
+                    network: network.clone(),
+                })
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    self.daemon_audio.store(true, Ordering::SeqCst);
+                }
+                _ => {
+                    if !self.daemon_audio.load(Ordering::SeqCst) {
+                        tracing::info!(
+                            "daemon doesn't speak the audio track lane (needs myownmesh ≥ 0.2.4) — audio rides the data channel"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1711,31 +1887,122 @@ impl Mesh {
 
         match route.media {
             MediaKind::Audio => {
-                // We source: capture the default mic and stream to the sink.
+                // We source: capture what the routed capability names — the
+                // machine's own playback for the synthetic `system-audio`,
+                // the default mic for a scanned input device — and stream
+                // it to the sink. Transport: the offer said what the sink
+                // can consume — Opus on the daemon's audio track lane when
+                // both stacks carry it and this peer's lane is free, PCM
+                // frames over the media channel otherwise (the floor).
                 if from_node == me {
+                    let source = audio_capture_source(route);
+                    let accepts_opus = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&route.id))
+                        .map(|r| r.audio.iter().any(|a| a == "opus"))
+                        .unwrap_or(false);
+                    let canon = pubkey_part(&to_node).to_string();
+                    let lane = if accepts_opus && self.daemon_audio.load(Ordering::SeqCst) {
+                        // Same takeover rule as the video lane: busy only
+                        // while the holder is still an *active* route.
+                        let holder = self.audio_lane_out.lock().get(&canon).cloned();
+                        let holder_active = holder.as_deref().is_some_and(|rid| {
+                            rid != route.id
+                                && self
+                                    .state
+                                    .lock()
+                                    .session
+                                    .as_ref()
+                                    .and_then(|s| s.route(rid))
+                                    .is_some_and(|r| r.is_active())
+                        });
+                        if holder_active {
+                            tracing::info!(
+                                "route {} — peer's audio lane busy; falling back to PCM frames",
+                                route.id
+                            );
+                            false
+                        } else {
+                            self.audio_lane_out.lock().insert(canon, route.id.clone());
+                            true
+                        }
+                    } else {
+                        false
+                    };
                     tracing::info!(
-                        "route {} active — streaming audio to {}",
+                        "route {} active — streaming {} to {} ({})",
                         route.id,
-                        short_id(&to_node)
+                        match source {
+                            CaptureSource::System => "system audio",
+                            CaptureSource::Mic => "mic audio",
+                        },
+                        short_id(&to_node),
+                        if lane { "Opus lane" } else { "PCM channel" }
                     );
                     let peer = to_node.clone();
-                    let rid = route.id.clone();
                     let tx = self.audio_out.clone();
+                    let encoder = if lane {
+                        match crate::audio::OpusStream::new() {
+                            Ok(enc) => Some(parking_lot::Mutex::new(enc)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "opus encoder for {} failed ({e}) — falling back to PCM frames",
+                                    route.id
+                                );
+                                self.release_audio_lanes(&route.id);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let rid = route.id.clone();
                     let seq = Arc::new(AtomicU64::new(0));
                     self.audio
-                        .start_capture(route.id.clone(), move |pcm, rate| {
-                            let s = seq.fetch_add(1, Ordering::Relaxed);
-                            let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
-                            let _ = tx.send((peer.clone(), frame));
+                        .start_capture(route.id.clone(), source, move |pcm, rate| {
+                            // try_send everywhere: a full queue drops this
+                            // buffer; the next one carries fresher sound.
+                            if let Some(enc) = &encoder {
+                                enc.lock().push(&pcm, rate, |data| {
+                                    let _ = tx.try_send(AudioOut::Lane {
+                                        peer: peer.clone(),
+                                        data,
+                                    });
+                                });
+                            } else {
+                                let s = seq.fetch_add(1, Ordering::Relaxed);
+                                let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
+                                let _ = tx.try_send(AudioOut::Channel(peer.clone(), frame));
+                            }
                         });
                 }
-                // We sink: play inbound frames for this route.
+                // We sink: play inbound frames for this route — and if we
+                // asked for the Opus lane, claim this peer's inbound lane
+                // so its `audio_inbound` frames decode into this route's
+                // ring (the sender may still pick PCM, in which case the
+                // claim simply never sees a frame).
                 if to_node == me {
                     tracing::info!(
                         "route {} active — playing audio from {}",
                         route.id,
                         short_id(&from_node)
                     );
+                    let offered_opus = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&route.id))
+                        .map(|r| r.audio.iter().any(|a| a == "opus"))
+                        .unwrap_or(false);
+                    if offered_opus {
+                        self.audio_lane_in
+                            .lock()
+                            .insert(pubkey_part(&from_node).to_string(), route.id.clone());
+                    }
                     self.audio.start_playback(route.id.clone());
                 }
             }
@@ -1787,8 +2054,10 @@ impl Mesh {
                             );
                             VideoMode::Mjpeg
                         } else {
+                            // Routine on every console tab switch — lane
+                            // bookkeeping, not an event.
                             if let Some(h) = holder.filter(|h| h != &route.id) {
-                                tracing::info!(
+                                tracing::debug!(
                                     "route {} takes the track lane over from ended route {h}",
                                     route.id
                                 );
@@ -1849,7 +2118,10 @@ impl Mesh {
                             .lock()
                             .insert(pubkey_part(&from_node).to_string(), route.id.clone());
                     }
-                    tracing::info!(
+                    // The "first screen frame" line is the signal worth a
+                    // default-level entry on this side; this one only
+                    // matters when that line never follows.
+                    tracing::debug!(
                         "route {} active — expecting screen frames from {}",
                         route.id,
                         short_id(&from_node)
@@ -2521,7 +2793,9 @@ impl Mesh {
         fps: Option<u32>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
-        tracing::info!(
+        // The streaming side logs the retune it actually applies — one
+        // line per pill change across the pair is plenty.
+        tracing::debug!(
             "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?}",
             short_id(&peer)
         );
@@ -2690,6 +2964,18 @@ fn is_terminal_route(route: &Route) -> bool {
 /// contract scheme the terminal uses.
 fn is_files_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":files")
+}
+
+/// What an audio route this machine sources should capture: the synthetic
+/// `system-audio` capability advertises "what this machine plays", so it
+/// captures the machine's own output (loopback); every other audio source
+/// is a scanned input device — the default mic in v1. Pure, so the rule
+/// that decides between "your room" and "your sound" is unit-testable.
+fn audio_capture_source(route: &Route) -> CaptureSource {
+    match route.from.as_str().split_once(':') {
+        Some((_, "system-audio")) => CaptureSource::System,
+        _ => CaptureSource::Mic,
+    }
 }
 
 /// Why an inbound terminal/files offer must be refused, if it must: it
@@ -2888,5 +3174,20 @@ mod tests {
         std::fs::write(dir.join("noext"), b"x").unwrap();
         assert_eq!(unique_path(&dir, "noext"), dir.join("noext (2)"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn system_audio_routes_capture_the_machines_own_output() {
+        // The synthetic `system-audio` capability = "what this machine
+        // plays" — its routes loop the output back…
+        let system = term_route("me:system-audio", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&system), CaptureSource::System);
+
+        // …while a scanned input device (and anything unrecognized,
+        // including a bare node id) captures the mic, exactly as before.
+        let mic = term_route("me:mic:array-1", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&mic), CaptureSource::Mic);
+        let bare = term_route("me", "them:system-audio", MediaKind::Audio);
+        assert_eq!(audio_capture_source(&bare), CaptureSource::Mic);
     }
 }

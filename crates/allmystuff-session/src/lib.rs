@@ -76,6 +76,10 @@ pub struct LiveRoute {
     /// side that streams reads them to pick the transport.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub video: Vec<String>,
+    /// Audio transports the offerer can consume (audio routes) — the
+    /// same contract as `video`, for the mesh's Opus lane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
 }
 
 impl LiveRoute {
@@ -192,13 +196,15 @@ impl Session {
 
     /// Offer a route to the peer that owns its other endpoint. Records it
     /// as `Outbound`/`Offered` and returns the message to send. `video`
-    /// names the transports this side can consume for a display route
-    /// (see [`RouteControl::Offer`]); empty means MJPEG only.
+    /// names the transports this side can consume for a display route,
+    /// `audio` for an audio route (see [`RouteControl::Offer`]); empty
+    /// means the channel fallback (MJPEG / PCM frames).
     pub fn offer(
         &mut self,
         route: Route,
         peer: impl Into<NodeId>,
         video: Vec<String>,
+        audio: Vec<String>,
     ) -> ControlMessage {
         let peer = peer.into();
         self.routes.insert(
@@ -209,9 +215,14 @@ impl Session {
                 origin: Origin::Outbound,
                 state: RouteState::Offered,
                 video: video.clone(),
+                audio: audio.clone(),
             },
         );
-        ControlMessage::Route(RouteControl::Offer { route, video })
+        ControlMessage::Route(RouteControl::Offer {
+            route,
+            video,
+            audio,
+        })
     }
 
     /// Locally tear a route down. Returns the message to send the peer (if
@@ -251,7 +262,11 @@ impl Session {
 
     fn handle_route(&mut self, from: NodeId, rc: RouteControl) -> Vec<Effect> {
         match rc {
-            RouteControl::Offer { route, video } => {
+            RouteControl::Offer {
+                route,
+                video,
+                audio,
+            } => {
                 let accept = self.auto_accept;
                 let state = if accept {
                     RouteState::Active
@@ -266,6 +281,7 @@ impl Session {
                         origin: Origin::Inbound,
                         state,
                         video,
+                        audio,
                     },
                 );
                 if accept {
@@ -400,7 +416,7 @@ mod tests {
     #[test]
     fn outbound_offer_goes_active_on_accept_and_starts_media() {
         let mut s = Session::new("this");
-        let msg = s.offer(route("r1"), "desk", Vec::new());
+        let msg = s.offer(route("r1"), "desk", Vec::new(), Vec::new());
         assert!(matches!(
             msg,
             ControlMessage::Route(RouteControl::Offer { .. })
@@ -425,6 +441,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
                 video: Vec::new(),
+                audio: Vec::new(),
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
@@ -447,6 +464,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
                 video: Vec::new(),
+                audio: Vec::new(),
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Incoming);
@@ -456,7 +474,7 @@ mod tests {
     #[test]
     fn reject_marks_rejected_with_reason() {
         let mut s = Session::new("this");
-        s.offer(route("r1"), "desk", Vec::new());
+        s.offer(route("r1"), "desk", Vec::new(), Vec::new());
         s.handle(
             "desk".into(),
             ControlMessage::Route(RouteControl::Reject {
@@ -481,6 +499,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
                 video: Vec::new(),
+                audio: Vec::new(),
             }),
         );
         let effects = s.handle(
@@ -501,6 +520,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
                 video: Vec::new(),
+                audio: Vec::new(),
             }),
         );
         let effects = s.drop_peer(&"this".into());
@@ -516,6 +536,7 @@ mod tests {
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
                 video: Vec::new(),
+                audio: Vec::new(),
             }),
         );
         // The route's peer may re-key and tune it.

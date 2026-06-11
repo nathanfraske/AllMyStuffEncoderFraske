@@ -186,6 +186,14 @@ pub enum RouteControl {
         /// never to a broken stream.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         video: Vec<String>,
+        /// Audio transports the *offerer* can consume for an audio
+        /// route, best first (today: `"opus"` — the mesh's RTP audio
+        /// lane). Same degradation contract as `video`: absent or
+        /// unrecognized on either side means PCM frames over the media
+        /// channel, never a broken stream. Only meaningful when the
+        /// offerer is the route's sink (the console's listen leg).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        audio: Vec<String>,
     },
     /// "Go ahead" — media may start.
     Accept { route_id: String },
@@ -349,11 +357,39 @@ mod tests {
             RouteControl::Offer { route, .. } => RouteControl::Offer {
                 route,
                 video: vec!["h264".into()],
+                audio: Vec::new(),
             },
             _ => unreachable!(),
         };
         let s = serde_json::to_string(&offered).unwrap();
         assert!(s.contains("\"video\":[\"h264\"]"));
+        let back: RouteControl = serde_json::from_str(&s).unwrap();
+        assert_eq!(offered, back);
+    }
+
+    #[test]
+    fn route_offer_audio_accepts_skew_both_ways() {
+        // The audio accepts ride the same contract as video's: absent
+        // decodes as "PCM channel only", empty serializes invisibly,
+        // populated round-trips.
+        let legacy = r#"{"kind":"offer","route":{
+            "id":"r1","from":"a:system-audio","to":"b:system-audio","media":"audio"
+        }}"#;
+        let rc: RouteControl = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(rc, RouteControl::Offer { ref audio, .. } if audio.is_empty()));
+        let s = serde_json::to_string(&rc).unwrap();
+        assert!(!s.contains("audio\":["));
+
+        let offered = match rc {
+            RouteControl::Offer { route, .. } => RouteControl::Offer {
+                route,
+                video: Vec::new(),
+                audio: vec!["opus".into()],
+            },
+            _ => unreachable!(),
+        };
+        let s = serde_json::to_string(&offered).unwrap();
+        assert!(s.contains("\"audio\":[\"opus\"]"));
         let back: RouteControl = serde_json::from_str(&s).unwrap();
         assert_eq!(offered, back);
     }

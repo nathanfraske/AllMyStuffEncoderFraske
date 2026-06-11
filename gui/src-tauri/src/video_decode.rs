@@ -111,7 +111,9 @@ impl DecodeBridge {
 
     pub fn stop(&self, route_id: &str) {
         if self.routes.lock().remove(route_id).is_some() {
-            tracing::info!("native H.264 decoder stopped for {route_id}");
+            // The start line names the decode path in use; the stop is
+            // routine teardown (every tab switch in native mode).
+            tracing::debug!("native H.264 decoder stopped for {route_id}");
         }
     }
 }

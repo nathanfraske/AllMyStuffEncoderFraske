@@ -74,6 +74,10 @@ enigo = "0.6"
 # from source — needs only a C/C++ toolchain). MJPEG stays as the
 # fallback wherever this can't run or the peer can't decode.
 openh264 = "0.9"
+# Opus encode/decode for the mesh's audio track lane (libopus, built
+# from source like openh264). The PCM-over-channel stream stays as the
+# fallback for older daemons/peers, exactly like MJPEG for video.
+opus = "0.3"
 # Access units ride the daemon control socket as base64 (same encoding
 # the session crate's media frames use).
 base64 = "0.22"
@@ -84,8 +88,13 @@ allmystuff-pixels = { path = "pixels" }
 # PR_SET_PDEATHSIG for the daemon lifetime tie (see
 # daemon_spawn::tie_daemon_lifetime) — the kernel SIGKILLs the daemon
 # when a crashed or force-killed app can no longer clean up after itself.
+# libloading dlopens libpulse-simple at runtime for system-audio capture
+# (the monitor of the default sink) — dlopen rather than a link-time
+# dependency so the binary still runs on a box without a pulse server.
+# Both crates are already in the resolved tree (Tauri's Linux stack).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+libloading = "0.8"
 
 # In-house DXGI Output Duplication for screen capture, and the
 # virtual-desktop absolute mouse move (enigo's Abs can only reach the

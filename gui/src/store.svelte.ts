@@ -209,7 +209,7 @@ class AppStore {
   // Route ids the console owns, by channel, so it tears down exactly what it
   // set up (and nothing a different connection made).
   private consoleVideoRouteId: string | null = null;
-  private consoleAudioRouteIds: string[] = [];
+  private consoleAudioRouteId: string | null = null;
   private consoleControlRouteId: string | null = null;
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
@@ -753,6 +753,17 @@ class AppStore {
     }
     this.routeStates = states;
 
+    // A console waiting on its video backbone: the route just went
+    // active, so bring the session's default legs (audio, control) up
+    // now — sequenced behind the picture instead of racing it at open.
+    if (
+      this.consoleAutoLegs &&
+      this.consoleVideoLive &&
+      states[this.consoleVideoLive]?.state === "active"
+    ) {
+      this.startConsoleAutoLegs();
+    }
+
     this.reconcileFleetRelationships();
     this.reconcileShares();
   }
@@ -988,8 +999,12 @@ class AppStore {
 
   /** Start the console session *in this window* — the body of a console
    *  window (and the web preview's popover). Wires the backbone video route
-   *  to this machine's display now; audio and control are toggled from
-   *  inside the console. */
+   *  to this machine's display first; audio passthrough and keyboard &
+   *  mouse come up automatically the moment the video route reports
+   *  active — a console is the whole session by default, like sitting
+   *  down at the machine, but the legs are sequenced (video, then the
+   *  rest) instead of racing each other onto the wire at open. The
+   *  toggles inside are the off-switches. */
   openConsoleHere(nodeId: string) {
     const node = this.node(nodeId);
     if (!this.consoleAllowed(node, nodeId)) return;
@@ -997,7 +1012,7 @@ class AppStore {
     this.consoleAudio = false;
     this.consoleControl = false;
     this.consoleVideoRouteId = null;
-    this.consoleAudioRouteIds = [];
+    this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
@@ -1005,7 +1020,29 @@ class AppStore {
     this.consoleCodec = "auto";
     this.consoleTune = {};
     void this.applyConsoleVideo();
+    if (this.consoleVideoLive) {
+      // The usual case: video is on the wire — the snapshot that flips
+      // it active triggers the remaining legs (see applySessionSnapshot).
+      this.consoleAutoLegs = true;
+    } else {
+      // No video path (nothing to wait for) — bring the legs up now; an
+      // audio-only console is still a session.
+      this.startConsoleAutoLegs();
+    }
     this.toast("ok", `Console open on ${node!.label}`);
+  }
+
+  /** Pending "bring audio + control up once video is live" — set at console
+   *  open, consumed by the first snapshot showing the video route active. */
+  private consoleAutoLegs = false;
+
+  /** The console's default session legs. Only ever turns things *on* — a
+   *  toggle the user already flipped stays exactly as they left it. */
+  private startConsoleAutoLegs() {
+    this.consoleAutoLegs = false;
+    if (!this.consoleNodeId) return;
+    if (!this.consoleAudio) this.toggleConsoleAudio();
+    if (!this.consoleControl) this.toggleConsoleControl();
   }
 
   /** The gate both console entries share: a known remote machine that runs
@@ -1040,10 +1077,10 @@ class AppStore {
   closeConsole(): Promise<unknown> {
     const pending: Promise<unknown>[] = [];
     if (this.consoleVideoRouteId) pending.push(this.disconnect(this.consoleVideoRouteId));
-    for (const id of this.consoleAudioRouteIds) pending.push(this.disconnect(id));
+    if (this.consoleAudioRouteId) pending.push(this.disconnect(this.consoleAudioRouteId));
     if (this.consoleControlRouteId) pending.push(this.disconnect(this.consoleControlRouteId));
     this.consoleVideoRouteId = null;
-    this.consoleAudioRouteIds = [];
+    this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
@@ -1051,6 +1088,7 @@ class AppStore {
     this.consoleInput = null;
     this.consoleAudio = false;
     this.consoleControl = false;
+    this.consoleAutoLegs = false;
     return Promise.allSettled(pending);
   }
 
@@ -1121,35 +1159,33 @@ class AppStore {
     void this.applyConsoleVideo();
   }
 
-  /** Audio passthrough: hear the remote *and* send it your audio. */
+  /** Audio passthrough: play what the remote machine is playing — its
+   *  system audio, loopback-captured on the far side — on this machine's
+   *  speakers. Deliberately listen-only, not a call: the console never
+   *  opens a microphone. The far side's loopback captures *everything*
+   *  it plays, so any audio we injected would come straight back one
+   *  round trip later as an echo (there's no echo cancellation yet) —
+   *  the clean design is that nothing ever flows that way. */
   toggleConsoleAudio() {
     const remote = this.consoleNodeId;
     if (!remote) return;
     if (this.consoleAudio) {
-      for (const id of this.consoleAudioRouteIds) this.disconnect(id);
-      this.consoleAudioRouteIds = [];
+      if (this.consoleAudioRouteId) this.disconnect(this.consoleAudioRouteId);
+      this.consoleAudioRouteId = null;
       this.consoleAudio = false;
       return;
     }
-    // Two legs: hear the remote, and send it your audio. The channel reads
-    // as on when either leg is live; only legs this call created are owned
-    // for teardown.
-    const owned: string[] = [];
-    let anyLive = false;
-    const legs: Array<[Capability | undefined, Capability | undefined]> = [
-      [matchEndpoint(this.catalog, remote, "audio", "provide"), matchEndpoint(this.catalog, this.localId, "audio", "consume")],
-      [matchEndpoint(this.catalog, this.localId, "audio", "provide"), matchEndpoint(this.catalog, remote, "audio", "consume")],
-    ];
-    for (const [from, to] of legs) {
-      if (!from || !to) continue;
-      const leg = this.consoleConnect(from.id, to.id);
-      if (!leg) continue;
-      anyLive = true;
-      if (leg.created) owned.push(leg.id);
+    const from = matchEndpoint(this.catalog, remote, "audio", "provide");
+    const to = matchEndpoint(this.catalog, this.localId, "audio", "consume");
+    const leg = from && to ? this.consoleConnect(from.id, to.id) : null;
+    if (leg) {
+      // Own the route for teardown only if this call created it (never a
+      // pre-existing one the user wired from the graph).
+      this.consoleAudioRouteId = leg.created ? leg.id : null;
+      this.consoleAudio = true;
+    } else {
+      this.toast("warn", "No audio path to that machine");
     }
-    this.consoleAudioRouteIds = owned;
-    this.consoleAudio = anyLive;
-    if (!anyLive) this.toast("warn", "No audio path to that machine");
   }
 
   /** Send this machine's keyboard & mouse to the remote (input injection on
