@@ -238,7 +238,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    input for a scanned mic — and streams it
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
-   speak the lane (myownmesh > 0.2.3), as PCM `AudioFrame`s over
+   speak the lane (myownmesh ≥ 0.2.4), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step

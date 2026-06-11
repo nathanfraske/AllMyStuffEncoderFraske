@@ -1867,7 +1867,7 @@ impl Mesh {
                 _ => {
                     if !self.daemon_audio.load(Ordering::SeqCst) {
                         tracing::info!(
-                            "daemon doesn't speak the audio track lane (needs myownmesh > 0.2.3) — audio rides the data channel"
+                            "daemon doesn't speak the audio track lane (needs myownmesh ≥ 0.2.4) — audio rides the data channel"
                         );
                     }
                 }
