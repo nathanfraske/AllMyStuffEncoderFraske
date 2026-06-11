@@ -155,7 +155,13 @@ Tauri 2 + Svelte 5, a client of the daemon.
   `build.rs` fetches the rev pinned in `.myownmesh-rev` and stages it as a
   Tauri sidecar (`binaries/myownmesh-<triple>`, `externalBin`), so the mesh
   is there for free — `daemon_spawn` resolves the bundled binary and
-  auto-spawns it. `update_*` commands drive `allmystuff-updater`.
+  auto-spawns it. (That covers source builds and the OS bundles; the
+  portable `curl | sh` install is a bare binary with no sidecar inside, so
+  there the *installer* guarantees the daemon instead — reusing an
+  installed `myownmesh` that meets the pin, asking an older one to update
+  itself, or installing one next to the app, which `daemon_spawn` finds in
+  the same next-to-the-binary slot.) `update_*` commands drive
+  `allmystuff-updater`.
 - **Front-end** (`src/`) — the graph. `catalog.ts` is a faithful TypeScript
   port of the graph crate's rules, so the canvas is fully interactive on
   demo data with no backend; when the backend is present it validates the

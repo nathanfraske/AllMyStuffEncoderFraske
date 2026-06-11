@@ -2,8 +2,9 @@
 # Run from PowerShell: `powershell -ExecutionPolicy Bypass -File scripts/bootstrap.ps1`
 #
 # Installs Rust (+ the MSVC linker), Node, pnpm, WebView2, and `just`, then
-# the GUI dependencies — everything `just dev` needs. For live mesh (real
-# peers + audio streaming), also run `just mesh-install` afterwards.
+# the GUI dependencies — everything `just dev` needs. The mesh daemon is
+# not a prerequisite: the GUI's build.rs fetches and bundles it
+# automatically on the first `just dev`.
 
 $ErrorActionPreference = "Stop"
 
@@ -93,4 +94,4 @@ Push-Location gui
 pnpm install --silent
 Pop-Location
 
-Log "Done. 'just dev' runs the app. For live mesh, also run: just mesh-install"
+Log "Done. 'just dev' runs the app (the first build fetches + bundles the mesh daemon automatically)."

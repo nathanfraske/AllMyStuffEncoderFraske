@@ -16,8 +16,8 @@ help:
 
 # Install dev prerequisites: the WebKitGTK/GTK + ALSA libs the Tauri +
 # cpal backend links against, plus Rust, Node, and pnpm. After this,
-# `just dev` runs the app; `just mesh-install` adds the mesh daemon for
-# live (non-demo) mode.
+# `just dev` runs the app — the mesh daemon is bundled automatically by
+# the GUI's first build (it fetches the rev pinned in .myownmesh-rev).
 [unix]
 [doc("Install dev prerequisites (WebKit/GTK/ALSA, Rust, Node, pnpm).")]
 setup:

@@ -31,9 +31,10 @@ pub fn launch() -> ExitCode {
         None => {
             eprintln!("allmystuff: couldn't find the `allmystuff-gui` desktop app.");
             eprintln!();
-            eprintln!("Install the app bundle, point ALLMYSTUFF_GUI_BIN at its path, or");
+            eprintln!("Re-run the installer (it fetches the app by default), install an OS");
+            eprintln!("bundle from Releases, point ALLMYSTUFF_GUI_BIN at the binary, or");
             eprintln!("run the CLI directly (`allmystuff scan`). From a source checkout,");
-            eprintln!("`just gui-dev` runs the app.");
+            eprintln!("`just dev` runs the app.");
             return ExitCode::FAILURE;
         }
     };

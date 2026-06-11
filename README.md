@@ -46,7 +46,8 @@ is built for everyone else. It does three things:
 One command — detects platform, fetches the binaries from
 [GitHub Releases](https://github.com/mrjeeves/AllMyStuff/releases),
 verifies SHA-256, drops `allmystuff` **and** the `allmystuff-gui`
-desktop app on your PATH (so a bare `allmystuff` opens the app).
+desktop app on your PATH (so a bare `allmystuff` opens the app), and
+brings the mesh along with it.
 
 ```sh
 # macOS / Linux
@@ -58,18 +59,32 @@ curl -fsSL https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/in
 irm https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.ps1 | iex
 ```
 
+**The mesh comes along.** Live machines run on a
+[MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) daemon, and the
+installer sorts that out too — there is no second install command:
+
+- a `myownmesh` that's already installed and recent enough (at or
+  above the version pinned in [`.myownmesh-rev`](.myownmesh-rev)) is
+  **used as-is**;
+- an older one is **asked to update itself** (`myownmesh update`);
+- none at all → the daemon is **installed next to the app**,
+  downloaded and SHA-256-verified from MyOwnMesh's releases.
+
+The app starts and manages the daemon by itself — and it opens into a
+populated demo graph even with no mesh at all, so a failed or skipped
+daemon never blocks you from exploring. Pass `--no-mesh` (Unix) /
+`-NoMesh` (Windows) to leave the daemon alone.
+
 The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
 writable) on Unix and `%LOCALAPPDATA%\Programs\AllMyStuff` on
 Windows, and adds the directory to PATH if it isn't already there.
 The desktop app goes in by default; pass `--no-gui` (Unix) or
-`-NoGui` (Windows) for a CLI-only install on a headless box. The
-app opens into a populated demo graph with no mesh at all; for live
-machines it uses a `myownmesh` daemon found on PATH — one
-[MyOwnMesh install command](https://github.com/mrjeeves/MyOwnMesh#install)
-away. The GUI binary relies on the system webview (libwebkit2gtk /
-WebView2 / WKWebView); for full OS integration (menu entry, icon,
-the mesh daemon bundled in) grab the `.deb` / `.AppImage` / `.dmg` /
-`.msi` bundle from Releases instead.
+`-NoGui` (Windows) for a CLI-only install on a headless box — that
+skips the daemon too, since only the desktop app uses it. The GUI
+binary relies on the system webview (libwebkit2gtk / WebView2 /
+WKWebView); for full OS integration (menu entry, icon, the mesh
+daemon bundled inside the package) grab the `.deb` / `.AppImage` /
+`.dmg` / `.msi` bundle from Releases instead.
 
 Prefer a tarball directly? The portable binaries
 (`allmystuff-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on

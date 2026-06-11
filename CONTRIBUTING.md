@@ -11,9 +11,10 @@ just setup     # one-time: WebKit/GTK/ALSA libs, Rust, Node, pnpm, GUI deps
 just dev       # run the desktop app with hot reload
 ```
 
-`just dev` opens the app on a populated demo graph, so you get the full UI
-with no mesh running. For live peers + audio streaming, also run
-`just mesh-install` once (see [Live mesh](#live-mesh-real-peers--streaming)).
+`just dev` opens the app on a populated demo graph — and with live mesh
+too: the first GUI build fetches the pinned `myownmesh` daemon and bundles
+it as a sidecar automatically, nothing extra to install (see
+[Live mesh](#live-mesh-real-peers--streaming)).
 
 Install [`just`](https://github.com/casey/just) first (`cargo install just`,
 `brew install just`, `winget install Casey.Just`, or your package manager).
