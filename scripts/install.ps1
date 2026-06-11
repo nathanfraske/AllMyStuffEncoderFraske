@@ -6,7 +6,17 @@
 #
 # Installs both the `allmystuff` CLI and the `allmystuff-gui` desktop
 # app (the app is small and makes a bare `allmystuff` open it — pass
-# -NoGui for a CLI-only install).
+# -NoGui for a CLI-only install), then makes sure the `myownmesh`
+# daemon the app's live mode runs on is in place:
+#
+#   * an installed daemon that's new enough (>= the version pinned in
+#     .myownmesh-rev) is used as-is;
+#   * an older one is asked to update itself (`myownmesh update`);
+#   * none at all -> the latest MyOwnMesh release is installed next to
+#     the app (same download + SHA-256 verification as the app itself).
+#
+# Pass -NoMesh to leave the daemon entirely alone. Mesh trouble never
+# fails the install — the app always opens (demo graph) without it.
 #
 # Usage (PowerShell):
 #   irm https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.ps1 | iex
@@ -18,8 +28,10 @@ param(
     [switch]$DryRun,
     [switch]$FromSource,
     [switch]$NoGui,
+    [switch]$NoMesh,
     [string]$Prefix = "$env:LOCALAPPDATA\Programs\AllMyStuff",
-    [string]$Repo = $(if ($env:ALLMYSTUFF_REPO) { $env:ALLMYSTUFF_REPO } else { "mrjeeves/AllMyStuff" })
+    [string]$Repo = $(if ($env:ALLMYSTUFF_REPO) { $env:ALLMYSTUFF_REPO } else { "mrjeeves/AllMyStuff" }),
+    [string]$MeshRepo = $(if ($env:MYOWNMESH_REPO) { $env:MYOWNMESH_REPO } else { "mrjeeves/MyOwnMesh" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +47,7 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $asset = "allmystuff-windows-$arch.zip"
 $guiAsset = "allmystuff-gui-windows-$arch.zip"
+$meshAsset = "myownmesh-windows-$arch.zip"
 
 function Install-FromZip([string]$zipPath) {
     if (-not (Test-Path $Prefix)) {
@@ -90,18 +103,24 @@ function Try-Release {
     try {
         $zip = Join-Path $tmp $asset
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        $shaUrl = "$url.sha256"
+        # A missing sidecar downgrades to a warning; a present-but-wrong
+        # checksum must never install.
+        $shaFile = "$zip.sha256"
+        $haveSha = $true
         try {
-            $shaFile = "$zip.sha256"
-            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
+            Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing
+        } catch {
+            Warn "No SHA256 sidecar; skipping integrity check."
+            $haveSha = $false
+        }
+        if ($haveSha) {
             $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
             $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
             if ($expected -ne $actual) {
-                throw "SHA256 mismatch: expected $expected, got $actual"
+                Err "SHA256 mismatch for ${asset}: expected $expected, got $actual — not installing it."
+                exit 1
             }
             Log "SHA256 OK"
-        } catch {
-            Warn "No SHA256 sidecar or check failed; skipping integrity check."
         }
         Install-FromZip $zip
         return $true
@@ -135,18 +154,23 @@ function Try-ReleaseGui {
     try {
         $zip = Join-Path $tmp $guiAsset
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        $shaUrl = "$url.sha256"
+        # Missing sidecar -> warn and continue; wrong checksum -> don't install.
+        $shaFile = "$zip.sha256"
+        $haveSha = $true
         try {
-            $shaFile = "$zip.sha256"
-            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
+            Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing
+        } catch {
+            Warn "No SHA256 sidecar for GUI; skipping integrity check."
+            $haveSha = $false
+        }
+        if ($haveSha) {
             $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
             $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
             if ($expected -ne $actual) {
-                throw "SHA256 mismatch: expected $expected, got $actual"
+                Warn "SHA256 mismatch for $guiAsset — not installing the GUI."
+                return $false
             }
             Log "SHA256 OK"
-        } catch {
-            Warn "No SHA256 sidecar or check failed for GUI; skipping integrity check."
         }
         Install-GuiFromZip $zip
         return $true
@@ -155,6 +179,159 @@ function Try-ReleaseGui {
         return $false
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The mesh daemon. The desktop app's live mode runs on `myownmesh`
+# (demo mode needs nothing), so the installer makes sure a usable daemon
+# is in place — without ever failing the app install over it:
+#
+#   1. installed and new enough (>= the .myownmesh-rev pin) -> used as-is;
+#   2. installed but older -> asked to update itself (`myownmesh update`);
+#   3. missing -> the latest MyOwnMesh release is installed next to the
+#      app, where the app finds it without any PATH refresh.
+
+# The minimum daemon version this app wants: the rev pinned in
+# .myownmesh-rev, read from the checkout when running from one, fetched
+# from the repo otherwise. $null when the pin is unreachable or isn't a
+# version tag (a sha pin can't be compared) — any installed daemon
+# passes then.
+function Get-MeshMinVersion {
+    $rev = $null
+    if ($PSScriptRoot) {
+        $local = Join-Path (Split-Path $PSScriptRoot -Parent) ".myownmesh-rev"
+        if (Test-Path $local) { $rev = (Get-Content $local -Raw).Trim() }
+    }
+    if (-not $rev) {
+        try {
+            $rev = (Invoke-RestMethod -Uri "https://raw.githubusercontent.com/$Repo/main/.myownmesh-rev" -Headers @{ "User-Agent" = "allmystuff-installer" }).Trim()
+        } catch {
+            return $null
+        }
+    }
+    if ($rev -match '^v(\d+\.\d+(\.\d+)?)') { return [version]$Matches[1] }
+    return $null
+}
+
+# `myownmesh --version` -> [version]0.2.4 ($null when it won't answer).
+function Get-MeshVersion([string]$exe) {
+    try {
+        $out = (& $exe --version 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+        return [version](("$out".Trim() -split '\s+')[-1].TrimStart('v'))
+    } catch {
+        return $null
+    }
+}
+
+# Fetch the daemon zip from MyOwnMesh's latest release (SHA-256 verified,
+# like the app's own assets) and install it next to the app.
+function Try-ReleaseMesh {
+    $api = "https://api.github.com/repos/$MeshRepo/releases/latest"
+    try {
+        $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "allmystuff-installer" }
+    } catch {
+        Warn "MyOwnMesh releases unreachable: $($_.Exception.Message)"
+        return $false
+    }
+    $match = $release.assets | Where-Object { $_.name -eq $meshAsset } | Select-Object -First 1
+    if (-not $match) {
+        Warn "No release asset matched $meshAsset in MyOwnMesh's latest release."
+        return $false
+    }
+    $url = $match.browser_download_url
+    Log "Downloading $url"
+
+    $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "myownmesh-install-$([guid]::NewGuid())")
+    try {
+        $zip = Join-Path $tmp $meshAsset
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        # Missing sidecar -> warn and continue; wrong checksum -> don't install.
+        $shaFile = "$zip.sha256"
+        $haveSha = $true
+        try {
+            Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing
+        } catch {
+            Warn "No SHA256 sidecar for the daemon; skipping integrity check."
+            $haveSha = $false
+        }
+        if ($haveSha) {
+            $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
+            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+            if ($expected -ne $actual) {
+                Warn "SHA256 mismatch for $meshAsset — not installing the daemon."
+                return $false
+            }
+            Log "SHA256 OK"
+        }
+        Expand-Archive -Path $zip -DestinationPath $Prefix -Force
+        $exe = Join-Path $Prefix "myownmesh.exe"
+        if (-not (Test-Path $exe)) {
+            Warn "myownmesh.exe not found in $meshAsset after extraction."
+            return $false
+        }
+        Log "Installed: $exe"
+        return $true
+    } catch {
+        Warn "Daemon download/install failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+function Ensure-Mesh {
+    # Prefer a daemon sitting next to the app (where we'd install one —
+    # the app checks there first too), then PATH.
+    $existing = $null
+    $local = Join-Path $Prefix "myownmesh.exe"
+    if (Test-Path $local) {
+        $existing = $local
+    } else {
+        $cmd = Get-Command myownmesh -ErrorAction SilentlyContinue
+        if ($cmd) { $existing = $cmd.Source }
+    }
+    $min = Get-MeshMinVersion
+
+    if ($existing) {
+        $ver = Get-MeshVersion $existing
+        if ($ver -and (-not $min -or $ver -ge $min)) {
+            if ($min) { Log "Mesh: using the installed myownmesh v$ver at $existing (needs v$min+)." }
+            else      { Log "Mesh: using the installed myownmesh v$ver at $existing." }
+            return
+        }
+        if ($ver) { Log "Mesh: installed myownmesh is v$ver but this release wants v$min+." }
+        else      { Log "Mesh: $existing didn't answer --version." }
+        if ($DryRun) {
+            Log "(dry-run) would ask it to update itself: myownmesh update"
+            return
+        }
+        Log "Asking it to update itself (myownmesh update)…"
+        try { & $existing update } catch { Warn "myownmesh update failed: $($_.Exception.Message)" }
+        $ver = Get-MeshVersion $existing
+        if ($ver -and (-not $min -or $ver -ge $min)) {
+            Log "Mesh: myownmesh is now v$ver."
+        } else {
+            Warn "Mesh: couldn't bring myownmesh up to v$min (see above). The app still runs —"
+            Warn "an older daemon just lacks the newer mesh features. Retry later with: myownmesh update"
+        }
+        return
+    }
+
+    if ($DryRun) {
+        Log "(dry-run) would install the myownmesh daemon ($meshAsset) next to the app"
+        return
+    }
+    Log "Mesh: no myownmesh daemon found — installing it next to the app…"
+    if (Try-ReleaseMesh) {
+        $ver = Get-MeshVersion (Join-Path $Prefix "myownmesh.exe")
+        if ($ver) { Log "Mesh: installed myownmesh v$ver — the app starts it automatically." }
+        else      { Log "Mesh: installed myownmesh — the app starts it automatically." }
+    } else {
+        Warn "Mesh: couldn't fetch the daemon. The app still opens (demo graph); for"
+        Warn "live machines, re-run this installer later or use MyOwnMesh's:"
+        Warn ('  iex "& { $(irm https://raw.githubusercontent.com/' + $MeshRepo + '/main/scripts/install.ps1) } -NoGui"')
     }
 }
 
@@ -212,9 +389,12 @@ if ($FromSource -or -not (Try-Release)) {
 # Desktop app (allmystuff-gui). On by default; -NoGui skips it. Only
 # attempted on the release path — building the GUI from source needs
 # the full Tauri/pnpm toolchain, out of scope for this installer.
+$guiInstalled = $false
 if (-not $NoGui) {
     if ($installedFromRelease) {
-        if (-not (Try-ReleaseGui)) {
+        if (Try-ReleaseGui) {
+            $guiInstalled = $true
+        } else {
             Warn "GUI binary not installed; a bare 'allmystuff' will print a hint until it is. Re-run the installer later, or build it from gui\."
         }
     } elseif ($DryRun) {
@@ -225,12 +405,29 @@ if (-not $NoGui) {
     }
 }
 
+# Mesh daemon — see the block above Ensure-Mesh for the rules. Only the
+# desktop app talks to the daemon, so a CLI-only install skips it; a GUI
+# built from source bundles its own (gui's build.rs).
+if ($NoMesh) {
+    Log "Skipping the mesh daemon (-NoMesh)."
+} elseif ($NoGui) {
+    Log "CLI-only install; skipping the mesh daemon (only the desktop app uses it)."
+} elseif ($guiInstalled) {
+    Ensure-Mesh
+} else {
+    Log "Mesh: skipped — no desktop app was installed, and only the app uses the"
+    Log "daemon (a GUI built from gui\ bundles its own)."
+}
+
 if (-not $NoGui) {
     Log "Done. Try: allmystuff (opens the app) | allmystuff scan | allmystuff capabilities"
-    Log "The app opens into a demo graph with no mesh at all. For live machines it"
-    Log "uses a 'myownmesh' daemon from PATH (the .msi/.exe bundles on Releases ship"
-    Log "it built in). Get the daemon with:"
-    Log "  irm https://raw.githubusercontent.com/mrjeeves/MyOwnMesh/main/scripts/install.ps1 | iex"
+    Log "The app opens into a demo graph even with no mesh. Live machines run on the"
+    Log "'myownmesh' daemon (handled above), which the app starts and manages"
+    Log "automatically."
+    if ($NoMesh) {
+        Log "You skipped it (-NoMesh) — when you want live mode:"
+        Log ('  iex "& { $(irm https://raw.githubusercontent.com/' + $MeshRepo + '/main/scripts/install.ps1) } -NoGui"')
+    }
 } else {
     Log "Done. Try: allmystuff scan | allmystuff capabilities | allmystuff update"
 }

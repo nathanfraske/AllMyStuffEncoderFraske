@@ -8,9 +8,9 @@
 # step dies with "pnpm: command not found". This mirrors MyOwnMesh /
 # MyOwnLLM so the three apps share one setup story.
 #
-# For live mesh (real peers + audio streaming) you also need the
-# `myownmesh` daemon — run `just mesh-install` once after this. The app
-# runs fine in demo mode without it.
+# The `myownmesh` daemon is not a prerequisite: the GUI's build.rs
+# fetches and bundles it automatically on the first `just dev` (and the
+# app runs fine in demo mode without any mesh at all).
 #
 # Idempotent: re-running is cheap and safe — anything already present is
 # skipped.
@@ -190,4 +190,4 @@ log "Installing GUI dependencies…"
 ( cd gui && pnpm install --silent )
 
 log "✓ setup complete — \`just dev\` runs the app."
-log "  For live peers + audio streaming, also run: just mesh-install"
+log "  (The first build fetches + bundles the mesh daemon automatically.)"
