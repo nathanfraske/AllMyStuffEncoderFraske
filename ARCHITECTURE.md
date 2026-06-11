@@ -240,10 +240,14 @@ Tauri 2 + Svelte 5, a client of the daemon.
    *mic* capture whose first seconds are pure zeros names the OS
    microphone permission (macOS/Windows deny with silence, not an error —
    a silent system capture is just a quiet desktop), and a playback
-   that's never fed says so once. The console's audio passthrough wires
-   exactly this pair: the remote's `system-audio` to your speakers, your
-   default mic (never your own `system-audio`, which would echo the
-   remote's sound back at it) to its speakers. A display route
+   that's never fed says so once. The console's audio passthrough is
+   deliberately **listen-only** — the remote's `system-audio` to your
+   speakers, nothing back. It's a console, not a call: the far side's
+   loopback captures *everything* it plays, so any audio the console
+   injected (a mic leg) would ride that loopback straight back and land
+   one round trip later as a trailing echo. Until echo cancellation
+   exists, the console simply never opens a microphone — wiring a mic
+   somewhere stays a deliberate act on the graph. A display route
    streams the routed screen — the primary for the synthetic `screen`, the
    named monitor for a `screen:<id>` capability — from a persistent capture
    session (in-house DXGI Output Duplication on Windows — xcap's recorder

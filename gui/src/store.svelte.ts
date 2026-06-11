@@ -209,7 +209,7 @@ class AppStore {
   // Route ids the console owns, by channel, so it tears down exactly what it
   // set up (and nothing a different connection made).
   private consoleVideoRouteId: string | null = null;
-  private consoleAudioRouteIds: string[] = [];
+  private consoleAudioRouteId: string | null = null;
   private consoleControlRouteId: string | null = null;
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
@@ -997,7 +997,7 @@ class AppStore {
     this.consoleAudio = false;
     this.consoleControl = false;
     this.consoleVideoRouteId = null;
-    this.consoleAudioRouteIds = [];
+    this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
@@ -1040,10 +1040,10 @@ class AppStore {
   closeConsole(): Promise<unknown> {
     const pending: Promise<unknown>[] = [];
     if (this.consoleVideoRouteId) pending.push(this.disconnect(this.consoleVideoRouteId));
-    for (const id of this.consoleAudioRouteIds) pending.push(this.disconnect(id));
+    if (this.consoleAudioRouteId) pending.push(this.disconnect(this.consoleAudioRouteId));
     if (this.consoleControlRouteId) pending.push(this.disconnect(this.consoleControlRouteId));
     this.consoleVideoRouteId = null;
-    this.consoleAudioRouteIds = [];
+    this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
@@ -1121,52 +1121,33 @@ class AppStore {
     void this.applyConsoleVideo();
   }
 
-  /** Audio passthrough: hear what the remote machine is *playing* — its
-   *  system audio, which the far side loopback-captures — and talk to it
-   *  through your mic. The talk leg deliberately anchors on a real
-   *  microphone, never this machine's own system-audio: looping our
-   *  output back would ship the remote's sound straight back at it as
-   *  echo. No mic here simply means the session is listen-only. */
+  /** Audio passthrough: play what the remote machine is playing — its
+   *  system audio, loopback-captured on the far side — on this machine's
+   *  speakers. Deliberately listen-only, not a call: the console never
+   *  opens a microphone. The far side's loopback captures *everything*
+   *  it plays, so any audio we injected would come straight back one
+   *  round trip later as an echo (there's no echo cancellation yet) —
+   *  the clean design is that nothing ever flows that way. */
   toggleConsoleAudio() {
     const remote = this.consoleNodeId;
     if (!remote) return;
     if (this.consoleAudio) {
-      for (const id of this.consoleAudioRouteIds) this.disconnect(id);
-      this.consoleAudioRouteIds = [];
+      if (this.consoleAudioRouteId) this.disconnect(this.consoleAudioRouteId);
+      this.consoleAudioRouteId = null;
       this.consoleAudio = false;
       return;
     }
-    // Two legs. The channel reads as on when either leg is live; only
-    // legs this call created are owned for teardown.
-    const owned: string[] = [];
-    let anyLive = false;
-    const legs: Array<[Capability | undefined, Capability | undefined]> = [
-      [matchEndpoint(this.catalog, remote, "audio", "provide"), matchEndpoint(this.catalog, this.localId, "audio", "consume")],
-      [this.defaultMicrophone(this.localId), matchEndpoint(this.catalog, remote, "audio", "consume")],
-    ];
-    for (const [from, to] of legs) {
-      if (!from || !to) continue;
-      const leg = this.consoleConnect(from.id, to.id);
-      if (!leg) continue;
-      anyLive = true;
-      if (leg.created) owned.push(leg.id);
+    const from = matchEndpoint(this.catalog, remote, "audio", "provide");
+    const to = matchEndpoint(this.catalog, this.localId, "audio", "consume");
+    const leg = from && to ? this.consoleConnect(from.id, to.id) : null;
+    if (leg) {
+      // Own the route for teardown only if this call created it (never a
+      // pre-existing one the user wired from the graph).
+      this.consoleAudioRouteId = leg.created ? leg.id : null;
+      this.consoleAudio = true;
+    } else {
+      this.toast("warn", "No audio path to that machine");
     }
-    this.consoleAudioRouteIds = owned;
-    this.consoleAudio = anyLive;
-    if (!anyLive) this.toast("warn", "No audio path to that machine");
-  }
-
-  /** A node's scanned microphone to speak through — the flagged default
-   *  first. Distinct from `matchEndpoint`, which prefers the synthetic
-   *  machine endpoint (`system-audio`) that means "this machine's sound",
-   *  exactly what a talk leg must not source. */
-  private defaultMicrophone(nodeId: string): Capability | undefined {
-    return this.capsOf(nodeId)
-      .filter((c) => c.media === "audio" && canSource(c.flow) && c.origin === "microphone")
-      .sort(
-        (a, b) =>
-          Number(b.default ?? false) - Number(a.default ?? false) || a.id.localeCompare(b.id),
-      )[0];
   }
 
   /** Send this machine's keyboard & mouse to the remote (input injection on
