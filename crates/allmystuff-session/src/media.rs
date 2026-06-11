@@ -299,6 +299,7 @@ impl FileFrame {
 pub enum MediaPayload {
     Audio(AudioFrame),
     Video(VideoFrame),
+    VideoStatus(VideoStatusFrame),
     Input(InputEvent),
     Terminal(TermFrame),
     File(FileFrame),
@@ -312,6 +313,9 @@ impl MediaPayload {
             Some("video") => serde_json::from_value(payload)
                 .ok()
                 .map(MediaPayload::Video),
+            Some("vstat") => serde_json::from_value(payload)
+                .ok()
+                .map(MediaPayload::VideoStatus),
             Some("input") => serde_json::from_value(payload)
                 .ok()
                 .map(MediaPayload::Input),
@@ -331,6 +335,7 @@ impl MediaPayload {
         match self {
             MediaPayload::Audio(f) => &f.route,
             MediaPayload::Video(f) => &f.route,
+            MediaPayload::VideoStatus(f) => &f.route,
             MediaPayload::Input(f) => &f.route,
             MediaPayload::Terminal(f) => &f.route,
             MediaPayload::File(f) => &f.route,
@@ -367,6 +372,61 @@ pub enum MediaTagFile {
     #[default]
     #[serde(rename = "file")]
     File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaTagVStat {
+    #[default]
+    #[serde(rename = "vstat")]
+    VStat,
+}
+
+/// Why a display route's stream isn't (or is again) producing frames —
+/// the host's capture telling the viewer in-band, so "connected but no
+/// pixels" reads as the real condition instead of a silent black stage.
+/// Sent on state *changes* only; a peer that doesn't know the `vstat`
+/// tag drops it unread ([`MediaPayload::decode`]'s unknown-tag rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoStatusState {
+    /// Frames are flowing (clears any earlier condition).
+    Ok,
+    /// Wayland: the compositor's screen-share consent dialog is up on the
+    /// host and needs a human there to approve it.
+    WaitingConsent,
+    /// The capture session is live but the display produces no frames —
+    /// the monitor is asleep or blanked.
+    DisplayAsleep,
+    /// No capturable monitor right now (all outputs detached — deep-sleep
+    /// DP monitors drop off the desktop entirely).
+    NoMonitor,
+    /// Grabs are failing (denied screen-recording permission, a portal
+    /// that never granted, a locked session…) — `detail` carries the OS
+    /// error text.
+    GrabFailed,
+}
+
+/// One capture-status change of a display route, host → viewer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoStatusFrame {
+    /// Tag for demuxing off the shared media channel. Always `"vstat"`.
+    pub t: MediaTagVStat,
+    pub route: String,
+    pub state: VideoStatusState,
+    /// OS-level error text, when there is one worth showing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl VideoStatusFrame {
+    pub fn new(route: impl Into<String>, state: VideoStatusState, detail: Option<String>) -> Self {
+        VideoStatusFrame {
+            t: MediaTagVStat::VStat,
+            route: route.into(),
+            state,
+            detail,
+        }
+    }
 }
 
 impl VideoFrame {
@@ -588,6 +648,29 @@ mod tests {
             let back: InputEvent = serde_json::from_value(v).unwrap();
             assert_eq!(e, back);
         }
+    }
+
+    #[test]
+    fn video_status_round_trips_and_demuxes() {
+        let s = VideoStatusFrame::new(
+            "route:a→b",
+            VideoStatusState::WaitingConsent,
+            Some("portal dialog pending".into()),
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["t"], "vstat");
+        assert_eq!(v["state"], "waiting_consent");
+        assert!(matches!(
+            MediaPayload::decode(v),
+            Some(MediaPayload::VideoStatus(f))
+                if f.route == "route:a→b" && f.state == VideoStatusState::WaitingConsent
+        ));
+
+        // `Ok` with no detail keeps the wire shape minimal.
+        let ok =
+            serde_json::to_value(VideoStatusFrame::new("r", VideoStatusState::Ok, None)).unwrap();
+        assert!(ok.get("detail").is_none());
+        assert_eq!(ok["state"], "ok");
     }
 
     #[test]

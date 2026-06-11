@@ -33,7 +33,7 @@ pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
     FileEntry, FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, TermEvent, TermFrame,
-    VideoAssembler, VideoFrame,
+    VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState,
 };
 
 /// Which side of a route we are.

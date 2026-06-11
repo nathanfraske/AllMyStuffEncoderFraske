@@ -28,6 +28,9 @@ mod ownership;
 mod terminal;
 mod video;
 mod video_decode;
+mod wake;
+#[cfg(target_os = "linux")]
+mod wayland_capture;
 mod win_capture;
 
 use std::sync::Arc;

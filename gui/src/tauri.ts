@@ -298,6 +298,31 @@ export async function watchVideo(
   };
 }
 
+/** A display-route host explaining its capture state in-band (`vstat`
+ *  media frames): why frames aren't flowing — consent dialog pending on
+ *  the host, display asleep, no monitor, grabs failing — or `ok` when
+ *  they are (again). */
+export type VideoHostStatus = {
+  route: string;
+  state: "ok" | "waiting_consent" | "display_asleep" | "no_monitor" | "grab_failed";
+  detail?: string | null;
+};
+
+/** Listen for the host's capture-status reports on `routeId`, so the
+ *  console can explain a black stage instead of just showing one. No-op
+ *  in web mode. */
+export async function watchVideoStatus(
+  routeId: string,
+  cb: (s: VideoHostStatus) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<VideoHostStatus>("allmystuff://video-status", (e) => {
+    if (e.payload.route === routeId) cb(e.payload);
+  });
+  return () => unlisten();
+}
+
 // ---- terminal (the mesh-native shell) ----------------------------------
 
 /** Open (or focus) the dedicated terminal window for `node` — one window

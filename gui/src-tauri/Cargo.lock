@@ -48,6 +48,7 @@ dependencies = [
  "allmystuff-updater",
  "anyhow",
  "base64 0.22.1",
+ "core-foundation",
  "cpal",
  "dirs 5.0.1",
  "enigo",
@@ -59,6 +60,7 @@ dependencies = [
  "openh264",
  "opus",
  "parking_lot",
+ "pipewire",
  "portable-pty",
  "serde",
  "serde_json",
@@ -73,6 +75,7 @@ dependencies = [
  "windows 0.61.3",
  "windows-sys 0.60.2",
  "xcap",
+ "zbus",
 ]
 
 [[package]]
