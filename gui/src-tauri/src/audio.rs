@@ -57,6 +57,17 @@ pub enum CaptureSource {
     System,
 }
 
+/// Playout depth the inbound ring aims for — enough to ride normal
+/// network jitter without underruns, small enough that audio stays in
+/// step with the video stream (which drops stale frames and runs ~a
+/// frame or two behind live). Lip-sync offsets under ~100 ms read as
+/// "in sync".
+const TARGET_DEPTH_MS: usize = 80;
+/// Depth at which [`AudioBridge::feed`] trims the ring back to
+/// [`TARGET_DEPTH_MS`]. The gap between the two is hysteresis: a burst
+/// must overshoot meaningfully before a trim (an audible skip) is paid.
+const MAX_DEPTH_MS: usize = 200;
+
 /// One running route's audio resources (a capture or a playback thread).
 struct RouteAudio {
     stop: Arc<AtomicBool>,
@@ -234,10 +245,22 @@ impl AudioBridge {
         };
         let mut ring = pb.ring.lock();
         ring.extend(samples);
-        // Bound latency to ~1s; drop the oldest if we fall behind.
-        let cap = out_rate as usize;
-        while ring.len() > cap {
-            ring.pop_front();
+        // Keep playout close behind the live edge. The ring is a jitter
+        // buffer, not a reservoir: whatever piles up beyond MAX_DEPTH_MS —
+        // the device-open transient at session start, a network burst,
+        // slow clock drift between the two ends — becomes *permanent* lag
+        // behind the video stream (which drops stale frames) unless it's
+        // cut. Trim the *oldest* samples back to TARGET_DEPTH_MS: one
+        // small audible skip, and the audio is current again.
+        let max = (out_rate as usize / 1000) * MAX_DEPTH_MS;
+        let target = (out_rate as usize / 1000) * TARGET_DEPTH_MS;
+        if ring.len() > max.max(1) {
+            let excess = ring.len() - target;
+            ring.drain(..excess);
+            tracing::debug!(
+                "audio ring for {route_id} trimmed to {TARGET_DEPTH_MS} ms (held {} ms)",
+                (excess + target) / (out_rate as usize / 1000).max(1)
+            );
         }
     }
 
@@ -813,6 +836,31 @@ mod tests {
         let mut loud = LevelStats::new();
         loud.since = Instant::now() - Duration::from_secs(6);
         assert!(!loud.note(&[0, 900, 0], |_| {}), "signal present");
+    }
+
+    #[test]
+    fn playback_ring_trims_back_to_the_target_depth() {
+        // The ring is a jitter buffer: anything beyond MAX_DEPTH_MS is
+        // cut back to TARGET_DEPTH_MS (oldest samples dropped) so audio
+        // can't fall permanently behind the video stream. (No audio
+        // device in CI: the playback thread bails instantly, the ring
+        // never drains — exactly what this needs to be deterministic.)
+        let bridge = AudioBridge::new();
+        bridge.start_playback("r".into());
+        // Default device rate 48 kHz → target 3840 samples, max 9600.
+        let frame = AudioFrame::new("r", 0, 48_000, 1, vec![1i16; 4800]); // 100 ms
+        for _ in 0..5 {
+            bridge.feed("r", &frame);
+        }
+        let depth = {
+            let routes = bridge.playbacks.lock();
+            let pb = routes.get("r").and_then(|r| r.playback.as_ref()).unwrap();
+            let len = pb.ring.lock().len();
+            len
+        };
+        // 500 ms went in; the trims must have pulled it back to target.
+        assert_eq!(depth, (48_000 / 1000) * TARGET_DEPTH_MS);
+        bridge.stop("r");
     }
 
     #[test]

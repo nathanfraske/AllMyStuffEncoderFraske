@@ -82,8 +82,10 @@ pub struct Mesh {
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
-    /// task sends them on the media channel.
-    audio_out: mpsc::UnboundedSender<(String, AudioFrame)>,
+    /// task sends them on the media channel. Bounded like video: a stalled
+    /// link sheds buffers (a brief skip) instead of queueing a backlog the
+    /// listener then hears seconds late.
+    audio_out: mpsc::Sender<(String, AudioFrame)>,
     /// Outbound video, deliberately *bounded*: when the link can't keep up
     /// the capture side drops frames instead of queueing stale ones (an
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
@@ -212,9 +214,10 @@ struct State {
 
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
-        let (audio_out, mut audio_rx) = mpsc::unbounded_channel::<(String, AudioFrame)>();
-        // A shallow queue: at most a few frames in flight, so a slow link
-        // sheds load by dropping captures rather than growing latency.
+        // Shallow queues both: at most a few frames in flight, so a slow
+        // link sheds load by dropping captures rather than growing latency.
+        // Audio's 8 buffers are ~160 ms of slack.
+        let (audio_out, mut audio_rx) = mpsc::channel::<(String, AudioFrame)>(8);
         let (video_out, mut video_rx) = mpsc::channel::<(String, VideoPacket)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
@@ -253,7 +256,7 @@ impl Mesh {
         });
 
         // Forwarders: drain captured frames out to peers on the media
-        // channel — audio unbounded (tiny, ordered), video bounded. Send
+        // channel, both bounded (see the field docs). Send
         // failures are *surfaced* (rate-limited): a silently-dying media
         // plane is exactly the "connected but nothing arrives" mystery.
         {
@@ -1746,7 +1749,9 @@ impl Mesh {
                         .start_capture(route.id.clone(), source, move |pcm, rate| {
                             let s = seq.fetch_add(1, Ordering::Relaxed);
                             let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
-                            let _ = tx.send((peer.clone(), frame));
+                            // try_send: a full queue drops this buffer; the
+                            // next one carries fresher sound.
+                            let _ = tx.try_send((peer.clone(), frame));
                         });
                 }
                 // We sink: play inbound frames for this route.
