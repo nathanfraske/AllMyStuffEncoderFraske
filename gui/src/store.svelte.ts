@@ -988,8 +988,10 @@ class AppStore {
 
   /** Start the console session *in this window* — the body of a console
    *  window (and the web preview's popover). Wires the backbone video route
-   *  to this machine's display now; audio and control are toggled from
-   *  inside the console. */
+   *  to this machine's display and brings audio passthrough and keyboard &
+   *  mouse up with it — a console is the whole session by default, like
+   *  sitting down at the machine. The toggles inside are the off-switches
+   *  (and each leg reports itself when it has no path). */
   openConsoleHere(nodeId: string) {
     const node = this.node(nodeId);
     if (!this.consoleAllowed(node, nodeId)) return;
@@ -1005,6 +1007,8 @@ class AppStore {
     this.consoleCodec = "auto";
     this.consoleTune = {};
     void this.applyConsoleVideo();
+    this.toggleConsoleAudio();
+    this.toggleConsoleControl();
     this.toast("ok", `Console open on ${node!.label}`);
   }
 
