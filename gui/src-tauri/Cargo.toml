@@ -27,8 +27,10 @@ tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 
-# Async runtime — control-socket client + Tauri commands.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+# Async runtime — control-socket client + Tauri commands. "process"
+# backs the daemon self-update the spawner runs when the installed
+# myownmesh is older than the pin.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process"] }
 
 # Local IPC: same crate the daemon uses, so control-socket address
 # resolution stays identical across both ends of the wire.

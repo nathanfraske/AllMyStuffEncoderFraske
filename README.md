@@ -70,7 +70,11 @@ installer sorts that out too — there is no second install command:
 - none at all → the daemon is **installed next to the app**,
   downloaded and SHA-256-verified from MyOwnMesh's releases.
 
-The app starts and manages the daemon by itself — and it opens into a
+The app starts and manages the daemon by itself — and from then on
+keeps it current: an installed daemon that's fallen behind the app's
+pin is asked to update itself at launch, before it's started, so a
+stale mesh never quietly costs you features (a too-old daemon lacks
+the media lanes that screens and audio ride). The app opens into a
 populated demo graph even with no mesh at all, so a failed or skipped
 daemon never blocks you from exploring. Pass `--no-mesh` (Unix) /
 `-NoMesh` (Windows) to leave the daemon alone.

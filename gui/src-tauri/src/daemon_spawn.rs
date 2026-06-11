@@ -4,9 +4,12 @@
 //! `Drop`). This mirrors the MyOwnMesh GUI's daemon spawner, minus the
 //! source-checkout dev path — AllMyStuff ships against an installed
 //! `myownmesh` (pinned in `.myownmesh-rev`), found on `$PATH` or via the
-//! `MYOWNMESH_BIN` override.
+//! `MYOWNMESH_BIN` override. A binary that's fallen behind the pin is
+//! asked to update itself (`myownmesh update`, the same thing the
+//! installer invokes) before we start it, so the mesh comes up with the
+//! features this app was built against.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -99,18 +102,145 @@ pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
 }
 
-/// Compare the answering daemon's version against the app's pin and log
-/// the verdict — loudly on mismatch. A stale daemon is the #1 way "the
-/// app updated but a feature didn't appear" happens: the sidecar
-/// resolution prefers a sibling dev build, and a long-lived daemon
-/// process survives app upgrades entirely. Only meaningful when the pin
-/// is a version tag (`vX.Y.Z`); a sha pin can't be compared.
-pub async fn log_daemon_version(client: &ControlClient) {
-    let Some(pin) = option_env!("MYOWNMESH_PIN") else {
+/// `"v0.2.4"` / `"0.2.4"` / `"0.2.4-rc.1"` → `(0, 2, 4)`. Missing
+/// minor/patch fields compare as 0 (the installer's `version_ge` does
+/// the same). `None` when the major field isn't numeric — callers gate
+/// sha pins out themselves (they don't start with `v`).
+fn parse_semverish(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim();
+    let s = s.strip_prefix('v').unwrap_or(s);
+    let mut nums = [None::<u64>; 3];
+    for (i, part) in s.splitn(3, '.').enumerate() {
+        let end = part
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(part.len());
+        nums[i] = part[..end].parse().ok();
+    }
+    Some((nums[0]?, nums[1].unwrap_or(0), nums[2].unwrap_or(0)))
+}
+
+/// First line of `myownmesh --version` ("myownmesh 0.2.4") → `(0, 2, 4)`.
+fn parse_version_output(out: &str) -> Option<(u64, u64, u64)> {
+    parse_semverish(out.lines().next()?.split_whitespace().last()?)
+}
+
+fn fmt_ver((a, b, c): (u64, u64, u64)) -> String {
+    format!("{a}.{b}.{c}")
+}
+
+/// The app's daemon pin, when it's a comparable version tag (`vX.Y.Z`).
+/// A sha pin can't be compared, so every version passes then — same
+/// rule as the installer's `mesh_min_version`.
+fn pinned_version() -> Option<(&'static str, (u64, u64, u64))> {
+    let pin = option_env!("MYOWNMESH_PIN")?;
+    let want = parse_semverish(pin.strip_prefix('v')?)?;
+    Some((pin, want))
+}
+
+/// `bin --version`, parsed. `None` when the binary won't answer.
+async fn binary_version(bin: &Path) -> Option<(u64, u64, u64)> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `myownmesh update` downloads a release binary, so give it real time —
+/// but never wedge mesh bring-up forever on a stalled network.
+const DAEMON_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Run `<bin> update` — the daemon's own self-updater, the same thing
+/// the installer invokes — and report whether the binary on disk now
+/// satisfies the pin. Its output is folded into our log; failure never
+/// propagates (an old daemon still beats no daemon).
+async fn run_daemon_update(bin: &Path) -> bool {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    match tokio::time::timeout(DAEMON_UPDATE_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            tracing::warn!(
+                "myownmesh update didn't finish within {}s — continuing with what's on disk",
+                DAEMON_UPDATE_TIMEOUT.as_secs()
+            );
+        }
+        Ok(Err(e)) => tracing::warn!("couldn't run myownmesh update: {e}"),
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let said = stdout.trim();
+            if !said.is_empty() {
+                tracing::info!("myownmesh update: {said}");
+            }
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!("myownmesh update failed: {}", stderr.trim());
+            }
+        }
+    }
+    // The re-check is what decides — `update` may have been refused
+    // (package-manager install), failed, or landed exactly the pin.
+    match (pinned_version(), binary_version(bin).await) {
+        (Some((_, want)), Some(have)) => have >= want,
+        _ => false,
+    }
+}
+
+/// When the daemon binary we're about to start is older than the app's
+/// pin, update it first. A stale daemon is the #1 way "the app updated
+/// but a feature didn't appear" happens — it answers the socket fine,
+/// so everything *looks* up, but the newer media lanes (the video track
+/// lane screens ride, the Opus audio lane) simply don't exist in it.
+async fn ensure_daemon_current(bin: &Path) {
+    let Some((pin, want)) = pinned_version() else {
         return;
     };
-    let Some(pinned) = pin.strip_prefix('v').filter(|p| !p.is_empty()) else {
-        return;
+    match binary_version(bin).await {
+        None => tracing::warn!(
+            "couldn't read {}'s version to compare against the {pin} pin",
+            bin.display()
+        ),
+        Some(have) if have >= want => {}
+        Some(have) => {
+            tracing::info!(
+                "myownmesh at {} is v{} but this app pins {pin} — asking it to update itself (myownmesh update)…",
+                bin.display(),
+                fmt_ver(have)
+            );
+            if run_daemon_update(bin).await {
+                tracing::info!("myownmesh is current — starting the updated daemon");
+            } else {
+                tracing::warn!(
+                    "couldn't bring myownmesh up to {pin}; starting the old daemon — the newer mesh features (e.g. the video track lane that screens ride) stay unavailable. Update it by hand: myownmesh update"
+                );
+            }
+        }
+    }
+}
+
+/// Compare the answering daemon's version against the app's pin and log
+/// the verdict — loudly on mismatch. Returns `true` when the daemon is
+/// confirmed older than the pin. Only meaningful when the pin is a
+/// version tag (`vX.Y.Z`); a sha pin can't be compared.
+pub async fn log_daemon_version(client: &ControlClient) -> bool {
+    let Some((pin, want)) = pinned_version() else {
+        return false;
     };
     let running = client
         .request(&Request::Status)
@@ -119,11 +249,28 @@ pub async fn log_daemon_version(client: &ControlClient) {
         .and_then(|r| r.data)
         .and_then(|d| d.get("version").and_then(|v| v.as_str()).map(String::from));
     match running {
-        Some(v) if v == pinned => tracing::info!("myownmesh daemon v{v} (matches the {pin} pin)"),
-        Some(v) => tracing::warn!(
-            "myownmesh daemon is v{v} but this app pins {pin} — features the newer daemon carries (e.g. the video track lane) will be unavailable. If this is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its stale binary so build.rs fetches the pinned release) and restart the app."
-        ),
-        None => tracing::warn!("couldn't read the daemon version to compare against the {pin} pin"),
+        Some(v) => match parse_semverish(&v) {
+            Some(have) if have >= want => {
+                tracing::info!("myownmesh daemon v{v} (satisfies the {pin} pin)");
+                false
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "myownmesh daemon is v{v} but this app pins {pin} — features the newer daemon carries (e.g. the video track lane) will be unavailable. If this is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its stale binary so build.rs fetches the pinned release) and restart the app."
+                );
+                true
+            }
+            None => {
+                tracing::warn!(
+                    "myownmesh daemon reported an unreadable version ({v}) against the {pin} pin"
+                );
+                false
+            }
+        },
+        None => {
+            tracing::warn!("couldn't read the daemon version to compare against the {pin} pin");
+            false
+        }
     }
 }
 
@@ -140,6 +287,24 @@ fn usable(p: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Where `find_daemon_binary` found the daemon — decides whether the
+/// binary is ours to keep current.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DaemonSource {
+    /// Explicit `MYOWNMESH_BIN` override — deliberately pinned, never
+    /// touched.
+    Override,
+    /// Installed for the user: the production bundle's sidecar or a
+    /// `myownmesh` on `$PATH` (what the installer drops). Kept current
+    /// against the pin by asking it to update itself.
+    Installed,
+    /// A dev artifact (the dev-staged sidecar, the `build.rs` source
+    /// slot, a sibling checkout's target dir) — never touched;
+    /// self-updating one would clobber build output with a release
+    /// download.
+    DevBuild,
+}
+
 /// Locate the `myownmesh` daemon. It normally ships *with the app* — bundled
 /// as a Tauri sidecar by `build.rs` (see that file) — so this resolves the
 /// bundled binary first and only falls back for unusual setups:
@@ -152,7 +317,7 @@ fn usable(p: &std::path::Path) -> bool {
 ///    build-time manifest dir).
 /// 4. Side-by-side `../MyOwnMesh` source build.
 /// 5. `myownmesh` on `$PATH`.
-pub fn find_daemon_binary() -> Result<PathBuf> {
+pub fn find_daemon_binary() -> Result<(PathBuf, DaemonSource)> {
     let exe = if cfg!(windows) {
         "myownmesh.exe"
     } else {
@@ -168,17 +333,22 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
-            return Ok(p);
+            return Ok((p, DaemonSource::Override));
         }
     }
 
-    // 2. Bundled sidecar next to the running app binary.
+    // 2. Bundled sidecar next to the running app binary. The plain name
+    // is the production bundle; the triple-suffixed one is Tauri's dev
+    // staging of the source slot.
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(dir) = exe_path.parent() {
-            for name in [exe, exe_triple.as_str()] {
+            for (name, source) in [
+                (exe, DaemonSource::Installed),
+                (exe_triple.as_str(), DaemonSource::DevBuild),
+            ] {
                 let p = dir.join(name);
                 if usable(&p) {
-                    return Ok(p);
+                    return Ok((p, source));
                 }
             }
         }
@@ -189,14 +359,14 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         .join("binaries")
         .join(&exe_triple);
     if usable(&dev_slot) {
-        return Ok(dev_slot);
+        return Ok((dev_slot, DaemonSource::DevBuild));
     }
 
     // 4. Side-by-side MyOwnMesh checkout (release first, then debug).
     for profile in ["release", "debug"] {
         if let Some(p) = sibling_myownmesh_path(profile, exe) {
             if p.exists() {
-                return Ok(p);
+                return Ok((p, DaemonSource::DevBuild));
             }
         }
     }
@@ -206,7 +376,7 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
             if candidate.exists() {
-                return Ok(candidate);
+                return Ok((candidate, DaemonSource::Installed));
             }
         }
     }
@@ -239,11 +409,26 @@ fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
 pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<DaemonChild>> {
     if probe(client).await {
         tracing::info!("existing myownmesh daemon found on the control socket");
-        log_daemon_version(client).await;
+        if log_daemon_version(client).await {
+            // The running daemon is stale, but it isn't ours to restart
+            // (an externally-started daemon, or a macOS orphan from a
+            // crashed run). Refresh the binary on disk so the *next*
+            // daemon start runs the pinned features.
+            if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
+                if run_daemon_update(&bin).await {
+                    tracing::warn!(
+                        "updated myownmesh on disk, but the running daemon keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch the app"
+                    );
+                }
+            }
+        }
         return Ok(None);
     }
 
-    let bin = find_daemon_binary().context("locate myownmesh binary")?;
+    let (bin, source) = find_daemon_binary().context("locate myownmesh binary")?;
+    if source == DaemonSource::Installed {
+        ensure_daemon_current(&bin).await;
+    }
     tracing::info!(?bin, "spawning myownmesh daemon");
 
     let mut cmd = Command::new(&bin);
@@ -291,4 +476,56 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         "daemon did not answer within 8s; leaving it running — the event pump will retry"
     );
     Ok(Some(handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semverish_parses_tags_and_bare_versions() {
+        assert_eq!(parse_semverish("v0.2.4"), Some((0, 2, 4)));
+        assert_eq!(parse_semverish("0.2.4"), Some((0, 2, 4)));
+        assert_eq!(parse_semverish("0.10.3"), Some((0, 10, 3)));
+        assert_eq!(parse_semverish(" v1.0.0 "), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn semverish_missing_fields_compare_as_zero() {
+        assert_eq!(parse_semverish("0.2"), Some((0, 2, 0)));
+        assert_eq!(parse_semverish("1"), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn semverish_ignores_prerelease_suffixes() {
+        assert_eq!(parse_semverish("0.2.4-rc.1"), Some((0, 2, 4)));
+    }
+
+    #[test]
+    fn semverish_rejects_non_versions() {
+        assert_eq!(parse_semverish(""), None);
+        assert_eq!(parse_semverish("main"), None);
+        assert_eq!(parse_semverish("x.2.4"), None);
+    }
+
+    #[test]
+    fn version_output_takes_the_last_token_of_the_first_line() {
+        assert_eq!(parse_version_output("myownmesh 0.2.4\n"), Some((0, 2, 4)));
+        assert_eq!(
+            parse_version_output("myownmesh 0.2.1\nextra noise\n"),
+            Some((0, 2, 1))
+        );
+        assert_eq!(parse_version_output("garbage"), None);
+        assert_eq!(parse_version_output(""), None);
+    }
+
+    #[test]
+    fn tuple_ordering_matches_semver() {
+        // The whole fix rides on this comparison: numeric per-field,
+        // not lexicographic on the string ("0.10.0" > "0.2.4").
+        assert!((0, 2, 1) < (0, 2, 4));
+        assert!((0, 10, 0) > (0, 2, 4));
+        assert!((1, 0, 0) > (0, 10, 0));
+        assert!((0, 2, 4) >= (0, 2, 4));
+    }
 }
