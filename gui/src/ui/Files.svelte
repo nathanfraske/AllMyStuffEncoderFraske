@@ -93,6 +93,8 @@
     text: string;
     url: string; // blob URL for images
     loading: boolean;
+    /** The host's reason when the read failed — shown in the pane. */
+    error: string;
   }
   let preview = $state<Preview | null>(null);
 
@@ -169,6 +171,11 @@
 
   // ---- navigation --------------------------------------------------------
 
+  /** Ask for a directory's contents. `path` itself only moves when the
+   *  host's listing lands (the `entries` branch of `onEvent`) — never on
+   *  the ask. A failed open must leave the path bar on the directory the
+   *  list still shows, or one bad folder poisons every later attempt by
+   *  compounding onto a path that was never valid. */
   function list(target: string) {
     const req = nextReq++;
     listReq = req;
@@ -179,8 +186,7 @@
 
   function open(e: FileEntry) {
     if (e.dir) {
-      path = childPath(e.name);
-      list(path);
+      list(childPath(e.name));
     } else {
       openPreview(e);
     }
@@ -188,13 +194,11 @@
 
   function goUp() {
     if (atRoot) return;
-    path = parentOf(path);
-    list(path);
+    list(parentOf(path));
   }
 
   function goHome() {
-    path = home || "~";
-    list(path);
+    list(home || "~");
   }
 
   function refresh() {
@@ -254,8 +258,11 @@
         const p = previews.get(ev.req);
         if (p) {
           previews.delete(ev.req);
-          if (preview?.loading) preview = null;
-          app.toast("warn", `Couldn't preview ${p.name}: ${ev.reason}`);
+          // Tell the story in the pane itself (only if it's still about
+          // this file) — and never touch the listing or the path.
+          if (preview?.name === p.name) {
+            preview = { name: p.name, kind: "none", text: "", url: "", loading: false, error: ev.reason };
+          }
           return;
         }
         const op = pendingOps.get(ev.req);
@@ -278,17 +285,28 @@
   // ---- preview -------------------------------------------------------------
 
   function openPreview(e: FileEntry) {
+    // Already showing (or fetching) this very file — don't re-read it.
+    // An errored attempt (kind "none" + error) does retry.
+    if (preview?.name === e.name && (preview.loading || preview.kind !== "none" || !preview.error))
+      return;
     const ext = extOf(e.name);
     const isImage = ext in IMAGE_EXT;
     const isText = TEXT_EXT.has(ext) || e.size <= 256 * 1024;
     if (preview?.url) URL.revokeObjectURL(preview.url);
     if (e.size > PREVIEW_MAX || (!isImage && !isText)) {
-      preview = { name: e.name, kind: "none", text: "", url: "", loading: false };
+      preview = { name: e.name, kind: "none", text: "", url: "", loading: false, error: "" };
       return;
     }
     const req = nextReq++;
     previews.set(req, { name: e.name, parts: [], bytes: 0, total: e.size });
-    preview = { name: e.name, kind: isImage ? "image" : "text", text: "", url: "", loading: true };
+    preview = {
+      name: e.name,
+      kind: isImage ? "image" : "text",
+      text: "",
+      url: "",
+      loading: true,
+      error: "",
+    };
     send({ kind: "read", req, path: childPath(e.name) });
   }
 
@@ -303,15 +321,15 @@
     const ext = extOf(p.name);
     if (ext in IMAGE_EXT) {
       const url = URL.createObjectURL(new Blob([all.buffer as ArrayBuffer], { type: IMAGE_EXT[ext] }));
-      preview = { name: p.name, kind: "image", text: "", url, loading: false };
+      preview = { name: p.name, kind: "image", text: "", url, loading: false, error: "" };
       return;
     }
     const text = new TextDecoder("utf-8", { fatal: false }).decode(all);
     // A pile of replacement chars means it wasn't text after all.
     const garbage = (text.slice(0, 2000).match(/�/g)?.length ?? 0) > 20;
     preview = garbage
-      ? { name: p.name, kind: "none", text: "", url: "", loading: false }
-      : { name: p.name, kind: "text", text, url: "", loading: false };
+      ? { name: p.name, kind: "none", text: "", url: "", loading: false, error: "" }
+      : { name: p.name, kind: "text", text, url: "", loading: false, error: "" };
   }
 
   function closePreview() {
@@ -614,7 +632,13 @@
                 role="option"
                 aria-selected={selected === e.name}
                 tabindex="0"
-                onclick={() => (selected = selected === e.name ? null : e.name)}
+                onclick={() => {
+                  const was = selected === e.name;
+                  selected = was ? null : e.name;
+                  // Selecting a file previews it right away (the finder
+                  // habit) — folders still wait for the double-click.
+                  if (!e.dir && !was) openPreview(e);
+                }}
                 ondblclick={() => open(e)}
                 onkeydown={(ev) => {
                   if (ev.key === "Enter") open(e);
@@ -676,6 +700,10 @@
                 <div class="p-body p-center"><img src={preview.url} alt={preview.name} /></div>
               {:else if preview.kind === "text"}
                 <pre class="p-body">{preview.text}</pre>
+              {:else if preview.error}
+                <div class="p-body p-center muted">
+                  Couldn't read this file: {preview.error}
+                </div>
               {:else}
                 <div class="p-body p-center muted">
                   No preview for this file — use ⬇ to save it to Downloads.
