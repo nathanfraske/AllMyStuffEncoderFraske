@@ -1,13 +1,19 @@
-//! The display media plane: capture of this machine's screens, so an
-//! active display route actually streams pixels — H.264 on the mesh's
-//! track lane, MJPEG as the compatibility floor (the piKVM transport:
-//! every frame a standalone JPEG, no codec state to desync).
+//! The video media plane: capture of this machine's screens **and
+//! cameras**, so an active display or camera route actually streams
+//! pixels — H.264 on the mesh's track lane, MJPEG as the compatibility
+//! floor (the piKVM transport: every frame a standalone JPEG, no codec
+//! state to desync).
 //!
 //! Mirrors [`crate::audio::AudioBridge`]'s shape: each sourcing route runs
-//! a dedicated thread that captures **the monitor its source capability
-//! names** (the synthetic `screen` is the primary, `screen:<id>` one of
-//! the others), fits it to the transport's ceiling, encodes, and hands
-//! the packet to a callback the mesh forwards.
+//! a dedicated thread that captures **what its source capability names**
+//! (the synthetic `screen` is the primary monitor, `screen:<id>` one of
+//! the others, a camera capability the OS camera it scanned — see
+//! [`VideoSource`]), fits it to the transport's ceiling, encodes, and
+//! hands the packet to a callback the mesh forwards. Everything from the
+//! encoder down — transports, tuning, refresh asks, stats, the status
+//! reports — is one pipeline; only the frame *source* differs, and camera
+//! frames enter through the same pump the persistent screen sessions use
+//! ([`crate::camera_capture`]).
 //!
 //! Capture prefers a **persistent session**: our own DXGI Output
 //! Duplication on Windows (see [`crate::win_capture`] for why xcap's
@@ -65,8 +71,8 @@ use allmystuff_session::{VideoFrame, VideoStatusState};
 
 use crate::wake;
 
-/// Which transport a display route's stream encodes for — picked by the
-/// mesh from the offer's `video` accepts (see `RouteControl::Offer`).
+/// Which transport a video-carrying route's stream encodes for — picked
+/// by the mesh from the offer's `video` accepts (see `RouteControl::Offer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
     /// Standalone JPEG frames over the media channel — the v1 transport
@@ -74,6 +80,21 @@ pub enum VideoMode {
     Mjpeg,
     /// H.264 access units for the mesh's RTP track lane.
     H264,
+}
+
+/// What a route's capture thread points at — the one place a display
+/// route and a camera route differ. Everything downstream (encoder,
+/// transport, tune/refresh, status) is shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoSource {
+    /// A monitor: `None` = the primary (the synthetic `screen`
+    /// capability), `Some(id)` = the monitor with that enumeration id
+    /// (a `screen:<id>` capability — see [`extra_screens`]).
+    Screen(Option<u32>),
+    /// A camera, by the inventory device id its capability embeds
+    /// (`cam:video0`) — resolved back to the OS device by
+    /// [`crate::camera_capture`].
+    Camera(String),
 }
 
 /// One capture tick's output, headed for the forwarder. (H.264 units
@@ -318,7 +339,7 @@ struct RouteVideo {
     thread: Option<JoinHandle<()>>,
     /// Everything needed to restart this capture on a retune.
     mode: VideoMode,
-    monitor: Option<u32>,
+    source: VideoSource,
     on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
     on_status: OnStatus,
     /// One-shot "give the viewer a clean entry now" flag the encoder
@@ -345,20 +366,18 @@ impl VideoBridge {
         Self::default()
     }
 
-    /// Begin streaming a screen for `route_id`, encoding for `mode`.
-    /// `monitor` picks which: `None` = the primary (the synthetic `screen`
-    /// capability), `Some(id)` = the monitor with that enumeration id (a
-    /// `screen:<id>` capability — see [`extra_screens`]). `on_packet` is
-    /// called with each encoded packet; it returns `false` when the packet
-    /// was dropped downstream (backpressure), which is fine — the next
-    /// capture simply carries the newer picture. `on_status` is called on
-    /// capture-state transitions, for the viewer's benefit (see
+    /// Begin streaming `source` for `route_id`, encoding for `mode` — a
+    /// monitor for a display route, a camera for a video one. `on_packet`
+    /// is called with each encoded packet; it returns `false` when the
+    /// packet was dropped downstream (backpressure), which is fine — the
+    /// next capture simply carries the newer picture. `on_status` is
+    /// called on capture-state transitions, for the viewer's benefit (see
     /// [`StatusReporter`]).
     pub fn start_capture<F, S>(
         &self,
         route_id: String,
         mode: VideoMode,
-        monitor: Option<u32>,
+        source: VideoSource,
         on_packet: F,
         on_status: S,
     ) where
@@ -368,7 +387,7 @@ impl VideoBridge {
         self.spawn_route(
             route_id,
             mode,
-            monitor,
+            source,
             Tune::default(),
             Arc::new(on_packet),
             Arc::new(on_status),
@@ -379,7 +398,7 @@ impl VideoBridge {
         &self,
         route_id: String,
         mode: VideoMode,
-        monitor: Option<u32>,
+        source: VideoSource,
         tune: Tune,
         on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
         on_status: OnStatus,
@@ -389,18 +408,23 @@ impl VideoBridge {
         let (stop_thread, refresh_thread, cb) = (stop.clone(), refresh.clone(), on_packet.clone());
         let status_cb = on_status.clone();
         let id = route_id.clone();
+        let src = source.clone();
         let thread = std::thread::spawn(move || {
+            let what = match &src {
+                VideoSource::Screen(_) => "screen",
+                VideoSource::Camera(_) => "camera",
+            };
             if let Err(e) = run_capture(
                 &stop_thread,
                 &refresh_thread,
                 &id,
                 mode,
-                monitor,
+                &src,
                 tune,
                 cb,
                 status_cb,
             ) {
-                tracing::warn!("screen capture for {id} stopped: {e}");
+                tracing::warn!("{what} capture for {id} stopped: {e}");
             }
         });
         self.routes.lock().insert(
@@ -409,7 +433,7 @@ impl VideoBridge {
                 stop,
                 thread: Some(thread),
                 mode,
-                monitor,
+                source,
                 on_packet,
                 on_status,
                 refresh,
@@ -432,9 +456,9 @@ impl VideoBridge {
         let Some(old) = self.routes.lock().remove(route_id) else {
             return;
         };
-        let (mode, monitor, on_packet, on_status) = (
+        let (mode, source, on_packet, on_status) = (
             old.mode,
-            old.monitor,
+            old.source.clone(),
             old.on_packet.clone(),
             old.on_status.clone(),
         );
@@ -449,7 +473,7 @@ impl VideoBridge {
         self.spawn_route(
             route_id.to_string(),
             mode,
-            monitor,
+            source,
             tune,
             on_packet,
             on_status,
@@ -467,13 +491,66 @@ fn run_capture(
     refresh: &Arc<AtomicBool>,
     route_id: &str,
     mode: VideoMode,
-    monitor_id: Option<u32>,
+    source: &VideoSource,
     tune: Tune,
     on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
     on_status: OnStatus,
 ) -> Result<(), String> {
     let on_packet = &*on_packet;
     let mut reporter = StatusReporter::new(on_status);
+
+    // A camera source skips the whole monitor story: open the device,
+    // pump its frames into the same encoder. Open failures are told to
+    // the viewer in-band, like every capture condition — "no camera"
+    // when there's nothing to open, "camera failed" (with the OS text)
+    // when there is but it won't stream: held by another app, or a
+    // permission denial.
+    if let VideoSource::Camera(device) = source {
+        // A hosted camera is active use the OS can't see — hold the
+        // machine awake like a hosted screen (without forcing the panel
+        // on; the camera doesn't need the display lit).
+        let _awake = wake::DisplayAwake::hold("hosting a camera stream");
+        let fps = tune.fps();
+        let mut encoder = make_encoder(route_id, mode, (0, 0), tune, refresh)?;
+        let mut stats = StreamStats::new(route_id, encoder.mode());
+        let (session, frames) = match crate::camera_capture::open(device, fps) {
+            Ok(open) => open,
+            Err(e) => {
+                let state = if e.contains("no camera") {
+                    VideoStatusState::NoCamera
+                } else {
+                    VideoStatusState::CameraFailed
+                };
+                reporter.report(state, Some(e.clone()));
+                return Err(e);
+            }
+        };
+        let result = pump_frames_with_stall(
+            stop,
+            fps,
+            &frames,
+            |f: crate::camera_capture::RawFrame| (f.rgba, f.width, f.height),
+            on_packet,
+            &mut encoder,
+            &mut stats,
+            &mut reporter,
+            VideoStatusState::CameraFailed,
+        );
+        drop(session);
+        // A camera whose stream died mid-route (unplugged) ends with the
+        // viewer told why, not just a frozen last frame.
+        if let Err(e) = &result {
+            if !stop.load(Ordering::SeqCst) {
+                reporter.report(VideoStatusState::CameraFailed, Some(e.clone()));
+            }
+        }
+        return result;
+    }
+    let monitor_id = match source {
+        VideoSource::Screen(id) => *id,
+        VideoSource::Camera(_) => unreachable!("camera handled above"),
+    };
+
     // A hosted screen is active use the OS can't see: hold the display
     // awake for the stream's lifetime, and force one that's already dark
     // back on — neither capture path can grab from a sleeping panel.
@@ -503,19 +580,8 @@ fn run_capture(
         }
     };
     let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
-    // An encoder that can't init (openh264 build/runtime trouble) must
-    // cost quality, not the stream: fall back to MJPEG and say so.
-    let (mut encoder, mode) = match StreamEncoder::new(route_id, mode, source_hint, tune, refresh) {
-        Ok(enc) => (enc, mode),
-        Err(e) => {
-            tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
-            (
-                StreamEncoder::new(route_id, VideoMode::Mjpeg, source_hint, tune, refresh)?,
-                VideoMode::Mjpeg,
-            )
-        }
-    };
-    let mut stats = StreamStats::new(route_id, mode);
+    let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh)?;
+    let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
 
     // Windows: our own DXGI Output Duplication session — damage-driven,
@@ -701,8 +767,41 @@ fn pump_frames<T, X>(
 where
     X: Fn(T) -> (Vec<u8>, u32, u32),
 {
+    pump_frames_with_stall(
+        stop,
+        fps,
+        frames,
+        raw,
+        on_packet,
+        encoder,
+        stats,
+        reporter,
+        VideoStatusState::DisplayAsleep,
+    )
+}
+
+/// [`pump_frames`] with the first-frame-stall condition named by the
+/// caller: a frameless screen session is a dark display (worth wake
+/// pressure on the panel), a frameless camera is the camera failing —
+/// different words to the viewer, and no point lighting the screen.
+#[allow(clippy::too_many_arguments)]
+fn pump_frames_with_stall<T, X>(
+    stop: &AtomicBool,
+    fps: u32,
+    frames: &mpsc::Receiver<T>,
+    raw: X,
+    on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
+    encoder: &mut StreamEncoder,
+    stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
+    stall_state: VideoStatusState,
+) -> Result<(), String>
+where
+    X: Fn(T) -> (Vec<u8>, u32, u32),
+{
     let budget = Duration::from_secs(1) / fps.max(1);
     let started = Instant::now();
+    let from_screen = stall_state == VideoStatusState::DisplayAsleep;
     let mut got_any = false;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -712,17 +811,19 @@ where
         let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
             Ok(f) => f,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // A session that opened fine but never delivers is a dark
-                // display: damage-driven backends send nothing from a
-                // sleeping screen, and even a still desktop hands over its
-                // first frame on connect. Keep wake pressure on the panel
-                // the whole frameless window (the pulse rate-limits
+                // A screen session that opened fine but never delivers is
+                // a dark display: damage-driven backends send nothing from
+                // a sleeping screen, and even a still desktop hands over
+                // its first frame on connect. Keep wake pressure on the
+                // panel the whole frameless window (the pulse rate-limits
                 // itself) — one polite wiggle at start demonstrably isn't
                 // enough on Windows.
                 if !got_any {
-                    wake::force_display_on();
+                    if from_screen {
+                        wake::force_display_on();
+                    }
                     if started.elapsed() >= FIRST_FRAME_STALL {
-                        reporter.report(VideoStatusState::DisplayAsleep, None);
+                        reporter.report(stall_state, None);
                     }
                 }
                 continue;
@@ -984,6 +1085,25 @@ impl FrameEncoder {
     }
 }
 
+/// One route's encoder for the negotiated transport — with the rule that
+/// an encoder that can't init (openh264 build/runtime trouble) must cost
+/// quality, not the stream: fall back to MJPEG and say so.
+fn make_encoder(
+    route_id: &str,
+    mode: VideoMode,
+    source_hint: (u32, u32),
+    tune: Tune,
+    refresh: &Arc<AtomicBool>,
+) -> Result<StreamEncoder, String> {
+    match StreamEncoder::new(route_id, mode, source_hint, tune, refresh) {
+        Ok(enc) => Ok(enc),
+        Err(e) => {
+            tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
+            StreamEncoder::new(route_id, VideoMode::Mjpeg, source_hint, tune, refresh)
+        }
+    }
+}
+
 /// The per-route encode stage, dispatching on the negotiated transport.
 /// (The H.264 arm boxes openh264's chunky encoder state.)
 enum StreamEncoder {
@@ -992,6 +1112,15 @@ enum StreamEncoder {
 }
 
 impl StreamEncoder {
+    /// The transport this encoder actually produces (the negotiated one,
+    /// or the MJPEG floor [`make_encoder`] fell back to).
+    fn mode(&self) -> VideoMode {
+        match self {
+            StreamEncoder::Mjpeg(_) => VideoMode::Mjpeg,
+            StreamEncoder::H264(_) => VideoMode::H264,
+        }
+    }
+
     /// `source_hint` is the capture source's expected resolution (the
     /// monitor's), which pre-budgets the H.264 bitrate; `(0, 0)` =
     /// unknown. The real budget locks to the first frame's true fitted

@@ -137,12 +137,15 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
 
 The one place hardware vocabulary meets graph vocabulary. Turns an
 `Inventory` into graph `Capability`s — physical devices (mic → audio source,
-monitor → display sink, …) plus a synthetic per-machine set (**screen** =
-display source, **control** = input sink, **keyboard & mouse** = input
-source — a console forwards "whatever this machine's user does", never one
-scanned device, so driving a remote works even where the input scan finds
-nothing (macOS) — and **system audio** = duplex) so whole-computer flows
-(screen-share, room calls, remote control) have something to land on *and*
+camera → video source, monitor → display sink, …) plus a synthetic
+per-machine set (**screen** = display source, **control** = input sink,
+**keyboard & mouse** = input source — a console forwards "whatever this
+machine's user does", never one scanned device, so driving a remote works
+even where the input scan finds nothing (macOS) — **system audio** =
+duplex, and **video in** = video sink — the app shows inbound camera
+streams in a window, so "can receive a camera" is a property of the
+machine, exactly like control) so whole-computer flows (screen-share,
+camera feeds, room calls, remote control) have something to land on *and*
 start from. The GUI also passes its own monitor enumeration in
 (`capabilities_with_screens`): each monitor beyond the primary becomes a
 `screen:<id>` display source — one console tab per screen — with ids the
@@ -158,9 +161,12 @@ Tauri 2 + Svelte 5, a client of the daemon.
   `allmystuff-session` state machine, emits `allmystuff://session`
   snapshots), the `audio` bridge (capture → mesh → playback for active
   audio routes: cpal for mics and playback, the OS loopback — WASAPI /
-  pulse monitor — when the source is the machine's `system-audio`),
-  `connect_route`/`disconnect_route` commands, and
-  `daemon_spawn`. The `myownmesh` daemon ships **bundled with the app**:
+  pulse monitor — when the source is the machine's `system-audio`), the
+  `video` bridge (one capture thread per sourced display/camera route —
+  screens via the platform capture sessions, cameras via `camera_capture`:
+  nokhwa over V4L2 / AVFoundation / Media Foundation, decoded to RGBA and
+  fed through the same encoder), `connect_route`/`disconnect_route`
+  commands, and `daemon_spawn`. The `myownmesh` daemon ships **bundled with the app**:
   `build.rs` fetches the rev pinned in `.myownmesh-rev` and stages it as a
   Tauri sidecar (`binaries/myownmesh-<triple>`, `externalBin`), so the mesh
   is there for free — `daemon_spawn` resolves the bundled binary and
@@ -392,7 +398,25 @@ Tauri 2 + Svelte 5, a client of the daemon.
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;
    `ALLMYSTUFF_VIDEO_FPS` / `ALLMYSTUFF_VIDEO_MAX_EDGE` /
-   `ALLMYSTUFF_VIDEO_BITRATE` dial the H.264 stream without a rebuild. An input
+   `ALLMYSTUFF_VIDEO_BITRATE` dial the H.264 stream without a rebuild. A
+   **camera route** (`MediaKind::Video`) is the same stream with a lens
+   behind it instead of a monitor: the source capability names a scanned
+   camera, `camera_capture` opens it (nokhwa: V4L2 / AVFoundation / Media
+   Foundation, asking for the device's smoothest rate and the largest
+   picture at it — the 1080p30 / 720p60 webcam sweet spot — decoded to
+   RGBA whatever the sensor speaks, MJPG included), and the frames enter
+   the identical encoder/transport/tune/refresh pipeline — H.264 lane,
+   MJPEG floor, quality pills, `vstat` reports (two camera-specific
+   states: *no camera*, *camera failed* — held by another app, or an OS
+   permission) and all. The landing spot is the peer's synthetic
+   `video-in` sink (every machine running the app can *show* a camera, so
+   the bridge advertises one per machine, ranked with the other
+   whole-machine endpoints), and the watching window — a console's camera
+   tab, a room tile — renders it through the very same pull-and-paint
+   plane as a screen. Hosts advertise the `camera` feature tag; a console
+   pointed at an older build's camera says "update that machine" instead
+   of wiring a route that would never carry pixels (and an older *viewer*
+   never wires one — its build has no `video-in` sink to land on). An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
    buttons / wheel / DOM-`key` values — each move naming which remote screen
    it's normalized over, so control follows the console's selected tab —
@@ -489,14 +513,14 @@ goes to everyone.
 
 ## Next milestones
 
-- **Camera video + storage transport** over the same route pipe that audio,
-  screen, and input already use — each needs its capture backend feeding the
-  existing offer/accept/media plumbing. (Cameras already show as console
-  tabs; selecting one says the transport is coming.)
+- **Storage transport** over the same route pipe that audio, screen,
+  camera, and input already use — the one scanned media still showing
+  active without a stream behind it. (Camera video landed: see the
+  camera-route paragraph above.)
 - **Per-device audio routing** — map a specific scanned device to a `cpal`
   device (audio still uses the default input/output; monitors are routed
-  per-screen now), and an audio codec (Opus) so the media channel isn't
-  raw PCM.
+  per-screen and cameras per-device now), and an audio codec (Opus) so
+  the media channel isn't raw PCM.
 - **Share-grant-gated control** — input injection currently trusts only the
   device's owner/fleet; honouring a *shared* person's explicit control grant
   rides on the share-enforcement work.

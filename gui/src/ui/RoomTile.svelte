@@ -1,5 +1,6 @@
 <script lang="ts">
-  // One member's screen share inside a room panel — a lean cousin of the
+  // One member's share inside a room panel — their screen or their
+  // camera, told apart by the route's media — a lean cousin of the
   // console stage. It always asks the backend to decode (`decode: true`,
   // the console ladder's universal bottom rung), so the tile just blits
   // RGBA / JPEG frames and works in every webview; a member who wants the
@@ -26,6 +27,9 @@
   let frameH = $state(0);
 
   const who = $derived(app.roomWho(member.id));
+  // A video route is a camera feed; a display route is a screen share —
+  // the badge says which, since both tile identically.
+  const isCamera = $derived(route.media === "video");
 
   // The live route this tile may drive the sharer with, if any.
   const controlRoute = $derived(app.roomControlRouteTo(member.id));
@@ -153,7 +157,7 @@
   class="tile"
   class:driving={!!controlRoute}
   role="application"
-  aria-label="{who.who}'s screen{who.machine ? ` (${who.machine})` : ''}"
+  aria-label="{who.who}'s {isCamera ? 'camera' : 'screen'}{who.machine ? ` (${who.machine})` : ''}"
   tabindex={controlRoute ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
@@ -170,7 +174,7 @@
     </div>
   {:else}
     <div class="badge">
-      🖥 <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
+      {isCamera ? "📷" : "🖥"} <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
       {#if controlRoute}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
     </div>
   {/if}

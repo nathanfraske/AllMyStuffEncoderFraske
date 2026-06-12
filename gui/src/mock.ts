@@ -19,13 +19,15 @@ function cap(
 }
 
 /** The synthetic "the machine itself" set every node exposes (mirrors the
- *  bridge crate: screen out, control in, keyboard & mouse out, audio both). */
+ *  bridge crate: screen out, control in, keyboard & mouse out, audio both,
+ *  video in — the landing spot for camera streams). */
 function machineCaps(node: string): Capability[] {
   return [
     cap(node, "screen", "Screen", "display", "source", "screen"),
     cap(node, "control", "Keyboard & mouse control", "input", "sink", "control"),
     cap(node, "keyboard-mouse", "Keyboard & mouse", "input", "source", "controller"),
     cap(node, "system-audio", "System audio", "audio", "duplex", "system"),
+    cap(node, "video-in", "Video in", "video", "sink", "viewer"),
   ];
 }
 
@@ -38,7 +40,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "this",
       summary: { os: "macOS 14", cpu: "Apple M2", ram_bytes: 16 * 2 ** 30, device_count: 13 },
     },
@@ -49,7 +51,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "this",
       summary: { os: "Windows 11", cpu: "Ryzen 7 7700", ram_bytes: 32 * 2 ** 30, device_count: 11 },
     },
@@ -60,7 +62,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "this",
       summary: { os: "Linux", cpu: "Amlogic S905", ram_bytes: 4 * 2 ** 30, device_count: 5 },
     },
@@ -71,7 +73,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "this",
       summary: { os: "Linux", cpu: "Pi 5", ram_bytes: 8 * 2 ** 30, device_count: 6 },
     },
@@ -84,7 +86,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "unclaimed" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: null,
       claimable: true,
       summary: { os: "Linux", cpu: "Intel N100", ram_bytes: 16 * 2 ** 30, device_count: 7 },
@@ -106,7 +108,7 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       online: false,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "alex",
       relationship: {
         kind: "shared",
@@ -135,7 +137,7 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms"],
+      features: ["terminal", "files", "rooms", "camera"],
       owner: "alex",
       relationship: { kind: "unclaimed" },
       summary: { os: "Android 15", cpu: "Snapdragon 8", ram_bytes: 8 * 2 ** 30, device_count: 6 },

@@ -117,19 +117,20 @@ export function scanSelf(): Promise<ScanResult | null> {
 
 /** Offer a real connection over the mesh. Returns the route id, or null in
  *  web mode (the store falls back to a local route for the demo). A
- *  display route advertises H.264 by default (the streaming side then uses
- *  the mesh's RTP track lane): decode is covered everywhere — WebCodecs
- *  where the webview has it, the backend's native openh264 decoder where
- *  it doesn't — and the backend still withholds the offer when the local
- *  daemon predates the track lane. MJPEG stays the floor both ends share,
- *  and `codec: "mjpeg"` forces it (the console's codec pill). */
+ *  display or camera route advertises H.264 by default (the streaming
+ *  side then uses the mesh's RTP track lane): decode is covered
+ *  everywhere — WebCodecs where the webview has it, the backend's native
+ *  openh264 decoder where it doesn't — and the backend still withholds
+ *  the offer when the local daemon predates the track lane. MJPEG stays
+ *  the floor both ends share, and `codec: "mjpeg"` forces it (the
+ *  console's codec pill). */
 export function connectRoute(
   from: string,
   to: string,
   media: MediaKind,
   codec?: "auto" | "h264" | "mjpeg",
 ): Promise<string | null> {
-  const video = media === "display" && codec !== "mjpeg" ? ["h264"] : [];
+  const video = (media === "display" || media === "video") && codec !== "mjpeg" ? ["h264"] : [];
   return tryInvoke<string>("connect_route", { from, to, media, video });
 }
 
@@ -305,7 +306,14 @@ export async function watchVideo(
  *  they are (again). */
 export type VideoHostStatus = {
   route: string;
-  state: "ok" | "waiting_consent" | "display_asleep" | "no_monitor" | "grab_failed";
+  state:
+    | "ok"
+    | "waiting_consent"
+    | "display_asleep"
+    | "no_monitor"
+    | "grab_failed"
+    | "no_camera"
+    | "camera_failed";
   detail?: string | null;
 };
 

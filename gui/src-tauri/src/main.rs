@@ -19,6 +19,7 @@
 
 mod audio;
 mod byte_queues;
+mod camera_capture;
 mod control_client;
 mod daemon_spawn;
 mod files;

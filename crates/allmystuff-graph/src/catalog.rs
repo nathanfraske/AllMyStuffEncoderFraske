@@ -313,7 +313,10 @@ fn flow_word(f: Flow) -> &'static str {
 }
 
 fn is_machine_origin(origin: &str) -> bool {
-    matches!(origin, "screen" | "control" | "controller" | "system")
+    matches!(
+        origin,
+        "screen" | "control" | "controller" | "system" | "viewer"
+    )
 }
 
 /// Sort key for [`Catalog::match_endpoint`] (lower = preferred): a

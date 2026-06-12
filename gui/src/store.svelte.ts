@@ -68,6 +68,7 @@ import {
   type SessionSnapshot,
 } from "./tauri";
 import {
+  FEATURE_CAMERA,
   FEATURE_FILES,
   FEATURE_ROOMS,
   FEATURE_TERMINAL,
@@ -1118,6 +1119,15 @@ class AppStore {
       });
   }
 
+  /** Whether a machine's cameras actually *stream* when selected: its
+   *  build advertises the camera feature. Cameras as capabilities predate
+   *  the transport, so an older host still shows its camera tab — the
+   *  console explains the update instead of wiring a route that can never
+   *  carry pixels. */
+  cameraStreamSupported(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_CAMERA);
+  }
+
   /** Open a console session on a remote machine — the single handle for its
    *  screen, its audio passthrough and keyboard/mouse control. On the
    *  desktop this opens a *dedicated OS window* per machine (so several
@@ -1261,10 +1271,15 @@ class AppStore {
     if (epoch !== this.consoleVideoEpoch) return; // a newer switch took over
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
     if (!inp) return;
-    // The remote screen (display) lands on this machine's display sink — a
-    // real route the backend streams video frames down. A camera (video)
-    // has no local sink yet, so it's view-only until camera transport
-    // lands; the console is honest about that.
+    // A camera tab on a host whose build predates camera streaming: skip
+    // the wire — the route could never carry pixels, and the stage
+    // explains the update instead.
+    if (inp.media === "video" && !this.cameraStreamSupported(this.machineByAnyId(inp.node))) {
+      return;
+    }
+    // The remote screen (display) lands on this machine's display sink, a
+    // camera (video) on its synthetic video-in sink — either way a real
+    // route the backend streams frames down.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
     if (!sink) return;
     const leg = this.ownedConnect(inp.id, sink.id, this.consoleCodec);
@@ -1783,15 +1798,16 @@ class AppStore {
       .map((id) => ({ id, node: this.machineByAnyId(id) }));
   });
 
-  /** Inbound screen shares for the open room: every active display route
-   *  from a member's machine into this one. These are the panel's video
-   *  tiles — the same pull-and-paint plane the console uses. */
+  /** Inbound shares for the open room: every active display (screen
+   *  share) or video (camera) route from a member's machine into this
+   *  one. These are the panel's video tiles — the same pull-and-paint
+   *  plane the console uses. */
   roomInboundShares = $derived.by((): { route: Route; member: MeshNode }[] => {
     const room = this.openRoom;
     if (!room) return [];
     const out: { route: Route; member: MeshNode }[] = [];
     for (const r of this.catalog.routes) {
-      if (r.media !== "display") continue;
+      if (r.media !== "display" && r.media !== "video") continue;
       const from = this.capabilityForDisplay(r.from);
       const to = this.capabilityForDisplay(r.to);
       if (!from || !to || !this.isMe(to.node) || this.isMe(from.node)) continue;
@@ -2188,9 +2204,10 @@ class AppStore {
     else this.toast("warn", "Nobody in the room can receive a screen right now");
   }
 
-  /** Send your camera to the room. The routes are real, but camera
-   *  *transport* hasn't landed yet (the same honest note the console
-   *  shows) — and most machines expose no video sink to receive one. */
+  /** Send your camera to the room: this machine's default camera to every
+   *  member's video sink. Members see it as a live tile, exactly like a
+   *  screen share — same routes, same transport, a camera behind the
+   *  capture instead of a monitor. */
   toggleRoomCam() {
     const roomId = this.roomOpenId;
     if (!roomId) return;
@@ -2200,7 +2217,7 @@ class AppStore {
       return;
     }
     const from = this.capsOf(this.localId)
-      .filter((c) => c.media === "video" && canSource(c.flow))
+      .filter((c) => c.media === "video" && canSource(c.flow) && c.origin === "camera")
       .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false))[0];
     if (!from) {
       this.toast("warn", "No camera on this machine");
@@ -2208,8 +2225,8 @@ class AppStore {
     }
     const wired = this.wireRoomLegs(roomId, "cam", from, "video");
     this.setRoomSend(roomId, "cam", wired > 0);
-    if (wired > 0) this.toastLegs("Camera wired (transport is on its way)", wired);
-    else this.toast("warn", "No member can receive camera video yet — camera transport is on its way");
+    if (wired > 0) this.toastLegs("Your camera is live", wired);
+    else this.toast("warn", "Nobody in the room can receive camera video right now");
   }
 
   /** Let the room drive this machine: each member's keyboard & mouse is

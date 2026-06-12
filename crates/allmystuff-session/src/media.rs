@@ -381,11 +381,12 @@ pub enum MediaTagVStat {
     VStat,
 }
 
-/// Why a display route's stream isn't (or is again) producing frames —
-/// the host's capture telling the viewer in-band, so "connected but no
-/// pixels" reads as the real condition instead of a silent black stage.
-/// Sent on state *changes* only; a peer that doesn't know the `vstat`
-/// tag drops it unread ([`MediaPayload::decode`]'s unknown-tag rule).
+/// Why a display/camera route's stream isn't (or is again) producing
+/// frames — the host's capture telling the viewer in-band, so "connected
+/// but no pixels" reads as the real condition instead of a silent black
+/// stage. Sent on state *changes* only; a peer that doesn't know the
+/// `vstat` tag (or a state added since its build) drops the frame unread
+/// ([`MediaPayload::decode`]'s unknown-tag rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoStatusState {
@@ -404,6 +405,13 @@ pub enum VideoStatusState {
     /// that never granted, a locked session…) — `detail` carries the OS
     /// error text.
     GrabFailed,
+    /// The camera a video route names isn't there (unplugged since the
+    /// scan, and no other camera to fall back to).
+    NoCamera,
+    /// The camera exists but won't open — typically held by another app
+    /// (V4L2's EBUSY, a Windows exclusive lock) or an OS camera-permission
+    /// denial. `detail` carries the OS error text.
+    CameraFailed,
 }
 
 /// One capture-status change of a display route, host → viewer.
@@ -671,6 +679,24 @@ mod tests {
             serde_json::to_value(VideoStatusFrame::new("r", VideoStatusState::Ok, None)).unwrap();
         assert!(ok.get("detail").is_none());
         assert_eq!(ok["state"], "ok");
+
+        // The camera conditions ride the same frame; a peer that predates
+        // them fails the decode and drops the frame, per the tag rule.
+        let cam = serde_json::to_value(VideoStatusFrame::new(
+            "r",
+            VideoStatusState::CameraFailed,
+            Some("Device or resource busy".into()),
+        ))
+        .unwrap();
+        assert_eq!(cam["state"], "camera_failed");
+        assert!(matches!(
+            MediaPayload::decode(cam),
+            Some(MediaPayload::VideoStatus(f)) if f.state == VideoStatusState::CameraFailed
+        ));
+        let none =
+            serde_json::to_value(VideoStatusFrame::new("r", VideoStatusState::NoCamera, None))
+                .unwrap();
+        assert_eq!(none["state"], "no_camera");
     }
 
     #[test]

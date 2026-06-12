@@ -44,6 +44,10 @@
   const selected = $derived<Capability | null>(
     (selectedId ? app.capability(selectedId) : null) ?? null,
   );
+  // Whether the machine's build streams its cameras at all — an older one
+  // advertises the tabs but has no transport behind them, and the stage
+  // says so instead of waiting on pixels that never come.
+  const cameraSupported = $derived(node ? app.cameraStreamSupported(node) : false);
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
   // mouse move so the remote lands the cursor on the screen being viewed.
@@ -446,6 +450,10 @@
         return "No monitor to capture on the remote machine — its displays are detached or in deep sleep.";
       case "grab_failed":
         return `Screen capture is failing on the remote machine${s.detail ? `: ${s.detail}` : "."}`;
+      case "no_camera":
+        return "No camera to capture on the remote machine — it may have been unplugged since the scan.";
+      case "camera_failed":
+        return `The remote camera won't stream — another app may be holding it, or its camera permission is off${s.detail ? ` (${s.detail})` : ""}.`;
       default:
         return "";
     }
@@ -609,7 +617,9 @@
             bind:this={canvasEl}
             class="live"
             class:waiting={!hasFrame}
-            aria-label="Live screen of {displayName(node)}"
+            aria-label="Live {selected?.media === 'video' ? 'camera' : 'screen'} view of {displayName(
+              node,
+            )}"
           ></canvas>
         {/if}
         {#if hasFrame}
@@ -626,9 +636,14 @@
               <div class="screen-note">
                 {hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…"}
               </div>
+            {:else if cameraSupported}
+              <div class="screen-note">
+                {hostStatus ? hostStatusText(hostStatus) : "Connecting this camera…"}
+              </div>
             {:else}
               <div class="screen-note">
-                Camera input selected — camera streaming is the next transport to land.
+                This machine runs an older AllMyStuff — update it there and its cameras will
+                stream here.
               </div>
             {/if}
           </div>

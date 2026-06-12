@@ -253,7 +253,7 @@
         {#if p.screen}<span class="send-chip ok">🖥 sharing screen</span>{/if}
         {#if p.sound}<span class="send-chip ok">🔊 sharing sound</span>{/if}
         {#if p.control}<span class="send-chip ok">🕹 control open</span>{/if}
-        {#if p.cam}<span class="send-chip">📷 camera wired</span>{/if}
+        {#if p.cam}<span class="send-chip ok">📷 camera live</span>{/if}
       </div>
     {/if}
     <div class="nameplate">
@@ -440,6 +440,7 @@
                     {#if p.mic}<span title="Talking">🎙</span>{/if}
                     {#if p.sound}<span title="Sharing sound">🔊</span>{/if}
                     {#if p.me && p.screen}<span title="Sharing your screen">🖥</span>{/if}
+                    {#if p.me && p.cam}<span title="Sharing your camera">📷</span>{/if}
                     {#if !p.me && app.isRoomHost(room)}
                       <button
                         class="m-remove"
@@ -509,7 +510,7 @@
             class="ctl"
             class:on={app.roomCam}
             onclick={() => app.toggleRoomCam()}
-            title="Send your camera to the room (camera transport is on its way) (v)"
+            title="Send your camera to the room — members see it as a live tile (v)"
           >
             <span class="ctl-icon" class:slashed={!app.roomCam}>📷</span>
             <span class="ctl-label">Camera</span>
