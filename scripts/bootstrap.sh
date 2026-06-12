@@ -43,11 +43,16 @@ install_linux_deps() {
       # xdg-utils backs Tauri's AppImage bundler; libasound2-dev is the
       # ALSA dev headers cpal links against; pipewire + xkbcommon + gbm
       # back the console's screen capture (xcap) and input injection
-      # (enigo).
+      # (enigo). clang + libclang-dev are bindgen's: the PipeWire
+      # bindings (libspa-sys) parse the C headers with libclang, and
+      # without clang's own resource headers the parse dies on
+      # "'stdbool.h' file not found" (CI never sees it — GitHub
+      # runners ship clang preinstalled).
       sudo apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
         librsvg2-dev libssl-dev libasound2-dev xdg-utils curl wget file \
         libpipewire-0.3-dev libxkbcommon-dev libgbm-dev \
+        clang libclang-dev \
         build-essential pkg-config
       ;;
     fedora|rhel|centos)
@@ -56,18 +61,20 @@ install_linux_deps() {
         webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
         librsvg2-devel openssl-devel alsa-lib-devel curl wget file gcc \
         pipewire-devel libxkbcommon-devel mesa-libgbm-devel \
+        clang clang-devel \
         gcc-c++ make pkgconf-pkg-config
       ;;
     arch|manjaro)
       log "Installing Tauri + audio build deps (pacman)…"
       sudo pacman -S --needed --noconfirm \
         webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg openssl \
-        alsa-lib curl wget file base-devel
+        alsa-lib curl wget file base-devel clang
       ;;
     *)
       warn "Unrecognised Linux distro (${ID:-?}). Install Tauri deps manually:"
       warn "  https://tauri.app/start/prerequisites/#linux"
-      warn "…plus the ALSA dev headers (libasound2-dev / alsa-lib-devel)."
+      warn "…plus the ALSA dev headers (libasound2-dev / alsa-lib-devel)"
+      warn "and clang + libclang (bindgen builds the PipeWire bindings)."
       ;;
   esac
 }
