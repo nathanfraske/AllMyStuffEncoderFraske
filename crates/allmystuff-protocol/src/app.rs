@@ -160,6 +160,12 @@ pub struct OwnedRoster {
     /// Shared fleet key. Empty means "no fleet yet".
     #[serde(default)]
     pub key: String,
+    /// The fleet's display name — whatever its owner answers to ("Casey").
+    /// Cosmetic and gossiped with the roster, converging by the same
+    /// version. Empty = unnamed, and an empty name is skipped on the wire
+    /// so an older peer sees exactly the roster shape it always did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// Bumped on every membership change so peers converge on the newest copy.
     #[serde(default)]
     pub version: u64,
@@ -461,6 +467,7 @@ mod tests {
     fn owned_roster_round_trips() {
         let r = OwnedRoster {
             key: "a1b2c3".into(),
+            name: "Casey".into(),
             version: 4,
             members: vec![
                 OwnedMember {
@@ -480,12 +487,19 @@ mod tests {
 
     #[test]
     fn owned_roster_tolerates_a_minimal_advert() {
-        // A member from an older peer may carry just the device id.
+        // A member from an older peer may carry just the device id — and no
+        // fleet name (the field postdates them).
         let json = r#"{ "key": "k", "members": [{ "device": "d" }] }"#;
         let r: OwnedRoster = serde_json::from_str(json).unwrap();
         assert_eq!(r.version, 0);
         assert_eq!(r.members.len(), 1);
         assert_eq!(r.members[0].label, "");
+        assert_eq!(r.name, "");
+
+        // An unnamed fleet serializes *without* the key, so an older
+        // receiver sees exactly the roster shape it always did.
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(!s.contains("name"));
     }
 
     #[test]

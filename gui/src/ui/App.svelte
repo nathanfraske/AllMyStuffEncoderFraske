@@ -84,7 +84,13 @@
     </div>
 
     <div class="summary">
-      <span class="chip"><b>{app.mineCount}</b> yours</span>
+      <button
+        class="chip yours"
+        onclick={() => app.openSettings("fleet")}
+        title="Your fleet — name it, see its key and members"
+      >
+        <b>{app.mineCount}</b> yours{#if app.fleetName}&nbsp;· {app.fleetName}{/if}
+      </button>
       <span class="chip"><b>{app.sharedCount}</b> shared</span>
       <span class="net-anchor">
         <button
@@ -218,6 +224,14 @@
     display: flex;
     gap: 0.4rem;
     margin-left: auto;
+  }
+  .chip.yours {
+    cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease;
+  }
+  .chip.yours:hover {
+    background: var(--surface);
+    border-color: var(--accent);
   }
   .net-anchor {
     position: relative;

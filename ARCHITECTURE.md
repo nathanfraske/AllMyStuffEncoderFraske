@@ -120,7 +120,11 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   devices one owner has claimed, all linked by a single shared **fleet key**.
   The owner mints the key on its first claim and hands it down on each
   adoption; every co-owned device gossips the roster and converges by version,
-  exactly like a mesh roster. For now the key only groups devices internally
+  exactly like a mesh roster. The roster also carries the fleet's **name**
+  ("Casey") — set from the Fleet pane by any member, replacing with the
+  version like membership does (an empty name is skipped on the wire, so
+  older peers see the exact roster shape they always did). The name labels
+  the graph's fleet section and is what new rooms are titled after. For now the key only groups devices internally
   (a later edition links it to other things). It's persisted next to the
   ownership record.
 
@@ -217,8 +221,17 @@ Tauri 2 + Svelte 5, a client of the daemon.
   are the multi-machine layer over the same plumbing: a room is a named,
   locally-persisted member list (invites ride `CHANNEL_ROOMS`), and joining
   opens a zoom-like call panel where **everything starts off** — mic,
-  camera, screen share. Each toggle fans ordinary routes out to the members
-  (authorization and the share sheet apply unchanged): **Mic** is the call
+  camera, screen share. A fresh room defaults to being named after the
+  fleet's owner ("Casey's room"); its maker is its owner and renames it
+  inline from the panel title (members converge via the re-stated invite).
+  Each toggle fans ordinary routes out to the members — but **room sharing
+  is scoped to the room**: membership is the consent, so room legs validate
+  structurally via `propose_room_route` / `proposeRoomRoute` without the
+  share-grant gate, **no standing grant is ever minted**, and leaving tears
+  every room-wired leg down. What happens in a room changes nothing about
+  what its members may do to each other outside it. (Input injection keeps
+  its backend owner/fleet gate regardless — a guest's control events are
+  still dropped.) The toggles: **Mic** is the call
   (your voice → their speakers); **Share sound** is deliberately separate —
   the machine's loopback (`system-audio`), never the mic; **Share screen**
   streams to each member's display, rendered in *their* panel as live tiles
@@ -399,9 +412,9 @@ the network pill's off-switch holds). **Device ownership**
 is already persisted there (`allmystuff-ownership.json`): the recorded owner
 survives restarts, while claim mode is deliberately transient (re-asserted
 each start by the flag) so a box never sits silently adoptable across reboots.
-That same record now also holds the **owned fleet** — the shared key and the
-roster of co-owned devices — so a fleet survives restarts and re-converges via
-gossip on the next start. Roster convergence is by version with *replacement*
+That same record now also holds the **owned fleet** — the shared key, the
+fleet's display name, and the roster of co-owned devices — so a fleet survives
+restarts and re-converges via gossip on the next start. Roster convergence is by version with *replacement*
 on a strictly newer copy (that's how a **leave or kick** propagates — a union
 could only ever add), equal versions union, and a newer roster that no longer
 lists this device means it was kicked: the fleet drops locally and ownership

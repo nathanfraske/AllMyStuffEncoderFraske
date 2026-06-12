@@ -227,6 +227,9 @@ export interface OwnedMember {
  *  An empty `key` means you haven't claimed anything yet. */
 export interface OwnedRoster {
   key: string;
+  /** The fleet's display name ("Casey") — cosmetic, gossiped with the
+   *  roster. Absent/empty = unnamed (an older peer never sends it). */
+  name?: string;
   version: number;
   members: OwnedMember[];
 }
@@ -366,6 +369,10 @@ export interface VirtualRoom {
   id: string;
   name: string;
   members: string[];
+  /** Canonical id of the room's creator — the one member who renames it.
+   *  Absent on rooms minted before the field (or stubbed from a stray
+   *  chat), which leaves the rename open to whoever holds the copy. */
+  owner?: string;
 }
 
 /** One line of a room's chat (kept in memory for the session). */

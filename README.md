@@ -110,12 +110,14 @@ zoom controls.
   picks the matching endpoint (your mic → that PC's audio-in; that PC's
   screen → your monitor), draws a glowing wire — and pops the console that
   manages that kind of session on the far machine.
-- **Make a room** → a zoom-like call between machines you pick. Joining
-  wires *nothing*: your **mic** (the call — your voice), camera and screen
-  share all start off, and the panel adds **share sound** (what the machine
-  is *playing* — deliberately never your mic), **share control** (let
-  members drive this machine), chat, and file sending. Members' screen
-  shares show up as live tiles.
+- **Make a room** → a zoom-like call between machines you pick, named
+  after your fleet's owner by default (its maker can rename it inline).
+  Joining wires *nothing*: your **mic** (the call — your voice), camera and
+  screen share all start off, and the panel adds **share sound** (what the
+  machine is *playing* — deliberately never your mic), **share control**
+  (let members drive this machine), chat, and file sending. Members' screen
+  shares show up as live tiles — and it's a *real* room: sharing there is
+  scoped to the room and never hands its members standing permissions.
 
 Edges are colour-coded by what flows through them — <b>audio</b>,
 <b>video</b>, <b>screen</b>, <b>controls</b>, <b>files</b> — so the graph

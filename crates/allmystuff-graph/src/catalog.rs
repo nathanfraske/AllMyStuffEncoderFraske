@@ -95,6 +95,32 @@ impl Catalog {
         from: &CapabilityId,
         to: &CapabilityId,
     ) -> Result<Route, ConnectError> {
+        let route = self.validate_route(from, to)?;
+        self.authorize(&route)?;
+        Ok(route)
+    }
+
+    /// Validate a connection for the **rooms plane**: every structural
+    /// rule of [`Catalog::propose_route`] — known endpoints, media, flow —
+    /// without the share-grant gate. Being in the same room *is* the
+    /// consent, and it's scoped to the room session: the route lives only
+    /// while the room toggle does, and no standing [`Grant`] is ever
+    /// minted for it. A real virtual room — what happens there doesn't
+    /// change what its members may do to each other outside it.
+    pub fn propose_room_route(
+        &self,
+        from: &CapabilityId,
+        to: &CapabilityId,
+    ) -> Result<Route, ConnectError> {
+        self.validate_route(from, to)
+    }
+
+    /// The structural half of a proposal (no authorization).
+    fn validate_route(
+        &self,
+        from: &CapabilityId,
+        to: &CapabilityId,
+    ) -> Result<Route, ConnectError> {
         if from == to {
             return Err(ConnectError::SelfLoop);
         }
@@ -134,14 +160,12 @@ impl Catalog {
             dst.media
         };
 
-        let route = Route {
+        Ok(Route {
             id: route_id(from, to),
             from: from.clone(),
             to: to.clone(),
             media,
-        };
-        self.authorize(&route)?;
-        Ok(route)
+        })
     }
 
     /// Check a route against the relationships in play. Endpoints on your

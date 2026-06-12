@@ -22,7 +22,9 @@
   }
 
   function openDraft() {
-    draftName = "";
+    // Pre-fill the default so the maker sees what they'll get: a room
+    // named after the fleet's owner ("Casey's room"). Still editable.
+    draftName = app.defaultRoomName();
     draftMembers = [];
     app.roomDraftOpen = true;
   }
@@ -59,7 +61,7 @@
       </p>
       <input
         class="name-input"
-        placeholder="Room name (e.g. Movie night)"
+        placeholder={app.defaultRoomName()}
         bind:value={draftName}
         onkeydown={(e) => e.key === "Enter" && create()}
       />

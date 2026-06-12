@@ -156,6 +156,29 @@ export function routeId(from: string, to: string): string {
 
 /** Validate + authorize a connection. Mirrors `Catalog::propose_route`. */
 export function proposeRoute(cat: Catalog, from: string, to: string): ConnectResult {
+  const structural = validateRoute(cat, from, to);
+  if (!structural.ok) return structural;
+
+  const denied = requiredGrants(cat, from, to);
+  if (denied.length > 0) {
+    const who = denied[0].personName;
+    const act = describeAction(denied[0].media, denied[0].role);
+    return { ok: false, reason: `${who} isn't allowed to ${act} yet.`, denied };
+  }
+  return structural;
+}
+
+/** Validate a connection for the **rooms plane** — every structural rule
+ *  of `proposeRoute` without the share-grant gate. Being in the same room
+ *  *is* the consent, and it's scoped to the room session: the route lives
+ *  only while the room toggle does, and no standing grant is ever minted
+ *  for it. Mirrors `Catalog::propose_room_route`. */
+export function proposeRoomRoute(cat: Catalog, from: string, to: string): ConnectResult {
+  return validateRoute(cat, from, to);
+}
+
+/** The structural half of a proposal (no authorization). */
+function validateRoute(cat: Catalog, from: string, to: string): ConnectResult {
   if (from === to) return { ok: false, reason: "A thing can't connect to itself." };
   const src = capability(cat, from);
   const dst = capability(cat, to);
@@ -178,13 +201,6 @@ export function proposeRoute(cat: Catalog, from: string, to: string): ConnectRes
       ok: false,
       reason: `${MEDIA[src.media].label} doesn't fit ${MEDIA[dst.media].label}.`,
     };
-
-  const denied = requiredGrants(cat, from, to);
-  if (denied.length > 0) {
-    const who = denied[0].personName;
-    const act = describeAction(denied[0].media, denied[0].role);
-    return { ok: false, reason: `${who} isn't allowed to ${act} yet.`, denied };
-  }
 
   const media = src.media !== "generic" ? src.media : dst.media;
   return { ok: true, route: { id: routeId(from, to), from, to, media } };

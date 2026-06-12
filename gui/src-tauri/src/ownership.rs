@@ -36,6 +36,10 @@ struct Persisted {
     /// this device is itself adopted.
     #[serde(default)]
     fleet_key: Option<String>,
+    /// The fleet's display name ("Casey") — cosmetic, gossiped with the
+    /// roster, empty when unnamed.
+    #[serde(default)]
+    fleet_name: String,
     /// Last version of the owned roster we hold (last-writer-wins on gossip).
     #[serde(default)]
     fleet_version: u64,
@@ -50,6 +54,7 @@ struct Inner {
     owner: Option<String>,
     claim_mode: bool,
     fleet_key: Option<String>,
+    fleet_name: String,
     fleet_version: u64,
     fleet_members: Vec<OwnedMember>,
 }
@@ -75,6 +80,7 @@ impl Ownership {
             claim_mode: persisted.owner.is_none() && env_claim_flag(),
             owner: persisted.owner,
             fleet_key: persisted.fleet_key,
+            fleet_name: persisted.fleet_name,
             fleet_version: persisted.fleet_version,
             fleet_members: persisted.fleet_members,
         };
@@ -141,6 +147,7 @@ impl Ownership {
         i.owner = Some(claimer.to_string());
         i.claim_mode = false;
         let prev_key = i.fleet_key.take();
+        let prev_name = std::mem::take(&mut i.fleet_name);
         let prev_version = std::mem::take(&mut i.fleet_version);
         let prev_members = std::mem::take(&mut i.fleet_members);
         if persist(&self.path, &i) {
@@ -152,6 +159,7 @@ impl Ownership {
             i.owner = None;
             i.claim_mode = true;
             i.fleet_key = prev_key;
+            i.fleet_name = prev_name;
             i.fleet_version = prev_version;
             i.fleet_members = prev_members;
             false
@@ -194,6 +202,7 @@ impl Ownership {
             return false;
         }
         i.fleet_key = None;
+        i.fleet_name.clear();
         i.fleet_version = 0;
         i.fleet_members.clear();
         persist(&self.path, &i);
@@ -206,6 +215,7 @@ impl Ownership {
         let key = i.fleet_key.clone()?;
         Some(OwnedRoster {
             key,
+            name: i.fleet_name.clone(),
             version: i.fleet_version,
             members: i.fleet_members.clone(),
         })
@@ -289,6 +299,7 @@ impl Ownership {
                 .any(|m| pubkey_part(m.device.as_str()) == me_canon);
             if !listed {
                 i.fleet_key = None;
+                i.fleet_name.clear();
                 i.fleet_version = 0;
                 i.fleet_members.clear();
                 persist(&self.path, &i);
@@ -308,11 +319,15 @@ impl Ownership {
                         .iter()
                         .any(|n| n.device.as_str() == x.device.as_str())
                 });
+            // The fleet's name rides replacement like membership — a rename
+            // alone is a structural change (re-broadcast + UI refresh).
+            let renamed = i.fleet_name != incoming.name;
             i.fleet_key = Some(incoming.key.clone());
+            i.fleet_name = incoming.name.clone();
             i.fleet_members = new_members;
             i.fleet_version = incoming.version;
             persist(&self.path, &i);
-            return adopting || !same_set;
+            return adopting || !same_set || renamed;
         }
 
         if incoming.version < i.fleet_version {
@@ -325,6 +340,13 @@ impl Ownership {
         // gossip out-ranks the copy we just merged.
         let mut structural = false;
         let mut dirty = false;
+        if i.fleet_name.is_empty() && !incoming.name.is_empty() {
+            // Name refresh, label-style: adopt when we have none (a
+            // conflicting non-empty name is left to the next versioned
+            // rename, never ping-ponged at equal versions).
+            i.fleet_name = incoming.name.clone();
+            dirty = true;
+        }
         for m in &incoming.members {
             let canon = pubkey_part(m.device.as_str());
             match i
@@ -379,10 +401,12 @@ impl Ownership {
             .collect();
         let roster = OwnedRoster {
             key,
+            name: i.fleet_name.clone(),
             version: i.fleet_version + 1,
             members,
         };
         i.fleet_key = None;
+        i.fleet_name.clear();
         i.fleet_version = 0;
         i.fleet_members.clear();
         persist(&self.path, &i);
@@ -419,6 +443,38 @@ impl Ownership {
         persist(&self.path, &i);
         Ok(OwnedRoster {
             key,
+            name: i.fleet_name.clone(),
+            version: i.fleet_version,
+            members: i.fleet_members.clone(),
+        })
+    }
+
+    /// Name (or rename) the fleet. Membership is the permission, the same
+    /// rule as kicking: you can't name a fleet you aren't in. Bumps the
+    /// version so the rename replaces everywhere the roster gossips, and
+    /// returns the roster to broadcast.
+    pub fn set_fleet_name(&self, me: &str, name: &str) -> Result<OwnedRoster, String> {
+        let name = name.trim();
+        let mut i = self.inner.lock();
+        let Some(key) = i.fleet_key.clone() else {
+            return Err("this device isn't in a fleet".into());
+        };
+        let me_canon = pubkey_part(me);
+        if !i
+            .fleet_members
+            .iter()
+            .any(|m| pubkey_part(m.device.as_str()) == me_canon)
+        {
+            return Err("you can't name a fleet you aren't in".into());
+        }
+        if i.fleet_name != name {
+            i.fleet_name = name.to_string();
+            i.fleet_version += 1;
+            persist(&self.path, &i);
+        }
+        Ok(OwnedRoster {
+            key,
+            name: i.fleet_name.clone(),
             version: i.fleet_version,
             members: i.fleet_members.clone(),
         })
@@ -490,6 +546,7 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
     let persisted = Persisted {
         owner: inner.owner.clone(),
         fleet_key: inner.fleet_key.clone(),
+        fleet_name: inner.fleet_name.clone(),
         fleet_version: inner.fleet_version,
         fleet_members: inner.fleet_members.clone(),
     };
@@ -583,6 +640,7 @@ mod tests {
         // A foreign fleet's gossip (different key) is ignored once we hold one.
         let foreign = OwnedRoster {
             key: "ffff".into(),
+            name: String::new(),
             version: 99,
             members: vec![OwnedMember {
                 device: "intruder".into(),
@@ -599,6 +657,7 @@ mod tests {
         // that is *not* in the roster must not join itself to the fleet.
         let roster = OwnedRoster {
             key: "k1".into(),
+            name: String::new(),
             version: 3,
             members: vec![OwnedMember {
                 device: "owner".into(),
@@ -631,6 +690,7 @@ mod tests {
         // The new owner's roster (fresh key, lists us) now adopts cleanly.
         let roster = OwnedRoster {
             key: "fresh-key".into(),
+            name: String::new(),
             version: 3,
             members: vec![
                 OwnedMember {
@@ -647,9 +707,67 @@ mod tests {
         assert_eq!(dev.fleet().unwrap().key, "fresh-key");
     }
 
+    #[test]
+    fn fleet_name_renames_version_and_gossips_with_replacement() {
+        // The owner names the fleet: version bumps, the roster carries it.
+        let owner = memory();
+        owner.ensure_fleet_key();
+        assert!(owner.upsert_member("owner-AAAAA", "Owner"));
+        assert!(owner.upsert_member("nuc-BBBBB", "Spare NUC"));
+        let before = owner.fleet().unwrap().version;
+        let named = owner.set_fleet_name("owner-AAAAA", "  Casey  ").unwrap();
+        assert_eq!(named.name, "Casey", "name is trimmed");
+        assert_eq!(named.version, before + 1);
+
+        // A member merging the newer roster adopts the name — and the
+        // rename alone is structural (it re-broadcasts and refreshes UI).
+        let member = memory();
+        assert!(member.merge_fleet("nuc-BBBBB", &named));
+        assert_eq!(member.fleet().unwrap().name, "Casey");
+        let renamed = OwnedRoster {
+            name: "Casey's house".into(),
+            version: named.version + 1,
+            ..named.clone()
+        };
+        assert!(member.merge_fleet("nuc-BBBBB", &renamed));
+        assert_eq!(member.fleet().unwrap().name, "Casey's house");
+
+        // Equal-version gossip fills an *empty* name (label-style refresh,
+        // not structural) but never overwrites a non-empty one.
+        let other = memory();
+        let unnamed = OwnedRoster {
+            name: String::new(),
+            ..renamed.clone()
+        };
+        assert!(other.merge_fleet("nuc-BBBBB", &unnamed));
+        assert!(
+            !other.merge_fleet("nuc-BBBBB", &renamed),
+            "name fill isn't structural"
+        );
+        assert_eq!(other.fleet().unwrap().name, "Casey's house");
+        let conflicting = OwnedRoster {
+            name: "Impostor".into(),
+            ..renamed.clone()
+        };
+        assert!(!other.merge_fleet("nuc-BBBBB", &conflicting));
+        assert_eq!(
+            other.fleet().unwrap().name,
+            "Casey's house",
+            "equal versions never rename"
+        );
+
+        // A non-member can't name the fleet; renaming to the same name is
+        // a no-op that doesn't bump the version.
+        assert!(owner.set_fleet_name("stranger-XXXXX", "Hax").is_err());
+        let v = owner.fleet().unwrap().version;
+        let same = owner.set_fleet_name("owner-AAAAA", "Casey").unwrap();
+        assert_eq!(same.version, v);
+    }
+
     fn roster(key: &str, version: u64, devices: &[&str]) -> OwnedRoster {
         OwnedRoster {
             key: key.into(),
+            name: String::new(),
             version,
             members: devices
                 .iter()

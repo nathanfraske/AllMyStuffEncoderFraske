@@ -1877,6 +1877,22 @@ impl Mesh {
         Ok(())
     }
 
+    /// Front-end command: name (or rename) the fleet. The bumped roster
+    /// replaces everywhere it gossips — same convergence as a kick — and
+    /// the UI refreshes from the `allmystuff://owned` event.
+    pub async fn fleet_set_name(self: &Arc<Self>, name: String) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let roster = self.ownership.set_fleet_name(&me, &name)?;
+        tracing::info!(
+            "fleet named {:?} (roster now v{})",
+            roster.name,
+            roster.version
+        );
+        self.broadcast_roster(&roster).await;
+        self.emit_owned();
+        Ok(())
+    }
+
     /// Re-read the joined networks, (re)subscribe every channel on each, then
     /// re-advertise. Called after the set of networks changes (create / join /
     /// leave) or a network's transport is restarted by a signaling/STUN/TURN

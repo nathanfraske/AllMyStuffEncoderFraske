@@ -426,6 +426,38 @@ mod tests {
         assert_eq!(reqs[0].description, "Receive your display");
     }
 
+    #[test]
+    fn room_routes_skip_the_grant_gate_but_not_the_rules() {
+        // Casting my screen to Alex's display has no grant — the normal
+        // path denies it, while the rooms plane (membership is the
+        // consent, scoped to the room) lets it through.
+        let mut cat = fixture();
+        cat.capabilities.push(Capability::new(
+            "alex",
+            "alex:display",
+            "Alex's monitor",
+            MediaKind::Display,
+            Flow::Sink,
+            "display",
+        ));
+        let from: CapabilityId = "this:screen".into();
+        let to: CapabilityId = "alex:display".into();
+        assert!(matches!(
+            cat.propose_route(&from, &to).unwrap_err(),
+            ConnectError::Denied(_)
+        ));
+        let r = cat
+            .propose_room_route(&from, &to)
+            .expect("a room leg needs no grant");
+        assert_eq!(r.media, MediaKind::Display);
+
+        // The structural rules still hold: a mic can't feed a display.
+        let err = cat
+            .propose_room_route(&"this:mic".into(), &"alex:display".into())
+            .unwrap_err();
+        assert!(matches!(err, ConnectError::MediaMismatch { .. }), "{err:?}");
+    }
+
     // ---- endpoint matching --------------------------------------------
 
     #[test]
