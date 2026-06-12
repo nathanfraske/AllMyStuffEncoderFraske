@@ -1,11 +1,16 @@
-//! Keep the display awake while this machine hosts a screen stream.
+//! Keep the display awake while this machine hosts a screen stream —
+//! and **force it back on** when it's already dark.
 //!
 //! A remote console session *is* active use, but the OS can't see it:
 //! no local input arrives, the idle timer runs out, and the display
 //! sleeps — at which point the damage-driven capture backends simply
 //! stop producing frames (and a deep-sleeping DisplayPort monitor drops
-//! off the desktop entirely, taking the capture target with it). So a
-//! hosted display route holds a [`DisplayAwake`] guard for its lifetime:
+//! off the desktop entirely, taking the capture target with it).
+//!
+//! Two halves, because the OS treats them as different problems:
+//!
+//! **Prevention** — a hosted display route holds a [`DisplayAwake`]
+//! guard for its lifetime:
 //!
 //!  * **Windows** — a keeper thread holds
 //!    `SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED |
@@ -18,16 +23,43 @@
 //!    bus (GNOME's `org.gnome.SessionManager` as the fallback), the
 //!    standard "a video is playing" inhibitor.
 //!
-//! Guards are refcounted process-wide: the OS-level hold is acquired when
-//! the first route starts and released when the last one ends. Everything
-//! is best-effort — a desktop with no inhibition service just keeps the
-//! old behaviour, and the in-band capture status (`vstat`) tells the
-//! viewer when the display went away regardless.
+//! **Waking** — [`force_display_on`]. A held inhibitor does *not*
+//! re-light a panel that's already off, and a tiny injected mouse move
+//! is exactly the class of synthetic input modern display power
+//! managers filter (Windows especially: software jiggles don't relight
+//! the panel; a real TeamViewer-style login does, because it fires the
+//! strong activity signals). So the pulse uses each OS's *documented*
+//! force-on calls, plus a synthetic key tap (F15 — exists on no
+//! mainstream keyboard) that survives the filtering injected mouse
+//! motion doesn't:
 //!
-//! [`nudge_display`] is the other half: holding the display *awake*
-//! doesn't *wake* one that's already asleep when the route starts, but a
-//! synthetic 1-px mouse wiggle does, on every platform — the same
-//! `enigo` machinery the control plane injects with.
+//!  * **Windows** — a one-shot `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`
+//!    (no `ES_CONTINUOUS`: the documented "reset the display idle timer"
+//!    pulse that re-lights an idle-darkened panel) plus a
+//!    `WM_SYSCOMMAND`/`SC_MONITORPOWER(-1)` broadcast — the explicit
+//!    "monitor on" message.
+//!  * **macOS** — `IOPMAssertionDeclareUserActivity(kIOPMUserActiveLocal)`,
+//!    *the* public "a user is here, light the display now" call.
+//!  * **Linux** — DPMS `ForceLevel(On)` over xcb when an X display is
+//!    reachable (X11 and XWayland), plus `SimulateUserActivity` on the
+//!    freedesktop and GNOME screensaver buses and a logind
+//!    `SetIdleHint(false)` — all best-effort.
+//!
+//! Pulses are rate-limited process-wide (one per few seconds), so the
+//! capture loop can pulse on every frameless tick and the input
+//! injector on every inbound click/keystroke without spamming the OS.
+//! The injector only pulses **while a hosted stream is dark**
+//! ([`force_display_on_if_dark`]) — when frames flow, real injected
+//! input already counts as activity, and phantom F15 taps during active
+//! typing would be noise.
+//!
+//! The honest limit: a **locked Windows console** gives user-session
+//! processes no way to relight the secure desktop (that takes a SYSTEM
+//! service, the TeamViewer/RustDesk architecture) — on such a box the
+//! viewer at least gets told via the in-band capture status.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -78,17 +110,69 @@ impl Drop for DisplayAwake {
     }
 }
 
-/// Wake a display that's already asleep: a relative 1-px mouse move out
-/// and back, which every OS treats as user activity. Best-effort — a
-/// session that can't inject (no permission, no seat) just skips it.
-pub fn nudge_display() {
-    use enigo::{Coordinate, Enigo, Mouse, Settings};
+/// Whether some hosted display stream is currently dark (no frames /
+/// failing grabs) — set by the capture loops' status reporting, read by
+/// the input injector so a viewer's click can relight the panel.
+static STREAM_DARK: AtomicBool = AtomicBool::new(false);
+
+pub fn set_stream_dark(dark: bool) {
+    STREAM_DARK.store(dark, Ordering::Relaxed);
+}
+
+/// Minimum spacing between OS wake pulses — callers pulse freely (every
+/// frameless capture tick, every inbound click); this gate makes that
+/// one OS-visible pulse per window.
+const PULSE_EVERY: Duration = Duration::from_secs(3);
+
+static LAST_PULSE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn pulse_due() -> bool {
+    let mut last = LAST_PULSE.lock();
+    let now = Instant::now();
+    match *last {
+        Some(t) if now.duration_since(t) < PULSE_EVERY => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Force the display on, now — the strong calls, not just a wiggle.
+/// Safe to call hot (rate-limited internally); everything inside is
+/// best-effort and logged at debug on refusal.
+pub fn force_display_on() {
+    if !pulse_due() {
+        return;
+    }
+    platform::force_display_on();
+    synthetic_user_activity();
+}
+
+/// The input injector's hook: pulse only while a hosted stream is dark.
+/// A viewer wiggling and clicking at a black console is exactly the
+/// "remote login wakes the machine" moment — when frames already flow,
+/// the real injected input is activity enough.
+pub fn force_display_on_if_dark() {
+    if STREAM_DARK.load(Ordering::Relaxed) {
+        force_display_on();
+    }
+}
+
+/// A synthetic key tap + tiny mouse wiggle. The F15 *key* event is the
+/// load-bearing half — display power managers honor injected key
+/// presses where they filter small injected mouse motion — and F15
+/// exists on no mainstream keyboard, so the focused app sees nothing it
+/// reacts to.
+fn synthetic_user_activity() {
+    use enigo::{Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
     match Enigo::new(&Settings::default()) {
         Ok(mut enigo) => {
+            let _ = enigo.key(Key::F15, Direction::Click);
             let _ = enigo.move_mouse(1, 0, Coordinate::Rel);
             let _ = enigo.move_mouse(-1, 0, Coordinate::Rel);
         }
-        Err(e) => tracing::debug!("display wake nudge unavailable: {e}"),
+        Err(e) => tracing::debug!("synthetic user activity unavailable: {e}"),
     }
 }
 
@@ -126,6 +210,27 @@ mod platform {
     pub fn release(hold: Hold) {
         let _ = hold.0.send(());
     }
+
+    pub fn force_display_on() {
+        use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_DISPLAY_REQUIRED};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, HWND_BROADCAST, SC_MONITORPOWER, WM_SYSCOMMAND,
+        };
+        // One-shot, *without* ES_CONTINUOUS: the documented "reset the
+        // display idle timer" pulse, which re-lights a panel the idle
+        // timer turned off (the continuous hold only prevents).
+        unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED) };
+        // And the explicit monitor-power message: lParam -1 = on. This
+        // reaches the power manager even when injected input wouldn't.
+        unsafe {
+            PostMessageW(
+                HWND_BROADCAST,
+                WM_SYSCOMMAND,
+                SC_MONITORPOWER as usize,
+                -1isize,
+            )
+        };
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -135,6 +240,9 @@ mod platform {
 
     type IOPMAssertionID = u32;
     const IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+    /// `kIOPMUserActiveLocal` — count as a *local* user so the display
+    /// actually lights (`Remote` deliberately leaves it dark).
+    const IOPM_USER_ACTIVE_LOCAL: u32 = 0;
 
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
@@ -145,6 +253,11 @@ mod platform {
             assertion_id: *mut IOPMAssertionID,
         ) -> i32;
         fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> i32;
+        fn IOPMAssertionDeclareUserActivity(
+            assertion_name: CFStringRef,
+            user_type: u32,
+            assertion_id: *mut IOPMAssertionID,
+        ) -> i32;
     }
 
     pub struct Hold(Vec<IOPMAssertionID>);
@@ -176,6 +289,24 @@ mod platform {
     pub fn release(hold: Hold) {
         for id in hold.0 {
             unsafe { IOPMAssertionRelease(id) };
+        }
+    }
+
+    pub fn force_display_on() {
+        // The public "a user is here — light the display now" call; the
+        // system retires the assertion by itself after its activity
+        // window, so there's nothing to release.
+        let name = CFString::new("AllMyStuff remote session activity");
+        let mut id: IOPMAssertionID = 0;
+        let status = unsafe {
+            IOPMAssertionDeclareUserActivity(
+                name.as_concrete_TypeRef(),
+                IOPM_USER_ACTIVE_LOCAL,
+                &mut id,
+            )
+        };
+        if status != 0 {
+            tracing::debug!("IOPMAssertionDeclareUserActivity refused: {status}");
         }
     }
 }
@@ -244,6 +375,72 @@ mod platform {
         }
     }
 
+    pub fn force_display_on() {
+        // X11 and XWayland: DPMS force-on is the direct, documented call.
+        if std::env::var_os("DISPLAY").is_some() {
+            x11_dpms_on();
+        }
+        dbus_user_activity();
+    }
+
+    fn x11_dpms_on() {
+        let connected = xcb::Connection::connect_with_extensions(
+            None,
+            &[],
+            // Optional: a server without DPMS just skips this leg.
+            &[xcb::Extension::Dpms],
+        );
+        let (conn, _) = match connected {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("DPMS wake: no X connection: {e}");
+                return;
+            }
+        };
+        if !conn.active_extensions().any(|e| e == xcb::Extension::Dpms) {
+            return;
+        }
+        let cookie = conn.send_request_checked(&xcb::dpms::ForceLevel {
+            power_level: xcb::dpms::DpmsMode::On,
+        });
+        if let Err(e) = conn.check_request(cookie) {
+            tracing::debug!("DPMS ForceLevel(On): {e}");
+        }
+    }
+
+    /// "A user is active" on every bus that listens: the freedesktop and
+    /// GNOME screensaver interfaces, and logind's idle hint.
+    fn dbus_user_activity() {
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            for (dest, path, iface) in [
+                (
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    "org.freedesktop.ScreenSaver",
+                ),
+                (
+                    "org.gnome.ScreenSaver",
+                    "/org/gnome/ScreenSaver",
+                    "org.gnome.ScreenSaver",
+                ),
+            ] {
+                if let Ok(p) = proxy(&conn, dest, path, iface) {
+                    let _ = p.call_method("SimulateUserActivity", &());
+                }
+            }
+        }
+        if let Ok(sys) = zbus::blocking::Connection::system() {
+            if let Ok(p) = proxy(
+                &sys,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1/session/auto",
+                "org.freedesktop.login1.Session",
+            ) {
+                let _ = p.call_method("SetIdleHint", &(false));
+            }
+        }
+    }
+
     fn proxy<'a>(
         conn: &zbus::blocking::Connection,
         dest: &'a str,
@@ -284,6 +481,8 @@ mod platform {
     }
 
     pub fn release(_hold: Hold) {}
+
+    pub fn force_display_on() {}
 }
 
 #[cfg(test)]
@@ -307,5 +506,22 @@ mod tests {
             AWAKE.lock().backend.is_none(),
             "hold released with last guard"
         );
+    }
+
+    #[test]
+    fn pulses_are_rate_limited() {
+        // Only this test touches the pulse gate; the first call in the
+        // process opens the window, the immediate second is swallowed.
+        assert!(pulse_due());
+        assert!(!pulse_due());
+    }
+
+    #[test]
+    fn dark_flag_gates_the_input_pulse() {
+        set_stream_dark(false);
+        assert!(!STREAM_DARK.load(Ordering::Relaxed));
+        set_stream_dark(true);
+        assert!(STREAM_DARK.load(Ordering::Relaxed));
+        set_stream_dark(false);
     }
 }
