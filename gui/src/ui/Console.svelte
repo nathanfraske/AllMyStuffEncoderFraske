@@ -1015,7 +1015,12 @@
     flex: 1;
     min-width: 0;
     overflow-x: auto;
-    padding: 0.1rem;
+    /* Bottom room inside the scroller for the tabs' pop-out button,
+       which hangs off the bottom corner (the scroll clip would eat an
+       overhang); the negative margin gives the space back so the bar
+       doesn't grow. */
+    padding: 0.1rem 0.1rem 0.55rem;
+    margin-bottom: -0.45rem;
   }
   .tab {
     display: flex;
@@ -1069,7 +1074,7 @@
   }
   .tab-pop {
     position: absolute;
-    top: -0.45rem;
+    bottom: -0.45rem;
     right: -0.3rem;
     width: 1.25rem;
     height: 1.25rem;
