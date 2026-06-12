@@ -203,6 +203,21 @@ pub struct RoomMessage {
     pub event: RoomEvent,
 }
 
+/// How a room admits a machine that asks to join ([`RoomEvent::Knock`])
+/// without holding an invite. The host states it on every
+/// [`RoomEvent::Invite`]; only the host ever enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomAccess {
+    /// Anyone on a shared mesh who knocks with the room's id is admitted
+    /// automatically — the id *is* the invite.
+    Open,
+    /// The host admits each knock by hand. The default, and what an older
+    /// host's invites (no field on the wire) read as.
+    #[default]
+    Invite,
+}
+
 /// The events of a room's membership + chat plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -211,8 +226,16 @@ pub enum RoomEvent {
     /// every roster or name change, carrying the full member list —
     /// replacement semantics, so removals propagate (a member that's no
     /// longer listed drops the room). Receivers ignore invites for a
-    /// known room from anyone but its host.
-    Invite { members: Vec<NodeId> },
+    /// known room from anyone but its host. Once received, the room stays
+    /// on the member's device like a roster slot — it's listed (and can be
+    /// rejoined) until the host removes them or closes the room.
+    Invite {
+        members: Vec<NodeId>,
+        /// How the room treats knocks. Absent on an older host's invites
+        /// (`default`), which reads as invite-only — never more open.
+        #[serde(default)]
+        access: RoomAccess,
+    },
     /// The sender opened the room — they're present in the call now.
     Join,
     /// The sender left the room (hung up).
@@ -224,6 +247,16 @@ pub enum RoomEvent {
     /// kind and drops the whole message: it just keeps a dead room
     /// listed until the user forgets it locally.)
     Close,
+    /// "May I join?" — sent **to the host** by a machine holding the
+    /// room's id but no invite (the id was shared out-of-band and pasted
+    /// into the rooms UI). An [`RoomAccess::Open`] host admits at once by
+    /// re-stating the roster (an [`RoomEvent::Invite`] listing the
+    /// knocker); an invite-only host surfaces it for a human to admit or
+    /// deny. An older host drops the whole message — the knock simply
+    /// goes unanswered, like knocking on a door nobody's behind.
+    Knock,
+    /// The host's "no" to a knock, so the asker isn't left waiting.
+    Deny,
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share, and
@@ -541,10 +574,44 @@ mod tests {
             name: "Movie night".into(),
             event: RoomEvent::Invite {
                 members: vec!["a".into(), "b".into()],
+                access: RoomAccess::Open,
             },
         };
-        let back: RoomMessage = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["access"], "open");
+        let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn room_invite_without_access_reads_invite_only() {
+        // An older host's invite carries no `access` — it must never read
+        // as more open than the host meant.
+        let json = r#"{ "room": "room:abc", "name": "Movie night",
+                        "kind": "invite", "members": ["a"] }"#;
+        let m: RoomMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            m.event,
+            RoomEvent::Invite {
+                members: vec!["a".into()],
+                access: RoomAccess::Invite,
+            }
+        );
+    }
+
+    #[test]
+    fn room_knock_and_deny_round_trip() {
+        for (event, kind) in [(RoomEvent::Knock, "knock"), (RoomEvent::Deny, "deny")] {
+            let m = RoomMessage {
+                room: "room:owner:ab12cd34".into(),
+                name: String::new(),
+                event,
+            };
+            let j = serde_json::to_value(&m).unwrap();
+            assert_eq!(j["kind"], kind);
+            let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
+            assert_eq!(m, back);
+        }
     }
 
     #[test]

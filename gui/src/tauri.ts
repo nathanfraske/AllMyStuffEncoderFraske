@@ -647,6 +647,66 @@ export async function onRoom(
   );
 }
 
+/** Open (or focus) the dedicated window for one room — the call in its
+ *  own OS window, full-screenable like a console. Desktop only; the web
+ *  preview keeps the in-page panel. */
+export async function openRoomWindow(roomId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_room_window", { room: roomId });
+}
+
+/** Which room this window is the call for, when the window was opened by
+ *  `openRoomWindow` (`?room=<room id>`). Null in the main window. */
+export function roomWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("room");
+}
+
+/** The same-device chatter between this app's windows about rooms — a
+ *  room window telling the main window "I joined / left", the main window
+ *  asking a room window to hang up, any window announcing the saved rooms
+ *  list changed. Mesh room messages never echo back to their sender, so
+ *  windows of one device need this local lane to stay in step. Carried on
+ *  the Tauri event bus (which reaches every window, the sender included —
+ *  receivers drop their own `token`). No-op in web mode: one window. */
+export interface RoomLocalEvent {
+  /** The emitting window's store token — receivers ignore their own. */
+  token: string;
+  /** What happened: `join`/`leave` mirror self-presence, `leave-ask`
+   *  requests whichever window holds the room joined to hang up, `sync`
+   *  says the persisted rooms list changed (reload it), `knock-done`
+   *  says an ask-to-join was answered (clear it everywhere). */
+  kind: "join" | "leave" | "leave-ask" | "sync" | "knock-done";
+  room?: string;
+  /** `knock-done`: whose ask was answered. */
+  from?: string;
+}
+
+export async function emitRoomLocal(event: RoomLocalEvent): Promise<void> {
+  if (!isTauri()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit("allmystuff://room-local", event);
+}
+
+export async function onRoomLocal(cb: (e: RoomLocalEvent) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<RoomLocalEvent>("allmystuff://room-local", (e) => cb(e.payload));
+}
+
+/** Flip this OS window in or out of fullscreen (a room window's
+ *  fullscreen control). Resolves to the new state; web mode is a no-op
+ *  (the browser owns fullscreen there). */
+export async function toggleWindowFullscreen(): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  const win = getCurrentWindow();
+  const next = !(await win.isFullscreen());
+  await win.setFullscreen(next);
+  return next;
+}
+
 // ---- self-update -------------------------------------------------------
 //
 // These degrade to null in web mode (no backend), so the Updates settings

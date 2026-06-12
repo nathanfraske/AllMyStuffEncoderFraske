@@ -113,13 +113,23 @@ zoom controls.
 - **Make a room** → a zoom-like call between machines you pick — or just
   this one, inviting others later: **you host the rooms you make** (their
   identity, roster and name are yours; closing one ends it for everyone),
-  named after your fleet's owner by default. Joining wires *nothing*: your
+  named after your fleet's owner by default, **open or invite-only** —
+  an open room's id *is* the invite (copy it from the panel; pasting one
+  under "Join with an id" knocks, and an invite-only host admits or
+  denies from the People panel). Rooms you made, were invited to, or
+  were *ever* invited to stay on your list like roster slots until the
+  host says otherwise. On the desktop each room opens in **its own
+  window** — full-screenable, like every console — and it reads like the
+  calls you know: a tile per person (owner names first — "Casey", with
+  the machine alongside), red-slashed mic when muted, a green *you're
+  sharing* banner with the stop button on it, chat and people on the
+  right, Leave in red. Joining wires *nothing*: your
   **mic** (the call — your voice), camera and screen share all start off,
   and the panel adds **share sound** (what the machine is *playing* —
   deliberately never your mic), **share control** (let members drive this
   machine), chat, and file sending. Members' screen shares show up as live
-  tiles — and it's a *real* room: sharing there is scoped to the room,
-  stream-only (nothing is stored), and never hands its members standing
+  letterboxed tiles — and it's a *real* room: sharing there is scoped to the
+  room, stream-only (nothing is stored), and never hands its members standing
   permissions. Be in as many rooms at once as you like; each room's
   toggles are its own.
 

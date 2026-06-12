@@ -363,8 +363,15 @@ export interface VideoFrameMsg {
 // itself (mic, screen, sound, control) is ordinary routes, proposed and
 // authorized exactly like any other connection.
 
+/** How a room admits a machine that knocks (asks to join with the room's
+ *  id but no invite). Absent — an older host, an old save — reads as
+ *  `invite`: never more open than the host meant. */
+export type RoomAccess = "open" | "invite";
+
 /** A room as the rooms bar lists it. `members` are canonical (bare-pubkey)
- *  node ids and include this machine. */
+ *  node ids and include this machine. Once a room lands here — made here,
+ *  or invited into — it stays like a roster slot: listed and rejoinable
+ *  until the host removes this device or closes the room. */
 export interface VirtualRoom {
   id: string;
   name: string;
@@ -375,6 +382,8 @@ export interface VirtualRoom {
    *  Absent on rooms minted before the field (or stubbed from a stray
    *  chat), which leaves those controls open to whoever holds the copy. */
   owner?: string;
+  /** The host's knock policy, restated on every invite. */
+  access?: RoomAccess;
 }
 
 /** One line of a room's chat (kept in memory for the session). */
@@ -390,14 +399,18 @@ export interface RoomChatLine {
 
 /** A wire message of the rooms plane (mirrors the Rust `RoomMessage` —
  *  tagged on `kind`, with the room id + name restated on every message).
- *  `invite` (the roster/name replacement) and `close` are the **host's**
- *  alone; receivers ignore them from anyone else. */
+ *  `invite` (the roster/name/access replacement), `close` and `deny` are
+ *  the **host's** alone; receivers ignore them from anyone else. `knock`
+ *  travels the other way — a machine holding the room's id (pasted into
+ *  the rooms UI) asking the host to let it in. */
 export type RoomWireMessage = { room: string; name?: string } & (
-  | { kind: "invite"; members: string[] }
+  | { kind: "invite"; members: string[]; access?: RoomAccess }
   | { kind: "join" }
   | { kind: "leave" }
   | { kind: "chat"; text: string }
   | { kind: "close" }
+  | { kind: "knock" }
+  | { kind: "deny" }
 );
 
 /** The presence feature tag for the rooms plane (mirrors the Rust
