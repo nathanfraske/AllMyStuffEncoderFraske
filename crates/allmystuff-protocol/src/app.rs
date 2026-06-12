@@ -181,6 +181,16 @@ pub struct OwnedRoster {
 /// invite that raced a chat line, a member that reinstalled). The media
 /// of a room (mic, screen share, …) is **not** here: those are ordinary
 /// routes, proposed and authorized exactly like any other connection.
+///
+/// A room is **hosted by its maker**: the id is minted under the maker's
+/// canonical device id (`room:{owner}:{nonce}`), and the room's control
+/// plane — its roster and name (the [`RoomEvent::Invite`] replacement) and
+/// its end of life ([`RoomEvent::Close`]) — is honoured only from that
+/// host (the mesh authenticates senders, so this is a real check, not a
+/// label). Members talk to each other directly for everything streamed
+/// (join/leave presence, chat, the media routes) — nothing flows *through*
+/// the host — and a room is stream-only: nothing is stored, and any future
+/// history would live with the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomMessage {
     /// The room's stable id (minted by its creator).
@@ -197,16 +207,23 @@ pub struct RoomMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoomEvent {
-    /// "You're in this room." Sent to each member on creation (and
-    /// whenever the roster changes), carrying the full member list so
-    /// everyone renders the same room.
+    /// "You're in this room." Sent by the **host** on creation and on
+    /// every roster or name change, carrying the full member list —
+    /// replacement semantics, so removals propagate (a member that's no
+    /// longer listed drops the room). Receivers ignore invites for a
+    /// known room from anyone but its host.
     Invite { members: Vec<NodeId> },
     /// The sender opened the room — they're present in the call now.
     Join,
-    /// The sender left the room (closed its panel).
+    /// The sender left the room (hung up).
     Leave,
     /// A chat line from the sender.
     Chat { text: String },
+    /// The **host** closed the room for everyone — members drop it.
+    /// (From anyone else it's ignored. An older build doesn't know the
+    /// kind and drops the whole message: it just keeps a dead room
+    /// listed until the user forgets it locally.)
+    Close,
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share, and
@@ -527,6 +544,19 @@ mod tests {
             },
         };
         let back: RoomMessage = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn room_close_round_trips() {
+        let m = RoomMessage {
+            room: "room:owner:ab12cd34".into(),
+            name: "Movie night".into(),
+            event: RoomEvent::Close,
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "close");
+        let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
         assert_eq!(m, back);
     }
 

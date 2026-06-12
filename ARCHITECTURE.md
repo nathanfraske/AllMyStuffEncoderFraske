@@ -224,6 +224,23 @@ Tauri 2 + Svelte 5, a client of the daemon.
   camera, screen share. A fresh room defaults to being named after the
   fleet's owner ("Casey's room"); its maker is its owner and renames it
   inline from the panel title (members converge via the re-stated invite).
+
+  Every room is **hosted by its maker** — a room of just your own node is
+  fine (invite machines later from the panel). Hosting means the room's
+  *identity and control plane* are the host's, not that anything flows
+  through it: the id is minted under the host's canonical device id
+  (`room:{host}:{nonce}`); the roster and name answer to the host alone
+  (invites from anyone else are ignored — the mesh authenticates senders,
+  so that's a real check); replacement rosters propagate removals (a
+  member no longer listed drops the room, the fleet pattern); and the
+  host deleting the room **closes it for everyone** (`close`), where a
+  guest deleting merely forgets a local copy. Members still talk directly
+  to each other for everything streamed — join/leave presence, chat, and
+  the media routes — and rooms are **stream-only**: nothing is stored, and
+  any future history/storage would live with the host. Being in several
+  rooms at once is fine: join state, send toggles and the routes they own
+  are all per-room, the panel just shows one room at a time, and
+  minimizing it (as opposed to leaving) keeps everything live.
   Each toggle fans ordinary routes out to the members — but **room sharing
   is scoped to the room**: membership is the consent, so room legs validate
   structurally via `propose_room_route` / `proposeRoomRoute` without the

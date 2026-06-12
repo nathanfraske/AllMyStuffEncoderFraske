@@ -369,9 +369,11 @@ export interface VirtualRoom {
   id: string;
   name: string;
   members: string[];
-  /** Canonical id of the room's creator — the one member who renames it.
+  /** Canonical id of the room's **host** — its maker. The room's
+   *  identity is minted under this device (`room:{host}:{nonce}`), and
+   *  its control plane (roster, name, closing it) answers to it alone.
    *  Absent on rooms minted before the field (or stubbed from a stray
-   *  chat), which leaves the rename open to whoever holds the copy. */
+   *  chat), which leaves those controls open to whoever holds the copy. */
   owner?: string;
 }
 
@@ -387,12 +389,15 @@ export interface RoomChatLine {
 }
 
 /** A wire message of the rooms plane (mirrors the Rust `RoomMessage` —
- *  tagged on `kind`, with the room id + name restated on every message). */
+ *  tagged on `kind`, with the room id + name restated on every message).
+ *  `invite` (the roster/name replacement) and `close` are the **host's**
+ *  alone; receivers ignore them from anyone else. */
 export type RoomWireMessage = { room: string; name?: string } & (
   | { kind: "invite"; members: string[] }
   | { kind: "join" }
   | { kind: "leave" }
   | { kind: "chat"; text: string }
+  | { kind: "close" }
 );
 
 /** The presence feature tag for the rooms plane (mirrors the Rust

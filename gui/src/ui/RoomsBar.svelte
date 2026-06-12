@@ -57,7 +57,9 @@
     <!-- Making a room: name it, pick who's in it. -->
     <div class="draft">
       <p class="hint">
-        A room is a call between machines — join it and turn on only what you want to share.
+        A room is a call between machines, and <b>you host the rooms you make</b> — their
+        identity and roster are this device's. Start one with just this node and invite
+        machines later.
       </p>
       <input
         class="name-input"
@@ -81,8 +83,8 @@
           <p class="hint faint">No other machines on the graph yet.</p>
         {/if}
       </div>
-      <button class="btn primary small wide" onclick={create} disabled={draftMembers.length === 0}>
-        Create room
+      <button class="btn primary small wide" onclick={create}>
+        {draftMembers.length === 0 ? "Create room (just this node)" : "Create room"}
       </button>
     </div>
   {:else if app.rooms.length === 0}
@@ -100,21 +102,28 @@
           <div class="r-main">
             <div class="r-name">
               🪩 {r.name}
+              {#if app.isJoined(r.id)}<span class="in-dot" title="You're in this room"></span>{/if}
               {#if unread > 0}<span class="unread" title="Unread chat">{unread}</span>{/if}
             </div>
             <div class="r-sub">
-              {memberSummary(r.members)}{present > 0 ? ` · ${present} in now` : ""}
+              {app.isRoomHost(r) ? "hosted by you" : `hosted by ${app.roomHostLabel(r)}`}
+              · {memberSummary(r.members)}{present > 0 ? ` · ${present} in now` : ""}
             </div>
           </div>
-          {#if app.roomOpenId === r.id}
-            <button class="btn small" onclick={() => app.leaveRoom()}>Leave</button>
+          {#if app.isJoined(r.id)}
+            {#if app.roomOpenId !== r.id}
+              <button class="btn small primary" onclick={() => app.joinRoom(r.id)}>Open</button>
+            {/if}
+            <button class="btn small" onclick={() => app.leaveRoom(r.id)}>Leave</button>
           {:else}
             <button class="btn small primary" onclick={() => app.joinRoom(r.id)}>Join</button>
           {/if}
           <button
             class="btn small ghost x"
-            title="Remove this room from this device"
-            aria-label="Remove room"
+            title={app.isRoomHost(r)
+              ? "Close this room — you host it, so it ends for everyone"
+              : "Remove this room from this device"}
+            aria-label={app.isRoomHost(r) ? "Close room" : "Remove room"}
             onclick={() => app.deleteRoom(r.id)}>✕</button
           >
         </li>
@@ -240,6 +249,13 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
+  }
+  .in-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.16);
   }
   .unread {
     background: var(--accent);

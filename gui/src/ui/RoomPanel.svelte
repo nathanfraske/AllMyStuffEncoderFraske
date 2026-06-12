@@ -37,6 +37,21 @@
   const chat = $derived(room ? app.roomChat[room.id] ?? [] : []);
   const unread = $derived(room ? app.roomUnread[room.id] ?? 0 : 0);
 
+  // The host's "invite more machines" picker.
+  let invitePickerOpen = $state(false);
+  const inviteCandidates = $derived(
+    room
+      ? app.roomCandidateNodes.filter(
+          (n) => !room.members.some((m) => app.machineByAnyId(m)?.id === n.id),
+        )
+      : [],
+  );
+
+  function invite(nodeId: string) {
+    if (!room) return;
+    app.addRoomMembers(room.id, [nodeId]);
+  }
+
   function inRoom(memberId: string): boolean {
     if (!room) return false;
     return (app.roomPresence[room.id] ?? []).some((m) => m === memberId);
@@ -106,6 +121,14 @@
         {:else}
           <div class="title">🪩 {room.name}</div>
         {/if}
+        <span
+          class="host-chip"
+          class:mine={app.isRoomHost(room)}
+          title="The room's identity, roster and name live with its host. Rooms are stream-only — nothing is stored, here or anywhere."
+        >
+          🏠 {app.isRoomHost(room) ? "you host this room" : `hosted by ${app.roomHostLabel(room)}`}
+          · stream-only
+        </span>
         <div class="members">
           {#each app.roomMemberNodes as m (m.id)}
             {@const n = m.node}
@@ -122,13 +145,57 @@
               {:else if n && isAppNode(n) && n.relationship.kind === "unclaimed"}
                 <span class="m-note" title="Claim it (or mark it shared) before media can route there">unclaimed</span>
               {/if}
+              {#if app.isRoomHost(room)}
+                <button
+                  class="m-remove"
+                  title="Remove this machine from the room"
+                  aria-label="Remove member"
+                  onclick={() => app.removeRoomMember(room.id, m.id)}>✕</button
+                >
+              {/if}
             </span>
+          {:else}
+            <span class="m-note solo">just you — invite a machine to share with</span>
           {/each}
+          {#if app.isRoomHost(room)}
+            <span class="invite-wrap">
+              <button
+                class="btn small"
+                disabled={inviteCandidates.length === 0}
+                title={inviteCandidates.length === 0
+                  ? "Every machine on the graph is already in this room"
+                  : "Invite more machines (you host this room)"}
+                onclick={() => (invitePickerOpen = !invitePickerOpen)}>＋ Invite</button
+              >
+              {#if invitePickerOpen && inviteCandidates.length > 0}
+                <div class="invite-pick">
+                  {#each inviteCandidates as n (n.id)}
+                    <button
+                      class="invite-row"
+                      onclick={() => {
+                        invitePickerOpen = false;
+                        invite(n.id);
+                      }}
+                    >
+                      <span class="m-dot" class:on={n.online}></span>
+                      {displayName(n)}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </span>
+          {/if}
         </div>
         <button class="btn small" class:primary={unread > 0} onclick={toggleChat}>
           💬 Chat{#if unread > 0}&nbsp;<b>{unread}</b>{/if}
         </button>
-        <button class="btn small danger-btn" onclick={() => app.leaveRoom()}>Leave room</button>
+        <button class="btn small danger-btn" onclick={() => app.leaveRoom(room.id)}>Leave room</button>
+        <button
+          class="btn small ghost mini"
+          title="Back to the graph — you stay in the room (everything keeps streaming)"
+          aria-label="Minimize the room"
+          onclick={() => app.closeRoomPanel()}>—</button
+        >
       </header>
 
       <div class="body">
@@ -268,8 +335,9 @@
 
         <p class="clarity">
           🎙 <b>Mic</b> is the call — your voice. 🔊 <b>Share sound</b> sends what this machine is
-          <i>playing</i> — never your mic. Everything here is <b>scoped to the room</b>: it ends
-          when you leave, and nobody gains a standing permission from it.
+          <i>playing</i> — never your mic. Everything here is <b>scoped to the room</b> and
+          <b>stream-only</b>: nothing is stored, it all ends when you leave, and nobody gains a
+          standing permission from it.
         </p>
       </footer>
     </section>
@@ -348,6 +416,24 @@
     padding: 0.15rem 0.45rem;
     min-width: 12rem;
   }
+  .host-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.7rem;
+    font-weight: 650;
+    color: var(--ink-faint);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    padding: 0.16rem 0.55rem;
+    white-space: nowrap;
+  }
+  .host-chip.mine {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-color: oklch(0.64 0.255 350 / 0.35);
+  }
   .members {
     display: flex;
     align-items: center;
@@ -355,6 +441,58 @@
     flex: 1;
     min-width: 0;
     flex-wrap: wrap;
+  }
+  .m-remove {
+    border: none;
+    background: transparent;
+    color: var(--ink-faint);
+    font-size: 0.66rem;
+    padding: 0 0.1rem;
+    line-height: 1;
+  }
+  .m-remove:hover {
+    color: var(--danger);
+  }
+  .m-note.solo {
+    color: var(--ink-faint);
+    font-size: 0.74rem;
+  }
+  .invite-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .invite-pick {
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    left: 0;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-md);
+    padding: 0.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 12rem;
+    z-index: 6;
+  }
+  .invite-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    text-align: left;
+    font-size: 0.78rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: var(--r-sm);
+  }
+  .invite-row:hover {
+    background: var(--surface-2);
+  }
+  .mini {
+    font-weight: 800;
   }
   .member {
     display: inline-flex;

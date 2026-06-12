@@ -152,6 +152,37 @@ function emptyRoomRoutes(): Record<RoomChannel, string[]> {
   return { mic: [], cam: [], screen: [], sound: [], control: [] };
 }
 
+/** One joined room's send toggles — everything off until flipped. */
+interface RoomSendState {
+  mic: boolean;
+  cam: boolean;
+  screen: boolean;
+  sound: boolean;
+  control: boolean;
+}
+
+const ROOM_SEND_OFF: RoomSendState = {
+  mic: false,
+  cam: false,
+  screen: false,
+  sound: false,
+  control: false,
+};
+
+/** Mint a room id under its host's canonical device id — the identity
+ *  itself says whose room it is. */
+function newRoomId(host: string): string {
+  return `room:${host}:${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** The host a room id is anchored under (`room:{host}:{nonce}`), if it
+ *  parses. A fallback only — a room's recorded `owner` always wins (older
+ *  ids carry a timestamp where the host now goes). */
+function roomHostFromId(id: string): string | null {
+  const m = /^room:([^:]+):[^:]+$/.exec(id);
+  return m ? m[1] : null;
+}
+
 export interface Toast {
   id: number;
   kind: "ok" | "info" | "warn";
@@ -271,18 +302,20 @@ class AppStore {
   roomChatOpen = $state(false);
   /** The "make a room" composer in the rooms bar. */
   roomDraftOpen = $state(false);
-  // The open room's send toggles. A room joins like a muted call: nothing
-  // is wired until one of these is deliberately turned on.
-  roomMic = $state(false);
-  roomCam = $state(false);
-  roomScreen = $state(false);
-  /** Sharing this machine's *sound* (its loopback) — not the microphone. */
-  roomSound = $state(false);
-  /** Letting members drive this machine (their keyboard & mouse in). */
-  roomControl = $state(false);
-  /** Route ids each room toggle created, so leaving tears down exactly
-   *  what the room wired (never a route the user made on the graph). */
-  private roomRoutes: Record<RoomChannel, string[]> = emptyRoomRoutes();
+  /** Rooms this device is currently *in* — being in several at once is
+   *  fine; the panel (`roomOpenId`) just shows one at a time, and closing
+   *  the panel doesn't hang up. */
+  joinedRoomIds = $state<string[]>([]);
+  /** Per-joined-room send toggles. A room joins like a muted call:
+   *  nothing is wired until a toggle is deliberately turned on — and each
+   *  room's toggles are its own (mic live in one room stays live while
+   *  you look at another). */
+  roomSend = $state<Record<string, RoomSendState>>({});
+  /** Route ids each room's toggles created (keyed by room id, then
+   *  channel), so leaving a room tears down exactly what *that room*
+   *  wired (never a route the user made on the graph, never another
+   *  room's legs). */
+  private roomRoutes: Record<string, Record<RoomChannel, string[]>> = {};
 
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
@@ -1523,7 +1556,7 @@ class AppStore {
   private seedDemoRoom() {
     if (this.rooms.length > 0) return;
     this.rooms.push({
-      id: "room:demo",
+      id: "room:this:demo",
       name: "Movie night",
       members: ["this", "desk", "tv"],
       owner: "this",
@@ -1609,6 +1642,56 @@ class AppStore {
     return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_ROOMS);
   }
 
+  /** The canonical id of a room's **host** — the device the room's
+   *  identity, ownership and control plane belong to. The recorded owner
+   *  wins; the id's anchor segment is the fallback for stubs. */
+  roomHost(room: VirtualRoom): string | null {
+    return room.owner ?? roomHostFromId(room.id);
+  }
+
+  /** Whether this device hosts `room`. A room with no traceable host (a
+   *  pre-hosting save) answers to whoever holds the copy. */
+  isRoomHost(room: VirtualRoom): boolean {
+    const host = this.roomHost(room);
+    return !host || this.isMe(host);
+  }
+
+  /** A room host's display label, for "hosted by …" lines. */
+  roomHostLabel(room: VirtualRoom): string {
+    const host = this.roomHost(room);
+    if (!host || this.isMe(host)) return "you";
+    return this.machineByAnyId(host)?.label ?? shortId(host);
+  }
+
+  /** Whether this device is currently in `roomId` (joined the call). */
+  isJoined(roomId: string): boolean {
+    return this.joinedRoomIds.includes(roomId);
+  }
+
+  /** One room's send toggles (all-off until joined and flipped). */
+  roomSendState(roomId: string): RoomSendState {
+    return this.roomSend[roomId] ?? ROOM_SEND_OFF;
+  }
+
+  // The open room's toggles, for the panel's strip.
+  roomMic = $derived.by(() => !!this.roomOpenId && this.roomSendState(this.roomOpenId).mic);
+  roomCam = $derived.by(() => !!this.roomOpenId && this.roomSendState(this.roomOpenId).cam);
+  roomScreen = $derived.by(() => !!this.roomOpenId && this.roomSendState(this.roomOpenId).screen);
+  roomSound = $derived.by(() => !!this.roomOpenId && this.roomSendState(this.roomOpenId).sound);
+  roomControl = $derived.by(() => !!this.roomOpenId && this.roomSendState(this.roomOpenId).control);
+
+  private setRoomSend(roomId: string, channel: RoomChannel, on: boolean) {
+    this.roomSend = {
+      ...this.roomSend,
+      [roomId]: { ...this.roomSendState(roomId), [channel]: on },
+    };
+  }
+
+  /** The routes one room's toggles own, by channel. */
+  private legsOf(roomId: string): Record<RoomChannel, string[]> {
+    return (this.roomRoutes[roomId] ??= emptyRoomRoutes());
+  }
+
   /** The room whose panel is open, if any. */
   openRoom = $derived.by(() =>
     this.roomOpenId ? this.rooms.find((r) => r.id === this.roomOpenId) ?? null : null,
@@ -1688,41 +1771,91 @@ class AppStore {
     return `${base}'s room`;
   }
 
-  /** Make a room and tell its members. The maker is its owner — the one
-   *  member who can rename it later. */
+  /** Make a room — you're its **host**: the id is minted under this
+   *  device, the roster and name answer to it, and closing it ends the
+   *  room for everyone. A room of just this node is fine; invite
+   *  machines later from its panel. */
   createRoom(name: string, memberIds: string[]) {
     const clean = name.trim() || this.defaultRoomName();
-    const members = [
-      canonicalNodeId(this.localId),
-      ...memberIds.map(canonicalNodeId).filter((m) => !this.isMe(m)),
-    ];
-    const room: VirtualRoom = {
-      id: newId("room"),
-      name: clean,
-      members,
-      owner: canonicalNodeId(this.localId),
-    };
+    const me = canonicalNodeId(this.localId);
+    const members = [me, ...memberIds.map(canonicalNodeId).filter((m) => !this.isMe(m))];
+    const room: VirtualRoom = { id: newRoomId(me), name: clean, members, owner: me };
     this.rooms.push(room);
     this.saveRooms();
     this.roomDraftOpen = false;
-    this.toast("ok", `Made the room “${clean}”`);
+    this.toast("ok", `Made the room “${clean}” — you host it`);
     this.broadcastRoom(room, { room: room.id, name: room.name, kind: "invite", members });
   }
 
-  /** Whether this device may rename `room`: its owner (or a room from
-   *  before owners existed, which anyone holding it may title). */
-  canRenameRoom(room: VirtualRoom): boolean {
-    return !room.owner || this.isMe(room.owner);
+  /** Add members to a room you host. Everyone (the new members included)
+   *  converges on the re-stated roster. */
+  addRoomMembers(roomId: string, memberIds: string[]) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room) return;
+    if (!this.isRoomHost(room)) {
+      this.toast("warn", "Only the room's host can invite members");
+      return;
+    }
+    const add = memberIds
+      .map(canonicalNodeId)
+      .filter((m) => !this.isMe(m) && !room.members.some((x) => sameMachine(x, m)));
+    if (add.length === 0) return;
+    room.members = [...room.members, ...add];
+    this.saveRooms();
+    this.toast("ok", `Invited ${add.length} machine${add.length === 1 ? "" : "s"} to “${room.name}”`);
+    this.broadcastRoom(room, {
+      room: room.id,
+      name: room.name,
+      kind: "invite",
+      members: room.members,
+    });
   }
 
-  /** Rename a room (owner only). Members converge via the re-stated
+  /** Remove a member from a room you host. The replacement roster goes to
+   *  the *old* member set, so the removed machine hears the roster it's
+   *  absent from and drops the room. */
+  removeRoomMember(roomId: string, memberId: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room) return;
+    if (!this.isRoomHost(room)) {
+      this.toast("warn", "Only the room's host can remove members");
+      return;
+    }
+    const target = canonicalNodeId(memberId);
+    if (this.isMe(target)) return; // the host closes, never removes itself
+    const before = room.members;
+    room.members = room.members.filter((m) => !sameMachine(m, target));
+    if (room.members.length === before.length) return;
+    this.saveRooms();
+    this.presenceDrop(room.id, target);
+    const label = this.machineByAnyId(target)?.label ?? shortId(target);
+    this.toast("info", `Removed ${label} from “${room.name}”`);
+    if (this.backendConnected) {
+      const others = before.filter((m) => !this.isMe(m));
+      if (others.length) {
+        void roomSend(others, {
+          room: room.id,
+          name: room.name,
+          kind: "invite",
+          members: room.members,
+        });
+      }
+    }
+  }
+
+  /** Whether this device may rename `room` — the host's privilege. */
+  canRenameRoom(room: VirtualRoom): boolean {
+    return this.isRoomHost(room);
+  }
+
+  /** Rename a room (host only). Members converge via the re-stated
    *  invite, which carries the room's name and roster. */
   renameRoom(roomId: string, name: string) {
     const room = this.rooms.find((r) => r.id === roomId);
     const clean = name.trim();
     if (!room || !clean || room.name === clean) return;
     if (!this.canRenameRoom(room)) {
-      this.toast("warn", "Only the room's owner can rename it");
+      this.toast("warn", "Only the room's host can rename it");
       return;
     }
     room.name = clean;
@@ -1736,57 +1869,84 @@ class AppStore {
     });
   }
 
-  /** Forget a room on this device (members keep theirs). */
+  /** Delete a room. From its **host** this closes the room for everyone
+   *  (the room *is* the host's); from anyone else it only forgets the
+   *  room on this device — you can't delete someone else's room. */
   deleteRoom(roomId: string) {
-    if (this.roomOpenId === roomId) this.leaveRoom();
-    const name = this.rooms.find((r) => r.id === roomId)?.name;
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room) return;
+    const hosted = this.isRoomHost(room);
+    const members = [...room.members];
+    if (this.isJoined(roomId)) {
+      this.unjoinRoom(roomId);
+      if (!hosted) this.broadcastTo(members, room, { room: room.id, name: room.name, kind: "leave" });
+    }
+    if (hosted) {
+      this.broadcastTo(members, room, { room: room.id, name: room.name, kind: "close" });
+    }
     this.rooms = this.rooms.filter((r) => r.id !== roomId);
     this.saveRooms();
-    if (name) this.toast("info", `Removed “${name}” from this device`);
+    this.toast(
+      "info",
+      hosted ? `Closed “${room.name}” for everyone` : `Removed “${room.name}” from this device`,
+    );
   }
 
-  /** Join a room — open its call panel. Like sitting down muted: nothing
-   *  is wired until a toggle is turned on. */
+  /** Join a room (or bring an already-joined one back on screen). Like
+   *  sitting down muted: nothing is wired until a toggle is turned on.
+   *  Being in several rooms at once is fine — the panel just shows one;
+   *  use [`AppStore.closeRoomPanel`] to look away without hanging up. */
   joinRoom(roomId: string) {
     const room = this.rooms.find((r) => r.id === roomId);
     if (!room) return;
-    if (this.roomOpenId && this.roomOpenId !== roomId) this.leaveRoom();
+    if (!this.isJoined(roomId)) {
+      this.joinedRoomIds = [...this.joinedRoomIds, roomId];
+      this.roomSend = { ...this.roomSend, [roomId]: { ...ROOM_SEND_OFF } };
+      this.roomRoutes[roomId] = emptyRoomRoutes();
+      this.presenceAdd(roomId, canonicalNodeId(this.localId));
+      this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
+    }
     this.roomOpenId = roomId;
     this.roomChatOpen = false;
     this.roomUnread = { ...this.roomUnread, [roomId]: 0 };
-    this.roomMic = false;
-    this.roomCam = false;
-    this.roomScreen = false;
-    this.roomSound = false;
-    this.roomControl = false;
-    this.roomRoutes = emptyRoomRoutes();
-    this.presenceAdd(roomId, canonicalNodeId(this.localId));
-    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
   }
 
-  /** Leave the room: every toggle goes off (tearing down exactly the
-   *  routes the room wired), and members see us go. */
-  leaveRoom() {
-    const room = this.openRoom;
-    if (!room) return;
-    for (const channel of ROOM_CHANNELS) this.dropRoomLegs(channel);
-    this.roomMic = false;
-    this.roomCam = false;
-    this.roomScreen = false;
-    this.roomSound = false;
-    this.roomControl = false;
-    this.presenceDrop(room.id, canonicalNodeId(this.localId));
-    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "leave" });
+  /** Put the panel away without leaving — every joined room (and whatever
+   *  it's sending) stays live. */
+  closeRoomPanel() {
     this.roomOpenId = null;
+  }
+
+  /** Hang up one room: its toggles go off (tearing down exactly the
+   *  routes that room wired — no other room's), and members see us go. */
+  leaveRoom(roomId: string | null = this.roomOpenId) {
+    if (!roomId || !this.isJoined(roomId)) return;
+    const room = this.rooms.find((r) => r.id === roomId);
+    this.unjoinRoom(roomId);
+    if (room) this.broadcastRoom(room, { room: room.id, name: room.name, kind: "leave" });
+  }
+
+  /** The silent half of leaving (also the close / removed-by-host path):
+   *  tear down this room's legs and drop the joined state, no broadcast. */
+  private unjoinRoom(roomId: string) {
+    for (const channel of ROOM_CHANNELS) this.dropRoomLegs(roomId, channel);
+    delete this.roomRoutes[roomId];
+    const { [roomId]: _gone, ...rest } = this.roomSend;
+    this.roomSend = rest;
+    this.joinedRoomIds = this.joinedRoomIds.filter((id) => id !== roomId);
+    this.presenceDrop(roomId, canonicalNodeId(this.localId));
+    if (this.roomOpenId === roomId) this.roomOpenId = null;
   }
 
   /** Talk to the room: your **microphone** to every member's speakers —
    *  the call itself. (Sharing what this machine is *playing* is the
    *  separate "share sound" toggle.) */
   toggleRoomMic() {
-    if (this.roomMic) {
-      this.dropRoomLegs("mic");
-      this.roomMic = false;
+    const roomId = this.roomOpenId;
+    if (!roomId) return;
+    if (this.roomSendState(roomId).mic) {
+      this.dropRoomLegs(roomId, "mic");
+      this.setRoomSend(roomId, "mic", false);
       return;
     }
     const from = this.localAudioSource("mic");
@@ -1794,8 +1954,8 @@ class AppStore {
       this.toast("warn", "No microphone on this machine");
       return;
     }
-    const wired = this.wireRoomLegs("mic", from, "audio");
-    this.roomMic = wired > 0;
+    const wired = this.wireRoomLegs(roomId, "mic", from, "audio");
+    this.setRoomSend(roomId, "mic", wired > 0);
     if (wired > 0) this.toastLegs("Your mic is live", wired);
     else this.toast("warn", "Nobody in the room can receive audio right now");
   }
@@ -1804,9 +1964,11 @@ class AppStore {
    *  loopback — to every member's speakers. Deliberately not the mic:
    *  use the mic toggle to talk. */
   toggleRoomSound() {
-    if (this.roomSound) {
-      this.dropRoomLegs("sound");
-      this.roomSound = false;
+    const roomId = this.roomOpenId;
+    if (!roomId) return;
+    if (this.roomSendState(roomId).sound) {
+      this.dropRoomLegs(roomId, "sound");
+      this.setRoomSend(roomId, "sound", false);
       return;
     }
     const from = this.localAudioSource("system");
@@ -1814,8 +1976,8 @@ class AppStore {
       this.toast("warn", "This machine exposes no system audio");
       return;
     }
-    const wired = this.wireRoomLegs("sound", from, "audio");
-    this.roomSound = wired > 0;
+    const wired = this.wireRoomLegs(roomId, "sound", from, "audio");
+    this.setRoomSend(roomId, "sound", wired > 0);
     if (wired > 0) this.toastLegs("Sharing this machine's sound", wired);
     else this.toast("warn", "Nobody in the room can receive audio right now");
   }
@@ -1823,9 +1985,11 @@ class AppStore {
   /** Share your screen with the room: this machine's screen to every
    *  member's display. Members see it as a tile in their room panel. */
   toggleRoomScreen() {
-    if (this.roomScreen) {
-      this.dropRoomLegs("screen");
-      this.roomScreen = false;
+    const roomId = this.roomOpenId;
+    if (!roomId) return;
+    if (this.roomSendState(roomId).screen) {
+      this.dropRoomLegs(roomId, "screen");
+      this.setRoomSend(roomId, "screen", false);
       return;
     }
     const from = this.capsOf(this.localId).find(
@@ -1835,8 +1999,8 @@ class AppStore {
       this.toast("warn", "This machine exposes no screen");
       return;
     }
-    const wired = this.wireRoomLegs("screen", from, "display");
-    this.roomScreen = wired > 0;
+    const wired = this.wireRoomLegs(roomId, "screen", from, "display");
+    this.setRoomSend(roomId, "screen", wired > 0);
     if (wired > 0) this.toastLegs("Sharing your screen", wired);
     else this.toast("warn", "Nobody in the room can receive a screen right now");
   }
@@ -1845,9 +2009,11 @@ class AppStore {
    *  *transport* hasn't landed yet (the same honest note the console
    *  shows) — and most machines expose no video sink to receive one. */
   toggleRoomCam() {
-    if (this.roomCam) {
-      this.dropRoomLegs("cam");
-      this.roomCam = false;
+    const roomId = this.roomOpenId;
+    if (!roomId) return;
+    if (this.roomSendState(roomId).cam) {
+      this.dropRoomLegs(roomId, "cam");
+      this.setRoomSend(roomId, "cam", false);
       return;
     }
     const from = this.capsOf(this.localId)
@@ -1857,8 +2023,8 @@ class AppStore {
       this.toast("warn", "No camera on this machine");
       return;
     }
-    const wired = this.wireRoomLegs("cam", from, "video");
-    this.roomCam = wired > 0;
+    const wired = this.wireRoomLegs(roomId, "cam", from, "video");
+    this.setRoomSend(roomId, "cam", wired > 0);
     if (wired > 0) this.toastLegs("Camera wired (transport is on its way)", wired);
     else this.toast("warn", "No member can receive camera video yet — camera transport is on its way");
   }
@@ -1869,9 +2035,11 @@ class AppStore {
    *  facts: only your owner/fleet can actually move things (a guest's
    *  events are dropped until share-gated control lands). */
   toggleRoomControl() {
-    if (this.roomControl) {
-      this.dropRoomLegs("control");
-      this.roomControl = false;
+    const roomId = this.roomOpenId;
+    if (!roomId) return;
+    if (this.roomSendState(roomId).control) {
+      this.dropRoomLegs(roomId, "control");
+      this.setRoomSend(roomId, "control", false);
       return;
     }
     const mySink = matchEndpoint(this.catalog, this.localId, "input", "consume");
@@ -1886,10 +2054,10 @@ class AppStore {
       const theirSrc = matchEndpoint(this.catalog, node.id, "input", "provide");
       if (!theirSrc) continue;
       const leg = this.roomConnect(theirSrc.id, mySink.id);
-      if (leg?.created) this.roomRoutes.control.push(leg.id);
+      if (leg?.created) this.legsOf(roomId).control.push(leg.id);
       if (leg) wired += 1;
     }
-    this.roomControl = wired > 0;
+    this.setRoomSend(roomId, "control", wired > 0);
     if (wired > 0) this.toastLegs("Members can drive this machine", wired);
     else this.toast("warn", "No member can send control right now");
   }
@@ -1924,18 +2092,31 @@ class AppStore {
     const existing = this.rooms.find((r) => r.id === msg.room);
     switch (msg.kind) {
       case "invite": {
+        // The roster as the host states it — replacement semantics, so a
+        // member that's no longer listed is *out*. Never force-add anyone.
         const members = [...new Set(msg.members.map(canonicalNodeId))];
-        if (!members.includes(canonicalNodeId(this.localId))) {
-          members.push(canonicalNodeId(this.localId));
-        }
-        if (!members.includes(sender)) members.push(sender);
+        if (!members.some((m) => sameMachine(m, sender))) members.push(sender);
+        const listsMe = members.some((m) => this.isMe(m));
         if (existing) {
+          // The room is its host's: roster and name answer to the host
+          // alone (the mesh authenticates `from`, so this check is real).
+          const host = this.roomHost(existing);
+          if (host && !sameMachine(host, sender)) return;
+          if (!listsMe) {
+            // The host's new roster no longer lists us — we're out.
+            if (this.isJoined(existing.id)) this.unjoinRoom(existing.id);
+            this.rooms = this.rooms.filter((r) => r.id !== existing.id);
+            this.saveRooms();
+            this.toast("info", `${senderLabel} removed this device from “${existing.name}”`);
+            return;
+          }
           existing.name = msg.name?.trim() || existing.name;
           existing.members = members;
-          // Invites come from the room's maker — adopt them as owner on a
-          // copy that predates the field (a chat-minted stub, an old save).
+          // Adopt the inviter as host on a copy that predates the field
+          // (a chat-minted stub, an old save).
           existing.owner ??= sender;
         } else {
+          if (!listsMe) return; // someone else's room — not ours to keep
           this.rooms.push({
             id: msg.room,
             name: msg.name?.trim() || "Room",
@@ -1953,6 +2134,18 @@ class AppStore {
       }
       case "leave": {
         this.presenceDrop(msg.room, sender);
+        break;
+      }
+      case "close": {
+        // The host ended the room for everyone. From anyone else it's
+        // noise (the authenticated sender must be the host).
+        if (!existing) return;
+        const host = this.roomHost(existing);
+        if (host && !sameMachine(host, sender)) return;
+        if (this.isJoined(existing.id)) this.unjoinRoom(existing.id);
+        this.rooms = this.rooms.filter((r) => r.id !== existing.id);
+        this.saveRooms();
+        this.toast("info", `${senderLabel} closed “${existing.name}”`);
         break;
       }
       case "chat": {
@@ -2006,8 +2199,15 @@ class AppStore {
   /** Fan one room-plane message at every member but us. Fire-and-forget:
    *  the plane has no acks, and presence heals gaps. */
   private broadcastRoom(room: VirtualRoom, msg: RoomWireMessage) {
+    this.broadcastTo(room.members, room, msg);
+  }
+
+  /** Like [`AppStore.broadcastRoom`] but to an explicit member list — the
+   *  close and removal paths, where the audience is the roster *before*
+   *  the change. */
+  private broadcastTo(members: string[], _room: VirtualRoom, msg: RoomWireMessage) {
     if (!this.backendConnected) return;
-    const others = room.members.filter((m) => !this.isMe(m));
+    const others = members.filter((m) => !this.isMe(m));
     if (others.length) void roomSend(others, msg);
   }
 
@@ -2046,8 +2246,13 @@ class AppStore {
 
   /** Wire one toggle's leg to every eligible member: `from` (a local
    *  source) into each member's matching sink. Returns how many members
-   *  got a leg (created ones are owned for teardown). */
-  private wireRoomLegs(channel: RoomChannel, from: Capability, media: MediaKind): number {
+   *  got a leg (created ones are owned by `roomId` for teardown). */
+  private wireRoomLegs(
+    roomId: string,
+    channel: RoomChannel,
+    from: Capability,
+    media: MediaKind,
+  ): number {
     let wired = 0;
     for (const { node } of this.roomMemberNodes) {
       if (!node || !isAppNode(node) || !node.online) continue;
@@ -2055,16 +2260,18 @@ class AppStore {
       const sink = matchEndpoint(this.catalog, node.id, media, "consume");
       if (!sink) continue;
       const leg = this.roomConnect(from.id, sink.id);
-      if (leg?.created) this.roomRoutes[channel].push(leg.id);
+      if (leg?.created) this.legsOf(roomId)[channel].push(leg.id);
       if (leg) wired += 1;
     }
     return wired;
   }
 
-  /** Tear down the routes one toggle created (and only those). */
-  private dropRoomLegs(channel: RoomChannel) {
-    for (const id of this.roomRoutes[channel]) void this.disconnect(id);
-    this.roomRoutes[channel] = [];
+  /** Tear down the routes one room's toggle created (and only those). */
+  private dropRoomLegs(roomId: string, channel: RoomChannel) {
+    const legs = this.roomRoutes[roomId];
+    if (!legs) return;
+    for (const id of legs[channel]) void this.disconnect(id);
+    legs[channel] = [];
   }
 
   private toastLegs(what: string, n: number) {
@@ -2652,7 +2859,9 @@ class AppStore {
    *  (membership is the consent), so it never depended on a grant — and
    *  leaving the room is what tears it down. */
   private reauthorize() {
-    const roomWired = new Set(Object.values(this.roomRoutes).flat());
+    const roomWired = new Set(
+      Object.values(this.roomRoutes).flatMap((legs) => Object.values(legs).flat()),
+    );
     const before = this.catalog.routes.length;
     this.catalog.routes = this.catalog.routes.filter(
       (r) => roomWired.has(r.id) || requiredGrants(this.catalog, r.from, r.to).length === 0,
