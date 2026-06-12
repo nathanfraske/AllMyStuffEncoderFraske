@@ -127,6 +127,10 @@ pub struct Mesh {
     /// seconds — the receive half of the dial-in line the sender's
     /// `StreamStats` provides.
     video_in_stats: Mutex<HashMap<String, VideoInStats>>,
+    /// Last emission per inbound-video diagnostic key — the rate limit
+    /// behind [`Self::diag_ok`], so a dead stream explains itself once per
+    /// [`WARN_EVERY`] instead of at frame rate.
+    video_diag_last: Mutex<HashMap<String, std::time::Instant>>,
     /// When each route last asked its sender for a clean decode entry —
     /// decode errors arrive at frame rate; the asks must not.
     refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
@@ -277,6 +281,7 @@ impl Mesh {
             video_lane_in: Mutex::new(HashMap::new()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             video_in_stats: Mutex::new(HashMap::new()),
+            video_diag_last: Mutex::new(HashMap::new()),
             refresh_asks: Mutex::new(HashMap::new()),
             audio_lane_out: Mutex::new(HashMap::new()),
             audio_lane_in: Mutex::new(HashMap::new()),
@@ -1145,27 +1150,50 @@ impl Mesh {
         use base64::Engine as _;
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_lane_in.lock().get(&canon).cloned() else {
-            tracing::debug!(
-                "video sample from {} with no claimed inbound lane — dropped",
-                short_id(from)
-            );
+            // The sender is streaming the track lane at us but no route
+            // here claimed it — the one-sided stream the viewer reads as
+            // "connecting forever". Loud (rate-limited): this exact drop
+            // was a debug whisper while the stage sat black.
+            if self.diag_ok(&format!("lane:{canon}")) {
+                tracing::warn!(
+                    "H.264 samples arriving from {} but no route claimed the inbound lane — dropped (viewer shows nothing)",
+                    short_id(from)
+                );
+            }
             return;
         };
         if !self.inbound_video_ok(&route_id, from) {
-            tracing::debug!("video sample for {route_id} refused (route not live here)");
+            if self.diag_ok(&format!("gate:{route_id}")) {
+                tracing::warn!(
+                    "H.264 samples for {route_id} refused — {}",
+                    self.route_diag(&route_id, from)
+                );
+            }
             return;
         }
         let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
             return;
         };
+        // The arrival side of the sender's "route active — streaming"
+        // line: one INFO per stream, so a healthy hop is attributable
+        // from this end too (the MJPEG path has logged its first frame
+        // this way all along).
+        let first = !self.video_in_stats.lock().contains_key(&route_id);
         self.note_video_in(&route_id, "H.264", data.len());
-        // 90 kHz RTP clock → µs for the decoder's timestamps.
-        let ts_us = rtp_timestamp as u64 * 1000 / 90;
         let wants_decode = self
             .video_watchers
             .lock()
             .get(&route_id)
             .is_some_and(|w| w.decode);
+        if first {
+            tracing::info!(
+                "first H.264 sample for {route_id} from {} ({} bytes, key={key}, native decode={wants_decode})",
+                short_id(from),
+                data.len(),
+            );
+        }
+        // 90 kHz RTP clock → µs for the decoder's timestamps.
+        let ts_us = rtp_timestamp as u64 * 1000 / 90;
         if wants_decode {
             let mesh = Arc::downgrade(self);
             let rid = route_id.clone();
@@ -1206,7 +1234,16 @@ impl Mesh {
         const MAX_QUEUED: usize = 120;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
-            tracing::debug!("no console window watching {route_id} — packet dropped");
+            drop(map);
+            // Routine for a beat while a window boots; a *persistent* run
+            // of these is a stream with nowhere to land — say so at a
+            // visible level (rate-limited) instead of the debug whisper
+            // that read as a silent black stage.
+            if self.diag_ok(&format!("watchless:{route_id}")) {
+                tracing::info!(
+                    "frames flowing for {route_id} but no window is watching it — dropping until one does"
+                );
+            }
             return;
         };
         if w.queue.len() >= MAX_QUEUED {
@@ -1350,6 +1387,10 @@ impl Mesh {
             // switch, ladder reset) leaves no orphan decoder behind.
             self.video_decode.stop(&route_id);
         }
+        // One line per watch claim, so a viewer-side log shows which
+        // window holds each stream and on which decode path — the missing
+        // half of "frames flowing but no window watching".
+        tracing::info!("window watching {route_id} (native decode: {decode})");
         self.video_watchers.lock().insert(
             route_id,
             VideoWatcher {
@@ -2170,10 +2211,7 @@ impl Mesh {
                     self.start_video_stream(route, &to_node, mode, VideoSource::Screen(monitor));
                 } else if to_node == me {
                     self.claim_inbound_video_lane(route, &from_node);
-                    // The "first screen frame" line is the signal worth a
-                    // default-level entry on this side; this one only
-                    // matters when that line never follows.
-                    tracing::debug!(
+                    tracing::info!(
                         "route {} active — expecting screen frames from {}",
                         route.id,
                         short_id(&from_node)
@@ -2200,7 +2238,7 @@ impl Mesh {
                     self.start_video_stream(route, &to_node, mode, VideoSource::Camera(device));
                 } else if to_node == me {
                     self.claim_inbound_video_lane(route, &from_node);
-                    tracing::debug!(
+                    tracing::info!(
                         "route {} active — expecting camera frames from {}",
                         route.id,
                         short_id(&from_node)
@@ -2351,6 +2389,17 @@ impl Mesh {
             self.video_lane_in
                 .lock()
                 .insert(pubkey_part(from_node).to_string(), route.id.clone());
+            tracing::info!(
+                "route {} — inbound video lane claimed from {} (H.264 samples will route here)",
+                route.id,
+                short_id(from_node)
+            );
+        } else {
+            tracing::info!(
+                "route {} — no H.264 in our offer; expecting MJPEG frames from {}",
+                route.id,
+                short_id(from_node)
+            );
         }
     }
 
@@ -2950,6 +2999,38 @@ impl Mesh {
     fn inbound_video_ok(&self, route_id: &str, sender: &str) -> bool {
         self.inbound_media_ok(route_id, sender, MediaKind::Display)
             || self.inbound_media_ok(route_id, sender, MediaKind::Video)
+    }
+
+    /// Why an inbound video frame was refused, in one diagnosable line —
+    /// which [`Self::inbound_media_ok`] condition failed, with the facts.
+    fn route_diag(&self, route_id: &str, sender: &str) -> String {
+        let me = self.local_node_id().unwrap_or_default();
+        let st = self.state.lock();
+        match st.session.as_ref().and_then(|s| s.route(route_id)) {
+            None => "this session doesn't know the route".to_string(),
+            Some(r) => format!(
+                "route state {:?} · media {:?} · sinks here: {} · sender is its peer: {}",
+                r.state,
+                r.route.media,
+                node_of(r.route.to.as_str()) == me,
+                pubkey_part(r.peer.as_str()) == pubkey_part(sender),
+            ),
+        }
+    }
+
+    /// Rate limit for the inbound-video diagnostics: true at most once per
+    /// [`WARN_EVERY`] per `key`, so a dead stream explains itself in the
+    /// log without arriving at frame rate.
+    fn diag_ok(&self, key: &str) -> bool {
+        let mut map = self.video_diag_last.lock();
+        let now = std::time::Instant::now();
+        match map.get(key) {
+            Some(t) if now.duration_since(*t) < WARN_EVERY => false,
+            _ => {
+                map.insert(key.to_string(), now);
+                true
+            }
+        }
     }
 
     /// Whether `sender` may drive this machine's keyboard and mouse: it is
