@@ -34,9 +34,24 @@
 //! late joiners aren't stranded), and when the link can't keep up the
 //! bounded forwarder drops captures rather than queueing stale ones.
 //!
-//! v1 simplification still standing, called out honestly: on Wayland each
-//! route start runs the compositor's share-picker dialog (the portal's
-//! one-time consent; restore tokens are a follow-up).
+//! Three failure modes the capture used to suffer silently are handled
+//! here as part of the stream:
+//!
+//!  * **A sleeping display.** Hosting a route holds a keep-awake guard
+//!    and nudges an already-asleep display at start (see [`crate::wake`])
+//!    — damage-driven backends produce nothing from a dark screen, and a
+//!    deep-sleeping DisplayPort monitor detaches from the desktop
+//!    entirely (which is why a failed monitor lookup gets one retry
+//!    after the nudge has had a beat to re-attach things).
+//!  * **Wayland consent.** Route starts ride a portal session with a
+//!    **restore token** ([`crate::wayland_capture`]): the compositor's
+//!    share-picker is a once-per-machine event, and every start after it
+//!    is silent — which is what an unattended host needs.
+//!  * **Silence with no explanation.** Capture state changes travel to
+//!    the viewer in-band (`vstat` media frames, [`StatusReporter`]):
+//!    "waiting for consent", "display asleep", "no monitor", "grabs
+//!    failing" — so the far end reads the real condition, never a
+//!    wordless black stage.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +61,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use allmystuff_session::VideoFrame;
+use allmystuff_session::{VideoFrame, VideoStatusState};
+
+use crate::wake;
 
 /// Which transport a display route's stream encodes for — picked by the
 /// mesh from the offer's `video` accepts (see `RouteControl::Offer`).
@@ -268,6 +285,31 @@ impl Tune {
     }
 }
 
+/// The host side of a capture-status report: state + optional OS error
+/// text, forwarded to the viewer as a `vstat` media frame by the mesh.
+pub type OnStatus = Arc<dyn Fn(VideoStatusState, Option<String>) + Send + Sync>;
+
+/// Dedupe wrapper over [`OnStatus`]: only state *transitions* hit the
+/// wire, so a failing grab loop costs one frame, not one per tick.
+struct StatusReporter {
+    cb: OnStatus,
+    last: Option<VideoStatusState>,
+}
+
+impl StatusReporter {
+    fn new(cb: OnStatus) -> Self {
+        StatusReporter { cb, last: None }
+    }
+
+    fn report(&mut self, state: VideoStatusState, detail: Option<String>) {
+        if self.last == Some(state) {
+            return;
+        }
+        self.last = Some(state);
+        (self.cb)(state, detail);
+    }
+}
+
 struct RouteVideo {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -275,6 +317,7 @@ struct RouteVideo {
     mode: VideoMode,
     monitor: Option<u32>,
     on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
+    on_status: OnStatus,
     /// One-shot "give the viewer a clean entry now" flag the encoder
     /// consumes (IDR for H.264, an immediate resend for MJPEG).
     refresh: Arc<AtomicBool>,
@@ -305,15 +348,19 @@ impl VideoBridge {
     /// `screen:<id>` capability — see [`extra_screens`]). `on_packet` is
     /// called with each encoded packet; it returns `false` when the packet
     /// was dropped downstream (backpressure), which is fine — the next
-    /// capture simply carries the newer picture.
-    pub fn start_capture<F>(
+    /// capture simply carries the newer picture. `on_status` is called on
+    /// capture-state transitions, for the viewer's benefit (see
+    /// [`StatusReporter`]).
+    pub fn start_capture<F, S>(
         &self,
         route_id: String,
         mode: VideoMode,
         monitor: Option<u32>,
         on_packet: F,
+        on_status: S,
     ) where
         F: Fn(VideoPacket) -> bool + Send + Sync + 'static,
+        S: Fn(VideoStatusState, Option<String>) + Send + Sync + 'static,
     {
         self.spawn_route(
             route_id,
@@ -321,6 +368,7 @@ impl VideoBridge {
             monitor,
             Tune::default(),
             Arc::new(on_packet),
+            Arc::new(on_status),
         );
     }
 
@@ -331,14 +379,24 @@ impl VideoBridge {
         monitor: Option<u32>,
         tune: Tune,
         on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
+        on_status: OnStatus,
     ) {
         let stop = Arc::new(AtomicBool::new(false));
         let refresh = Arc::new(AtomicBool::new(false));
         let (stop_thread, refresh_thread, cb) = (stop.clone(), refresh.clone(), on_packet.clone());
+        let status_cb = on_status.clone();
         let id = route_id.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = run_capture(&stop_thread, &refresh_thread, &id, mode, monitor, tune, cb)
-            {
+            if let Err(e) = run_capture(
+                &stop_thread,
+                &refresh_thread,
+                &id,
+                mode,
+                monitor,
+                tune,
+                cb,
+                status_cb,
+            ) {
                 tracing::warn!("screen capture for {id} stopped: {e}");
             }
         });
@@ -350,6 +408,7 @@ impl VideoBridge {
                 mode,
                 monitor,
                 on_packet,
+                on_status,
                 refresh,
             },
         );
@@ -370,7 +429,12 @@ impl VideoBridge {
         let Some(old) = self.routes.lock().remove(route_id) else {
             return;
         };
-        let (mode, monitor, on_packet) = (old.mode, old.monitor, old.on_packet.clone());
+        let (mode, monitor, on_packet, on_status) = (
+            old.mode,
+            old.monitor,
+            old.on_packet.clone(),
+            old.on_status.clone(),
+        );
         drop(old); // joins the old capture thread; its session releases
         tracing::info!(
             "route {route_id} retuned: edge {} · bitrate {} · fps {}",
@@ -379,7 +443,14 @@ impl VideoBridge {
                 .map_or("auto".into(), |v| format!("{:.1} Mbps", v as f64 / 1e6)),
             tune.fps.map_or("auto".into(), |v| v.to_string()),
         );
-        self.spawn_route(route_id.to_string(), mode, monitor, tune, on_packet);
+        self.spawn_route(
+            route_id.to_string(),
+            mode,
+            monitor,
+            tune,
+            on_packet,
+            on_status,
+        );
     }
 
     pub fn stop(&self, route_id: &str) {
@@ -387,6 +458,7 @@ impl VideoBridge {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture(
     stop: &AtomicBool,
     refresh: &Arc<AtomicBool>,
@@ -395,10 +467,38 @@ fn run_capture(
     monitor_id: Option<u32>,
     tune: Tune,
     on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
+    on_status: OnStatus,
 ) -> Result<(), String> {
     let on_packet = &*on_packet;
+    let mut reporter = StatusReporter::new(on_status);
+    // A hosted screen is active use the OS can't see: hold the display
+    // awake for the stream's lifetime, and wiggle a display that's
+    // already dark — neither capture path can grab from a sleeping one.
+    let _awake = wake::DisplayAwake::hold("hosting a screen stream");
+    wake::nudge_display();
     // The monitor up front: its resolution budgets the encoder's bitrate.
-    let monitor = select_monitor(monitor_id)?;
+    // One retry after a beat: the nudge may still be re-attaching outputs
+    // (a deep-sleeping DisplayPort monitor detaches from the desktop
+    // entirely, and re-enumeration after wake takes a moment).
+    let monitor = match select_monitor(monitor_id) {
+        Ok(m) => m,
+        Err(first) => {
+            std::thread::sleep(Duration::from_millis(1500));
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            match select_monitor(monitor_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        "no monitor to capture for {route_id}: {e} (first attempt: {first})"
+                    );
+                    reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
+                    return Err(e);
+                }
+            }
+        }
+    };
     let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
     // An encoder that can't init (openh264 build/runtime trouble) must
     // cost quality, not the stream: fall back to MJPEG and say so.
@@ -433,6 +533,7 @@ fn run_capture(
                         on_packet,
                         &mut encoder,
                         &mut stats,
+                        &mut reporter,
                     );
                     drop(session);
                     match result {
@@ -460,46 +561,96 @@ fn run_capture(
         }
     }
 
-    #[cfg(not(windows))]
-    if prefer_session_capture() {
-        // Two attempts, each with a freshly enumerated monitor: a route
-        // that restarts can hand the portal a stale display handle, and
-        // re-enumerating is exactly what heals that. Only then do we
-        // settle for per-frame screenshots — the dire-framerate path of
-        // last resort.
-        for attempt in 0..2 {
-            let monitor = select_monitor(monitor_id)?;
-            match run_session_capture(
-                stop,
-                fps,
-                route_id,
-                &monitor,
-                on_packet,
-                &mut encoder,
-                &mut stats,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if stop.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-                    if attempt == 0 {
+    // Linux Wayland: our own portal session — the only sanctioned capture
+    // there, run with a restore token so an unattended start is silent
+    // (see `wayland_capture`). When no token is stored yet, the consent
+    // dialog needs a human at this machine — say so to the viewer before
+    // the wait. A failed or refused session degrades to the per-grab
+    // path below, which keeps explaining itself in-band.
+    #[cfg(target_os = "linux")]
+    if wayland_session() {
+        if !crate::wayland_capture::has_restore_token(monitor_id) {
+            reporter.report(VideoStatusState::WaitingConsent, None);
+        }
+        match crate::wayland_capture::open(monitor_id) {
+            Ok((session, frames)) => {
+                tracing::info!("wayland screencast session started for {route_id}");
+                let result = pump_frames(
+                    stop,
+                    fps,
+                    &frames,
+                    |f: crate::wayland_capture::RawFrame| (f.rgba, f.width, f.height),
+                    on_packet,
+                    &mut encoder,
+                    &mut stats,
+                    &mut reporter,
+                );
+                drop(session);
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if stop.load(Ordering::SeqCst) {
+                            return Ok(());
+                        }
                         tracing::warn!(
-                            "capture session for {route_id} unavailable ({e}); \
-                             retrying with a fresh monitor handle"
-                        );
-                        std::thread::sleep(Duration::from_millis(300));
-                    } else {
-                        tracing::warn!(
-                            "capture session for {route_id} unavailable ({e}); \
+                            "wayland screencast for {route_id} ended ({e}); \
                              falling back to per-frame screenshots"
                         );
                     }
                 }
             }
+            Err(e) => {
+                tracing::warn!(
+                    "wayland screencast for {route_id} unavailable ({e}); \
+                     falling back to per-frame screenshots"
+                );
+                reporter.report(VideoStatusState::GrabFailed, Some(e));
+            }
         }
     }
-    let monitor = select_monitor(monitor_id)?;
+
+    // macOS: xcap's AVFoundation session. Two attempts, each with a
+    // freshly enumerated monitor: a route that restarts can hand the
+    // session a stale display handle, and re-enumerating is exactly what
+    // heals that. Only then do we settle for per-frame screenshots — the
+    // dire-framerate path of last resort.
+    #[cfg(target_os = "macos")]
+    for attempt in 0..2 {
+        let monitor = select_monitor(monitor_id)?;
+        match run_session_capture(
+            stop,
+            fps,
+            route_id,
+            &monitor,
+            on_packet,
+            &mut encoder,
+            &mut stats,
+            &mut reporter,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if attempt == 0 {
+                    tracing::warn!(
+                        "capture session for {route_id} unavailable ({e}); \
+                         retrying with a fresh monitor handle"
+                    );
+                    std::thread::sleep(Duration::from_millis(300));
+                } else {
+                    tracing::warn!(
+                        "capture session for {route_id} unavailable ({e}); \
+                         falling back to per-frame screenshots"
+                    );
+                }
+            }
+        }
+    }
+    let monitor = select_monitor(monitor_id).map_err(|e| {
+        reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
+        e
+    })?;
     run_oneshot_capture(
         stop,
         fps,
@@ -508,25 +659,8 @@ fn run_capture(
         on_packet,
         &mut encoder,
         &mut stats,
+        &mut reporter,
     )
-}
-
-/// Whether to try a persistent capture session first. On Linux only
-/// Wayland has a real one (PipeWire ScreenCast); under X11 xcap's recorder
-/// is the same per-frame screenshot in an unpaced hot loop, so our paced
-/// one-shot loop is strictly better there. macOS's session backend
-/// (AVFoundation) is the right default. (Windows runs its own DXGI path
-/// and never asks.)
-#[cfg(not(windows))]
-fn prefer_session_capture() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        wayland_session()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
 }
 
 /// Mirrors xcap's (private) `wayland_detect`, so our path choice matches
@@ -538,11 +672,19 @@ fn wayland_session() -> bool {
     session.eq_ignore_ascii_case("wayland") || display.to_lowercase().contains("wayland")
 }
 
+/// How long a just-started session may produce nothing before the
+/// viewer is told the display is dark. Only the *first* frame is held
+/// to this — once one arrived, a quiet channel is an idle desktop on a
+/// damage-driven backend, not a problem.
+const FIRST_FRAME_STALL: Duration = Duration::from_secs(5);
+
 /// Drain a session's frame channel into the encoder, paced to the target
 /// rate: each tick encodes the *freshest* pending frame; a backlog is
 /// skipped, never transcoded late. Generic over the session's frame type
 /// (`raw` extracts RGBA + dimensions) so the platform backends — our DXGI
-/// duplication, xcap's recorders — share one pump.
+/// duplication, the Wayland portal stream, xcap's recorders — share one
+/// pump.
+#[allow(clippy::too_many_arguments)]
 fn pump_frames<T, X>(
     stop: &AtomicBool,
     fps: u32,
@@ -551,11 +693,14 @@ fn pump_frames<T, X>(
     on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
     encoder: &mut StreamEncoder,
     stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
 ) -> Result<(), String>
 where
     X: Fn(T) -> (Vec<u8>, u32, u32),
 {
     let budget = Duration::from_secs(1) / fps.max(1);
+    let started = Instant::now();
+    let mut got_any = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -563,11 +708,22 @@ where
         // A bounded wait keeps the stop flag responsive on idle screens.
         let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
             Ok(f) => f,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A session that opened fine but never delivers is a dark
+                // display: damage-driven backends send nothing from a
+                // sleeping screen, and even a still desktop hands over its
+                // first frame on connect.
+                if !got_any && started.elapsed() >= FIRST_FRAME_STALL {
+                    reporter.report(VideoStatusState::DisplayAsleep, None);
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("capture session ended".to_string());
             }
         };
+        got_any = true;
+        reporter.report(VideoStatusState::Ok, None);
         let started = Instant::now();
         while let Ok(newer) = frames.try_recv() {
             frame = newer;
@@ -591,11 +747,12 @@ where
     }
 }
 
-/// Stream from a persistent OS capture session (PipeWire ScreenCast on
-/// Wayland, AVFoundation on macOS). Set-up (portal consent) happens once;
-/// frames arrive as the OS produces them — damage-driven backends send
-/// nothing while the screen is still.
-#[cfg(not(windows))]
+/// Stream from xcap's persistent AVFoundation capture session. Set-up
+/// happens once; frames arrive as the OS produces them — damage-driven
+/// backends send nothing while the screen is still. (Wayland rides
+/// `wayland_capture` instead; X11 prefers the paced one-shot loop.)
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn run_session_capture(
     stop: &AtomicBool,
     fps: u32,
@@ -604,6 +761,7 @@ fn run_session_capture(
     on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
     encoder: &mut StreamEncoder,
     stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
 ) -> Result<(), String> {
     let (recorder, frames) = monitor.video_recorder().map_err(|e| e.to_string())?;
     recorder.start().map_err(|e| e.to_string())?;
@@ -616,6 +774,7 @@ fn run_session_capture(
         on_packet,
         encoder,
         stats,
+        reporter,
     );
     let _ = recorder.stop();
     result
@@ -625,6 +784,7 @@ fn run_session_capture(
 /// Every grab pays the platform's full one-shot cost, so the effective
 /// rate is whatever that path allows; the encoder's unchanged-frame gate
 /// at least makes idle screens cheap to *send*.
+#[allow(clippy::too_many_arguments)]
 fn run_oneshot_capture(
     stop: &AtomicBool,
     fps: u32,
@@ -633,6 +793,7 @@ fn run_oneshot_capture(
     on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
     encoder: &mut StreamEncoder,
     stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
 ) -> Result<(), String> {
     let budget = Duration::from_secs(1) / fps.max(1);
     let mut failures = 0u64;
@@ -648,25 +809,31 @@ fn run_oneshot_capture(
         match outcome {
             Ok(Some(packet)) => {
                 failures = 0;
+                reporter.report(VideoStatusState::Ok, None);
                 if on_packet(packet) {
                     stats.sent += 1;
                 } else {
                     stats.dropped += 1;
                 }
             }
-            Ok(None) => failures = 0,
+            Ok(None) => {
+                failures = 0;
+                reporter.report(VideoStatusState::Ok, None);
+            }
             Err(e) => {
                 // A transient grab failure (screen lock, monitor sleep)
                 // shouldn't end the stream — but a *persistent* one (a
                 // denied screen-recording permission, a Wayland portal
                 // that never granted) must be loud, not a debug whisper:
                 // it reads as "connected but no pixels" at the far end.
+                // The viewer hears it too, in-band.
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(100) {
                     tracing::warn!("screen grab failing for {route_id} ({failures}x): {e}");
                 } else {
                     tracing::debug!("screen grab failed for {route_id}: {e}");
                 }
+                reporter.report(VideoStatusState::GrabFailed, Some(e));
             }
         }
         stats.maybe_log();

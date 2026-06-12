@@ -29,7 +29,7 @@ use allmystuff_protocol::{
 };
 use allmystuff_session::{
     AudioFrame, Effect, FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session,
-    TermEvent, TermFrame, VideoAssembler, VideoFrame,
+    TermEvent, TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame,
 };
 
 use crate::audio::{AudioBridge, CaptureSource};
@@ -516,6 +516,13 @@ impl Mesh {
         // boot id we haven't recorded (their app just started while the
         // daemon link stayed up) gets answered with our state directly. The
         // mesh carries traffic when something *happens*, not on a heartbeat.
+        //
+        // Devices, though, change under a running app — a monitor wakes (or
+        // deep-sleeps and *detaches*: DP monitors drop off the desktop), a
+        // mic gets plugged in — and the profile peers hold was scanned once
+        // at start. The watcher below re-scans on a slow cadence and counts
+        // as "something happened" only when the picture actually changed.
+        self.spawn_inventory_watch();
 
         // Event loop.
         let mesh = self.clone();
@@ -524,6 +531,62 @@ impl Mesh {
                 mesh.handle_value(value).await;
             }
             mesh.emit_status("disconnected", None);
+        });
+    }
+
+    /// Re-scan this machine's inventory every [`INVENTORY_RESCAN`] and
+    /// refresh the live presence profile when the device picture changed,
+    /// so a display that woke (or detached), a camera that appeared, or a
+    /// changed default reaches the graph — local drawer and peers both —
+    /// without an app restart. The scan is cheap by design ("cheap enough
+    /// to call on a button press"), and steady state broadcasts nothing.
+    fn spawn_inventory_watch(self: &Arc<Self>) {
+        const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(10);
+        let mesh = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(INVENTORY_RESCAN).await;
+                let Some(mesh) = mesh.upgrade() else {
+                    return;
+                };
+                let Some(node) = mesh.state.lock().profile.as_ref().map(|p| p.node.clone()) else {
+                    continue; // live session not up yet
+                };
+                let scanned = tokio::task::spawn_blocking(move || {
+                    let inv = allmystuff_inventory::scan();
+                    (
+                        allmystuff_bridge::node_summary(&inv),
+                        allmystuff_bridge::capabilities_with_screens(
+                            &inv,
+                            &node,
+                            &crate::video::extra_screens(),
+                        ),
+                    )
+                })
+                .await;
+                let Ok((summary, capabilities)) = scanned else {
+                    continue;
+                };
+                let changed = {
+                    let mut st = mesh.state.lock();
+                    let Some(p) = st.profile.as_mut() else {
+                        continue;
+                    };
+                    let fresh = profile_fingerprint(&summary, &capabilities);
+                    if profile_fingerprint(&p.summary, &p.capabilities) == fresh {
+                        false
+                    } else {
+                        p.summary = summary;
+                        p.capabilities = capabilities;
+                        true
+                    }
+                };
+                if changed {
+                    tracing::info!("device picture changed on rescan — re-broadcasting presence");
+                    mesh.broadcast_presence().await;
+                    mesh.emit_snapshot();
+                }
+            }
         });
     }
 
@@ -842,6 +905,33 @@ impl Mesh {
                             self.note_video_in(&full.route, "MJPEG", full.jpeg.len());
                             self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full));
                         }
+                    }
+                    MediaPayload::VideoStatus(status) => {
+                        // The host explaining its capture state ("display
+                        // asleep", "waiting for consent"…). Gated like the
+                        // frames it stands in for; the console window shows
+                        // it on the stage.
+                        if !self.inbound_media_ok(&status.route, &from, MediaKind::Display) {
+                            return;
+                        }
+                        tracing::info!(
+                            "capture status for {}: {:?}{}",
+                            status.route,
+                            status.state,
+                            status
+                                .detail
+                                .as_deref()
+                                .map(|d| format!(" ({d})"))
+                                .unwrap_or_default()
+                        );
+                        let _ = self.app.emit(
+                            "allmystuff://video-status",
+                            serde_json::json!({
+                                "route": status.route,
+                                "state": status.state,
+                                "detail": status.detail,
+                            }),
+                        );
                     }
                     MediaPayload::Input(ev) => {
                         // Injecting keystrokes is the most privileged thing
@@ -2095,12 +2185,40 @@ impl Mesh {
                     );
                     let peer = to_node.clone();
                     let tx = self.video_out.clone();
-                    self.video
-                        .start_capture(route.id.clone(), mode, monitor, move |packet| {
+                    let status_mesh = Arc::downgrade(self);
+                    let status_peer = to_node.clone();
+                    let status_route = route.id.clone();
+                    self.video.start_capture(
+                        route.id.clone(),
+                        mode,
+                        monitor,
+                        move |packet| {
                             // try_send: a full queue drops this packet; the next
                             // capture carries a fresher picture.
                             tx.try_send((peer.clone(), packet)).is_ok()
-                        });
+                        },
+                        move |state, detail| {
+                            // Capture-state transitions travel to the viewer
+                            // in-band (`vstat`), so its console can explain a
+                            // black stage instead of just showing one.
+                            let Some(mesh) = status_mesh.upgrade() else {
+                                return;
+                            };
+                            let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
+                            let peer = status_peer.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let Ok(payload) = serde_json::to_value(&frame) else {
+                                    return;
+                                };
+                                if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                                    tracing::debug!(
+                                        "capture status to {} failed: {e}",
+                                        short_id(&peer)
+                                    );
+                                }
+                            });
+                        },
+                    );
                 } else if to_node == me {
                     // Claim the peer's inbound lane for this route if we
                     // offered H.264 — the sender may still pick MJPEG, in
@@ -2904,6 +3022,17 @@ fn empty_owned() -> Value {
 //   [20..28] JPEG: frame seq · H.264/raw: timestamp in µs
 
 pub(crate) const VIDEO_IPC_HEADER_LEN: usize = 28;
+
+/// One comparable string for "what this machine advertises": the presence
+/// summary + capability list, serialized. The inventory watcher diffs it
+/// across rescans — JSON equality is exactly "would peers see something
+/// different", since this *is* what presence carries.
+fn profile_fingerprint(
+    summary: &impl serde::Serialize,
+    capabilities: &impl serde::Serialize,
+) -> String {
+    serde_json::to_string(&(summary, capabilities)).unwrap_or_default()
+}
 
 pub(crate) fn video_ipc_header(
     kind: u8,

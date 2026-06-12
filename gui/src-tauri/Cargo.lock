@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -48,6 +48,7 @@ dependencies = [
  "allmystuff-updater",
  "anyhow",
  "base64 0.22.1",
+ "core-foundation",
  "cpal",
  "dirs 5.0.1",
  "enigo",
@@ -59,6 +60,7 @@ dependencies = [
  "openh264",
  "opus",
  "parking_lot",
+ "pipewire",
  "portable-pty",
  "serde",
  "serde_json",
@@ -73,11 +75,12 @@ dependencies = [
  "windows 0.61.3",
  "windows-sys 0.60.2",
  "xcap",
+ "zbus",
 ]
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -90,7 +93,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "allmystuff-graph",
  "serde",
@@ -99,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -110,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -5364,6 +5367,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

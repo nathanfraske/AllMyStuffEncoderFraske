@@ -19,7 +19,14 @@
   // the control route.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { closeThisWindow, onThisWindowClose, refreshRoute, watchVideo } from "../tauri";
+  import {
+    closeThisWindow,
+    onThisWindowClose,
+    refreshRoute,
+    watchVideo,
+    watchVideoStatus,
+    type VideoHostStatus,
+  } from "../tauri";
   import {
     displayName,
     originIcon,
@@ -56,6 +63,10 @@
   // first key unit and rebuilt on the next one after any error.
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let hasFrame = $state(false);
+  // The host's word on why pixels aren't flowing (`vstat`): shown on the
+  // placeholder before the first frame, and as a banner if the stream
+  // stalls after one. Null = no condition reported (or it cleared).
+  let hostStatus = $state<VideoHostStatus | null>(null);
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
@@ -207,6 +218,7 @@
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
     hasFrame = false;
+    hostStatus = null;
     fps = 0;
     transport = "";
     decodeFails = 0;
@@ -216,6 +228,16 @@
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
+    let unwatchStatus: (() => void) | undefined;
+    // The host's capture-state reports for this route — they explain the
+    // placeholder (and any mid-stream stall) in the host's own words.
+    void watchVideoStatus(route, (s) => {
+      if (cancelled) return;
+      hostStatus = s.state === "ok" ? null : s;
+    }).then((u) => {
+      if (cancelled) u();
+      else unwatchStatus = u;
+    });
     let decoder: VideoDecoder | null = null;
     let codecString: string | null = null;
     // The decode ladder: hardware-preference first; any stall (born dead
@@ -397,6 +419,7 @@
     return () => {
       cancelled = true;
       unwatch?.();
+      unwatchStatus?.();
       stallKick = () => {};
       if (pendingFrame) {
         pendingFrame.close();
@@ -410,6 +433,23 @@
       decoder = null;
     };
   });
+
+  /** The host's capture condition as a human sentence — what the stage
+   *  shows instead of (or over) silent black. */
+  function hostStatusText(s: VideoHostStatus): string {
+    switch (s.state) {
+      case "waiting_consent":
+        return "Waiting for someone at the remote machine to approve screen sharing (a one-time consent dialog is open there).";
+      case "display_asleep":
+        return "The remote display is asleep or blank — nudging it awake…";
+      case "no_monitor":
+        return "No monitor to capture on the remote machine — its displays are detached or in deep sleep.";
+      case "grab_failed":
+        return `Screen capture is failing on the remote machine${s.detail ? `: ${s.detail}` : "."}`;
+      default:
+        return "";
+    }
+  }
 
   let closing = false;
   async function endSession() {
@@ -573,13 +613,19 @@
           ></canvas>
         {/if}
         {#if hasFrame}
-          <!-- the canvas above is the stage -->
+          <!-- the canvas above is the stage; a host-reported stall (the
+               remote display sleeping mid-session) banners over it. -->
+          {#if hostStatus}
+            <div class="host-status">{hostStatusText(hostStatus)}</div>
+          {/if}
         {:else if selected}
           <div class="screen" style="--mc: {mediaColor(selected.media)}">
             <div class="screen-glyph">{inputIcon(selected)}</div>
             <div class="screen-title">{selected.label}</div>
             {#if selected.media === "display"}
-              <div class="screen-note">Connecting this machine's display…</div>
+              <div class="screen-note">
+                {hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…"}
+              </div>
             {:else}
               <div class="screen-note">
                 Camera input selected — camera streaming is the next transport to land.
@@ -874,6 +920,8 @@
   .stage {
     flex: 1;
     min-height: 0;
+    /* Anchors the .host-status banner. */
+    position: relative;
     display: grid;
     /* The single track must be the stage's size, never the content's:
        an auto track grows to the canvas's intrinsic width (1920), which
@@ -936,6 +984,24 @@
     font-size: 0.82rem;
     max-width: 28rem;
     line-height: 1.45;
+  }
+  /* The host's capture condition, bannered over a live stage when the
+     stream stalls mid-session (display fell asleep, grabs failing). */
+  .host-status {
+    position: absolute;
+    left: 50%;
+    bottom: 1.4rem;
+    transform: translateX(-50%);
+    max-width: min(34rem, 85%);
+    padding: 0.45rem 0.85rem;
+    border-radius: 0.55rem;
+    background: rgba(26, 23, 48, 0.92);
+    border: 1px solid #2c2740;
+    color: #c7c0e2;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    text-align: center;
+    pointer-events: none;
   }
   .controls {
     display: flex;

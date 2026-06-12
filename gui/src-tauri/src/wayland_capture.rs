@@ -1,0 +1,663 @@
+//! Wayland screen capture with **restore tokens** — the portal dance
+//! xcap runs, plus the one option it doesn't send.
+//!
+//! On Wayland the only sanctioned screen capture is the
+//! `org.freedesktop.portal.ScreenCast` portal: ask for a session, let
+//! the *user* pick what to share in the compositor's consent dialog,
+//! receive a PipeWire node to pull frames from. xcap's recorder does
+//! exactly that — but never sets `persist_mode`, so the dialog re-runs
+//! on **every route start**, which is fatal for the one thing this app
+//! exists to do: reach a machine nobody is sitting at.
+//!
+//! This module runs the same handshake itself and asks the portal to
+//! persist the grant (`persist_mode = 2`, *until explicitly revoked*).
+//! The `restore_token` that comes back is stored next to the app's
+//! other state (`~/.myownmesh/allmystuff-screencast.json`) and replayed
+//! on the next start: consent becomes a **once per machine** event, and
+//! every start after it is silent and unattended. Tokens are single-use
+//! — each `Start` response carries a fresh one, which replaces the
+//! stored one (and a response with *no* token clears it, so a portal
+//! that refused to persist isn't asked to restore garbage).
+//!
+//! The consent dialog is also why every portal wait here carries a
+//! timeout: an unanswered dialog must degrade (the caller falls back to
+//! per-frame grabs and tells the viewer in-band) rather than wedge the
+//! capture thread — and with it, route teardown — forever. On timeout
+//! the session is `Close`d so the compositor drops the stale dialog.
+//!
+//! Frames arrive on a dedicated PipeWire loop thread (format
+//! negotiation and pixel conversion mirror xcap's recorder, with a
+//! stride-aware copy), handed over an mpsc channel as ready-to-encode
+//! RGBA. Dropping the [`WaylandSession`] quits the loop and joins the
+//! thread, so a torn-down route releases its compositor stream.
+//!
+//! One honest limitation: the portal never lets an app *name* the
+//! output it wants — the user picks in the dialog. A `screen:<id>`
+//! route therefore keys its own token, and what it restores is whatever
+//! the user picked for that tab the first time.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use pipewire::{
+    channel,
+    context::ContextRc,
+    keys::{MEDIA_CATEGORY, MEDIA_ROLE, MEDIA_TYPE},
+    main_loop::MainLoopRc,
+    properties,
+    spa::{
+        param::{
+            format::{FormatProperties, MediaSubtype, MediaType},
+            format_utils,
+            video::{VideoFormat, VideoInfoRaw},
+            ParamType,
+        },
+        pod::{self, serialize::PodSerializer, Pod},
+        utils::{Direction, Fraction, Rectangle, SpaTypes},
+    },
+    stream::{StreamFlags, StreamRc},
+};
+use zbus::blocking::{Connection, Proxy};
+use zbus::zvariant::{DeserializeDict, OwnedObjectPath, Type, Value};
+
+/// One captured picture, packed RGBA — what the encoder pump wants.
+pub struct RawFrame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The live capture: a compositor ScreenCast stream feeding the frame
+/// channel. Dropping it quits the PipeWire loop and joins its thread.
+pub struct WaylandSession {
+    quit: Option<channel::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for WaylandSession {
+    fn drop(&mut self) {
+        if let Some(quit) = self.quit.take() {
+            let _ = quit.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Whether a stored restore token exists for this monitor key — i.e.
+/// whether the next [`open`] should start silently. The caller uses
+/// this to tell the viewer a consent dialog is (probably) about to
+/// need a human.
+pub fn has_restore_token(monitor_id: Option<u32>) -> bool {
+    load_token(&monitor_key(monitor_id)).is_some()
+}
+
+/// Open a portal ScreenCast session (restoring a prior grant when a
+/// token is stored) and start pulling frames from its PipeWire node.
+pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFrame>), String> {
+    let key = monitor_key(monitor_id);
+    let restore = load_token(&key);
+    let restoring = restore.is_some();
+
+    let conn = Connection::session().map_err(|e| format!("session bus: {e}"))?;
+    let portal = screencast_proxy(&conn)?;
+
+    let session = create_session(&conn, &portal)?;
+    select_sources(&conn, &portal, &session, restore.as_deref())?;
+    // The Start wait is the human one: with a token the portal answers
+    // immediately; without one (or with one the compositor no longer
+    // honours) the consent dialog is up until someone acts on it.
+    let started = match start(&conn, &portal, &session, CONSENT_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => {
+            close_session(&conn, &session);
+            return Err(e);
+        }
+    };
+
+    // Persist the rotated token — present means "replay me next time",
+    // absent means the portal didn't persist the grant; never keep a
+    // token the compositor has already burned.
+    save_token(&key, started.restore_token.as_deref());
+    if restoring && started.restore_token.is_none() {
+        tracing::info!("screencast restore token not renewed — next start will ask consent");
+    }
+
+    let node_id = started
+        .streams
+        .as_ref()
+        .and_then(|s| s.first())
+        .map(|s| s.0)
+        .ok_or("portal returned no stream")?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<RawFrame>();
+    let (quit_tx, quit_rx) = channel::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("wayland-screencast".into())
+        .spawn(move || {
+            if let Err(e) = pipewire_consume(node_id, tx, quit_rx) {
+                tracing::warn!("wayland screencast pipewire loop ended: {e}");
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok((
+        WaylandSession {
+            quit: Some(quit_tx),
+            thread: Some(thread),
+        },
+        rx,
+    ))
+}
+
+// ---- the portal handshake ----------------------------------------------
+
+/// How long an unanswered consent dialog may hold a route start. Long
+/// enough to walk to the machine; short enough that an unattended host
+/// degrades to "tell the viewer" instead of wedging teardown.
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Configuration round-trips (no human involved) answer fast or never.
+const PORTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+
+#[derive(DeserializeDict, Type, Debug)]
+#[zvariant(signature = "dict")]
+struct CreateSessionResponse {
+    session_handle: String,
+}
+
+#[derive(DeserializeDict, Type, Debug)]
+#[zvariant(signature = "dict")]
+struct SelectSourcesResponse {}
+
+#[allow(dead_code)]
+#[derive(DeserializeDict, Type, Debug)]
+#[zvariant(signature = "dict")]
+struct StartStream {
+    id: Option<String>,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    source_type: Option<u32>,
+    mapping_id: Option<String>,
+}
+
+#[derive(DeserializeDict, Type, Debug)]
+#[zvariant(signature = "dict")]
+struct StartResponse {
+    streams: Option<Vec<(u32, StartStream)>>,
+    restore_token: Option<String>,
+}
+
+fn screencast_proxy(conn: &Connection) -> Result<Proxy<'static>, String> {
+    Proxy::new(
+        conn,
+        PORTAL_DEST,
+        PORTAL_PATH,
+        "org.freedesktop.portal.ScreenCast",
+    )
+    .map_err(|e| format!("ScreenCast portal: {e}"))
+}
+
+/// A unique-enough portal handle token: the portal only needs it to not
+/// collide within our own connection.
+fn handle_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("allmystuff_{n}_{t}")
+}
+
+fn create_session(conn: &Connection, portal: &Proxy<'static>) -> Result<OwnedObjectPath, String> {
+    let token = handle_token();
+    let session_token = handle_token();
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(&token));
+    options.insert("session_handle_token", Value::from(&session_token));
+
+    let response: CreateSessionResponse = wait_response(conn, &token, PORTAL_TIMEOUT, || {
+        portal
+            .call_method("CreateSession", &(options))
+            .map(|_| ())
+            .map_err(|e| format!("CreateSession: {e}"))
+    })?;
+
+    OwnedObjectPath::try_from(response.session_handle).map_err(|e| format!("session handle: {e}"))
+}
+
+fn select_sources(
+    conn: &Connection,
+    portal: &Proxy<'static>,
+    session: &OwnedObjectPath,
+    restore_token: Option<&str>,
+) -> Result<(), String> {
+    let token = handle_token();
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(&token));
+    options.insert("types", Value::from(1u32)); // MONITOR
+    options.insert("multiple", Value::from(false));
+    // 2 = persist until explicitly revoked — the whole point: consent
+    // once, then silent unattended starts.
+    options.insert("persist_mode", Value::from(2u32));
+    if let Some(t) = restore_token {
+        options.insert("restore_token", Value::from(t));
+    }
+    // Embed the host's pointer in the stream when the portal can — a
+    // remote-control viewer steers that pointer, so seeing it matters.
+    // (Bit 2 = EMBEDDED; the default elsewhere is HIDDEN.)
+    if let Ok(modes) = portal.get_property::<u32>("AvailableCursorModes") {
+        if modes & 2 != 0 {
+            options.insert("cursor_mode", Value::from(2u32));
+        }
+    }
+
+    let _: SelectSourcesResponse = wait_response(conn, &token, PORTAL_TIMEOUT, || {
+        portal
+            .call_method("SelectSources", &(session, options))
+            .map(|_| ())
+            .map_err(|e| format!("SelectSources: {e}"))
+    })?;
+    Ok(())
+}
+
+fn start(
+    conn: &Connection,
+    portal: &Proxy<'static>,
+    session: &OwnedObjectPath,
+    timeout: Duration,
+) -> Result<StartResponse, String> {
+    let token = handle_token();
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(&token));
+
+    wait_response(conn, &token, timeout, || {
+        portal
+            .call_method("Start", &(session, "", options))
+            .map(|_| ())
+            .map_err(|e| format!("Start: {e}"))
+    })
+}
+
+/// Tell the portal we walked away, so a still-open consent dialog is
+/// withdrawn instead of haunting the host's screen.
+fn close_session(conn: &Connection, session: &OwnedObjectPath) {
+    if let Ok(p) = Proxy::new(
+        conn,
+        PORTAL_DEST,
+        session.as_str().to_owned(),
+        "org.freedesktop.portal.Session",
+    ) {
+        let _ = p.call_method("Close", &());
+    }
+}
+
+/// Subscribe to a portal request's `Response` signal *before* issuing
+/// the method call, then wait for it with a timeout. The subscription
+/// rides a helper thread so the wait can time out — a thread stuck on a
+/// dialog nobody answers parks harmlessly until the portal closes the
+/// request, instead of wedging the capture thread.
+fn wait_response<T>(
+    conn: &Connection,
+    handle_token: &str,
+    timeout: Duration,
+    issue: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String>
+where
+    T: for<'de> serde::Deserialize<'de> + Type + Send + 'static,
+{
+    let unique = conn
+        .unique_name()
+        .ok_or("no unique bus name")?
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let request_path = format!("/org/freedesktop/portal/desktop/request/{unique}/{handle_token}");
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Result<T, String>>();
+    let conn = conn.clone();
+    std::thread::Builder::new()
+        .name("portal-response".into())
+        .spawn(move || {
+            let subscribe = || -> Result<_, String> {
+                let proxy = Proxy::new(
+                    &conn,
+                    PORTAL_DEST,
+                    request_path,
+                    "org.freedesktop.portal.Request",
+                )
+                .map_err(|e| e.to_string())?;
+                proxy.receive_signal("Response").map_err(|e| e.to_string())
+            };
+            let mut signal = match subscribe() {
+                Ok(s) => {
+                    let _ = ready_tx.send(Ok(()));
+                    s
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let outcome = (|| -> Result<T, String> {
+                let message = signal.next().ok_or("portal request vanished")?;
+                let body = message.body();
+                let (code, body): (u32, T) = body.deserialize().map_err(|e| e.to_string())?;
+                match code {
+                    0 => Ok(body),
+                    1 => Err("cancelled at the consent dialog".into()),
+                    c => Err(format!("portal response code {c}")),
+                }
+            })();
+            let _ = out_tx.send(outcome);
+        })
+        .map_err(|e| e.to_string())?;
+
+    ready_rx
+        .recv_timeout(PORTAL_TIMEOUT)
+        .map_err(|_| "portal subscription stalled".to_string())??;
+    issue()?;
+    out_rx.recv_timeout(timeout).map_err(|_| {
+        format!(
+            "no portal answer within {}s (consent dialog unattended?)",
+            timeout.as_secs()
+        )
+    })?
+}
+
+// ---- the PipeWire consumer ----------------------------------------------
+
+#[derive(Clone)]
+struct StreamData {
+    format: VideoInfoRaw,
+}
+
+/// Connect to the portal's stream node and pump pictures into `tx`
+/// until the quit channel fires. Format negotiation and conversion
+/// mirror xcap's recorder (RGB/RGBA/RGBx/BGRx → packed RGBA), plus a
+/// stride-aware copy — compositors pad rows on some resolutions.
+fn pipewire_consume(
+    node_id: u32,
+    tx: Sender<RawFrame>,
+    quit: channel::Receiver<()>,
+) -> Result<(), String> {
+    pipewire::init();
+
+    let main_loop = MainLoopRc::new(None).map_err(|e| e.to_string())?;
+    let context = ContextRc::new(&main_loop, None).map_err(|e| e.to_string())?;
+    let core = context.connect_rc(None).map_err(|e| e.to_string())?;
+
+    let stream = StreamRc::new(
+        core.clone(),
+        "AllMyStuff",
+        properties::properties! {
+            *MEDIA_TYPE => "Video",
+            *MEDIA_CATEGORY => "Capture",
+            *MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let _listener = stream
+        .add_local_listener_with_user_data(StreamData {
+            format: Default::default(),
+        })
+        .param_changed(|_, data, id, param| {
+            let Some(param) = param else { return };
+            if id != ParamType::Format.as_raw() {
+                return;
+            }
+            let (media_type, media_subtype) = match format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("screencast format parse: {e:?}");
+                    return;
+                }
+            };
+            if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+            if let Err(e) = data.format.parse(param) {
+                tracing::warn!("screencast format parse: {e:?}");
+            }
+        })
+        .process(move |stream, data| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let size = data.format.size();
+            let (w, h) = (size.width, size.height);
+            if w == 0 || h == 0 {
+                return;
+            }
+            let format = data.format.format();
+            let bpp: usize = match format {
+                VideoFormat::RGB => 3,
+                VideoFormat::RGBA | VideoFormat::RGBx | VideoFormat::BGRx => 4,
+                other => {
+                    tracing::warn!("screencast format {other:?} unsupported");
+                    return;
+                }
+            };
+            let stride = {
+                let s = datas[0].chunk().stride();
+                if s > 0 {
+                    s as usize
+                } else {
+                    w as usize * bpp
+                }
+            };
+            let Some(frame_data) = datas[0].data() else {
+                return;
+            };
+            // Pack the rows (drop any stride padding), then normalize to
+            // RGBA exactly the way xcap's recorder does.
+            let row = w as usize * bpp;
+            let mut packed = Vec::with_capacity(row * h as usize);
+            for y in 0..h as usize {
+                let start = y * stride;
+                let Some(src) = frame_data.get(start..start + row) else {
+                    return; // short buffer — skip the torn frame
+                };
+                packed.extend_from_slice(src);
+            }
+            let rgba = match format {
+                VideoFormat::RGB => {
+                    let mut buf = vec![0u8; (w * h * 4) as usize];
+                    for (src, dst) in packed.chunks_exact(3).zip(buf.chunks_exact_mut(4)) {
+                        dst[..3].copy_from_slice(src);
+                        dst[3] = 255;
+                    }
+                    buf
+                }
+                VideoFormat::BGRx => {
+                    let mut buf = packed;
+                    for px in buf.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                    buf
+                }
+                _ => packed, // RGBA / RGBx
+            };
+            let _ = tx.send(RawFrame {
+                rgba,
+                width: w,
+                height: h,
+            });
+        })
+        .register()
+        .map_err(|e| e.to_string())?;
+
+    let obj = pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pod::property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::RGB,
+            VideoFormat::RGBA,
+            VideoFormat::RGBx,
+            VideoFormat::BGRx,
+        ),
+        pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle {
+                width: 128,
+                height: 128
+            },
+            Rectangle {
+                width: 1,
+                height: 1
+            },
+            Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction { num: 30, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction {
+                num: 1000,
+                denom: 1
+            }
+        ),
+    );
+    let values = PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(obj))
+        .map_err(|e| e.to_string())?
+        .0
+        .into_inner();
+    let mut params = [Pod::from_bytes(&values).ok_or("failed to build format pod")?];
+
+    stream
+        .connect(
+            Direction::Input,
+            Some(node_id),
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let _attached = quit.attach(main_loop.loop_(), {
+        let main_loop = main_loop.clone();
+        move |_| main_loop.quit()
+    });
+
+    main_loop.run();
+    Ok(())
+}
+
+// ---- restore-token persistence -------------------------------------------
+
+fn monitor_key(monitor_id: Option<u32>) -> String {
+    match monitor_id {
+        Some(id) => format!("monitor:{id}"),
+        None => "primary".to_string(),
+    }
+}
+
+/// Token file next to the app's other state (the ownership store keeps
+/// the same home: `MYOWNMESH_HOME` override, else `~`).
+fn token_store_path() -> Option<PathBuf> {
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".myownmesh").join("allmystuff-screencast.json"))
+}
+
+fn load_token(key: &str) -> Option<String> {
+    read_tokens(&token_store_path()?).remove(key)
+}
+
+fn save_token(key: &str, token: Option<&str>) {
+    let Some(path) = token_store_path() else {
+        return;
+    };
+    let mut tokens = read_tokens(&path);
+    match token {
+        Some(t) => {
+            tokens.insert(key.to_string(), t.to_string());
+        }
+        None => {
+            tokens.remove(key);
+        }
+    }
+    write_tokens(&path, &tokens);
+}
+
+fn read_tokens(path: &std::path::Path) -> HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_tokens(path: &std::path::Path, tokens: &HashMap<String, String>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string_pretty(tokens) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!("couldn't persist screencast token: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("couldn't serialize screencast tokens: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_round_trip_per_monitor_key() {
+        let dir = std::env::temp_dir().join(format!("ams-vstat-test-{}", std::process::id()));
+        let path = dir.join("tokens.json");
+        let mut tokens = HashMap::new();
+        tokens.insert(monitor_key(None), "tok-primary".to_string());
+        tokens.insert(monitor_key(Some(7)), "tok-7".to_string());
+        write_tokens(&path, &tokens);
+        let back = read_tokens(&path);
+        assert_eq!(back.get("primary").map(String::as_str), Some("tok-primary"));
+        assert_eq!(back.get("monitor:7").map(String::as_str), Some("tok-7"));
+        // Clearing a key (a Start with no renewed token) removes it.
+        let mut cleared = back;
+        cleared.remove(&monitor_key(Some(7)));
+        write_tokens(&path, &cleared);
+        assert!(read_tokens(&path).get("monitor:7").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_tokens_never_collide_in_process() {
+        let a = handle_token();
+        let b = handle_token();
+        assert_ne!(a, b);
+        assert!(a.starts_with("allmystuff_"));
+    }
+}
