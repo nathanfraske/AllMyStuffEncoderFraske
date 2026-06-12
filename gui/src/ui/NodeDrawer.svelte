@@ -431,20 +431,20 @@
     border-radius: var(--r-pill);
   }
   .pill.mine {
-    background: #e7f6ef;
-    color: #137a52;
+    background: var(--ok-soft);
+    color: var(--ok);
   }
   .pill.guest {
-    background: #fdedd2;
-    color: #97631a;
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .pill.soft {
     background: var(--surface-2);
     color: var(--ink-soft);
   }
   .pill.theirs {
-    background: #f3e8fd;
-    color: #7a3bc0;
+    background: var(--violet-soft);
+    color: var(--violet);
   }
   .pill.fleet {
     background: var(--accent-soft);
@@ -466,9 +466,9 @@
   .net-chip {
     font-size: 0.64rem;
     font-weight: 650;
-    background: #eef0fb;
-    border: 1px solid #dfe3f7;
-    color: #4a3bc0;
+    background: var(--violet-soft);
+    border: 1px solid oklch(0.62 0.2 292 / 0.35);
+    color: var(--violet);
     border-radius: var(--r-pill);
     padding: 0.04rem 0.4rem;
   }
@@ -589,7 +589,7 @@
     font-size: 0.72rem;
   }
   .revoke:hover {
-    background: #fdeaee;
+    background: var(--danger-soft);
     color: var(--danger);
   }
   .presets {
@@ -701,23 +701,23 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    color: #97631a;
-    background: #fdedd2;
+    color: var(--warn);
+    background: var(--warn-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.34rem;
   }
   .cap.is-default .cap-icon {
-    filter: drop-shadow(0 0 0.5px #e0a13a);
+    filter: drop-shadow(0 0 0.5px var(--warn));
   }
   /* Sends vs Receives clusters inside a media group — visually distinct
      columns of direction, so "what it gives" never reads as "what it takes". */
   .flow-cluster {
     margin: 0.15rem 0 0.35rem;
     padding-left: 0.45rem;
-    border-left: 2px solid #cfe9dc;
+    border-left: 2px solid oklch(0.8 0.17 150 / 0.35);
   }
   .flow-cluster.receives {
-    border-left-color: #f6d9c4;
+    border-left-color: oklch(0.74 0.085 72 / 0.45);
   }
   .flow-head {
     display: flex;
@@ -749,7 +749,7 @@
   }
   .connect-dot:hover {
     background: var(--mc);
-    color: #fff;
+    color: var(--bg);
     transform: scale(1.08);
   }
   .console-open {

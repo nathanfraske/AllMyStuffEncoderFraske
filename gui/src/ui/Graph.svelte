@@ -208,7 +208,7 @@
   <svg class="edges" {width} {height} aria-hidden="true">
     <defs>
       <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
-        <circle cx="1.5" cy="1.5" r="1.5" fill="rgba(108,92,231,0.10)" />
+        <circle cx="1.5" cy="1.5" r="1.5" fill="oklch(0.62 0.20 292 / 0.16)" />
       </pattern>
     </defs>
     <rect x="0" y="0" {width} {height} fill="url(#dots)" />
@@ -400,8 +400,8 @@
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
   }
   .node.shared {
-    border-color: #f0c27a;
-    background: linear-gradient(180deg, #fffaf0, #ffffff);
+    border-color: oklch(0.74 0.085 72 / 0.55);
+    background: linear-gradient(180deg, var(--surface-2), var(--surface));
   }
   .node.unclaimed {
     border-style: dashed;
@@ -446,7 +446,7 @@
   }
   .node.armed:hover {
     border-color: var(--ok);
-    box-shadow: 0 0 0 3px rgba(26, 160, 109, 0.18), var(--shadow-lg);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.18), var(--shadow-lg);
   }
   .node-top {
     display: flex;
@@ -456,7 +456,7 @@
   .avatar {
     font-size: 1.25rem;
     line-height: 1;
-    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.1));
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
   }
   .node-id {
     min-width: 0;
@@ -485,7 +485,7 @@
   }
   .dot.on {
     background: var(--ok);
-    box-shadow: 0 0 0 3px rgba(26, 160, 109, 0.16);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.16);
   }
   .node-meta {
     display: flex;
@@ -501,9 +501,9 @@
   .net-chip {
     font-size: 0.6rem;
     font-weight: 650;
-    background: #eef0fb;
-    border: 1px solid #dfe3f7;
-    color: #4a3bc0;
+    background: var(--violet-soft);
+    border: 1px solid oklch(0.62 0.2 292 / 0.35);
+    color: var(--violet);
     border-radius: var(--r-pill);
     padding: 0.02rem 0.36rem;
   }
@@ -523,12 +523,12 @@
     color: var(--accent-ink);
   }
   .tag.mine {
-    background: #e7f6ef;
-    color: #137a52;
+    background: var(--ok-soft);
+    color: var(--ok);
   }
   .tag.guest {
-    background: #fdedd2;
-    color: #97631a;
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .tag.unclaimed {
     background: var(--surface-2);
@@ -536,8 +536,8 @@
     border: 1px dashed var(--line-strong);
   }
   .tag.theirs {
-    background: #f3e8fd;
-    color: #7a3bc0;
+    background: var(--violet-soft);
+    color: var(--violet);
   }
   .tag.fleet {
     background: var(--accent-soft);
@@ -562,7 +562,7 @@
   }
   .empty-orb {
     font-size: 2.6rem;
-    filter: drop-shadow(0 3px 6px rgba(108, 92, 231, 0.25));
+    filter: drop-shadow(0 3px 6px oklch(0.64 0.255 350 / 0.35));
     animation: breathe 2.4s ease-in-out infinite;
   }
   .empty-title {
@@ -591,8 +591,9 @@
     top: 1rem;
     left: 50%;
     transform: translateX(-50%);
-    background: var(--ink);
-    color: #fff;
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    color: var(--ink);
     padding: 0.5rem 0.7rem 0.5rem 1rem;
     border-radius: var(--r-pill);
     font-size: 0.82rem;
@@ -604,9 +605,9 @@
     animation: drop 0.16s ease;
   }
   .arm-banner .btn {
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.1);
     border-color: transparent;
-    color: #fff;
+    color: var(--ink);
     box-shadow: none;
   }
   @keyframes drop {

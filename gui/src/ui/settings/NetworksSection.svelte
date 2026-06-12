@@ -331,8 +331,8 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    color: #137a52;
-    background: #e7f6ef;
+    color: var(--ok);
+    background: var(--ok-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
   }

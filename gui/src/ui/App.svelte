@@ -156,8 +156,8 @@
     align-items: center;
     gap: 1rem;
     padding: 0.6rem 1rem;
-    background: rgba(255, 255, 255, 0.7);
-    backdrop-filter: blur(8px);
+    background: oklch(0.135 0.022 285 / 0.74);
+    backdrop-filter: blur(14px) saturate(1.2);
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
     z-index: 30;
@@ -169,7 +169,7 @@
   }
   .logo {
     font-size: 1.5rem;
-    filter: drop-shadow(0 2px 3px rgba(108, 92, 231, 0.25));
+    filter: drop-shadow(0 2px 3px oklch(0.64 0.255 350 / 0.35));
   }
   .name {
     font-weight: 800;
@@ -197,14 +197,14 @@
     color: var(--ink);
   }
   .chip.net {
-    background: #fdeaee;
+    background: var(--danger-soft);
     color: var(--danger);
-    border-color: #f7d6dd;
+    border-color: oklch(0.7 0.19 14 / 0.35);
   }
   .chip.net.live {
-    background: #e7f6ef;
-    color: #137a52;
-    border-color: #c9ebda;
+    background: var(--ok-soft);
+    color: var(--ok);
+    border-color: oklch(0.8 0.17 150 / 0.3);
   }
   .net-dot {
     width: 7px;
@@ -225,17 +225,17 @@
     align-items: center;
     gap: 0.45rem;
     border: 1.5px solid var(--warn);
-    background: #fff8ee;
-    color: #97631a;
+    background: var(--warn-soft);
+    color: var(--warn);
     padding: 0.34rem 0.7rem 0.34rem 0.5rem;
     border-radius: var(--r-pill);
     font-size: 0.8rem;
     font-weight: 650;
-    box-shadow: 0 0 0 0 rgba(224, 137, 42, 0.5);
+    box-shadow: 0 0 0 0 oklch(0.79 0.14 75 / 0.5);
     animation: nudge-pulse 1.8s ease-out infinite;
   }
   .nudge:hover {
-    background: #fdedd2;
+    background: oklch(0.79 0.14 75 / 0.24);
   }
   .nudge-mark {
     display: grid;
@@ -244,20 +244,20 @@
     height: 1.15rem;
     border-radius: 50%;
     background: var(--warn);
-    color: #fff;
+    color: var(--bg);
     font-weight: 800;
     font-size: 0.78rem;
     line-height: 1;
   }
   @keyframes nudge-pulse {
     0% {
-      box-shadow: 0 0 0 0 rgba(224, 137, 42, 0.45);
+      box-shadow: 0 0 0 0 oklch(0.79 0.14 75 / 0.45);
     }
     70% {
-      box-shadow: 0 0 0 8px rgba(224, 137, 42, 0);
+      box-shadow: 0 0 0 8px oklch(0.79 0.14 75 / 0);
     }
     100% {
-      box-shadow: 0 0 0 0 rgba(224, 137, 42, 0);
+      box-shadow: 0 0 0 0 oklch(0.79 0.14 75 / 0);
     }
   }
   .gear {

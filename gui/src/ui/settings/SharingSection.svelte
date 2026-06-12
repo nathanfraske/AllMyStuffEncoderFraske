@@ -278,7 +278,7 @@
     font-size: 0.72rem;
   }
   .revoke:hover {
-    background: #fdeaee;
+    background: var(--danger-soft);
     color: var(--danger);
   }
   .muted {
@@ -294,10 +294,10 @@
   }
   .stop {
     color: var(--danger);
-    border-color: #f4c7d0;
+    border-color: oklch(0.7 0.19 14 / 0.4);
   }
   .stop:hover,
   .stop.armed {
-    background: #fdeaee;
+    background: var(--danger-soft);
   }
 </style>

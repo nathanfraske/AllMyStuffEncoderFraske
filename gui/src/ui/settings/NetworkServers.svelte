@@ -224,7 +224,7 @@
     flex-shrink: 0;
   }
   .x:hover {
-    background: #fdeaee;
+    background: var(--danger-soft);
     color: var(--danger);
   }
   .empty {

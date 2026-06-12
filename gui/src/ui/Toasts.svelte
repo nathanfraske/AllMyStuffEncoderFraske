@@ -25,8 +25,9 @@
     pointer-events: none;
   }
   .toast {
-    background: var(--ink);
-    color: #fff;
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    color: var(--ink);
     padding: 0.5rem 0.9rem;
     border-radius: var(--r-pill);
     font-size: 0.84rem;
@@ -50,12 +51,14 @@
     height: 1.15rem;
     border-radius: 50%;
     font-size: 0.72rem;
-    background: rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.12);
   }
   .toast.ok .ic {
     background: var(--ok);
+    color: var(--bg);
   }
   .toast.warn .ic {
     background: var(--warn);
+    color: var(--bg);
   }
 </style>

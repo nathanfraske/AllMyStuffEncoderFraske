@@ -1,42 +1,53 @@
 /* AllMyStuff design system.
  *
  * Goal: friendly and a little fun, but calm and reliable — the opposite
- * of a network-engineering console. Soft surfaces, rounded everything,
- * one warm accent, and a colour per "media kind" so the graph reads at a
- * glance (audio = amber, video = violet, display = blue, input = green,
- * storage = teal). */
+ * of a network-engineering console. The palette is the allmystuff.works
+ * one: a deep violet-tinted dark, one hot magenta accent, violet as the
+ * supporting hue, and a colour per "media kind" so the graph reads at a
+ * glance (audio = amber, video = violet, display = magenta, input =
+ * green, storage = teal). */
 
 :root {
-  --bg: #f6f7fb;
-  --bg-grad-a: #eef0fb;
-  --bg-grad-b: #f7f3fb;
-  --surface: #ffffff;
-  --surface-2: #f3f4f9;
-  --ink: #1c1d2b;
-  --ink-soft: #5b5e74;
-  --ink-faint: #9598ad;
-  --line: #e7e8f0;
-  --line-strong: #d7d9e6;
+  color-scheme: dark;
 
-  --accent: #6c5ce7;
-  --accent-soft: #efeafe;
-  --accent-ink: #4a3bc0;
+  --bg: oklch(0.135 0.022 285);
+  --bg-grad-a: oklch(0.62 0.2 292 / 0.13);
+  --bg-grad-b: oklch(0.64 0.255 350 / 0.08);
+  --surface: oklch(0.175 0.025 285);
+  --surface-2: oklch(0.21 0.028 285);
+  --ink: oklch(0.93 0.012 285);
+  --ink-soft: oklch(0.75 0.02 285);
+  --ink-faint: oklch(0.58 0.025 285);
+  --line: oklch(0.245 0.03 285);
+  --line-strong: oklch(0.31 0.035 285);
 
-  --ok: #1aa06d;
-  --warn: #e0892a;
-  --danger: #e0506a;
+  --accent: oklch(0.64 0.255 350);
+  --accent-soft: oklch(0.64 0.255 350 / 0.16);
+  --accent-ink: oklch(0.76 0.19 350);
+
+  --violet: oklch(0.62 0.2 292);
+  --violet-soft: oklch(0.62 0.2 292 / 0.18);
+  --bronze: oklch(0.74 0.085 72);
+  --bronze-soft: oklch(0.74 0.085 72 / 0.16);
+
+  --ok: oklch(0.8 0.17 150);
+  --ok-soft: oklch(0.8 0.17 150 / 0.14);
+  --warn: oklch(0.79 0.14 75);
+  --warn-soft: oklch(0.79 0.14 75 / 0.15);
+  --danger: oklch(0.7 0.19 14);
+  --danger-soft: oklch(0.7 0.19 14 / 0.15);
 
   /* Media-kind palette. */
-  --m-audio: #f0a500;
-  --m-video: #8b5cf6;
-  --m-display: #3b82f6;
-  --m-input: #22a06b;
-  --m-storage: #0ea5a5;
-  --m-data: #8a8fa3;
+  --m-audio: oklch(0.82 0.15 90);
+  --m-video: oklch(0.7 0.17 292);
+  --m-display: var(--accent);
+  --m-input: oklch(0.78 0.16 160);
+  --m-storage: oklch(0.75 0.15 195);
+  --m-data: oklch(0.66 0.03 285);
 
-  --shadow-sm: 0 1px 2px rgba(28, 29, 43, 0.06), 0 1px 3px rgba(28, 29, 43, 0.05);
-  --shadow-md: 0 6px 20px rgba(28, 29, 43, 0.1);
-  --shadow-lg: 0 18px 50px rgba(28, 29, 43, 0.18);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 18px 40px -20px rgba(0, 0, 0, 0.7);
+  --shadow-lg: 0 40px 90px -40px rgba(0, 0, 0, 0.8);
 
   --r-sm: 8px;
   --r-md: 12px;
@@ -145,7 +156,7 @@ button {
 .scrim {
   position: fixed;
   inset: 0;
-  background: rgba(28, 29, 43, 0.32);
+  background: rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(2px);
   display: grid;
   place-items: center;

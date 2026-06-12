@@ -982,7 +982,7 @@
   }
   .act.danger:hover,
   .act.danger.armed {
-    background: #fdeaee;
+    background: var(--danger-soft);
     color: var(--danger);
     width: auto;
     padding: 0 0.4rem;
@@ -1109,7 +1109,7 @@
     white-space: nowrap;
   }
   .t-note.ok {
-    color: #137a52;
+    color: var(--ok);
   }
   .t-note.bad {
     color: var(--danger);
