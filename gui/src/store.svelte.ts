@@ -18,13 +18,16 @@ import { demoCatalog } from "./mock";
 import {
   buildNetworkConfig,
   claimNode,
+  closeThisWindow,
   connectRoute,
   tuneRoute,
   type StreamTune,
+  type VideoLocalEvent,
   consoleWindowTarget,
   disabledNetworks,
   disconnectRoute,
   emitRoomLocal,
+  emitVideoLocal,
   fleetKick,
   fleetLeave,
   fleetSetName,
@@ -48,9 +51,11 @@ import {
   onRoomLocal,
   onSession,
   onSubscription,
+  onVideoLocal,
   openConsoleWindow,
   openRoomWindow,
   openTerminalWindow,
+  openVideoWindow,
   ownedRoster,
   roomSend,
   roomWindowTarget,
@@ -273,6 +278,28 @@ class AppStore {
   consoleTune = $state<StreamTune>({});
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
+
+  // ---- video popouts (one stream in its own OS window) --------------
+  /** Streams currently held in their own popout window, by key
+   *  (`cap:<capability id>` for a console input, `share:<route id>` for a
+   *  room share). Synced across this app's windows over the video-local
+   *  lane — popouts announce `opened`/`closed`, and answer a `hello` ping
+   *  so a console/room window that opens later still learns of them. The
+   *  tab/tile for a popped stream shows "Return video here" instead of
+   *  the video. */
+  poppedVideos = $state<Record<string, true>>({});
+  /** When *this window* is a popout: its key (set by the popout host). */
+  videoPopoutKey = $state<string | null>(null);
+  /** The live route the popout renders — wired and owned by the popout
+   *  for a `cap:` key (torn down on close), merely watched for `share:`. */
+  videoPopoutLive = $state<string | null>(null);
+  /** Owned-for-teardown route id (`cap:` popouts that created theirs). */
+  private videoPopoutRouteId: string | null = null;
+  /** Bumped when this popout should re-assert its frame watch — a console
+   *  window booting may have briefly claimed the same route's watch slot
+   *  before the popout census told it to back off (watch claims replace
+   *  each other by design: a route shows in one window). */
+  videoPopoutRewatch = $state(0);
 
   // ---- terminal (the mesh-native shell) ----------------------------
   /** The remote machine the in-page terminal popover is open on (web
@@ -565,6 +592,9 @@ class AppStore {
     // The same-device lane between this app's windows (a room window's
     // join/leave, the bar's hang-up ask, saved-list changes).
     await onRoomLocal((e) => this.handleRoomLocal(e));
+    // Its video-popout sibling: which streams live in their own windows,
+    // and the "Return video here" ask that puts one back.
+    await onVideoLocal((e) => this.handleVideoLocal(e));
     // The fleet roster converges live — a claim, or gossip catching up, pushes
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
@@ -1165,17 +1195,38 @@ class AppStore {
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodec = "auto";
     this.consoleTune = {};
-    void this.applyConsoleVideo();
+    if (isTauri()) {
+      // Census before the first wire: ping for popout windows and give
+      // their `opened` answers a beat to land, so a console (re)opening
+      // onto an input that already lives in its own window shows "Return
+      // video here" instead of briefly stealing the stream's watch slot.
+      // (The `opened` handler still self-heals the race either way.)
+      this.helloVideoLane();
+      setTimeout(() => {
+        if (this.consoleNodeId !== nodeId) return; // closed meanwhile
+        void this.wireConsoleFirstVideo();
+      }, 180);
+    } else {
+      void this.wireConsoleFirstVideo();
+    }
+    this.toast("ok", `Console open on ${node!.label}`);
+  }
+
+  /** The console's opening video wire + the auto-legs decision — split
+   *  from [`openConsoleHere`] so the desktop can hold it through the
+   *  popout census above. */
+  private async wireConsoleFirstVideo() {
+    await this.applyConsoleVideo();
     if (this.consoleVideoLive) {
       // The usual case: video is on the wire — the snapshot that flips
       // it active triggers the remaining legs (see applySessionSnapshot).
       this.consoleAutoLegs = true;
     } else {
-      // No video path (nothing to wait for) — bring the legs up now; an
-      // audio-only console is still a session.
+      // No video path (nothing to wait for, or the input is popped out)
+      // — bring the legs up now; an audio-only console is still a
+      // session.
       this.startConsoleAutoLegs();
     }
-    this.toast("ok", `Console open on ${node!.label}`);
   }
 
   /** Pending "bring audio + control up once video is live" — set at console
@@ -1271,6 +1322,10 @@ class AppStore {
     if (epoch !== this.consoleVideoEpoch) return; // a newer switch took over
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
     if (!inp) return;
+    // An input that lives in its own popout window stays there — the
+    // stage shows "Return video here" instead of competing for the
+    // stream's one watch slot.
+    if (this.isVideoPopped(`cap:${inp.id}`)) return;
     // A camera tab on a host whose build predates camera streaming: skip
     // the wire — the route could never carry pixels, and the stage
     // explains the update instead.
@@ -1381,6 +1436,175 @@ class AppStore {
     const existsNow = this.catalog.routes.some((r) => r.id === id);
     if (!existsNow) return null; // blocked / denied — nothing got wired
     return { id, created: !existedBefore };
+  }
+
+  // ---- video popouts (one stream in its own OS window) --------------
+
+  /** Whether the stream behind `key` is held in a popout window. */
+  isVideoPopped(key: string): boolean {
+    return !!this.poppedVideos[key];
+  }
+
+  /** Ping the lane for popouts: each answers `opened`, so this window's
+   *  popped set converges on the windows that actually exist. Called by
+   *  the console / room panel on mount (no-op in web mode). */
+  helloVideoLane() {
+    void emitVideoLocal({ token: this.windowToken, kind: "hello" });
+  }
+
+  /** Lift a console video input out into its own OS window. If the
+   *  console is showing that input right now, its route is torn down
+   *  *first* (awaited, so the teardown precedes the popout's fresh offer
+   *  on the wire — the same ordering the console's tab switches keep, so
+   *  the popout takes the H.264 lane over instead of racing it). */
+  async popOutConsoleInput(capId: string) {
+    if (!isTauri()) return;
+    const cap = this.capability(capId);
+    if (!cap) return;
+    const key = `cap:${capId}`;
+    this.poppedVideos = { ...this.poppedVideos, [key]: true };
+    if (this.consoleInput === capId && this.consoleVideoLive) {
+      const owned = this.consoleVideoRouteId;
+      this.consoleVideoRouteId = null;
+      this.consoleVideoLive = null;
+      if (owned) await this.disconnect(owned);
+    }
+    const machine = this.machineByAnyId(cap.node);
+    void openVideoWindow(key, `${cap.label} · ${machine?.label ?? "AllMyStuff"}`);
+  }
+
+  /** Lift a room share's tile out into its own OS window. The popout only
+   *  *watches* the route (the sender owns it), so nothing re-negotiates —
+   *  the frames simply land in the new window instead of the tile. */
+  popOutRoomShare(route: Route, member: MeshNode) {
+    if (!isTauri()) return;
+    const key = `share:${route.id}`;
+    this.poppedVideos = { ...this.poppedVideos, [key]: true };
+    const who = this.roomWho(member.id);
+    const what = route.media === "video" ? "camera" : "screen";
+    void openVideoWindow(key, `${who.who}'s ${what} · AllMyStuff`);
+  }
+
+  /** The tab's "Return video here": ask whichever popout holds `key` to
+   *  put the stream back (it tears down / unwatches, emits `closed`, and
+   *  closes itself; the `closed` handler re-wires the tab). If no popout
+   *  answers — it's already gone and the popped mark is stale — un-pop
+   *  locally after a beat so the button always resets. */
+  askReturnVideo(key: string) {
+    void emitVideoLocal({ token: this.windowToken, kind: "return-ask", key });
+    setTimeout(() => {
+      if (this.poppedVideos[key]) this.videoPopoutGone(key);
+    }, 1500);
+  }
+
+  /** One event off the same-device video-popout lane (another window of
+   *  this app talking; own echoes are dropped by token). */
+  private handleVideoLocal(e: VideoLocalEvent) {
+    if (e.token === this.windowToken) return;
+    switch (e.kind) {
+      case "hello": {
+        // A console/room window booted and asked who's out there. If this
+        // window is a popout, answer — and re-assert the frame watch a
+        // beat later: the asker may have briefly claimed our route's
+        // watch slot while it didn't yet know (claims replace each other;
+        // see videoPopoutRewatch).
+        if (this.videoPopoutKey) {
+          void emitVideoLocal({
+            token: this.windowToken,
+            kind: "opened",
+            key: this.videoPopoutKey,
+          });
+          setTimeout(() => (this.videoPopoutRewatch += 1), 400);
+        }
+        break;
+      }
+      case "opened": {
+        if (!e.key) break;
+        this.poppedVideos = { ...this.poppedVideos, [e.key]: true };
+        // Boot race: this console wired an input before learning it was
+        // popped out (the census answer landed after the auto-wire).
+        // Back off — release the route if this window owns it, and let
+        // the stage show "Return video here" instead.
+        const capId = e.key.startsWith("cap:") ? e.key.slice(4) : null;
+        if (capId && this.consoleInput === capId && this.consoleVideoLive) {
+          const owned = this.consoleVideoRouteId;
+          this.consoleVideoRouteId = null;
+          this.consoleVideoLive = null;
+          if (owned) void this.disconnect(owned);
+        }
+        break;
+      }
+      case "closed": {
+        if (e.key) this.videoPopoutGone(e.key);
+        break;
+      }
+      case "return-ask": {
+        if (e.key && this.videoPopoutKey === e.key) void this.closeVideoPopout();
+        break;
+      }
+    }
+  }
+
+  /** A popout ended (its `closed`, or a stale mark timing out): un-pop the
+   *  key, and if this is the console window sitting on that input's tab,
+   *  wire the stream back into the stage. Room tiles re-watch reactively. */
+  private videoPopoutGone(key: string) {
+    const { [key]: _gone, ...rest } = this.poppedVideos;
+    this.poppedVideos = rest;
+    const capId = key.startsWith("cap:") ? key.slice(4) : null;
+    if (capId && this.consoleNodeId && this.consoleInput === capId) {
+      void this.applyConsoleVideo();
+    }
+  }
+
+  /** Boot this window as the popout for `key` — called by the popout host
+   *  once the stream's facts have landed. A `cap:` key wires (and then
+   *  owns) a fresh route from that capability to this machine's matching
+   *  sink, exactly as the console stage would; a `share:` key only
+   *  watches the sender's existing route. Announces `opened` either way. */
+  initVideoPopout(key: string) {
+    this.videoPopoutKey = key;
+    if (key.startsWith("cap:")) {
+      const cap = this.capability(key.slice(4));
+      const sink = cap ? matchEndpoint(this.catalog, this.localId, cap.media, "consume") : null;
+      const leg = cap && sink ? this.ownedConnect(cap.id, sink.id) : null;
+      this.videoPopoutLive = leg?.id ?? null;
+      this.videoPopoutRouteId = leg?.created ? leg.id : null;
+    } else if (key.startsWith("share:")) {
+      this.videoPopoutLive = key.slice(6);
+    }
+    void emitVideoLocal({ token: this.windowToken, kind: "opened", key });
+  }
+
+  /** End this popout (the Return ask, or the window's OS ✕): tear down the
+   *  route it created (never one it merely watched), tell the lane, and
+   *  close the window. The await keeps the teardown ahead of the console's
+   *  re-wire — `closed` is only emitted once it's on the wire. */
+  async closeVideoPopout() {
+    const key = this.videoPopoutKey;
+    if (!key) return;
+    this.videoPopoutKey = null;
+    this.videoPopoutLive = null;
+    const owned = this.videoPopoutRouteId;
+    this.videoPopoutRouteId = null;
+    if (owned) await this.disconnect(owned);
+    await emitVideoLocal({ token: this.windowToken, kind: "closed", key });
+    void closeThisWindow();
+  }
+
+  /** The live outbound input route to `nodeId`, if any — what lets a
+   *  video surface (room tile, popout) forward clicks and keys over the
+   *  picture. Exists exactly while that machine wired *our* keyboard &
+   *  mouse to its control sink (a room's "share control", the console's
+   *  control toggle); injection stays gated on the far side regardless. */
+  controlRouteTo(nodeId: string): string | null {
+    for (const r of this.catalog.routes) {
+      if (r.media !== "input") continue;
+      const from = this.capability(r.from);
+      const to = this.capability(r.to);
+      if (from && to && this.isMe(from.node) && sameMachine(to.node, nodeId)) return r.id;
+    }
+    return null;
   }
 
   // ---- terminal (the mesh-native shell) ----------------------------
@@ -1817,20 +2041,6 @@ class AppStore {
     }
     return out;
   });
-
-  /** The live input route a member can drive this tile's machine with —
-   *  set when that machine turned "share control" on (it wired *our*
-   *  keyboard & mouse to its control sink). The tile captures over the
-   *  picture and sends events down this route. */
-  roomControlRouteTo(memberNodeId: string): string | null {
-    for (const r of this.catalog.routes) {
-      if (r.media !== "input") continue;
-      const from = this.capability(r.from);
-      const to = this.capability(r.to);
-      if (from && to && this.isMe(from.node) && sameMachine(to.node, memberNodeId)) return r.id;
-    }
-    return null;
-  }
 
   /** What a member is sending into this machine right now ("talking",
    *  "sharing sound"), read off the live audio routes' source origins. */

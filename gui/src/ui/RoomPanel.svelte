@@ -13,12 +13,19 @@
   //   🎙 Mic — your voice to the room (the call itself);
   //   🔊 Share sound — what this *machine* is playing (its loopback),
   //      never your microphone.
+  import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import { clipboardWrite, toggleWindowFullscreen } from "../tauri";
   import { isAppNode, type MeshNode } from "../types";
   import RoomTile from "./RoomTile.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
+
+  onMount(() => {
+    // Ask the popout lane who's already out there, so tiles whose stream
+    // lives in another window show "Return video here" from the start.
+    app.helloVideoLane();
+  });
 
   const room = $derived(app.openRoom);
   let chatInput = $state("");
@@ -355,7 +362,7 @@
           {#if app.roomInboundShares.length > 0}
             <div class="share-stage" class:single={app.roomInboundShares.length === 1}>
               {#each app.roomInboundShares as share (share.route.id)}
-                <RoomTile route={share.route} member={share.member} />
+                <RoomTile route={share.route} member={share.member} {windowed} />
               {/each}
             </div>
             <div class="filmstrip">

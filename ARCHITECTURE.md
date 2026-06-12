@@ -213,7 +213,31 @@ Tauri 2 + Svelte 5, a client of the daemon.
   advertises — its screen, each extra monitor (`screen:<id>`), and its
   cameras. While control is on the stage captures pointer/key events,
   normalizes coordinates onto the streamed frame, and forwards them down
-  the control route via `send_input`. The top bar's gear
+  the control route via `send_input`. Hovering a tab reveals a **pop-out**
+  (`⧉`): the input lifts into its **own OS window**
+  (`open_video_window` → `?video=cap:<capability id>` →
+  `VideoPopoutHost.svelte`), which wires and *owns* its own route — so a
+  camera can sit on a second monitor while the console stays on the
+  screen — with its own hover controls (quality pills, a stream chip,
+  fullscreen) and input forwarding whenever a live control route to that
+  machine exists. The tab left behind holds a big **"Return video
+  here"** (the stage shows it while that input is selected): one click
+  asks the popout — found or not, fullscreen or not — to tear down and
+  close, and the stage re-wires. Room tiles pop out the same way
+  (`?video=share:<route id>`), except the popout only *watches* the
+  sender's existing route — frame-watch claims replace each other by
+  design (a route shows in one window), so the pixels simply move.
+  Windows coordinate over a small local lane
+  (`allmystuff://video-local`, the room-local pattern): popouts announce
+  `opened`/`closed` and answer a `hello` census ping (consoles defer
+  their first wire a beat for it, with both sides self-healing if the
+  census loses the race), and `return-ask` is the Return button's
+  message. Both the console stage and every room tile also grow a hover
+  **fullscreen** control in the player corner (bottom-right): the video
+  takes the whole window over (chrome hidden) and, in an OS window, the
+  window goes fullscreen with it — Esc steps out unless control is
+  live, where every key belongs to the far machine and the hover
+  control is the way back. The top bar's gear
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
   Fleet (the owned roster's shared key + members), and Updates (the
   `allmystuff-updater` controls). The **Networks** tab is itself split into

@@ -715,6 +715,54 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
   return next;
 }
 
+// ---- video popouts (one stream in its own OS window) -------------------
+
+/** Open (or focus) the dedicated popout window for one video stream.
+ *  `key` names the stream (`cap:<capability id>` for a console input the
+ *  popout wires itself, `share:<route id>` for a room share it merely
+ *  watches); `title` seeds the OS window title. Desktop only — the web
+ *  preview has no windows to pop into. */
+export async function openVideoWindow(key: string, title: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_video_window", { key, title });
+}
+
+/** Which stream this window is a popout for, when it was opened by
+ *  `openVideoWindow` (`?video=<key>`). Null everywhere else. */
+export function videoWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("video");
+}
+
+/** The same-device chatter between this app's windows about video
+ *  popouts — the popout-presence twin of [`RoomLocalEvent`]. A popout
+ *  announces itself (`opened` at boot, and again in answer to a `hello`
+ *  ping, so a console/room window that opens later still learns of it)
+ *  and its end (`closed` — including the OS ✕); `return-ask` is a tab's
+ *  "Return video here" asking whichever window holds that stream to put
+ *  it back. No-op in web mode: one window. */
+export interface VideoLocalEvent {
+  /** The emitting window's store token — receivers ignore their own. */
+  token: string;
+  kind: "opened" | "closed" | "return-ask" | "hello";
+  /** The popout key (`cap:<capability id>` / `share:<route id>`).
+   *  Absent on `hello` (a who's-out-there ping). */
+  key?: string;
+}
+
+export async function emitVideoLocal(event: VideoLocalEvent): Promise<void> {
+  if (!isTauri()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit("allmystuff://video-local", event);
+}
+
+export async function onVideoLocal(cb: (e: VideoLocalEvent) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<VideoLocalEvent>("allmystuff://video-local", (e) => cb(e.payload));
+}
+
 // ---- self-update -------------------------------------------------------
 //
 // These degrade to null in web mode (no backend), so the Updates settings

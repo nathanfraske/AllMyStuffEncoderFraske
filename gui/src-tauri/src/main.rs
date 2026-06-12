@@ -376,6 +376,39 @@ async fn open_room_window(app: tauri::AppHandle, room: String) -> Result<(), Str
     Ok(())
 }
 
+/// Open (or focus) the popout window for one video stream — a console
+/// input or a room share lifted out of its tab into its own OS window
+/// (movable, resizable, fullscreen-able), so several streams can be on
+/// screen at once. The window loads the same app with `?video=<key>`;
+/// the key (`cap:<capability id>` / `share:<route id>`) tells the popout
+/// what to wire or watch. `title` names the stream until the popout
+/// retitles itself with resolved labels.
+#[tauri::command]
+async fn open_video_window(
+    app: tauri::AppHandle,
+    key: String,
+    title: String,
+) -> Result<(), String> {
+    let label = format!("video-{}", window_slug(&key));
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        // The key carries capability/route ids (colons, the route arrow) —
+        // percent-encode so the query survives; URLSearchParams decodes.
+        tauri::WebviewUrl::App(format!("index.html?video={}", query_encode(&key)).into()),
+    )
+    .title(&title)
+    .inner_size(880.0, 560.0)
+    .min_inner_size(380.0, 260.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// A node id reduced to the characters Tauri allows in a window label —
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
@@ -386,6 +419,20 @@ fn window_slug(node: &str) -> String {
             } else {
                 '_'
             }
+        })
+        .collect()
+}
+
+/// Percent-encode `s` for a URL query value (RFC 3986 unreserved kept,
+/// everything else `%XX`) — what a popout key needs to ride
+/// `?video=<key>` intact. The front-end's `URLSearchParams` decodes it.
+fn query_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
         })
         .collect()
 }
@@ -817,6 +864,7 @@ fn main() {
             video_refresh,
             tune_route,
             open_console_window,
+            open_video_window,
             term_send,
             term_watch,
             term_poll,
@@ -890,4 +938,31 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_encode_round_trips_popout_keys() {
+        // RFC 3986 unreserved characters pass through untouched…
+        assert_eq!(query_encode("abc-XYZ_0.9~"), "abc-XYZ_0.9~");
+        // …while a popout key's colons and the route arrow are escaped so
+        // the `?video=<key>` query survives (URLSearchParams decodes).
+        assert_eq!(
+            query_encode("cap:desk:cam:video0"),
+            "cap%3Adesk%3Acam%3Avideo0"
+        );
+        assert_eq!(
+            query_encode("share:route:a→b"),
+            "share%3Aroute%3Aa%E2%86%92b"
+        );
+    }
+
+    #[test]
+    fn window_slug_flattens_to_label_charset() {
+        assert_eq!(window_slug("cap:desk:cam/0"), "cap_desk_cam_0");
+        assert_eq!(window_slug("plain-id_9"), "plain-id_9");
+    }
 }

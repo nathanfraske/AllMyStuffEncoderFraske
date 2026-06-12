@@ -13,11 +13,17 @@
   // When the sharer also turned "share control" on (there's a live input
   // route from this machine's keyboard & mouse to theirs), the tile
   // captures clicks/keys over the picture and sends them down that route.
+  //
+  // The hover cluster (bottom-right, every video player's corner) pops
+  // the share out into its own OS window or takes it fullscreen; a
+  // popped tile holds a big "Return video here" in its middle so a
+  // stream lost to another monitor is always one click from home.
   import { app } from "../store.svelte";
-  import { sendInput, watchVideo } from "../tauri";
+  import { isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
 
-  let { route, member }: { route: Route; member: MeshNode } = $props();
+  let { route, member, windowed = false }: { route: Route; member: MeshNode; windowed?: boolean } =
+    $props();
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let hasFrame = $state(false);
@@ -25,17 +31,50 @@
   // (and pointer normalization) works against.
   let frameW = $state(0);
   let frameH = $state(0);
+  // Fullscreen ("theater"): the tile takes the whole window over (CSS),
+  // and — when the room has its own OS window — the window goes
+  // fullscreen too, so exactly this video fills the screen.
+  let theater = $state(false);
 
   const who = $derived(app.roomWho(member.id));
   // A video route is a camera feed; a display route is a screen share —
   // the badge says which, since both tile identically.
   const isCamera = $derived(route.media === "video");
+  const popKey = $derived(`share:${route.id}`);
+  const popped = $derived(app.isVideoPopped(popKey));
 
   // The live route this tile may drive the sharer with, if any.
-  const controlRoute = $derived(app.roomControlRouteTo(member.id));
+  const controlRoute = $derived(app.controlRouteTo(member.id));
+
+  async function flipTheater() {
+    theater = !theater;
+    if (windowed) await toggleWindowFullscreen();
+  }
+
+  // A popout opening while this tile is fullscreen would strand the
+  // window fullscreen behind the Return note — step out first.
+  $effect(() => {
+    if (popped && theater) void flipTheater();
+  });
+
+  function onWindowKey(e: KeyboardEvent) {
+    // Esc leaves fullscreen — unless control is granted, where every key
+    // belongs to the far machine (the hover ⛶ exits instead).
+    if (theater && !controlRoute && e.key === "Escape") {
+      e.preventDefault();
+      void flipTheater();
+    }
+  }
 
   $effect(() => {
     const routeId = route.id;
+    // A popped tile stops watching entirely — the popout window owns the
+    // frame watch (claims replace each other), and the tile shows the
+    // Return button instead.
+    if (popped) {
+      hasFrame = false;
+      return;
+    }
     let cancelled = false;
     let unwatch: (() => void) | null = null;
     hasFrame = false;
@@ -147,6 +186,8 @@
   }
 </script>
 
+<svelte:window onkeydown={onWindowKey} />
+
 <!-- role=application: like the console stage, a screen-share tile with
      control on is a remote-desktop surface — every pointer/key goes to
      the far machine, not this document. The tile is focusable only while
@@ -155,10 +196,11 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
   class="tile"
-  class:driving={!!controlRoute}
+  class:driving={!!controlRoute && !popped}
+  class:theater
   role="application"
   aria-label="{who.who}'s {isCamera ? 'camera' : 'screen'}{who.machine ? ` (${who.machine})` : ''}"
-  tabindex={controlRoute ? 0 : -1}
+  tabindex={controlRoute && !popped ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
@@ -166,16 +208,56 @@
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
 >
-  <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
-  {#if !hasFrame}
-    <div class="waiting-note">
-      <span class="who">{who.who}{#if who.machine}&nbsp;<span class="machine">· {who.machine}</span>{/if}</span>
-      <span class="note">waiting for pixels…</span>
+  {#if popped}
+    <!-- The stream lives in its own window right now; this is its way
+         home — findable even when that window is fullscreen elsewhere. -->
+    <div class="popped-note">
+      <span class="who">{who.who}'s {isCamera ? "camera" : "screen"} is in its own window</span>
+      <button class="return-btn" onclick={() => app.askReturnVideo(popKey)}>
+        ⤓ Return video here
+      </button>
     </div>
   {:else}
-    <div class="badge">
-      {isCamera ? "📷" : "🖥"} <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
-      {#if controlRoute}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
+    <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
+    {#if !hasFrame}
+      <div class="waiting-note">
+        <span class="who">{who.who}{#if who.machine}&nbsp;<span class="machine">· {who.machine}</span>{/if}</span>
+        <span class="note">waiting for pixels…</span>
+      </div>
+    {:else}
+      <div class="badge">
+        {isCamera ? "📷" : "🖥"} <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
+        {#if controlRoute}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
+      </div>
+    {/if}
+    <!-- The video player's corner: fullscreen where everyone looks for
+         it, popout beside it. Hover-revealed; pointer events stop here so
+         a granted control route never sees these clicks. -->
+    <div class="corner">
+      {#if isTauri() && !theater}
+        <button
+          class="corner-btn"
+          title="Pop this video out into its own window"
+          aria-label="Pop out into its own window"
+          onpointerdown={(e) => e.stopPropagation()}
+          onpointerup={(e) => e.stopPropagation()}
+          onclick={(e) => {
+            e.stopPropagation();
+            app.popOutRoomShare(route, member);
+          }}>⧉</button
+        >
+      {/if}
+      <button
+        class="corner-btn"
+        title={theater ? "Exit fullscreen (Esc)" : "Fullscreen"}
+        aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
+        onpointerdown={(e) => e.stopPropagation()}
+        onpointerup={(e) => e.stopPropagation()}
+        onclick={(e) => {
+          e.stopPropagation();
+          void flipTheater();
+        }}>{theater ? "⤡" : "⛶"}</button
+      >
     </div>
   {/if}
 </div>
@@ -255,5 +337,69 @@
   }
   .ctl {
     color: var(--ok);
+  }
+
+  /* Fullscreen: this one video takes the whole window over (and the OS
+     window itself goes fullscreen when the room has one). */
+  .tile.theater {
+    position: fixed;
+    inset: 0;
+    z-index: 120;
+    border-radius: 0;
+    border: none;
+  }
+
+  /* The hover corner — the video player's bottom-right. */
+  .corner {
+    position: absolute;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    display: inline-flex;
+    gap: 0.3rem;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .tile:hover .corner,
+  .corner:focus-within {
+    opacity: 1;
+  }
+  .corner-btn {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    color: #fff;
+    border-radius: var(--r-sm);
+    width: 1.9rem;
+    height: 1.9rem;
+    font-size: 0.95rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .corner-btn:hover {
+    background: rgba(0, 0, 0, 0.8);
+  }
+
+  /* The way home for a popped-out stream. */
+  .popped-note {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.7rem;
+    padding: 1rem;
+    text-align: center;
+  }
+  .return-btn {
+    border: 1px solid var(--line-strong);
+    background: var(--accent);
+    color: #fff;
+    border-radius: var(--r-md);
+    padding: 0.7rem 1.2rem;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .return-btn:hover {
+    filter: brightness(1.12);
   }
 </style>

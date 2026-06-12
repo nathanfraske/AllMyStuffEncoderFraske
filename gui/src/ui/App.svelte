@@ -8,6 +8,7 @@
     roomWindowTarget,
     setWindowTitle,
     terminalWindowTarget,
+    videoWindowTarget,
   } from "../tauri";
   import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
@@ -25,17 +26,20 @@
   import FilesHost from "./FilesHost.svelte";
   import Terminal from "./Terminal.svelte";
   import TerminalHost from "./TerminalHost.svelte";
+  import VideoPopoutHost from "./VideoPopoutHost.svelte";
   import Toasts from "./Toasts.svelte";
 
   // When this webview is a dedicated console window (`?console=<node>`),
-  // terminal window (`?terminal=<node>`), files window (`?files=<node>`)
-  // or room window (`?room=<room id>`), it renders just that session —
-  // the host components boot the store themselves, so everything below
-  // the split is main-window only.
+  // terminal window (`?terminal=<node>`), files window (`?files=<node>`),
+  // room window (`?room=<room id>`) or video popout (`?video=<key>` — one
+  // stream lifted out of its tab), it renders just that session — the
+  // host components boot the store themselves, so everything below the
+  // split is main-window only.
   const consoleTarget = consoleWindowTarget();
   const terminalTarget = terminalWindowTarget();
   const filesTarget = filesWindowTarget();
   const roomTarget = roomWindowTarget();
+  const videoTarget = videoWindowTarget();
 
   // Which build this is. Comes from gui/src-tauri/Cargo.toml via Tauri
   // (kept in sync by scripts/bump-version.sh); empty in the in-browser
@@ -43,7 +47,7 @@
   let version = $state("");
 
   onMount(() => {
-    if (consoleTarget || terminalTarget || filesTarget || roomTarget) return;
+    if (consoleTarget || terminalTarget || filesTarget || roomTarget || videoTarget) return;
     // Wire up live backend data (scan + presence + routes) if the Tauri
     // backend is here; otherwise the demo graph stands in so the app is
     // never empty.
@@ -60,7 +64,9 @@
   });
 </script>
 
-{#if terminalTarget}
+{#if videoTarget}
+  <VideoPopoutHost target={videoTarget} />
+{:else if terminalTarget}
   <TerminalHost target={terminalTarget} />
 {:else if filesTarget}
   <FilesHost target={filesTarget} />
