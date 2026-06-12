@@ -65,7 +65,14 @@
 <div class="shell">
   <header class="topbar">
     <div class="brand">
-      <span class="logo">🧦</span>
+      <svg class="logo" viewBox="0 0 256 256" aria-hidden="true">
+        <g stroke="currentColor" stroke-width="13" fill="none" stroke-linecap="round">
+          <path d="M128 74 L77 165 M128 74 L181 160 M77 165 L181 160" />
+        </g>
+        <circle cx="128" cy="72" r="27" fill="currentColor" />
+        <circle cx="76" cy="166" r="22" fill="currentColor" />
+        <circle cx="182" cy="160" r="22" fill="currentColor" />
+      </svg>
       <div class="brandtext">
         <div class="name">
           AllMyStuff{#if version}<span class="ver" title="Running version">v{version}</span>{/if}
@@ -168,7 +175,10 @@
     gap: 0.6rem;
   }
   .logo {
-    font-size: 1.5rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    flex-shrink: 0;
+    color: var(--accent);
     filter: drop-shadow(0 2px 3px oklch(0.64 0.255 350 / 0.35));
   }
   .name {
