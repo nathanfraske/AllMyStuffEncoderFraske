@@ -549,7 +549,11 @@
   .scrim {
     position: fixed;
     inset: 0;
-    z-index: 40;
+    /* Same layer as the console + files popovers: with the z-indexes
+       tied, DOM order in App.svelte (console → terminal → files) decides
+       the stack, so a terminal opened from the console's footer lands
+       above the console instead of invisibly behind it. */
+    z-index: 60;
     display: grid;
     place-items: center;
   }
