@@ -2,8 +2,10 @@
 
 The desktop icon set (`icon.ico`, `icon.icns`, and the multi-resolution
 PNGs listed in `tauri.conf.json` → `bundle.icon`) is generated from
-`icon.png` — a 512×512 placeholder (a little node graph in the AllMyStuff
-accent). The `.ico` is also what `tauri-build` embeds as the Windows
+`icon.png` — the 512×512 brand mark: the node graph on a rounded square
+in the design system's CEC magenta (`oklch(0.64 0.255 350)`), matching
+the allmystuff.works favicon. The `.ico` is also what `tauri-build`
+embeds as the Windows
 resource, so it must exist for a Windows build.
 
 To regenerate from new source artwork (≥ 1024×1024 recommended):
