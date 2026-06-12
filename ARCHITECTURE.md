@@ -450,14 +450,23 @@ Tauri 2 + Svelte 5, a client of the daemon.
    of wiring a route that would never carry pixels (and an older *viewer*
    never wires one — its build has no `video-in` sink to land on). An input
    route carries `InputEvent`s the other direction: normalized mouse moves /
-   buttons / wheel / DOM-`key` values — each move naming which remote screen
+   buttons / wheel / key events — each move naming which remote screen
    it's normalized over, so control follows the console's selected tab —
    injected at the sink with `enigo` (plus a hand-raised
    `MOUSEEVENTF_VIRTUALDESK` move on Windows, where enigo's absolute
    coordinates can't reach past the primary monitor) — but only after the
    gate: the route must be live *and* the sender must be the device's
    recorded owner or a co-owned fleet member, so a route that merely
-   auto-accepted can never type into your machine.
+   auto-accepted can never type into your machine. Both ends assume key
+   *combinations* are the norm: every key event carries the physical
+   DOM `code` next to the layout-resolved `key`, plain typing injects
+   the typist's character while a chord (Ctrl/Alt/Meta held) resolves
+   through the physical key (Ctrl+C is the C key, not whatever the held
+   modifiers composed), the sink remembers what each route pressed so a
+   keyup releases exactly what its keydown pressed (Shift+1 goes down
+   "!", comes up "1") and a dying route lifts everything it still holds,
+   and the senders burst-release held keys whenever their keyups can no
+   longer arrive (window blur, control toggled off, session close).
 
 **A terminal session** is one more route on the same plumbing — and no sshd
 anywhere. A node that can host shells advertises `"terminal"` in its

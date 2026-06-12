@@ -18,6 +18,7 @@
   // normalizes coordinates onto the streamed frame, and forwards them down
   // the control route.
   import { onMount } from "svelte";
+  import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
     closeThisWindow,
@@ -486,6 +487,10 @@
   async function endSession() {
     if (closing) return;
     closing = true;
+    // Keys still held ride out *before* the control route goes — closing
+    // a console mid-chord (⌘W closes this very window) must not leave
+    // the remote holding the modifier.
+    keys.releaseAll();
     // UI resets synchronously; the await is only so a console window's
     // teardown reaches the backend before the webview dies. Bounded — a
     // wedged daemon must never hold a closing window hostage.
@@ -555,6 +560,11 @@
     app.sendConsoleInput({ kind: "wheel", dx: e.deltaX * lines, dy: e.deltaY * lines });
   }
 
+  // Key forwarding with the bookkeeping combinations need: the physical
+  // `code` rides along, and held keys are lifted in a burst whenever
+  // their keyups can no longer arrive (blur, control off, session end).
+  const keys = makeKeyForwarder((a) => app.sendConsoleInput(a));
+
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node) return;
     if (!app.consoleControl) {
@@ -568,10 +578,16 @@
       return;
     }
     // With control on, *every* key belongs to the remote — including
-    // Escape, exactly like sitting at the machine.
+    // Escape and chords like Ctrl+W, exactly like sitting at the machine.
     e.preventDefault();
-    if (e.repeat) return; // the remote OS does its own key repeat
-    app.sendConsoleInput({ kind: "key", key: e.key, down });
+    keys.onKey(e, down);
+  }
+
+  function toggleControl() {
+    // Turning control off mid-chord: lift what's held while the route
+    // can still carry the keyups.
+    if (app.consoleControl) keys.releaseAll();
+    app.toggleConsoleControl();
   }
 
   function inputIcon(c: Capability): string {
@@ -582,6 +598,7 @@
 <svelte:window
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
+  onblur={() => keys.releaseAll()}
   onclick={() => (openPill = null)}
 />
 
@@ -789,7 +806,7 @@
           <button
             class="toggle"
             class:on={app.consoleControl}
-            onclick={() => app.toggleConsoleControl()}
+            onclick={toggleControl}
             title="Send this machine's keyboard & mouse to the remote"
           >
             <span class="t-icon">⌨️</span>

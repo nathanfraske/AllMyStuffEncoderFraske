@@ -87,7 +87,23 @@ pub enum InputAction {
     Wheel { dx: f64, dy: f64 },
     /// `key` is the DOM `KeyboardEvent.key` value — a printable character
     /// ("a", "?") or a named key ("Enter", "ArrowLeft", "Shift").
-    Key { key: String, down: bool },
+    ///
+    /// `code` is the DOM `KeyboardEvent.code` value — the *physical* key
+    /// ("KeyC", "Digit1"), which modifiers never change. Key combinations
+    /// need it twice over: a chord like Ctrl+C must land on the remote's
+    /// *C key*, not on whatever character the sender's layout composed
+    /// under the held modifiers, and the keyup of a chord must release
+    /// the same key its keydown pressed even when the modifier lifted
+    /// in between (Shift+1 goes down as "!" but comes up as "1" — only
+    /// the code ties the pair together). Absent from an older sender;
+    /// absent on the wire when unknown, so an older receiver sees the
+    /// exact shape it always did.
+    Key {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        down: bool,
+    },
 }
 
 /// One event of a terminal route's stream — the byte-level conversation
@@ -646,7 +662,13 @@ mod tests {
             InputAction::Wheel { dx: 0.0, dy: -3.0 },
             InputAction::Key {
                 key: "Enter".into(),
+                code: None,
                 down: false,
+            },
+            InputAction::Key {
+                key: "c".into(),
+                code: Some("KeyC".into()),
+                down: true,
             },
         ];
         for action in actions {
@@ -718,6 +740,7 @@ mod tests {
             1,
             InputAction::Key {
                 key: "a".into(),
+                code: None,
                 down: true,
             },
         ))
@@ -989,6 +1012,28 @@ mod tests {
         // older *receiver* isn't handed a key it never knew.
         let v = serde_json::to_value(&ev).unwrap();
         assert!(v.get("screen").is_none());
+    }
+
+    #[test]
+    fn a_codeless_key_event_still_decodes() {
+        // The exact shape an older sender (no physical-key field) emits.
+        let legacy = serde_json::json!({
+            "t": "input", "route": "r", "seq": 1,
+            "kind": "key", "key": "Enter", "down": true
+        });
+        let ev: InputEvent = serde_json::from_value(legacy).expect("legacy decodes");
+        assert_eq!(
+            ev.action,
+            InputAction::Key {
+                key: "Enter".into(),
+                code: None,
+                down: true
+            }
+        );
+        // And the codeless shape serializes without the field, so an
+        // older *receiver* isn't handed a key it never knew.
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.get("code").is_none());
     }
 
     #[test]

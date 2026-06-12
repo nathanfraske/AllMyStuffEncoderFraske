@@ -19,6 +19,7 @@
   // arriving over the local lane — runs the same teardown, announces
   // `closed`, and the tab that popped it re-wires itself.
   import { onMount } from "svelte";
+  import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
     focusThisWindow,
@@ -121,7 +122,12 @@
     }, 1000);
     // The OS chrome's ✕ runs the same teardown as a "Return video here"
     // ask — the close is held until the route teardown is on the wire.
-    void onThisWindowClose(() => void app.closeVideoPopout()).then((u) => (unlistenClose = u));
+    // Keys still held ride out first: the control route outlives this
+    // window, so without the lift the far machine keeps the modifier.
+    void onThisWindowClose(() => {
+      keys.releaseAll();
+      void app.closeVideoPopout();
+    }).then((u) => (unlistenClose = u));
     return () => {
       unlistenClose?.();
       clearInterval(fpsTimer);
@@ -272,13 +278,18 @@
     const lines = e.deltaMode === 1 ? 1 : 1 / 40;
     send({ kind: "wheel", dx: e.deltaX * lines, dy: e.deltaY * lines });
   }
+  // Key forwarding with the bookkeeping combinations need: the physical
+  // `code` rides along, and keys still held when this window loses focus
+  // are lifted in a burst — otherwise the far machine keeps a stuck
+  // modifier.
+  const keys = makeKeyForwarder(send);
+
   function onKey(e: KeyboardEvent, down: boolean) {
     if (controlActive) {
       // With control granted, every key belongs to the far machine —
       // the hover ⛶ leaves fullscreen.
       e.preventDefault();
-      if (e.repeat) return;
-      send({ kind: "key", key: e.key, down });
+      keys.onKey(e, down);
       return;
     }
     if (down && e.key === "Escape" && fullscreen) void flipFullscreen();
@@ -288,6 +299,7 @@
 <svelte:window
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
+  onblur={() => keys.releaseAll()}
   onclick={() => (openPill = null)}
 />
 
