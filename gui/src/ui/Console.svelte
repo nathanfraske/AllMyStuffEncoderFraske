@@ -110,9 +110,13 @@
   let stallKick = () => {};
   let decodeModeNote = "";
   // Whether the backend decodes for us (raw RGBA in, no webview codec).
-  // Starts true where WebCodecs doesn't exist at all; the decode ladder
-  // also lands here after WebCodecs stalls twice. Sticky for the session —
-  // a webview whose decoder wedged once isn't owed a third chance.
+  // Starts true where WebCodecs doesn't exist at all, and flips true at
+  // mount when it exists but can't actually decode H.264 (the
+  // isConfigSupported probe — WebKitGTK ships the API shape with the
+  // codecs delegated to GStreamer plugins that usually aren't there).
+  // The decode ladder also lands here after WebCodecs stalls or dies
+  // repeatedly. Sticky for the session — a webview whose decoder wedged
+  // once isn't owed a third chance.
   let nativeDecode = $state(typeof VideoDecoder === "undefined");
 
   // ---- the quality pills ---------------------------------------------
@@ -192,6 +196,24 @@
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
+    // "VideoDecoder exists" stopped meaning "H.264 decode works":
+    // WebKitGTK 2.4x ships the WebCodecs shape with codec support
+    // delegated to GStreamer plugins that usually aren't installed. Ask
+    // the API itself; anything short of a clean "supported" starts the
+    // session on native decode instead of feeding a decoder that can
+    // only die. (A probe that *lies* is still caught by the born-dead
+    // ladder below — this just skips the few seconds it costs.)
+    if (!nativeDecode && typeof VideoDecoder !== "undefined") {
+      try {
+        void VideoDecoder.isConfigSupported({ codec: "avc1.42E01F" })
+          .then((s) => {
+            if (!s.supported) nativeDecode = true;
+          })
+          .catch(() => (nativeDecode = true));
+      } catch {
+        nativeDecode = true;
+      }
+    }
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       const inRate = inCount;
@@ -347,6 +369,16 @@
       frameCount += 1;
     };
 
+    // Decoder instances lost on this rung before they ever produced a
+    // frame. The queue-stall detectors above can't see this failure
+    // shape: a decoder whose configure() throws — or whose very first
+    // decode errors — dies and resets the counters each time, so the
+    // ladder never stepped and the stage sat black forever. WebKitGTK
+    // 2.4x is the live case: it exposes the VideoDecoder *shape* with no
+    // working H.264 behind it (GStreamer-dependent), so the old "does
+    // VideoDecoder exist" test chose a decoder that can only die.
+    let bornDeadDrops = 0;
+
     const dropDecoder = (why: unknown) => {
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
@@ -359,6 +391,16 @@
         // already closed
       }
       decoder = null;
+      // Nothing ever decoded on this rung and the decoder keeps dying:
+      // that's a rung failure, not a glitch — walk the same ladder the
+      // stall detectors use, which ends at the backend's native decoder.
+      if (decodeOutputs === 0) {
+        bornDeadDrops += 1;
+        if (bornDeadDrops >= 3) {
+          bornDeadDrops = 0;
+          rebuildDecoder();
+        }
+      }
     };
 
     void watchVideo(
