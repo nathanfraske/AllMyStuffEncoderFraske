@@ -15,6 +15,21 @@
 
   let revealed = $state(false);
   let copied = $state(false);
+  // The fleet-name editor. Seeded from the roster whenever it converges
+  // (a rename gossiped from another member lands here too), unless the
+  // user is mid-edit.
+  let nameDraft = $state("");
+  let nameDirty = $state(false);
+  $effect(() => {
+    const live = app.fleetName;
+    if (!nameDirty) nameDraft = live;
+  });
+
+  function saveName() {
+    nameDirty = false;
+    if (nameDraft.trim() === app.fleetName) return;
+    void app.setFleetName(nameDraft);
+  }
   // Two-step confirm: first click arms (shows "sure?"), second acts. The
   // armed id is the member's device (or "leave" for the leave button).
   let armed = $state<string | null>(null);
@@ -78,6 +93,25 @@
         <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
       </div>
       <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+
+      <div class="name-row">
+        <label class="name-label" for="fleet-owner-name">🪪 Fleet owner name</label>
+        <input
+          id="fleet-owner-name"
+          class="name-input"
+          placeholder="Unnamed — whose fleet is this?"
+          disabled={!selfIsMember}
+          bind:value={nameDraft}
+          oninput={() => (nameDirty = true)}
+          onkeydown={(e) => e.key === "Enter" && saveName()}
+          onblur={saveName}
+        />
+      </div>
+      <p class="hint">
+        The fleet answers to this name everywhere — the graph's “{app.fleetName ||
+          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it. It
+        gossips with the roster, so every member sees the same name.
+      </p>
     </section>
 
     <section class="block">
@@ -105,7 +139,17 @@
           </li>
         {/each}
       </ul>
-      {#if selfIsMember}
+      {#if !selfIsMember}
+        <p class="hint">
+          This device isn't in the fleet, so it can only watch the roster —
+          you can't kick devices from a fleet you aren't in.
+        </p>
+      {/if}
+    </section>
+
+    {#if selfIsMember}
+      <!-- The exit lives at the very bottom, away from the everyday stuff. -->
+      <section class="block">
         <div class="leave-row">
           <button
             class="btn small leave"
@@ -120,13 +164,8 @@
             ownership — the device goes back to unclaimed.
           </span>
         </div>
-      {:else}
-        <p class="hint">
-          This device isn't in the fleet, so it can only watch the roster —
-          you can't kick devices from a fleet you aren't in.
-        </p>
-      {/if}
-    </section>
+      </section>
+    {/if}
   {:else}
     <section class="block empty-block">
       <div class="empty-orb">🔗</div>
@@ -192,6 +231,31 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
+  }
+  .name-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.7rem;
+  }
+  .name-label {
+    flex-shrink: 0;
+    font-size: 0.9rem;
+    font-weight: 650;
+  }
+  .name-input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.4rem 0.6rem;
+    font-size: 0.86rem;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .name-input:disabled {
+    opacity: 0.6;
   }
   code {
     flex: 1;

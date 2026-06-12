@@ -616,6 +616,14 @@ export async function fleetKick(device: string): Promise<void> {
   await invoke("fleet_kick", { device });
 }
 
+/** Name (or rename) the fleet (members only). Throws with the reason when
+ *  refused; the renamed roster arrives back via `allmystuff://owned`. */
+export async function fleetSetName(name: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_set_name", { name });
+}
+
 // ---- virtual rooms (the rooms plane) ------------------------------------
 
 /** Fan one room-plane message out to `members` (canonical or display node

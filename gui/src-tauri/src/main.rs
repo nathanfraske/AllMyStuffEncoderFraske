@@ -393,6 +393,13 @@ async fn fleet_kick(mesh: State<'_, Arc<Mesh>>, device: String) -> Result<(), St
     mesh.inner().fleet_kick(device).await
 }
 
+/// Name (or rename) the fleet this device belongs to. Members only; the
+/// renamed roster gossips out and converges like any membership change.
+#[tauri::command]
+async fn fleet_set_name(mesh: State<'_, Arc<Mesh>>, name: String) -> Result<(), String> {
+    mesh.inner().fleet_set_name(name).await
+}
+
 /// Fan one room-plane message (invite / join / leave / chat) out to the
 /// given members. Best-effort per member; returns how many the daemon
 /// actually dispatched to, so the UI can say when a line reached nobody.
@@ -801,6 +808,7 @@ fn main() {
             owned_roster,
             fleet_leave,
             fleet_kick,
+            fleet_set_name,
             mesh_status,
             mesh_identity,
             mesh_networks,

@@ -18,6 +18,21 @@
   let chatInput = $state("");
   let chatLog = $state<HTMLDivElement | null>(null);
   let filesPickerOpen = $state(false);
+  // The owner's inline rename: the title flips to an input in place.
+  let renaming = $state(false);
+  let renameDraft = $state("");
+
+  function startRename() {
+    if (!room || !app.canRenameRoom(room)) return;
+    renameDraft = room.name;
+    renaming = true;
+  }
+
+  function commitRename() {
+    if (!renaming) return;
+    renaming = false;
+    if (room) app.renameRoom(room.id, renameDraft);
+  }
 
   const chat = $derived(room ? app.roomChat[room.id] ?? [] : []);
   const unread = $derived(room ? app.roomUnread[room.id] ?? 0 : 0);
@@ -71,7 +86,26 @@
   <div class="room-wrap">
     <section class="room" aria-label="Room {room.name}">
       <header class="head">
-        <div class="title">🪩 {room.name}</div>
+        {#if renaming}
+          <!-- svelte-ignore a11y_autofocus — the input replaces the title
+               the user just clicked; focusing it is the whole point. -->
+          <input
+            class="title-input"
+            autofocus
+            bind:value={renameDraft}
+            onkeydown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") renaming = false;
+            }}
+            onblur={commitRename}
+          />
+        {:else if app.canRenameRoom(room)}
+          <button class="title title-btn" title="Rename this room (you made it)" onclick={startRename}>
+            🪩 {room.name} <span class="pencil" aria-hidden="true">✎</span>
+          </button>
+        {:else}
+          <div class="title">🪩 {room.name}</div>
+        {/if}
         <div class="members">
           {#each app.roomMemberNodes as m (m.id)}
             {@const n = m.node}
@@ -111,7 +145,8 @@
               <div class="empty-title">You're in — and sending nothing.</div>
               <div class="empty-sub">
                 Mic, camera and screen are off until you turn them on below. Shared screens from
-                other members show up here.
+                other members show up here. Sharing in a room is scoped to the room — it never
+                adds standing permissions for its members.
               </div>
             </div>
           {/if}
@@ -233,7 +268,8 @@
 
         <p class="clarity">
           🎙 <b>Mic</b> is the call — your voice. 🔊 <b>Share sound</b> sends what this machine is
-          <i>playing</i> — never your mic.
+          <i>playing</i> — never your mic. Everything here is <b>scoped to the room</b>: it ends
+          when you leave, and nobody gains a standing permission from it.
         </p>
       </footer>
     </section>
@@ -280,6 +316,37 @@
     font-weight: 750;
     font-size: 1rem;
     white-space: nowrap;
+  }
+  .title-btn {
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    padding: 0.1rem 0.3rem;
+    border-radius: var(--r-sm);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  .title-btn:hover {
+    background: var(--surface-2);
+  }
+  .pencil {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  .title-btn:hover .pencil {
+    color: var(--ink);
+  }
+  .title-input {
+    font-weight: 750;
+    font-size: 1rem;
+    font-family: inherit;
+    color: var(--ink);
+    background: var(--surface-2);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-sm);
+    padding: 0.15rem 0.45rem;
+    min-width: 12rem;
   }
   .members {
     display: flex;

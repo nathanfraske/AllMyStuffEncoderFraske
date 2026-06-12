@@ -9,6 +9,7 @@ import {
   canSource,
   capabilityForDisplay,
   matchEndpoint,
+  proposeRoomRoute,
   proposeRoute,
   requiredGrants,
   type GrantRequest,
@@ -25,6 +26,7 @@ import {
   disconnectRoute,
   fleetKick,
   fleetLeave,
+  fleetSetName,
   isTauri,
   openFilesWindow,
   meshIdentity,
@@ -319,6 +321,38 @@ class AppStore {
   // ---- owned fleet (the gossiped "Owned" roster) ------------------
   /** The shared key + members linking the devices you've claimed. */
   ownedFleet = $state<OwnedRoster | null>(null);
+
+  /** The fleet's display name ("Casey"), empty when unnamed. */
+  fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
+
+  /** Name (or rename) the fleet — members only (the backend enforces it;
+   *  the demo mirrors the rule). The renamed roster gossips out and every
+   *  member converges, exactly like a kick. */
+  async setFleetName(name: string) {
+    const clean = name.trim();
+    if (this.backendConnected) {
+      try {
+        await fleetSetName(clean);
+        this.toast("ok", clean ? `Fleet named “${clean}”` : "Fleet name cleared");
+      } catch (e) {
+        this.toast("warn", `Couldn't name the fleet: ${String(e)}`);
+      }
+      return;
+    }
+    // Demo/web: apply the same membership rule locally.
+    if (!this.ownedFleet || !this.isFleetMember(this.localId)) {
+      this.toast("warn", "You can't name a fleet you aren't in");
+      return;
+    }
+    if ((this.ownedFleet.name ?? "") !== clean) {
+      this.ownedFleet = {
+        ...this.ownedFleet,
+        name: clean,
+        version: this.ownedFleet.version + 1,
+      };
+    }
+    this.toast("ok", clean ? `Fleet named “${clean}” (demo)` : "Fleet name cleared (demo)");
+  }
 
   // ---- self-update -------------------------------------------------
   updateInfo = $state<UpdateStatus | null>(null);
@@ -1488,7 +1522,12 @@ class AppStore {
    *  preview (a stored rooms list wins — this never overwrites yours). */
   private seedDemoRoom() {
     if (this.rooms.length > 0) return;
-    this.rooms.push({ id: "room:demo", name: "Movie night", members: ["this", "desk", "tv"] });
+    this.rooms.push({
+      id: "room:demo",
+      name: "Movie night",
+      members: ["this", "desk", "tv"],
+      owner: "this",
+    });
   }
 
   /** Demo/web only: stand in two networks with their server configs and spread
@@ -1641,19 +1680,60 @@ class AppStore {
     this.catalog.nodes.filter((n) => !this.isMe(n.id) && isAppNode(n)),
   );
 
-  /** Make a room and tell its members. */
+  /** What a fresh room is called when its maker doesn't say: named after
+   *  the fleet's owner ("Casey's room"), falling back to this machine's
+   *  label while the fleet is unnamed. */
+  defaultRoomName(): string {
+    const base = this.fleetName || this.node(this.localId)?.label || "My";
+    return `${base}'s room`;
+  }
+
+  /** Make a room and tell its members. The maker is its owner — the one
+   *  member who can rename it later. */
   createRoom(name: string, memberIds: string[]) {
-    const clean = name.trim() || "Room";
+    const clean = name.trim() || this.defaultRoomName();
     const members = [
       canonicalNodeId(this.localId),
       ...memberIds.map(canonicalNodeId).filter((m) => !this.isMe(m)),
     ];
-    const room: VirtualRoom = { id: newId("room"), name: clean, members };
+    const room: VirtualRoom = {
+      id: newId("room"),
+      name: clean,
+      members,
+      owner: canonicalNodeId(this.localId),
+    };
     this.rooms.push(room);
     this.saveRooms();
     this.roomDraftOpen = false;
     this.toast("ok", `Made the room “${clean}”`);
     this.broadcastRoom(room, { room: room.id, name: room.name, kind: "invite", members });
+  }
+
+  /** Whether this device may rename `room`: its owner (or a room from
+   *  before owners existed, which anyone holding it may title). */
+  canRenameRoom(room: VirtualRoom): boolean {
+    return !room.owner || this.isMe(room.owner);
+  }
+
+  /** Rename a room (owner only). Members converge via the re-stated
+   *  invite, which carries the room's name and roster. */
+  renameRoom(roomId: string, name: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    const clean = name.trim();
+    if (!room || !clean || room.name === clean) return;
+    if (!this.canRenameRoom(room)) {
+      this.toast("warn", "Only the room's owner can rename it");
+      return;
+    }
+    room.name = clean;
+    this.saveRooms();
+    this.toast("ok", `Room renamed to “${clean}”`);
+    this.broadcastRoom(room, {
+      room: room.id,
+      name: clean,
+      kind: "invite",
+      members: room.members,
+    });
   }
 
   /** Forget a room on this device (members keep theirs). */
@@ -1805,7 +1885,7 @@ class AppStore {
       if (node.relationship.kind === "unclaimed") continue;
       const theirSrc = matchEndpoint(this.catalog, node.id, "input", "provide");
       if (!theirSrc) continue;
-      const leg = this.ownedConnect(theirSrc.id, mySink.id);
+      const leg = this.roomConnect(theirSrc.id, mySink.id);
       if (leg?.created) this.roomRoutes.control.push(leg.id);
       if (leg) wired += 1;
     }
@@ -1852,8 +1932,16 @@ class AppStore {
         if (existing) {
           existing.name = msg.name?.trim() || existing.name;
           existing.members = members;
+          // Invites come from the room's maker — adopt them as owner on a
+          // copy that predates the field (a chat-minted stub, an old save).
+          existing.owner ??= sender;
         } else {
-          this.rooms.push({ id: msg.room, name: msg.name?.trim() || "Room", members });
+          this.rooms.push({
+            id: msg.room,
+            name: msg.name?.trim() || "Room",
+            members,
+            owner: sender,
+          });
           this.toast("info", `${senderLabel} added you to “${msg.name?.trim() || "a room"}”`);
         }
         this.saveRooms();
@@ -1938,6 +2026,24 @@ class AppStore {
       .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false))[0];
   }
 
+  /** Wire one room leg. Room sharing is **scoped to the room**: being a
+   *  member is the consent, so the leg skips the share-grant gate — and
+   *  minting a standing grant is exactly what it must never do. What
+   *  happens in a room changes nothing about what its members may do to
+   *  each other outside it. The route still validates structurally and
+   *  still rides the real backend offer. */
+  private roomConnect(from: string, to: string): { id: string; created: boolean } | null {
+    const res = proposeRoomRoute(this.catalog, from, to);
+    if (!res.ok) return null;
+    const id = res.route.id;
+    const existedBefore = this.catalog.routes.some((r) => r.id === id);
+    if (!existedBefore) {
+      this.addRoute(res.route.from, res.route.to);
+      this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
+    }
+    return { id, created: !existedBefore };
+  }
+
   /** Wire one toggle's leg to every eligible member: `from` (a local
    *  source) into each member's matching sink. Returns how many members
    *  got a leg (created ones are owned for teardown). */
@@ -1948,7 +2054,7 @@ class AppStore {
       if (node.relationship.kind === "unclaimed") continue;
       const sink = matchEndpoint(this.catalog, node.id, media, "consume");
       if (!sink) continue;
-      const leg = this.ownedConnect(from.id, sink.id);
+      const leg = this.roomConnect(from.id, sink.id);
       if (leg?.created) this.roomRoutes[channel].push(leg.id);
       if (leg) wired += 1;
     }
@@ -2541,11 +2647,15 @@ class AppStore {
   }
 
   /** After any authorization change, drop routes that are no longer
-   *  allowed. Security can't lag behind the grants. */
+   *  allowed. Security can't lag behind the grants. Routes the open room
+   *  wired are exempt: room sharing is scoped to the room session
+   *  (membership is the consent), so it never depended on a grant — and
+   *  leaving the room is what tears it down. */
   private reauthorize() {
+    const roomWired = new Set(Object.values(this.roomRoutes).flat());
     const before = this.catalog.routes.length;
     this.catalog.routes = this.catalog.routes.filter(
-      (r) => requiredGrants(this.catalog, r.from, r.to).length === 0,
+      (r) => roomWired.has(r.id) || requiredGrants(this.catalog, r.from, r.to).length === 0,
     );
     const dropped = before - this.catalog.routes.length;
     if (dropped > 0) this.toast("warn", `${dropped} connection${dropped > 1 ? "s" : ""} stopped`);

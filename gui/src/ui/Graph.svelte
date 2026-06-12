@@ -44,7 +44,12 @@
       app.isFleetMember(n.id) ||
       (!!n.owner && app.isMe(n.owner))
     ) {
-      return { key: "mine", label: app.fleetMemberIds.size > 1 ? "Your fleet" : "Your devices" };
+      const label = app.fleetName
+        ? `${app.fleetName}'s fleet`
+        : app.fleetMemberIds.size > 1
+          ? "Your fleet"
+          : "Your devices";
+      return { key: "mine", label };
     }
     if (n.relationship.kind === "shared") {
       const p = n.relationship.person;
