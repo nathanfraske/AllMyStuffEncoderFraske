@@ -857,6 +857,37 @@
           </button>
         </div>
 
+        <!-- Quick handles to the rest of this machine — its file manager
+             and a shell — so a console session doesn't send you back to
+             the graph drawer for them. Owner/fleet gated exactly like the
+             drawer's buttons (the far side enforces the rule again); on
+             the desktop each opens (or focuses) the machine's dedicated
+             window beside this one. -->
+        {#if app.filesAllowed(node) || app.terminalAllowed(node)}
+          <div class="quick">
+            {#if app.filesAllowed(node)}
+              <button
+                class="launch"
+                onclick={() => app.openFiles(node.id)}
+                title="Browse this machine's files over the mesh"
+              >
+                <span class="t-icon">🗂</span>
+                Files
+              </button>
+            {/if}
+            {#if app.terminalAllowed(node)}
+              <button
+                class="launch"
+                onclick={() => app.openTerminal(node.id)}
+                title="Open a shell on this machine over the mesh"
+              >
+                <span class="t-icon">📟</span>
+                Terminal
+              </button>
+            {/if}
+          </div>
+        {/if}
+
         {#if app.consoleVideoLive}
           <div class="pills" role="group" aria-label="Stream quality">
             {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
@@ -1273,11 +1304,13 @@
     border-top: 1px solid #2c2740;
     flex-shrink: 0;
   }
-  .toggles {
+  .toggles,
+  .quick {
     display: flex;
     gap: 0.4rem;
   }
-  .toggle {
+  .toggle,
+  .launch {
     display: flex;
     align-items: center;
     gap: 0.4rem;
@@ -1291,7 +1324,8 @@
     cursor: pointer;
     transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .toggle:hover {
+  .toggle:hover,
+  .launch:hover {
     border-color: var(--accent);
   }
   .toggle.on {
