@@ -7,6 +7,7 @@ import type {
   Capability,
   CheckOutcome,
   FileEvent,
+  RoomWireMessage,
   IdentityInfo,
   InputAction,
   InventorySummary,
@@ -615,6 +616,29 @@ export async function fleetKick(device: string): Promise<void> {
   await invoke("fleet_kick", { device });
 }
 
+// ---- virtual rooms (the rooms plane) ------------------------------------
+
+/** Fan one room-plane message out to `members` (canonical or display node
+ *  ids; self is skipped backend-side). Resolves to how many members the
+ *  daemon actually dispatched to — 0 in web mode, where nothing can flow
+ *  and the room is local-only. */
+export async function roomSend(members: string[], message: RoomWireMessage): Promise<number> {
+  const n = await tryInvoke<number>("room_send", { members, message });
+  return n ?? 0;
+}
+
+/** Inbound room-plane traffic (an invite, a join/leave, a chat line).
+ *  No-op listener in web mode. */
+export async function onRoom(
+  cb: (e: { from: string; message: RoomWireMessage }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string; message: RoomWireMessage }>("allmystuff://room", (e) =>
+    cb(e.payload),
+  );
+}
+
 // ---- self-update -------------------------------------------------------
 //
 // These degrade to null in web mode (no backend), so the Updates settings
@@ -689,6 +713,18 @@ export const meshNetworkUpdate = (config: unknown) =>
 
 export const meshNetworkRemove = (network: string) =>
   invokeReq<unknown>("mesh_network_remove", { network });
+
+/** The networks currently switched off — their full parked configs (we
+ *  only read the summary fields; the rest round-trips untouched). */
+export async function disabledNetworks(): Promise<NetworkConfigFull[]> {
+  const r = await invokeReq<NetworkConfigFull[]>("disabled_networks");
+  return Array.isArray(r) ? r : [];
+}
+
+/** Switch a network off (leave the daemon, park the config) or back on
+ *  (re-join from the parked config). Rosters survive on disk in between. */
+export const setNetworkEnabled = (network: string, enabled: boolean) =>
+  invokeReq<unknown>("network_set_enabled", { network, enabled });
 
 /** The whole daemon config (every network with its full signaling/STUN/TURN).
  *  The Servers settings pane reads this to populate its editor. */

@@ -19,8 +19,8 @@
 //!    forwards is "whatever this machine's user does", not one scanned
 //!    device, so driving a remote never depends on the input scan finding
 //!    hardware — macOS finds none), and **system audio** (a duplex
-//!    endpoint for its mixer). These are what an RDC group lands on at
-//!    the far end.
+//!    endpoint for its mixer). These are what whole-computer flows
+//!    (remote control, a room's screen share) land on at the far end.
 //!
 //! This is the only place hardware vocabulary meets graph vocabulary, so
 //! it's small and thoroughly tested.

@@ -26,23 +26,146 @@
 
   type Placed = { node: MeshNode; x: number; y: number };
 
-  // Radial layout: "this" in the middle, everything else on a ring with
-  // the things you own first and the people you share with after, so the
-  // eye reads "my fleet, then my guests."
-  const layout = $derived.by((): Placed[] => {
+  // ---- fleet grouping -------------------------------------------------
+  //
+  // Every node belongs to exactly one fleet: yours (this device, your
+  // owned-fleet co-members, anything you own), a named fleet per *other*
+  // owner (people bring fleets — their devices group under them), or
+  // "Unknown fleet" for devices that advertise no owner at all (including
+  // bare mesh endpoints not running AllMyStuff). Both views read this:
+  // the ring seats fleets together, the grid draws them as sections.
+
+  type FleetGroup = { key: string; label: string; nodes: MeshNode[] };
+
+  function fleetKeyOf(n: MeshNode): { key: string; label: string } {
+    if (
+      n.kind === "this" ||
+      n.relationship.kind === "mine" ||
+      app.isFleetMember(n.id) ||
+      (!!n.owner && app.isMe(n.owner))
+    ) {
+      return { key: "mine", label: app.fleetMemberIds.size > 1 ? "Your fleet" : "Your devices" };
+    }
+    if (n.relationship.kind === "shared") {
+      const p = n.relationship.person;
+      return { key: `fleet:${p.id}`, label: `${p.name}'s fleet` };
+    }
+    if (n.owner) {
+      const person = app.personFor(n);
+      return { key: `fleet:${person.id}`, label: `${person.name}'s fleet` };
+    }
+    return { key: "unknown", label: "Unknown fleet" };
+  }
+
+  const fleetGroups = $derived.by((): FleetGroup[] => {
+    const groups = new Map<string, FleetGroup>();
+    for (const n of app.catalog.nodes) {
+      const { key, label } = fleetKeyOf(n);
+      const g = groups.get(key) ?? { key, label, nodes: [] };
+      g.nodes.push(n);
+      groups.set(key, g);
+    }
+    for (const g of groups.values()) {
+      g.nodes.sort((a, b) => {
+        // This device leads its fleet; the rest read alphabetically.
+        const rank = (n: MeshNode) => (n.kind === "this" ? 0 : 1);
+        return rank(a) - rank(b) || a.label.localeCompare(b.label);
+      });
+    }
+    // Your fleet first, named fleets alphabetically, the unknowns last.
+    const rank = (g: FleetGroup) => (g.key === "mine" ? 0 : g.key === "unknown" ? 2 : 1);
+    return [...groups.values()].sort(
+      (a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label),
+    );
+  });
+
+  // ---- views ------------------------------------------------------------
+  //
+  // Two layouts over the same nodes: the radial default ("this" centred,
+  // fleets seated together around the ring) and the grouped grid (one
+  // labelled section per fleet) — switched from the zoom controls.
+
+  type ViewMode = "radial" | "grid";
+  const VIEW_STORE_KEY = "allmystuff.graphView.v1";
+  let view = $state<ViewMode>(loadView());
+
+  function loadView(): ViewMode {
+    try {
+      return localStorage.getItem(VIEW_STORE_KEY) === "grid" ? "grid" : "radial";
+    } catch {
+      return "radial";
+    }
+  }
+
+  function setView(v: ViewMode) {
+    view = v;
+    panX = 0;
+    panY = 0;
+    zoom = 1;
+    try {
+      localStorage.setItem(VIEW_STORE_KEY, v);
+    } catch {
+      /* private mode — the toggle just doesn't persist */
+    }
+  }
+
+  // The grid's geometry: one section per fleet, nodes wrapped into rows.
+  const GRID_MARGIN = 28;
+  const CELL_W = NODE_W + 26;
+  const CELL_H = NODE_H + 64; // node + meta rows + breathing room
+  const SECTION_HEAD = 34;
+  const SECTION_GAP = 26;
+  const SECTION_PAD = 14;
+
+  type Section = { key: string; label: string; x: number; y: number; w: number; h: number; count: number };
+
+  const gridLayout = $derived.by((): { placed: Placed[]; sections: Section[] } => {
+    const placed: Placed[] = [];
+    const sections: Section[] = [];
+    const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / CELL_W));
+    let y = GRID_MARGIN;
+    for (const g of fleetGroups) {
+      const useCols = Math.min(cols, Math.max(1, g.nodes.length));
+      const rows = Math.ceil(g.nodes.length / useCols);
+      const w = useCols * CELL_W + 2 * SECTION_PAD;
+      const x0 = Math.max(GRID_MARGIN, (width - w) / 2);
+      sections.push({
+        key: g.key,
+        label: g.label,
+        x: x0,
+        y,
+        w,
+        h: SECTION_HEAD + rows * CELL_H + SECTION_PAD,
+        count: g.nodes.length,
+      });
+      g.nodes.forEach((n, i) => {
+        const col = i % useCols;
+        const row = Math.floor(i / useCols);
+        placed.push({
+          node: n,
+          x: x0 + SECTION_PAD + col * CELL_W + CELL_W / 2,
+          y: y + SECTION_HEAD + row * CELL_H + CELL_H / 2 - 10,
+        });
+      });
+      y += SECTION_HEAD + rows * CELL_H + SECTION_PAD + SECTION_GAP;
+    }
+    return { placed, sections };
+  });
+
+  // Radial layout: "this" in the middle, everything else on a ring seated
+  // by fleet — your devices first, then each named fleet, unknowns last —
+  // so the eye reads "my fleet, then everyone else's."
+  const radialLayout = $derived.by((): Placed[] => {
     const cx = width / 2;
     const cy = height / 2;
-    const nodes = app.catalog.nodes;
     // Centre the local machine by its definitive marker (`kind === "this"`),
     // not by id: a presence snapshot can move `localId` to the real session id
     // before a scan re-homes the node off its first-scan placeholder, and we
     // must never leave the centre empty with "me" stranded out on the ring.
-    const me = nodes.find((n) => n.kind === "this") ?? nodes.find((n) => n.id === app.localId);
-    const others = nodes.filter((n) => n.id !== me?.id);
-    others.sort((a, b) => {
-      const rank = (n: MeshNode) => (n.relationship.kind === "mine" ? 0 : 1);
-      return rank(a) - rank(b) || a.label.localeCompare(b.label);
-    });
+    const me =
+      app.catalog.nodes.find((n) => n.kind === "this") ??
+      app.catalog.nodes.find((n) => n.id === app.localId);
+    const others = fleetGroups.flatMap((g) => g.nodes).filter((n) => n.id !== me?.id);
     const placed: Placed[] = [];
     if (me) placed.push({ node: me, x: cx, y: cy });
     const radius = Math.max(180, Math.min(width, height) / 2 - 130);
@@ -52,6 +175,9 @@
     });
     return placed;
   });
+
+  const layout = $derived(view === "grid" ? gridLayout.placed : radialLayout);
+  const sections = $derived(view === "grid" ? gridLayout.sections : []);
 
   const posOf = $derived.by(() => {
     const m = new Map<string, Placed>();
@@ -63,7 +189,7 @@
   // on. Curved + coloured by media, with parallel routes fanned apart.
   // Endpoints resolve through the display fallback so a live terminal
   // session (whose endpoints aren't catalog capabilities) draws its wire.
-  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string; group: boolean };
+  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string };
   const edges = $derived.by((): Edge[] => {
     const pairCount = new Map<string, number>();
     const out: Edge[] = [];
@@ -93,7 +219,6 @@
         cx: mx + (-dy / len) * off,
         cy: my + (dx / len) * off,
         color: mediaColor(r.media as MediaKind),
-        group: !!r.group,
       });
     }
     return out;
@@ -125,13 +250,12 @@
 
   function onPointerDown(e: PointerEvent) {
     const target = e.target as Element | null;
-    if (target?.closest?.(".node")) return; // let node clicks through
+    // Let node clicks through — and never capture the pointer on the
+    // floating controls, or their buttons swallow the click (capturing
+    // re-targets the pointerup, so the browser never composes a click).
+    if (target?.closest?.(".node, .zoombar, .arm-banner")) return;
     if (app.dragFrom) {
       app.cancelConnect();
-      return;
-    }
-    if (app.groupPickerFor) {
-      app.cancelGroupConnect();
       return;
     }
     app.selectNode(null);
@@ -164,16 +288,16 @@
     return "🖥";
   }
 
-  // Whether a node is a valid action target right now (connect drop or
-  // group destination) — drives the pulsing highlight. A device must be
-  // running AllMyStuff and already claimed to be a target.
-  const armed = $derived(!!app.dragFrom || !!app.groupPickerFor);
+  // Whether a node is a valid connect-drop target right now — drives the
+  // pulsing highlight. A device must be running AllMyStuff and already
+  // claimed to be a target.
+  const armed = $derived(!!app.dragFrom);
   function targetable(n: MeshNode): boolean {
     return isAppNode(n) && n.relationship.kind !== "unclaimed";
   }
 
   function onNodeClick(n: MeshNode) {
-    if (app.dragFrom || app.groupPickerFor) {
+    if (app.dragFrom) {
       // Mesh-only and not-yet-claimed nodes aren't connection targets.
       if (!isAppNode(n)) {
         app.toast("warn", `${n.label} isn't running AllMyStuff`);
@@ -183,8 +307,7 @@
         app.toast("warn", `Claim ${n.label} first — open it to adopt it`);
         return;
       }
-      if (app.dragFrom) app.dropConnectOnNode(n.id);
-      else if (app.groupPickerFor) app.connectGroupTo(app.groupPickerFor, n.id);
+      app.dropConnectOnNode(n.id);
     } else {
       app.selectNode(app.selectedNodeId === n.id ? null : n.id);
     }
@@ -216,7 +339,6 @@
       {#each edges as e (e.id)}
         <path
           class="wire"
-          class:group={e.group}
           d="M {e.x1} {e.y1} Q {e.cx} {e.cy} {e.x2} {e.y2}"
           stroke={e.color}
           fill="none"
@@ -233,6 +355,21 @@
 
   <!-- node layer (HTML, shares the same transform) -->
   <div class="nodes" style="transform: translate({panX}px, {panY}px) scale({zoom});">
+    {#each sections as s (s.key)}
+      <!-- grid view only: one labelled band per fleet -->
+      <div
+        class="section"
+        class:mine={s.key === "mine"}
+        class:unknown={s.key === "unknown"}
+        style="left: {s.x}px; top: {s.y}px; width: {s.w}px; height: {s.h}px;"
+      >
+        <div class="section-head">
+          {s.key === "mine" ? "🔗" : s.key === "unknown" ? "❓" : "🧑"}
+          {s.label}
+          <span class="section-count">{s.count}</span>
+        </div>
+      </div>
+    {/each}
     {#each layout as p (p.node.id)}
       {@const n = p.node}
       {@const shared = n.relationship.kind === "shared"}
@@ -317,17 +454,27 @@
 
   {#if armed}
     <div class="arm-banner">
-      {#if app.dragFrom}
-        Tap a device to connect — or tap empty space to cancel
-        <button class="btn small" onclick={() => app.cancelConnect()}>Cancel</button>
-      {:else}
-        Tap a device to send the group there
-        <button class="btn small" onclick={() => app.cancelGroupConnect()}>Cancel</button>
-      {/if}
+      Tap a device to connect — or tap empty space to cancel
+      <button class="btn small" onclick={() => app.cancelConnect()}>Cancel</button>
     </div>
   {/if}
 
   <div class="zoombar">
+    <button
+      class="zbtn"
+      class:active={view === "radial"}
+      title="Radial view — this device in the centre"
+      aria-label="Radial view"
+      onclick={() => setView("radial")}>◎</button
+    >
+    <button
+      class="zbtn"
+      class:active={view === "grid"}
+      title="Grid view — grouped by fleet"
+      aria-label="Grid view, grouped by fleet"
+      onclick={() => setView("grid")}>⊞</button
+    >
+    <span class="zsep"></span>
     <button class="zbtn" title="Zoom out" onclick={() => (zoom = Math.max(MIN_ZOOM, zoom / 1.2))}>−</button>
     <button class="zbtn wide" title="Reset view" onclick={() => { panX = 0; panY = 0; zoom = 1; }}>{Math.round(zoom * 100)}%</button>
     <button class="zbtn" title="Zoom in" onclick={() => (zoom = Math.min(MAX_ZOOM, zoom * 1.2))}>+</button>
@@ -356,10 +503,6 @@
     opacity: 0.45;
     stroke-linecap: round;
   }
-  .wire.group {
-    stroke-width: 5;
-    opacity: 0.3;
-  }
   .wire-flow {
     stroke-width: 3;
     stroke-linecap: round;
@@ -377,6 +520,45 @@
     inset: 0;
     transform-origin: 0 0;
     pointer-events: none;
+  }
+  /* Grid view's fleet bands — quiet containers behind the nodes. */
+  .section {
+    position: absolute;
+    border: 1.5px dashed var(--line-strong);
+    border-radius: var(--r-lg);
+    background: oklch(0.21 0.028 285 / 0.35);
+  }
+  .section.mine {
+    border-color: oklch(0.64 0.255 350 / 0.45);
+    background: oklch(0.64 0.255 350 / 0.05);
+  }
+  .section.unknown {
+    border-style: dotted;
+    background: transparent;
+  }
+  .section-head {
+    position: absolute;
+    top: 0.45rem;
+    left: 0.8rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    font-weight: 750;
+    color: var(--ink-soft);
+    letter-spacing: 0.01em;
+  }
+  .section.mine .section-head {
+    color: var(--accent-ink);
+  }
+  .section-count {
+    font-size: 0.66rem;
+    font-weight: 700;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    padding: 0.02rem 0.4rem;
+    color: var(--ink-faint);
   }
   .node {
     position: absolute;
@@ -621,6 +803,7 @@
     right: 1rem;
     bottom: 1rem;
     display: flex;
+    align-items: center;
     gap: 0.25rem;
     background: var(--surface);
     border: 1px solid var(--line);
@@ -640,9 +823,19 @@
   .zbtn:hover {
     background: var(--surface-2);
   }
+  .zbtn.active {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
   .zbtn.wide {
     width: 3rem;
     font-size: 0.74rem;
     font-variant-numeric: tabular-nums;
+  }
+  .zsep {
+    width: 1px;
+    height: 1.1rem;
+    background: var(--line);
+    margin: 0 0.1rem;
   }
 </style>

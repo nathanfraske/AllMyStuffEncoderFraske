@@ -1,8 +1,7 @@
 //! The [`Catalog`] — the whole graph in one place: which nodes exist,
-//! what each can do, what's wired to what, and which bundles exist. It's
-//! the single object the UI reads and the only thing that mints a
-//! [`Route`], because route creation is exactly where media, flow, and
-//! authorization get enforced.
+//! what each can do, and what's wired to what. It's the single object the
+//! UI reads and the only thing that mints a [`Route`], because route
+//! creation is exactly where media, flow, and authorization get enforced.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +15,6 @@ pub struct Catalog {
     pub nodes: Vec<MeshNode>,
     pub capabilities: Vec<Capability>,
     pub routes: Vec<Route>,
-    pub groups: Vec<Group>,
 }
 
 /// Why a connection couldn't be made.
@@ -24,10 +22,6 @@ pub struct Catalog {
 pub enum ConnectError {
     #[error("unknown capability: {0}")]
     UnknownCapability(String),
-    #[error("unknown node: {0}")]
-    UnknownNode(String),
-    #[error("unknown group: {0}")]
-    UnknownGroup(String),
     #[error("a capability can't connect to itself")]
     SelfLoop,
     #[error("{from} produces {from_media} but {to} expects {to_media}")]
@@ -43,12 +37,6 @@ pub enum ConnectError {
         label: String,
         wanted: &'static str,
         flow: &'static str,
-    },
-    #[error("nothing on {node} can {verb} {media} to complete this group")]
-    NoMatchingEndpoint {
-        node: String,
-        media: &'static str,
-        verb: &'static str,
     },
     /// Boxed because [`Denied`] is by far the largest variant; boxing it
     /// keeps `Result<Route, ConnectError>` small on the happy path.
@@ -83,10 +71,6 @@ impl Catalog {
         self.capabilities.iter().find(|c| &c.id == id)
     }
 
-    pub fn group(&self, id: &str) -> Option<&Group> {
-        self.groups.iter().find(|g| g.id == id)
-    }
-
     /// Capabilities physically present on a node.
     pub fn capabilities_on<'a>(
         &'a self,
@@ -98,11 +82,6 @@ impl Catalog {
     fn require_cap(&self, id: &CapabilityId) -> Result<&Capability, ConnectError> {
         self.capability(id)
             .ok_or_else(|| ConnectError::UnknownCapability(id.to_string()))
-    }
-
-    fn require_node(&self, id: &NodeId) -> Result<&MeshNode, ConnectError> {
-        self.node(id)
-            .ok_or_else(|| ConnectError::UnknownNode(id.to_string()))
     }
 
     // ---- single-route creation ---------------------------------------
@@ -160,7 +139,6 @@ impl Catalog {
             from: from.clone(),
             to: to.clone(),
             media,
-            group: None,
         };
         self.authorize(&route)?;
         Ok(route)
@@ -259,78 +237,17 @@ impl Catalog {
         self.routes.len() != before
     }
 
-    // ---- group fan-out ------------------------------------------------
+    // ---- endpoint matching ---------------------------------------------
 
-    /// Wire every member of a group to `target` as a unit. Each member
-    /// becomes one route in the direction its flow implies:
-    ///
-    ///  * a **source** member (mic, keyboard, this screen) feeds the
-    ///    target's matching sink;
-    ///  * a **sink** member (monitor, speaker) is fed by the target's
-    ///    matching source;
-    ///  * a **duplex** member wires both directions that exist.
-    ///
-    /// Members with no counterpart on the target are skipped (you can't
-    /// route a mic to a machine that records nothing) — but an
-    /// authorization failure is never skipped; it aborts the whole
-    /// connect so a group can't partially breach a share.
-    pub fn connect_group(
-        &self,
-        group_id: &str,
-        target: &NodeId,
-    ) -> Result<Vec<Route>, ConnectError> {
-        let group = self
-            .group(group_id)
-            .ok_or_else(|| ConnectError::UnknownGroup(group_id.to_string()))?;
-        self.require_node(target)?;
-        if &group.node == target {
-            return Err(ConnectError::SelfLoop);
-        }
-
-        let mut routes = Vec::new();
-        for member_id in &group.members {
-            let Some(member) = self.capability(member_id) else {
-                continue;
-            };
-            // Outbound leg: member sources → a target sink.
-            if member.flow.can_source() {
-                if let Some(sink) = self.match_endpoint(target, member.media, GrantRole::Consume) {
-                    routes.push(self.group_route(member_id, &sink.id, member.media, group_id)?);
-                }
-            }
-            // Inbound leg: a target source → member sinks.
-            if member.flow.can_sink() {
-                if let Some(src) = self.match_endpoint(target, member.media, GrantRole::Provide) {
-                    routes.push(self.group_route(&src.id, member_id, member.media, group_id)?);
-                }
-            }
-        }
-
-        if routes.is_empty() {
-            // Report the first member's unmet need so the UI can explain.
-            let first = group
-                .members
-                .first()
-                .and_then(|m| self.capability(m))
-                .map(|c| (c.node.to_string(), c.media.label()))
-                .unwrap_or_default();
-            return Err(ConnectError::NoMatchingEndpoint {
-                node: target.to_string(),
-                media: leak_media_label(first.1),
-                verb: "exchange",
-            });
-        }
-        Ok(routes)
-    }
-
-    /// Pick the target capability that can play `role` for `media`.
-    /// Preference order: a synthetic machine capability (origin
-    /// `screen`/`control`/`controller`/`system`) first, so an RDC group
-    /// lands on "this computer" rather than a stray device; then the
+    /// Pick the capability on `node` that can play `role` for `media` —
+    /// where a plain "connect this to that machine" lands. Preference
+    /// order: a synthetic machine capability (origin
+    /// `screen`/`control`/`controller`/`system`) first, so a whole-computer
+    /// flow lands on "this computer" rather than a stray device; then the
     /// category's **current default** device, so a plain "connect audio
     /// here" lands on the mic the machine actually uses; then the first
     /// physical match by id order.
-    fn match_endpoint(
+    pub fn match_endpoint(
         &self,
         node: &NodeId,
         media: MediaKind,
@@ -356,25 +273,6 @@ impl Catalog {
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
         candidates.into_iter().next()
-    }
-
-    fn group_route(
-        &self,
-        from: &CapabilityId,
-        to: &CapabilityId,
-        media: MediaKind,
-        group_id: &str,
-    ) -> Result<Route, ConnectError> {
-        let route = Route {
-            id: route_id(from, to),
-            from: from.clone(),
-            to: to.clone(),
-            media,
-            group: Some(group_id.to_string()),
-        };
-        // Authorization still applies to every leg.
-        self.authorize(&route)?;
-        Ok(route)
     }
 }
 
@@ -405,22 +303,4 @@ fn endpoint_rank(c: &Capability) -> u8 {
     } else {
         2
     }
-}
-
-// `MediaKind::label` returns `&'static str`; this just re-borrows the
-// matching static so `NoMatchingEndpoint` can hold it.
-fn leak_media_label(s: &str) -> &'static str {
-    for m in [
-        MediaKind::Audio,
-        MediaKind::Video,
-        MediaKind::Display,
-        MediaKind::Input,
-        MediaKind::Storage,
-        MediaKind::Generic,
-    ] {
-        if m.label() == s {
-            return m.label();
-        }
-    }
-    "data"
 }

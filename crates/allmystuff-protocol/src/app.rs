@@ -43,6 +43,12 @@ pub const CHANNEL_MEDIA: &str = "allmystuff/media/v1";
 /// presence, and converges by version the same way a mesh roster does.
 pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 
+/// Typed-channel name for **virtual rooms** — the lightweight membership +
+/// chat plane of a room (the media itself rides ordinary routes). Only
+/// peers that advertise [`FEATURE_ROOMS`] subscribe; an older peer never
+/// sees the channel, so the whole plane is additive.
+pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
+
 /// Feature tag a node advertises in [`NodeProfile::features`] when it can
 /// host mesh-native terminal sessions (spawn a PTY and stream it over the
 /// media channel). A peer only offers a terminal route to nodes that
@@ -54,6 +60,12 @@ pub const FEATURE_TERMINAL: &str = "terminal";
 /// over the media channel — the "Open Files" console). A peer only offers
 /// a files route to nodes that advertise this.
 pub const FEATURE_FILES: &str = "files";
+
+/// Feature tag a node advertises in [`NodeProfile::features`] when it
+/// speaks the virtual-rooms plane ([`CHANNEL_ROOMS`]): room invites, join /
+/// leave presence, and chat. The room UI badges members without it (an
+/// older build) so nobody wonders why a message went unanswered.
+pub const FEATURE_ROOMS: &str = "rooms";
 
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
@@ -154,6 +166,41 @@ pub struct OwnedRoster {
     /// Every device the owner has claimed (and the owner itself).
     #[serde(default)]
     pub members: Vec<OwnedMember>,
+}
+
+/// One message of the virtual-rooms plane, carried on [`CHANNEL_ROOMS`].
+/// A room itself is a lightweight, user-minted thing — a stable id, a
+/// cosmetic name, and a member list — and every message restates the id
+/// and name so a receiver can render a room it has never heard of (an
+/// invite that raced a chat line, a member that reinstalled). The media
+/// of a room (mic, screen share, …) is **not** here: those are ordinary
+/// routes, proposed and authorized exactly like any other connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMessage {
+    /// The room's stable id (minted by its creator).
+    pub room: String,
+    /// The room's display name, restated on every message.
+    #[serde(default)]
+    pub name: String,
+    /// What happened.
+    #[serde(flatten)]
+    pub event: RoomEvent,
+}
+
+/// The events of a room's membership + chat plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoomEvent {
+    /// "You're in this room." Sent to each member on creation (and
+    /// whenever the roster changes), carrying the full member list so
+    /// everyone renders the same room.
+    Invite { members: Vec<NodeId> },
+    /// The sender opened the room — they're present in the call now.
+    Join,
+    /// The sender left the room (closed its panel).
+    Leave,
+    /// A chat line from the sender.
+    Chat { text: String },
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share, and
@@ -439,6 +486,44 @@ mod tests {
         assert_eq!(r.version, 0);
         assert_eq!(r.members.len(), 1);
         assert_eq!(r.members[0].label, "");
+    }
+
+    #[test]
+    fn room_messages_round_trip_and_tag() {
+        let m = RoomMessage {
+            room: "room:abc".into(),
+            name: "Movie night".into(),
+            event: RoomEvent::Chat {
+                text: "hi all".into(),
+            },
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["room"], "room:abc");
+        assert_eq!(j["name"], "Movie night");
+        assert_eq!(j["kind"], "chat");
+        assert_eq!(j["text"], "hi all");
+        let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
+        assert_eq!(m, back);
+
+        let m = RoomMessage {
+            room: "room:abc".into(),
+            name: "Movie night".into(),
+            event: RoomEvent::Invite {
+                members: vec!["a".into(), "b".into()],
+            },
+        };
+        let back: RoomMessage = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn room_message_tolerates_a_minimal_advert() {
+        // A join from a build that skipped the name still decodes.
+        let json = r#"{ "room": "room:abc", "kind": "join" }"#;
+        let m: RoomMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(m.room, "room:abc");
+        assert_eq!(m.name, "");
+        assert_eq!(m.event, RoomEvent::Join);
     }
 
     #[test]

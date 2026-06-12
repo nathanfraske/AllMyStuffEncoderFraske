@@ -7,35 +7,24 @@
   import { mediaColor } from "../types";
 
   const share = $derived(app.pendingShare);
-  const groupShare = $derived(app.pendingGroupShare);
 
-  const requests = $derived(share?.requests ?? groupShare?.requests ?? []);
+  const requests = $derived(share?.requests ?? []);
   const who = $derived(requests[0]?.personName ?? "this person");
 </script>
 
-<svelte:window
-  onkeydown={(e) => e.key === "Escape" && (share ? app.dismissPendingShare() : app.dismissGroupShare())}
-/>
+<svelte:window onkeydown={(e) => e.key === "Escape" && app.dismissPendingShare()} />
 
-{#if share || groupShare}
+{#if share}
   <div class="scrim">
-    <button
-      class="backdrop"
-      aria-label="Dismiss"
-      onclick={() => (share ? app.dismissPendingShare() : app.dismissGroupShare())}
+    <button class="backdrop" aria-label="Dismiss" onclick={() => app.dismissPendingShare()}
     ></button>
     <div class="sheet" role="dialog" aria-modal="true" aria-label="Permission needed" tabindex="-1">
       <div class="emoji">🤝</div>
-      {#if share}
-        <h3>Share with {who}?</h3>
-        <p class="lead">
-          To connect <b>{share.fromLabel}</b> and <b>{share.toLabel}</b>, you need to let
-          {who} do this:
-        </p>
-      {:else}
-        <h3>Share with {who}?</h3>
-        <p class="lead">Sending this group there needs {who} to allow:</p>
-      {/if}
+      <h3>Share with {who}?</h3>
+      <p class="lead">
+        To connect <b>{share.fromLabel}</b> and <b>{share.toLabel}</b>, you need to let
+        {who} do this:
+      </p>
 
       <ul class="asks">
         {#each requests as r}
@@ -52,10 +41,8 @@
       </p>
 
       <div class="actions">
-        <button class="btn ghost" onclick={() => (share ? app.dismissPendingShare() : app.dismissGroupShare())}>
-          Not now
-        </button>
-        <button class="btn primary" onclick={() => (share ? app.approvePendingShare() : app.approveGroupShare())}>
+        <button class="btn ghost" onclick={() => app.dismissPendingShare()}> Not now </button>
+        <button class="btn primary" onclick={() => app.approvePendingShare()}>
           Allow &amp; connect
         </button>
       </div>

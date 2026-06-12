@@ -137,21 +137,21 @@
     <text x="74" y="20" font-size="15" text-anchor="middle" fill="#5b5e74">+</text>
   </g>
 
-  <!-- ============ groups bar (bottom-left) ============ -->
+  <!-- ============ rooms bar (bottom-left) ============ -->
   <g transform="translate(16,612)" filter="url(#shadow)">
     <rect width="300" height="132" rx="12" fill="#ffffff" stroke="#e7e8f0"/>
-    <text x="14" y="26" font-size="12.5" font-weight="650" fill="#5b5e74">Groups</text>
-    <rect x="232" y="12" width="56" height="22" rx="11" fill="#ffffff" stroke="#d7d9e6"/>
-    <text x="260" y="27" font-size="11" text-anchor="middle" fill="#1c1d2b">＋ New</text>
+    <text x="14" y="26" font-size="12.5" font-weight="650" fill="#5b5e74">Rooms</text>
+    <rect x="222" y="12" width="66" height="22" rx="11" fill="#6c5ce7"/>
+    <text x="255" y="27" font-size="11" text-anchor="middle" fill="#ffffff" font-weight="600">＋ New room</text>
 
     <rect x="12" y="44" width="276" height="44" rx="9" fill="#f3f4f9"/>
-    <text x="24" y="64" font-size="13" font-weight="600" fill="#1c1d2b">📦 My desk</text>
-    <text x="24" y="79" font-size="10.5" fill="#9598ad">5 things · Built-in display, Magic Keyboard…</text>
+    <text x="24" y="64" font-size="13" font-weight="600" fill="#1c1d2b">🪩 Movie night</text>
+    <text x="24" y="79" font-size="10.5" fill="#9598ad">Desk PC, Living-room TV · 2 in now</text>
     <rect x="214" y="54" width="62" height="24" rx="12" fill="#6c5ce7"/>
-    <text x="245" y="70" font-size="11" text-anchor="middle" fill="#ffffff" font-weight="600">Send…</text>
+    <text x="245" y="70" font-size="11" text-anchor="middle" fill="#ffffff" font-weight="600">Join</text>
 
     <rect x="12" y="96" width="276" height="26" rx="8" fill="#ffffff" stroke="#eef0f5"/>
-    <text x="24" y="113" font-size="10.5" fill="#9598ad">Bundle a screen, keyboard &amp; audio into a “desk”…</text>
+    <text x="24" y="113" font-size="10.5" fill="#9598ad">A call you join muted — share screen, sound or files…</text>
   </g>
 
   <!-- ============ node drawer (right) ============ -->

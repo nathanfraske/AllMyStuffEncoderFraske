@@ -399,7 +399,6 @@ mod tests {
             from: "this:mic".into(),
             to: "desk:system-audio".into(),
             media: MediaKind::Audio,
-            group: None,
         }
     }
 

@@ -131,10 +131,20 @@
             </button>
             <button class="btn small" title="Copy this network's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
             <button class="btn small" title="Edit this network's servers" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Servers</button>
+            <button class="btn small" title="Switch this network off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
             <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
           </li>
         {/each}
-        {#if app.networks.length === 0}
+        {#each app.disabledNets as c (c.id)}
+          <li class="off">
+            <div class="net-main">
+              <span class="net-name">{networkDisplayName(c)}<span class="badge off-badge">disabled</span></span>
+              <span class="net-sub">{c.network_id} · kept for later — devices there can't see you</span>
+            </div>
+            <button class="btn small primary" onclick={() => app.toggleNetworkEnabled(c.id, true)}>Enable</button>
+          </li>
+        {/each}
+        {#if app.networks.length === 0 && app.disabledNets.length === 0}
           <li class="empty">No networks yet — create one, or join with a handle from another device.</li>
         {/if}
       </ul>
@@ -308,6 +318,19 @@
   }
   .nets li.on {
     box-shadow: 0 0 0 1.5px var(--accent);
+  }
+  .nets li.off {
+    opacity: 0.7;
+    border: 1px dashed var(--line-strong);
+    background: transparent;
+  }
+  .nets li.off .net-main {
+    cursor: default;
+  }
+  .off-badge {
+    color: var(--ink-faint);
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
   }
   .net-main {
     flex: 1;

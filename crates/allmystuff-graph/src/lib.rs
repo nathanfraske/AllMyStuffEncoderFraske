@@ -2,10 +2,8 @@
 //!
 //! The model behind the AllMyStuff screen: a graph of **nodes** (your
 //! machines and the people you share with), the **capabilities** each one
-//! exposes (this mic, that display, this computer's screen), the
-//! **routes** that wire one capability to another across the mesh, and the
-//! **groups** that bundle a set of capabilities so you can move them as a
-//! unit.
+//! exposes (this mic, that display, this computer's screen), and the
+//! **routes** that wire one capability to another across the mesh.
 //!
 //! On top of that sits the part that makes it safe for normal people: the
 //! **relationship + grant** model. MyOwnMesh underneath proves *identity*
@@ -428,59 +426,18 @@ mod tests {
         assert_eq!(reqs[0].description, "Receive your display");
     }
 
-    // ---- groups: the RDC bundle --------------------------------------
+    // ---- endpoint matching --------------------------------------------
 
     #[test]
-    fn rdc_group_fans_out_to_the_right_routes() {
-        let cat = {
-            let mut c = fixture();
-            c.groups.push(Group {
-                id: "rdc".into(),
-                name: "My desk".into(),
-                node: NodeId::this(),
-                // Monitor (sink), keyboard (source), mic (source),
-                // speakers (sink) — the classic remote-desktop terminal.
-                members: vec![
-                    "this:display".into(),
-                    "this:keyboard".into(),
-                    "this:mic".into(),
-                    "this:speaker".into(),
-                ],
-            });
-            c
-        };
+    fn match_endpoint_prefers_machine_then_default_device() {
+        // On a node with a synthetic system endpoint, audio lands there.
+        let cat = fixture();
+        let picked = cat
+            .match_endpoint(&"desk".into(), MediaKind::Audio, GrantRole::Consume)
+            .expect("desk can sink audio");
+        assert_eq!(picked.id, "desk:system".into());
 
-        let routes = cat
-            .connect_group("rdc", &"desk".into())
-            .expect("connects to my desk PC");
-
-        // Expect: desk screen → my display, my keyboard → desk control,
-        // my mic → desk system audio, desk system audio → my speakers.
-        let has = |from: &str, to: &str| {
-            routes
-                .iter()
-                .any(|r| r.from == from.into() && r.to == to.into())
-        };
-        assert!(
-            has("desk:screen", "this:display"),
-            "remote screen drives my monitor"
-        );
-        assert!(
-            has("this:keyboard", "desk:control"),
-            "my keyboard controls the PC"
-        );
-        assert!(has("this:mic", "desk:system"), "my mic feeds the PC");
-        assert!(
-            has("desk:system", "this:speaker"),
-            "the PC's audio reaches my speakers"
-        );
-        assert!(routes.iter().all(|r| r.group.as_deref() == Some("rdc")));
-    }
-
-    #[test]
-    fn group_routing_prefers_the_default_device() {
-        // A target with two speakers and no synthetic system-audio endpoint:
-        // a group's audio source should land on the one marked default.
+        // Without one, the category's *default* device wins over id order.
         let mut cat = Catalog::new();
         cat.nodes.push(MeshNode::this("My laptop"));
         cat.nodes.push(MeshNode {
@@ -490,14 +447,6 @@ mod tests {
             relationship: Relationship::Mine,
             online: true,
         });
-        cat.capabilities.push(Capability::new(
-            "this",
-            "this:mic",
-            "Mic",
-            MediaKind::Audio,
-            Flow::Source,
-            "microphone",
-        ));
         // The default is the id-*later* speaker, so only default-preference
         // (not id order, which would pick spkA) can explain the choice.
         cat.capabilities.push(Capability::new(
@@ -519,40 +468,10 @@ mod tests {
             )
             .as_default(true),
         );
-        cat.groups.push(Group {
-            id: "g".into(),
-            name: "Audio".into(),
-            node: NodeId::this(),
-            members: vec!["this:mic".into()],
-        });
-        let routes = cat.connect_group("g", &"box".into()).expect("connects");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].to, "box:spkZ".into());
-    }
-
-    #[test]
-    fn group_connect_aborts_when_a_leg_would_breach_a_share() {
-        // A group on a shared person's node, pointed at my desk PC, must
-        // not silently connect the authorized legs while dropping the
-        // denied one — it aborts.
-        let mut cat = fixture();
-        cat.groups.push(Group {
-            id: "alex-desk".into(),
-            name: "Alex's desk".into(),
-            node: "alex".into(),
-            members: vec!["alex:screen".into()], // Display source on Alex
-        });
-        // My desk PC has a display sink to receive it.
-        cat.capabilities.push(Capability::new(
-            "desk",
-            "desk:display",
-            "Desk monitor",
-            MediaKind::Display,
-            Flow::Sink,
-            "display",
-        ));
-        let err = cat.connect_group("alex-desk", &"desk".into()).unwrap_err();
-        assert!(matches!(err, ConnectError::Denied(_)), "{err:?}");
+        let picked = cat
+            .match_endpoint(&"box".into(), MediaKind::Audio, GrantRole::Consume)
+            .expect("box can sink audio");
+        assert_eq!(picked.id, "box:spkZ".into());
     }
 
     // ---- serde --------------------------------------------------------

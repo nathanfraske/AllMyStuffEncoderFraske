@@ -1,6 +1,6 @@
 //! The vocabulary of the graph: nodes, capabilities, the routes that
-//! wire capabilities together, the groups that bundle them, and the
-//! relationships + grants that decide who's allowed to do what.
+//! wire capabilities together, and the relationships + grants that
+//! decide who's allowed to do what.
 //!
 //! Everything here is plain data with stable string ids, so the whole
 //! model round-trips through JSON to the Svelte front-end and (eventually)
@@ -346,24 +346,4 @@ pub struct Route {
     pub from: CapabilityId,
     pub to: CapabilityId,
     pub media: MediaKind,
-    /// Set when this route was created as part of connecting a [`Group`],
-    /// so the UI can show the bundle as one thing and tear it down
-    /// together.
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
-// ---- group ------------------------------------------------------------
-
-/// A named, isolatable bundle of capabilities on **one** node that you
-/// wire to a target as a unit — the "RDC group": monitor + keyboard +
-/// mouse + speaker + mic, all pointed at one remote machine so your desk
-/// becomes that machine's terminal. Connecting the group fans out into
-/// one route per member, each in the direction that member's flow implies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Group {
-    pub id: String,
-    pub name: String,
-    pub node: NodeId,
-    pub members: Vec<CapabilityId>,
 }

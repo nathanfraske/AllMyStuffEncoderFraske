@@ -111,21 +111,12 @@ export interface Route {
   from: string;
   to: string;
   media: MediaKind;
-  group?: string | null;
-}
-
-export interface Group {
-  id: string;
-  name: string;
-  node: string;
-  members: string[];
 }
 
 export interface Catalog {
   nodes: MeshNode[];
   capabilities: Capability[];
   routes: Route[];
-  groups: Group[];
 }
 
 // ---- networks · identity · roster (mirror the daemon control shapes) --
@@ -361,61 +352,46 @@ export interface VideoFrameMsg {
   data: Uint8Array<ArrayBuffer>;
 }
 
-// ---- bundles (pre-set kits with category slots) -----------------------
+// ---- virtual rooms ----------------------------------------------------
+//
+// A room is a lightweight, user-minted gathering of machines — a zoom-like
+// call you join with everything off. Its membership + chat plane rides the
+// `allmystuff/rooms/v1` channel (mirrors the Rust `RoomMessage`); the media
+// itself (mic, screen, sound, control) is ordinary routes, proposed and
+// authorized exactly like any other connection.
 
-/** One slot in a bundle template — a category of local device to include.
- *  `flow` is the local device's direction: a `source` feeds the target, a
- *  `sink` is fed by it (so "Screen" is a display sink — your monitor shows
- *  the remote machine; "Keyboard & mouse" is an input source). */
-export interface BundleSlot {
-  id: string;
-  label: string;
-  media: MediaKind;
-  flow: Flow;
-}
-
-export interface BundleTemplate {
+/** A room as the rooms bar lists it. `members` are canonical (bare-pubkey)
+ *  node ids and include this machine. */
+export interface VirtualRoom {
   id: string;
   name: string;
-  icon: string;
-  blurb: string;
-  slots: BundleSlot[];
+  members: string[];
 }
 
-/** Ready-made kits you fill from this machine's devices and point at another
- *  machine as one unit — no hand-building. */
-export const BUNDLE_TEMPLATES: BundleTemplate[] = [
-  {
-    id: "desk",
-    name: "My desk",
-    icon: "🖥️",
-    blurb: "Screen, keyboard & mouse, mic and speakers — turn another machine into your desk.",
-    slots: [
-      { id: "screen", label: "Screen", media: "display", flow: "sink" },
-      { id: "keyboard", label: "Keyboard & mouse", media: "input", flow: "source" },
-      { id: "mic", label: "Microphone", media: "audio", flow: "source" },
-      { id: "speakers", label: "Speakers", media: "audio", flow: "sink" },
-    ],
-  },
-  {
-    id: "callkit",
-    name: "Call kit",
-    icon: "🎥",
-    blurb: "Camera, mic and speakers — send your A/V to another machine.",
-    slots: [
-      { id: "camera", label: "Camera", media: "video", flow: "source" },
-      { id: "mic", label: "Microphone", media: "audio", flow: "source" },
-      { id: "speakers", label: "Speakers", media: "audio", flow: "sink" },
-    ],
-  },
-  {
-    id: "listen",
-    name: "Listening room",
-    icon: "🔊",
-    blurb: "Send this machine's audio to another's speakers.",
-    slots: [{ id: "audio", label: "System audio", media: "audio", flow: "source" }],
-  },
-];
+/** One line of a room's chat (kept in memory for the session). */
+export interface RoomChatLine {
+  /** Canonical node id of the sender ("" for system notes). */
+  from: string;
+  /** Display name resolved at receive time, so lines survive a peer
+   *  dropping off the graph. */
+  fromLabel: string;
+  text: string;
+  at: number;
+}
+
+/** A wire message of the rooms plane (mirrors the Rust `RoomMessage` —
+ *  tagged on `kind`, with the room id + name restated on every message). */
+export type RoomWireMessage = { room: string; name?: string } & (
+  | { kind: "invite"; members: string[] }
+  | { kind: "join" }
+  | { kind: "leave" }
+  | { kind: "chat"; text: string }
+);
+
+/** The presence feature tag for the rooms plane (mirrors the Rust
+ *  `FEATURE_ROOMS`). A member without it (an older build) never sees the
+ *  room's invites or chat — the room panel badges them. */
+export const FEATURE_ROOMS = "rooms";
 
 // ---- visual helpers ---------------------------------------------------
 

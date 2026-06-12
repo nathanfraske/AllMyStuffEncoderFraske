@@ -8,7 +8,6 @@ import {
   canSink,
   canSource,
   capabilityForDisplay,
-  connectGroup,
   matchEndpoint,
   proposeRoute,
   requiredGrants,
@@ -22,6 +21,7 @@ import {
   tuneRoute,
   type StreamTune,
   consoleWindowTarget,
+  disabledNetworks,
   disconnectRoute,
   fleetKick,
   fleetLeave,
@@ -41,15 +41,18 @@ import {
   meshRosterRemove,
   onOwned,
   onOwnership,
+  onRoom,
   onSession,
   onSubscription,
   openConsoleWindow,
   openTerminalWindow,
   ownedRoster,
+  roomSend,
   scanSelf,
   sendInput,
   sessionSnapshot,
   setClaimable,
+  setNetworkEnabled,
   updateApply,
   updateCheck,
   updateSetPrefs,
@@ -57,15 +60,14 @@ import {
   type SessionSnapshot,
 } from "./tauri";
 import {
-  BUNDLE_TEMPLATES,
   FEATURE_FILES,
+  FEATURE_ROOMS,
   FEATURE_TERMINAL,
   isAppNode,
   networkDisplayName,
   type Capability,
   type Catalog,
   type CheckOutcome,
-  type Flow,
   type Grant,
   type IdentityInfo,
   type InputAction,
@@ -77,9 +79,12 @@ import {
   type PeerInfo,
   type Person,
   type Relationship,
+  type RoomChatLine,
+  type RoomWireMessage,
   type RosterPeer,
   type Route,
   type RouteLiveState,
+  type VirtualRoom,
   type TurnEntry,
   type UpdatePrefs,
   type UpdateStatus,
@@ -132,6 +137,19 @@ function sameMachine(a: string, b: string): boolean {
 let seq = 0;
 const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 
+/** localStorage key for this device's rooms list. */
+const ROOMS_STORE_KEY = "allmystuff.rooms.v1";
+
+/** The send channels a room can have live, each owning the routes its
+ *  toggle created. `mic` is the call (your voice); `sound` is the
+ *  machine's loopback — kept strictly apart on purpose. */
+const ROOM_CHANNELS = ["mic", "cam", "screen", "sound", "control"] as const;
+type RoomChannel = (typeof ROOM_CHANNELS)[number];
+
+function emptyRoomRoutes(): Record<RoomChannel, string[]> {
+  return { mic: [], cam: [], screen: [], sound: [], control: [] };
+}
+
 export interface Toast {
   id: number;
   kind: "ok" | "info" | "warn";
@@ -148,13 +166,6 @@ export interface PendingShare {
   requests: GrantRequest[];
 }
 
-/** A connection a group is about to make that needs permission. */
-export interface PendingGroupShare {
-  groupId: string;
-  target: string;
-  requests: GrantRequest[];
-}
-
 /** One person/fleet you're sharing with, gathered for the Sharing settings
  *  pane: who they are, which of their nodes you know, and every grant
  *  you've given them (with the node it's recorded on, for revocation). */
@@ -168,7 +179,7 @@ export interface SharePartner {
  *  where every node + capability comes from the live scan and mesh presence
  *  (no demo stand-ins). */
 function emptyCatalog(): Catalog {
-  return { nodes: [], capabilities: [], routes: [], groups: [] };
+  return { nodes: [], capabilities: [], routes: [] };
 }
 
 class AppStore {
@@ -183,7 +194,6 @@ class AppStore {
   /** Capability the user is dragging a wire from, if any. */
   dragFrom = $state<string | null>(null);
   pendingShare = $state<PendingShare | null>(null);
-  pendingGroupShare = $state<PendingGroupShare | null>(null);
   /** The unified Settings panel (networks · updates · fleet) and which pane
    *  it's showing. The top-bar gear opens it; the Networks button deep-links
    *  to the networks pane. */
@@ -192,7 +202,6 @@ class AppStore {
   /** The "a new device wants to join" approval popup (the code-grid nudge). */
   approvalsOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
-  groupPickerFor = $state<string | null>(null); // groupId awaiting a target
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
 
@@ -244,6 +253,35 @@ class AppStore {
    *  endpoint (`{me}:files-view:…`) — unique endpoint, unique route id. */
   private filesViewSeq = 0;
 
+  // ---- virtual rooms ------------------------------------------------
+  /** Every room this device knows — created here or invited into. Members
+   *  are canonical node ids (this machine included). Persisted locally. */
+  rooms = $state<VirtualRoom[]>([]);
+  /** The room whose call panel is open (you've "joined"), if any. */
+  roomOpenId = $state<string | null>(null);
+  /** Chat lines per room id (session memory — history isn't synced). */
+  roomChat = $state<Record<string, RoomChatLine[]>>({});
+  /** Unread chat per room id, for the rooms bar badge. */
+  roomUnread = $state<Record<string, number>>({});
+  /** Canonical ids currently *in* each room (they broadcast a join). */
+  roomPresence = $state<Record<string, string[]>>({});
+  /** Whether the open room's chat sidebar is showing. */
+  roomChatOpen = $state(false);
+  /** The "make a room" composer in the rooms bar. */
+  roomDraftOpen = $state(false);
+  // The open room's send toggles. A room joins like a muted call: nothing
+  // is wired until one of these is deliberately turned on.
+  roomMic = $state(false);
+  roomCam = $state(false);
+  roomScreen = $state(false);
+  /** Sharing this machine's *sound* (its loopback) — not the microphone. */
+  roomSound = $state(false);
+  /** Letting members drive this machine (their keyboard & mouse in). */
+  roomControl = $state(false);
+  /** Route ids each room toggle created, so leaving tears down exactly
+   *  what the room wired (never a route the user made on the graph). */
+  private roomRoutes: Record<RoomChannel, string[]> = emptyRoomRoutes();
+
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
   localId = $state("this");
@@ -261,6 +299,11 @@ class AppStore {
   networkConfigs = $state<NetworkConfigFull[]>([]);
   /** config_id currently selected in the Servers pane. */
   serversNetwork = $state<string | null>(null);
+  /** Networks switched *off* but kept — their full parked configs. The
+   *  pill menu lists these under the live ones; enabling re-joins. */
+  disabledNets = $state<NetworkConfigFull[]>([]);
+  /** The network pill's dropdown (enable/disable without deleting). */
+  netMenuOpen = $state(false);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -282,12 +325,6 @@ class AppStore {
   updateBusy = $state(false);
   /** Result of the last manual "check now", for the Updates pane. */
   updateOutcome = $state<CheckOutcome | null>(null);
-
-  // ---- bundles (pre-set kits with category slots) -----------------
-  /** The bundle template id currently being filled, if any. */
-  bundleDraftId = $state<string | null>(null);
-  /** slot id → chosen local capability id, for the draft bundle. */
-  bundleSlots = $state<Record<string, string>>({});
 
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
@@ -392,9 +429,11 @@ class AppStore {
   /** Wire up live backend data, if there is a backend. No-op (keeps the
    *  demo graph) in web mode. Called once on mount. */
   async init() {
+    this.loadRooms();
     if (!isTauri()) {
       this.seedDemoFleet();
       this.seedDemoNetworks();
+      this.seedDemoRoom();
     }
     await this.hydrateFromBackend();
     await this.loadIdentity();
@@ -407,6 +446,7 @@ class AppStore {
     await this.pullSessionSnapshot();
     await this.loadOwnedFleet();
     await this.loadUpdateStatus();
+    await this.loadDisabledNetworks();
     this.startMeshPolling();
     await onSubscription((s) => {
       const live = s.status === "live";
@@ -418,10 +458,13 @@ class AppStore {
         void this.refreshNetworks().then(() => this.syncMeshGraph());
         void this.pullSessionSnapshot();
         void this.loadOwnedFleet();
+        void this.loadDisabledNetworks();
       }
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
+    // The rooms plane: invites, join/leave presence, chat.
+    await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
     // The fleet roster converges live — a claim, or gossip catching up, pushes
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
@@ -746,7 +789,7 @@ class AppStore {
       const id = lr.route.id;
       const exists = this.catalog.routes.some((r) => r.id === id);
       if (active && !exists) {
-        this.catalog.routes.push({ ...lr.route, group: null });
+        this.catalog.routes.push({ ...lr.route });
       } else if (!active && exists) {
         this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
       }
@@ -945,11 +988,11 @@ class AppStore {
     if (this.backendConnected) void connectRoute(from, to, media, codec);
   }
 
-  private addRoute(from: string, to: string, group: string | null = null) {
+  private addRoute(from: string, to: string) {
     const cap = this.capability(from);
     const id = `route:${from}→${to}`;
     if (this.catalog.routes.some((r) => r.id === id)) return;
-    this.catalog.routes.push({ id, from, to, media: cap?.media ?? "generic", group });
+    this.catalog.routes.push({ id, from, to, media: cap?.media ?? "generic" });
   }
 
   /** Tear a route down. The local catalog updates synchronously; the
@@ -958,13 +1001,7 @@ class AppStore {
    *  it, everyone else ignores it. */
   disconnect(routeId: string): Promise<unknown> {
     const sent = this.backendConnected ? disconnectRoute(routeId) : Promise.resolve(null);
-    const route = this.catalog.routes.find((r) => r.id === routeId);
     this.catalog.routes = this.catalog.routes.filter((r) => r.id !== routeId);
-    // Tearing one leg of a group tears the whole bundle — it's one thing.
-    if (route?.group) {
-      this.catalog.routes = this.catalog.routes.filter((r) => r.group !== route.group);
-      this.toast("info", "Disconnected the group");
-    }
     return sent;
   }
 
@@ -1131,7 +1168,7 @@ class AppStore {
     // lands; the console is honest about that.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
     if (!sink) return;
-    const leg = this.consoleConnect(inp.id, sink.id, this.consoleCodec);
+    const leg = this.ownedConnect(inp.id, sink.id, this.consoleCodec);
     // Render whatever's live; only own the route for teardown if this call
     // created it.
     this.consoleVideoLive = leg?.id ?? null;
@@ -1177,7 +1214,7 @@ class AppStore {
     }
     const from = matchEndpoint(this.catalog, remote, "audio", "provide");
     const to = matchEndpoint(this.catalog, this.localId, "audio", "consume");
-    const leg = from && to ? this.consoleConnect(from.id, to.id) : null;
+    const leg = from && to ? this.ownedConnect(from.id, to.id) : null;
     if (leg) {
       // Own the route for teardown only if this call created it (never a
       // pre-existing one the user wired from the graph).
@@ -1202,7 +1239,7 @@ class AppStore {
     }
     const mySrc = matchEndpoint(this.catalog, this.localId, "input", "provide");
     const remoteSink = matchEndpoint(this.catalog, remote, "input", "consume");
-    const leg = mySrc && remoteSink ? this.consoleConnect(mySrc.id, remoteSink.id) : null;
+    const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
     if (leg) {
       this.consoleControlRouteId = leg.created ? leg.id : null;
       this.consoleControlLive = leg.id;
@@ -1212,13 +1249,14 @@ class AppStore {
     }
   }
 
-  /** Connect a console leg through the normal route path (so authorization
-   *  and the backend offer still apply). Returns the route id when it's now
-   *  live, and whether *this* call created it — so the console reads the
-   *  channel as on only when something is actually wired, and tears down only
-   *  the routes it made (never a pre-existing one the user set up, and never
-   *  a leg that was blocked behind a share prompt). */
-  private consoleConnect(
+  /** Connect one session leg (a console channel, a room toggle) through
+   *  the normal route path, so authorization and the backend offer still
+   *  apply. Returns the route id when it's now live, and whether *this*
+   *  call created it — so a session reads its channel as on only when
+   *  something is actually wired, and tears down only the routes it made
+   *  (never a pre-existing one the user set up, and never a leg that was
+   *  blocked behind a share prompt). */
+  private ownedConnect(
     from: string,
     to: string,
     codec?: "auto" | "h264" | "mjpeg",
@@ -1446,6 +1484,13 @@ class AppStore {
     }
   }
 
+  /** Demo/web only: a starter room so the rooms bar isn't empty in the
+   *  preview (a stored rooms list wins — this never overwrites yours). */
+  private seedDemoRoom() {
+    if (this.rooms.length > 0) return;
+    this.rooms.push({ id: "room:demo", name: "Movie night", members: ["this", "desk", "tv"] });
+  }
+
   /** Demo/web only: stand in two networks with their server configs and spread
    *  the demo devices across them, so the multi-network UI (the Servers +
    *  Devices panes, the per-node network chips) is alive in the preview. */
@@ -1510,106 +1555,437 @@ class AppStore {
     }
   }
 
-  // ---- groups ------------------------------------------------------
+  // ---- virtual rooms ------------------------------------------------
+  //
+  // A room is a zoom-like call between machines you pick. Joining wires
+  // *nothing*: mic, camera and screen share all start off, and each
+  // toggle fans ordinary routes out to the members (so authorization,
+  // share prompts, and the live backend offer all apply unchanged).
+  // Membership + chat ride the lightweight rooms channel; deleting a
+  // room only forgets it on this device.
 
-  /** Begin pointing a group at a node — the next node click is the target. */
-  startGroupConnect(groupId: string) {
-    this.groupPickerFor = groupId;
-    this.toast("info", "Pick where this group should go");
+  /** Whether `node` speaks the rooms plane (invites, chat). An older
+   *  build simply doesn't — the panel badges it. */
+  roomsSupported(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_ROOMS);
   }
 
-  cancelGroupConnect() {
-    this.groupPickerFor = null;
+  /** The room whose panel is open, if any. */
+  openRoom = $derived.by(() =>
+    this.roomOpenId ? this.rooms.find((r) => r.id === this.roomOpenId) ?? null : null,
+  );
+
+  /** The open room's members other than this machine, resolved to graph
+   *  nodes (members we've never seen stay as bare ids — see the panel). */
+  roomMemberNodes = $derived.by((): { id: string; node: MeshNode | undefined }[] => {
+    const room = this.openRoom;
+    if (!room) return [];
+    return room.members
+      .filter((m) => !this.isMe(m))
+      .map((id) => ({ id, node: this.machineByAnyId(id) }));
+  });
+
+  /** Inbound screen shares for the open room: every active display route
+   *  from a member's machine into this one. These are the panel's video
+   *  tiles — the same pull-and-paint plane the console uses. */
+  roomInboundShares = $derived.by((): { route: Route; member: MeshNode }[] => {
+    const room = this.openRoom;
+    if (!room) return [];
+    const out: { route: Route; member: MeshNode }[] = [];
+    for (const r of this.catalog.routes) {
+      if (r.media !== "display") continue;
+      const from = this.capabilityForDisplay(r.from);
+      const to = this.capabilityForDisplay(r.to);
+      if (!from || !to || !this.isMe(to.node) || this.isMe(from.node)) continue;
+      const member = room.members.find((m) => sameMachine(m, from.node));
+      const node = member ? this.machineByAnyId(member) : undefined;
+      if (node) out.push({ route: r, member: node });
+    }
+    return out;
+  });
+
+  /** The live input route a member can drive this tile's machine with —
+   *  set when that machine turned "share control" on (it wired *our*
+   *  keyboard & mouse to its control sink). The tile captures over the
+   *  picture and sends events down this route. */
+  roomControlRouteTo(memberNodeId: string): string | null {
+    for (const r of this.catalog.routes) {
+      if (r.media !== "input") continue;
+      const from = this.capability(r.from);
+      const to = this.capability(r.to);
+      if (from && to && this.isMe(from.node) && sameMachine(to.node, memberNodeId)) return r.id;
+    }
+    return null;
   }
 
-  connectGroupTo(groupId: string, target: string) {
-    const res = connectGroup(this.catalog, groupId, target);
-    this.groupPickerFor = null;
-    if (res.ok) {
-      for (const r of res.routes) this.addRoute(r.from, r.to, groupId);
-      const name = this.catalog.groups.find((g) => g.id === groupId)?.name ?? "group";
-      const tlabel = this.node(target)?.label ?? target;
-      this.toast("ok", `“${name}” is now using ${tlabel}`);
-      // Sending a bundle at a machine pops its session console too — the
-      // first route's media picks which one (a desk/call kit is console
-      // media; a storage bundle would open files).
-      const lead = res.routes[0];
-      if (lead && !this.isMe(target)) this.popConsoleFor(target, lead.media);
+  /** What a member is sending into this machine right now ("talking",
+   *  "sharing sound"), read off the live audio routes' source origins. */
+  roomMemberSends(memberNodeId: string): { mic: boolean; sound: boolean } {
+    let mic = false;
+    let sound = false;
+    for (const r of this.catalog.routes) {
+      if (r.media !== "audio") continue;
+      const from = this.capability(r.from);
+      const to = this.capability(r.to);
+      if (!from || !to || !this.isMe(to.node) || !sameMachine(from.node, memberNodeId)) continue;
+      if (from.origin === "system") sound = true;
+      else mic = true;
+    }
+    return { mic, sound };
+  }
+
+  /** Nodes you can put in a room: machines on the graph running
+   *  AllMyStuff, other than this one. (Unclaimed ones can chat once
+   *  invited, but can't be routed to until claimed or shared.) */
+  roomCandidateNodes = $derived.by(() =>
+    this.catalog.nodes.filter((n) => !this.isMe(n.id) && isAppNode(n)),
+  );
+
+  /** Make a room and tell its members. */
+  createRoom(name: string, memberIds: string[]) {
+    const clean = name.trim() || "Room";
+    const members = [
+      canonicalNodeId(this.localId),
+      ...memberIds.map(canonicalNodeId).filter((m) => !this.isMe(m)),
+    ];
+    const room: VirtualRoom = { id: newId("room"), name: clean, members };
+    this.rooms.push(room);
+    this.saveRooms();
+    this.roomDraftOpen = false;
+    this.toast("ok", `Made the room “${clean}”`);
+    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "invite", members });
+  }
+
+  /** Forget a room on this device (members keep theirs). */
+  deleteRoom(roomId: string) {
+    if (this.roomOpenId === roomId) this.leaveRoom();
+    const name = this.rooms.find((r) => r.id === roomId)?.name;
+    this.rooms = this.rooms.filter((r) => r.id !== roomId);
+    this.saveRooms();
+    if (name) this.toast("info", `Removed “${name}” from this device`);
+  }
+
+  /** Join a room — open its call panel. Like sitting down muted: nothing
+   *  is wired until a toggle is turned on. */
+  joinRoom(roomId: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room) return;
+    if (this.roomOpenId && this.roomOpenId !== roomId) this.leaveRoom();
+    this.roomOpenId = roomId;
+    this.roomChatOpen = false;
+    this.roomUnread = { ...this.roomUnread, [roomId]: 0 };
+    this.roomMic = false;
+    this.roomCam = false;
+    this.roomScreen = false;
+    this.roomSound = false;
+    this.roomControl = false;
+    this.roomRoutes = emptyRoomRoutes();
+    this.presenceAdd(roomId, canonicalNodeId(this.localId));
+    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
+  }
+
+  /** Leave the room: every toggle goes off (tearing down exactly the
+   *  routes the room wired), and members see us go. */
+  leaveRoom() {
+    const room = this.openRoom;
+    if (!room) return;
+    for (const channel of ROOM_CHANNELS) this.dropRoomLegs(channel);
+    this.roomMic = false;
+    this.roomCam = false;
+    this.roomScreen = false;
+    this.roomSound = false;
+    this.roomControl = false;
+    this.presenceDrop(room.id, canonicalNodeId(this.localId));
+    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "leave" });
+    this.roomOpenId = null;
+  }
+
+  /** Talk to the room: your **microphone** to every member's speakers —
+   *  the call itself. (Sharing what this machine is *playing* is the
+   *  separate "share sound" toggle.) */
+  toggleRoomMic() {
+    if (this.roomMic) {
+      this.dropRoomLegs("mic");
+      this.roomMic = false;
       return;
     }
-    if (res.denied && res.denied.length) {
-      this.pendingGroupShare = { groupId, target, requests: res.denied };
+    const from = this.localAudioSource("mic");
+    if (!from) {
+      this.toast("warn", "No microphone on this machine");
       return;
     }
-    this.toast("warn", res.reason);
+    const wired = this.wireRoomLegs("mic", from, "audio");
+    this.roomMic = wired > 0;
+    if (wired > 0) this.toastLegs("Your mic is live", wired);
+    else this.toast("warn", "Nobody in the room can receive audio right now");
   }
 
-  approveGroupShare() {
-    const p = this.pendingGroupShare;
-    if (!p) return;
-    for (const req of p.requests) this.grant(req.node, requestToGrant(req));
-    this.connectGroupTo(p.groupId, p.target);
-    this.pendingGroupShare = null;
-  }
-
-  dismissGroupShare() {
-    this.pendingGroupShare = null;
-  }
-
-  createGroup(name: string, node: string, members: string[]) {
-    const id = newId("group");
-    this.catalog.groups.push({ id, name, node, members });
-    this.toast("ok", `Made the group “${name}”`);
-    return id;
-  }
-
-  // ---- bundles (pre-set kits with category slots) -----------------
-
-  /** Start filling a bundle template — auto-fill each slot from this
-   *  machine's matching devices; the user can swap any of them. */
-  startBundle(templateId: string) {
-    const tpl = BUNDLE_TEMPLATES.find((t) => t.id === templateId);
-    if (!tpl) return;
-    this.bundleDraftId = templateId;
-    const slots: Record<string, string> = {};
-    for (const slot of tpl.slots) {
-      const role = slot.flow === "source" ? "provide" : "consume";
-      const cap = matchEndpoint(this.catalog, this.localId, slot.media, role);
-      if (cap) slots[slot.id] = cap.id;
+  /** Share this machine's **sound** — what it's playing, captured off the
+   *  loopback — to every member's speakers. Deliberately not the mic:
+   *  use the mic toggle to talk. */
+  toggleRoomSound() {
+    if (this.roomSound) {
+      this.dropRoomLegs("sound");
+      this.roomSound = false;
+      return;
     }
-    this.bundleSlots = slots;
+    const from = this.localAudioSource("system");
+    if (!from) {
+      this.toast("warn", "This machine exposes no system audio");
+      return;
+    }
+    const wired = this.wireRoomLegs("sound", from, "audio");
+    this.roomSound = wired > 0;
+    if (wired > 0) this.toastLegs("Sharing this machine's sound", wired);
+    else this.toast("warn", "Nobody in the room can receive audio right now");
   }
 
-  setBundleSlot(slotId: string, capId: string) {
-    this.bundleSlots = { ...this.bundleSlots, [slotId]: capId };
-  }
-
-  cancelBundle() {
-    this.bundleDraftId = null;
-    this.bundleSlots = {};
-  }
-
-  /** This machine's capabilities that fit a slot (same media + direction). */
-  bundleCandidates(slot: { media: MediaKind; flow: Flow }): Capability[] {
-    const wantSource = slot.flow === "source";
-    return this.capsOf(this.localId).filter(
-      (c) => c.media === slot.media && (wantSource ? canSource(c.flow) : canSink(c.flow)),
+  /** Share your screen with the room: this machine's screen to every
+   *  member's display. Members see it as a tile in their room panel. */
+  toggleRoomScreen() {
+    if (this.roomScreen) {
+      this.dropRoomLegs("screen");
+      this.roomScreen = false;
+      return;
+    }
+    const from = this.capsOf(this.localId).find(
+      (c) => c.media === "display" && canSource(c.flow) && c.origin === "screen",
     );
-  }
-
-  /** Turn the filled draft into a bundle and arm the "tap a machine to send
-   *  it there" picker — it fans out as one connection. */
-  sendBundle() {
-    const tpl = BUNDLE_TEMPLATES.find((t) => t.id === this.bundleDraftId);
-    if (!tpl) return;
-    const members = Object.values(this.bundleSlots).filter(Boolean);
-    if (members.length === 0) {
-      this.toast("warn", "Fill at least one slot first");
+    if (!from) {
+      this.toast("warn", "This machine exposes no screen");
       return;
     }
-    const groupId = this.createGroup(tpl.name, this.localId, members);
-    this.cancelBundle();
-    this.startGroupConnect(groupId);
+    const wired = this.wireRoomLegs("screen", from, "display");
+    this.roomScreen = wired > 0;
+    if (wired > 0) this.toastLegs("Sharing your screen", wired);
+    else this.toast("warn", "Nobody in the room can receive a screen right now");
+  }
+
+  /** Send your camera to the room. The routes are real, but camera
+   *  *transport* hasn't landed yet (the same honest note the console
+   *  shows) — and most machines expose no video sink to receive one. */
+  toggleRoomCam() {
+    if (this.roomCam) {
+      this.dropRoomLegs("cam");
+      this.roomCam = false;
+      return;
+    }
+    const from = this.capsOf(this.localId)
+      .filter((c) => c.media === "video" && canSource(c.flow))
+      .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false))[0];
+    if (!from) {
+      this.toast("warn", "No camera on this machine");
+      return;
+    }
+    const wired = this.wireRoomLegs("cam", from, "video");
+    this.roomCam = wired > 0;
+    if (wired > 0) this.toastLegs("Camera wired (transport is on its way)", wired);
+    else this.toast("warn", "No member can receive camera video yet — camera transport is on its way");
+  }
+
+  /** Let the room drive this machine: each member's keyboard & mouse is
+   *  wired to this machine's control. Members then click and type over
+   *  your screen-share tile. Injection stays gated on the far side's
+   *  facts: only your owner/fleet can actually move things (a guest's
+   *  events are dropped until share-gated control lands). */
+  toggleRoomControl() {
+    if (this.roomControl) {
+      this.dropRoomLegs("control");
+      this.roomControl = false;
+      return;
+    }
+    const mySink = matchEndpoint(this.catalog, this.localId, "input", "consume");
+    if (!mySink) {
+      this.toast("warn", "This machine exposes no control endpoint");
+      return;
+    }
+    let wired = 0;
+    for (const { node } of this.roomMemberNodes) {
+      if (!node || !isAppNode(node) || !node.online) continue;
+      if (node.relationship.kind === "unclaimed") continue;
+      const theirSrc = matchEndpoint(this.catalog, node.id, "input", "provide");
+      if (!theirSrc) continue;
+      const leg = this.ownedConnect(theirSrc.id, mySink.id);
+      if (leg?.created) this.roomRoutes.control.push(leg.id);
+      if (leg) wired += 1;
+    }
+    this.roomControl = wired > 0;
+    if (wired > 0) this.toastLegs("Members can drive this machine", wired);
+    else this.toast("warn", "No member can send control right now");
+  }
+
+  /** Send a chat line to the room. */
+  sendRoomChat(text: string) {
+    const room = this.openRoom;
+    const line = text.trim();
+    if (!room || !line) return;
+    this.appendRoomChat(room.id, {
+      from: canonicalNodeId(this.localId),
+      fromLabel: this.node(this.localId)?.label ?? "Me",
+      text: line,
+      at: Date.now(),
+    });
+    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "chat", text: line });
+  }
+
+  /** Members of the open room you can send files to (the owner/fleet
+   *  gate, same as everywhere): the panel's file-send targets. */
+  roomFileTargets = $derived.by((): MeshNode[] => {
+    return this.roomMemberNodes
+      .map((m) => m.node)
+      .filter((n): n is MeshNode => !!n && this.filesAllowed(n));
+  });
+
+  /** Handle one inbound room-plane message. */
+  handleRoomMessage(from: string, msg: RoomWireMessage) {
+    const sender = canonicalNodeId(from);
+    if (this.isMe(sender)) return;
+    const senderLabel = this.machineByAnyId(sender)?.label ?? shortId(sender);
+    const existing = this.rooms.find((r) => r.id === msg.room);
+    switch (msg.kind) {
+      case "invite": {
+        const members = [...new Set(msg.members.map(canonicalNodeId))];
+        if (!members.includes(canonicalNodeId(this.localId))) {
+          members.push(canonicalNodeId(this.localId));
+        }
+        if (!members.includes(sender)) members.push(sender);
+        if (existing) {
+          existing.name = msg.name?.trim() || existing.name;
+          existing.members = members;
+        } else {
+          this.rooms.push({ id: msg.room, name: msg.name?.trim() || "Room", members });
+          this.toast("info", `${senderLabel} added you to “${msg.name?.trim() || "a room"}”`);
+        }
+        this.saveRooms();
+        break;
+      }
+      case "join": {
+        if (existing) this.presenceAdd(msg.room, sender);
+        break;
+      }
+      case "leave": {
+        this.presenceDrop(msg.room, sender);
+        break;
+      }
+      case "chat": {
+        // A chat for a room we don't know yet still lands — mint a stub
+        // (the proper roster arrives with the next invite).
+        if (!existing) {
+          this.rooms.push({
+            id: msg.room,
+            name: msg.name?.trim() || "Room",
+            members: [canonicalNodeId(this.localId), sender],
+          });
+          this.saveRooms();
+        }
+        this.appendRoomChat(msg.room, {
+          from: sender,
+          fromLabel: senderLabel,
+          text: msg.text,
+          at: Date.now(),
+        });
+        break;
+      }
+    }
+  }
+
+  // The rooms plane's local helpers.
+
+  private appendRoomChat(roomId: string, line: RoomChatLine) {
+    this.roomChat = {
+      ...this.roomChat,
+      [roomId]: [...(this.roomChat[roomId] ?? []), line].slice(-200),
+    };
+    // Unread unless the line landed where you're already reading: this
+    // room's panel with the chat sidebar showing.
+    if (this.roomOpenId !== roomId || !this.roomChatOpen) {
+      this.roomUnread = { ...this.roomUnread, [roomId]: (this.roomUnread[roomId] ?? 0) + 1 };
+    }
+  }
+
+  private presenceAdd(roomId: string, member: string) {
+    const cur = this.roomPresence[roomId] ?? [];
+    if (!cur.includes(member)) {
+      this.roomPresence = { ...this.roomPresence, [roomId]: [...cur, member] };
+    }
+  }
+
+  private presenceDrop(roomId: string, member: string) {
+    const cur = this.roomPresence[roomId] ?? [];
+    this.roomPresence = { ...this.roomPresence, [roomId]: cur.filter((m) => m !== member) };
+  }
+
+  /** Fan one room-plane message at every member but us. Fire-and-forget:
+   *  the plane has no acks, and presence heals gaps. */
+  private broadcastRoom(room: VirtualRoom, msg: RoomWireMessage) {
+    if (!this.backendConnected) return;
+    const others = room.members.filter((m) => !this.isMe(m));
+    if (others.length) void roomSend(others, msg);
+  }
+
+  /** This machine's audio source for a room leg: the loopback for
+   *  `system`, otherwise the best non-system capture (the default mic
+   *  first). The split is the whole point — the mic toggle must never
+   *  quietly fall back to the loopback, or "talk" becomes "broadcast
+   *  everything this machine plays". */
+  private localAudioSource(kind: "mic" | "system"): Capability | undefined {
+    const sources = this.capsOf(this.localId).filter(
+      (c) => c.media === "audio" && canSource(c.flow),
+    );
+    if (kind === "system") return sources.find((c) => c.origin === "system");
+    return sources
+      .filter((c) => c.origin !== "system")
+      .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false))[0];
+  }
+
+  /** Wire one toggle's leg to every eligible member: `from` (a local
+   *  source) into each member's matching sink. Returns how many members
+   *  got a leg (created ones are owned for teardown). */
+  private wireRoomLegs(channel: RoomChannel, from: Capability, media: MediaKind): number {
+    let wired = 0;
+    for (const { node } of this.roomMemberNodes) {
+      if (!node || !isAppNode(node) || !node.online) continue;
+      if (node.relationship.kind === "unclaimed") continue;
+      const sink = matchEndpoint(this.catalog, node.id, media, "consume");
+      if (!sink) continue;
+      const leg = this.ownedConnect(from.id, sink.id);
+      if (leg?.created) this.roomRoutes[channel].push(leg.id);
+      if (leg) wired += 1;
+    }
+    return wired;
+  }
+
+  /** Tear down the routes one toggle created (and only those). */
+  private dropRoomLegs(channel: RoomChannel) {
+    for (const id of this.roomRoutes[channel]) void this.disconnect(id);
+    this.roomRoutes[channel] = [];
+  }
+
+  private toastLegs(what: string, n: number) {
+    this.toast("ok", `${what} — ${n} member${n === 1 ? "" : "s"}`);
+  }
+
+  /** Rooms persist on this device (like the graph's relationships, the
+   *  mesh holds no central copy — every member keeps their own). */
+  private saveRooms() {
+    try {
+      localStorage.setItem(ROOMS_STORE_KEY, JSON.stringify(this.rooms));
+    } catch {
+      /* storage unavailable (private mode) — rooms last the session */
+    }
+  }
+
+  private loadRooms() {
+    try {
+      const raw = localStorage.getItem(ROOMS_STORE_KEY);
+      if (!raw) return;
+      const rooms = JSON.parse(raw) as VirtualRoom[];
+      if (Array.isArray(rooms)) {
+        this.rooms = rooms.filter((r) => r && r.id && Array.isArray(r.members));
+      }
+    } catch {
+      /* a corrupt store just means no rooms */
+    }
   }
 
   // ---- networks / identity / roster -------------------------------
@@ -1692,6 +2068,79 @@ class AppStore {
     } catch (e) {
       this.toast("warn", `Couldn't leave: ${errMsg(e)}`);
     }
+  }
+
+  /** Pull the parked (disabled) network configs from the backend. */
+  async loadDisabledNetworks() {
+    if (!isTauri()) return;
+    try {
+      this.disabledNets = await disabledNetworks();
+    } catch {
+      this.disabledNets = [];
+    }
+  }
+
+  /** Switch a network off or back on **without deleting it** — the pill
+   *  menu's toggle. Off = leave the daemon but park the full config (the
+   *  roster file survives on disk); on = re-join from the parked config.
+   *  `key` may be a config id or network id. */
+  async toggleNetworkEnabled(key: string, on: boolean) {
+    if (!this.backendConnected) {
+      this.demoToggleNetwork(key, on);
+      return;
+    }
+    try {
+      await setNetworkEnabled(key, on);
+      this.toast(
+        on ? "ok" : "info",
+        on ? "Network enabled — reconnecting" : "Network disabled — kept for when you want it back",
+      );
+      await this.refreshNetworks();
+      await this.loadDisabledNetworks();
+      await this.syncMeshGraph();
+    } catch (e) {
+      this.toast("warn", `Couldn't ${on ? "enable" : "disable"} the network: ${errMsg(e)}`);
+    }
+  }
+
+  /** Demo/web twin of the toggle: move the network between the live and
+   *  parked lists, and quiet the devices that were only reachable on it. */
+  private demoToggleNetwork(key: string, on: boolean) {
+    if (on) {
+      const cfg = this.disabledNets.find((c) => c.id === key || c.network_id === key);
+      if (!cfg) return;
+      this.disabledNets = this.disabledNets.filter((c) => c !== cfg);
+      this.networks = [
+        ...this.networks,
+        {
+          config_id: cfg.id,
+          network_id: cfg.network_id,
+          label: (cfg.label ?? "") as string,
+          phase: "joined",
+        },
+      ];
+    } else {
+      const net = this.networks.find((n) => n.config_id === key || n.network_id === key);
+      if (!net) return;
+      this.networks = this.networks.filter((n) => n !== net);
+      const cfg = this.networkConfig(net.config_id) ?? {
+        id: net.config_id,
+        network_id: net.network_id,
+        label: net.label,
+      };
+      this.disabledNets = [...this.disabledNets, cfg];
+    }
+    // A device only reachable over disabled networks reads offline, and
+    // this machine's own chips track what's actually joined.
+    const enabledNames = new Set(this.networks.map((n) => networkDisplayName(n)));
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this") {
+        n.networks = [...enabledNames].sort();
+        continue;
+      }
+      if (n.networks?.length) n.online = n.networks.some((name) => enabledNames.has(name));
+    }
+    this.toast(on ? "ok" : "info", on ? "Network enabled (demo)" : "Network disabled (demo)");
   }
 
   // ---- per-network transport config (signaling · STUN · TURN) -----
