@@ -75,10 +75,6 @@ rules, no I/O.
 - **Route** — wires a source capability to a sink of compatible media. Only
   ever minted by `Catalog::propose_route`, which is where media, flow, and
   authorization are all checked.
-- **Group** — an isolatable bundle of capabilities on one node, fanned out to
-  a target as a unit (the RDC kit). `Catalog::connect_group` builds one route
-  per member in the direction its flow implies — and aborts the whole connect
-  if any leg would breach a share.
 - **Relationship** — `Mine` (a device you own or manage) or `Shared { person,
   grants }`. A `Grant` authorizes a shared endpoint to play one role
   (`Provide` = they source, `Consume` = they sink) for one media, optionally
@@ -97,7 +93,7 @@ rules, no I/O.
   authenticated claimer the mesh delivered, persisted next to the identity.
 
 See `crates/allmystuff-graph/src/lib.rs` tests for the full behaviour,
-including the RDC fan-out and the share-breach abort.
+including the person-wide grant union and the endpoint auto-pick.
 
 ### allmystuff-protocol
 
@@ -111,8 +107,12 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   documents.
 - **`app`** — AllMyStuff's own peer-to-peer messages that ride *inside* the
   daemon's typed channels: a `NodeProfile` presence advert,
-  `ControlMessage`s for route setup and share negotiation, and the
-  `OwnedRoster` fleet gossip (`CHANNEL_OWNED`). Authorization is
+  `ControlMessage`s for route setup and share negotiation, the
+  `OwnedRoster` fleet gossip (`CHANNEL_OWNED`), and the **virtual-rooms
+  plane** (`CHANNEL_ROOMS`): `RoomMessage`s carrying a room's invites,
+  join/leave presence, and chat — only the membership + chat plane; a
+  room's media is ordinary routes. Peers advertise the `rooms` feature
+  tag, so an older build simply never sees the channel. Authorization is
   never on the wire — a node only advertises or accepts what its local
   `Catalog` already permits.
 - **The owned fleet** — claiming a device doesn't just flip a flag: the two
@@ -133,8 +133,8 @@ display source, **control** = input sink, **keyboard & mouse** = input
 source — a console forwards "whatever this machine's user does", never one
 scanned device, so driving a remote works even where the input scan finds
 nothing (macOS) — and **system audio** = duplex) so whole-computer flows
-(screen-share, RDC, remote control) have something to land on *and* start
-from. The GUI also passes its own monitor enumeration in
+(screen-share, room calls, remote control) have something to land on *and*
+start from. The GUI also passes its own monitor enumeration in
 (`capabilities_with_screens`): each monitor beyond the primary becomes a
 `screen:<id>` display source — one console tab per screen — with ids the
 capture side resolves back to the same monitor. Shared by the CLI and the
@@ -212,6 +212,31 @@ Tauri 2 + Svelte 5, a client of the daemon.
   that opens the **approvals popup** (`ApprovalsPopup.svelte`) — the bilateral
   code grid (each side's suffix + verification code) with Approve and Decline
   (a cancel, not a deny).
+
+  **Virtual rooms** (`RoomsBar.svelte` + `RoomPanel.svelte`, bottom-left)
+  are the multi-machine layer over the same plumbing: a room is a named,
+  locally-persisted member list (invites ride `CHANNEL_ROOMS`), and joining
+  opens a zoom-like call panel where **everything starts off** — mic,
+  camera, screen share. Each toggle fans ordinary routes out to the members
+  (authorization and the share sheet apply unchanged): **Mic** is the call
+  (your voice → their speakers); **Share sound** is deliberately separate —
+  the machine's loopback (`system-audio`), never the mic; **Share screen**
+  streams to each member's display, rendered in *their* panel as live tiles
+  (`RoomTile.svelte`, the console pipeline's native-decode rung); **Share
+  control** wires each member's keyboard & mouse to this machine so they
+  can drive it over your tile — injection still gated by the far side's
+  owner/fleet rule; file sending opens the existing files session
+  (owner/fleet gated); chat is a `RoomMessage` to every member. The graph
+  itself has two layouts switched from the zoom controls: the radial
+  default and a **grouped grid** — one labelled section per fleet (yours,
+  each owner's, "unknown fleet" for devices advertising no owner). The
+  top bar's **network pill** opens a menu listing every network with an
+  on/off switch — disable parks the network's full config in
+  `allmystuff-networks.json` (under `~/.myownmesh`) and leaves it
+  daemon-side; enable re-joins from the parked config; roster files
+  survive on disk in between, so approvals aren't lost (the daemon has no
+  dormant-network notion — `network_set_enabled` in the Tauri backend is
+  what holds the ticket).
 
   New/joined networks default their signaling relay + STUN + TURN to
   MyOwnMesh's semi-public reference servers (`wss://myownmesh.com`,
@@ -366,8 +391,11 @@ partials deleted on failure or teardown), and the window just renders
 
 AllMyStuff rides on MyOwnMesh's identity + roster (under `~/.myownmesh/`,
 overridable via `MYOWNMESH_HOME`). Its own additions — relationships, grants,
-groups, and saved routes — are app state layered on top; the mesh provides
-the cryptographic identity that those grants attach to. **Device ownership**
+rooms, and saved routes — are app state layered on top; the mesh provides
+the cryptographic identity that those grants attach to. Two of them are
+durable today: rooms (each device keeps its own list, localStorage-side)
+and **disabled networks** (`allmystuff-networks.json` — the parked configs
+the network pill's off-switch holds). **Device ownership**
 is already persisted there (`allmystuff-ownership.json`): the recorded owner
 survives restarts, while claim mode is deliberately transient (re-asserted
 each start by the flag) so a box never sits silently adoptable across reboots.

@@ -38,6 +38,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "this",
       summary: { os: "macOS 14", cpu: "Apple M2", ram_bytes: 16 * 2 ** 30, device_count: 13 },
     },
@@ -48,6 +49,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "this",
       summary: { os: "Windows 11", cpu: "Ryzen 7 7700", ram_bytes: 32 * 2 ** 30, device_count: 11 },
     },
@@ -58,6 +60,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "this",
       summary: { os: "Linux", cpu: "Amlogic S905", ram_bytes: 4 * 2 ** 30, device_count: 5 },
     },
@@ -68,6 +71,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "this",
       summary: { os: "Linux", cpu: "Pi 5", ram_bytes: 8 * 2 ** 30, device_count: 6 },
     },
@@ -80,6 +84,7 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "unclaimed" },
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: null,
       claimable: true,
       summary: { os: "Linux", cpu: "Intel N100", ram_bytes: 16 * 2 ** 30, device_count: 7 },
@@ -101,6 +106,7 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       online: false,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "alex",
       relationship: {
         kind: "shared",
@@ -129,6 +135,7 @@ export function demoCatalog(): Catalog {
       kind: "machine",
       online: true,
       app: true,
+      features: ["terminal", "files", "rooms"],
       owner: "alex",
       relationship: { kind: "unclaimed" },
       summary: { os: "Android 15", cpu: "Snapdragon 8", ram_bytes: 8 * 2 ** 30, device_count: 6 },
@@ -175,20 +182,9 @@ export function demoCatalog(): Catalog {
 
   // A few pre-wired routes (all between things I own, so all valid).
   const routes = [
-    { id: "route:this:system-audio→desk:speakers", from: "this:system-audio", to: "desk:speakers", media: "audio" as MediaKind, group: null },
-    { id: "route:desk:screen→tv:oled", from: "desk:screen", to: "tv:oled", media: "display" as MediaKind, group: null },
+    { id: "route:this:system-audio→desk:speakers", from: "this:system-audio", to: "desk:speakers", media: "audio" as MediaKind },
+    { id: "route:desk:screen→tv:oled", from: "desk:screen", to: "tv:oled", media: "display" as MediaKind },
   ];
 
-  // The RDC bundle: my MacBook's screen + keyboard + trackpad + mic +
-  // speakers, ready to point at any machine as a unit.
-  const groups = [
-    {
-      id: "group:my-desk",
-      name: "My desk",
-      node: "this",
-      members: ["this:display", "this:keyboard", "this:trackpad", "this:mic", "this:speakers"],
-    },
-  ];
-
-  return { nodes, capabilities, routes, groups };
+  return { nodes, capabilities, routes };
 }

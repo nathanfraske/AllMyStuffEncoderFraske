@@ -187,47 +187,7 @@ export function proposeRoute(cat: Catalog, from: string, to: string): ConnectRes
   }
 
   const media = src.media !== "generic" ? src.media : dst.media;
-  return { ok: true, route: { id: routeId(from, to), from, to, media, group: null } };
-}
-
-/** Fan a group out to a target node. Mirrors `Catalog::connect_group`:
- *  source members feed the target's sink, sink members are fed by its
- *  source, and an authorization failure aborts the whole connect. */
-export function connectGroup(
-  cat: Catalog,
-  groupId: string,
-  target: string,
-):
-  | { ok: true; routes: Route[] }
-  | { ok: false; reason: string; denied?: GrantRequest[] } {
-  const group = cat.groups.find((g) => g.id === groupId);
-  if (!group) return { ok: false, reason: "Unknown group." };
-  if (group.node === target) return { ok: false, reason: "That's the same place." };
-
-  const routes: Route[] = [];
-  for (const memberId of group.members) {
-    const member = capability(cat, memberId);
-    if (!member) continue;
-    if (canSource(member.flow)) {
-      const sink = matchEndpoint(cat, target, member.media, "consume");
-      if (sink) {
-        const r = proposeRoute(cat, memberId, sink.id);
-        if (!r.ok) return { ok: false, reason: r.reason, denied: r.denied };
-        routes.push({ ...r.route, group: groupId });
-      }
-    }
-    if (canSink(member.flow)) {
-      const src = matchEndpoint(cat, target, member.media, "provide");
-      if (src) {
-        const r = proposeRoute(cat, src.id, memberId);
-        if (!r.ok) return { ok: false, reason: r.reason, denied: r.denied };
-        routes.push({ ...r.route, group: groupId });
-      }
-    }
-  }
-  if (routes.length === 0)
-    return { ok: false, reason: "Nothing on the target can pair with this group." };
-  return { ok: true, routes };
+  return { ok: true, route: { id: routeId(from, to), from, to, media } };
 }
 
 const MACHINE_ORIGINS = new Set(["screen", "control", "controller", "system"]);

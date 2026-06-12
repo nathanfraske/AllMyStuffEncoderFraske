@@ -11,7 +11,9 @@
   import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
-  import BundlesBar from "./BundlesBar.svelte";
+  import NetworkMenu from "./NetworkMenu.svelte";
+  import RoomsBar from "./RoomsBar.svelte";
+  import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalsPopup from "./ApprovalsPopup.svelte";
   import ShareSheet from "./ShareSheet.svelte";
@@ -84,21 +86,34 @@
     <div class="summary">
       <span class="chip"><b>{app.mineCount}</b> yours</span>
       <span class="chip"><b>{app.sharedCount}</b> shared</span>
-      <button
-        class="chip net"
-        class:live={app.backendConnected && app.networks.length > 0}
-        onclick={() => app.openSettings("networks")}
-        title="Manage your networks"
-      >
-        <span class="net-dot"></span>
-        {!app.backendConnected
-          ? "demo mode"
-          : app.networks.length > 1
-            ? `${app.networks.length} networks`
-            : app.activeNetwork
-              ? networkDisplayName(app.activeNetwork)
-              : "no network"}
-      </button>
+      <span class="net-anchor">
+        <button
+          class="chip net"
+          class:live={app.backendConnected && app.networks.length > 0}
+          onclick={(e) => {
+            e.stopPropagation();
+            app.netMenuOpen = !app.netMenuOpen;
+          }}
+          title="Your networks — switch them on or off"
+          aria-haspopup="menu"
+          aria-expanded={app.netMenuOpen}
+        >
+          <span class="net-dot"></span>
+          {!app.backendConnected
+            ? "demo mode"
+            : app.networks.length > 1
+              ? `${app.networks.length} networks`
+              : app.activeNetwork
+                ? networkDisplayName(app.activeNetwork)
+                : app.disabledNets.length > 0
+                  ? "networks off"
+                  : "no network"}
+          {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
+        </button>
+        {#if app.netMenuOpen}
+          <NetworkMenu />
+        {/if}
+      </span>
     </div>
 
     <div class="actions">
@@ -122,8 +137,9 @@
 
   <main class="stage">
     <Graph />
-    <BundlesBar />
+    <RoomsBar />
     <NodeDrawer />
+    <RoomPanel />
   </main>
 
   {#if app.settingsOpen}
@@ -202,6 +218,18 @@
     display: flex;
     gap: 0.4rem;
     margin-left: auto;
+  }
+  .net-anchor {
+    position: relative;
+    display: inline-flex;
+  }
+  .net-off {
+    font-size: 0.64rem;
+    font-weight: 700;
+    color: var(--ink-faint);
+    background: var(--surface);
+    border-radius: var(--r-pill);
+    padding: 0 0.3rem;
   }
   .chip b {
     color: var(--ink);

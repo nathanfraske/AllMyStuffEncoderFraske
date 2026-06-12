@@ -24,8 +24,9 @@ use tokio::sync::mpsc;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
-    ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RouteControl,
-    CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, PROTOCOL_VERSION,
+    ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RoomMessage,
+    RouteControl, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, Effect, FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session,
@@ -680,9 +681,13 @@ impl Mesh {
             // know to offer one. Runtime spawn failures still degrade
             // in-band (the viewer sees the error in its terminal). Same
             // for file sessions: plain std::fs everywhere we ship.
+            // …and it speaks the virtual-rooms plane (invites, join/leave,
+            // chat on CHANNEL_ROOMS), so room UIs can badge members that
+            // can't hear them.
             features: vec![
                 allmystuff_protocol::FEATURE_TERMINAL.to_string(),
                 allmystuff_protocol::FEATURE_FILES.to_string(),
+                allmystuff_protocol::FEATURE_ROOMS.to_string(),
             ],
         }
     }
@@ -994,6 +999,19 @@ impl Mesh {
                     }
                 }
             }
+            CHANNEL_ROOMS => {
+                // The rooms plane is deliberately thin backend-side: rooms
+                // live in the GUI (like relationships do), so a decoded
+                // message is simply forwarded to every window. Decoding
+                // here rather than passing raw JSON keeps the same skew
+                // discipline as every other channel — a message this build
+                // doesn't understand is dropped, never an error.
+                if let Ok(msg) = serde_json::from_value::<RoomMessage>(payload) {
+                    let _ = self
+                        .app
+                        .emit("allmystuff://room", json!({ "from": from, "message": msg }));
+                }
+            }
             _ => {}
         }
     }
@@ -1242,7 +1260,6 @@ impl Mesh {
             from: from.clone().into(),
             to: to.clone().into(),
             media,
-            group: None,
         };
         let from_node = node_of(&from);
         let to_node = node_of(&to);
@@ -1882,17 +1899,18 @@ impl Mesh {
         self.emit_snapshot();
     }
 
-    /// Subscribe presence, owned, control, and media on each given network.
-    /// All four ride every network: broadcasts (presence/owned) so peers are
-    /// found wherever they are, and point-to-point (control/media) so a frame
-    /// addressed to whichever network the *sender* last saw us on always has
-    /// a subscriber here.
+    /// Subscribe presence, owned, control, media, and rooms on each given
+    /// network. All of them ride every network: broadcasts (presence/owned)
+    /// so peers are found wherever they are, and point-to-point
+    /// (control/media/rooms) so a frame addressed to whichever network the
+    /// *sender* last saw us on always has a subscriber here.
     async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
         let channels = [
             CHANNEL_PRESENCE,
             CHANNEL_OWNED,
             CHANNEL_CONTROL,
             CHANNEL_MEDIA,
+            CHANNEL_ROOMS,
         ];
         for network in networks {
             for channel in channels {
@@ -2958,6 +2976,55 @@ impl Mesh {
         self.send_media_value(&peer, payload).await
     }
 
+    /// Fan one room-plane message out to the given members — the rooms
+    /// channel's point-to-point sends (an invite, a join/leave, a chat
+    /// line). Best-effort per member: one with no shared network right now
+    /// (offline, or never seen) is skipped — the rooms plane has no acks,
+    /// and presence plus re-stated invites heal the gaps. Returns how many
+    /// members the daemon actually dispatched to, so the UI can be honest
+    /// about a line that reached nobody.
+    pub async fn room_send(
+        &self,
+        members: Vec<String>,
+        message: RoomMessage,
+    ) -> Result<u32, String> {
+        let me = self.local_node_id();
+        let payload = serde_json::to_value(&message).map_err(|e| e.to_string())?;
+        let mut delivered = 0u32;
+        for member in members {
+            // Never loop a message back at ourselves (the GUI already
+            // applied it locally).
+            if me
+                .as_deref()
+                .is_some_and(|m| pubkey_part(m) == pubkey_part(&member))
+            {
+                continue;
+            }
+            let Some(network) = self.network_for_peer(&member) else {
+                continue;
+            };
+            let resp = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network,
+                    channel: CHANNEL_ROOMS.to_string(),
+                    peer: pubkey_part(&member).to_string(),
+                    payload: payload.clone(),
+                })
+                .await;
+            match resp {
+                Ok(r) if r.ok => delivered += 1,
+                Ok(r) => tracing::debug!(
+                    "room send to {} refused: {}",
+                    short_id(&member),
+                    r.error.unwrap_or_default()
+                ),
+                Err(e) => tracing::debug!("room send to {} failed: {e}", short_id(&member)),
+            }
+        }
+        Ok(delivered)
+    }
+
     /// Send a control message to one peer, reporting whether the daemon
     /// actually dispatched it. The daemon's peer set is keyed by the *bare
     /// pubkey* (what signaling announces), while AllMyStuff mostly holds
@@ -3227,7 +3294,6 @@ mod tests {
             from: from.into(),
             to: to.into(),
             media,
-            group: None,
         }
     }
 

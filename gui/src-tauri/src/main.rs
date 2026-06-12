@@ -24,6 +24,7 @@ mod daemon_spawn;
 mod files;
 mod input_inject;
 mod mesh;
+mod networks_store;
 mod ownership;
 mod terminal;
 mod video;
@@ -44,6 +45,10 @@ use tauri::{Manager, RunEvent, State};
 struct AppState {
     client: Arc<ControlClient>,
     daemon_child: Mutex<Option<daemon_spawn::DaemonChild>>,
+    /// Full configs of networks the user switched off — parked here so
+    /// re-enabling re-joins with everything (servers, label, roster path)
+    /// intact. See `network_set_enabled`.
+    disabled_networks: networks_store::DisabledNetworks,
 }
 
 fn unwrap_response(resp: Response) -> Result<Value, String> {
@@ -388,6 +393,20 @@ async fn fleet_kick(mesh: State<'_, Arc<Mesh>>, device: String) -> Result<(), St
     mesh.inner().fleet_kick(device).await
 }
 
+/// Fan one room-plane message (invite / join / leave / chat) out to the
+/// given members. Best-effort per member; returns how many the daemon
+/// actually dispatched to, so the UI can say when a line reached nobody.
+#[tauri::command]
+async fn room_send(
+    mesh: State<'_, Arc<Mesh>>,
+    members: Vec<String>,
+    message: serde_json::Value,
+) -> Result<u32, String> {
+    let message: allmystuff_protocol::RoomMessage =
+        serde_json::from_value(message).map_err(|e| e.to_string())?;
+    mesh.inner().room_send(members, message).await
+}
+
 // ---- mesh control passthroughs ----------------------------------------
 
 #[tauri::command]
@@ -563,6 +582,101 @@ async fn mesh_network_remove(
     Ok(data)
 }
 
+/// The networks currently switched off (their full parked configs), for
+/// the pill menu's disabled rows.
+#[tauri::command]
+fn disabled_networks(state: State<'_, AppState>) -> Vec<Value> {
+    state.disabled_networks.list()
+}
+
+/// Switch a network off or back on without deleting it. Off = leave the
+/// daemon (peers drop, nothing is advertised there any more) but park the
+/// full config locally; on = hand the parked config back to the daemon.
+/// The network's roster file survives on disk either way, so approvals
+/// aren't lost in between. `network` may be the config id or network id.
+#[tauri::command]
+async fn network_set_enabled(
+    state: State<'_, AppState>,
+    mesh: State<'_, Arc<Mesh>>,
+    network: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    if enabled {
+        let config = state
+            .disabled_networks
+            .take(&network)
+            .ok_or_else(|| format!("'{network}' isn't a disabled network here"))?;
+        let rejoin = state
+            .client
+            .request(&Request::NetworkAdd {
+                config: config.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(unwrap_response);
+        match rejoin {
+            Ok(data) => {
+                mesh.inner().sync_networks().await;
+                Ok(data)
+            }
+            Err(e) => {
+                // Park it back so a failed re-join (daemon down, say) never
+                // loses the config.
+                state.disabled_networks.park(config);
+                Err(e)
+            }
+        }
+    } else {
+        // Snapshot the full config *before* leaving — `config_show` is the
+        // only place the daemon hands the whole thing back.
+        let shown = unwrap_response(
+            state
+                .client
+                .request(&Request::ConfigShow)
+                .await
+                .map_err(|e| e.to_string())?,
+        )?;
+        let config = shown
+            .pointer("/config/networks")
+            .and_then(|v| v.as_array())
+            .and_then(|nets| {
+                nets.iter()
+                    .find(|n| {
+                        let id = n.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                        let nid = n
+                            .get("network_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        id == network || nid == network
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| format!("unknown network: {network}"))?;
+        if !state.disabled_networks.park(config) {
+            return Err("couldn't save the network for later — not disabling it".into());
+        }
+        let left = state
+            .client
+            .request(&Request::NetworkRemove {
+                network: network.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(unwrap_response);
+        match left {
+            Ok(data) => {
+                mesh.inner().sync_networks().await;
+                Ok(data)
+            }
+            Err(e) => {
+                // Still joined — un-park so the books match reality.
+                let _ = state.disabled_networks.take(&network);
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Set this device's display-name override. Persists in the daemon identity
 /// and updates the live presence profile so peers see the new name on the
 /// next broadcast. An empty string resets the name to the hostname.
@@ -655,6 +769,7 @@ fn main() {
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
+            disabled_networks: networks_store::DisabledNetworks::load(),
         })
         .invoke_handler(tauri::generate_handler![
             scan_self,
@@ -682,6 +797,7 @@ fn main() {
             file_download,
             open_files_window,
             session_snapshot,
+            room_send,
             owned_roster,
             fleet_leave,
             fleet_kick,
@@ -692,6 +808,8 @@ fn main() {
             mesh_network_add,
             mesh_network_remove,
             mesh_network_update,
+            disabled_networks,
+            network_set_enabled,
             mesh_config_show,
             mesh_network_id_generate,
             mesh_roster_approve,

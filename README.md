@@ -8,8 +8,8 @@ A friendly desktop app that finds every device on your machines — screens,
 mics (even 4-mic arrays), speakers, cameras, keyboards, drives — lays them
 out as one graph across a private mesh you own, and lets you connect them
 with a tap. Your mic to the studio PC. The living-room TV showing your
-laptop. Your whole desk — monitor, keyboard, mouse, mic, speakers — pointed
-at a machine in the garage, as one bundle.
+laptop. A **virtual room** holding the kitchen, the office and the garage
+in one call — screens, sound and files shared only when you switch them on.
 
 Built on [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh). Pure-Rust core,
 Tauri + Svelte app, auto-updating — the same family as
@@ -97,8 +97,11 @@ Prefer a tarball directly? The portable binaries
 
 ## The graph
 
-The whole app is one canvas. Your machines orbit *this device*; the people
-you share with sit on the outside.
+The whole app is one canvas, with two ways to read it: the radial view
+(your machines orbit *this device*, fleets seated together) and a **grouped
+grid** — one labelled band per fleet (yours, each person's, and an
+"unknown fleet" for devices that advertise no owner) — switched from the
+zoom controls.
 
 - **Click a node** → a drawer with its hardware, the session buttons
   (**Remote Control · Open Files · Open Terminal**), the live connections
@@ -107,10 +110,12 @@ you share with sit on the outside.
   picks the matching endpoint (your mic → that PC's audio-in; that PC's
   screen → your monitor), draws a glowing wire — and pops the console that
   manages that kind of session on the far machine.
-- **Bundle a group** → make an *isolatable* set — your monitor + keyboard +
-  mouse + mic + speakers — and beam the whole thing at one machine, turning
-  your desk into its terminal (the "RDC" move). The bundle connects and
-  disconnects as one thing.
+- **Make a room** → a zoom-like call between machines you pick. Joining
+  wires *nothing*: your **mic** (the call — your voice), camera and screen
+  share all start off, and the panel adds **share sound** (what the machine
+  is *playing* — deliberately never your mic), **share control** (let
+  members drive this machine), chat, and file sending. Members' screen
+  shares show up as live tiles.
 
 Edges are colour-coded by what flows through them — <b>audio</b>,
 <b>video</b>, <b>screen</b>, <b>controls</b>, <b>files</b> — so the graph
@@ -154,7 +159,7 @@ daemon** rather than an embedder of the engine.
 
 ```
 allmystuff-inventory   # lib — cross-platform device scan (Linux live; macOS/Windows scaffolded)
-allmystuff-graph       # lib — capabilities, routes, groups, and the own-vs-share authorization model
+allmystuff-graph       # lib — capabilities, routes, and the own-vs-share authorization model
 allmystuff-protocol    # lib — mirror of the myownmesh control socket + AllMyStuff's peer messages
 allmystuff-bridge      # lib — turns an Inventory into routable graph capabilities (+ presence summary)
 allmystuff-cli         # bin — `allmystuff scan` / `capabilities`, headless
@@ -210,7 +215,7 @@ The graph in action (on this machine's real devices):
 
 The desktop app opens straight into a populated demo graph even with no
 mesh, so you can explore the whole experience — clicking nodes, drawing
-connections, the share sheet, groups — offline. A bare `allmystuff` opens
+connections, the share sheet, rooms — offline. A bare `allmystuff` opens
 it; the subcommands (`scan`, `capabilities`, `update`) are for headless
 boxes and scripts.
 
