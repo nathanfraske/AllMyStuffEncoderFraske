@@ -18,9 +18,11 @@
 //!    **keyboard & mouse** (an input *source* — what a console window
 //!    forwards is "whatever this machine's user does", not one scanned
 //!    device, so driving a remote never depends on the input scan finding
-//!    hardware — macOS finds none), and **system audio** (a duplex
-//!    endpoint for its mixer). These are what whole-computer flows
-//!    (remote control, a room's screen share) land on at the far end.
+//!    hardware — macOS finds none), **system audio** (a duplex
+//!    endpoint for its mixer), and **video in** (a video *sink* — the app
+//!    shows inbound camera streams in a window, so any machine can receive
+//!    one). These are what whole-computer flows (remote control, a room's
+//!    screen share, a camera feed) land on at the far end.
 //!
 //! This is the only place hardware vocabulary meets graph vocabulary, so
 //! it's small and thoroughly tested.
@@ -97,6 +99,18 @@ pub fn capabilities_with_screens(
         MediaKind::Audio,
         Flow::Duplex,
         "system",
+    ));
+    // The video sink every camera stream lands on: the app renders inbound
+    // camera video in a window (console stage, room tile), so "can show
+    // video" is a property of the machine itself — like control — not of
+    // any scanned device. Without it a camera source has nowhere to go:
+    // monitors are *display* sinks, deliberately a different media.
+    caps.push(mk(
+        format!("{n}:video-in"),
+        "Video in".into(),
+        MediaKind::Video,
+        Flow::Sink,
+        "viewer",
     ));
 
     // ---- physical devices -------------------------------------------
@@ -287,6 +301,12 @@ mod tests {
 
         let sys = by_origin("system").expect("system audio");
         assert_eq!((sys.media, sys.flow), (MediaKind::Audio, Flow::Duplex));
+
+        // The camera landing spot: every machine can *show* inbound video,
+        // so every machine is a video sink — cameras need somewhere to go.
+        let viewer = by_origin("viewer").expect("video in");
+        assert_eq!((viewer.media, viewer.flow), (MediaKind::Video, Flow::Sink));
+        assert_eq!(viewer.id.as_str(), "this:video-in");
     }
 
     #[test]

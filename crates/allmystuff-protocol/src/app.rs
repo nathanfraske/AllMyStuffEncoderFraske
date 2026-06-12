@@ -67,6 +67,14 @@ pub const FEATURE_FILES: &str = "files";
 /// older build) so nobody wonders why a message went unanswered.
 pub const FEATURE_ROOMS: &str = "rooms";
 
+/// Feature tag a node advertises in [`NodeProfile::features`] when it can
+/// *stream* its cameras (a capture backend feeds its video routes). The
+/// cameras themselves have always ridden presence as capabilities; this
+/// says selecting one will actually produce pixels — a console pointed at
+/// an older build's camera explains "update that machine" instead of
+/// waiting on a stream that will never start.
+pub const FEATURE_CAMERA: &str = "camera";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.

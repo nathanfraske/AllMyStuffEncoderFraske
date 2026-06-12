@@ -72,6 +72,12 @@ xcap = "0.9"
 # speed on typical x86-64 desktops, plain safe Rust elsewhere.
 jpeg-encoder = { version = "0.7", features = ["simd"] }
 enigo = "0.6"
+# Camera capture for video routes — V4L2 on Linux, AVFoundation on macOS,
+# Media Foundation on Windows, one API over all three. Frames decode to
+# RGBA (its `decoding` default carries the MJPEG path most webcams speak,
+# mozjpeg built from source like openh264/opus) and feed the same encoder
+# pipeline screens use.
+nokhwa = { version = "0.10", features = ["input-native"] }
 # H.264 encode for the mesh's video track lane (Cisco's encoder, built
 # from source — needs only a C/C++ toolchain). MJPEG stays as the
 # fallback wherever this can't run or the peer can't decode.
@@ -163,6 +169,15 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.allmystuff-pixels]
 opt-level = 3
+# Camera frames pass through nokhwa's pixel-format conversion (YUYV→RGBA
+# in Rust, MJPEG via mozjpeg) every tick — same treatment as the rest of
+# the media plane.
+[profile.release.package.nokhwa]
+opt-level = 3
+[profile.release.package.nokhwa-core]
+opt-level = 3
+[profile.release.package.mozjpeg]
+opt-level = 3
 
 [profile.dev.package.jpeg-encoder]
 opt-level = 3
@@ -175,6 +190,12 @@ opt-level = 3
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.allmystuff-pixels]
+opt-level = 3
+[profile.dev.package.nokhwa]
+opt-level = 3
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+[profile.dev.package.mozjpeg]
 opt-level = 3
 # The media plane's framing also leans on these every packet (JSON lines
 # on the control socket, base64 payloads) — worth optimizing in dev too.

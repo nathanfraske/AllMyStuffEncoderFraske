@@ -39,7 +39,7 @@ use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
 use crate::terminal::{OutMsg, TerminalHost};
-use crate::video::{VideoBridge, VideoMode, VideoPacket};
+use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge};
 
 pub struct Mesh {
@@ -49,8 +49,9 @@ pub struct Mesh {
     media_pipe: MediaPipe,
     app: AppHandle,
     audio: Arc<AudioBridge>,
-    /// Screen capture for display routes this machine sources (the far end
-    /// of a console session looking at us).
+    /// Screen + camera capture for the display/video routes this machine
+    /// sources (the far end of a console session looking at us, a room
+    /// member watching our camera).
     video: Arc<VideoBridge>,
     /// Native H.264 decode for inbound display routes whose console window
     /// asked for ready-to-paint frames (no WebCodecs in its webview, or its
@@ -683,11 +684,14 @@ impl Mesh {
             // for file sessions: plain std::fs everywhere we ship.
             // …and it speaks the virtual-rooms plane (invites, join/leave,
             // chat on CHANNEL_ROOMS), so room UIs can badge members that
-            // can't hear them.
+            // can't hear them. Camera streaming likewise rides every OS
+            // (V4L2 / AVFoundation / Media Foundation); a camera that
+            // won't open at route time degrades in-band too (`vstat`).
             features: vec![
                 allmystuff_protocol::FEATURE_TERMINAL.to_string(),
                 allmystuff_protocol::FEATURE_FILES.to_string(),
                 allmystuff_protocol::FEATURE_ROOMS.to_string(),
+                allmystuff_protocol::FEATURE_CAMERA.to_string(),
             ],
         }
     }
@@ -885,11 +889,13 @@ impl Mesh {
                     MediaPayload::Video(frame) => {
                         // Surface frames only for a route this session knows
                         // is live, sinks here, and belongs to the sender —
-                        // the watching console window renders them. Chunked
-                        // frames reassemble first; the first complete frame
-                        // of a stream is logged so "connected but no pixels"
-                        // is attributable from this side too.
-                        if !self.inbound_media_ok(&frame.route, &from, MediaKind::Display) {
+                        // the watching window (console stage, room tile)
+                        // renders them. Display and camera routes share the
+                        // frame shape. Chunked frames reassemble first; the
+                        // first complete frame of a stream is logged so
+                        // "connected but no pixels" is attributable from
+                        // this side too.
+                        if !self.inbound_video_ok(&frame.route, &from) {
                             tracing::debug!(
                                 "dropped video frame for {} from {} (route not live here)",
                                 frame.route,
@@ -901,7 +907,7 @@ impl Mesh {
                         if let Some(full) = full {
                             if full.seq == 0 {
                                 tracing::info!(
-                                    "first screen frame for {} ({}×{})",
+                                    "first video frame for {} ({}×{})",
                                     full.route,
                                     full.width,
                                     full.height
@@ -913,10 +919,10 @@ impl Mesh {
                     }
                     MediaPayload::VideoStatus(status) => {
                         // The host explaining its capture state ("display
-                        // asleep", "waiting for consent"…). Gated like the
-                        // frames it stands in for; the console window shows
-                        // it on the stage.
-                        if !self.inbound_media_ok(&status.route, &from, MediaKind::Display) {
+                        // asleep", "camera failed"…). Gated like the frames
+                        // it stands in for; the console window shows it on
+                        // the stage.
+                        if !self.inbound_video_ok(&status.route, &from) {
                             return;
                         }
                         tracing::info!(
@@ -1145,7 +1151,7 @@ impl Mesh {
             );
             return;
         };
-        if !self.inbound_media_ok(&route_id, from, MediaKind::Display) {
+        if !self.inbound_video_ok(&route_id, from) {
             tracing::debug!("video sample for {route_id} refused (route not live here)");
             return;
         }
@@ -2000,8 +2006,9 @@ impl Mesh {
     }
 
     /// Begin carrying media for a now-active route. Audio, display (screen
-    /// streaming), and input (remote control) are wired; camera video and
-    /// storage still show active without a transport, and the log says so.
+    /// streaming), video (camera streaming), and input (remote control)
+    /// are wired; storage still shows active without a transport, and the
+    /// log says so.
     fn start_media(self: &Arc<Self>, route: &Route) {
         let Some(me) = self.local_node_id() else {
             return;
@@ -2139,70 +2146,13 @@ impl Mesh {
                 // capture — it claims the inbound lane so arriving samples
                 // route to its console window.
                 if from_node == me && to_node != me {
-                    let accepts_h264 = self
-                        .state
-                        .lock()
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.route(&route.id))
-                        .map(|r| r.video.iter().any(|v| v == "h264"))
-                        .unwrap_or(false);
-                    let canon = pubkey_part(&to_node).to_string();
-                    let daemon_video = self.daemon_video.load(Ordering::SeqCst);
-                    if accepts_h264 && !daemon_video {
-                        tracing::warn!(
-                            "route {} — viewer accepts H.264 but the local daemon predates the track lane (needs myownmesh ≥ 0.2.1); streaming MJPEG",
-                            route.id
-                        );
-                    }
-                    let mode = if accepts_h264 && daemon_video {
-                        // The lane is busy only while its holder is still
-                        // an *active* route — a torn-down or superseded
-                        // one (the common case: the viewer switched
-                        // console tabs) is taken over, not deferred to.
-                        let holder = self.video_lane_out.lock().get(&canon).cloned();
-                        let holder_active = holder.as_deref().is_some_and(|rid| {
-                            rid != route.id
-                                && self
-                                    .state
-                                    .lock()
-                                    .session
-                                    .as_ref()
-                                    .and_then(|s| s.route(rid))
-                                    .is_some_and(|r| r.is_active())
-                        });
-                        if holder_active {
-                            tracing::info!(
-                                "route {} — peer's track lane busy; falling back to MJPEG",
-                                route.id
-                            );
-                            VideoMode::Mjpeg
-                        } else {
-                            // Routine on every console tab switch — lane
-                            // bookkeeping, not an event.
-                            if let Some(h) = holder.filter(|h| h != &route.id) {
-                                tracing::debug!(
-                                    "route {} takes the track lane over from ended route {h}",
-                                    route.id
-                                );
-                            }
-                            self.video_lane_out
-                                .lock()
-                                .insert(canon.clone(), route.id.clone());
-                            VideoMode::H264
-                        }
-                    } else {
-                        VideoMode::Mjpeg
-                    };
+                    let mode = self.pick_outbound_video_mode(route, &to_node);
                     // Which monitor: the synthetic `screen` is the primary;
                     // a `screen:<id>` capability names one of the others
                     // (the ids come from this machine's own monitor
                     // enumeration — see `video::extra_screens`).
-                    let monitor = route
-                        .from
-                        .as_str()
-                        .split_once(':')
-                        .and_then(|(_, dev)| dev.strip_prefix("screen:"))
+                    let monitor = device_of(route.from.as_str())
+                        .and_then(|dev| dev.strip_prefix("screen:").map(str::to_string))
                         .and_then(|id| id.parse::<u32>().ok());
                     tracing::info!(
                         "route {} active — streaming this {} to {} ({})",
@@ -2212,69 +2162,43 @@ impl Mesh {
                             None => "screen".to_string(),
                         },
                         short_id(&to_node),
-                        match mode {
-                            VideoMode::H264 => "H.264 track",
-                            VideoMode::Mjpeg => "MJPEG",
-                        }
+                        mode_label(mode),
                     );
-                    let peer = to_node.clone();
-                    let tx = self.video_out.clone();
-                    let status_mesh = Arc::downgrade(self);
-                    let status_peer = to_node.clone();
-                    let status_route = route.id.clone();
-                    self.video.start_capture(
-                        route.id.clone(),
-                        mode,
-                        monitor,
-                        move |packet| {
-                            // try_send: a full queue drops this packet; the next
-                            // capture carries a fresher picture.
-                            tx.try_send((peer.clone(), packet)).is_ok()
-                        },
-                        move |state, detail| {
-                            // Capture-state transitions travel to the viewer
-                            // in-band (`vstat`), so its console can explain a
-                            // black stage instead of just showing one.
-                            let Some(mesh) = status_mesh.upgrade() else {
-                                return;
-                            };
-                            let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
-                            let peer = status_peer.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let Ok(payload) = serde_json::to_value(&frame) else {
-                                    return;
-                                };
-                                if let Err(e) = mesh.send_media_value(&peer, payload).await {
-                                    tracing::debug!(
-                                        "capture status to {} failed: {e}",
-                                        short_id(&peer)
-                                    );
-                                }
-                            });
-                        },
-                    );
+                    self.start_video_stream(route, &to_node, mode, VideoSource::Screen(monitor));
                 } else if to_node == me {
-                    // Claim the peer's inbound lane for this route if we
-                    // offered H.264 — the sender may still pick MJPEG, in
-                    // which case the claim simply never sees a sample.
-                    let offered_h264 = self
-                        .state
-                        .lock()
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.route(&route.id))
-                        .map(|r| r.video.iter().any(|v| v == "h264"))
-                        .unwrap_or(false);
-                    if offered_h264 {
-                        self.video_lane_in
-                            .lock()
-                            .insert(pubkey_part(&from_node).to_string(), route.id.clone());
-                    }
+                    self.claim_inbound_video_lane(route, &from_node);
                     // The "first screen frame" line is the signal worth a
                     // default-level entry on this side; this one only
                     // matters when that line never follows.
                     tracing::debug!(
                         "route {} active — expecting screen frames from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
+            MediaKind::Video => {
+                // A camera route — same stream, different lens: the source
+                // capability names one of this machine's scanned cameras,
+                // and its frames ride exactly the pipeline a screen does
+                // (transport negotiation, lanes, tuning, status reports
+                // included). The viewer side claims the inbound lane and
+                // renders in whichever window watches the route — a
+                // console's camera tab, a room's tile.
+                if from_node == me && to_node != me {
+                    let mode = self.pick_outbound_video_mode(route, &to_node);
+                    let device = device_of(route.from.as_str()).unwrap_or_default();
+                    tracing::info!(
+                        "route {} active — streaming camera {device} to {} ({})",
+                        route.id,
+                        short_id(&to_node),
+                        mode_label(mode),
+                    );
+                    self.start_video_stream(route, &to_node, mode, VideoSource::Camera(device));
+                } else if to_node == me {
+                    self.claim_inbound_video_lane(route, &from_node);
+                    tracing::debug!(
+                        "route {} active — expecting camera frames from {}",
                         route.id,
                         short_id(&from_node)
                     );
@@ -2345,6 +2269,130 @@ impl Mesh {
                 );
             }
         }
+    }
+
+    /// The transport for a stream this machine is about to send on
+    /// `route` — shared by the display and camera arms of
+    /// [`Self::start_media`]: H.264 on the peer's track lane when the
+    /// offer asked for it, the local daemon carries it, and the lane
+    /// isn't held by another *active* route (a torn-down or superseded
+    /// holder — the common case: the viewer switched console tabs — is
+    /// taken over, not deferred to); MJPEG over the media channel
+    /// otherwise, exactly as v1.
+    fn pick_outbound_video_mode(&self, route: &Route, to_node: &str) -> VideoMode {
+        let accepts_h264 = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|s| s.route(&route.id))
+            .map(|r| r.video.iter().any(|v| v == "h264"))
+            .unwrap_or(false);
+        let canon = pubkey_part(to_node).to_string();
+        let daemon_video = self.daemon_video.load(Ordering::SeqCst);
+        if accepts_h264 && !daemon_video {
+            tracing::warn!(
+                "route {} — viewer accepts H.264 but the local daemon predates the track lane (needs myownmesh ≥ 0.2.1); streaming MJPEG",
+                route.id
+            );
+        }
+        if !(accepts_h264 && daemon_video) {
+            return VideoMode::Mjpeg;
+        }
+        // The lane is busy only while its holder is still an *active*
+        // route.
+        let holder = self.video_lane_out.lock().get(&canon).cloned();
+        let holder_active = holder.as_deref().is_some_and(|rid| {
+            rid != route.id
+                && self
+                    .state
+                    .lock()
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.route(rid))
+                    .is_some_and(|r| r.is_active())
+        });
+        if holder_active {
+            tracing::info!(
+                "route {} — peer's track lane busy; falling back to MJPEG",
+                route.id
+            );
+            VideoMode::Mjpeg
+        } else {
+            // Routine on every console tab switch — lane bookkeeping,
+            // not an event.
+            if let Some(h) = holder.filter(|h| h != &route.id) {
+                tracing::debug!(
+                    "route {} takes the track lane over from ended route {h}",
+                    route.id
+                );
+            }
+            self.video_lane_out.lock().insert(canon, route.id.clone());
+            VideoMode::H264
+        }
+    }
+
+    /// The sink side's mirror: claim the peer's inbound track lane for
+    /// this route if we offered H.264 — the sender may still pick MJPEG,
+    /// in which case the claim simply never sees a sample.
+    fn claim_inbound_video_lane(&self, route: &Route, from_node: &str) {
+        let offered_h264 = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|s| s.route(&route.id))
+            .map(|r| r.video.iter().any(|v| v == "h264"))
+            .unwrap_or(false);
+        if offered_h264 {
+            self.video_lane_in
+                .lock()
+                .insert(pubkey_part(from_node).to_string(), route.id.clone());
+        }
+    }
+
+    /// Start the capture behind an outbound display/camera stream, wired
+    /// to the packet forwarder and the in-band capture-status reports.
+    fn start_video_stream(
+        self: &Arc<Self>,
+        route: &Route,
+        to_node: &str,
+        mode: VideoMode,
+        source: VideoSource,
+    ) {
+        let peer = to_node.to_string();
+        let tx = self.video_out.clone();
+        let status_mesh = Arc::downgrade(self);
+        let status_peer = peer.clone();
+        let status_route = route.id.clone();
+        self.video.start_capture(
+            route.id.clone(),
+            mode,
+            source,
+            move |packet| {
+                // try_send: a full queue drops this packet; the next
+                // capture carries a fresher picture.
+                tx.try_send((peer.clone(), packet)).is_ok()
+            },
+            move |state, detail| {
+                // Capture-state transitions travel to the viewer in-band
+                // (`vstat`), so its console can explain a black stage
+                // instead of just showing one.
+                let Some(mesh) = status_mesh.upgrade() else {
+                    return;
+                };
+                let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
+                let peer = status_peer.clone();
+                tauri::async_runtime::spawn(async move {
+                    let Ok(payload) = serde_json::to_value(&frame) else {
+                        return;
+                    };
+                    if let Err(e) = mesh.send_media_value(&peer, payload).await {
+                        tracing::debug!("capture status to {} failed: {e}", short_id(&peer));
+                    }
+                });
+            },
+        );
     }
 
     /// The host side of a terminal route going active: spawn this user's
@@ -2893,6 +2941,14 @@ impl Mesh {
             && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
     }
 
+    /// [`Self::inbound_media_ok`] for the frame kinds two media share:
+    /// video frames (and their `vstat` reports) belong to a display route
+    /// *or* a camera one — same pipeline, different lens.
+    fn inbound_video_ok(&self, route_id: &str, sender: &str) -> bool {
+        self.inbound_media_ok(route_id, sender, MediaKind::Display)
+            || self.inbound_media_ok(route_id, sender, MediaKind::Video)
+    }
+
     /// Whether `sender` may drive this machine's keyboard and mouse: it is
     /// the recorded owner, or a member of the owned fleet this device
     /// belongs to. Nobody else — not even a peer a route auto-accepted for.
@@ -2908,9 +2964,10 @@ impl Mesh {
         })
     }
 
-    /// Ask the far end of an inbound display route for a clean decode
-    /// entry (IDR) *now* — the decoder here lost its place. Rate-limited
-    /// per route: decode errors arrive at frame rate, the asks must not.
+    /// Ask the far end of an inbound display/camera route for a clean
+    /// decode entry (IDR) *now* — the decoder here lost its place.
+    /// Rate-limited per route: decode errors arrive at frame rate, the
+    /// asks must not.
     /// Old peers don't know the message and drop it; recovery then waits
     /// for the periodic IDR exactly as before.
     pub async fn request_refresh(self: &Arc<Self>, route_id: String) -> Result<(), String> {
@@ -2934,9 +2991,9 @@ impl Mesh {
         .await
     }
 
-    /// Ask the far end of an inbound display route to stream with these
-    /// quality picks (`None` = that dial back on automatic). Old peers
-    /// drop the message and stay on automatic.
+    /// Ask the far end of an inbound display/camera route to stream with
+    /// these quality picks (`None` = that dial back on automatic). Old
+    /// peers drop the message and stay on automatic.
     pub async fn request_tune(
         self: &Arc<Self>,
         route_id: String,
@@ -3162,6 +3219,20 @@ fn node_of(cap_id: &str) -> String {
         .unwrap_or_else(|| cap_id.to_string())
 }
 
+/// The device part of a capability id — everything after the node
+/// (`"<node>:cam:video0"` → `"cam:video0"`). `None` for a bare node id.
+fn device_of(cap_id: &str) -> Option<String> {
+    cap_id.split_once(':').map(|(_, dev)| dev.to_string())
+}
+
+/// The transport's name for route-active log lines.
+fn mode_label(mode: VideoMode) -> &'static str {
+    match mode {
+        VideoMode::H264 => "H.264 track",
+        VideoMode::Mjpeg => "MJPEG",
+    }
+}
+
 /// Whether `route` is a mesh-native terminal session: generic media whose
 /// source endpoint is a machine's `…:terminal` handle. (Terminal
 /// endpoints are deliberately *not* catalog capabilities — generic would
@@ -3341,6 +3412,20 @@ mod tests {
 
         let storage = term_route("host:files", "me:files-view:1", MediaKind::Storage);
         assert!(!is_files_route(&storage), "media is part of the contract");
+    }
+
+    #[test]
+    fn capability_ids_split_into_node_and_device() {
+        // The device part keeps its own colons — a camera route resolves
+        // `<node>:cam:video0` back to the inventory id `cam:video0`, the
+        // display arm reads `screen:<id>` the same way.
+        assert_eq!(node_of("desk:cam:video0"), "desk");
+        assert_eq!(device_of("desk:cam:video0").as_deref(), Some("cam:video0"));
+        assert_eq!(device_of("desk:screen:7").as_deref(), Some("screen:7"));
+        assert_eq!(device_of("desk:screen").as_deref(), Some("screen"));
+        // A bare node id has no device half.
+        assert_eq!(device_of("desk"), None);
+        assert_eq!(node_of("desk"), "desk");
     }
 
     #[test]

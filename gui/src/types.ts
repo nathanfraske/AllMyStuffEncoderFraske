@@ -100,6 +100,13 @@ export const FEATURE_TERMINAL = "terminal";
  *  Files" console (mirrors the Rust `FEATURE_FILES`). */
 export const FEATURE_FILES = "files";
 
+/** The presence feature tag for camera *streaming* (mirrors the Rust
+ *  `FEATURE_CAMERA`): the node's video routes have a capture backend
+ *  behind them. Cameras have always ridden presence as capabilities;
+ *  without this tag the machine advertising them predates the transport,
+ *  and the console says so instead of waiting on pixels that never come. */
+export const FEATURE_CAMERA = "camera";
+
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
  *  The local node and any node we've had presence from count as app nodes. */
 export function isAppNode(n: { kind?: NodeKind; app?: boolean }): boolean {
@@ -462,6 +469,7 @@ export function originIcon(origin: string, media: MediaKind): string {
     gamepad: "🎮",
     storage: "🗂",
     system: "🔉",
+    viewer: "📺",
   };
   return map[origin] ?? MEDIA[media].icon;
 }
