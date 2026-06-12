@@ -441,7 +441,7 @@
       case "waiting_consent":
         return "Waiting for someone at the remote machine to approve screen sharing (a one-time consent dialog is open there).";
       case "display_asleep":
-        return "The remote display is asleep or blank — nudging it awake…";
+        return "The remote display is asleep or blank — forcing it awake (clicking here helps too)…";
       case "no_monitor":
         return "No monitor to capture on the remote machine — its displays are detached or in deep sleep.";
       case "grab_failed":

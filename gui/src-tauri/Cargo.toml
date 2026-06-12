@@ -103,6 +103,10 @@ libc = "0.2"
 libloading = "0.8"
 zbus = "5"
 pipewire = "0.9"
+# DPMS ForceLevel(On) — the X11/XWayland "light the panel now" call
+# (wake::force_display_on). Same xcb the tree already builds for xcap;
+# the dpms feature just generates one more extension module.
+xcb = { version = "1", features = ["dpms"] }
 
 # IOKit power assertions (NoDisplaySleep) while hosting a screen stream —
 # wake.rs. core-foundation is already in the resolved tree via Tauri.
@@ -133,6 +137,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]

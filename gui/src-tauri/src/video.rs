@@ -306,6 +306,9 @@ impl StatusReporter {
             return;
         }
         self.last = Some(state);
+        // The injector pulses the display awake on inbound clicks only
+        // while a stream is dark — this transition is what tells it.
+        wake::set_stream_dark(!matches!(state, VideoStatusState::Ok));
         (self.cb)(state, detail);
     }
 }
@@ -472,12 +475,12 @@ fn run_capture(
     let on_packet = &*on_packet;
     let mut reporter = StatusReporter::new(on_status);
     // A hosted screen is active use the OS can't see: hold the display
-    // awake for the stream's lifetime, and wiggle a display that's
-    // already dark — neither capture path can grab from a sleeping one.
+    // awake for the stream's lifetime, and force one that's already dark
+    // back on — neither capture path can grab from a sleeping panel.
     let _awake = wake::DisplayAwake::hold("hosting a screen stream");
-    wake::nudge_display();
+    wake::force_display_on();
     // The monitor up front: its resolution budgets the encoder's bitrate.
-    // One retry after a beat: the nudge may still be re-attaching outputs
+    // One retry after a beat: the wake may still be re-attaching outputs
     // (a deep-sleeping DisplayPort monitor detaches from the desktop
     // entirely, and re-enumeration after wake takes a moment).
     let monitor = match select_monitor(monitor_id) {
@@ -712,9 +715,15 @@ where
                 // A session that opened fine but never delivers is a dark
                 // display: damage-driven backends send nothing from a
                 // sleeping screen, and even a still desktop hands over its
-                // first frame on connect.
-                if !got_any && started.elapsed() >= FIRST_FRAME_STALL {
-                    reporter.report(VideoStatusState::DisplayAsleep, None);
+                // first frame on connect. Keep wake pressure on the panel
+                // the whole frameless window (the pulse rate-limits
+                // itself) — one polite wiggle at start demonstrably isn't
+                // enough on Windows.
+                if !got_any {
+                    wake::force_display_on();
+                    if started.elapsed() >= FIRST_FRAME_STALL {
+                        reporter.report(VideoStatusState::DisplayAsleep, None);
+                    }
                 }
                 continue;
             }
@@ -826,7 +835,9 @@ fn run_oneshot_capture(
                 // denied screen-recording permission, a Wayland portal
                 // that never granted) must be loud, not a debug whisper:
                 // it reads as "connected but no pixels" at the far end.
-                // The viewer hears it too, in-band.
+                // The viewer hears it too, in-band — and the panel keeps
+                // getting wake pressure in case sleep is the whole story.
+                wake::force_display_on();
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(100) {
                     tracing::warn!("screen grab failing for {route_id} ({failures}x): {e}");

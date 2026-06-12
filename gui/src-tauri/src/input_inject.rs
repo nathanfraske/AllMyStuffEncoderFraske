@@ -74,6 +74,16 @@ fn run_injector(rx: mpsc::Receiver<InputAction>) {
     };
     let mut screens = ScreenMap::load();
     while let Ok(action) = rx.recv() {
+        // A viewer clicking or typing at a *dark* console is the "remote
+        // login wakes the machine" moment — relight the panel so the
+        // stream they're driving blind comes back. No-op while frames
+        // flow (rate-limited and gated inside).
+        if matches!(
+            action,
+            InputAction::MouseButton { .. } | InputAction::Key { .. }
+        ) {
+            crate::wake::force_display_on_if_dark();
+        }
         let result = match action {
             InputAction::MouseMove { x, y, screen } => {
                 let rect = screens.resolve(screen);
