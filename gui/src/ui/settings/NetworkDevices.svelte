@@ -110,12 +110,12 @@
     border-radius: var(--r-pill);
   }
   .pill.mine {
-    background: #e7f6ef;
-    color: #137a52;
+    background: var(--ok-soft);
+    color: var(--ok);
   }
   .pill.guest {
-    background: #fdedd2;
-    color: #97631a;
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .pill.soft {
     background: var(--surface);

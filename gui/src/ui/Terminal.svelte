@@ -132,7 +132,9 @@
       theme: {
         background: "#14121f",
         foreground: "#d7d2ec",
-        cursor: "#a899f6",
+        // The accent magenta — oklch(0.64 0.255 350), same as the rest of
+        // the app (xterm wants plain hex).
+        cursor: "#f11ea1",
         selectionBackground: "#3d3760",
       },
       // The remote's ConPTY reflows on resize; telling xterm gets the
@@ -576,7 +578,7 @@
     transition: border-color 0.12s ease;
   }
   .terminal.bell {
-    border-color: #a899f6;
+    border-color: var(--accent);
   }
   .windowed .terminal {
     width: 100%;

@@ -3,7 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>AllMyStuff</title>
+    <!-- Painted before the bundle loads so the window never flashes white
+         over the dark theme. Mirrors --bg in src/app.css. -->
+    <style>
+      html {
+        background: oklch(0.135 0.022 285);
+      }
+    </style>
   </head>
   <body>
     <div id="app"></div>

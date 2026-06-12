@@ -187,7 +187,7 @@
     height: 2rem;
     border-radius: 50%;
     background: var(--warn);
-    color: #fff;
+    color: var(--bg);
     font-weight: 800;
     font-size: 1.1rem;
     flex-shrink: 0;
@@ -231,7 +231,7 @@
   }
   .card.confirm {
     border-color: var(--warn);
-    background: #fff8ee;
+    background: var(--warn-soft);
   }
   .card-head {
     display: flex;
@@ -265,8 +265,8 @@
     color: var(--accent-ink);
   }
   .state-pill.confirm-needed {
-    background: #fdedd2;
-    color: #97631a;
+    background: var(--warn-soft);
+    color: var(--warn);
   }
   .state-pill.waiting-peer {
     background: var(--surface-2);
@@ -303,12 +303,12 @@
     border: 1px solid transparent;
   }
   .tile.suffix {
-    background: #eaf1fe;
-    border-color: #cfe0fb;
+    background: var(--violet-soft);
+    border-color: oklch(0.62 0.2 292 / 0.4);
   }
   .tile.code {
-    background: #fdf0d9;
-    border-color: #f5e0b6;
+    background: var(--warn-soft);
+    border-color: oklch(0.79 0.14 75 / 0.4);
   }
   .tile-k {
     display: block;
@@ -326,10 +326,10 @@
     margin-top: 0.1rem;
   }
   .tile.suffix .tile-v {
-    color: #1c4fb3;
+    color: var(--violet);
   }
   .tile.code .tile-v {
-    color: #97631a;
+    color: var(--warn);
   }
   .arrow {
     color: var(--ink-faint);

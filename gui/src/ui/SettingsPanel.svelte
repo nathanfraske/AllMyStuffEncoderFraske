@@ -154,7 +154,7 @@
     padding: 0 0.3rem;
     border-radius: var(--r-pill);
     background: var(--warn);
-    color: #fff;
+    color: var(--bg);
     font-size: 0.68rem;
     font-weight: 700;
     display: grid;

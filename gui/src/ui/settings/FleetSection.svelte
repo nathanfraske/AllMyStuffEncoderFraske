@@ -273,9 +273,9 @@
   }
   .kick:hover,
   .kick.armed {
-    border-color: #e0939f;
+    border-color: oklch(0.7 0.19 14 / 0.5);
     color: var(--danger);
-    background: #fdeaee;
+    background: var(--danger-soft);
   }
   .leave-row {
     display: flex;
@@ -288,9 +288,9 @@
     flex: 1;
   }
   .leave.armed {
-    border-color: #e0939f;
+    border-color: oklch(0.7 0.19 14 / 0.5);
     color: var(--danger);
-    background: #fdeaee;
+    background: var(--danger-soft);
   }
   .empty-block {
     display: flex;

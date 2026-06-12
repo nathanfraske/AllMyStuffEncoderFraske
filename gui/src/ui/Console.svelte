@@ -851,7 +851,7 @@
   }
   .dot.on {
     background: var(--ok);
-    box-shadow: 0 0 0 3px rgba(26, 160, 109, 0.25);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
   }
   .inputs {
     display: flex;
@@ -894,7 +894,7 @@
     white-space: nowrap;
   }
   .tab-def {
-    color: #ffd86b;
+    color: var(--warn);
     font-size: 0.7rem;
   }
   .no-inputs {
@@ -932,7 +932,7 @@
     place-items: center;
     padding: 1rem;
     background:
-      radial-gradient(1200px 400px at 50% -10%, rgba(108, 92, 231, 0.12), transparent),
+      radial-gradient(1200px 400px at 50% -10%, oklch(0.62 0.2 292 / 0.12), transparent),
       repeating-linear-gradient(0deg, #100e1a, #100e1a 2px, #12101c 2px, #12101c 4px);
   }
   .stage.grabbing {
@@ -960,7 +960,7 @@
     height: 100%;
     border: 1px solid #2c2740;
     border-radius: var(--r-md);
-    background: radial-gradient(900px 360px at 50% 30%, rgba(108, 92, 231, 0.1), #0c0b14);
+    background: radial-gradient(900px 360px at 50% 30%, oklch(0.62 0.2 292 / 0.1), #0c0b14);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -971,7 +971,7 @@
   }
   .screen-glyph {
     font-size: 3.4rem;
-    filter: drop-shadow(0 4px 12px var(--mc, rgba(108, 92, 231, 0.4)));
+    filter: drop-shadow(0 4px 12px var(--mc, oklch(0.62 0.2 292 / 0.4)));
     opacity: 0.92;
   }
   .screen-title {
@@ -1034,9 +1034,9 @@
     border-color: var(--accent);
   }
   .toggle.on {
-    background: rgba(26, 160, 109, 0.18);
+    background: oklch(0.8 0.17 150 / 0.15);
     border-color: var(--ok);
-    color: #c7efdb;
+    color: oklch(0.88 0.09 150);
   }
   .t-icon {
     font-size: 0.95rem;
@@ -1111,7 +1111,7 @@
   }
   .pip.lit {
     background: var(--ok);
-    box-shadow: 0 0 0 3px rgba(26, 160, 109, 0.25);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
   }
   .status {
     display: flex;
@@ -1141,8 +1141,8 @@
     background: var(--mc);
   }
   .chip.stream {
-    color: #c7efdb;
-    border-color: rgba(26, 160, 109, 0.5);
+    color: oklch(0.88 0.09 150);
+    border-color: oklch(0.8 0.17 150 / 0.5);
   }
   .live-dot {
     background: var(--ok);
@@ -1159,11 +1159,11 @@
   }
   .end {
     flex-shrink: 0;
-    background: #2a1622;
-    border: 1px solid #5b2740;
-    color: #ffb4c8;
+    background: oklch(0.2 0.05 14);
+    border: 1px solid oklch(0.38 0.11 14);
+    color: oklch(0.82 0.1 14);
   }
   .end:hover {
-    background: #3a1c2e;
+    background: oklch(0.25 0.07 14);
   }
 </style>
