@@ -293,12 +293,15 @@ export interface UpdatePrefs {
  *  Mouse coordinates are normalized 0..1 over the remote screen the
  *  console is showing; `screen` names which one (the `screen:<id>`
  *  capability's id), absent for the primary — so control follows the
- *  selected tab. */
+ *  selected tab. Key events carry the physical `code` alongside the
+ *  layout-resolved `key`: combinations resolve through it on the far
+ *  side (Ctrl+C must land on the C key, whatever character the held
+ *  modifiers composed here). */
 export type InputAction =
   | { kind: "mouse_move"; x: number; y: number; screen?: number }
   | { kind: "mouse_button"; button: number; down: boolean }
   | { kind: "wheel"; dx: number; dy: number }
-  | { kind: "key"; key: string; down: boolean };
+  | { kind: "key"; key: string; code?: string; down: boolean };
 
 /** One terminal event a terminal window sends down its route. Tagged
  *  exactly like the Rust `TermEvent` (serde `kind`, snake_case); `bytes`

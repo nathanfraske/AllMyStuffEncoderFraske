@@ -16,15 +16,29 @@
 //! point on a second screen. macOS and X11 take global coordinates
 //! through enigo directly.
 //!
-//! Keys arrive as the DOM `KeyboardEvent.key` value: printable characters
-//! inject as themselves (so the *typist's* layout wins), named keys map
-//! through a fixed table.
+//! Keys arrive as the DOM `KeyboardEvent.key` value (the layout-resolved
+//! character or a name like "Enter"), plus — from senders that know it —
+//! the physical `KeyboardEvent.code` ("KeyC"). Injection assumes key
+//! *combinations* are the norm, not the exception:
+//!
+//! - Plain typing (no modifier beyond Shift held) injects the resolved
+//!   character as itself, so the *typist's* layout wins — with held
+//!   Shift, an uppercase letter injects as its base letter and the
+//!   forwarded Shift restores the case.
+//! - A chord (Ctrl/Alt/Meta held) resolves through the *physical* key:
+//!   Ctrl+C must land on the remote's C key, never on whatever character
+//!   the sender's layout composed under the held modifiers.
+//! - Each route's pressed keys are remembered, so a keyup releases
+//!   exactly the key its keydown pressed (Shift+1 goes down as "!" but
+//!   comes up as "1" — without the memory the remote keeps a stuck key),
+//!   and a route tearing down mid-chord lifts everything it still held.
 //!
 //! `Enigo` isn't `Send`, so one dedicated thread owns it and drains a
-//! channel of [`InputAction`]s; the mesh just calls [`Injector::apply`]
-//! after its route/ownership gates pass. The thread starts lazily on the
-//! first event and dies with the app.
+//! channel of commands; the mesh just calls [`Injector::apply`] after its
+//! route/ownership gates pass. The thread starts lazily on the first
+//! event and dies with the app.
 
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 #[cfg(not(windows))]
@@ -34,9 +48,14 @@ use parking_lot::Mutex;
 
 use allmystuff_session::InputAction;
 
+enum Cmd {
+    Event { route: String, action: InputAction },
+    ReleaseRoute(String),
+}
+
 #[derive(Default)]
 pub struct Injector {
-    tx: Mutex<Option<mpsc::Sender<InputAction>>>,
+    tx: Mutex<Option<mpsc::Sender<Cmd>>>,
 }
 
 impl Injector {
@@ -47,15 +66,37 @@ impl Injector {
     /// Queue one event for injection. Starts the injector thread on first
     /// use; if the platform refuses (no display server, missing
     /// permissions) the failure is logged once and events are dropped.
-    pub fn apply(&self, action: InputAction) {
+    pub fn apply(&self, route: &str, action: InputAction) {
+        self.send(
+            Cmd::Event {
+                route: route.into(),
+                action,
+            },
+            true,
+        );
+    }
+
+    /// A control route ended (teardown, peer drop): lift any keys its
+    /// stream still holds down, so a console that vanished mid-chord
+    /// doesn't leave this machine with a stuck Ctrl. No-op for routes
+    /// that never pressed anything.
+    pub fn release_route(&self, route: &str) {
+        // Never spawns the thread: if it isn't running, nothing is held.
+        self.send(Cmd::ReleaseRoute(route.into()), false);
+    }
+
+    fn send(&self, cmd: Cmd, spawn: bool) {
         let mut tx = self.tx.lock();
         if tx.is_none() {
-            let (sender, rx) = mpsc::channel::<InputAction>();
+            if !spawn {
+                return;
+            }
+            let (sender, rx) = mpsc::channel::<Cmd>();
             std::thread::spawn(move || run_injector(rx));
             *tx = Some(sender);
         }
         if let Some(t) = tx.as_ref() {
-            if t.send(action).is_err() {
+            if t.send(cmd).is_err() {
                 // The thread ended (platform refused); allow a retry on the
                 // next event rather than wedging forever.
                 *tx = None;
@@ -64,7 +105,7 @@ impl Injector {
     }
 }
 
-fn run_injector(rx: mpsc::Receiver<InputAction>) {
+fn run_injector(rx: mpsc::Receiver<Cmd>) {
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(e) => {
@@ -73,7 +114,24 @@ fn run_injector(rx: mpsc::Receiver<InputAction>) {
         }
     };
     let mut screens = ScreenMap::load();
-    while let Ok(action) = rx.recv() {
+    // Each control route's keyboard state — held modifiers steer how the
+    // next key resolves, and whatever is still down gets lifted when the
+    // route goes away.
+    let mut keys: HashMap<String, KeyTracker> = HashMap::new();
+    while let Ok(cmd) = rx.recv() {
+        let (route, action) = match cmd {
+            Cmd::Event { route, action } => (route, action),
+            Cmd::ReleaseRoute(route) => {
+                if let Some(mut tracker) = keys.remove(&route) {
+                    for k in tracker.release_all() {
+                        if let Err(e) = enigo.key(k, Direction::Release) {
+                            tracing::debug!("releasing {k:?} after route end failed: {e}");
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         // A viewer clicking or typing at a *dark* console is the "remote
         // login wakes the machine" moment — relight the panel so the
         // stream they're driving blind comes back. No-op while frames
@@ -108,10 +166,22 @@ fn run_injector(rx: mpsc::Receiver<InputAction>) {
                 }
                 r
             }
-            InputAction::Key { ref key, down } => match map_key(key) {
-                Some(k) => enigo.key(k, direction(down)).map_err(|e| e.to_string()),
-                None => Ok(()),
-            },
+            InputAction::Key {
+                ref key,
+                ref code,
+                down,
+            } => {
+                let tracker = keys.entry(route).or_default();
+                let k = if down {
+                    tracker.press(key, code.as_deref())
+                } else {
+                    tracker.release(key, code.as_deref())
+                };
+                match k {
+                    Some(k) => enigo.key(k, direction(down)).map_err(|e| e.to_string()),
+                    None => Ok(()),
+                }
+            }
         };
         if let Err(e) = result {
             tracing::debug!("input injection event failed: {e}");
@@ -284,21 +354,161 @@ fn dom_button(button: u8) -> Option<Button> {
     }
 }
 
-/// DOM `KeyboardEvent.key` → enigo key. A single-char value is a
-/// printable character and injects as itself (typist's layout wins);
-/// named keys map explicitly. `None` = a key we deliberately don't carry
-/// (media keys, IME composition, lock keys we can't faithfully mirror).
-fn map_key(key: &str) -> Option<Key> {
-    let mut chars = key.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        return Some(Key::Unicode(c));
+/// One control route's keyboard state: which keys its stream holds down
+/// (each remembered as the enigo key actually injected), in press order.
+///
+/// The memory carries combinations across the places a stateless mapping
+/// breaks: held Ctrl/Alt/Meta switch resolution to the physical key, a
+/// keyup releases exactly what its keydown pressed even when the
+/// modifiers (and so the DOM `key` value) changed in between, and a dying
+/// route can lift everything it still holds.
+#[derive(Default)]
+struct KeyTracker {
+    /// (identity, injected key) per held key — identity is the physical
+    /// `code` when the sender knew it, else the `key` value itself.
+    pressed: Vec<(String, Key)>,
+}
+
+impl KeyTracker {
+    fn held(&self, k: Key) -> bool {
+        self.pressed.iter().any(|(_, p)| *p == k)
     }
+
+    fn identity(key: &str, code: Option<&str>) -> String {
+        match code {
+            Some(c) if !c.is_empty() => c.into(),
+            _ => key.into(),
+        }
+    }
+
+    /// A keydown: resolve what to inject and remember it as held.
+    fn press(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
+        let k = self.resolve(key, code)?;
+        let id = Self::identity(key, code);
+        // An old sender's auto-repeat re-presses; keep one entry.
+        self.pressed.retain(|(i, _)| *i != id);
+        self.pressed.push((id, k));
+        Some(k)
+    }
+
+    /// A keyup: release exactly the key the matching keydown pressed. For
+    /// a down we never saw (an older sender, a mid-stream subscribe),
+    /// fall back to resolving fresh.
+    fn release(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
+        let id = Self::identity(key, code);
+        if let Some(i) = self.pressed.iter().position(|(i, _)| *i == id) {
+            return Some(self.pressed.remove(i).1);
+        }
+        self.resolve(key, code)
+    }
+
+    /// Everything still held, in reverse press order (chords unwind the
+    /// way they wound up: the letter lifts before its modifier).
+    fn release_all(&mut self) -> Vec<Key> {
+        self.pressed.drain(..).rev().map(|(_, k)| k).collect()
+    }
+
+    /// DOM `KeyboardEvent.key` (+ physical `code`) → enigo key, steered by
+    /// the modifiers this route currently holds. `None` = a key we
+    /// deliberately don't carry (media keys, IME composition, lock keys we
+    /// can't faithfully mirror).
+    fn resolve(&self, key: &str, code: Option<&str>) -> Option<Key> {
+        let mut chars = key.chars();
+        let c = match (chars.next(), chars.next()) {
+            (Some(c), None) => c,
+            _ => return map_named(key),
+        };
+        let combo = self.held(Key::Control) || self.held(Key::Alt) || self.held(Key::Meta);
+        if combo {
+            // A chord wants the *physical* key: Ctrl+C is the C key, not
+            // whatever character the sender's layout composed under the
+            // held modifiers (macOS Option turns letters into "ç", "å"…).
+            if let Some(base) = code.and_then(base_char) {
+                return Some(Key::Unicode(base));
+            }
+        }
+        if (combo || self.held(Key::Shift)) && c.is_uppercase() {
+            // The modifier is already held on this end — inject the base
+            // letter and let it restore the case, instead of asking the
+            // platform for a "press of 'C'" (which Windows can't express
+            // as a single virtual key).
+            let mut lower = c.to_lowercase();
+            if let (Some(l), None) = (lower.next(), lower.next()) {
+                return Some(Key::Unicode(l));
+            }
+        }
+        Some(Key::Unicode(c))
+    }
+}
+
+/// The physical key a DOM `KeyboardEvent.code` names, as the character on
+/// its keycap (US-reference, the convention `code` itself is defined by) —
+/// what a chord resolves through. `None` for keys without a stable cap
+/// (named keys travel by `key` instead).
+fn base_char(code: &str) -> Option<char> {
+    if let Some(letter) = code.strip_prefix("Key") {
+        let mut chars = letter.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_uppercase() {
+                return Some(c.to_ascii_lowercase());
+            }
+        }
+        return None;
+    }
+    if let Some(digit) = code.strip_prefix("Digit") {
+        let mut chars = digit.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_digit() {
+                return Some(c);
+            }
+        }
+        return None;
+    }
+    if let Some(pad) = code.strip_prefix("Numpad") {
+        return match pad {
+            "Add" => Some('+'),
+            "Subtract" => Some('-'),
+            "Multiply" => Some('*'),
+            "Divide" => Some('/'),
+            "Decimal" => Some('.'),
+            _ => {
+                let mut chars = pad.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if c.is_ascii_digit() => Some(c),
+                    _ => None,
+                }
+            }
+        };
+    }
+    match code {
+        "Space" => Some(' '),
+        "Minus" => Some('-'),
+        "Equal" => Some('='),
+        "BracketLeft" => Some('['),
+        "BracketRight" => Some(']'),
+        "Backslash" => Some('\\'),
+        "Semicolon" => Some(';'),
+        "Quote" => Some('\''),
+        "Backquote" => Some('`'),
+        "Comma" => Some(','),
+        "Period" => Some('.'),
+        "Slash" => Some('/'),
+        _ => None,
+    }
+}
+
+/// Named DOM `KeyboardEvent.key` values → enigo keys.
+fn map_named(key: &str) -> Option<Key> {
     Some(match key {
         "Enter" => Key::Return,
         "Escape" => Key::Escape,
         "Backspace" => Key::Backspace,
         "Tab" => Key::Tab,
         "Delete" => Key::Delete,
+        // Insert is half a chord on its own (Shift+Insert pastes,
+        // Ctrl+Insert copies) — macOS has no such key to press.
+        #[cfg(not(target_os = "macos"))]
+        "Insert" => Key::Insert,
         "Home" => Key::Home,
         "End" => Key::End,
         "PageUp" => Key::PageUp,
@@ -334,17 +544,102 @@ mod tests {
 
     #[test]
     fn printable_keys_inject_as_unicode() {
-        assert_eq!(map_key("a"), Some(Key::Unicode('a')));
-        assert_eq!(map_key("?"), Some(Key::Unicode('?')));
+        let t = KeyTracker::default();
+        assert_eq!(t.resolve("a", Some("KeyA")), Some(Key::Unicode('a')));
+        assert_eq!(t.resolve("?", Some("Slash")), Some(Key::Unicode('?')));
         // Layout-resolved characters carry through untranslated.
-        assert_eq!(map_key("ü"), Some(Key::Unicode('ü')));
+        assert_eq!(t.resolve("ü", None), Some(Key::Unicode('ü')));
     }
 
     #[test]
     fn named_keys_map_and_unknown_ones_drop() {
-        assert_eq!(map_key("Enter"), Some(Key::Return));
-        assert_eq!(map_key("ArrowLeft"), Some(Key::LeftArrow));
-        assert_eq!(map_key("MediaPlayPause"), None);
+        let t = KeyTracker::default();
+        assert_eq!(t.resolve("Enter", None), Some(Key::Return));
+        assert_eq!(t.resolve("ArrowLeft", None), Some(Key::LeftArrow));
+        assert_eq!(t.resolve("MediaPlayPause", None), None);
+    }
+
+    #[test]
+    fn chords_resolve_through_the_physical_key() {
+        let mut t = KeyTracker::default();
+        assert_eq!(t.press("Control", Some("ControlLeft")), Some(Key::Control));
+        // Ctrl+C lands on the C key even when the sender's layout
+        // composed something else under the held modifiers…
+        assert_eq!(t.press("ç", Some("KeyC")), Some(Key::Unicode('c')));
+        // …and the shifted variant of a chord stays on the same key.
+        assert_eq!(t.press("C", Some("KeyC")), Some(Key::Unicode('c')));
+        assert_eq!(t.press("!", Some("Digit1")), Some(Key::Unicode('1')));
+        // Named keys chord by name, as always.
+        assert_eq!(t.resolve("Tab", Some("Tab")), Some(Key::Tab));
+        // An older sender carries no code — the character itself stands,
+        // lower-cased so the held modifier isn't asked for twice.
+        assert_eq!(t.resolve("T", None), Some(Key::Unicode('t')));
+        assert_eq!(t.resolve("t", None), Some(Key::Unicode('t')));
+    }
+
+    #[test]
+    fn shifted_typing_injects_the_base_letter() {
+        let mut t = KeyTracker::default();
+        assert_eq!(t.press("Shift", Some("ShiftLeft")), Some(Key::Shift));
+        // The held Shift restores the case on this end.
+        assert_eq!(t.resolve("A", Some("KeyA")), Some(Key::Unicode('a')));
+        // Shifted symbols keep the typist's layout (no chord here).
+        assert_eq!(t.resolve("!", Some("Digit1")), Some(Key::Unicode('!')));
+        assert_eq!(t.resolve("@", None), Some(Key::Unicode('@')));
+    }
+
+    #[test]
+    fn keyup_releases_what_its_keydown_pressed() {
+        let mut t = KeyTracker::default();
+        t.press("Shift", Some("ShiftLeft"));
+        // Shift+1 goes down as "!"…
+        assert_eq!(t.press("!", Some("Digit1")), Some(Key::Unicode('!')));
+        assert_eq!(t.release("Shift", Some("ShiftLeft")), Some(Key::Shift));
+        // …and comes up as "1": the release must lift the '!' that went
+        // down, not a '1' that never did.
+        assert_eq!(t.release("1", Some("Digit1")), Some(Key::Unicode('!')));
+        assert!(t.pressed.is_empty());
+        // A keyup nothing matches (older sender) still resolves fresh.
+        assert_eq!(t.release("a", Some("KeyA")), Some(Key::Unicode('a')));
+    }
+
+    #[test]
+    fn release_all_unwinds_in_reverse_press_order() {
+        let mut t = KeyTracker::default();
+        t.press("Control", Some("ControlLeft"));
+        t.press("Shift", Some("ShiftLeft"));
+        t.press("T", Some("KeyT"));
+        assert_eq!(
+            t.release_all(),
+            vec![Key::Unicode('t'), Key::Shift, Key::Control]
+        );
+        assert!(t.pressed.is_empty());
+    }
+
+    #[test]
+    fn repeated_downs_keep_one_held_entry() {
+        let mut t = KeyTracker::default();
+        t.press("a", Some("KeyA"));
+        t.press("a", Some("KeyA"));
+        assert_eq!(t.pressed.len(), 1);
+        // Identity falls back to the key value when the code is missing.
+        t.press("b", None);
+        t.press("b", Some(""));
+        assert_eq!(t.pressed.len(), 2);
+    }
+
+    #[test]
+    fn keycaps_resolve_from_dom_codes() {
+        assert_eq!(base_char("KeyA"), Some('a'));
+        assert_eq!(base_char("Digit7"), Some('7'));
+        assert_eq!(base_char("Numpad3"), Some('3'));
+        assert_eq!(base_char("NumpadAdd"), Some('+'));
+        assert_eq!(base_char("Space"), Some(' '));
+        assert_eq!(base_char("BracketLeft"), Some('['));
+        // Named keys have no keycap character — they travel by name.
+        assert_eq!(base_char("Enter"), None);
+        assert_eq!(base_char("F5"), None);
+        assert_eq!(base_char("ControlLeft"), None);
     }
 
     #[test]

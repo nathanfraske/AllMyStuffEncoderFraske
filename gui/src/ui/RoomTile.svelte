@@ -13,6 +13,7 @@
   // When the sharer also turned "share control" on (there's a live input
   // route from this machine's keyboard & mouse to theirs), the tile
   // captures clicks/keys over the picture and sends them down that route.
+  import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import { sendInput, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
@@ -140,10 +141,16 @@
     e.preventDefault();
     send({ kind: "wheel", dx: e.deltaX, dy: e.deltaY });
   }
+  // Key forwarding with the bookkeeping combinations need: the physical
+  // `code` rides along, auto-repeat stays local, and keys still held when
+  // the tile loses focus are lifted in a burst — otherwise the sharer's
+  // machine keeps a stuck modifier.
+  const keys = makeKeyForwarder(send);
+
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!controlRoute) return;
     e.preventDefault();
-    send({ kind: "key", key: e.key, down });
+    keys.onKey(e, down);
   }
 </script>
 
@@ -165,6 +172,7 @@
   onwheel={onWheel}
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
+  onblur={() => keys.releaseAll()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
   {#if !hasFrame}

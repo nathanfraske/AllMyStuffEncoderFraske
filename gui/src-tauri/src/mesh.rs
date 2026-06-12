@@ -954,7 +954,7 @@ impl Mesh {
                         if self.inbound_media_ok(&ev.route, &from, MediaKind::Input)
                             && self.sender_may_control(&from)
                         {
-                            self.injector.apply(ev.action);
+                            self.injector.apply(&ev.route, ev.action);
                         } else {
                             tracing::warn!(
                                 "dropped input event from {from}: not an authorized controller"
@@ -1465,6 +1465,9 @@ impl Mesh {
                     self.video_watchers.lock().remove(&id);
                     self.release_video_lanes(&id);
                     self.release_audio_lanes(&id);
+                    // A control route ending mid-chord must not leave this
+                    // machine holding the keys it injected.
+                    self.injector.release_route(&id);
                     self.terminal.stop(&id);
                     self.files.stop(&id);
                     self.drop_downloads(&id);

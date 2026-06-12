@@ -1146,11 +1146,12 @@ class AppStore {
   /** Start the console session *in this window* — the body of a console
    *  window (and the web preview's popover). Wires the backbone video route
    *  to this machine's display first; audio passthrough and keyboard &
-   *  mouse come up automatically the moment the video route reports
-   *  active — a console is the whole session by default, like sitting
-   *  down at the machine, but the legs are sequenced (video, then the
-   *  rest) instead of racing each other onto the wire at open. The
-   *  toggles inside are the off-switches. */
+   *  mouse control are *assumed on* for a remote session — a console is
+   *  the whole session by default, like sitting down at the machine. The
+   *  legs are sequenced (video, then the rest) instead of racing each
+   *  other onto the wire at open, but sequencing only ever *delays* them:
+   *  a video route that's already live (or a snapshot that never comes)
+   *  still ends with control on. The toggles inside are the off-switches. */
   openConsoleHere(nodeId: string) {
     const node = this.node(nodeId);
     if (!this.consoleAllowed(node, nodeId)) return;
@@ -1166,26 +1167,40 @@ class AppStore {
     this.consoleCodec = "auto";
     this.consoleTune = {};
     void this.applyConsoleVideo();
-    if (this.consoleVideoLive) {
-      // The usual case: video is on the wire — the snapshot that flips
-      // it active triggers the remaining legs (see applySessionSnapshot).
+    if (
+      this.consoleVideoLive &&
+      this.backendConnected &&
+      this.routeStates[this.consoleVideoLive]?.state !== "active"
+    ) {
+      // The usual case: video is on the wire but not active yet — the
+      // snapshot that flips it active triggers the remaining legs (see
+      // applySessionSnapshot). The timer is the backstop for a snapshot
+      // that never comes (a lost push, a route active since before this
+      // window looked): control comes up regardless, just unsequenced.
       this.consoleAutoLegs = true;
+      this.consoleAutoLegsFallback = setTimeout(() => this.startConsoleAutoLegs(), 3000);
     } else {
-      // No video path (nothing to wait for) — bring the legs up now; an
-      // audio-only console is still a session.
+      // Video already active, absent, or local-only (no backend) —
+      // nothing to sequence behind; bring the legs up now.
       this.startConsoleAutoLegs();
     }
     this.toast("ok", `Console open on ${node!.label}`);
   }
 
   /** Pending "bring audio + control up once video is live" — set at console
-   *  open, consumed by the first snapshot showing the video route active. */
+   *  open, consumed by the first snapshot showing the video route active
+   *  (or by the fallback timer when no such snapshot ever lands). */
   private consoleAutoLegs = false;
+  private consoleAutoLegsFallback: ReturnType<typeof setTimeout> | null = null;
 
   /** The console's default session legs. Only ever turns things *on* — a
    *  toggle the user already flipped stays exactly as they left it. */
   private startConsoleAutoLegs() {
     this.consoleAutoLegs = false;
+    if (this.consoleAutoLegsFallback) {
+      clearTimeout(this.consoleAutoLegsFallback);
+      this.consoleAutoLegsFallback = null;
+    }
     if (!this.consoleNodeId) return;
     if (!this.consoleAudio) this.toggleConsoleAudio();
     if (!this.consoleControl) this.toggleConsoleControl();
@@ -1235,6 +1250,10 @@ class AppStore {
     this.consoleAudio = false;
     this.consoleControl = false;
     this.consoleAutoLegs = false;
+    if (this.consoleAutoLegsFallback) {
+      clearTimeout(this.consoleAutoLegsFallback);
+      this.consoleAutoLegsFallback = null;
+    }
     return Promise.allSettled(pending);
   }
 
