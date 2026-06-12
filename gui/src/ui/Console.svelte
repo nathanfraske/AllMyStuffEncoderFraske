@@ -22,8 +22,11 @@
   import { app } from "../store.svelte";
   import {
     closeThisWindow,
+    focusThisWindow,
+    isTauri,
     onThisWindowClose,
     refreshRoute,
+    toggleWindowFullscreen,
     watchVideo,
     watchVideoStatus,
     type VideoHostStatus,
@@ -49,6 +52,26 @@
   // advertises the tabs but has no transport behind them, and the stage
   // says so instead of waiting on pixels that never come.
   const cameraSupported = $derived(node ? app.cameraStreamSupported(node) : false);
+  // The selected input is off in its own popout window — the stage shows
+  // the big "Return video here" instead of competing for the stream.
+  const selectedPopped = $derived(!!selectedId && app.isVideoPopped(`cap:${selectedId}`));
+  // Pointer forwarding is live only over a *desktop* picture: coordinates
+  // normalize onto the streamed frame, and only a screen's frame maps
+  // back onto the remote desktop — a camera tab is a viewing surface.
+  // (Keys keep the session rule: with control on they always belong to
+  // the remote, whichever tab is showing.)
+  const stagePointerActive = $derived(app.consoleControl && selected?.media === "display");
+  // Fullscreen ("theater"): the stage takes the whole window over (bars
+  // and tabs hidden), and — windowed — the OS window goes fullscreen too,
+  // so exactly this video fills the screen. Esc exits while control is
+  // off; with control on every key belongs to the remote, so the hover
+  // ⛶ is the way out.
+  let theater = $state(false);
+
+  async function flipTheater() {
+    theater = !theater;
+    if (windowed) await toggleWindowFullscreen();
+  }
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
   // mouse move so the remote lands the cursor on the screen being viewed.
@@ -504,7 +527,13 @@
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
-    if (!app.consoleControl) return;
+    if (!stagePointerActive) return;
+    // The KVM rule: with control live, the window under the mouse is the
+    // one your keyboard should reach — claim OS focus on hover, no click
+    // in between (a click would go to the *remote*). This is what makes
+    // keys land on the machine you're pointing at when popout windows of
+    // other machines are open beside this console.
+    if (!document.hasFocus()) void focusThisWindow();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
@@ -514,7 +543,7 @@
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
-    if (!app.consoleControl) return;
+    if (!stagePointerActive) return;
     const p = normPoint(e);
     if (!p) return;
     e.preventDefault();
@@ -524,7 +553,7 @@
   }
 
   function onWheel(e: WheelEvent) {
-    if (!app.consoleControl || !normPoint(e)) return;
+    if (!stagePointerActive || !normPoint(e)) return;
     e.preventDefault();
     // Normalize the browser's delta modes to wheel lines.
     const lines = e.deltaMode === 1 ? 1 : 1 / 40;
@@ -539,9 +568,13 @@
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node) return;
     if (!app.consoleControl) {
-      // Without control, Escape closes the session (popover habit; in a
-      // window it closes the window too).
-      if (down && e.key === "Escape") endSession();
+      // Without control, Escape steps out of fullscreen first, then (the
+      // popover habit) closes the session; in a window it closes the
+      // window too.
+      if (down && e.key === "Escape") {
+        if (theater) void flipTheater();
+        else endSession();
+      }
       return;
     }
     // With control on, *every* key belongs to the remote — including
@@ -576,6 +609,7 @@
     {/if}
     <div
       class="console"
+      class:theater
       role="dialog"
       aria-modal={!windowed}
       aria-label="Console for {displayName(node)}"
@@ -595,18 +629,33 @@
         <!-- Video inputs tab bar -->
         <div class="inputs" role="tablist" aria-label="Video inputs">
           {#each inputs as inp (inp.id)}
-            <button
-              class="tab"
-              class:active={inp.id === selectedId}
-              role="tab"
-              aria-selected={inp.id === selectedId}
-              title={inp.label}
-              onclick={() => app.setConsoleInput(inp.id)}
-            >
-              <span class="tab-icon">{inputIcon(inp)}</span>
-              <span class="tab-label">{inp.label}</span>
-              {#if inp.default}<span class="tab-def" title="Default input">★</span>{/if}
-            </button>
+            {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
+            <span class="tab-wrap" class:active={inp.id === selectedId}>
+              <button
+                class="tab"
+                class:active={inp.id === selectedId}
+                role="tab"
+                aria-selected={inp.id === selectedId}
+                title={inpPopped ? `${inp.label} — in its own window` : inp.label}
+                onclick={() => app.setConsoleInput(inp.id)}
+              >
+                <span class="tab-icon">{inputIcon(inp)}</span>
+                <span class="tab-label">{inp.label}</span>
+                {#if inp.default}<span class="tab-def" title="Default input">★</span>{/if}
+                {#if inpPopped}<span class="tab-out" title="In its own window">↗</span>{/if}
+              </button>
+              {#if isTauri() && !inpPopped}
+                <button
+                  class="tab-pop"
+                  title="Pop this video out into its own window"
+                  aria-label="Pop {inp.label} out into its own window"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void app.popOutConsoleInput(inp.id);
+                  }}>⧉</button
+                >
+              {/if}
+            </span>
           {/each}
           {#if inputs.length === 0}
             <span class="no-inputs">No video inputs advertised</span>
@@ -620,7 +669,7 @@
            event belongs to the far machine while control is on. -->
       <div
         class="stage"
-        class:grabbing={app.consoleControl}
+        class:grabbing={stagePointerActive}
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         onpointermove={onPointerMove}
@@ -629,46 +678,79 @@
         onwheel={onWheel}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
-        {#if app.consoleVideoLive}
-          <canvas
-            bind:this={canvasEl}
-            class="live"
-            class:waiting={!hasFrame}
-            aria-label="Live {selected?.media === 'video' ? 'camera' : 'screen'} view of {displayName(
-              node,
-            )}"
-          ></canvas>
-        {/if}
-        {#if hasFrame}
-          <!-- the canvas above is the stage; a host-reported stall (the
-               remote display sleeping mid-session) banners over it. -->
-          {#if hostStatus}
-            <div class="host-status">{hostStatusText(hostStatus)}</div>
-          {/if}
-        {:else if selected}
-          <div class="screen" style="--mc: {mediaColor(selected.media)}">
-            <div class="screen-glyph">{inputIcon(selected)}</div>
-            <div class="screen-title">{selected.label}</div>
-            {#if selected.media === "display"}
-              <div class="screen-note">
-                {hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…"}
-              </div>
-            {:else if cameraSupported}
-              <div class="screen-note">
-                {hostStatus ? hostStatusText(hostStatus) : "Connecting this camera…"}
-              </div>
-            {:else}
-              <div class="screen-note">
-                This machine runs an older AllMyStuff — update it there and its cameras will
-                stream here.
-              </div>
-            {/if}
+        {#if selectedPopped}
+          <!-- This input lives in its own window right now; here's its
+               way home — findable even when that window is fullscreen on
+               another monitor. -->
+          <div class="screen">
+            <div class="screen-glyph">{selected ? inputIcon(selected) : "🪟"}</div>
+            <div class="screen-title">{selected?.label ?? ""} is in its own window</div>
+            <button class="return-btn" onclick={() => app.askReturnVideo(`cap:${selectedId}`)}>
+              ⤓ Return video here
+            </button>
           </div>
         {:else}
-          <div class="screen empty">
-            <div class="screen-glyph">🪟</div>
-            <div class="screen-note">Pick a video input above to view this machine.</div>
-          </div>
+          {#if app.consoleVideoLive}
+            <canvas
+              bind:this={canvasEl}
+              class="live"
+              class:waiting={!hasFrame}
+              aria-label="Live {selected?.media === 'video' ? 'camera' : 'screen'} view of {displayName(
+                node,
+              )}"
+            ></canvas>
+          {/if}
+          {#if hasFrame}
+            <!-- the canvas above is the stage; a host-reported stall (the
+                 remote display sleeping mid-session) banners over it. -->
+            {#if hostStatus}
+              <div class="host-status">{hostStatusText(hostStatus)}</div>
+            {/if}
+          {:else if selected}
+            <div class="screen" style="--mc: {mediaColor(selected.media)}">
+              <div class="screen-glyph">{inputIcon(selected)}</div>
+              <div class="screen-title">{selected.label}</div>
+              {#if selected.media === "display"}
+                <div class="screen-note">
+                  {hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…"}
+                </div>
+              {:else if cameraSupported}
+                <div class="screen-note">
+                  {hostStatus ? hostStatusText(hostStatus) : "Connecting this camera…"}
+                </div>
+              {:else}
+                <div class="screen-note">
+                  This machine runs an older AllMyStuff — update it there and its cameras will
+                  stream here.
+                </div>
+              {/if}
+            </div>
+          {:else}
+            <div class="screen empty">
+              <div class="screen-glyph">🪟</div>
+              <div class="screen-note">Pick a video input above to view this machine.</div>
+            </div>
+          {/if}
+          <!-- The video player's corner: fullscreen where everyone looks
+               for it. Hover-revealed; clicks stop here so control
+               forwarding never sees them. -->
+          {#if app.consoleVideoLive}
+            <div class="corner">
+              <button
+                class="corner-btn"
+                title={theater
+                  ? `Exit fullscreen${app.consoleControl ? "" : " (Esc)"}`
+                  : "Fullscreen"}
+                aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
+                onpointerdown={(e) => e.stopPropagation()}
+                onpointerup={(e) => e.stopPropagation()}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void flipTheater();
+                }}>{theater ? "⤡" : "⛶"}</button
+              >
+            </div>
+          {/if}
         {/if}
       </div>
 
@@ -929,6 +1011,45 @@
     color: var(--warn);
     font-size: 0.7rem;
   }
+  .tab-out {
+    color: var(--accent-2, #9be3ff);
+    font-size: 0.7rem;
+  }
+  .tab.active .tab-out {
+    color: #fff;
+  }
+  /* The hover popout: lives on a wrapper (a button can't nest one),
+     revealed when the tab is hovered or it has keyboard focus. */
+  .tab-wrap {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+  .tab-pop {
+    position: absolute;
+    top: -0.45rem;
+    right: -0.3rem;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: 50%;
+    border: 1px solid #443d63;
+    background: #241f38;
+    color: #c8c2e0;
+    font-size: 0.66rem;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .tab-wrap:hover .tab-pop,
+  .tab-pop:focus-visible {
+    opacity: 1;
+  }
+  .tab-pop:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
   .no-inputs {
     font-size: 0.76rem;
     color: #8b84a8;
@@ -969,6 +1090,67 @@
   }
   .stage.grabbing {
     cursor: crosshair;
+  }
+  /* Fullscreen ("theater"): chrome away, the stage is the window. */
+  .console.theater > .bar,
+  .console.theater > .controls {
+    display: none;
+  }
+  .console.theater {
+    border: none;
+    border-radius: 0;
+  }
+  .console.theater > .stage {
+    padding: 0;
+    background: #000;
+  }
+  .console.theater .live {
+    border-radius: 0;
+    box-shadow: none;
+  }
+  /* The hover corner — the video player's bottom-right. */
+  .corner {
+    position: absolute;
+    right: 1.4rem;
+    bottom: 1.4rem;
+    display: inline-flex;
+    gap: 0.3rem;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .stage:hover .corner,
+  .corner:focus-within {
+    opacity: 1;
+  }
+  .corner-btn {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    color: #fff;
+    border-radius: var(--r-sm);
+    width: 2.1rem;
+    height: 2.1rem;
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .corner-btn:hover {
+    background: rgba(0, 0, 0, 0.8);
+  }
+  /* The way home for a popped-out input. */
+  .return-btn {
+    margin-top: 0.4rem;
+    border: 1px solid var(--line-strong);
+    background: var(--accent);
+    color: #fff;
+    border-radius: var(--r-md);
+    padding: 0.75rem 1.3rem;
+    font-size: 1rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .return-btn:hover {
+    filter: brightness(1.12);
   }
   .live {
     max-width: 100%;

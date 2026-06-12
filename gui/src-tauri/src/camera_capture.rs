@@ -129,12 +129,7 @@ pub fn open(device: &str, fps: u32) -> Result<(CameraSession, Receiver<RawFrame>
 /// `frame()` blocks until the sensor delivers, pacing the loop naturally;
 /// the explicit pacing below is for backends that poll a buffer instead
 /// (AVFoundation), where a hot loop would re-decode the same picture.
-fn run_reader(
-    camera: &mut nokhwa::Camera,
-    stop: &AtomicBool,
-    tx: &SyncSender<RawFrame>,
-    fps: u32,
-) {
+fn run_reader(camera: &mut nokhwa::Camera, stop: &AtomicBool, tx: &SyncSender<RawFrame>, fps: u32) {
     let budget = Duration::from_secs(1) / fps.max(1);
     let mut failures = 0u64;
     while !stop.load(Ordering::SeqCst) {
