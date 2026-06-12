@@ -21,6 +21,7 @@
   import { app } from "../store.svelte";
   import {
     closeThisWindow,
+    focusThisWindow,
     isTauri,
     onThisWindowClose,
     refreshRoute,
@@ -53,6 +54,12 @@
   // The selected input is off in its own popout window — the stage shows
   // the big "Return video here" instead of competing for the stream.
   const selectedPopped = $derived(!!selectedId && app.isVideoPopped(`cap:${selectedId}`));
+  // Pointer forwarding is live only over a *desktop* picture: coordinates
+  // normalize onto the streamed frame, and only a screen's frame maps
+  // back onto the remote desktop — a camera tab is a viewing surface.
+  // (Keys keep the session rule: with control on they always belong to
+  // the remote, whichever tab is showing.)
+  const stagePointerActive = $derived(app.consoleControl && selected?.media === "display");
   // Fullscreen ("theater"): the stage takes the whole window over (bars
   // and tabs hidden), and — windowed — the OS window goes fullscreen too,
   // so exactly this video fills the screen. Esc exits while control is
@@ -515,7 +522,13 @@
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
-    if (!app.consoleControl) return;
+    if (!stagePointerActive) return;
+    // The KVM rule: with control live, the window under the mouse is the
+    // one your keyboard should reach — claim OS focus on hover, no click
+    // in between (a click would go to the *remote*). This is what makes
+    // keys land on the machine you're pointing at when popout windows of
+    // other machines are open beside this console.
+    if (!document.hasFocus()) void focusThisWindow();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
@@ -525,7 +538,7 @@
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
-    if (!app.consoleControl) return;
+    if (!stagePointerActive) return;
     const p = normPoint(e);
     if (!p) return;
     e.preventDefault();
@@ -535,7 +548,7 @@
   }
 
   function onWheel(e: WheelEvent) {
-    if (!app.consoleControl || !normPoint(e)) return;
+    if (!stagePointerActive || !normPoint(e)) return;
     e.preventDefault();
     // Normalize the browser's delta modes to wheel lines.
     const lines = e.deltaMode === 1 ? 1 : 1 / 40;
@@ -639,7 +652,7 @@
            event belongs to the far machine while control is on. -->
       <div
         class="stage"
-        class:grabbing={app.consoleControl}
+        class:grabbing={stagePointerActive}
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         onpointermove={onPointerMove}

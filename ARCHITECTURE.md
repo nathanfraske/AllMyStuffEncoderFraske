@@ -220,7 +220,15 @@ Tauri 2 + Svelte 5, a client of the daemon.
   camera can sit on a second monitor while the console stays on the
   screen — with its own hover controls (quality pills, a stream chip,
   fullscreen) and input forwarding whenever a live control route to that
-  machine exists. The tab left behind holds a big **"Return video
+  machine exists. Forwarding follows the KVM conventions people's hands
+  know: it's live only over a *desktop* picture (pointer coordinates
+  normalize onto the streamed frame, and only a screen's frame maps back
+  onto the remote desktop — a camera feed is a pure viewing surface,
+  console stage and room tiles included), and **the control surface under
+  the mouse claims the OS focus** — keyboard events only ever reach the
+  focused window, so hovering a popout is what aims your keys at the
+  machine you're pointing at, no click in between (a click would go to
+  the remote). The tab left behind holds a big **"Return video
   here"** (the stage shows it while that input is selected): one click
   asks the popout — found or not, fullscreen or not — to tear down and
   close, and the stage re-wires. Room tiles pop out the same way

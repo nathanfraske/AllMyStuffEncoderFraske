@@ -21,6 +21,7 @@
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import {
+    focusThisWindow,
     onThisWindowClose,
     sendInput,
     toggleWindowFullscreen,
@@ -46,6 +47,11 @@
    *  stream to shape. */
   const ownsRoute = $derived(!!capId);
   const controlRoute = $derived(sourceCap ? app.controlRouteTo(sourceCap.node) : null);
+  /** Forwarding is live only over a *desktop* picture — pointer
+   *  coordinates normalize onto the streamed frame, and only a screen's
+   *  frame maps back onto the remote desktop (a camera feed has no
+   *  sensible mapping, so it stays a pure viewing surface). */
+  const controlActive = $derived(!!controlRoute && sourceCap?.media === "display");
   // Which remote monitor coordinates normalize over (a `screen:<id>`
   // input); undefined = the primary, and what camera streams send.
   const controlScreen = $derived.by(() => {
@@ -237,7 +243,14 @@
 
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
+    // The KVM rule: with control live, the window under the mouse is the
+    // one the keyboard should reach — claim OS focus on hover, no click
+    // in between (a click would go to the *remote*). Keyboard events only
+    // ever reach the focused window, so this is what makes keys land on
+    // the machine you're pointing at when several control surfaces are
+    // open at once.
+    if (!document.hasFocus()) void focusThisWindow();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = norm(e);
@@ -246,7 +259,7 @@
     send({ kind: "mouse_move", ...p, screen: controlScreen });
   }
   function onPointerButton(e: PointerEvent, down: boolean) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
     const p = norm(e);
     if (!p) return;
     e.preventDefault();
@@ -254,13 +267,13 @@
     send({ kind: "mouse_button", button: e.button, down });
   }
   function onWheel(e: WheelEvent) {
-    if (!controlRoute || !norm(e)) return;
+    if (!controlActive || !norm(e)) return;
     e.preventDefault();
     const lines = e.deltaMode === 1 ? 1 : 1 / 40;
     send({ kind: "wheel", dx: e.deltaX * lines, dy: e.deltaY * lines });
   }
   function onKey(e: KeyboardEvent, down: boolean) {
-    if (controlRoute) {
+    if (controlActive) {
       // With control granted, every key belongs to the far machine —
       // the hover ⛶ leaves fullscreen.
       e.preventDefault();
@@ -282,14 +295,14 @@
      surface — every pointer/key goes to the far machine. -->
 <div
   class="popout"
-  class:driving={!!controlRoute}
+  class:driving={controlActive}
   role="application"
   aria-label="Popped-out video{sourceCap ? ` — ${sourceCap.label}` : ''}"
   onpointermove={onPointerMove}
   onpointerdown={(e) => onPointerButton(e, true)}
   onpointerup={(e) => onPointerButton(e, false)}
   onwheel={onWheel}
-  oncontextmenu={(e) => controlRoute && e.preventDefault()}
+  oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
   {#if !hasFrame}
@@ -323,8 +336,8 @@
     {#if hasFrame}
       <span class="chip"><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport ? ` · ${transport}` : ""}</span>
     {/if}
-    {#if controlRoute}
-      <span class="chip ctl" title="A live control route lets you click and type here">🕹 control</span>
+    {#if controlActive}
+      <span class="chip ctl" title="A live control route lets you click and type here — hovering this window is what aims your keyboard at it">🕹 control</span>
     {/if}
     <span class="spacer"></span>
     {#if ownsRoute}
@@ -374,7 +387,7 @@
     {/if}
     <button
       class="corner-btn"
-      title={fullscreen ? `Exit fullscreen${controlRoute ? "" : " (Esc)"}` : "Fullscreen"}
+      title={fullscreen ? `Exit fullscreen${controlActive ? "" : " (Esc)"}` : "Fullscreen"}
       aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
       onpointerdown={(e) => e.stopPropagation()}
       onpointerup={(e) => e.stopPropagation()}

@@ -19,7 +19,7 @@
   // popped tile holds a big "Return video here" in its middle so a
   // stream lost to another monitor is always one click from home.
   import { app } from "../store.svelte";
-  import { isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
+  import { focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
 
   let { route, member, windowed = false }: { route: Route; member: MeshNode; windowed?: boolean } =
@@ -43,8 +43,13 @@
   const popKey = $derived(`share:${route.id}`);
   const popped = $derived(app.isVideoPopped(popKey));
 
-  // The live route this tile may drive the sharer with, if any.
+  // The live route this tile may drive the sharer with, if any —
+  // forwarding is live only over a *desktop* picture: coordinates
+  // normalize onto the streamed frame, and only a screen share's frame
+  // maps back onto the sharer's desktop (a camera tile is a pure
+  // viewing surface).
   const controlRoute = $derived(app.controlRouteTo(member.id));
+  const controlActive = $derived(!!controlRoute && route.media === "display" && !popped);
 
   async function flipTheater() {
     theater = !theater;
@@ -60,7 +65,7 @@
   function onWindowKey(e: KeyboardEvent) {
     // Esc leaves fullscreen — unless control is granted, where every key
     // belongs to the far machine (the hover ⛶ exits instead).
-    if (theater && !controlRoute && e.key === "Escape") {
+    if (theater && !controlActive && e.key === "Escape") {
       e.preventDefault();
       void flipTheater();
     }
@@ -138,6 +143,14 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
 
+  function claimFocus() {
+    // The KVM rule: with control live, the surface under the mouse is the
+    // one your keyboard should reach — claim OS focus on hover (a no-op
+    // when this window already has it), so keys land on the machine
+    // you're pointing at even with popouts of other machines open.
+    if (!document.hasFocus()) void focusThisWindow();
+  }
+
   // Coordinates are normalized 0..1 over the streamed frame's *content
   // box* — the picture inside the letterbox, not the element — exactly
   // like the console stage, so clicks land where they look like they do.
@@ -158,12 +171,13 @@
   }
 
   function onPointerMove(e: PointerEvent) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
+    claimFocus();
     const p = norm(e);
     if (p) send({ kind: "mouse_move", x: p.x, y: p.y });
   }
   function onPointerDown(e: PointerEvent) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
     (e.currentTarget as HTMLElement).focus();
     const p = norm(e);
     if (!p) return;
@@ -171,16 +185,16 @@
     send({ kind: "mouse_button", button: e.button, down: true });
   }
   function onPointerUp(e: PointerEvent) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
     send({ kind: "mouse_button", button: e.button, down: false });
   }
   function onWheel(e: WheelEvent) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
     e.preventDefault();
     send({ kind: "wheel", dx: e.deltaX, dy: e.deltaY });
   }
   function onKey(e: KeyboardEvent, down: boolean) {
-    if (!controlRoute) return;
+    if (!controlActive) return;
     e.preventDefault();
     send({ kind: "key", key: e.key, down });
   }
@@ -196,11 +210,11 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
   class="tile"
-  class:driving={!!controlRoute && !popped}
+  class:driving={controlActive}
   class:theater
   role="application"
   aria-label="{who.who}'s {isCamera ? 'camera' : 'screen'}{who.machine ? ` (${who.machine})` : ''}"
-  tabindex={controlRoute && !popped ? 0 : -1}
+  tabindex={controlActive ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
@@ -227,7 +241,7 @@
     {:else}
       <div class="badge">
         {isCamera ? "📷" : "🖥"} <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
-        {#if controlRoute}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
+        {#if controlActive}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
       </div>
     {/if}
     <!-- The video player's corner: fullscreen where everyone looks for

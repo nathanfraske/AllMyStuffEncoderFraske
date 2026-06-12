@@ -703,6 +703,21 @@ export async function onRoomLocal(cb: (e: RoomLocalEvent) => void): Promise<() =
   return listen<RoomLocalEvent>("allmystuff://room-local", (e) => cb(e.payload));
 }
 
+/** Claim OS focus for this window — the KVM rule for control surfaces:
+ *  with remote control active, the window under the mouse is the one
+ *  your keyboard should reach, with no click in between (a click would
+ *  go to the *remote* anyway). Callers gate this on control being live;
+ *  web mode is a no-op (one window). */
+export async function focusThisWindow(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().setFocus();
+  } catch (e) {
+    console.warn("window focus failed:", e);
+  }
+}
+
 /** Flip this OS window in or out of fullscreen (a room window's
  *  fullscreen control). Resolves to the new state; web mode is a no-op
  *  (the browser owns fullscreen there). */
