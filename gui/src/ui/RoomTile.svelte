@@ -5,17 +5,27 @@
   // RGBA / JPEG frames and works in every webview; a member who wants the
   // full-quality path opens a console on the sharer instead.
   //
+  // The picture letterboxes like every call app's: `object-fit: contain`
+  // inside the tile, black bars top/bottom *or* left/right as the shapes
+  // demand, never a stretch and never a crop.
+  //
   // When the sharer also turned "share control" on (there's a live input
   // route from this machine's keyboard & mouse to theirs), the tile
   // captures clicks/keys over the picture and sends them down that route.
   import { app } from "../store.svelte";
   import { sendInput, watchVideo } from "../tauri";
-  import { displayName, type InputAction, type MeshNode, type Route } from "../types";
+  import { type InputAction, type MeshNode, type Route } from "../types";
 
   let { route, member }: { route: Route; member: MeshNode } = $props();
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let hasFrame = $state(false);
+  // The streamed frame's pixel size — the content box the letterbox math
+  // (and pointer normalization) works against.
+  let frameW = $state(0);
+  let frameH = $state(0);
+
+  const who = $derived(app.roomWho(member.id));
 
   // The live route this tile may drive the sharer with, if any.
   const controlRoute = $derived(app.roomControlRouteTo(member.id));
@@ -34,6 +44,8 @@
       const ctx = c.getContext("2d");
       if (!ctx) return;
       draw(ctx);
+      frameW = w;
+      frameH = h;
       hasFrame = true;
     };
 
@@ -83,13 +95,21 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
 
+  // Coordinates are normalized 0..1 over the streamed frame's *content
+  // box* — the picture inside the letterbox, not the element — exactly
+  // like the console stage, so clicks land where they look like they do.
   function norm(e: PointerEvent): { x: number; y: number } | null {
     const c = canvasEl;
-    if (!c) return null;
+    if (!c || !frameW || !frameH) return null;
     const r = c.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return null;
-    const x = (e.clientX - r.left) / r.width;
-    const y = (e.clientY - r.top) / r.height;
+    const scale = Math.min(r.width / frameW, r.height / frameH);
+    const cw = frameW * scale;
+    const ch = frameH * scale;
+    const ox = r.left + (r.width - cw) / 2;
+    const oy = r.top + (r.height - ch) / 2;
+    const x = (e.clientX - ox) / cw;
+    const y = (e.clientY - oy) / ch;
     if (x < 0 || x > 1 || y < 0 || y > 1) return null;
     return { x, y };
   }
@@ -133,7 +153,7 @@
   class="tile"
   class:driving={!!controlRoute}
   role="application"
-  aria-label="{displayName(member)}'s screen"
+  aria-label="{who.who}'s screen{who.machine ? ` (${who.machine})` : ''}"
   tabindex={controlRoute ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
@@ -142,15 +162,15 @@
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
 >
-  <canvas bind:this={canvasEl}></canvas>
+  <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
   {#if !hasFrame}
-    <div class="waiting">
-      <span class="who">{displayName(member)}</span>
+    <div class="waiting-note">
+      <span class="who">{who.who}{#if who.machine}&nbsp;<span class="machine">· {who.machine}</span>{/if}</span>
       <span class="note">waiting for pixels…</span>
     </div>
   {:else}
     <div class="badge">
-      🖥 {displayName(member)}
+      🖥 <b>{who.who}</b>{#if who.machine}<span class="machine">· {who.machine}</span>{/if}
       {#if controlRoute}<span class="ctl" title="They turned control sharing on — click and type here to drive their machine">🕹 you can drive</span>{/if}
     </div>
   {/if}
@@ -163,8 +183,13 @@
     border-radius: var(--r-md);
     overflow: hidden;
     border: 1px solid var(--line-strong);
-    min-height: 10rem;
+    min-height: 8rem;
+    min-width: 0;
+    /* The single track is the tile's size, never the canvas's intrinsic
+       one — the letterbox comes from object-fit inside the element. */
     display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
   }
   .tile.driving {
@@ -175,13 +200,17 @@
     outline-offset: -2px;
   }
   canvas {
-    max-width: 100%;
-    max-height: 100%;
     width: 100%;
-    height: auto;
+    height: 100%;
+    object-fit: contain;
     display: block;
   }
-  .waiting {
+  /* Mounted (so the first frame has somewhere to land) but invisible
+     until one does — the waiting note shows through. */
+  canvas.waiting {
+    visibility: hidden;
+  }
+  .waiting-note {
     position: absolute;
     inset: 0;
     display: flex;
@@ -211,6 +240,14 @@
     padding: 0.18rem 0.55rem;
     font-size: 0.72rem;
     font-weight: 600;
+    max-width: calc(100% - 1rem);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .machine {
+    color: oklch(0.75 0.02 285);
+    font-weight: 500;
   }
   .ctl {
     color: var(--ok);

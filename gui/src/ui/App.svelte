@@ -5,6 +5,7 @@
     appVersion,
     consoleWindowTarget,
     filesWindowTarget,
+    roomWindowTarget,
     setWindowTitle,
     terminalWindowTarget,
   } from "../tauri";
@@ -13,6 +14,7 @@
   import NodeDrawer from "./NodeDrawer.svelte";
   import NetworkMenu from "./NetworkMenu.svelte";
   import RoomsBar from "./RoomsBar.svelte";
+  import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalsPopup from "./ApprovalsPopup.svelte";
@@ -26,13 +28,14 @@
   import Toasts from "./Toasts.svelte";
 
   // When this webview is a dedicated console window (`?console=<node>`),
-  // terminal window (`?terminal=<node>`) or files window (`?files=<node>`),
-  // it renders just that session for that machine — the host components
-  // boot the store themselves, so everything below the split is
-  // main-window only.
+  // terminal window (`?terminal=<node>`), files window (`?files=<node>`)
+  // or room window (`?room=<room id>`), it renders just that session —
+  // the host components boot the store themselves, so everything below
+  // the split is main-window only.
   const consoleTarget = consoleWindowTarget();
   const terminalTarget = terminalWindowTarget();
   const filesTarget = filesWindowTarget();
+  const roomTarget = roomWindowTarget();
 
   // Which build this is. Comes from gui/src-tauri/Cargo.toml via Tauri
   // (kept in sync by scripts/bump-version.sh); empty in the in-browser
@@ -40,7 +43,7 @@
   let version = $state("");
 
   onMount(() => {
-    if (consoleTarget || terminalTarget || filesTarget) return;
+    if (consoleTarget || terminalTarget || filesTarget || roomTarget) return;
     // Wire up live backend data (scan + presence + routes) if the Tauri
     // backend is here; otherwise the demo graph stands in so the app is
     // never empty.
@@ -63,6 +66,8 @@
   <FilesHost target={filesTarget} />
 {:else if consoleTarget}
   <ConsoleHost target={consoleTarget} />
+{:else if roomTarget}
+  <RoomHost target={roomTarget} />
 {:else}
 <div class="shell">
   <header class="topbar">

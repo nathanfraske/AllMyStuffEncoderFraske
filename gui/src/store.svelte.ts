@@ -24,6 +24,7 @@ import {
   consoleWindowTarget,
   disabledNetworks,
   disconnectRoute,
+  emitRoomLocal,
   fleetKick,
   fleetLeave,
   fleetSetName,
@@ -44,12 +45,17 @@ import {
   onOwned,
   onOwnership,
   onRoom,
+  onRoomLocal,
   onSession,
   onSubscription,
   openConsoleWindow,
+  openRoomWindow,
   openTerminalWindow,
   ownedRoster,
   roomSend,
+  roomWindowTarget,
+  terminalWindowTarget,
+  filesWindowTarget,
   scanSelf,
   sendInput,
   sessionSnapshot,
@@ -81,6 +87,7 @@ import {
   type PeerInfo,
   type Person,
   type Relationship,
+  type RoomAccess,
   type RoomChatLine,
   type RoomWireMessage,
   type RosterPeer,
@@ -300,12 +307,26 @@ class AppStore {
   roomPresence = $state<Record<string, string[]>>({});
   /** Whether the open room's chat sidebar is showing. */
   roomChatOpen = $state(false);
+  /** Whether the open room's participants sidebar is showing. */
+  roomPeopleOpen = $state(false);
   /** The "make a room" composer in the rooms bar. */
   roomDraftOpen = $state(false);
   /** Rooms this device is currently *in* — being in several at once is
    *  fine; the panel (`roomOpenId`) just shows one at a time, and closing
    *  the panel doesn't hang up. */
   joinedRoomIds = $state<string[]>([]);
+  /** Rooms joined by *another window* of this app (the dedicated room
+   *  windows announce join/leave on the local bus) — so the rooms bar
+   *  reads "you're in" no matter which window holds the call. */
+  roomsJoinedElsewhere = $state<string[]>([]);
+  /** When each joined room was joined (ms epoch) — the call timer. */
+  roomJoinedAt = $state<Record<string, number>>({});
+  /** Pending knocks per room this device hosts: machines asking to join
+   *  an invite-only room, waiting for admit/deny in the room panel. */
+  roomKnocks = $state<Record<string, { from: string; label: string; at: number }[]>>({});
+  /** Room ids this device knocked on (join-by-id), awaiting the host's
+   *  answer — an arriving invite for one of these auto-joins. */
+  pendingKnocks = $state<string[]>([]);
   /** Per-joined-room send toggles. A room joins like a muted call:
    *  nothing is wired until a toggle is deliberately turned on — and each
    *  room's toggles are its own (mic live in one room stays live while
@@ -316,6 +337,14 @@ class AppStore {
    *  wired (never a route the user made on the graph, never another
    *  room's legs). */
   private roomRoutes: Record<string, Record<RoomChannel, string[]>> = {};
+  /** This window's id on the same-device room bus — local events echo to
+   *  every window (the sender included), and this is how we drop ours. */
+  private readonly windowToken = `w_${Math.random().toString(36).slice(2, 10)}`;
+  /** Whether this store runs in the app's main window. Every window's
+   *  store hears every mesh event, so host-side *decisions* that answer
+   *  one (admitting a knock) run only here — once, not once per window. */
+  private readonly isMainWindow =
+    !consoleWindowTarget() && !terminalWindowTarget() && !filesWindowTarget() && !roomWindowTarget();
 
   /** The local machine's node id. `"this"` in demo/web mode; the real mesh
    *  device id once the backend session is up. The graph centres on it. */
@@ -530,8 +559,11 @@ class AppStore {
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
-    // The rooms plane: invites, join/leave presence, chat.
+    // The rooms plane: invites, join/leave presence, chat, knocks.
     await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
+    // The same-device lane between this app's windows (a room window's
+    // join/leave, the bar's hang-up ask, saved-list changes).
+    await onRoomLocal((e) => this.handleRoomLocal(e));
     // The fleet roster converges live — a claim, or gossip catching up, pushes
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
@@ -1656,11 +1688,55 @@ class AppStore {
     return !host || this.isMe(host);
   }
 
-  /** A room host's display label, for "hosted by …" lines. */
+  /** A room host's display label, for "hosted by …" lines — the person
+   *  when one is known (the fleet's owner name, a share's person), the
+   *  machine otherwise. */
   roomHostLabel(room: VirtualRoom): string {
     const host = this.roomHost(room);
     if (!host || this.isMe(host)) return "you";
-    return this.machineByAnyId(host)?.label ?? shortId(host);
+    const node = this.machineByAnyId(host);
+    return this.personNameFor(node) ?? node?.label ?? shortId(host);
+  }
+
+  /** The *person* behind a machine, when one is known: your fleet's
+   *  owner name for machines of your own fleet, the share's person for
+   *  someone else's. Null when only the machine itself is known. */
+  personNameFor(node: MeshNode | undefined): string | null {
+    if (!node) return null;
+    if (node.relationship.kind === "shared") return node.relationship.person.name.trim() || null;
+    if (node.relationship.kind === "mine" || this.isMe(node.id) || this.isFleetMember(node.id)) {
+      return this.fleetName || null;
+    }
+    return null;
+  }
+
+  /** How a machine reads inside a room: **the owner's name first**
+   *  ("Casey", with the machine dimmed alongside), because a call is
+   *  between people — the machine name leads only when no person is
+   *  known. Machine-specific surfaces (whose *screen*, whose *sound*)
+   *  keep the machine visible as the secondary line. */
+  roomWho(id: string): { who: string; machine: string | null; me: boolean } {
+    const me = this.isMe(id);
+    const node = this.machineByAnyId(id);
+    const machine = node?.label ?? shortId(id);
+    if (me) {
+      const person = this.fleetName;
+      return { who: person ? `${person} (you)` : "You", machine, me: true };
+    }
+    const person = this.personNameFor(node);
+    if (person && person !== machine) return { who: person, machine, me: false };
+    return { who: machine, machine: null, me: false };
+  }
+
+  /** A chat line's byline — the person when this device can resolve one,
+   *  the label stamped at receive time otherwise (so lines survive a
+   *  peer dropping off the graph). */
+  roomChatWho(line: RoomChatLine): { who: string; machine: string | null } {
+    if (this.isMe(line.from)) return { who: "You", machine: null };
+    const node = this.machineByAnyId(line.from);
+    if (!node) return { who: line.fromLabel, machine: null };
+    const w = this.roomWho(line.from);
+    return { who: w.who, machine: w.machine };
   }
 
   /** Whether this device is currently in `roomId` (joined the call). */
@@ -1771,20 +1847,45 @@ class AppStore {
     return `${base}'s room`;
   }
 
+  /** How `room` admits a knock. Absent (an old save, an older host's
+   *  invite) reads invite-only — never more open than the host meant. */
+  roomAccess(room: VirtualRoom): RoomAccess {
+    return room.access ?? "invite";
+  }
+
   /** Make a room — you're its **host**: the id is minted under this
    *  device, the roster and name answer to it, and closing it ends the
    *  room for everyone. A room of just this node is fine; invite
-   *  machines later from its panel. */
-  createRoom(name: string, memberIds: string[]) {
+   *  machines later from its panel. `access` is the knock policy: an
+   *  `open` room admits anyone who pastes its id; an `invite` room asks
+   *  you first. */
+  createRoom(name: string, memberIds: string[], access: RoomAccess = "invite") {
     const clean = name.trim() || this.defaultRoomName();
     const me = canonicalNodeId(this.localId);
     const members = [me, ...memberIds.map(canonicalNodeId).filter((m) => !this.isMe(m))];
-    const room: VirtualRoom = { id: newRoomId(me), name: clean, members, owner: me };
+    const room: VirtualRoom = { id: newRoomId(me), name: clean, members, owner: me, access };
     this.rooms.push(room);
     this.saveRooms();
     this.roomDraftOpen = false;
-    this.toast("ok", `Made the room “${clean}” — you host it`);
-    this.broadcastRoom(room, { room: room.id, name: room.name, kind: "invite", members });
+    this.toast(
+      "ok",
+      access === "open"
+        ? `Made the open room “${clean}” — anyone you give its id can join`
+        : `Made the room “${clean}” — you host it`,
+    );
+    this.broadcastRoom(room, this.inviteMessage(room));
+  }
+
+  /** The host's roster/name/access re-statement — every invite broadcast
+   *  goes through here so no path forgets a field. */
+  private inviteMessage(room: VirtualRoom): RoomWireMessage {
+    return {
+      room: room.id,
+      name: room.name,
+      kind: "invite",
+      members: room.members,
+      access: this.roomAccess(room),
+    };
   }
 
   /** Add members to a room you host. Everyone (the new members included)
@@ -1803,12 +1904,7 @@ class AppStore {
     room.members = [...room.members, ...add];
     this.saveRooms();
     this.toast("ok", `Invited ${add.length} machine${add.length === 1 ? "" : "s"} to “${room.name}”`);
-    this.broadcastRoom(room, {
-      room: room.id,
-      name: room.name,
-      kind: "invite",
-      members: room.members,
-    });
+    this.broadcastRoom(room, this.inviteMessage(room));
   }
 
   /** Remove a member from a room you host. The replacement roster goes to
@@ -1832,20 +1928,33 @@ class AppStore {
     this.toast("info", `Removed ${label} from “${room.name}”`);
     if (this.backendConnected) {
       const others = before.filter((m) => !this.isMe(m));
-      if (others.length) {
-        void roomSend(others, {
-          room: room.id,
-          name: room.name,
-          kind: "invite",
-          members: room.members,
-        });
-      }
+      if (others.length) void roomSend(others, this.inviteMessage(room));
     }
   }
 
   /** Whether this device may rename `room` — the host's privilege. */
   canRenameRoom(room: VirtualRoom): boolean {
     return this.isRoomHost(room);
+  }
+
+  /** Flip a room you host between open and invite-only. Members converge
+   *  on the re-stated invite; opening up also admits everyone already
+   *  knocking (they asked, the door's now open). */
+  setRoomAccess(roomId: string, access: RoomAccess) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room || !this.isRoomHost(room) || this.roomAccess(room) === access) return;
+    room.access = access;
+    this.saveRooms();
+    this.toast(
+      "ok",
+      access === "open"
+        ? `“${room.name}” is now open — its id is the invite`
+        : `“${room.name}” is invite-only again`,
+    );
+    this.broadcastRoom(room, this.inviteMessage(room));
+    if (access === "open") {
+      for (const k of this.roomKnocks[roomId] ?? []) this.admitKnock(roomId, k.from);
+    }
   }
 
   /** Rename a room (host only). Members converge via the re-stated
@@ -1861,12 +1970,7 @@ class AppStore {
     room.name = clean;
     this.saveRooms();
     this.toast("ok", `Room renamed to “${clean}”`);
-    this.broadcastRoom(room, {
-      room: room.id,
-      name: clean,
-      kind: "invite",
-      members: room.members,
-    });
+    this.broadcastRoom(room, this.inviteMessage(room));
   }
 
   /** Delete a room. From its **host** this closes the room for everyone
@@ -1885,6 +1989,8 @@ class AppStore {
       this.broadcastTo(members, room, { room: room.id, name: room.name, kind: "close" });
     }
     this.rooms = this.rooms.filter((r) => r.id !== roomId);
+    const { [roomId]: _knocks, ...restKnocks } = this.roomKnocks;
+    this.roomKnocks = restKnocks;
     this.saveRooms();
     this.toast(
       "info",
@@ -1892,22 +1998,40 @@ class AppStore {
     );
   }
 
-  /** Join a room (or bring an already-joined one back on screen). Like
-   *  sitting down muted: nothing is wired until a toggle is turned on.
-   *  Being in several rooms at once is fine — the panel just shows one;
-   *  use [`AppStore.closeRoomPanel`] to look away without hanging up. */
+  /** Join a room (or bring an already-joined one back on screen). On the
+   *  desktop this opens the room's *dedicated OS window* — the call lives
+   *  there, movable and full-screenable like a console window; re-joining
+   *  focuses it. The web preview (and the room windows themselves, via
+   *  [`AppStore.joinRoomHere`]) keep the call in-page. */
   joinRoom(roomId: string) {
+    if (!this.rooms.some((r) => r.id === roomId)) return;
+    if (isTauri() && !roomWindowTarget()) {
+      void openRoomWindow(roomId);
+      return;
+    }
+    this.joinRoomHere(roomId);
+  }
+
+  /** Join the call *in this window* — the body of a room window (and the
+   *  web preview's panel). Like sitting down muted: nothing is wired
+   *  until a toggle is turned on. Being in several rooms at once is fine —
+   *  the panel just shows one; use [`AppStore.closeRoomPanel`] to look
+   *  away without hanging up. */
+  joinRoomHere(roomId: string) {
     const room = this.rooms.find((r) => r.id === roomId);
     if (!room) return;
     if (!this.isJoined(roomId)) {
       this.joinedRoomIds = [...this.joinedRoomIds, roomId];
       this.roomSend = { ...this.roomSend, [roomId]: { ...ROOM_SEND_OFF } };
       this.roomRoutes[roomId] = emptyRoomRoutes();
+      this.roomJoinedAt = { ...this.roomJoinedAt, [roomId]: Date.now() };
       this.presenceAdd(roomId, canonicalNodeId(this.localId));
       this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
+      void emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId });
     }
     this.roomOpenId = roomId;
     this.roomChatOpen = false;
+    this.roomPeopleOpen = false;
     this.roomUnread = { ...this.roomUnread, [roomId]: 0 };
   }
 
@@ -1926,6 +2050,21 @@ class AppStore {
     if (room) this.broadcastRoom(room, { room: room.id, name: room.name, kind: "leave" });
   }
 
+  /** Whether this device is in `roomId` in *any* of this app's windows. */
+  isJoinedAnywhere(roomId: string): boolean {
+    return this.isJoined(roomId) || this.roomsJoinedElsewhere.includes(roomId);
+  }
+
+  /** Hang up no matter which window holds the call: this window leaves
+   *  directly; a room window is asked over the local bus (it leaves and
+   *  closes itself). The rooms bar's "Leave". */
+  leaveRoomEverywhere(roomId: string) {
+    if (this.isJoined(roomId)) this.leaveRoom(roomId);
+    if (this.roomsJoinedElsewhere.includes(roomId)) {
+      void emitRoomLocal({ token: this.windowToken, kind: "leave-ask", room: roomId });
+    }
+  }
+
   /** The silent half of leaving (also the close / removed-by-host path):
    *  tear down this room's legs and drop the joined state, no broadcast. */
   private unjoinRoom(roomId: string) {
@@ -1933,9 +2072,53 @@ class AppStore {
     delete this.roomRoutes[roomId];
     const { [roomId]: _gone, ...rest } = this.roomSend;
     this.roomSend = rest;
+    const { [roomId]: _at, ...restAt } = this.roomJoinedAt;
+    this.roomJoinedAt = restAt;
     this.joinedRoomIds = this.joinedRoomIds.filter((id) => id !== roomId);
     this.presenceDrop(roomId, canonicalNodeId(this.localId));
     if (this.roomOpenId === roomId) this.roomOpenId = null;
+    void emitRoomLocal({ token: this.windowToken, kind: "leave", room: roomId });
+  }
+
+  /** One event off the same-device room bus (another window of this app
+   *  talking; our own echoes are dropped by token). */
+  private handleRoomLocal(e: { token: string; kind: string; room?: string; from?: string }) {
+    if (e.token === this.windowToken) return;
+    switch (e.kind) {
+      case "knock-done": {
+        if (e.room && e.from) this.dropKnock(e.room, e.from, false);
+        break;
+      }
+      case "join": {
+        if (e.room && !this.roomsJoinedElsewhere.includes(e.room)) {
+          this.roomsJoinedElsewhere = [...this.roomsJoinedElsewhere, e.room];
+        }
+        break;
+      }
+      case "leave": {
+        if (e.room) {
+          this.roomsJoinedElsewhere = this.roomsJoinedElsewhere.filter((id) => id !== e.room);
+        }
+        break;
+      }
+      case "leave-ask": {
+        // Whichever window holds the call joined hangs up; everyone else
+        // has nothing joined and no-ops.
+        if (e.room && this.isJoined(e.room)) this.leaveRoom(e.room);
+        break;
+      }
+      case "sync": {
+        // The saved rooms list changed in another window (a rename, a
+        // delete, a fresh invite). Reload it; a joined room that vanished
+        // (the host here closed it from the main window) unjoins quietly —
+        // its room window notices and closes itself.
+        this.loadRooms();
+        for (const id of [...this.joinedRoomIds]) {
+          if (!this.rooms.some((r) => r.id === id)) this.unjoinRoom(id);
+        }
+        break;
+      }
+    }
   }
 
   /** Talk to the room: your **microphone** to every member's speakers —
@@ -2098,8 +2281,8 @@ class AppStore {
         if (!members.some((m) => sameMachine(m, sender))) members.push(sender);
         const listsMe = members.some((m) => this.isMe(m));
         if (existing) {
-          // The room is its host's: roster and name answer to the host
-          // alone (the mesh authenticates `from`, so this check is real).
+          // The room is its host's: roster, name and access answer to the
+          // host alone (the mesh authenticates `from`, so this is real).
           const host = this.roomHost(existing);
           if (host && !sameMachine(host, sender)) return;
           if (!listsMe) {
@@ -2112,6 +2295,7 @@ class AppStore {
           }
           existing.name = msg.name?.trim() || existing.name;
           existing.members = members;
+          existing.access = msg.access ?? existing.access;
           // Adopt the inviter as host on a copy that predates the field
           // (a chat-minted stub, an old save).
           existing.owner ??= sender;
@@ -2122,14 +2306,31 @@ class AppStore {
             name: msg.name?.trim() || "Room",
             members,
             owner: sender,
+            access: msg.access,
           });
           this.toast("info", `${senderLabel} added you to “${msg.name?.trim() || "a room"}”`);
         }
         this.saveRooms();
+        // A knock answered: the roster now lists us — walk right in.
+        if (this.pendingKnocks.includes(msg.room)) {
+          this.pendingKnocks = this.pendingKnocks.filter((id) => id !== msg.room);
+          this.toast("ok", `You're in “${msg.name?.trim() || existing?.name || "the room"}”`);
+          this.joinRoom(msg.room);
+        }
         break;
       }
       case "join": {
-        if (existing) this.presenceAdd(msg.room, sender);
+        if (existing) {
+          const knewThem = (this.roomPresence[existing.id] ?? []).includes(sender);
+          this.presenceAdd(msg.room, sender);
+          // Presence echo: a newcomer can't know who was already in the
+          // call (joins are only broadcast as they happen) — so if *we're*
+          // in, say so straight back to them. Echoes terminate because
+          // only a first appearance triggers one.
+          if (!knewThem && this.isJoined(existing.id) && this.backendConnected) {
+            void roomSend([sender], { room: existing.id, name: existing.name, kind: "join" });
+          }
+        }
         break;
       }
       case "leave": {
@@ -2167,6 +2368,127 @@ class AppStore {
         });
         break;
       }
+      case "knock": {
+        // Someone holding the room's id (no invite) asks to join. Only
+        // the room's host answers; a knock on a room we don't host (or
+        // don't know) is noise. Every window of the host queues the ask
+        // (the room window's People panel is where it's admitted), but
+        // anything *sent* in reply happens in the main window alone — a
+        // host with the room's window open mustn't answer twice.
+        if (!existing || !this.isRoomHost(existing)) return;
+        if (existing.members.some((m) => sameMachine(m, sender))) {
+          // Already on the roster — their invite must have gone missing
+          // (a reinstall, an offline gap). Re-state it just to them.
+          if (this.isMainWindow && this.backendConnected) {
+            void roomSend([sender], this.inviteMessage(existing));
+          }
+          return;
+        }
+        if (this.roomAccess(existing) === "open") {
+          if (this.isMainWindow) {
+            existing.members = [...existing.members, sender];
+            this.saveRooms();
+            this.toast("ok", `${senderLabel} joined the open room “${existing.name}”`);
+            this.broadcastRoom(existing, this.inviteMessage(existing));
+          }
+          return;
+        }
+        // Invite-only: queue the ask for the panel's admit/deny.
+        const cur = this.roomKnocks[existing.id] ?? [];
+        if (!cur.some((k) => sameMachine(k.from, sender))) {
+          this.roomKnocks = {
+            ...this.roomKnocks,
+            [existing.id]: [...cur, { from: sender, label: senderLabel, at: Date.now() }],
+          };
+          this.toast("info", `${senderLabel} asks to join “${existing.name}” — admit them from the room`);
+        }
+        break;
+      }
+      case "deny": {
+        // The host's "no" to our knock — only believable from the host.
+        if (!this.pendingKnocks.includes(msg.room)) return;
+        const host = existing ? this.roomHost(existing) : roomHostFromId(msg.room);
+        if (host && !sameMachine(host, sender)) return;
+        this.pendingKnocks = this.pendingKnocks.filter((id) => id !== msg.room);
+        this.toast("warn", `The host declined your ask to join${existing ? ` “${existing.name}”` : ""}`);
+        break;
+      }
+    }
+  }
+
+  /** Ask to join a room this device wasn't invited to, by its pasted id
+   *  (`room:<host>:<nonce>` — the host's device id is the anchor). An
+   *  open room admits you on the spot; an invite-only host is asked and
+   *  can admit or deny. A room already on the list just joins. */
+  async knockRoom(code: string): Promise<boolean> {
+    const id = code.trim();
+    if (!id) return false;
+    const known = this.rooms.find((r) => r.id === id);
+    if (known) {
+      this.joinRoom(known.id);
+      return true;
+    }
+    const host = roomHostFromId(id);
+    if (!host) {
+      this.toast("warn", "That doesn't look like a room id (room:<host>:<code>)");
+      return false;
+    }
+    if (this.isMe(host)) {
+      this.toast("warn", "That's one of this device's own rooms — but not on its list anymore");
+      return false;
+    }
+    if (!this.backendConnected) {
+      this.toast("info", "Demo mode — knocking needs the desktop app on a live mesh");
+      return false;
+    }
+    if (!this.pendingKnocks.includes(id)) {
+      this.pendingKnocks = [...this.pendingKnocks, id];
+    }
+    const sent = await roomSend([host], { room: id, kind: "knock" });
+    if (sent === 0) {
+      this.pendingKnocks = this.pendingKnocks.filter((r) => r !== id);
+      this.toast("warn", "Couldn't reach the room's host — are you on a shared network?");
+      return false;
+    }
+    this.toast("ok", "Asked to join — if the room is open you'll be let straight in");
+    return true;
+  }
+
+  /** Admit one knock on a room you host: onto the roster, roster restated
+   *  to everyone (the knocker included — that invite is their way in).
+   *  The answered ask is cleared in every window of this app. */
+  admitKnock(roomId: string, from: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room || !this.isRoomHost(room)) return;
+    this.dropKnock(roomId, from);
+    if (!room.members.some((m) => sameMachine(m, from))) {
+      room.members = [...room.members, canonicalNodeId(from)];
+      this.saveRooms();
+      this.broadcastRoom(room, this.inviteMessage(room));
+    }
+    const label = this.machineByAnyId(from)?.label ?? shortId(from);
+    this.toast("ok", `Let ${label} into “${room.name}”`);
+  }
+
+  /** Turn one knock away (the asker hears a `deny`, not silence). */
+  denyKnock(roomId: string, from: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room || !this.isRoomHost(room)) return;
+    this.dropKnock(roomId, from);
+    if (this.backendConnected) {
+      void roomSend([from], { room: room.id, name: room.name, kind: "deny" });
+    }
+  }
+
+  private dropKnock(roomId: string, from: string, announce = true) {
+    const cur = this.roomKnocks[roomId] ?? [];
+    this.roomKnocks = {
+      ...this.roomKnocks,
+      [roomId]: cur.filter((k) => !sameMachine(k.from, from)),
+    };
+    // Every window queued the ask; the one that answered clears the rest.
+    if (announce) {
+      void emitRoomLocal({ token: this.windowToken, kind: "knock-done", room: roomId, from });
     }
   }
 
@@ -2279,13 +2601,16 @@ class AppStore {
   }
 
   /** Rooms persist on this device (like the graph's relationships, the
-   *  mesh holds no central copy — every member keeps their own). */
+   *  mesh holds no central copy — every member keeps their own). Every
+   *  save is announced on the local bus so this app's other windows (the
+   *  main graph, an open room window) reload the same list. */
   private saveRooms() {
     try {
       localStorage.setItem(ROOMS_STORE_KEY, JSON.stringify(this.rooms));
     } catch {
       /* storage unavailable (private mode) — rooms last the session */
     }
+    void emitRoomLocal({ token: this.windowToken, kind: "sync" });
   }
 
   private loadRooms() {

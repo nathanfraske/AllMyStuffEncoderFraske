@@ -110,11 +110,16 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   `ControlMessage`s for route setup and share negotiation, the
   `OwnedRoster` fleet gossip (`CHANNEL_OWNED`), and the **virtual-rooms
   plane** (`CHANNEL_ROOMS`): `RoomMessage`s carrying a room's invites,
-  join/leave presence, and chat — only the membership + chat plane; a
-  room's media is ordinary routes. Peers advertise the `rooms` feature
-  tag, so an older build simply never sees the channel. Authorization is
-  never on the wire — a node only advertises or accepts what its local
-  `Catalog` already permits.
+  join/leave presence, chat, and the knock pair (`knock` — a machine
+  holding the room's id but no invite asking the host in; `deny` — the
+  host's no), with each invite restating the host's `RoomAccess` knock
+  policy (`open` admits a knock on the spot, `invite` — the default, and
+  what an older host's field-less invites read as — queues it for a
+  human). Only the membership + chat plane; a room's media is ordinary
+  routes. Peers advertise the `rooms` feature tag, so an older build
+  simply never sees the channel (and one that predates a message kind
+  drops just that message). Authorization is never on the wire — a node
+  only advertises or accepts what its local `Catalog` already permits.
 - **The owned fleet** — claiming a device doesn't just flip a flag: the two
   machines start sharing an `OwnedRoster` on `CHANNEL_OWNED` — the set of
   devices one owner has claimed, all linked by a single shared **fleet key**.
@@ -220,10 +225,28 @@ Tauri 2 + Svelte 5, a client of the daemon.
   **Virtual rooms** (`RoomsBar.svelte` + `RoomPanel.svelte`, bottom-left)
   are the multi-machine layer over the same plumbing: a room is a named,
   locally-persisted member list (invites ride `CHANNEL_ROOMS`), and joining
-  opens a zoom-like call panel where **everything starts off** — mic,
-  camera, screen share. A fresh room defaults to being named after the
-  fleet's owner ("Casey's room"); its maker is its owner and renames it
-  inline from the panel title (members converge via the re-stated invite).
+  opens a zoom-like call where **everything starts off** — mic, camera,
+  screen share. On the desktop the call gets its **own OS window** per
+  room (`open_room_window` → `?room=<id>` → `RoomHost.svelte`), movable
+  and full-screenable exactly like the console / terminal / files
+  windows — closing the window hangs up, and stopping being in the room
+  closes the window; the web preview keeps the in-page overlay. The
+  panel itself follows the conventions every call app trains people on:
+  a dark stage with a tile per person present (a presence *echo* — a
+  member already in the call answers a newcomer's `join` straight back —
+  keeps late joiners' galleries truthful), screen shares letterboxed
+  with the people on a filmstrip, a red-slashed mic/camera for the muted
+  state, a green **"You're sharing your screen"** banner with the red
+  stop right on it, a centred bottom control bar with Leave in red at
+  the far right, chat and People panels on the right, a call timer, and
+  `m` / `v` mute/camera keys. Room mechanics lean on the **person, not
+  the machine**, wherever the thing isn't machine-specific: chat
+  bylines, host labels, rosters and tiles lead with the fleet's owner
+  name or a share's person ("Casey · desk"), with the machine dimmed
+  alongside where it matters (whose *screen*, whose *sound*). A fresh
+  room defaults to being named after the fleet's owner ("Casey's room");
+  its maker is its owner and renames it inline from the panel title
+  (members converge via the re-stated invite).
 
   Every room is **hosted by its maker** — a room of just your own node is
   fine (invite machines later from the panel). Hosting means the room's
@@ -234,13 +257,28 @@ Tauri 2 + Svelte 5, a client of the daemon.
   so that's a real check); replacement rosters propagate removals (a
   member no longer listed drops the room, the fleet pattern); and the
   host deleting the room **closes it for everyone** (`close`), where a
-  guest deleting merely forgets a local copy. Members still talk directly
+  guest deleting merely forgets a local copy. An invite, once received,
+  sits like a **roster slot**: the room stays listed and rejoinable on
+  that device until the host removes it or closes the room. Rooms also
+  admit from *outside* the roster: the maker picks **open or
+  invite-only** at creation (flippable later from the panel), the room's
+  id is the pasteable invite (Copy invite in the panel, "Join with an
+  id" in the bar), and a pasted id **knocks** — an open room's host
+  admits it automatically, an invite-only host gets an Admit / Deny ask
+  in the People panel (`deny` so the asker isn't left waiting; a knock
+  from a machine already on the roster just gets the invite re-stated,
+  healing a lost one). Members still talk directly
   to each other for everything streamed — join/leave presence, chat, and
   the media routes — and rooms are **stream-only**: nothing is stored, and
   any future history/storage would live with the host. Being in several
   rooms at once is fine: join state, send toggles and the routes they own
   are all per-room, the panel just shows one room at a time, and
-  minimizing it (as opposed to leaving) keeps everything live.
+  minimizing it (as opposed to leaving) keeps everything live. The app's
+  windows stay in step over a small local Tauri-event lane
+  (`allmystuff://room-local`): a room window announces join/leave so the
+  bar reads "you're in", the bar's Leave reaches whichever window holds
+  the call, saved-list changes are reloaded everywhere, and an answered
+  knock clears in every window.
   Each toggle fans ordinary routes out to the members — but **room sharing
   is scoped to the room**: membership is the consent, so room legs validate
   structurally via `propose_room_route` / `proposeRoomRoute` without the

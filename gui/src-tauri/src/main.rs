@@ -351,6 +351,30 @@ async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), 
     Ok(())
 }
 
+/// Open (or focus) the dedicated window for one virtual room — the call
+/// itself, in its own OS window like the console / terminal / files
+/// sessions, so it can be moved, resized and full-screened. The window
+/// loads the same app with `?room=<room id>`.
+#[tauri::command]
+async fn open_room_window(app: tauri::AppHandle, room: String) -> Result<(), String> {
+    let label = format!("room-{}", window_slug(&room));
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(format!("index.html?room={room}").into()),
+    )
+    .title("AllMyStuff room")
+    .inner_size(1180.0, 760.0)
+    .min_inner_size(640.0, 440.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// A node id reduced to the characters Tauri allows in a window label —
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
@@ -805,6 +829,7 @@ fn main() {
             open_files_window,
             session_snapshot,
             room_send,
+            open_room_window,
             owned_roster,
             fleet_leave,
             fleet_kick,
