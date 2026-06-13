@@ -191,6 +191,35 @@ pub struct OwnedRoster {
     pub members: Vec<OwnedMember>,
 }
 
+/// One file a member offers into a room's **Shared Files** area, as the
+/// uploader states it to the host. `token` is an opaque fetch handle the
+/// uploader minted (it round-trips back as the files plane's `Fetch`
+/// request); the bytes never touch the host — a downloader pulls them
+/// straight from the uploader over a `:shared` route, gated on the token
+/// and the room's member set. `size` is the file's byte length, for the
+/// progress bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedFileMeta {
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// One entry of the host's aggregated Shared Files list — a
+/// [`SharedFileMeta`] tagged with the uploader so a downloader knows whom
+/// to fetch the bytes from. The host hosts the *list*; the uploader hosts
+/// the *bytes* (and only while it's online).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedEntry {
+    /// The uploader (canonical node id) — whom to open the `:shared` route to.
+    pub from: NodeId,
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
 /// One message of the virtual-rooms plane, carried on [`CHANNEL_ROOMS`].
 /// A room itself is a lightweight, user-minted thing — a stable id, a
 /// cosmetic name, and a member list — and every message restates the id
@@ -274,6 +303,22 @@ pub enum RoomEvent {
     Knock,
     /// The host's "no" to a knock, so the asker isn't left waiting.
     Deny,
+    /// A member tells the **host** the files it's currently offering into
+    /// the room's Shared Files area — replacement semantics (the member's
+    /// full current list each time). The host aggregates every member's
+    /// list and restates the whole as [`RoomEvent::Shares`]. The bytes
+    /// never travel through the host: a downloader fetches them straight
+    /// from the uploader over a `:shared` route. Sent member→host; ignored
+    /// by anyone that isn't the room's host. An older host drops the whole
+    /// message — its members simply see no shared files.
+    ShareList { files: Vec<SharedFileMeta> },
+    /// The **host's** authoritative Shared Files list for the room: every
+    /// online member's offerings, each tagged with the uploader so a
+    /// downloader knows whom to fetch from. Restated on every change and to
+    /// each new joiner, exactly like the roster ([`RoomEvent::Invite`]);
+    /// members ignore it from anyone but the host. Replacement semantics —
+    /// an uploader that's gone offline simply drops off the next list.
+    Shares { files: Vec<SharedEntry> },
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share, and
@@ -629,6 +674,46 @@ mod tests {
             let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
             assert_eq!(m, back);
         }
+    }
+
+    #[test]
+    fn room_shared_files_round_trip_and_tag() {
+        // A member's offering to the host.
+        let m = RoomMessage {
+            room: "room:owner:ab12cd34".into(),
+            name: String::new(),
+            event: RoomEvent::ShareList {
+                files: vec![SharedFileMeta {
+                    token: "share_xyz".into(),
+                    name: "deck.pdf".into(),
+                    size: 4096,
+                }],
+            },
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "share_list");
+        assert_eq!(j["files"][0]["token"], "share_xyz");
+        let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
+        assert_eq!(m, back);
+
+        // The host's aggregated list, tagged with each uploader.
+        let m = RoomMessage {
+            room: "room:owner:ab12cd34".into(),
+            name: "Movie night".into(),
+            event: RoomEvent::Shares {
+                files: vec![SharedEntry {
+                    from: "alex".into(),
+                    token: "share_xyz".into(),
+                    name: "deck.pdf".into(),
+                    size: 4096,
+                }],
+            },
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "shares");
+        assert_eq!(j["files"][0]["from"], "alex");
+        let back: RoomMessage = serde_json::from_str(&j.to_string()).unwrap();
+        assert_eq!(m, back);
     }
 
     #[test]

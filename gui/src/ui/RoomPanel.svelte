@@ -16,7 +16,7 @@
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import { clipboardWrite, toggleWindowFullscreen } from "../tauri";
-  import { isAppNode, type MeshNode } from "../types";
+  import { humanBytes, isAppNode, type MeshNode } from "../types";
   import RoomTile from "./RoomTile.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
@@ -30,7 +30,9 @@
   const room = $derived(app.openRoom);
   let chatInput = $state("");
   let chatLog = $state<HTMLDivElement | null>(null);
-  let filesPickerOpen = $state(false);
+  // The screen-selection popover (like Zoom's): shown when there's more
+  // than one monitor to choose between.
+  let screenPickerOpen = $state(false);
   // The owner's inline rename: the title flips to an input in place.
   let renaming = $state(false);
   let renameDraft = $state("");
@@ -55,6 +57,10 @@
   const chat = $derived(room ? app.roomChat[room.id] ?? [] : []);
   const unread = $derived(room ? app.roomUnread[room.id] ?? 0 : 0);
   const knocks = $derived(room && app.isRoomHost(room) ? app.roomKnocks[room.id] ?? [] : []);
+  // The room's Shared Files — yours (with a ✕ to stop sharing) and other
+  // members' (with a Download). The host hosts this list; bytes come
+  // straight from each uploader.
+  const sharedFiles = $derived(app.roomSharedFiles);
 
   const inviteCandidates = $derived(
     room
@@ -180,13 +186,27 @@
 
   function toggleChat() {
     app.roomChatOpen = !app.roomChatOpen;
-    if (app.roomChatOpen) app.roomPeopleOpen = false;
+    if (app.roomChatOpen) {
+      app.roomPeopleOpen = false;
+      app.roomFilesOpen = false;
+    }
     if (app.roomChatOpen && room) app.roomUnread = { ...app.roomUnread, [room.id]: 0 };
   }
 
   function togglePeople() {
     app.roomPeopleOpen = !app.roomPeopleOpen;
-    if (app.roomPeopleOpen) app.roomChatOpen = false;
+    if (app.roomPeopleOpen) {
+      app.roomChatOpen = false;
+      app.roomFilesOpen = false;
+    }
+  }
+
+  function toggleFiles() {
+    app.roomFilesOpen = !app.roomFilesOpen;
+    if (app.roomFilesOpen) {
+      app.roomChatOpen = false;
+      app.roomPeopleOpen = false;
+    }
   }
 
   // New chat while the sidebar is open is read immediately; keep the log
@@ -203,14 +223,33 @@
     }
   });
 
-  function sendFiles() {
-    const targets = app.roomFileTargets;
-    if (targets.length === 0) return;
-    if (targets.length === 1) {
-      app.openFiles(targets[0].id);
+  // "Share screen": one monitor shares straight away; several pop the
+  // selection menu so you pick which (the way every call app does).
+  function shareScreen() {
+    if (app.roomScreen) {
+      app.toggleRoomScreen();
       return;
     }
-    filesPickerOpen = !filesPickerOpen;
+    if (app.roomScreenSources.length > 1) {
+      screenPickerOpen = !screenPickerOpen;
+      return;
+    }
+    app.toggleRoomScreen();
+  }
+
+  function pickScreen(id: string) {
+    screenPickerOpen = false;
+    app.toggleRoomScreen(id);
+  }
+
+  // "Share files": add files to the room's Shared Files area, then open it
+  // so you see them land. (A call shares files for download — it's not the
+  // file manager: no browsing or editing anyone's disk.)
+  async function shareFiles() {
+    app.roomFilesOpen = true;
+    app.roomChatOpen = false;
+    app.roomPeopleOpen = false;
+    await app.shareRoomFiles();
   }
 
   async function copyInvite() {
@@ -500,6 +539,64 @@
             </div>
           </aside>
         {/if}
+
+        {#if app.roomFilesOpen}
+          <aside class="side files-side">
+            <header class="side-head">
+              <h4>Shared Files · {sharedFiles.length}</h4>
+              <button class="side-x" aria-label="Close shared files" onclick={toggleFiles}>✕</button>
+            </header>
+            <div class="files-scroll">
+              <button class="share-add" onclick={shareFiles}>＋ Share a file with the room</button>
+              {#each sharedFiles as s (s.from + s.file.token)}
+                {@const dl = app.sharedDownloads[s.file.token]}
+                <div class="shared-row" class:mine={s.me}>
+                  <div class="shared-icon" aria-hidden="true">🗂</div>
+                  <div class="shared-meta">
+                    <div class="shared-name" title={s.file.name}>{s.file.name}</div>
+                    <div class="shared-sub">
+                      {humanBytes(s.file.size)} · {s.me ? "you" : s.who}{#if !s.me && s.machine}&nbsp;· {s.machine}{/if}
+                    </div>
+                    {#if dl && dl.state === "fetching"}
+                      <div class="dl-bar"><span style="width:{dl.total ? Math.min(100, Math.round((dl.done / dl.total) * 100)) : 0}%"></span></div>
+                    {:else if dl && dl.state === "done"}
+                      <div class="dl-note ok">Saved to Downloads</div>
+                    {:else if dl && dl.state === "error"}
+                      <div class="dl-note err">{dl.note}</div>
+                    {/if}
+                  </div>
+                  {#if s.me}
+                    <button
+                      class="shared-act stop"
+                      title="Stop sharing this file"
+                      aria-label="Stop sharing"
+                      onclick={() => app.unshareRoomFile(room.id, s.file.token)}>✕</button
+                    >
+                  {:else}
+                    <button
+                      class="shared-act"
+                      disabled={dl?.state === "fetching"}
+                      title="Download to your Downloads folder"
+                      onclick={() => app.downloadSharedFile(s.from, s.file)}
+                    >
+                      {dl?.state === "fetching" ? "…" : dl?.state === "done" ? "Again" : "Download"}
+                    </button>
+                  {/if}
+                </div>
+              {:else}
+                <p class="files-empty">
+                  Nothing shared yet. <b>Share a file</b> and everyone in the call can download
+                  it{#if !app.backendConnected}&nbsp;(demo mode — sharing needs the desktop app){/if}.
+                </p>
+              {/each}
+              <p class="fine">
+                The room's host hosts this <b>list</b> — a file stays here while the person who
+                shared it is in the call. Downloads come <b>straight from them</b>, never through
+                the host, and it's read-only: nobody browses or edits anyone's disk.
+              </p>
+            </div>
+          </aside>
+        {/if}
       </div>
 
       <footer class="bar">
@@ -525,15 +622,29 @@
         </div>
         <div class="bar-sep"></div>
         <div class="bar-group">
-          <button
-            class="ctl"
-            class:on={app.roomScreen}
-            onclick={() => app.toggleRoomScreen()}
-            title="Share this machine's screen with the room"
-          >
-            <span class="ctl-icon">🖥</span>
-            <span class="ctl-label">{app.roomScreen ? "Stop share" : "Share screen"}</span>
-          </button>
+          <div class="files-wrap">
+            <button
+              class="ctl"
+              class:on={app.roomScreen}
+              onclick={shareScreen}
+              title={app.roomScreenSources.length > 1
+                ? "Share a screen with the room — pick which monitor"
+                : "Share this machine's screen with the room"}
+            >
+              <span class="ctl-icon">🖥</span>
+              <span class="ctl-label">{app.roomScreen ? "Stop share" : "Share screen"}</span>
+            </button>
+            {#if screenPickerOpen && !app.roomScreen}
+              <div class="files-pick">
+                <div class="pick-head">Share which screen?</div>
+                {#each app.roomScreenSources as s (s.id)}
+                  <button class="files-pick-row" onclick={() => pickScreen(s.id)}>
+                    🖥 {s.label}{#if s.default}&nbsp;<span class="pick-tag">main</span>{/if}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
           <button
             class="ctl"
             class:on={app.roomSound}
@@ -552,32 +663,14 @@
             <span class="ctl-icon">🕹</span>
             <span class="ctl-label">Share control</span>
           </button>
-          <div class="files-wrap">
-            <button
-              class="ctl"
-              disabled={app.roomFileTargets.length === 0}
-              onclick={sendFiles}
-              title={app.roomFileTargets.length === 0
-                ? "File sending is owner/fleet only — no eligible member right now"
-                : "Send files to a member (opens the file manager)"}
-            >
-              <span class="ctl-icon">🗂</span>
-              <span class="ctl-label">Send files</span>
-            </button>
-            {#if filesPickerOpen && app.roomFileTargets.length > 1}
-              <div class="files-pick">
-                {#each app.roomFileTargets as t (t.id)}
-                  <button
-                    class="files-pick-row"
-                    onclick={() => {
-                      filesPickerOpen = false;
-                      app.openFiles(t.id);
-                    }}>🗂 {app.roomWho(t.id).who}{#if app.roomWho(t.id).machine}&nbsp;· {app.roomWho(t.id).machine}{/if}</button
-                  >
-                {/each}
-              </div>
-            {/if}
-          </div>
+          <button
+            class="ctl"
+            onclick={shareFiles}
+            title="Add files to the room's Shared Files — members can download them while you're here (it's not a file browser)"
+          >
+            <span class="ctl-icon">🗂</span>
+            <span class="ctl-label">Share files</span>
+          </button>
         </div>
         <div class="bar-spacer"></div>
         <div class="bar-group">
@@ -585,6 +678,11 @@
             <span class="ctl-icon">💬</span>
             <span class="ctl-label">Chat</span>
             {#if unread > 0}<span class="ctl-badge">{unread}</span>{/if}
+          </button>
+          <button class="ctl" class:lit={app.roomFilesOpen} onclick={toggleFiles} title="Shared Files — what's been shared into this call">
+            <span class="ctl-icon">🗂</span>
+            <span class="ctl-label">Files</span>
+            {#if sharedFiles.length > 0}<span class="ctl-badge">{sharedFiles.length}</span>{/if}
           </button>
           <button class="ctl" class:lit={app.roomPeopleOpen} onclick={togglePeople} title="Who's here, invites, and asks to join">
             <span class="ctl-icon">👥</span>
@@ -1327,8 +1425,145 @@
     padding: 0.35rem 0.5rem;
     border-radius: var(--r-sm);
     white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
   }
   .files-pick-row:hover {
     background: var(--surface-2);
+  }
+  .pick-head {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    padding: 0.2rem 0.5rem 0.3rem;
+  }
+  .pick-tag {
+    font-size: 0.6rem;
+    font-weight: 700;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-radius: var(--r-pill);
+    padding: 0.02rem 0.34rem;
+  }
+
+  /* ---- the Shared Files sidebar ---- */
+  .files-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0.6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .share-add {
+    border: 1px dashed var(--line-strong);
+    background: var(--surface);
+    color: var(--ink-soft);
+    font-weight: 650;
+    font-size: 0.78rem;
+    border-radius: var(--r-md);
+    padding: 0.5rem;
+    flex-shrink: 0;
+  }
+  .share-add:hover {
+    border-color: var(--accent);
+    color: var(--ink);
+  }
+  .shared-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.45rem;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--surface);
+  }
+  .shared-row.mine {
+    border-color: oklch(0.64 0.255 350 / 0.3);
+    background: var(--accent-soft);
+  }
+  .shared-icon {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+  }
+  .shared-meta {
+    flex: 1;
+    min-width: 0;
+  }
+  .shared-name {
+    font-size: 0.8rem;
+    font-weight: 650;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .shared-sub {
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dl-bar {
+    margin-top: 0.3rem;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--surface-2);
+    overflow: hidden;
+  }
+  .dl-bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
+  .dl-note {
+    margin-top: 0.2rem;
+    font-size: 0.66rem;
+  }
+  .dl-note.ok {
+    color: var(--ok);
+  }
+  .dl-note.err {
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
+  .shared-act {
+    flex-shrink: 0;
+    border: 1px solid var(--line-strong);
+    background: var(--surface-2);
+    color: var(--ink);
+    font-weight: 650;
+    font-size: 0.72rem;
+    border-radius: var(--r-pill);
+    padding: 0.25rem 0.6rem;
+  }
+  .shared-act:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+  .shared-act:disabled {
+    opacity: 0.5;
+  }
+  .shared-act.stop {
+    border: none;
+    background: transparent;
+    color: var(--ink-faint);
+    padding: 0.1rem 0.3rem;
+  }
+  .shared-act.stop:hover {
+    color: var(--danger);
+  }
+  .files-empty {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    text-align: center;
+    margin-top: 0.5rem;
+    line-height: 1.5;
+  }
+  .files-empty b {
+    color: var(--ink-soft);
   }
 </style>

@@ -18,6 +18,7 @@ import type {
   OwnedRoster,
   PeerInfo,
   RosterPeer,
+  SharedFileMeta,
   TermEvent,
   UpdatePrefs,
   UpdateStatus,
@@ -556,6 +557,55 @@ export async function onFileProgress(
     "allmystuff://file-progress",
     (e) => cb(e.payload),
   );
+}
+
+// ---- Shared Files (the call's "Shared Files" area) ----------------------
+//
+// A call's file sharing is deliberately *not* the file manager: you offer
+// specific files into a room-scoped area members can download, never a
+// window onto your disk. The bytes ride the files plane peer-to-peer
+// (uploader → downloader, by opaque token); the room's host only carries
+// the list. All of these no-op (empty) in web mode — sharing needs the
+// desktop app on a live mesh.
+
+/** Offer `paths` into a room's Shared Files area, allowing `members`
+ *  (canonical node ids) to fetch them. Returns one `{ token, name, size }`
+ *  per file that could be read — the caller hands these to the room's host
+ *  for its shared list. Empty in web mode. */
+export async function roomShareFiles(
+  members: string[],
+  paths: string[],
+): Promise<SharedFileMeta[]> {
+  const r = await tryInvoke<SharedFileMeta[]>("room_share_files", { members, paths });
+  return r ?? [];
+}
+
+/** Refresh which members may fetch a set of shared tokens (the room's
+ *  roster changed while the files were on offer). No-op in web mode. */
+export function roomSetSharePeers(tokens: string[], members: string[]): Promise<null> {
+  return tryInvoke("room_set_share_peers", { tokens, members });
+}
+
+/** Stop offering a set of shared files (the uploader removed them or left
+ *  the room). No-op in web mode. */
+export function roomUnshare(tokens: string[]): Promise<null> {
+  return tryInvoke("room_unshare", { tokens });
+}
+
+/** Pick local files to share, via the OS open dialog (multi-select).
+ *  Returns the chosen absolute paths (empty if cancelled, or in web mode
+ *  where there's no native picker). */
+export async function pickFilesToShare(): Promise<string[]> {
+  if (!isTauri()) return [];
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({ multiple: true, directory: false, title: "Share files with the room" });
+    if (picked == null) return [];
+    return Array.isArray(picked) ? picked : [picked];
+  } catch (e) {
+    console.warn("file picker failed:", e);
+    return [];
+  }
 }
 
 /** Clipboard for the terminal: WebKitGTK's async clipboard API is flaky,

@@ -29,11 +29,19 @@ import {
   disconnectRoute,
   emitRoomLocal,
   emitVideoLocal,
+  fileDownload,
+  fileSend,
   fleetKick,
   fleetLeave,
   fleetSetName,
   isTauri,
+  onFileProgress,
+  onFileSaved,
   openFilesWindow,
+  pickFilesToShare,
+  roomShareFiles,
+  roomSetSharePeers,
+  roomUnshare,
   meshIdentity,
   meshIdentitySetLabel,
   meshConfigShow,
@@ -101,6 +109,8 @@ import {
   type RoomWireMessage,
   type RosterPeer,
   type Route,
+  type SharedEntry,
+  type SharedFileMeta,
   type RouteLiveState,
   type VirtualRoom,
   type TurnEntry,
@@ -202,6 +212,18 @@ const ROOM_SEND_OFF: RoomSendState = {
   sound: false,
   control: false,
 };
+
+/** One Shared Files download as the room panel shows it. */
+interface SharedDownload {
+  token: string;
+  name: string;
+  /** Bytes written so far / the file's full size (for the progress bar). */
+  done: number;
+  total: number;
+  state: "fetching" | "done" | "error";
+  /** Where it landed (on `done`) or the host's reason (on `error`). */
+  note: string;
+}
 
 /** Mint a room id under its host's canonical device id — the identity
  *  itself says whose room it is. */
@@ -369,6 +391,8 @@ class AppStore {
   roomChatOpen = $state(false);
   /** Whether the open room's participants sidebar is showing. */
   roomPeopleOpen = $state(false);
+  /** Whether the open room's Shared Files sidebar is showing. */
+  roomFilesOpen = $state(false);
   /** The "make a room" composer in the rooms bar. */
   roomDraftOpen = $state(false);
   /** Rooms this device is currently *in* — being in several at once is
@@ -397,6 +421,26 @@ class AppStore {
    *  wired (never a route the user made on the graph, never another
    *  room's legs). */
   private roomRoutes: Record<string, Record<RoomChannel, string[]>> = {};
+  /** Files *this* device is offering into each room's Shared Files area
+   *  (the uploader's own list). Cleared when we leave; not persisted —
+   *  shares are stream-only, like everything else in a room. */
+  roomMyShares = $state<Record<string, SharedFileMeta[]>>({});
+  /** The **host** side of the Shared Files list: for a room we host, every
+   *  member's current offerings (room id → uploader node id → files). We
+   *  aggregate these and restate the whole as the room's `shares` list. */
+  private roomHostShares: Record<string, Record<string, SharedFileMeta[]>> = {};
+  /** The Shared Files list as a **non-host** member received it from the
+   *  room's host (room id → entries). The host is the catalog; we just
+   *  render and download from this. */
+  roomSharesFromHost = $state<Record<string, SharedEntry[]>>({});
+  /** In-flight / finished shared-file downloads, keyed by fetch token: what
+   *  the panel shows as a progress bar and "Saved to …". */
+  sharedDownloads = $state<Record<string, SharedDownload>>({});
+  /** `"<routeId>:<req>"` → fetch token, so a backend `file-saved` /
+   *  `file-progress` (which name the route + req) updates the right row. */
+  private sharedReqToken: Record<string, string> = {};
+  private sharedViewSeq = 0;
+  private sharedReqSeq = 1;
   /** This window's id on the same-device room bus — local events echo to
    *  every window (the sender included), and this is how we drop ours. */
   private readonly windowToken = `w_${Math.random().toString(36).slice(2, 10)}`;
@@ -623,6 +667,13 @@ class AppStore {
     // the race; the same-device sibling bus rides along for symmetry.
     await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
     await onRoomLocal((e) => this.handleRoomLocal(e));
+    // Shared-file downloads stream straight to disk backend-side; these are
+    // how the room panel learns how far each got and where it landed. Both
+    // name the route + req, which we map back to the fetch token. (A files
+    // *window* has its own listeners for its routes; these only touch the
+    // `:shared` downloads this store registered, so the two never collide.)
+    await onFileProgress((e) => this.onSharedProgress(e));
+    await onFileSaved((e) => this.onSharedSaved(e));
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
@@ -2318,6 +2369,8 @@ class AppStore {
     this.saveRooms();
     this.toast("ok", `Invited ${add.length} machine${add.length === 1 ? "" : "s"} to “${room.name}”`);
     this.broadcastRoom(room, this.inviteMessage(room));
+    // The new members may now fetch what we're offering — widen the gate.
+    this.refreshSharePeers(roomId);
   }
 
   /** Remove a member from a room you host. The replacement roster goes to
@@ -2343,6 +2396,11 @@ class AppStore {
       const others = before.filter((m) => !this.isMe(m));
       if (others.length) void roomSend(others, this.inviteMessage(room));
     }
+    // Drop their files from the list we host, stop allowing them to fetch
+    // ours, and restate the pruned list to the (remaining) members.
+    this.setHostShare(roomId, target, []);
+    this.refreshSharePeers(roomId);
+    this.rebroadcastHostShares(roomId);
   }
 
   /** Whether this device may rename `room` — the host's privilege. */
@@ -2453,6 +2511,9 @@ class AppStore {
       this.callLog(`join ${roomId} — announcing presence to ${room.members.length - 1} member(s)`);
       this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
       void emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId });
+      // Re-announce any files we were already offering here (a rejoin), so
+      // the host folds them back into the room's Shared Files list.
+      if ((this.roomMyShares[roomId]?.length ?? 0) > 0) this.publishMyShares(roomId);
     }
     this.roomOpenId = roomId;
     this.roomChatOpen = false;
@@ -2501,6 +2562,9 @@ class AppStore {
     this.roomJoinedAt = restAt;
     this.joinedRoomIds = this.joinedRoomIds.filter((id) => id !== roomId);
     this.presenceDrop(roomId, canonicalNodeId(this.localId));
+    // Stop offering our files here and forget the room's shared lists (the
+    // `leave` we send tells the host to drop us from the list it hosts).
+    this.clearRoomShares(roomId);
     if (this.roomOpenId === roomId) this.roomOpenId = null;
     void emitRoomLocal({ token: this.windowToken, kind: "leave", room: roomId });
   }
@@ -2590,9 +2654,24 @@ class AppStore {
     else this.toast("warn", "Nobody in the room can receive audio right now");
   }
 
+  /** This machine's shareable screens — the display sources behind the
+   *  "Share screen" picker. A multi-monitor machine advertises one per
+   *  monitor (`screen` for the primary, `screen:<id>` for the rest — see
+   *  the bridge's `capabilities_with_screens`), so the picker is how you
+   *  choose *which* to share, the way every call app does. The primary
+   *  (the `default` one) sorts first. */
+  roomScreenSources = $derived.by((): Capability[] =>
+    this.capsOf(this.localId)
+      .filter((c) => c.media === "display" && canSource(c.flow) && c.origin === "screen")
+      .sort((a, b) => Number(b.default ?? false) - Number(a.default ?? false)),
+  );
+
   /** Share your screen with the room: this machine's screen to every
-   *  member's display. Members see it as a tile in their room panel. */
-  toggleRoomScreen() {
+   *  member's display. Members see it as a tile in their room panel.
+   *  `sourceId` picks one of [`roomScreenSources`] (the screen-selection
+   *  popup); omitted, it shares the primary — the single-monitor path,
+   *  where there's nothing to choose. */
+  toggleRoomScreen(sourceId?: string) {
     const roomId = this.roomOpenId;
     if (!roomId) return;
     if (this.roomSendState(roomId).screen) {
@@ -2600,16 +2679,15 @@ class AppStore {
       this.setRoomSend(roomId, "screen", false);
       return;
     }
-    const from = this.capsOf(this.localId).find(
-      (c) => c.media === "display" && canSource(c.flow) && c.origin === "screen",
-    );
+    const sources = this.roomScreenSources;
+    const from = sourceId ? sources.find((c) => c.id === sourceId) : sources[0];
     if (!from) {
       this.toast("warn", "This machine exposes no screen");
       return;
     }
     const wired = this.wireRoomLegs(roomId, "screen", from, "display");
     this.setRoomSend(roomId, "screen", wired > 0);
-    if (wired > 0) this.toastLegs("Sharing your screen", wired);
+    if (wired > 0) this.toastLegs(`Sharing ${sources.length > 1 ? from.label : "your screen"}`, wired);
     else this.toast("warn", "Nobody in the room can receive a screen right now");
   }
 
@@ -2685,13 +2763,245 @@ class AppStore {
     this.broadcastRoom(room, { room: room.id, name: room.name, kind: "chat", text: line });
   }
 
-  /** Members of the open room you can send files to (the owner/fleet
-   *  gate, same as everywhere): the panel's file-send targets. */
-  roomFileTargets = $derived.by((): MeshNode[] => {
-    return this.roomMemberNodes
-      .map((m) => m.node)
-      .filter((n): n is MeshNode => !!n && this.filesAllowed(n));
-  });
+  // ---- Shared Files (the call's shared-download area) ----------------
+  //
+  // A call's file sharing is deliberately *not* the file manager: you
+  // offer specific files into a room area members download from — never a
+  // window onto your disk, and never a way to edit or browse anyone's
+  // files. The room's **host** hosts the *list* (it aggregates every
+  // member's offerings and restates the whole, like the roster), so a
+  // file stays listed as long as its uploader is in the call; the bytes
+  // ride peer-to-peer straight from the uploader, never through the host.
+
+  /** One entry of the open room's Shared Files area, resolved for the
+   *  panel: the file, who offered it, and whether that's you. */
+  roomSharedFiles = $derived.by(
+    (): { from: string; me: boolean; who: string; machine: string | null; file: SharedFileMeta }[] => {
+      const room = this.openRoom;
+      if (!room) return [];
+      // The host renders from its own aggregate (filtered to who's still
+      // present/online — a file is offered only while its uploader is);
+      // everyone else renders the list the host sent them. Our *own*
+      // offerings are merged in directly too, so they show the instant we
+      // share (before the host's list echoes back, and in demo mode).
+      const me = canonicalNodeId(this.localId);
+      const authoritative: SharedEntry[] = this.isRoomHost(room)
+        ? this.hostSharedEntries(room.id)
+        : this.roomSharesFromHost[room.id] ?? [];
+      const seen = new Set<string>();
+      const entries: SharedEntry[] = [];
+      for (const f of this.roomMyShares[room.id] ?? []) {
+        seen.add(f.token);
+        entries.push({ from: me, ...f });
+      }
+      for (const e of authoritative) {
+        if (seen.has(e.token)) continue;
+        seen.add(e.token);
+        entries.push(e);
+      }
+      return entries.map((e) => {
+        const who = this.roomWho(e.from);
+        return {
+          from: e.from,
+          me: this.isMe(e.from),
+          who: this.isMe(e.from) ? "You" : who.who,
+          machine: this.isMe(e.from) ? null : who.machine,
+          file: { token: e.token, name: e.name, size: e.size },
+        };
+      });
+    },
+  );
+
+  /** The host's aggregated Shared Files list for `roomId`, flattened to
+   *  entries and pruned to uploaders that are still present *and* online —
+   *  the "available as long as the uploader is online" rule. */
+  private hostSharedEntries(roomId: string): SharedEntry[] {
+    const byUploader = this.roomHostShares[roomId] ?? {};
+    const present = this.roomPresence[roomId] ?? [];
+    const out: SharedEntry[] = [];
+    for (const [from, files] of Object.entries(byUploader)) {
+      const here = this.isMe(from) || present.some((m) => sameMachine(m, from));
+      const online = this.isMe(from) || !!this.machineByAnyId(from)?.online;
+      if (!here || !online) continue;
+      for (const f of files) out.push({ from, ...f });
+    }
+    return out;
+  }
+
+  /** Offer files into the open room's Shared Files area. Opens the OS file
+   *  picker, registers the picked files with the backend (allowing the
+   *  room's members to fetch them), adds them to our list, and publishes
+   *  the change — to the host if we're a member, or straight into the room
+   *  if we host it. In demo/web mode there's no picker or transport, so it
+   *  drops in a placeholder so the area is still explorable. */
+  async shareRoomFiles() {
+    const room = this.openRoom;
+    if (!room) return;
+    if (!this.backendConnected) {
+      const n = (this.roomMyShares[room.id]?.length ?? 0) + 1;
+      this.addMyShares(room.id, [{ token: `demo_${Date.now().toString(36)}`, name: `shared-file-${n}.txt`, size: 1024 * n }]);
+      this.toast("info", "Demo mode — sharing files needs the desktop app on a live mesh");
+      return;
+    }
+    const paths = await pickFilesToShare();
+    if (paths.length === 0) return;
+    const metas = await roomShareFiles(room.members, paths);
+    if (metas.length === 0) {
+      this.toast("warn", "Couldn't read those files to share them");
+      return;
+    }
+    this.addMyShares(room.id, metas);
+    this.toast("ok", `Sharing ${metas.length} file${metas.length === 1 ? "" : "s"} with the room`);
+  }
+
+  /** Stop offering one of *your* shared files (the ✕ on your entry).
+   *  Drops it from the backend registry and re-publishes the list. */
+  unshareRoomFile(roomId: string, token: string) {
+    const mine = this.roomMyShares[roomId] ?? [];
+    if (!mine.some((f) => f.token === token)) return;
+    this.roomMyShares = { ...this.roomMyShares, [roomId]: mine.filter((f) => f.token !== token) };
+    if (this.backendConnected) void roomUnshare([token]);
+    this.publishMyShares(roomId);
+  }
+
+  /** Add files to our offer list for a room and publish the change. */
+  private addMyShares(roomId: string, metas: SharedFileMeta[]) {
+    const mine = this.roomMyShares[roomId] ?? [];
+    this.roomMyShares = { ...this.roomMyShares, [roomId]: [...mine, ...metas] };
+    this.publishMyShares(roomId);
+  }
+
+  /** Make our current offer list for `roomId` known. If we host the room,
+   *  fold it into the aggregate and restate the whole list to members; if
+   *  we're a member, tell the host (it's the catalog). */
+  private publishMyShares(roomId: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room) return;
+    const mine = this.roomMyShares[roomId] ?? [];
+    if (this.isRoomHost(room)) {
+      this.setHostShare(roomId, canonicalNodeId(this.localId), mine);
+      this.rebroadcastHostShares(roomId);
+    } else {
+      const host = this.roomHost(room);
+      if (host && this.backendConnected) {
+        void roomSend([host], { room: roomId, name: room.name, kind: "share_list", files: mine });
+      }
+    }
+  }
+
+  /** Host side: record one uploader's offer list in the aggregate. */
+  private setHostShare(roomId: string, uploader: string, files: SharedFileMeta[]) {
+    const room = (this.roomHostShares[roomId] ??= {});
+    if (files.length === 0) delete room[canonicalNodeId(uploader)];
+    else room[canonicalNodeId(uploader)] = files;
+  }
+
+  /** Host side: restate the room's whole Shared Files list to its members
+   *  (replacement semantics — exactly like the roster). Pruned to present,
+   *  online uploaders, so a file drops off the moment its uploader leaves. */
+  private rebroadcastHostShares(roomId: string) {
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (!room || !this.isRoomHost(room) || !this.backendConnected) return;
+    const files = this.hostSharedEntries(roomId);
+    this.broadcastRoom(room, { room: roomId, name: room.name, kind: "shares", files });
+  }
+
+  /** Download one shared file — peer-to-peer from its uploader, by token.
+   *  Opens a `:shared` fetch route to them, registers the disk sink, and
+   *  sends the fetch; progress + completion arrive on the file-progress /
+   *  file-saved events, and the route is torn down once it lands. */
+  async downloadSharedFile(from: string, file: SharedFileMeta) {
+    if (this.isMe(from)) return; // your own file already lives here
+    if (!this.backendConnected) {
+      this.toast("info", "Demo mode — downloading shared files needs the desktop app");
+      return;
+    }
+    const existing = this.sharedDownloads[file.token];
+    if (existing && existing.state === "fetching") return; // already going
+    const routeId = this.sharedConnect(from);
+    const req = this.sharedReqSeq++;
+    try {
+      const dest = await fileDownload(routeId, req, file.name);
+      this.sharedReqToken[`${routeId}:${req}`] = file.token;
+      this.sharedDownloads = {
+        ...this.sharedDownloads,
+        [file.token]: { token: file.token, name: file.name, done: 0, total: file.size, state: "fetching", note: dest },
+      };
+      await fileSend(routeId, { kind: "fetch", req, token: file.token });
+    } catch (e) {
+      void disconnectRoute(routeId);
+      this.toast("warn", `Couldn't start the download: ${errMsg(e)}`);
+    }
+  }
+
+  /** Mint a fresh Shared Files fetch route to `host` — a generic route
+   *  from their `:shared` endpoint to a viewer endpoint minted here.
+   *  Mirrors [`AppStore.filesConnect`], but `:shared` is token-gated, not
+   *  owner/fleet, so any room member may open one. One route per download;
+   *  it's torn down when the file lands ([`AppStore.onSharedSaved`]). */
+  private sharedConnect(host: string): string {
+    const fromEp = `${host}:shared`;
+    const n = ++this.sharedViewSeq;
+    const toEp = `${this.localId}:shared-view:${Date.now().toString(36)}-${n}`;
+    void connectRoute(fromEp, toEp, "generic");
+    return `route:${fromEp}→${toEp}`;
+  }
+
+  /** A shared download reported progress — find its row by route+req. */
+  private onSharedProgress(e: { route: string; req: number; written: number; total: number }) {
+    const token = this.sharedReqToken[`${e.route}:${e.req}`];
+    const cur = token ? this.sharedDownloads[token] : undefined;
+    if (!token || !cur) return;
+    this.sharedDownloads = {
+      ...this.sharedDownloads,
+      [token]: { ...cur, done: e.written, total: e.total || cur.total },
+    };
+  }
+
+  /** A shared download finished (or failed) — land the row's final state
+   *  and tear the one-shot fetch route down. */
+  private onSharedSaved(e: { route: string; req: number; path: string | null; error: string | null }) {
+    const key = `${e.route}:${e.req}`;
+    const token = this.sharedReqToken[key];
+    const cur = token ? this.sharedDownloads[token] : undefined;
+    if (!token || !cur) return;
+    delete this.sharedReqToken[key];
+    void disconnectRoute(e.route);
+    this.sharedDownloads = {
+      ...this.sharedDownloads,
+      [token]: e.error
+        ? { ...cur, state: "error", note: e.error }
+        : { ...cur, state: "done", done: cur.total, note: e.path ?? cur.note },
+    };
+    if (e.error) this.toast("warn", `Download failed: ${e.error}`);
+    else this.toast("ok", `Saved “${cur.name}” to your Downloads`);
+  }
+
+  /** Tear down our shared-files state for a room that's ending for us
+   *  (we left, were removed, or the host closed it): stop offering our
+   *  files (backend) and forget every shared-files list. No broadcast —
+   *  our `leave` already tells the host to drop us, and the room may be
+   *  gone. Idempotent. */
+  private clearRoomShares(roomId: string) {
+    const mine = this.roomMyShares[roomId] ?? [];
+    if (mine.length && this.backendConnected) void roomUnshare(mine.map((f) => f.token));
+    const { [roomId]: _mine, ...restMine } = this.roomMyShares;
+    this.roomMyShares = restMine;
+    const { [roomId]: _host, ...restFromHost } = this.roomSharesFromHost;
+    this.roomSharesFromHost = restFromHost;
+    delete this.roomHostShares[roomId];
+  }
+
+  /** Refresh the backend's allow-list for our offered files when a room we
+   *  *host* changes roster — the new member set may now (or no longer) be
+   *  allowed to fetch what we're sharing. */
+  private refreshSharePeers(roomId: string) {
+    const mine = this.roomMyShares[roomId] ?? [];
+    const room = this.rooms.find((r) => r.id === roomId);
+    if (mine.length && room && this.backendConnected) {
+      void roomSetSharePeers(mine.map((f) => f.token), room.members);
+    }
+  }
 
   /** Handle one inbound room-plane message. */
   handleRoomMessage(from: string, msg: RoomWireMessage) {
@@ -2714,6 +3024,7 @@ class AppStore {
           if (!listsMe) {
             // The host's new roster no longer lists us — we're out.
             if (this.isJoined(existing.id)) this.unjoinRoom(existing.id);
+            this.clearRoomShares(existing.id);
             this.rooms = this.rooms.filter((r) => r.id !== existing.id);
             this.saveRooms();
             this.toast("info", `${senderLabel} removed this device from “${existing.name}”`);
@@ -2737,6 +3048,9 @@ class AppStore {
           this.toast("info", `${senderLabel} added you to “${msg.name?.trim() || "a room"}”`);
         }
         this.saveRooms();
+        // The roster the host just restated may add or drop members the
+        // files we're offering are allowed to reach — refresh that gate.
+        this.refreshSharePeers(msg.room);
         // A knock answered: the roster now lists us — walk right in.
         if (this.pendingKnocks.includes(msg.room)) {
           this.pendingKnocks = this.pendingKnocks.filter((id) => id !== msg.room);
@@ -2760,12 +3074,21 @@ class AppStore {
             this.callLog(`  echoing our presence back to ${senderLabel}`);
             void roomSend([sender], { room: existing.id, name: existing.name, kind: "join" });
           }
+          // We host the list: a newcomer can't know what's already shared,
+          // so restate the room's Shared Files list now they're present.
+          if (this.isRoomHost(existing)) this.rebroadcastHostShares(existing.id);
         }
         break;
       }
       case "leave": {
         this.callLog(`recv leave from ${senderLabel} for ${msg.room}`);
         this.presenceDrop(msg.room, sender);
+        // The list lives with the host: when an uploader leaves, their
+        // files come off it (the bytes were only theirs to serve).
+        if (existing && this.isRoomHost(existing)) {
+          this.setHostShare(existing.id, sender, []);
+          this.rebroadcastHostShares(existing.id);
+        }
         break;
       }
       case "close": {
@@ -2775,9 +3098,27 @@ class AppStore {
         const host = this.roomHost(existing);
         if (host && !sameMachine(host, sender)) return;
         if (this.isJoined(existing.id)) this.unjoinRoom(existing.id);
+        this.clearRoomShares(existing.id);
         this.rooms = this.rooms.filter((r) => r.id !== existing.id);
         this.saveRooms();
         this.toast("info", `${senderLabel} closed “${existing.name}”`);
+        break;
+      }
+      case "share_list": {
+        // A member tells us (the host) what it's offering. Only the host
+        // aggregates; from anyone to a non-host it's noise.
+        if (!existing || !this.isRoomHost(existing)) return;
+        this.setHostShare(existing.id, sender, msg.files);
+        this.rebroadcastHostShares(existing.id);
+        break;
+      }
+      case "shares": {
+        // The host's authoritative Shared Files list — believed only from
+        // the host (the mesh authenticates `from`).
+        if (!existing) return;
+        const host = this.roomHost(existing);
+        if (host && !sameMachine(host, sender)) return;
+        this.roomSharesFromHost = { ...this.roomSharesFromHost, [existing.id]: msg.files };
         break;
       }
       case "chat": {
@@ -2896,6 +3237,8 @@ class AppStore {
       room.members = [...room.members, canonicalNodeId(from)];
       this.saveRooms();
       this.broadcastRoom(room, this.inviteMessage(room));
+      // The admitted machine may now fetch what we're offering.
+      this.refreshSharePeers(roomId);
     }
     const label = this.machineByAnyId(from)?.label ?? shortId(from);
     this.toast("ok", `Let ${label} into “${room.name}”`);

@@ -237,6 +237,14 @@ pub enum FileEvent {
     /// Read a whole file. Answered with a stream of `Chunk`s (the last
     /// has `eof: true`) or `Err`.
     Read { req: u64, path: String },
+    /// Fetch a file offered into a room's **Shared Files** area, named by
+    /// the opaque `token` the uploader minted (never a path — a `:shared`
+    /// route can't browse the disk, only pull what was explicitly shared).
+    /// The host resolves the token to a path, checks the requester is a
+    /// member the file was shared with, and answers with the same `Chunk`
+    /// stream a `Read` would — or `Err` when the token is unknown or not
+    /// shared with this peer.
+    Fetch { req: u64, token: String },
     /// Write one piece of a file. The first piece (`append: false`)
     /// creates/truncates; later pieces append. The host answers `Ok` once
     /// the piece with `eof: true` is on disk (or `Err` at any point).
@@ -286,6 +294,7 @@ impl FileEvent {
         match self {
             FileEvent::List { req, .. }
             | FileEvent::Read { req, .. }
+            | FileEvent::Fetch { req, .. }
             | FileEvent::Write { req, .. }
             | FileEvent::Mkdir { req, .. }
             | FileEvent::Rename { req, .. }
