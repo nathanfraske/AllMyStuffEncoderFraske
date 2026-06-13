@@ -1536,6 +1536,29 @@ class AppStore {
 
   // ---- video popouts (one stream in its own OS window) --------------
 
+  /** Wire a popout's *own* video leg. Unlike [`ownedConnect`], this skips the
+   *  GUI's route authorization (the structural unclaimed gate and the share
+   *  gate): a popout only ever *continues* a stream that was already live and
+   *  authorized where it was popped out from, and the host enforces owner/fleet
+   *  itself. A fresh popout window boots its own store and may not have
+   *  re-derived the source's ownership yet, so routing it through `proposeRoute`
+   *  would refuse the stream with a bogus "isn't yours yet — claim it first" —
+   *  the route never lands and never heals. Here the leg is wired directly;
+   *  if the far side really wouldn't allow it, the host rejects and the popout
+   *  shows that. Returns the route id and whether this call created it. */
+  private wirePopoutLeg(from: string, to: string): { id: string; created: boolean } | null {
+    const src = this.capability(from);
+    const sink = this.capability(to);
+    if (!src || !sink) return null;
+    const id = `route:${from}→${to}`;
+    const existedBefore = this.catalog.routes.some((r) => r.id === id);
+    if (!existedBefore) {
+      this.addRoute(from, to);
+      this.fireBackendConnect(from, to, src.media);
+    }
+    return { id, created: !existedBefore };
+  }
+
   /** Whether the stream behind `key` is held in a popout window. */
   isVideoPopped(key: string): boolean {
     return !!this.poppedVideos[key];
@@ -1663,7 +1686,7 @@ class AppStore {
     if (key.startsWith("cap:")) {
       const cap = this.capability(key.slice(4));
       const sink = cap ? matchEndpoint(this.catalog, this.localId, cap.media, "consume") : null;
-      const leg = cap && sink ? this.ownedConnect(cap.id, sink.id) : null;
+      const leg = cap && sink ? this.wirePopoutLeg(cap.id, sink.id) : null;
       this.videoPopoutLive = leg?.id ?? null;
       this.videoPopoutRouteId = leg?.created ? leg.id : null;
     } else if (key.startsWith("share:")) {

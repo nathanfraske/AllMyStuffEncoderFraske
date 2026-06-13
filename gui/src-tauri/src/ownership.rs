@@ -46,6 +46,14 @@ struct Persisted {
     /// The fleet's members — every co-owned device, in canonical-pubkey form.
     #[serde(default)]
     fleet_members: Vec<OwnedMember>,
+    /// The key of a fleet we deliberately **left** (or were released from).
+    /// A tombstone: a co-member that hasn't yet seen our departure keeps
+    /// gossiping the old roster — which still lists us — and `merge_fleet`
+    /// would otherwise re-adopt it straight back ("I leave but keep getting
+    /// pulled back in"). Persisted so a restart doesn't re-expose the race;
+    /// cleared the moment a fresh claim re-homes this device.
+    #[serde(default)]
+    left_fleet_key: Option<String>,
 }
 
 /// Live state behind one lock, so a claim's check-and-set is atomic.
@@ -57,6 +65,9 @@ struct Inner {
     fleet_name: String,
     fleet_version: u64,
     fleet_members: Vec<OwnedMember>,
+    /// See [`Persisted::left_fleet_key`] — the fleet this device left, kept so
+    /// a lagging co-member's gossip can't silently re-adopt us back into it.
+    left_fleet_key: Option<String>,
 }
 
 /// The live ownership store. Cheap to share behind an `Arc`.
@@ -83,6 +94,7 @@ impl Ownership {
             fleet_name: persisted.fleet_name,
             fleet_version: persisted.fleet_version,
             fleet_members: persisted.fleet_members,
+            left_fleet_key: persisted.left_fleet_key,
         };
         Ownership {
             path,
@@ -114,7 +126,12 @@ impl Ownership {
         if i.owner.is_some() {
             i.claim_mode = false;
         } else {
-            i.fleet_key = None;
+            // A release leaves the fleet. Tombstone the key we held so a
+            // co-member's not-yet-updated gossip can't immediately re-adopt us
+            // back into it (see `merge_fleet`); a later claim clears it.
+            if let Some(k) = i.fleet_key.take() {
+                i.left_fleet_key = Some(k);
+            }
             i.fleet_version = 0;
             i.fleet_members.clear();
         }
@@ -150,6 +167,9 @@ impl Ownership {
         let prev_name = std::mem::take(&mut i.fleet_name);
         let prev_version = std::mem::take(&mut i.fleet_version);
         let prev_members = std::mem::take(&mut i.fleet_members);
+        // A fresh claim re-homes us: clear any leave/release tombstone so the
+        // new owner's roster gossip (often the same key we once left) adopts.
+        let prev_left = i.left_fleet_key.take();
         if persist(&self.path, &i) {
             true
         } else {
@@ -162,6 +182,7 @@ impl Ownership {
             i.fleet_name = prev_name;
             i.fleet_version = prev_version;
             i.fleet_members = prev_members;
+            i.left_fleet_key = prev_left;
             false
         }
     }
@@ -287,6 +308,14 @@ impl Ownership {
             if !listed {
                 return false;
             }
+            // We left (or were released from) this exact fleet, and a co-member
+            // that hasn't caught up is re-gossiping the old roster that still
+            // lists us. Refuse to silently rejoin — only a fresh claim (which
+            // clears the tombstone) puts us back. Without this, leaving a fleet
+            // never sticks: the next gossip pulls us straight back in.
+            if i.left_fleet_key.as_deref() == Some(incoming.key.as_str()) {
+                return false;
+            }
         }
         let adopting = i.fleet_key.is_none();
 
@@ -400,11 +429,14 @@ impl Ownership {
             .cloned()
             .collect();
         let roster = OwnedRoster {
-            key,
+            key: key.clone(),
             name: i.fleet_name.clone(),
             version: i.fleet_version + 1,
             members,
         };
+        // Tombstone the fleet we just left, so a co-member that hasn't yet
+        // processed our departure can't re-adopt us with its stale roster.
+        i.left_fleet_key = Some(key);
         i.fleet_key = None;
         i.fleet_name.clear();
         i.fleet_version = 0;
@@ -549,6 +581,7 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
         fleet_name: inner.fleet_name.clone(),
         fleet_version: inner.fleet_version,
         fleet_members: inner.fleet_members.clone(),
+        left_fleet_key: inner.left_fleet_key.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
         Ok(json) => std::fs::write(path, json).is_ok(),
@@ -705,6 +738,85 @@ mod tests {
         };
         assert!(dev.merge_fleet("this-dev", &roster));
         assert_eq!(dev.fleet().unwrap().key, "fresh-key");
+    }
+
+    #[test]
+    fn leaving_a_fleet_isnt_undone_by_a_co_members_stale_gossip() {
+        // A device in a two-machine fleet leaves. A co-member that hasn't yet
+        // seen the departure keeps gossiping the old roster — which still lists
+        // us. That must not pull us back in (the "I leave but keep getting
+        // sucked back in" bug); only a fresh claim re-homes us.
+        let roster = OwnedRoster {
+            key: "fleetkey".into(),
+            name: String::new(),
+            version: 3,
+            members: vec![
+                OwnedMember {
+                    device: "owner-AAAAA".into(),
+                    label: "Owner".into(),
+                },
+                OwnedMember {
+                    device: "me-BBBBB".into(),
+                    label: "Me".into(),
+                },
+            ],
+        };
+        let dev = memory();
+        assert!(dev.merge_fleet("me-BBBBB", &roster), "adopts when listed");
+        assert!(dev.leave_fleet("me-BBBBB").is_some(), "leaves the fleet");
+        assert!(dev.fleet().is_none());
+
+        // Stale gossip (same key, still lists us) is refused now.
+        assert!(
+            !dev.merge_fleet("me-BBBBB", &roster),
+            "a left fleet's stale gossip must not re-adopt us"
+        );
+        assert!(dev.fleet().is_none(), "still out");
+
+        // A genuine re-claim clears the tombstone, so the owner's roster lands.
+        dev.inner.lock().claim_mode = true;
+        assert!(dev.try_accept_claim("owner-AAAAA"));
+        assert!(
+            dev.merge_fleet("me-BBBBB", &roster),
+            "re-claimed → adopts again"
+        );
+        assert_eq!(dev.fleet().unwrap().members.len(), 2);
+    }
+
+    #[test]
+    fn a_released_device_isnt_re_adopted_by_stale_fleet_gossip() {
+        // The same race via the *release* path: our owner lets us go
+        // (`set_owner(None)` clears the fleet), and a co-member's lagging gossip
+        // must not pull us back into it either.
+        let roster = OwnedRoster {
+            key: "fleetkey".into(),
+            name: String::new(),
+            version: 4,
+            members: vec![
+                OwnedMember {
+                    device: "owner-AAAAA".into(),
+                    label: "Owner".into(),
+                },
+                OwnedMember {
+                    device: "me-BBBBB".into(),
+                    label: "Me".into(),
+                },
+            ],
+        };
+        let dev = memory();
+        dev.inner.lock().claim_mode = true;
+        assert!(dev.try_accept_claim("owner-AAAAA"));
+        assert!(dev.merge_fleet("me-BBBBB", &roster));
+        assert_eq!(dev.fleet().unwrap().members.len(), 2);
+
+        // The owner releases us: the fleet clears and its key is tombstoned.
+        assert!(dev.set_owner(None));
+        assert!(dev.fleet().is_none());
+        assert!(
+            !dev.merge_fleet("me-BBBBB", &roster),
+            "a released device must not be re-adopted by stale gossip"
+        );
+        assert!(dev.fleet().is_none());
     }
 
     #[test]
