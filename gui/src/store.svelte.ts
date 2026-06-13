@@ -585,6 +585,17 @@ class AppStore {
       this.seedDemoNetworks();
       this.seedDemoRoom();
     }
+    // The rooms plane goes live *before* the first data pull. A room window
+    // joins the instant its identity lands (set by `hydrateFromBackend`,
+    // just below), and a `join` broadcast before onRoom is listening drops
+    // the presence replies peers send straight back — leaving whoever joined
+    // *second* with a roster of only themselves (their listener wasn't up to
+    // hear who was already in the call; the first-joiner never noticed
+    // because theirs was). Room presence has no snapshot to heal the gap the
+    // way routes do, so the miss is permanent. Subscribing up front closes
+    // the race; the same-device sibling bus rides along for symmetry.
+    await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
+    await onRoomLocal((e) => this.handleRoomLocal(e));
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
@@ -613,12 +624,10 @@ class AppStore {
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
-    // The rooms plane: invites, join/leave presence, chat, knocks.
-    await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
-    // The same-device lane between this app's windows (a room window's
-    // join/leave, the bar's hang-up ask, saved-list changes).
-    await onRoomLocal((e) => this.handleRoomLocal(e));
-    // Its video-popout sibling: which streams live in their own windows,
+    // (The rooms plane — invites, join/leave presence, chat, knocks — and
+    // its same-device sibling bus are subscribed at the top of init, before
+    // the identity pull, so a room window can't join before onRoom listens.)
+    // The video-popout sibling: which streams live in their own windows,
     // and the "Return video here" ask that puts one back.
     await onVideoLocal((e) => this.handleVideoLocal(e));
     // The fleet roster converges live — a claim, or gossip catching up, pushes
