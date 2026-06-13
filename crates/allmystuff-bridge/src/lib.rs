@@ -19,10 +19,11 @@
 //!    forwards is "whatever this machine's user does", not one scanned
 //!    device, so driving a remote never depends on the input scan finding
 //!    hardware — macOS finds none), **system audio** (a duplex
-//!    endpoint for its mixer), and **video in** (a video *sink* — the app
+//!    endpoint for its mixer), **video in** (a video *sink* — the app
 //!    shows inbound camera streams in a window, so any machine can receive
-//!    one). These are what whole-computer flows (remote control, a room's
-//!    screen share, a camera feed) land on at the far end.
+//!    one), and its **clipboard** (a duplex endpoint a console pushes a
+//!    paste into). These are what whole-computer flows (remote control, a
+//!    room's screen share, a camera feed) land on at the far end.
 //!
 //! This is the only place hardware vocabulary meets graph vocabulary, so
 //! it's small and thoroughly tested.
@@ -99,6 +100,17 @@ pub fn capabilities_with_screens(
         MediaKind::Audio,
         Flow::Duplex,
         "system",
+    ));
+    // The machine's clipboard — duplex, since a console can both push into
+    // it (paste here) and, in time, pull from it (the planned cross-machine
+    // copy/paste). Like control, it's a property of the machine itself, not
+    // of any scanned device.
+    caps.push(mk(
+        format!("{n}:clipboard"),
+        "Clipboard".into(),
+        MediaKind::Clipboard,
+        Flow::Duplex,
+        "clipboard",
     ));
     // The video sink every camera stream lands on: the app renders inbound
     // camera video in a window (console stage, room tile), so "can show
@@ -307,6 +319,15 @@ mod tests {
         let viewer = by_origin("viewer").expect("video in");
         assert_eq!((viewer.media, viewer.flow), (MediaKind::Video, Flow::Sink));
         assert_eq!(viewer.id.as_str(), "this:video-in");
+
+        // The clipboard bridge: duplex, so a console can paste into it (and,
+        // later, pull from it for cross-machine copy/paste).
+        let clip = by_origin("clipboard").expect("clipboard");
+        assert_eq!(
+            (clip.media, clip.flow),
+            (MediaKind::Clipboard, Flow::Duplex)
+        );
+        assert_eq!(clip.id.as_str(), "this:clipboard");
     }
 
     #[test]

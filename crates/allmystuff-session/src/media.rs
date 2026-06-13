@@ -309,6 +309,59 @@ impl FileFrame {
     }
 }
 
+/// One clipboard transfer over a clipboard route. Sent **on paste**, never
+/// on copy: each machine keeps its own local clipboard, and content only
+/// crosses the wire at the moment the far side is about to paste it — so a
+/// copy here never clobbers the clipboard there. The receiving machine
+/// writes the payload to its OS clipboard, and the paste keystroke (riding
+/// the paired control route right behind this frame, on the same ordered
+/// channel) then lands it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFrame {
+    /// Tag for demuxing off the shared media channel. Always `"clip"`.
+    pub t: MediaTagClipboard,
+    pub route: String,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: ClipboardEvent,
+}
+
+/// What crossed on a clipboard route. `Text` is the wired case today;
+/// `Image` and `Files` are the shapes the planned cross-machine copy/paste
+/// fills in, defined now so the wire is forward-compatible — a sender that
+/// can't read an image off the local clipboard simply never emits one, and
+/// a receiver that doesn't act on a kind drops it ([`MediaPayload::decode`]
+/// keeps unknown *tags* safe; this keeps unknown *contents* safe the same
+/// way).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClipboardEvent {
+    /// Plain UTF-8 text — the everyday copy/paste.
+    Text { text: String },
+    /// A bitmap, raw bytes tagged with their MIME type (e.g. `image/png`),
+    /// base64 on the wire. For "copy an image here, paste it there".
+    Image {
+        mime: String,
+        #[serde(with = "bytes_b64")]
+        data: Vec<u8>,
+    },
+    /// One or more files referenced by name. The bytes move over the files
+    /// plane (the planned cross-machine copy/paste); this carries the
+    /// clipboard's *intent* to paste them.
+    Files { names: Vec<String> },
+}
+
+impl ClipboardFrame {
+    pub fn new(route: impl Into<String>, seq: u64, event: ClipboardEvent) -> Self {
+        ClipboardFrame {
+            t: MediaTagClipboard::Clipboard,
+            route: route.into(),
+            seq,
+            event,
+        }
+    }
+}
+
 /// Everything that can arrive on the media channel, demuxed by the `t`
 /// tag (no tag = audio, the original frame shape).
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +372,7 @@ pub enum MediaPayload {
     Input(InputEvent),
     Terminal(TermFrame),
     File(FileFrame),
+    Clipboard(ClipboardFrame),
 }
 
 impl MediaPayload {
@@ -339,6 +393,9 @@ impl MediaPayload {
                 .ok()
                 .map(MediaPayload::Terminal),
             Some("file") => serde_json::from_value(payload).ok().map(MediaPayload::File),
+            Some("clip") => serde_json::from_value(payload)
+                .ok()
+                .map(MediaPayload::Clipboard),
             Some(_) => None,
             None => serde_json::from_value(payload)
                 .ok()
@@ -355,6 +412,7 @@ impl MediaPayload {
             MediaPayload::Input(f) => &f.route,
             MediaPayload::Terminal(f) => &f.route,
             MediaPayload::File(f) => &f.route,
+            MediaPayload::Clipboard(f) => &f.route,
         }
     }
 }
@@ -388,6 +446,13 @@ pub enum MediaTagFile {
     #[default]
     #[serde(rename = "file")]
     File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaTagClipboard {
+    #[default]
+    #[serde(rename = "clip")]
+    Clipboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -889,6 +954,52 @@ mod tests {
         assert_eq!(
             MediaPayload::decode(serde_json::json!({
                 "t": "file", "route": "r", "seq": 4, "kind": "teleport"
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn clipboard_frames_round_trip_and_demux() {
+        let events = vec![
+            ClipboardEvent::Text {
+                text: "hello clipboard".into(),
+            },
+            ClipboardEvent::Image {
+                mime: "image/png".into(),
+                data: vec![0xFF, 0x00, 0x10],
+            },
+            ClipboardEvent::Files {
+                names: vec!["a.txt".into(), "b.png".into()],
+            },
+        ];
+        for event in events {
+            let f = ClipboardFrame::new("route:a:clipboard→b:clipboard", 3, event);
+            let v = serde_json::to_value(&f).unwrap();
+            assert_eq!(v["t"], "clip");
+            let back: ClipboardFrame = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(f, back);
+            assert!(matches!(
+                MediaPayload::decode(v),
+                Some(MediaPayload::Clipboard(g)) if g.seq == 3
+            ));
+        }
+        // Image bytes travel as base64, never raw.
+        let f = ClipboardFrame::new(
+            "r",
+            0,
+            ClipboardEvent::Image {
+                mime: "image/png".into(),
+                data: vec![0xFF],
+            },
+        );
+        assert!(serde_json::to_string(&f)
+            .unwrap()
+            .contains("\"data\":\"/w==\""));
+        // A newer peer's new content kind fails *that frame only*.
+        assert_eq!(
+            MediaPayload::decode(serde_json::json!({
+                "t": "clip", "route": "r", "seq": 1, "kind": "hologram"
             })),
             None
         );

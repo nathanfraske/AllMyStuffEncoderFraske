@@ -95,6 +95,11 @@ pub enum MediaKind {
     Input,
     /// A shared folder or volume.
     Storage,
+    /// The system clipboard — text now, images and files where the
+    /// platform supports them. A distinct kind (not `Generic`) so the
+    /// clipboard endpoint only ever wires to another clipboard, never to
+    /// some unrelated app payload the wildcard would have matched.
+    Clipboard,
     /// App-defined payload — matches anything.
     Generic,
 }
@@ -113,6 +118,7 @@ impl MediaKind {
             MediaKind::Display => "display",
             MediaKind::Input => "input",
             MediaKind::Storage => "storage",
+            MediaKind::Clipboard => "clipboard",
             MediaKind::Generic => "data",
         }
     }
