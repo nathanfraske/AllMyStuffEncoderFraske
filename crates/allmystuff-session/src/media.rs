@@ -335,30 +335,62 @@ pub struct ClipboardFrame {
     pub event: ClipboardEvent,
 }
 
-/// What crossed on a clipboard route. `Text` is the wired case today;
-/// `Image` and `Files` are the shapes the planned cross-machine copy/paste
-/// fills in, defined now so the wire is forward-compatible — a sender that
-/// can't read an image off the local clipboard simply never emits one, and
-/// a receiver that doesn't act on a kind drops it ([`MediaPayload::decode`]
-/// keeps unknown *tags* safe; this keeps unknown *contents* safe the same
-/// way).
+/// What crossed on a clipboard route. `Text` is one frame; an image or a
+/// set of files is a *transfer* — an [`Open`](ClipboardEvent::Open)
+/// manifest, then [`Chunk`](ClipboardEvent::Chunk)s of base64 bytes (the
+/// daemon channel caps a message near 64 KiB, so anything bigger is split
+/// exactly like a video frame), then a [`Close`](ClipboardEvent::Close)
+/// that commits it to the far clipboard. File bytes stream from disk and
+/// land in a staging dir on the receiver, whose OS clipboard is then
+/// pointed at them — so a paste in a file manager materializes them. The
+/// bytes ride this route in pieces; the *content* of those pieces is
+/// written with the same logic the files plane already uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClipboardEvent {
-    /// Plain UTF-8 text — the everyday copy/paste.
+    /// Plain UTF-8 text — the everyday copy/paste, one frame.
     Text { text: String },
-    /// A bitmap, raw bytes tagged with their MIME type (e.g. `image/png`),
-    /// base64 on the wire. For "copy an image here, paste it there".
-    Image {
-        mime: String,
+    /// Begin a binary transfer. `transfer` scopes its chunks; `content`
+    /// says whether the items are an image or files; `items` names each
+    /// piece and its byte length (one item for an image, one per file).
+    Open {
+        transfer: u64,
+        content: ClipboardContentKind,
+        items: Vec<ClipboardItem>,
+    },
+    /// One ≤[`CLIPBOARD_CHUNK_BYTES`] piece of `item`'s bytes, base64 on the
+    /// wire. An item's pieces arrive in order, back to back.
+    Chunk {
+        transfer: u64,
+        item: u32,
         #[serde(with = "bytes_b64")]
         data: Vec<u8>,
     },
-    /// One or more files referenced by name. The bytes move over the files
-    /// plane (the planned cross-machine copy/paste); this carries the
-    /// clipboard's *intent* to paste them.
-    Files { names: Vec<String> },
+    /// Every chunk delivered — assemble and write to the OS clipboard.
+    Close { transfer: u64 },
 }
+
+/// Whether a clipboard transfer carries an image or a set of files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardContentKind {
+    Image,
+    Files,
+}
+
+/// One piece of a clipboard transfer: a file's base name (or `image.png`
+/// for an image), and its total byte length so the receiver can pre-size
+/// and cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardItem {
+    pub name: String,
+    pub size: u64,
+}
+
+/// Max bytes per [`ClipboardEvent::Chunk`] before base64 — kept well under
+/// the daemon channel's ~64 KiB message ceiling once base64 (×4/3) and the
+/// JSON envelope are added.
+pub const CLIPBOARD_CHUNK_BYTES: usize = 32 * 1024;
 
 impl ClipboardFrame {
     pub fn new(route: impl Into<String>, seq: u64, event: ClipboardEvent) -> Self {
@@ -974,13 +1006,26 @@ mod tests {
             ClipboardEvent::Text {
                 text: "hello clipboard".into(),
             },
-            ClipboardEvent::Image {
-                mime: "image/png".into(),
+            ClipboardEvent::Open {
+                transfer: 7,
+                content: ClipboardContentKind::Files,
+                items: vec![
+                    ClipboardItem {
+                        name: "a.txt".into(),
+                        size: 3,
+                    },
+                    ClipboardItem {
+                        name: "b.png".into(),
+                        size: 9,
+                    },
+                ],
+            },
+            ClipboardEvent::Chunk {
+                transfer: 7,
+                item: 1,
                 data: vec![0xFF, 0x00, 0x10],
             },
-            ClipboardEvent::Files {
-                names: vec!["a.txt".into(), "b.png".into()],
-            },
+            ClipboardEvent::Close { transfer: 7 },
         ];
         for event in events {
             let f = ClipboardFrame::new("route:a:clipboard→b:clipboard", 3, event);
@@ -993,12 +1038,13 @@ mod tests {
                 Some(MediaPayload::Clipboard(g)) if g.seq == 3
             ));
         }
-        // Image bytes travel as base64, never raw.
+        // Chunk bytes travel as base64, never raw.
         let f = ClipboardFrame::new(
             "r",
             0,
-            ClipboardEvent::Image {
-                mime: "image/png".into(),
+            ClipboardEvent::Chunk {
+                transfer: 1,
+                item: 0,
                 data: vec![0xFF],
             },
         );

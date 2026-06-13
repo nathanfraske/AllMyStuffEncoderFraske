@@ -310,17 +310,6 @@ export type InputAction =
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; code?: string; down: boolean };
 
-/** One clipboard transfer over a clipboard route — sent on paste, so each
- *  machine keeps its own local clipboard and content only crosses when the
- *  far side is about to paste it. Tagged exactly like the Rust
- *  `ClipboardEvent` (serde `kind`, snake_case); image `data` is base64.
- *  `text` is wired today; `image`/`files` are the shapes the planned
- *  cross-machine copy/paste fills in. */
-export type ClipboardEvent =
-  | { kind: "text"; text: string }
-  | { kind: "image"; mime: string; data: string }
-  | { kind: "files"; names: string[] };
-
 /** One terminal event a terminal window sends down its route. Tagged
  *  exactly like the Rust `TermEvent` (serde `kind`, snake_case); `bytes`
  *  is base64 (the wire is JSON). `exit` is the host's word only — it never
