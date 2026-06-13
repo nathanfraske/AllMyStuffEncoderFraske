@@ -133,6 +133,11 @@ pub enum Request {
     VideoSend {
         network: String,
         peer: String,
+        /// Which of the peer's video lanes to write to. Defaults to 0 so a
+        /// pre-pool daemon (which ignores the field) still drives its single
+        /// lane; a lane-pool daemon (myownmesh ≥ 0.2.7) routes it to that track.
+        #[serde(default)]
+        stream: u8,
         duration_us: u64,
         data: String,
     },
@@ -155,6 +160,10 @@ pub enum Request {
     AudioSend {
         network: String,
         peer: String,
+        /// Which of the peer's audio lanes to write to (defaults to 0, exactly
+        /// like [`Request::VideoSend`]).
+        #[serde(default)]
+        stream: u8,
         duration_us: u64,
         data: String,
     },
