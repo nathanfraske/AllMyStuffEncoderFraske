@@ -109,6 +109,17 @@ async function tryInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
   }
 }
 
+/** Mirror one diagnostic line into the backend's `tracing` log so a
+ *  desktop session's *frontend* decisions land in the same capturable
+ *  stream (`ALLMYSTUFF_GUI_LOG`) as the Rust side — no webview devtools to
+ *  juggle. Always echoes to the webview console too, so the in-browser
+ *  preview (no Tauri) still shows it. Fire-and-forget: a diagnostic must
+ *  never change behaviour or throw. */
+export function clientLog(line: string): void {
+  console.info(line);
+  void tryInvoke("client_log", { line });
+}
+
 /** Scan this machine. Returns null in web mode; the caller keeps its demo
  *  data. `node_id` is the mesh device id once the session is up. */
 export function scanSelf(): Promise<ScanResult | null> {

@@ -20,7 +20,7 @@
   // stream lost to another monitor is always one click from home.
   import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
-  import { focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
+  import { clientLog, focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
   import { type InputAction, type MeshNode, type Route } from "../types";
 
   let { route, member, windowed = false }: { route: Route; member: MeshNode; windowed?: boolean } =
@@ -85,6 +85,13 @@
     let unwatch: (() => void) | null = null;
     hasFrame = false;
 
+    // The receive side's mirror of the backend's "expecting frames from X"
+    // line: a tile that watches but never reports a first frame is the
+    // "waiting for pixels" stall, told apart from "no inbound route here at
+    // all" (no tile, so no line) and "backend has frames, webview can't
+    // paint" (this fires, the picture still doesn't).
+    clientLog(`[room-call] tile: watching ${routeId} (${route.media} from ${member.id})`);
+
     const paint = (w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
       const c = canvasEl;
       if (cancelled || !c) return;
@@ -93,9 +100,11 @@
       const ctx = c.getContext("2d");
       if (!ctx) return;
       draw(ctx);
+      const wasFirst = !hasFrame;
       frameW = w;
       frameH = h;
       hasFrame = true;
+      if (wasFirst) clientLog(`[room-call] tile: first frame on ${routeId} (${w}×${h})`);
     };
 
     // JPEG bitmap decodes are async — chain them so frames paint in order.

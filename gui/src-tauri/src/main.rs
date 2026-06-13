@@ -113,6 +113,18 @@ async fn disconnect_route(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Resul
     mesh.inner().disconnect(route_id).await
 }
 
+/// Mirror one frontend diagnostic line into the GUI's `tracing` log. The
+/// call plane decides who to wire entirely in the webview (online/claimed
+/// gates, sink lookup, presence) — decisions the Rust side never sees — so
+/// a toggle that wires *nothing* is indistinguishable from one the mesh
+/// dropped. Routing those lines here puts them in the same
+/// `ALLMYSTUFF_GUI_LOG` stream as the backend's route lifecycle, so one
+/// capture reads a call end to end.
+#[tauri::command]
+fn client_log(line: String) {
+    tracing::info!("{line}");
+}
+
 /// Claim a device as one of yours. Only takes if the target is in claim
 /// mode; the target's next presence advert (owner = us) confirms it.
 #[tauri::command]
@@ -855,6 +867,7 @@ fn main() {
             scan_full,
             connect_route,
             disconnect_route,
+            client_log,
             claim_node,
             set_claimable,
             send_input,
