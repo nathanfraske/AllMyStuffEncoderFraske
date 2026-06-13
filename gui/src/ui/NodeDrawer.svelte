@@ -223,13 +223,25 @@
           </p>
           <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
         {:else if node.claimable}
-          <p class="muted">
-            This device was started in <b>claim mode</b> — it's offering itself
-            for adoption. Make it one of yours, or mark it shared.
-          </p>
-          <div class="claim">
-            <button class="btn small primary" onclick={claimThis}>Claim this device</button>
-            <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
+          <!-- The forefront claim affordance — an accent call-to-action, not a
+               buried button. Claiming is authorization, so the copy is the same
+               shape the sharing flow uses; the big button makes "make it mine"
+               the obvious next move. -->
+          <div class="claim-card">
+            <div class="claim-card-head">
+              <span class="claim-glyph" aria-hidden="true">＋</span>
+              <div>
+                <div class="claim-card-title">Make {displayName(node)} yours</div>
+                <div class="claim-card-sub">It's in claim mode — offering itself for adoption.</div>
+              </div>
+            </div>
+            <p class="claim-card-what">
+              Claiming links it into your fleet under a shared key, so your
+              devices trust each other for screen, files and control. It's the
+              same kind of authorization you'll use to share with people.
+            </p>
+            <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
+            <button class="linklike" onclick={makeShared}>It's someone else's — I'm just sharing with them →</button>
           </div>
         {:else}
           <p class="muted">
@@ -287,15 +299,28 @@
           <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 Part of your fleet — see the shared key →</button>
         {/if}
         {#if node.kind === "this"}
-          <!-- Hand this machine off: put it into claim mode so another of
-               your devices can adopt it (Task 4). -->
+          <!-- The other side of claiming: this device offering *itself*. When
+               it's on, a prominent banner makes the hand-off obvious — you
+               finish the claim from a machine that already owns your stuff. -->
+          {#if node.claimable}
+            <div class="offer-banner">
+              <span class="offer-glyph" aria-hidden="true">📡</span>
+              <div>
+                <div class="offer-title">This device is offering itself for adoption</div>
+                <div class="offer-sub">
+                  On a machine you already own, open this device on the graph and
+                  choose <b>Claim</b> — they'll link under one shared key.
+                </div>
+              </div>
+            </div>
+          {/if}
           <label class="adopt">
             <input
               type="checkbox"
               checked={node.claimable ?? false}
               onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
             />
-            <span>Allow another of my devices to adopt this one</span>
+            <span>{node.claimable ? "Offering this device for adoption" : "Offer this device so another of mine can adopt it"}</span>
           </label>
         {:else}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
@@ -472,11 +497,84 @@
     border-radius: var(--r-pill);
     padding: 0.04rem 0.4rem;
   }
-  .claim {
+  /* The claim call-to-action — a brand-accent card that leads the drawer for
+     an adoptable device, so claiming reads as the headline action it is. */
+  .claim-card {
+    border: 1.5px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: var(--r-md);
+    padding: 0.75rem 0.8rem;
+    margin-top: 0.2rem;
+  }
+  .claim-card-head {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
-    margin-top: 0.4rem;
+    gap: 0.55rem;
+  }
+  .claim-glyph {
+    display: grid;
+    place-items: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 800;
+    font-size: 1.1rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .claim-card-title {
+    font-weight: 750;
+    font-size: 0.95rem;
+  }
+  .claim-card-sub {
+    font-size: 0.74rem;
+    color: var(--accent-ink);
+    margin-top: 0.05rem;
+  }
+  .claim-card-what {
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: var(--ink-soft);
+    margin: 0.6rem 0 0.7rem;
+  }
+  .claim-go {
+    width: 100%;
+    justify-content: center;
+  }
+  .claim-card .linklike {
+    display: block;
+    width: 100%;
+    text-align: center;
+    color: var(--ink-soft);
+  }
+  /* This device offering itself — a calm status banner (it's a state, not a
+     call to act here), so the in-progress hand-off is impossible to miss. */
+  .offer-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: var(--r-md);
+    padding: 0.65rem 0.75rem;
+    margin: 0.2rem 0 0.5rem;
+  }
+  .offer-glyph {
+    font-size: 1.2rem;
+    line-height: 1.2;
+    flex-shrink: 0;
+  }
+  .offer-title {
+    font-weight: 700;
+    font-size: 0.86rem;
+  }
+  .offer-sub {
+    font-size: 0.76rem;
+    line-height: 1.45;
+    color: var(--ink-soft);
+    margin-top: 0.15rem;
   }
   .state {
     font-size: 0.7rem;

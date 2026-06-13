@@ -86,19 +86,21 @@
 
   // ---- views ------------------------------------------------------------
   //
-  // Two layouts over the same nodes: the radial default ("this" centred,
-  // fleets seated together around the ring) and the grouped grid (one
-  // labelled section per fleet) — switched from the zoom controls.
+  // Two layouts over the same nodes: the grouped grid (one labelled section
+  // per fleet — the default) and the radial ("this" centred, fleets seated
+  // together around the ring) — switched from the zoom controls.
 
   type ViewMode = "radial" | "grid";
   const VIEW_STORE_KEY = "allmystuff.graphView.v1";
   let view = $state<ViewMode>(loadView());
 
   function loadView(): ViewMode {
+    // Grid is the default now — only an explicit, stored "radial" choice opts
+    // back out, so a fresh install lands on the grouped view.
     try {
-      return localStorage.getItem(VIEW_STORE_KEY) === "grid" ? "grid" : "radial";
+      return localStorage.getItem(VIEW_STORE_KEY) === "radial" ? "radial" : "grid";
     } catch {
-      return "radial";
+      return "grid";
     }
   }
 
@@ -380,12 +382,16 @@
       {@const shared = n.relationship.kind === "shared"}
       {@const unclaimed = n.relationship.kind === "unclaimed"}
       {@const meshonly = !isAppNode(n)}
+      <!-- Offering itself for adoption *and* actually takeable (unowned): the
+           node gets an accent halo so "claim me" is obvious on the graph. -->
+      {@const adoptable = unclaimed && n.claimable === true && !(n.owner && !app.isMe(n.owner))}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
         class:self={n.kind === "this"}
         class:shared
         class:unclaimed
+        class:claimable={adoptable}
         class:meshonly
         class:selected={app.selectedNodeId === n.id}
         class:armed={armed && targetable(n)}
@@ -429,11 +435,14 @@
           {:else if shared}<span class="tag guest">guest</span>
           {:else if unclaimed}
             <!-- A device whose advert names an owner that isn't us is
-                 claimed by someone else — say that, not "unclaimed". -->
+                 claimed by someone else — say that, not "unclaimed". One
+                 that's offering itself gets the accent "claim" tag. -->
             {#if n.owner && !app.isMe(n.owner)}
               <span class="tag theirs">someone else's</span>
+            {:else if adoptable}
+              <span class="tag claimable">＋ claim</span>
             {:else}
-              <span class="tag unclaimed">{n.claimable ? "claimable" : "unclaimed"}</span>
+              <span class="tag unclaimed">unclaimed</span>
             {/if}
           {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
           {#if app.isFleetMember(n.id)}<span class="tag fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
@@ -594,6 +603,28 @@
     border-style: dashed;
     border-color: var(--line-strong);
   }
+  /* Offering itself for adoption: a solid accent edge and a gentle pulsing
+     halo, so a device you can claim invites the click the way a fresh, joinable
+     thing should — the graph-level echo of the top-bar claim nudge. */
+  .node.claimable {
+    border-style: solid;
+    border-color: var(--accent);
+    animation: claim-halo 1.9s ease-out infinite;
+  }
+  .node.claimable:hover {
+    transform: translateY(-2px);
+  }
+  @keyframes claim-halo {
+    0% {
+      box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0.4), var(--shadow-md);
+    }
+    70% {
+      box-shadow: 0 0 0 7px oklch(0.64 0.255 350 / 0), var(--shadow-md);
+    }
+    100% {
+      box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0), var(--shadow-md);
+    }
+  }
   /* A device that isn't running AllMyStuff: quiet, washed-out, and not a
      connection target — present so you can see it's there, but it shouldn't
      invite a click the way your real machines do. */
@@ -721,6 +752,12 @@
     background: var(--surface-2);
     color: var(--ink-soft);
     border: 1px dashed var(--line-strong);
+  }
+  .tag.claimable {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border: 1px solid var(--accent);
+    font-weight: 700;
   }
   .tag.theirs {
     background: var(--violet-soft);

@@ -266,6 +266,10 @@ class AppStore {
   settingsTab = $state<SettingsTab>("networks");
   /** The "a new device wants to join" approval popup (the code-grid nudge). */
   approvalsOpen = $state(false);
+  /** The "claim a device" sheet — the forefront adoption surface, opened from
+   *  the top-bar nudge or a device's drawer. Claiming is the step right after
+   *  joining a network, so it gets the same prominence the join nudge has. */
+  claimOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
@@ -524,6 +528,20 @@ class AppStore {
    *  session — what the top-bar nudge counts and the popup shows. */
   freshJoins = $derived(
     this.pendingJoins.filter((j) => !this.dismissedJoins.includes(canonicalNodeId(j.peer.device_id))),
+  );
+
+  /** Devices offering themselves for adoption that you can actually take —
+   *  running AllMyStuff, still unclaimed, in claim mode, and not already owned
+   *  by someone else. The mirror of `freshJoins` for the claim step: what the
+   *  top-bar "ready to claim" nudge counts and the Claim sheet lists. */
+  claimables = $derived(
+    this.catalog.nodes.filter(
+      (n) =>
+        isAppNode(n) &&
+        n.relationship.kind === "unclaimed" &&
+        n.claimable === true &&
+        !(n.owner && !this.isMe(n.owner)),
+    ),
   );
 
   /** Canonical pubkeys of every device in your owned fleet (you included), so
@@ -1518,6 +1536,29 @@ class AppStore {
 
   // ---- video popouts (one stream in its own OS window) --------------
 
+  /** Wire a popout's *own* video leg. Unlike [`ownedConnect`], this skips the
+   *  GUI's route authorization (the structural unclaimed gate and the share
+   *  gate): a popout only ever *continues* a stream that was already live and
+   *  authorized where it was popped out from, and the host enforces owner/fleet
+   *  itself. A fresh popout window boots its own store and may not have
+   *  re-derived the source's ownership yet, so routing it through `proposeRoute`
+   *  would refuse the stream with a bogus "isn't yours yet — claim it first" —
+   *  the route never lands and never heals. Here the leg is wired directly;
+   *  if the far side really wouldn't allow it, the host rejects and the popout
+   *  shows that. Returns the route id and whether this call created it. */
+  private wirePopoutLeg(from: string, to: string): { id: string; created: boolean } | null {
+    const src = this.capability(from);
+    const sink = this.capability(to);
+    if (!src || !sink) return null;
+    const id = `route:${from}→${to}`;
+    const existedBefore = this.catalog.routes.some((r) => r.id === id);
+    if (!existedBefore) {
+      this.addRoute(from, to);
+      this.fireBackendConnect(from, to, src.media);
+    }
+    return { id, created: !existedBefore };
+  }
+
   /** Whether the stream behind `key` is held in a popout window. */
   isVideoPopped(key: string): boolean {
     return !!this.poppedVideos[key];
@@ -1645,7 +1686,7 @@ class AppStore {
     if (key.startsWith("cap:")) {
       const cap = this.capability(key.slice(4));
       const sink = cap ? matchEndpoint(this.catalog, this.localId, cap.media, "consume") : null;
-      const leg = cap && sink ? this.ownedConnect(cap.id, sink.id) : null;
+      const leg = cap && sink ? this.wirePopoutLeg(cap.id, sink.id) : null;
       this.videoPopoutLive = leg?.id ?? null;
       this.videoPopoutRouteId = leg?.created ? leg.id : null;
     } else if (key.startsWith("share:")) {
@@ -3267,6 +3308,12 @@ class AppStore {
   openApprovals() {
     if (this.freshJoins.length === 0) return;
     this.approvalsOpen = true;
+  }
+
+  /** Open the "claim a device" sheet (the adoption nudge's target). */
+  openClaim() {
+    if (this.claimables.length === 0) return;
+    this.claimOpen = true;
   }
 
   /** Approve a pending join straight from the popup. */
