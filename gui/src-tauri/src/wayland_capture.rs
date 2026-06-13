@@ -36,12 +36,14 @@
 //! route therefore keys its own token, and what it restores is whatever
 //! the user picked for that tab the first time.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pipewire::{
     channel,
@@ -381,6 +383,34 @@ struct StreamData {
     format: VideoInfoRaw,
 }
 
+/// Rate limit for the consumer's "why this frame was dropped" warns —
+/// every drop condition repeats at frame rate; its explanation must not.
+const DROP_WARN_EVERY: Duration = Duration::from_secs(5);
+
+/// Per-condition rate-limited warns for the frame path. The capture
+/// thread used to skip bad frames silently, which from the far end reads
+/// as "session started, then nothing" — indistinguishable from a dark
+/// display. One line per condition per window names the real problem.
+struct DropWarns(HashMap<&'static str, Instant>);
+
+impl DropWarns {
+    fn new() -> Self {
+        DropWarns(HashMap::new())
+    }
+
+    fn warn(&mut self, key: &'static str, msg: impl FnOnce() -> String) {
+        let now = Instant::now();
+        let due = self
+            .0
+            .get(key)
+            .is_none_or(|t| now.duration_since(*t) >= DROP_WARN_EVERY);
+        if due {
+            self.0.insert(key, now);
+            tracing::warn!("{}", msg());
+        }
+    }
+}
+
 /// Connect to the portal's stream node and pump pictures into `tx`
 /// until the quit channel fires. Format negotiation and conversion
 /// mirror xcap's recorder (RGB/RGBA/RGBx/BGRx → packed RGBA), plus a
@@ -407,9 +437,29 @@ fn pipewire_consume(
     )
     .map_err(|e| e.to_string())?;
 
+    // A stream that dies (compositor revoked the grant, the output it
+    // recorded went away, negotiation failed) raises no panic and sends
+    // no frame — it just changes state. Surface that as the loop's
+    // result so the capture thread can fall back instead of idling on a
+    // dead stream forever.
+    let stream_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let mut drops = DropWarns::new();
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             format: Default::default(),
+        })
+        .state_changed({
+            let main_loop = main_loop.clone();
+            let stream_error = stream_error.clone();
+            move |_, _, old, new| {
+                if let pipewire::stream::StreamState::Error(e) = &new {
+                    *stream_error.borrow_mut() = Some(e.clone());
+                    main_loop.quit();
+                } else {
+                    tracing::debug!("wayland screencast stream: {old:?} → {new:?}");
+                }
+            }
         })
         .param_changed(|_, data, id, param| {
             let Some(param) = param else { return };
@@ -428,6 +478,17 @@ fn pipewire_consume(
             }
             if let Err(e) = data.format.parse(param) {
                 tracing::warn!("screencast format parse: {e:?}");
+            } else {
+                // The one line that proves negotiation completed — its
+                // absence after "session started" means the compositor
+                // never agreed on a format.
+                let size = data.format.size();
+                tracing::info!(
+                    "wayland screencast negotiated: {:?} {}×{}",
+                    data.format.format(),
+                    size.width,
+                    size.height
+                );
             }
         })
         .process(move |stream, data| {
@@ -436,19 +497,30 @@ fn pipewire_consume(
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
+                drops.warn("planes", || {
+                    "screencast buffer carried no data planes — frame dropped".into()
+                });
                 return;
             }
             let size = data.format.size();
             let (w, h) = (size.width, size.height);
             if w == 0 || h == 0 {
+                drops.warn("no-format", || {
+                    "screencast frame arrived before format negotiation — dropped".into()
+                });
                 return;
             }
             let format = data.format.format();
             let bpp: usize = match format {
                 VideoFormat::RGB => 3,
-                VideoFormat::RGBA | VideoFormat::RGBx | VideoFormat::BGRx => 4,
+                VideoFormat::RGBA
+                | VideoFormat::RGBx
+                | VideoFormat::BGRx
+                | VideoFormat::BGRA => 4,
                 other => {
-                    tracing::warn!("screencast format {other:?} unsupported");
+                    drops.warn("format", || {
+                        format!("screencast format {other:?} unsupported — frame dropped")
+                    });
                     return;
                 }
             };
@@ -461,6 +533,9 @@ fn pipewire_consume(
                 }
             };
             let Some(frame_data) = datas[0].data() else {
+                drops.warn("unmappable", || {
+                    "screencast buffer not mappable (DMA-BUF only?) — frame dropped".into()
+                });
                 return;
             };
             // Pack the rows (drop any stride padding), then normalize to
@@ -470,7 +545,13 @@ fn pipewire_consume(
             for y in 0..h as usize {
                 let start = y * stride;
                 let Some(src) = frame_data.get(start..start + row) else {
-                    return; // short buffer — skip the torn frame
+                    drops.warn("torn", || {
+                        format!(
+                            "screencast buffer shorter than {w}×{h} at stride {stride} — \
+                             torn frame dropped"
+                        )
+                    });
+                    return;
                 };
                 packed.extend_from_slice(src);
             }
@@ -483,7 +564,7 @@ fn pipewire_consume(
                     }
                     buf
                 }
-                VideoFormat::BGRx => {
+                VideoFormat::BGRx | VideoFormat::BGRA => {
                     let mut buf = packed;
                     for px in buf.chunks_exact_mut(4) {
                         px.swap(0, 2);
@@ -515,6 +596,10 @@ fn pipewire_consume(
             VideoFormat::RGBA,
             VideoFormat::RGBx,
             VideoFormat::BGRx,
+            // KWin (and Mutter on some stacks) offers BGRA first for
+            // shm screen casts; without it the intersection can come
+            // up empty and the stream dies before its first frame.
+            VideoFormat::BGRA,
         ),
         pod::property!(
             FormatProperties::VideoSize,
@@ -568,6 +653,13 @@ fn pipewire_consume(
     });
 
     main_loop.run();
+    // A loop quit by the error listener (vs. the route's own quit
+    // signal) ends the consumer with the compositor's reason; the
+    // dropped frame channel then bounces the capture thread onto its
+    // fallback path immediately instead of after the stall deadline.
+    if let Some(e) = stream_error.borrow_mut().take() {
+        return Err(format!("stream error: {e}"));
+    }
     Ok(())
 }
 
