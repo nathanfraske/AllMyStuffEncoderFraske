@@ -37,19 +37,42 @@
 
   type FleetGroup = { key: string; label: string; nodes: MeshNode[] };
 
+  const mineLabel = (): string =>
+    app.fleetName
+      ? `${app.fleetName}'s fleet`
+      : app.fleetMemberIds.size > 1
+        ? "Your fleet"
+        : "Your devices";
+
   function fleetKeyOf(n: MeshNode): { key: string; label: string } {
+    // The local device groups with your fleet — but only while it actually
+    // belongs to one. Leaving a fleet releases this machine's ownership, so a
+    // fleet-less "this" device drops to "Unknown fleet" alongside any other
+    // owner-less node, instead of clinging to a "Your devices" group of one.
+    // It still anchors your group while you genuinely own other machines, and
+    // while it's the only machine on the graph (a lone first-run device isn't
+    // "unknown").
+    if (n.kind === "this") {
+      const inFleet = app.isFleetMember(n.id) || (!!n.owner && app.isMe(n.owner));
+      const ownsOthers = app.catalog.nodes.some(
+        (m) =>
+          m.id !== n.id &&
+          (m.relationship.kind === "mine" ||
+            app.isFleetMember(m.id) ||
+            (!!m.owner && app.isMe(m.owner))),
+      );
+      const aloneHere =
+        app.catalog.nodes.filter((m) => m.id !== n.id && isAppNode(m)).length === 0;
+      return inFleet || ownsOthers || aloneHere
+        ? { key: "mine", label: mineLabel() }
+        : { key: "unknown", label: "Unknown fleet" };
+    }
     if (
-      n.kind === "this" ||
       n.relationship.kind === "mine" ||
       app.isFleetMember(n.id) ||
       (!!n.owner && app.isMe(n.owner))
     ) {
-      const label = app.fleetName
-        ? `${app.fleetName}'s fleet`
-        : app.fleetMemberIds.size > 1
-          ? "Your fleet"
-          : "Your devices";
-      return { key: "mine", label };
+      return { key: "mine", label: mineLabel() };
     }
     if (n.relationship.kind === "shared") {
       const p = n.relationship.person;
