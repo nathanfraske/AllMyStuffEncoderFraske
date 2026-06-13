@@ -2382,8 +2382,17 @@ impl Mesh {
         }
     }
 
-    /// The sink side's mirror: claim the peer's inbound track lane for
-    /// this route if we offered H.264 — the sender may still pick MJPEG,
+    /// The sink side's mirror of [`Self::pick_outbound_video_mode`]: claim the
+    /// peer's inbound track lane for this route when we offered H.264 — but
+    /// only when it's free or held by a route that's no longer active. A peer
+    /// has exactly one H.264 track, and the sender only ever puts one route's
+    /// access units on it (a second H.264 route to the same peer is told
+    /// MJPEG). If a second route *stole* the inbound mapping, that single track
+    /// — still carrying the *first* route's frames — would be delivered to the
+    /// second window, where its own MJPEG frames also land: the two streams
+    /// interleave (popping out a second screen of one machine). So an active
+    /// holder keeps the lane; the newcomer rides MJPEG, routed by its own id on
+    /// the media channel. The sender may still pick MJPEG even when we do claim,
     /// in which case the claim simply never sees a sample.
     fn claim_inbound_video_lane(&self, route: &Route, from_node: &str) {
         let offered_h264 = self
@@ -2394,22 +2403,44 @@ impl Mesh {
             .and_then(|s| s.route(&route.id))
             .map(|r| r.video.iter().any(|v| v == "h264"))
             .unwrap_or(false);
-        if offered_h264 {
-            self.video_lane_in
-                .lock()
-                .insert(pubkey_part(from_node).to_string(), route.id.clone());
-            tracing::info!(
-                "route {} — inbound video lane claimed from {} (H.264 samples will route here)",
-                route.id,
-                short_id(from_node)
-            );
-        } else {
+        if !offered_h264 {
             tracing::info!(
                 "route {} — no H.264 in our offer; expecting MJPEG frames from {}",
                 route.id,
                 short_id(from_node)
             );
+            return;
         }
+        let canon = pubkey_part(from_node).to_string();
+        // Busy only while the holder is a *different*, still-active route — a
+        // torn-down or superseded one (the viewer closed that popout / switched
+        // tabs) is taken over, exactly as the outbound side does.
+        let holder = self.video_lane_in.lock().get(&canon).cloned();
+        let holder_active = holder.as_deref().is_some_and(|rid| {
+            rid != route.id
+                && self
+                    .state
+                    .lock()
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.route(rid))
+                    .is_some_and(|r| r.is_active())
+        });
+        if holder_active {
+            tracing::info!(
+                "route {} — peer's inbound track lane busy ({}); expecting MJPEG frames from {}",
+                route.id,
+                holder.as_deref().unwrap_or("?"),
+                short_id(from_node)
+            );
+            return;
+        }
+        self.video_lane_in.lock().insert(canon, route.id.clone());
+        tracing::info!(
+            "route {} — inbound video lane claimed from {} (H.264 samples will route here)",
+            route.id,
+            short_id(from_node)
+        );
     }
 
     /// Start the capture behind an outbound display/camera stream, wired
