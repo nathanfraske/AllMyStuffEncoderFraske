@@ -75,6 +75,15 @@ pub const FEATURE_ROOMS: &str = "rooms";
 /// waiting on a stream that will never start.
 pub const FEATURE_CAMERA: &str = "camera";
 
+/// Feature tag a node advertises in [`NodeProfile::features`] when its local
+/// daemon provisions the **media lane pool** (myownmesh ≥ 0.2.7): several
+/// independent video/audio RTP tracks per peer, so a sender can fan several
+/// simultaneous streams to one peer (two screens of one machine) onto
+/// separate lanes instead of one. A sender only routes a second+ stream to a
+/// lane past 0 when the receiver advertises this; otherwise the extra stream
+/// falls back to MJPEG, exactly as before the pool.
+pub const FEATURE_MEDIA_LANES: &str = "media-lanes";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.

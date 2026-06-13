@@ -92,7 +92,7 @@ pub struct Mesh {
     /// the capture side drops frames instead of queueing stale ones (an
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
     /// next forced IDR).
-    video_out: mpsc::Sender<(String, VideoPacket)>,
+    video_out: mpsc::Sender<(String, String, VideoPacket)>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// This app run's random presence boot id — how peers detect that we
@@ -108,15 +108,6 @@ pub struct Mesh {
     /// push channel's ordered delivery meant one lost message silently
     /// froze the stream forever while the backend kept counting frames.
     video_watchers: Mutex<HashMap<String, VideoWatcher>>,
-    /// The H.264 track lane is one per peer connection: which route is
-    /// streaming *out* on it (peer pubkey → route id). A second display
-    /// route to the same peer falls back to MJPEG until the lane frees.
-    video_lane_out: Mutex<HashMap<String, String>>,
-    /// Which inbound route consumes each peer's track lane here (peer
-    /// pubkey → route id) — set when our offered display route goes
-    /// active with `h264` accepted, so `video_inbound` events route to
-    /// the right console window.
-    video_lane_in: Mutex<HashMap<String, String>>,
     /// Whether the local daemon speaks the video track lane (`video_*`
     /// ops, myownmesh ≥ 0.2.1). Probed at session start; while false the
     /// app neither offers nor picks H.264 — screen shares ride MJPEG and
@@ -134,13 +125,6 @@ pub struct Mesh {
     /// When each route last asked its sender for a clean decode entry —
     /// decode errors arrive at frame rate; the asks must not.
     refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
-    /// The Opus audio lane mirrors the video lane's bookkeeping: one
-    /// outbound stream per peer connection (peer pubkey → route id)…
-    audio_lane_out: Mutex<HashMap<String, String>>,
-    /// …and which inbound route consumes each peer's audio lane here —
-    /// claimed when our offered audio route goes active with `opus`
-    /// accepted, so `audio_inbound` frames decode into the right ring.
-    audio_lane_in: Mutex<HashMap<String, String>>,
     /// Per-route Opus decoders for inbound lane audio (stateful across
     /// frames; dropped with the route).
     audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
@@ -148,6 +132,9 @@ pub struct Mesh {
     /// ops, myownmesh ≥ 0.2.4) — the audio twin of `daemon_video`.
     /// While false, audio rides PCM frames over the media channel.
     daemon_audio: std::sync::atomic::AtomicBool,
+    /// How many media lanes the local daemon provisions per peer (from
+    /// Status `media_lanes`); 1 means a pre-pool daemon.
+    daemon_lanes: std::sync::atomic::AtomicU8,
 }
 
 /// One captured-audio packet headed for the forwarder, in whichever
@@ -156,7 +143,11 @@ enum AudioOut {
     /// A PCM frame for `CHANNEL_MEDIA` — the floor every peer speaks.
     Channel(String, AudioFrame),
     /// One encoded Opus frame for the daemon's audio track lane.
-    Lane { peer: String, data: Vec<u8> },
+    Lane {
+        peer: String,
+        route: String,
+        data: Vec<u8>,
+    },
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -232,6 +223,11 @@ struct State {
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
     peer_networks: HashMap<String, String>,
+    /// App features each peer last advertised (canonical pubkey → feature
+    /// list from its presence profile). Read to decide whether a peer can
+    /// ride the media-lane pool — `FEATURE_MEDIA_LANES` present means both
+    /// ends ship the lane-pool daemon and can split streams across lanes.
+    peer_features: HashMap<String, Vec<String>>,
     /// Last presence boot id seen per peer (canonical pubkey). A boot id we
     /// haven't recorded means the peer just (re)started and missed our
     /// adverts — we answer with our state directly. This is what lets
@@ -247,7 +243,7 @@ impl Mesh {
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
         let (audio_out, mut audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, mut video_rx) = mpsc::channel::<(String, VideoPacket)>(4);
+        let (video_out, mut video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
         let mesh = Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -266,6 +262,7 @@ impl Mesh {
                 network: None,
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
+                peer_features: HashMap::new(),
                 peer_boots: HashMap::new(),
                 client_id: None,
                 profile: None,
@@ -277,16 +274,13 @@ impl Mesh {
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
-            video_lane_out: Mutex::new(HashMap::new()),
-            video_lane_in: Mutex::new(HashMap::new()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             video_in_stats: Mutex::new(HashMap::new()),
             video_diag_last: Mutex::new(HashMap::new()),
             refresh_asks: Mutex::new(HashMap::new()),
-            audio_lane_out: Mutex::new(HashMap::new()),
-            audio_lane_in: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
+            daemon_lanes: std::sync::atomic::AtomicU8::new(1),
         });
 
         // Forwarders: drain captured frames out to peers on the media
@@ -306,8 +300,9 @@ impl Mesh {
                             let r = mesh.send_media_value(&peer, payload).await;
                             (peer, r)
                         }
-                        AudioOut::Lane { peer, data } => {
-                            let r = mesh.send_audio_track(&peer, data).await;
+                        AudioOut::Lane { peer, route, data } => {
+                            let lane = mesh.audio_lane(&route, &peer, true).unwrap_or(0);
+                            let r = mesh.send_audio_track(&peer, lane, data).await;
                             (peer, r)
                         }
                     };
@@ -324,7 +319,7 @@ impl Mesh {
             let mesh = mesh.clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, packet)) = video_rx.recv().await {
+                while let Some((peer, route_id, packet)) = video_rx.recv().await {
                     let outcome = match packet {
                         // An MJPEG frame above the data channel's message
                         // ceiling travels as several chunks sharing a seq.
@@ -344,7 +339,8 @@ impl Mesh {
                         // An H.264 access unit rides the mesh's RTP track
                         // lane — no chunking (RTP packetizes), no ceiling.
                         VideoPacket::H264 { data, duration_us } => {
-                            mesh.send_video_track(&peer, data, duration_us).await
+                            let lane = mesh.video_lane(&route_id, &peer, true).unwrap_or(0);
+                            mesh.send_video_track(&peer, lane, data, duration_us).await
                         }
                     };
                     if let Err(e) = outcome {
@@ -385,6 +381,7 @@ impl Mesh {
     async fn send_video_track(
         &self,
         peer: &str,
+        lane: u8,
         data: Vec<u8>,
         duration_us: u64,
     ) -> Result<(), String> {
@@ -396,6 +393,7 @@ impl Mesh {
             .send(&Request::VideoSend {
                 network,
                 peer: pubkey_part(peer).to_string(),
+                stream: lane,
                 duration_us,
                 data: base64::engine::general_purpose::STANDARD.encode(&data),
             })
@@ -405,7 +403,7 @@ impl Mesh {
 
     /// Send one encoded Opus frame to `peer` over the daemon's audio
     /// track lane (base64 on the control socket, RTP on the wire).
-    async fn send_audio_track(&self, peer: &str, data: Vec<u8>) -> Result<(), String> {
+    async fn send_audio_track(&self, peer: &str, lane: u8, data: Vec<u8>) -> Result<(), String> {
         use base64::Engine as _;
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
@@ -414,6 +412,7 @@ impl Mesh {
             .send(&Request::AudioSend {
                 network,
                 peer: pubkey_part(peer).to_string(),
+                stream: lane,
                 duration_us: crate::audio::OPUS_FRAME_US,
                 data: base64::engine::general_purpose::STANDARD.encode(&data),
             })
@@ -692,12 +691,18 @@ impl Mesh {
             // can't hear them. Camera streaming likewise rides every OS
             // (V4L2 / AVFoundation / Media Foundation); a camera that
             // won't open at route time degrades in-band too (`vstat`).
-            features: vec![
-                allmystuff_protocol::FEATURE_TERMINAL.to_string(),
-                allmystuff_protocol::FEATURE_FILES.to_string(),
-                allmystuff_protocol::FEATURE_ROOMS.to_string(),
-                allmystuff_protocol::FEATURE_CAMERA.to_string(),
-            ],
+            features: {
+                let mut f = vec![
+                    allmystuff_protocol::FEATURE_TERMINAL.to_string(),
+                    allmystuff_protocol::FEATURE_FILES.to_string(),
+                    allmystuff_protocol::FEATURE_ROOMS.to_string(),
+                    allmystuff_protocol::FEATURE_CAMERA.to_string(),
+                ];
+                if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
+                    f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
+                }
+                f
+            },
         }
     }
 
@@ -754,14 +759,16 @@ impl Mesh {
                     .get("rtp_timestamp")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
-                self.handle_video_inbound(from, rtp_timestamp, key, data);
+                let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                self.handle_video_inbound(from, stream, rtp_timestamp, key, data);
             }
             "audio_inbound" => {
                 let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
                 let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
                     return;
                 };
-                self.handle_audio_inbound(from, data);
+                let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                self.handle_audio_inbound(from, stream, data);
             }
             "event" => {
                 if let Some(event) = value.get("event") {
@@ -815,6 +822,10 @@ impl Mesh {
                     // `boot == 0` is an older heartbeating peer: no reply
                     // needed. Our own echo never replies to itself.
                     let canon = pubkey_part(profile.node.as_str()).to_string();
+                    self.state
+                        .lock()
+                        .peer_features
+                        .insert(canon.clone(), profile.features.clone());
                     let is_self = self
                         .local_node_id()
                         .is_some_and(|me| pubkey_part(&me) == canon);
@@ -1027,44 +1038,38 @@ impl Mesh {
         }
     }
 
-    /// Free any track-lane claims held by a route that just ended, in
-    /// both directions — the next display route to that peer can take
-    /// the lane over. The route's native decoder (if any) goes with it.
+    /// Drop the per-route video state a route that just ended leaves
+    /// behind — its receive-side counters, any pending re-key ask, and its
+    /// native decoder. (Lane assignment is computed on the fly now, so
+    /// there's no per-route lane mapping to free.)
     fn release_video_lanes(&self, route_id: &str) {
-        self.video_lane_out.lock().retain(|_, rid| rid != route_id);
-        self.video_lane_in.lock().retain(|_, rid| rid != route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
     }
 
-    /// The audio twin of [`Self::release_video_lanes`]: free the route's
-    /// audio-lane claims in both directions and drop its Opus decoder.
+    /// The audio twin of [`Self::release_video_lanes`]: drop the route's
+    /// Opus decoder when it ends.
     fn release_audio_lanes(&self, route_id: &str) {
-        self.audio_lane_out.lock().retain(|_, rid| rid != route_id);
-        self.audio_lane_in.lock().retain(|_, rid| rid != route_id);
         self.audio_decoders.lock().remove(route_id);
     }
 
-    /// One Opus frame arrived on a peer's audio lane. It belongs to
-    /// whichever of our routes claimed that peer's inbound lane — gated
-    /// exactly like every other media frame (route live, sinks here,
+    /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
+    /// to whichever of our routes maps to that lane (the lane-th Opus route
+    /// from this peer in sorted order — [`Self::audio_route_for_lane`]),
+    /// gated exactly like every other media frame (route live, sinks here,
     /// sender is the route's peer) — then decodes straight into the
     /// route's playback ring.
-    fn handle_audio_inbound(self: &Arc<Self>, from: &str, data_b64: &str) {
+    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data_b64: &str) {
         use base64::Engine as _;
-        let route_id = {
-            let lanes = self.audio_lane_in.lock();
-            lanes.get(pubkey_part(from)).cloned()
-        };
-        let Some(route_id) = route_id else {
-            // The audio twin of the video lane's "no route claimed it" warn
+        let Some(route_id) = self.audio_route_for_lane(from, stream) else {
+            // The audio twin of the video lane's "no route for it" warn
             // (rate-limited the same way): Opus arriving with nowhere to
             // decode it is the caller-hears-nothing drop, and it used to be
             // a DEBUG whisper while the room sat silent.
-            if self.diag_ok(&format!("audio-lane:{}", pubkey_part(from))) {
+            if self.diag_ok(&format!("audio-lane:{}:{stream}", pubkey_part(from))) {
                 tracing::warn!(
-                    "Opus frames arriving from {} but no route claimed the inbound audio lane — dropped (caller hears nothing)",
+                    "Opus frames arriving from {} on lane {stream} but no route maps to it — dropped (caller hears nothing)",
                     short_id(from)
                 );
             }
@@ -1139,30 +1144,33 @@ impl Mesh {
         }
     }
 
-    /// One assembled H.264 access unit arrived on a peer's track lane.
-    /// It belongs to whichever of our routes claimed that peer's inbound
-    /// lane — gated exactly like MJPEG frames (route live, sinks here,
-    /// sender is the route's peer) before it reaches a console window.
-    /// Where it goes next is the watcher's choice: access units straight
-    /// through (the webview decodes — WebCodecs), or through the native
-    /// decoder, which hands the window ready-to-paint RGBA frames.
+    /// One assembled H.264 access unit arrived on a peer's track lane
+    /// `stream`. It belongs to whichever of our routes maps to that lane
+    /// (the lane-th H.264 route from this peer in sorted order —
+    /// [`Self::video_route_for_lane`]), gated exactly like MJPEG frames
+    /// (route live, sinks here, sender is the route's peer) before it
+    /// reaches a console window. Where it goes next is the watcher's
+    /// choice: access units straight through (the webview decodes —
+    /// WebCodecs), or through the native decoder, which hands the window
+    /// ready-to-paint RGBA frames.
     fn handle_video_inbound(
         self: &Arc<Self>,
         from: &str,
+        stream: u8,
         rtp_timestamp: u32,
         key: bool,
         data_b64: &str,
     ) {
         use base64::Engine as _;
         let canon = pubkey_part(from).to_string();
-        let Some(route_id) = self.video_lane_in.lock().get(&canon).cloned() else {
+        let Some(route_id) = self.video_route_for_lane(from, stream) else {
             // The sender is streaming the track lane at us but no route
-            // here claimed it — the one-sided stream the viewer reads as
+            // here maps to it — the one-sided stream the viewer reads as
             // "connecting forever". Loud (rate-limited): this exact drop
             // was a debug whisper while the stage sat black.
-            if self.diag_ok(&format!("lane:{canon}")) {
+            if self.diag_ok(&format!("lane:{canon}:{stream}")) {
                 tracing::warn!(
-                    "H.264 samples arriving from {} but no route claimed the inbound lane — dropped (viewer shows nothing)",
+                    "H.264 samples arriving from {} on lane {stream} but no route maps to it — dropped (viewer shows nothing)",
                     short_id(from)
                 );
             }
@@ -2014,6 +2022,19 @@ impl Mesh {
             {
                 Ok(resp) if resp.ok => {
                     self.daemon_video.store(true, Ordering::SeqCst);
+                    // Learn the daemon's media-lane pool size, so we know how many
+                    // simultaneous streams to one peer can ride separate lanes.
+                    if let Some(n) = self
+                        .client
+                        .request(&Request::Status)
+                        .await
+                        .ok()
+                        .and_then(|r| r.data)
+                        .and_then(|d| d.get("media_lanes").and_then(|v| v.as_u64()))
+                    {
+                        self.daemon_lanes
+                            .store(n.clamp(1, 255) as u8, Ordering::SeqCst);
+                    }
                 }
                 _ => {
                     if !self.daemon_video.load(Ordering::SeqCst) {
@@ -2088,34 +2109,7 @@ impl Mesh {
                         .and_then(|s| s.route(&route.id))
                         .map(|r| r.audio.iter().any(|a| a == "opus"))
                         .unwrap_or(false);
-                    let canon = pubkey_part(&to_node).to_string();
-                    let lane = if accepts_opus && self.daemon_audio.load(Ordering::SeqCst) {
-                        // Same takeover rule as the video lane: busy only
-                        // while the holder is still an *active* route.
-                        let holder = self.audio_lane_out.lock().get(&canon).cloned();
-                        let holder_active = holder.as_deref().is_some_and(|rid| {
-                            rid != route.id
-                                && self
-                                    .state
-                                    .lock()
-                                    .session
-                                    .as_ref()
-                                    .and_then(|s| s.route(rid))
-                                    .is_some_and(|r| r.is_active())
-                        });
-                        if holder_active {
-                            tracing::info!(
-                                "route {} — peer's audio lane busy; falling back to PCM frames",
-                                route.id
-                            );
-                            false
-                        } else {
-                            self.audio_lane_out.lock().insert(canon, route.id.clone());
-                            true
-                        }
-                    } else {
-                        false
-                    };
+                    let lane = accepts_opus && self.audio_lane(&route.id, &to_node, true).is_some();
                     tracing::info!(
                         "route {} active — streaming {} to {} ({})",
                         route.id,
@@ -2153,6 +2147,7 @@ impl Mesh {
                                 enc.lock().push(&pcm, rate, |data| {
                                     let _ = tx.try_send(AudioOut::Lane {
                                         peer: peer.clone(),
+                                        route: rid.clone(),
                                         data,
                                     });
                                 });
@@ -2163,30 +2158,19 @@ impl Mesh {
                             }
                         });
                 }
-                // We sink: play inbound frames for this route — and if we
-                // asked for the Opus lane, claim this peer's inbound lane
-                // so its `audio_inbound` frames decode into this route's
-                // ring (the sender may still pick PCM, in which case the
-                // claim simply never sees a frame).
+                // We sink: play inbound frames for this route. Inbound Opus
+                // lane samples find their route on demand
+                // ([`Self::audio_route_for_lane`]) — the peer maps each
+                // active-codec route to a lane by sorted position the same
+                // way we do, so no claim is recorded here (the sender may
+                // still pick PCM, in which case the lane simply never sees a
+                // frame).
                 if to_node == me {
                     tracing::info!(
                         "route {} active — playing audio from {}",
                         route.id,
                         short_id(&from_node)
                     );
-                    let offered_opus = self
-                        .state
-                        .lock()
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.route(&route.id))
-                        .map(|r| r.audio.iter().any(|a| a == "opus"))
-                        .unwrap_or(false);
-                    if offered_opus {
-                        self.audio_lane_in
-                            .lock()
-                            .insert(pubkey_part(&from_node).to_string(), route.id.clone());
-                    }
                     self.audio.start_playback(route.id.clone());
                 }
             }
@@ -2219,7 +2203,6 @@ impl Mesh {
                     );
                     self.start_video_stream(route, &to_node, mode, VideoSource::Screen(monitor));
                 } else if to_node == me {
-                    self.claim_inbound_video_lane(route, &from_node);
                     tracing::info!(
                         "route {} active — expecting screen frames from {}",
                         route.id,
@@ -2246,7 +2229,6 @@ impl Mesh {
                     );
                     self.start_video_stream(route, &to_node, mode, VideoSource::Camera(device));
                 } else if to_node == me {
-                    self.claim_inbound_video_lane(route, &from_node);
                     tracing::info!(
                         "route {} active — expecting camera frames from {}",
                         route.id,
@@ -2321,14 +2303,130 @@ impl Mesh {
         }
     }
 
+    /// The ids of the active-codec media routes between us and `peer` in one
+    /// direction, sorted — the shared, signalling-free basis for lane
+    /// assignment: both ends compute the identical list from their own copy of
+    /// the session, so a route lands on the same lane on both. `codec` is
+    /// "h264" (video) or "opus" (audio); `outbound` = we are the source.
+    fn sorted_media_routes(&self, peer: &str, outbound: bool, codec: &str) -> Vec<String> {
+        let Some(me) = self.local_node_id() else {
+            return Vec::new();
+        };
+        let mp = pubkey_part(&me).to_string();
+        let pc = pubkey_part(peer).to_string();
+        let st = self.state.lock();
+        let Some(session) = st.session.as_ref() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = session
+            .routes()
+            .filter(|r| {
+                let codecs = if codec == "opus" { &r.audio } else { &r.video };
+                codecs.iter().any(|c| c == codec) && {
+                    let src = pubkey_part(node_of(r.route.from.as_str()).as_str()).to_string();
+                    let dst = pubkey_part(node_of(r.route.to.as_str()).as_str()).to_string();
+                    if outbound {
+                        src == mp && dst == pc
+                    } else {
+                        src == pc && dst == mp
+                    }
+                }
+            })
+            .map(|r| r.route.id.clone())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The media-lane pool size we and `peer` can both use for video: 0 when the
+    /// local daemon has no track lane at all (everything MJPEG), 1 when either
+    /// side predates the lane pool (only lane 0; extra streams fall back to
+    /// MJPEG — the original behaviour), else the local pool size (both ends ship
+    /// the same pinned daemon, so the counts match).
+    fn effective_video_lanes(&self, peer: &str) -> u8 {
+        if !self.daemon_video.load(Ordering::SeqCst) {
+            return 0;
+        }
+        if self.peer_supports_lanes(peer) {
+            self.daemon_lanes.load(Ordering::SeqCst).max(1)
+        } else {
+            1
+        }
+    }
+
+    /// The audio twin of [`Self::effective_video_lanes`], gated on the audio lane.
+    fn effective_audio_lanes(&self, peer: &str) -> u8 {
+        if !self.daemon_audio.load(Ordering::SeqCst) {
+            return 0;
+        }
+        if self.peer_supports_lanes(peer) {
+            self.daemon_lanes.load(Ordering::SeqCst).max(1)
+        } else {
+            1
+        }
+    }
+
+    /// Whether `peer` advertised the media-lane pool in its presence features.
+    fn peer_supports_lanes(&self, peer: &str) -> bool {
+        let canon = pubkey_part(peer);
+        self.state
+            .lock()
+            .peer_features
+            .get(canon)
+            .is_some_and(|f| f.iter().any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES))
+    }
+
+    /// The lane an outbound H.264 video route to `peer` rides, or `None` for
+    /// MJPEG (no usable lane, or the route's sorted position is past the
+    /// effective pool). `outbound` = we are the source.
+    fn video_lane(&self, route_id: &str, peer: &str, outbound: bool) -> Option<u8> {
+        let cap = self.effective_video_lanes(peer);
+        if cap == 0 {
+            return None;
+        }
+        let idx = self
+            .sorted_media_routes(peer, outbound, "h264")
+            .iter()
+            .position(|id| id == route_id)?;
+        (idx < cap as usize).then_some(idx as u8)
+    }
+
+    /// The audio twin of [`Self::video_lane`] (Opus on the audio lane).
+    fn audio_lane(&self, route_id: &str, peer: &str, outbound: bool) -> Option<u8> {
+        let cap = self.effective_audio_lanes(peer);
+        if cap == 0 {
+            return None;
+        }
+        let idx = self
+            .sorted_media_routes(peer, outbound, "opus")
+            .iter()
+            .position(|id| id == route_id)?;
+        (idx < cap as usize).then_some(idx as u8)
+    }
+
+    /// The route whose inbound video samples arrive on `lane` from `peer` — the
+    /// inverse of [`Self::video_lane`]: the lane-th H.264 video route from the
+    /// peer to us in sorted order. Routes a `video_inbound` event to the right
+    /// console window.
+    fn video_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
+        self.sorted_media_routes(peer, false, "h264")
+            .into_iter()
+            .nth(lane as usize)
+    }
+
+    /// The audio twin of [`Self::video_route_for_lane`].
+    fn audio_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
+        self.sorted_media_routes(peer, false, "opus")
+            .into_iter()
+            .nth(lane as usize)
+    }
+
     /// The transport for a stream this machine is about to send on
     /// `route` — shared by the display and camera arms of
     /// [`Self::start_media`]: H.264 on the peer's track lane when the
-    /// offer asked for it, the local daemon carries it, and the lane
-    /// isn't held by another *active* route (a torn-down or superseded
-    /// holder — the common case: the viewer switched console tabs — is
-    /// taken over, not deferred to); MJPEG over the media channel
-    /// otherwise, exactly as v1.
+    /// offer asked for it and the route's sorted position falls inside
+    /// the effective lane pool; MJPEG over the media channel otherwise,
+    /// exactly as v1.
     fn pick_outbound_video_mode(&self, route: &Route, to_node: &str) -> VideoMode {
         let accepts_h264 = self
             .state
@@ -2338,7 +2436,6 @@ impl Mesh {
             .and_then(|s| s.route(&route.id))
             .map(|r| r.video.iter().any(|v| v == "h264"))
             .unwrap_or(false);
-        let canon = pubkey_part(to_node).to_string();
         let daemon_video = self.daemon_video.load(Ordering::SeqCst);
         if accepts_h264 && !daemon_video {
             tracing::warn!(
@@ -2346,101 +2443,11 @@ impl Mesh {
                 route.id
             );
         }
-        if !(accepts_h264 && daemon_video) {
-            return VideoMode::Mjpeg;
-        }
-        // The lane is busy only while its holder is still an *active*
-        // route.
-        let holder = self.video_lane_out.lock().get(&canon).cloned();
-        let holder_active = holder.as_deref().is_some_and(|rid| {
-            rid != route.id
-                && self
-                    .state
-                    .lock()
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.route(rid))
-                    .is_some_and(|r| r.is_active())
-        });
-        if holder_active {
-            tracing::info!(
-                "route {} — peer's track lane busy; falling back to MJPEG",
-                route.id
-            );
-            VideoMode::Mjpeg
-        } else {
-            // Routine on every console tab switch — lane bookkeeping,
-            // not an event.
-            if let Some(h) = holder.filter(|h| h != &route.id) {
-                tracing::debug!(
-                    "route {} takes the track lane over from ended route {h}",
-                    route.id
-                );
-            }
-            self.video_lane_out.lock().insert(canon, route.id.clone());
+        if accepts_h264 && self.video_lane(&route.id, to_node, true).is_some() {
             VideoMode::H264
+        } else {
+            VideoMode::Mjpeg
         }
-    }
-
-    /// The sink side's mirror of [`Self::pick_outbound_video_mode`]: claim the
-    /// peer's inbound track lane for this route when we offered H.264 — but
-    /// only when it's free or held by a route that's no longer active. A peer
-    /// has exactly one H.264 track, and the sender only ever puts one route's
-    /// access units on it (a second H.264 route to the same peer is told
-    /// MJPEG). If a second route *stole* the inbound mapping, that single track
-    /// — still carrying the *first* route's frames — would be delivered to the
-    /// second window, where its own MJPEG frames also land: the two streams
-    /// interleave (popping out a second screen of one machine). So an active
-    /// holder keeps the lane; the newcomer rides MJPEG, routed by its own id on
-    /// the media channel. The sender may still pick MJPEG even when we do claim,
-    /// in which case the claim simply never sees a sample.
-    fn claim_inbound_video_lane(&self, route: &Route, from_node: &str) {
-        let offered_h264 = self
-            .state
-            .lock()
-            .session
-            .as_ref()
-            .and_then(|s| s.route(&route.id))
-            .map(|r| r.video.iter().any(|v| v == "h264"))
-            .unwrap_or(false);
-        if !offered_h264 {
-            tracing::info!(
-                "route {} — no H.264 in our offer; expecting MJPEG frames from {}",
-                route.id,
-                short_id(from_node)
-            );
-            return;
-        }
-        let canon = pubkey_part(from_node).to_string();
-        // Busy only while the holder is a *different*, still-active route — a
-        // torn-down or superseded one (the viewer closed that popout / switched
-        // tabs) is taken over, exactly as the outbound side does.
-        let holder = self.video_lane_in.lock().get(&canon).cloned();
-        let holder_active = holder.as_deref().is_some_and(|rid| {
-            rid != route.id
-                && self
-                    .state
-                    .lock()
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.route(rid))
-                    .is_some_and(|r| r.is_active())
-        });
-        if holder_active {
-            tracing::info!(
-                "route {} — peer's inbound track lane busy ({}); expecting MJPEG frames from {}",
-                route.id,
-                holder.as_deref().unwrap_or("?"),
-                short_id(from_node)
-            );
-            return;
-        }
-        self.video_lane_in.lock().insert(canon, route.id.clone());
-        tracing::info!(
-            "route {} — inbound video lane claimed from {} (H.264 samples will route here)",
-            route.id,
-            short_id(from_node)
-        );
     }
 
     /// Start the capture behind an outbound display/camera stream, wired
@@ -2457,6 +2464,7 @@ impl Mesh {
         let status_mesh = Arc::downgrade(self);
         let status_peer = peer.clone();
         let status_route = route.id.clone();
+        let route_id = route.id.clone();
         self.video.start_capture(
             route.id.clone(),
             mode,
@@ -2464,7 +2472,7 @@ impl Mesh {
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
-                tx.try_send((peer.clone(), packet)).is_ok()
+                tx.try_send((peer.clone(), route_id.clone(), packet)).is_ok()
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band

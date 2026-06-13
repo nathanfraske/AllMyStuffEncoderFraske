@@ -24,6 +24,6 @@ pub use app::{
     ControlMessage, InventorySummary, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
     RoomAccess, RoomEvent, RoomMessage, RouteControl, ShareControl, APP_ID, CHANNEL_CONTROL,
     CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, FEATURE_CAMERA, FEATURE_FILES,
-    FEATURE_ROOMS, FEATURE_TERMINAL, PROTOCOL_VERSION,
+    FEATURE_MEDIA_LANES, FEATURE_ROOMS, FEATURE_TERMINAL, PROTOCOL_VERSION,
 };
 pub use control::{ClientId, Request, Response, ServerOut};
