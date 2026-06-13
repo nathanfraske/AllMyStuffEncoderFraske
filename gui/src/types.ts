@@ -347,6 +347,7 @@ export interface FileEntry {
 export type FileEvent =
   | { kind: "list"; req: number; path: string }
   | { kind: "read"; req: number; path: string }
+  | { kind: "fetch"; req: number; token: string }
   | { kind: "write"; req: number; path: string; data: string; append?: boolean; eof?: boolean }
   | { kind: "mkdir"; req: number; path: string }
   | { kind: "rename"; req: number; from: string; to: string }
@@ -425,12 +426,34 @@ export interface RoomChatLine {
   at: number;
 }
 
+/** One file a member offers into a room's **Shared Files** area, as the
+ *  uploader states it (mirrors the Rust `SharedFileMeta`). `token` is an
+ *  opaque fetch handle — a downloader pulls the bytes straight from the
+ *  uploader by token; they never pass through the host. */
+export interface SharedFileMeta {
+  token: string;
+  name: string;
+  size: number;
+}
+
+/** One entry of the host's aggregated Shared Files list — a file plus the
+ *  uploader to fetch it from (mirrors the Rust `SharedEntry`). The host
+ *  hosts the *list*; the uploader hosts the *bytes*, and only while it's
+ *  online. */
+export interface SharedEntry {
+  /** Canonical node id of the uploader — whom to open the fetch route to. */
+  from: string;
+  token: string;
+  name: string;
+  size: number;
+}
+
 /** A wire message of the rooms plane (mirrors the Rust `RoomMessage` —
  *  tagged on `kind`, with the room id + name restated on every message).
- *  `invite` (the roster/name/access replacement), `close` and `deny` are
- *  the **host's** alone; receivers ignore them from anyone else. `knock`
- *  travels the other way — a machine holding the room's id (pasted into
- *  the rooms UI) asking the host to let it in. */
+ *  `invite` (the roster/name/access replacement), `close`, `deny` and
+ *  `shares` (the host's authoritative Shared Files list) are the **host's**
+ *  alone; receivers ignore them from anyone else. `knock` and `share_list`
+ *  (a member telling the host what it's offering) travel the other way. */
 export type RoomWireMessage = { room: string; name?: string } & (
   | { kind: "invite"; members: string[]; access?: RoomAccess }
   | { kind: "join" }
@@ -439,6 +462,8 @@ export type RoomWireMessage = { room: string; name?: string } & (
   | { kind: "close" }
   | { kind: "knock" }
   | { kind: "deny" }
+  | { kind: "share_list"; files: SharedFileMeta[] }
+  | { kind: "shares"; files: SharedEntry[] }
 );
 
 /** The presence feature tag for the rooms plane (mirrors the Rust

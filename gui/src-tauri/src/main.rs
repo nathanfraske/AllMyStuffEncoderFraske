@@ -511,6 +511,34 @@ async fn room_send(
     mesh.inner().room_send(members, message).await
 }
 
+// ---- Shared Files (the call's shared-download area) ---------------------
+
+/// Offer files into a room's Shared Files area — register each path with
+/// the members allowed to fetch it, returning the `{ token, name, size }`
+/// the GUI hands to the room's host for its shared list. The bytes never
+/// leave this machine until a member fetches them by token.
+#[tauri::command]
+fn room_share_files(
+    mesh: State<'_, Arc<Mesh>>,
+    members: Vec<String>,
+    paths: Vec<String>,
+) -> Vec<allmystuff_protocol::SharedFileMeta> {
+    mesh.room_share_files(members, paths)
+}
+
+/// Refresh the members allowed to fetch a set of shared tokens (the room's
+/// roster changed while the files were on offer).
+#[tauri::command]
+fn room_set_share_peers(mesh: State<'_, Arc<Mesh>>, tokens: Vec<String>, members: Vec<String>) {
+    mesh.room_set_share_peers(tokens, members);
+}
+
+/// Stop offering a set of shared files (the uploader removed them or left).
+#[tauri::command]
+fn room_unshare(mesh: State<'_, Arc<Mesh>>, tokens: Vec<String>) {
+    mesh.room_unshare(tokens);
+}
+
 // ---- mesh control passthroughs ----------------------------------------
 
 #[tauri::command]
@@ -905,6 +933,9 @@ fn main() {
             open_files_window,
             session_snapshot,
             room_send,
+            room_share_files,
+            room_set_share_peers,
+            room_unshare,
             open_room_window,
             owned_roster,
             fleet_leave,

@@ -25,8 +25,8 @@ use tokio::sync::mpsc;
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
     ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RoomMessage,
-    RouteControl, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    PROTOCOL_VERSION,
+    RouteControl, SharedFileMeta, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
+    CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardEvent, ClipboardFrame, Effect, FileEvent, FileFrame, InputAction,
@@ -81,6 +81,14 @@ pub struct Mesh {
     /// the window's queue — registered by `file_download` *before* the
     /// Read request goes out, so the first chunk can't race it.
     downloads: Mutex<HashMap<(String, u64), DownloadSink>>,
+    /// Host-side **Shared Files** registry: the files this machine has
+    /// offered into rooms, keyed by the opaque token the uploader handed
+    /// out. A `:shared` route can only `Fetch` by token (never browse a
+    /// path), and a fetch is served only when the requester's pubkey is in
+    /// the token's `allowed` set (the room's members) — so a call's shared
+    /// area never becomes a way to read the disk. Bytes flow straight to
+    /// the downloader; the room host only ever carries the *list*.
+    shared: Mutex<HashMap<String, SharedReg>>,
     state: Mutex<State>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
@@ -178,6 +186,15 @@ struct DownloadSink {
     last_progress: std::time::Instant,
 }
 
+/// One file offered into a room's Shared Files area: the absolute path on
+/// this disk and the pubkeys allowed to fetch it (the room's members, as
+/// the uploader stated them). The token that keys it in `Mesh::shared` is
+/// what travels — never this path.
+struct SharedReg {
+    path: std::path::PathBuf,
+    allowed: std::collections::HashSet<String>,
+}
+
 /// Receive-side counters for one route's stream.
 struct VideoInStats {
     since: std::time::Instant,
@@ -262,6 +279,7 @@ impl Mesh {
             files: FilesPlane::new(),
             file_seq: AtomicU64::new(0),
             downloads: Mutex::new(HashMap::new()),
+            shared: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
                 session: None,
                 network: None,
@@ -2321,6 +2339,27 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Generic if is_shared_route(route) => {
+                // A room's Shared Files fetch lane — the files plumbing,
+                // but token-gated instead of owner/fleet (see
+                // `handle_file_frame`). Downloads stream straight to disk
+                // via the registered sink, so the viewer side just needs a
+                // buffer for any reply that beats the registration.
+                if from_node == me && to_node != me {
+                    tracing::info!(
+                        "route {} active — serving shared files to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me && from_node != me {
+                    self.files.ensure_queue(&route.id);
+                    tracing::info!(
+                        "route {} active — shared-files fetch from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             other => {
                 tracing::info!(
                     "route {} active ({other:?}); media transport for it is a follow-up",
@@ -2775,13 +2814,14 @@ impl Mesh {
         let Some(me) = self.local_node_id() else {
             return;
         };
-        let (hosts_here, views_here) = {
+        let (hosts_here, views_here, shared) = {
             let st = self.state.lock();
             let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
                 return;
             };
+            let shared = is_shared_route(&r.route);
             if !(r.is_active()
-                && is_files_route(&r.route)
+                && (is_files_route(&r.route) || shared)
                 && pubkey_part(r.peer.as_str()) == pubkey_part(from))
             {
                 tracing::debug!(
@@ -2793,9 +2833,40 @@ impl Mesh {
             (
                 node_of(r.route.from.as_str()) == me,
                 node_of(r.route.to.as_str()) == me,
+                shared,
             )
         };
-        if hosts_here {
+        if hosts_here && shared {
+            // A Shared Files lane: token-gated, never owner/fleet, and only
+            // ever a `Fetch` — no path browsing, no writes. The token's
+            // allow-list (the room's members, as the uploader stated them)
+            // is the gate, re-cleared per request.
+            match &frame.event {
+                FileEvent::Fetch { req, token } => match self.shared_path_for(token, from) {
+                    Some(path) => self.start_files_request(
+                        &frame.route,
+                        from,
+                        FileEvent::Read { req: *req, path },
+                    ),
+                    None => {
+                        tracing::warn!(
+                            "dropped shared-file fetch from {}: token not shared with them",
+                            short_id(from)
+                        );
+                        self.send_file_event(
+                            frame.route.clone(),
+                            from.to_string(),
+                            FileEvent::Err {
+                                req: *req,
+                                reason: "that file isn't shared with you (or no longer is)".into(),
+                            },
+                        );
+                    }
+                },
+                // A `:shared` route carries nothing else from the viewer.
+                other => tracing::debug!("shared-files host ignoring {other:?}"),
+            }
+        } else if hosts_here {
             if !self.sender_may_control(from) {
                 tracing::warn!("dropped file request from {from}: not an authorized controller");
                 return;
@@ -2816,7 +2887,8 @@ impl Mesh {
                 | FileEvent::Delete { .. } => {
                     self.start_files_request(&frame.route, from, frame.event);
                 }
-                // Response kinds landing on the host are a confused peer.
+                // Response kinds (and `Fetch`, which only a `:shared` route
+                // serves) landing on the files host are a confused peer.
                 _ => {}
             }
         } else if views_here {
@@ -2890,9 +2962,14 @@ impl Mesh {
         route_id: String,
         event: FileEvent,
     ) -> Result<(), String> {
+        // A `Fetch` rides a `:shared` route (the Shared Files area); every
+        // other request rides a `:files` route (the file manager). Pairing
+        // the event to its route keeps a shared lane fetch-only.
+        let want_shared = matches!(event, FileEvent::Fetch { .. });
         match event {
             FileEvent::List { .. }
             | FileEvent::Read { .. }
+            | FileEvent::Fetch { .. }
             | FileEvent::Write { .. }
             | FileEvent::Mkdir { .. }
             | FileEvent::Rename { .. }
@@ -2907,7 +2984,12 @@ impl Mesh {
                 .as_ref()
                 .and_then(|s| s.route(&route_id))
                 .ok_or("unknown route")?;
-            if !(r.is_active() && is_files_route(&r.route) && node_of(r.route.to.as_str()) == me) {
+            let kind_ok = if want_shared {
+                is_shared_route(&r.route)
+            } else {
+                is_files_route(&r.route)
+            };
+            if !(r.is_active() && kind_ok && node_of(r.route.to.as_str()) == me) {
                 return Err("route isn't an active files session here".into());
             }
             r.peer.to_string()
@@ -2916,6 +2998,88 @@ impl Mesh {
         let frame = FileFrame::new(&route_id, seq, event);
         let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
         self.send_media_value(&peer, payload).await
+    }
+
+    // ---- Shared Files (the call's "Shared Files" area) ------------------
+
+    /// Offer files into a room's Shared Files area. Each readable path gets
+    /// an opaque fetch token, registered with the set of members allowed to
+    /// pull it (`members`, canonical node ids). Returns one
+    /// [`SharedFileMeta`] per file that could be read — the GUI hands these
+    /// to the room's host, which restates them in the room's list. The
+    /// bytes stay here; only the token + name + size travel.
+    pub fn room_share_files(
+        &self,
+        members: Vec<String>,
+        paths: Vec<String>,
+    ) -> Vec<SharedFileMeta> {
+        let allowed: std::collections::HashSet<String> =
+            members.iter().map(|m| pubkey_part(m).to_string()).collect();
+        let mut out = Vec::new();
+        let mut reg = self.shared.lock();
+        for path in paths {
+            let p = std::path::PathBuf::from(&path);
+            let Ok(meta) = std::fs::metadata(&p) else {
+                tracing::warn!("can't share {path}: not readable");
+                continue;
+            };
+            if meta.is_dir() {
+                tracing::warn!("can't share {path}: it's a folder");
+                continue;
+            }
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            let token = fresh_share_token();
+            reg.insert(
+                token.clone(),
+                SharedReg {
+                    path: p,
+                    allowed: allowed.clone(),
+                },
+            );
+            out.push(SharedFileMeta {
+                token,
+                name,
+                size: meta.len(),
+            });
+        }
+        out
+    }
+
+    /// Refresh the members allowed to fetch a set of shared tokens — the
+    /// room's roster changed (a join, an admit, a removal) while these
+    /// files were on offer. Unknown tokens are skipped.
+    pub fn room_set_share_peers(&self, tokens: Vec<String>, members: Vec<String>) {
+        let allowed: std::collections::HashSet<String> =
+            members.iter().map(|m| pubkey_part(m).to_string()).collect();
+        let mut reg = self.shared.lock();
+        for t in tokens {
+            if let Some(s) = reg.get_mut(&t) {
+                s.allowed = allowed.clone();
+            }
+        }
+    }
+
+    /// Stop offering files (the uploader removed them, or left the room).
+    pub fn room_unshare(&self, tokens: Vec<String>) {
+        let mut reg = self.shared.lock();
+        for t in tokens {
+            reg.remove(&t);
+        }
+    }
+
+    /// Resolve a fetch token to its on-disk path, but only for a peer it
+    /// was shared with — the Shared Files gate. `None` when the token is
+    /// unknown or `from` isn't on its allow-list.
+    fn shared_path_for(&self, token: &str, from: &str) -> Option<String> {
+        let reg = self.shared.lock();
+        let s = reg.get(token)?;
+        if !s.allowed.contains(pubkey_part(from)) {
+            return None;
+        }
+        Some(s.path.to_string_lossy().into_owned())
     }
 
     /// A files window claims an active route's buffered responses (returns
@@ -3476,6 +3640,15 @@ fn is_files_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":files")
 }
 
+/// Whether `route` is a room **Shared Files** fetch session: generic media
+/// whose source endpoint is a machine's `…:shared` handle. Unlike a files
+/// route it is *not* owner/fleet gated — any room member may open one — but
+/// it can only `Fetch` by token (see [`FilesPlane`] callers); the host
+/// gates each fetch on the token's allow-list, so it never browses a disk.
+fn is_shared_route(route: &Route) -> bool {
+    route.media == MediaKind::Generic && route.from.as_str().ends_with(":shared")
+}
+
 /// What an audio route this machine sources should capture: the synthetic
 /// `system-audio` capability advertises "what this machine plays", so it
 /// captures the machine's own output (loopback); every other audio source
@@ -3548,6 +3721,27 @@ fn pubkey_part(id: &str) -> &str {
         }
     }
     id
+}
+
+/// A fresh opaque fetch token for one shared file — 16 random bytes as
+/// hex, so it can't be guessed and never leaks the path it stands for.
+fn fresh_share_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // RNG unavailable (vanishingly rare): a wall-clock nonce still
+        // makes a unique-enough token for one app run.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        return format!("share_{n:032x}");
+    }
+    let mut s = String::with_capacity(6 + 32);
+    s.push_str("share_");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// A fresh random boot id for this app run — never 0, which presence
@@ -3643,6 +3837,23 @@ mod tests {
     }
 
     #[test]
+    fn shared_routes_are_recognized_and_distinct_from_files() {
+        let shared = term_route("host:shared", "me:shared-view:1", MediaKind::Generic);
+        assert!(is_shared_route(&shared));
+        // A shared route is *not* a files route — that's the whole point:
+        // it skips the owner/fleet offer screen and is fetch-by-token only.
+        assert!(!is_files_route(&shared));
+        assert!(!is_terminal_route(&shared));
+
+        let files = term_route("host:files", "me:files-view:1", MediaKind::Generic);
+        assert!(!is_shared_route(&files));
+
+        // The media is part of the contract here too.
+        let storage = term_route("host:shared", "me:shared-view:1", MediaKind::Storage);
+        assert!(!is_shared_route(&storage));
+    }
+
+    #[test]
     fn capability_ids_split_into_node_and_device() {
         // The device part keeps its own colons — a camera route resolves
         // `<node>:cam:video0` back to the inventory id `cam:video0`, the
@@ -3680,6 +3891,23 @@ mod tests {
         // …and unprivileged offers are never screened here, whoever asks.
         let audio = term_route("me:mic", "them:speaker", MediaKind::Audio);
         assert_eq!(privileged_offer_refusal(&audio, true, false), None);
+
+        // A Shared Files (`:shared`) offer is deliberately *not* screened —
+        // any room member opens one, and the per-fetch token gate (not the
+        // owner/fleet rule) is what keeps it to explicitly-shared files.
+        let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
+        assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    #[test]
+    fn fresh_share_tokens_are_unguessable_and_unique() {
+        let a = fresh_share_token();
+        let b = fresh_share_token();
+        assert!(a.starts_with("share_"));
+        assert_ne!(a, b, "tokens must not collide");
+        // 16 random bytes as hex, after the `share_` prefix.
+        assert_eq!(a.len(), "share_".len() + 32);
+        assert!(a["share_".len()..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
