@@ -607,6 +607,18 @@
   // their keyups can no longer arrive (blur, control off, session end).
   const keys = makeKeyForwarder((a) => app.sendConsoleInput(a));
 
+  // The physical paste chord — Cmd+V (mac) / Ctrl+V (win·linux). `code` is
+  // layout-independent, so this fires on the V key whatever it composes.
+  function isPasteChord(e: KeyboardEvent): boolean {
+    const isV = e.code === "KeyV" || (!e.code && e.key.toLowerCase() === "v");
+    return isV && (e.metaKey || e.ctrlKey) && !e.altKey;
+  }
+
+  // V keyups already accounted for: a paste is replayed as a synthesized
+  // press *after* the clipboard frame is sent (see onKey), so the matching
+  // natural keyup is a straggler to swallow — no double event, no stuck key.
+  const pasteHandled = new Set<string>();
+
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node) return;
     if (!app.consoleControl) {
@@ -622,6 +634,22 @@
     // With control on, *every* key belongs to the remote — including
     // Escape and chords like Ctrl+W, exactly like sitting at the machine.
     e.preventDefault();
+    // Send-on-paste: with clipboard passthrough on, a paste pushes this
+    // machine's clipboard to the remote first, then replays the paste
+    // keystroke — so the remote writes our clipboard before it pastes.
+    // Both ride the same ordered channel to the same peer, so sending the
+    // frame and only then the keystroke keeps the order the remote needs.
+    if (down && !e.repeat && app.consoleClipboard && isPasteChord(e)) {
+      const key = e.key;
+      const code = e.code || undefined;
+      pasteHandled.add(e.code || e.key);
+      void app.sendConsoleClipboard().finally(() => {
+        app.sendConsoleInput({ kind: "key", key, code, down: true });
+        app.sendConsoleInput({ kind: "key", key, code, down: false });
+      });
+      return;
+    }
+    if (!down && pasteHandled.delete(e.code || e.key)) return; // straggler keyup
     keys.onKey(e, down);
   }
 
@@ -842,7 +870,7 @@
             title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
           >
             <span class="t-icon">🔊</span>
-            Audio passthrough
+            Audio
             <span class="pip" class:lit={app.consoleAudio}></span>
           </button>
           <button
@@ -852,8 +880,18 @@
             title="Send this machine's keyboard & mouse to the remote"
           >
             <span class="t-icon">⌨️</span>
-            Keyboard &amp; mouse
+            Control
             <span class="pip" class:lit={app.consoleControl}></span>
+          </button>
+          <button
+            class="toggle"
+            class:on={app.consoleClipboard}
+            onclick={() => app.toggleConsoleClipboard()}
+            title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote. Each machine keeps its own clipboard otherwise."
+          >
+            <span class="t-icon">📋</span>
+            Clipboard
+            <span class="pip" class:lit={app.consoleClipboard}></span>
           </button>
         </div>
 

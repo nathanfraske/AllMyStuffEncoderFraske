@@ -29,9 +29,11 @@ use allmystuff_protocol::{
     PROTOCOL_VERSION,
 };
 use allmystuff_session::{
-    AudioFrame, Effect, FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session,
-    TermEvent, TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame,
+    AudioFrame, ClipboardEvent, ClipboardFrame, Effect, FileEvent, FileFrame, InputAction,
+    InputEvent, MediaPayload, Session, TermEvent, TermFrame, VideoAssembler, VideoFrame,
+    VideoStatusFrame,
 };
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::audio::{AudioBridge, CaptureSource};
 use crate::control_client::{ControlClient, MediaPipe};
@@ -95,6 +97,9 @@ pub struct Mesh {
     video_out: mpsc::Sender<(String, String, VideoPacket)>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
+    /// Sequence for outbound clipboard frames (one stream per app run, like
+    /// `input_seq` — clipboard rides alongside control).
+    clipboard_seq: AtomicU64,
     /// This app run's random presence boot id — how peers detect that we
     /// (re)started and answer with their state (see `NodeProfile::boot`).
     boot_id: u64,
@@ -271,6 +276,7 @@ impl Mesh {
             audio_out,
             video_out,
             input_seq: AtomicU64::new(0),
+            clipboard_seq: AtomicU64::new(0),
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
@@ -979,6 +985,7 @@ impl Mesh {
                     }
                     MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
                     MediaPayload::File(frame) => self.handle_file_frame(&from, frame),
+                    MediaPayload::Clipboard(frame) => self.handle_clipboard_frame(&from, frame),
                 }
             }
             CHANNEL_OWNED => {
@@ -2256,6 +2263,26 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Clipboard => {
+                // Nothing to start eagerly: the source pushes a frame per
+                // paste (`send_clipboard`), and the sink writes it straight
+                // to the OS clipboard on arrival (`handle_clipboard_frame`).
+                // Say the link is live so "awaiting accept" isn't the last
+                // word on a working clipboard route.
+                if from_node == me {
+                    tracing::info!(
+                        "route {} active — clipboard to {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me {
+                    tracing::info!(
+                        "route {} active — accepting clipboard from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             MediaKind::Generic if is_terminal_route(route) => {
                 if from_node == me && to_node != me {
                     // We're the shell end: spawn a PTY and pump it to the
@@ -3181,6 +3208,74 @@ impl Mesh {
         self.send_media_value(&peer, payload).await
     }
 
+    /// Front-end command: push this machine's clipboard down an active
+    /// outbound clipboard route — sent the instant the console forwards a
+    /// paste, so the far side pastes *our* content. This machine must be the
+    /// route's source side; the far end gates the write the same way it
+    /// gates input injection.
+    pub async fn send_clipboard(
+        self: &Arc<Self>,
+        route_id: String,
+        event: ClipboardEvent,
+    ) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && r.route.media == MediaKind::Clipboard
+                && node_of(r.route.from.as_str()) == me)
+            {
+                return Err("route isn't an active outbound clipboard link".into());
+            }
+            r.peer.to_string()
+        };
+        let seq = self.clipboard_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = ClipboardFrame::new(route_id, seq, event);
+        let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
+        self.send_media_value(&peer, payload).await
+    }
+
+    /// Sink side: a peer pasted into this machine, so write their clipboard
+    /// content to the local OS clipboard. Gated exactly like input injection
+    /// — a live clipboard route that sinks here from this sender, *and* the
+    /// sender being this device's owner or a co-owned fleet member — since
+    /// writing the clipboard is part of driving the machine. The paste
+    /// keystroke rides the control route right behind this on the same
+    /// ordered channel, so by the time it injects, the clipboard is set.
+    fn handle_clipboard_frame(&self, from: &str, frame: ClipboardFrame) {
+        if !(self.inbound_media_ok(&frame.route, from, MediaKind::Clipboard)
+            && self.sender_may_control(from))
+        {
+            tracing::warn!("dropped clipboard from {from}: not an authorized controller");
+            return;
+        }
+        match frame.event {
+            ClipboardEvent::Text { text } => {
+                if let Err(e) = self.app.clipboard().write_text(text) {
+                    tracing::warn!("clipboard write failed: {e}");
+                }
+            }
+            // Images and files are the planned cross-machine copy/paste:
+            // accepted on the wire today, written once the platform paths
+            // land. Logged, never an error, so a forward-looking sender
+            // never trips the receiver.
+            ClipboardEvent::Image { mime, data } => {
+                tracing::info!(
+                    "clipboard image ({mime}, {} bytes) — not yet written",
+                    data.len()
+                );
+            }
+            ClipboardEvent::Files { names } => {
+                tracing::info!("clipboard files {names:?} — not yet written");
+            }
+        }
+    }
+
     /// Fan one room-plane message out to the given members — the rooms
     /// channel's point-to-point sends (an invite, a join/leave, a chat
     /// line). Best-effort per member: one with no shared network right now
@@ -3499,6 +3594,7 @@ fn parse_media(s: &str) -> MediaKind {
         "display" => MediaKind::Display,
         "input" => MediaKind::Input,
         "storage" => MediaKind::Storage,
+        "clipboard" => MediaKind::Clipboard,
         _ => MediaKind::Generic,
     }
 }

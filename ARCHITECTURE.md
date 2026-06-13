@@ -142,9 +142,10 @@ per-machine set (**screen** = display source, **control** = input sink,
 **keyboard & mouse** = input source — a console forwards "whatever this
 machine's user does", never one scanned device, so driving a remote works
 even where the input scan finds nothing (macOS) — **system audio** =
-duplex, and **video in** = video sink — the app shows inbound camera
+duplex, **video in** = video sink — the app shows inbound camera
 streams in a window, so "can receive a camera" is a property of the
-machine, exactly like control) so whole-computer flows (screen-share,
+machine, exactly like control — and **clipboard** = duplex, the endpoint
+a console pushes a paste into) so whole-computer flows (screen-share,
 camera feeds, room calls, remote control) have something to land on *and*
 start from. The GUI also passes its own monitor enumeration in
 (`capabilities_with_screens`): each monitor beyond the primary becomes a
@@ -467,6 +468,17 @@ Tauri 2 + Svelte 5, a client of the daemon.
    "!", comes up "1") and a dying route lifts everything it still holds,
    and the senders burst-release held keys whenever their keyups can no
    longer arrive (window blur, control toggled off, session close).
+   A **clipboard route** (`MediaKind::Clipboard`, the synthetic per-machine
+   `clipboard` endpoint) rides the same plane as a third console toggle
+   next to audio and control, default-on in a session. To keep each
+   machine's clipboard its own, it carries nothing until you *paste*:
+   the console intercepts the paste chord, pushes this machine's clipboard
+   as a `"clip"` frame over `CHANNEL_MEDIA`, and only then forwards the
+   paste keystroke — both ordered to the same peer, so the sink writes the
+   clipboard (gated exactly like input injection) before the injected paste
+   reads it. Text is wired; the `ClipboardEvent` shape also carries images
+   and file names for the planned cross-machine copy/paste, accepted on the
+   wire today and written once their platform paths land.
 
 **A terminal session** is one more route on the same plumbing — and no sshd
 anywhere. A node that can host shells advertises `"terminal"` in its

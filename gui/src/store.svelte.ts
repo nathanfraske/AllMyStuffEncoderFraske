@@ -63,7 +63,9 @@ import {
   terminalWindowTarget,
   filesWindowTarget,
   scanSelf,
+  sendClipboard,
   sendInput,
+  readLocalClipboard,
   sessionSnapshot,
   setClaimable,
   setNetworkEnabled,
@@ -284,11 +286,16 @@ class AppStore {
   consoleAudio = $state(false);
   /** Whether keyboard & mouse control is being sent to the remote. */
   consoleControl = $state(false);
+  /** Whether clipboard passthrough is on — when it is, a paste in the
+   *  console pushes this machine's clipboard to the remote first, so the
+   *  paste lands our content. */
+  consoleClipboard = $state(false);
   // Route ids the console owns, by channel, so it tears down exactly what it
   // set up (and nothing a different connection made).
   private consoleVideoRouteId: string | null = null;
   private consoleAudioRouteId: string | null = null;
   private consoleControlRouteId: string | null = null;
+  private consoleClipboardRouteId: string | null = null;
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
   consoleVideoLive = $state<string | null>(null);
@@ -301,6 +308,8 @@ class AppStore {
   consoleTune = $state<StreamTune>({});
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
+  /** The live outbound clipboard route a paste pushes our clipboard down. */
+  consoleClipboardLive = $state<string | null>(null);
 
   // ---- video popouts (one stream in its own OS window) --------------
   /** Streams currently held in their own popout window, by key
@@ -1004,8 +1013,9 @@ class AppStore {
     this.routeStates = states;
 
     // A console waiting on its video backbone: the route just went
-    // active, so bring the session's default legs (audio, control) up
-    // now — sequenced behind the picture instead of racing it at open.
+    // active, so bring the session's default legs (audio, control,
+    // clipboard) up now — sequenced behind the picture instead of racing
+    // it at open.
     if (
       this.consoleAutoLegs &&
       this.consoleVideoLive &&
@@ -1265,11 +1275,14 @@ class AppStore {
     this.consoleNodeId = nodeId;
     this.consoleAudio = false;
     this.consoleControl = false;
+    this.consoleClipboard = false;
     this.consoleVideoRouteId = null;
     this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
+    this.consoleClipboardRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
+    this.consoleClipboardLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodec = "auto";
     this.consoleTune = {};
@@ -1332,6 +1345,16 @@ class AppStore {
     if (!this.consoleNodeId) return;
     if (!this.consoleAudio) this.toggleConsoleAudio();
     if (!this.consoleControl) this.toggleConsoleControl();
+    // Clipboard is newer than audio/control: only auto-enable it when the
+    // remote advertises a clipboard endpoint, so a console onto a
+    // not-yet-updated peer doesn't warn about a path that can't exist yet.
+    // An explicit toggle still reports it.
+    if (
+      !this.consoleClipboard &&
+      matchEndpoint(this.catalog, this.consoleNodeId, "clipboard", "consume")
+    ) {
+      this.toggleConsoleClipboard();
+    }
   }
 
   /** The gate both console entries share: a known remote machine that runs
@@ -1368,15 +1391,19 @@ class AppStore {
     if (this.consoleVideoRouteId) pending.push(this.disconnect(this.consoleVideoRouteId));
     if (this.consoleAudioRouteId) pending.push(this.disconnect(this.consoleAudioRouteId));
     if (this.consoleControlRouteId) pending.push(this.disconnect(this.consoleControlRouteId));
+    if (this.consoleClipboardRouteId) pending.push(this.disconnect(this.consoleClipboardRouteId));
     this.consoleVideoRouteId = null;
     this.consoleAudioRouteId = null;
     this.consoleControlRouteId = null;
+    this.consoleClipboardRouteId = null;
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
+    this.consoleClipboardLive = null;
     this.consoleNodeId = null;
     this.consoleInput = null;
     this.consoleAudio = false;
     this.consoleControl = false;
+    this.consoleClipboard = false;
     this.consoleAutoLegs = false;
     if (this.consoleAutoLegsFallback) {
       clearTimeout(this.consoleAutoLegsFallback);
@@ -1512,6 +1539,47 @@ class AppStore {
     } else {
       this.toast("warn", "No control path to that machine");
     }
+  }
+
+  /** Clipboard passthrough: with it on, a paste in the console first pushes
+   *  this machine's clipboard to the remote (see [`sendConsoleClipboard`]),
+   *  so the paste lands our content there. The route is outbound only —
+   *  local clipboard → remote clipboard — and, like control, sends nothing
+   *  until you actually paste, so each machine keeps its own clipboard. */
+  toggleConsoleClipboard() {
+    const remote = this.consoleNodeId;
+    if (!remote) return;
+    if (this.consoleClipboard) {
+      if (this.consoleClipboardRouteId) this.disconnect(this.consoleClipboardRouteId);
+      this.consoleClipboardRouteId = null;
+      this.consoleClipboardLive = null;
+      this.consoleClipboard = false;
+      return;
+    }
+    const mySrc = matchEndpoint(this.catalog, this.localId, "clipboard", "provide");
+    const remoteSink = matchEndpoint(this.catalog, remote, "clipboard", "consume");
+    const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
+    if (leg) {
+      this.consoleClipboardRouteId = leg.created ? leg.id : null;
+      this.consoleClipboardLive = leg.id;
+      this.consoleClipboard = true;
+    } else {
+      this.toast("warn", "No clipboard path to that machine");
+    }
+  }
+
+  /** Push this machine's clipboard down the live clipboard route — called
+   *  the instant the console forwards a paste, so the remote pastes our
+   *  content. Resolves once the frame is on the wire; the caller releases
+   *  the paste keystroke after, keeping the order the remote needs (write
+   *  clipboard, then inject paste). No-op when clipboard passthrough is off
+   *  or the clipboard is empty. */
+  async sendConsoleClipboard(): Promise<void> {
+    const route = this.consoleClipboardLive;
+    if (!route) return;
+    const event = await readLocalClipboard();
+    if (!event) return;
+    await sendClipboard(route, event);
   }
 
   /** Connect one session leg (a console channel, a room toggle) through

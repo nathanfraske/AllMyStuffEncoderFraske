@@ -20,7 +20,7 @@ function cap(
 
 /** The synthetic "the machine itself" set every node exposes (mirrors the
  *  bridge crate: screen out, control in, keyboard & mouse out, audio both,
- *  video in — the landing spot for camera streams). */
+ *  video in — the landing spot for camera streams — and the clipboard). */
 function machineCaps(node: string): Capability[] {
   return [
     cap(node, "screen", "Screen", "display", "source", "screen"),
@@ -28,6 +28,7 @@ function machineCaps(node: string): Capability[] {
     cap(node, "keyboard-mouse", "Keyboard & mouse", "input", "source", "controller"),
     cap(node, "system-audio", "System audio", "audio", "duplex", "system"),
     cap(node, "video-in", "Video in", "video", "sink", "viewer"),
+    cap(node, "clipboard", "Clipboard", "clipboard", "duplex", "clipboard"),
   ];
 }
 

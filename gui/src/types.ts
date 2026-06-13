@@ -3,7 +3,14 @@
 // shows up as a decode error when the Tauri backend hands real data over.
 // (Same discipline as the MyOwnMesh GUI's `types.ts`.)
 
-export type MediaKind = "audio" | "video" | "display" | "input" | "storage" | "generic";
+export type MediaKind =
+  | "audio"
+  | "video"
+  | "display"
+  | "input"
+  | "storage"
+  | "clipboard"
+  | "generic";
 export type Flow = "source" | "sink" | "duplex";
 export type GrantRole = "provide" | "consume" | "both";
 export type NodeKind = "this" | "machine";
@@ -303,6 +310,17 @@ export type InputAction =
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; code?: string; down: boolean };
 
+/** One clipboard transfer over a clipboard route — sent on paste, so each
+ *  machine keeps its own local clipboard and content only crosses when the
+ *  far side is about to paste it. Tagged exactly like the Rust
+ *  `ClipboardEvent` (serde `kind`, snake_case); image `data` is base64.
+ *  `text` is wired today; `image`/`files` are the shapes the planned
+ *  cross-machine copy/paste fills in. */
+export type ClipboardEvent =
+  | { kind: "text"; text: string }
+  | { kind: "image"; mime: string; data: string }
+  | { kind: "files"; names: string[] };
+
 /** One terminal event a terminal window sends down its route. Tagged
  *  exactly like the Rust `TermEvent` (serde `kind`, snake_case); `bytes`
  *  is base64 (the wire is JSON). `exit` is the host's word only — it never
@@ -445,6 +463,7 @@ export const MEDIA: Record<MediaKind, { label: string; color: string; icon: stri
   display: { label: "Screen", color: "var(--m-display)", icon: "🖥" },
   input: { label: "Controls", color: "var(--m-input)", icon: "⌨️" },
   storage: { label: "Files", color: "var(--m-storage)", icon: "🗂" },
+  clipboard: { label: "Clipboard", color: "var(--m-clipboard)", icon: "📋" },
   generic: { label: "Data", color: "var(--m-data)", icon: "📦" },
 };
 
@@ -470,6 +489,7 @@ export function originIcon(origin: string, media: MediaKind): string {
     mouse: "🖱",
     touchpad: "🖱",
     gamepad: "🎮",
+    clipboard: "📋",
     storage: "🗂",
     system: "🔉",
     viewer: "📺",

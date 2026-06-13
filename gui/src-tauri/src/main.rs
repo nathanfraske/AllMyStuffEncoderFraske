@@ -152,6 +152,19 @@ async fn send_input(
     mesh.inner().send_input(route_id, action).await
 }
 
+/// Push this machine's clipboard down an active outbound clipboard route —
+/// the console calls this the moment it forwards a paste.
+#[tauri::command]
+async fn send_clipboard(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    event: serde_json::Value,
+) -> Result<(), String> {
+    let event: allmystuff_session::ClipboardEvent =
+        serde_json::from_value(event).map_err(|e| e.to_string())?;
+    mesh.inner().send_clipboard(route_id, event).await
+}
+
 /// Register the calling window's interest in a route's inbound video.
 /// Packets queue backend-side from this moment; the window drains them
 /// with `video_poll` once per display refresh. (Pull, not push: a missed
@@ -871,6 +884,7 @@ fn main() {
             claim_node,
             set_claimable,
             send_input,
+            send_clipboard,
             video_watch,
             video_poll,
             video_unwatch,
