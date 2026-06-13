@@ -1058,10 +1058,16 @@ impl Mesh {
             lanes.get(pubkey_part(from)).cloned()
         };
         let Some(route_id) = route_id else {
-            tracing::debug!(
-                "audio frame from {} with no claimed inbound lane — dropped",
-                short_id(from)
-            );
+            // The audio twin of the video lane's "no route claimed it" warn
+            // (rate-limited the same way): Opus arriving with nowhere to
+            // decode it is the caller-hears-nothing drop, and it used to be
+            // a DEBUG whisper while the room sat silent.
+            if self.diag_ok(&format!("audio-lane:{}", pubkey_part(from))) {
+                tracing::warn!(
+                    "Opus frames arriving from {} but no route claimed the inbound audio lane — dropped (caller hears nothing)",
+                    short_id(from)
+                );
+            }
             return;
         };
         if !self.inbound_media_ok(&route_id, from, MediaKind::Audio) {
@@ -1361,8 +1367,11 @@ impl Mesh {
             return Err(e);
         }
         // The accept lands moments later as the route's "active" line; an
-        // offer that goes nowhere has its own warns above and below.
-        tracing::debug!(
+        // offer that goes nowhere has its own warns above and below. At
+        // INFO (not DEBUG) so a default-level capture shows the whole
+        // offer → accept → active arc — the silence after this line is the
+        // tell when a route is offered but the peer never accepts.
+        tracing::info!(
             "route {} offered to {} — awaiting accept",
             route.id,
             short_id(&peer)

@@ -18,6 +18,7 @@ import { demoCatalog } from "./mock";
 import {
   buildNetworkConfig,
   claimNode,
+  clientLog,
   closeThisWindow,
   connectRoute,
   tuneRoute,
@@ -584,6 +585,17 @@ class AppStore {
       this.seedDemoNetworks();
       this.seedDemoRoom();
     }
+    // The rooms plane goes live *before* the first data pull. A room window
+    // joins the instant its identity lands (set by `hydrateFromBackend`,
+    // just below), and a `join` broadcast before onRoom is listening drops
+    // the presence replies peers send straight back — leaving whoever joined
+    // *second* with a roster of only themselves (their listener wasn't up to
+    // hear who was already in the call; the first-joiner never noticed
+    // because theirs was). Room presence has no snapshot to heal the gap the
+    // way routes do, so the miss is permanent. Subscribing up front closes
+    // the race; the same-device sibling bus rides along for symmetry.
+    await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
+    await onRoomLocal((e) => this.handleRoomLocal(e));
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
@@ -612,12 +624,10 @@ class AppStore {
       this.backendConnected = live;
     });
     await onSession((snap) => this.applySessionSnapshot(snap));
-    // The rooms plane: invites, join/leave presence, chat, knocks.
-    await onRoom(({ from, message }) => this.handleRoomMessage(from, message));
-    // The same-device lane between this app's windows (a room window's
-    // join/leave, the bar's hang-up ask, saved-list changes).
-    await onRoomLocal((e) => this.handleRoomLocal(e));
-    // Its video-popout sibling: which streams live in their own windows,
+    // (The rooms plane — invites, join/leave presence, chat, knocks — and
+    // its same-device sibling bus are subscribed at the top of init, before
+    // the identity pull, so a room window can't join before onRoom listens.)
+    // The video-popout sibling: which streams live in their own windows,
     // and the "Return video here" ask that puts one back.
     await onVideoLocal((e) => this.handleVideoLocal(e));
     // The fleet roster converges live — a claim, or gossip catching up, pushes
@@ -2320,6 +2330,7 @@ class AppStore {
       this.roomRoutes[roomId] = emptyRoomRoutes();
       this.roomJoinedAt = { ...this.roomJoinedAt, [roomId]: Date.now() };
       this.presenceAdd(roomId, canonicalNodeId(this.localId));
+      this.callLog(`join ${roomId} — announcing presence to ${room.members.length - 1} member(s)`);
       this.broadcastRoom(room, { room: room.id, name: room.name, kind: "join" });
       void emitRoomLocal({ token: this.windowToken, kind: "join", room: roomId });
     }
@@ -2615,6 +2626,9 @@ class AppStore {
         break;
       }
       case "join": {
+        this.callLog(
+          `recv join from ${senderLabel} for ${msg.room}${existing ? "" : " — unknown room, ignored"}`,
+        );
         if (existing) {
           const knewThem = (this.roomPresence[existing.id] ?? []).includes(sender);
           this.presenceAdd(msg.room, sender);
@@ -2623,12 +2637,14 @@ class AppStore {
           // in, say so straight back to them. Echoes terminate because
           // only a first appearance triggers one.
           if (!knewThem && this.isJoined(existing.id) && this.backendConnected) {
+            this.callLog(`  echoing our presence back to ${senderLabel}`);
             void roomSend([sender], { room: existing.id, name: existing.name, kind: "join" });
           }
         }
         break;
       }
       case "leave": {
+        this.callLog(`recv leave from ${senderLabel} for ${msg.room}`);
         this.presenceDrop(msg.room, sender);
         break;
       }
@@ -2801,16 +2817,34 @@ class AppStore {
     }
   }
 
+  /** One room-call diagnostic line, mirrored to the backend log (see
+   *  [`clientLog`]). The call plane is otherwise opaque from the outside:
+   *  a toggle that wires nothing, a `join` that never lands, and a healthy
+   *  muted call all read identically. The `[room-call]` tag makes the
+   *  whole decision trail greppable in one `ALLMYSTUFF_GUI_LOG` capture. */
+  private callLog(line: string) {
+    clientLog(`[room-call] ${line}`);
+  }
+
   private presenceAdd(roomId: string, member: string) {
     const cur = this.roomPresence[roomId] ?? [];
     if (!cur.includes(member)) {
       this.roomPresence = { ...this.roomPresence, [roomId]: [...cur, member] };
+      this.callLog(
+        `presence +${this.roomWho(member).who} in ${roomId} — ${(this.roomPresence[roomId] ?? []).length} present`,
+      );
     }
   }
 
   private presenceDrop(roomId: string, member: string) {
     const cur = this.roomPresence[roomId] ?? [];
+    const had = cur.includes(member);
     this.roomPresence = { ...this.roomPresence, [roomId]: cur.filter((m) => m !== member) };
+    if (had) {
+      this.callLog(
+        `presence -${this.roomWho(member).who} from ${roomId} — ${(this.roomPresence[roomId] ?? []).length} present`,
+      );
+    }
   }
 
   /** Fan one room-plane message at every member but us. Fire-and-forget:
@@ -2825,7 +2859,16 @@ class AppStore {
   private broadcastTo(members: string[], _room: VirtualRoom, msg: RoomWireMessage) {
     if (!this.backendConnected) return;
     const others = members.filter((m) => !this.isMe(m));
-    if (others.length) void roomSend(others, msg);
+    if (!others.length) return;
+    void roomSend(others, msg).then((n) => {
+      // The fan-out's reach, for the kinds presence rides on: a join
+      // delivered to 0 peers is a roster that will never fill — and unlike
+      // chat (sent later, once links are warm) a join fires at the instant
+      // of joining, when a link may still be mid-handshake.
+      if (msg.kind === "join" || msg.kind === "leave" || msg.kind === "invite") {
+        this.callLog(`sent "${msg.kind}" → ${n}/${others.length} member(s) of ${msg.room}`);
+      }
+    });
   }
 
   /** This machine's audio source for a room leg: the loopback for
@@ -2871,15 +2914,47 @@ class AppStore {
     media: MediaKind,
   ): number {
     let wired = 0;
-    for (const { node } of this.roomMemberNodes) {
-      if (!node || !isAppNode(node) || !node.online) continue;
-      if (node.relationship.kind === "unclaimed") continue;
+    const members = this.roomMemberNodes;
+    this.callLog(
+      `wire "${channel}" (${media}) from ${from.label} — ${members.length} member(s) on the roster`,
+    );
+    for (const { id, node } of members) {
+      const who = node?.label ?? shortId(id);
+      // Each gate below is a place media silently went nowhere while chat
+      // sailed through (chat fans out to the roster regardless of these).
+      if (!node) {
+        this.callLog(`  ${who}: skip — never seen on the graph (no presence advert yet)`);
+        continue;
+      }
+      if (!isAppNode(node)) {
+        this.callLog(`  ${who}: skip — not running AllMyStuff`);
+        continue;
+      }
+      if (!node.online) {
+        this.callLog(`  ${who}: skip — reads offline (node.online=false — the gate chat ignores)`);
+        continue;
+      }
+      if (node.relationship.kind === "unclaimed") {
+        this.callLog(`  ${who}: skip — unclaimed (claim or share it before media can route there)`);
+        continue;
+      }
       const sink = matchEndpoint(this.catalog, node.id, media, "consume");
-      if (!sink) continue;
+      if (!sink) {
+        this.callLog(`  ${who}: skip — advertises no ${media} sink to receive on`);
+        continue;
+      }
       const leg = this.roomConnect(from.id, sink.id);
-      if (leg?.created) this.legsOf(roomId)[channel].push(leg.id);
-      if (leg) wired += 1;
+      if (!leg) {
+        this.callLog(`  ${who}: skip — route ${from.id} → ${sink.id} failed validateRoute`);
+        continue;
+      }
+      if (leg.created) this.legsOf(roomId)[channel].push(leg.id);
+      this.callLog(
+        `  ${who}: wired → ${sink.id} (${leg.created ? "new route — offer fired to the daemon" : "route already live"})`,
+      );
+      wired += 1;
     }
+    this.callLog(`wire "${channel}": ${wired}/${members.length} member(s) wired`);
     return wired;
   }
 
@@ -2887,8 +2962,10 @@ class AppStore {
   private dropRoomLegs(roomId: string, channel: RoomChannel) {
     const legs = this.roomRoutes[roomId];
     if (!legs) return;
+    const n = legs[channel].length;
     for (const id of legs[channel]) void this.disconnect(id);
     legs[channel] = [];
+    if (n) this.callLog(`drop "${channel}" — tore down ${n} leg(s) in ${roomId}`);
   }
 
   private toastLegs(what: string, n: number) {
