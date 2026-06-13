@@ -25,6 +25,18 @@
   // A remote machine you can open a console session on.
   const isRemoteApp = $derived(!!node && node.kind !== "this" && !meshonly);
 
+  // Whether this device is part of *your* fleet — your own machine, one you
+  // own, or a co-member sharing your fleet key. Its raw capabilities ("Its
+  // stuff") are only shown for these: a guest's or a stranger's machine on
+  // the mesh isn't yours to wire up from here.
+  const inMyFleet = $derived(
+    !!node &&
+      (node.kind === "this" ||
+        node.relationship.kind === "mine" ||
+        app.isFleetMember(node.id) ||
+        (!!node.owner && app.isMe(node.owner))),
+  );
+
   // Capabilities grouped by media for tidy sections.
   const grouped = $derived.by(() => {
     const m = new Map<MediaKind, Capability[]>();
@@ -106,6 +118,64 @@
    *  leads with the relationship, not a wall of devices. */
   let stuffOpen = $state(false);
 
+  // ---- sidebar sizing --------------------------------------------------
+  //
+  // The drawer is a real sidebar beside the graph now (it shares the flex
+  // row, so the graph reflows to make room) rather than a panel floating
+  // over it. It's resizable from its left edge and collapsible to a thin
+  // rail, so reading a device's detail never blocks graph navigation.
+  const WIDTH_KEY = "allmystuff.drawer.width.v1";
+  const MIN_W = 280;
+  const MAX_W = 560;
+  const DEFAULT_W = 384;
+
+  function loadWidth(): number {
+    try {
+      const v = Number(localStorage.getItem(WIDTH_KEY));
+      return v >= MIN_W && v <= MAX_W ? v : DEFAULT_W;
+    } catch {
+      return DEFAULT_W;
+    }
+  }
+
+  let width = $state(loadWidth());
+  let collapsed = $state(false);
+  let resizing = $state(false);
+
+  // A fresh selection always re-opens the panel — you clicked a node to see
+  // it. Tracked by id so a presence refresh (same node, new object) doesn't
+  // keep springing a deliberately-collapsed panel back open.
+  let shownId = $state<string | null>(null);
+  $effect(() => {
+    const id = node?.id ?? null;
+    if (id !== shownId) {
+      shownId = id;
+      collapsed = false;
+    }
+  });
+
+  function startResize(e: PointerEvent) {
+    resizing = true;
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  }
+  function onResizeMove(e: PointerEvent) {
+    if (!resizing) return;
+    // The drawer is flush against the window's right edge, so its width is
+    // simply the distance from the pointer to that edge.
+    width = Math.min(MAX_W, Math.max(MIN_W, window.innerWidth - e.clientX));
+  }
+  function endResize(e: PointerEvent) {
+    if (!resizing) return;
+    resizing = false;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    try {
+      localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+    } catch {
+      /* private mode — the width just doesn't persist */
+    }
+  }
+
   function addGrant(p: Preset) {
     if (!node) return;
     const g: Grant = {
@@ -131,8 +201,47 @@
 </script>
 
 {#if node}
-  <aside class="drawer" aria-label="{displayName(node)} details">
-    <header class="head">
+  <aside
+    class="drawer"
+    class:collapsed
+    class:resizing
+    style={collapsed ? "" : `width: ${width}px`}
+    aria-label="{displayName(node)} details"
+  >
+    {#if collapsed}
+      <!-- Collapsed: a thin rail that stays out of the graph's way while
+           keeping the selection — click to bring the detail back. -->
+      <div class="rail">
+        <button
+          class="rail-btn"
+          onclick={() => (collapsed = false)}
+          title="Expand details"
+          aria-label="Expand details">‹</button
+        >
+        <span class="rail-avatar" aria-hidden="true"
+          >{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span
+        >
+        <button
+          class="rail-btn"
+          onclick={() => app.selectNode(null)}
+          title="Close"
+          aria-label="Close">✕</button
+        >
+      </div>
+    {:else}
+      <!-- Drag this edge to resize the sidebar. -->
+      <div
+        class="resizer"
+        role="separator"
+        aria-label="Resize panel"
+        aria-orientation="vertical"
+        onpointerdown={startResize}
+        onpointermove={onResizeMove}
+        onpointerup={endResize}
+        onpointercancel={endResize}
+      ></div>
+      <div class="drawer-body">
+        <header class="head">
       <span class="avatar">{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span>
       <div class="title">
         <div class="name">{displayName(node)}</div>
@@ -164,6 +273,12 @@
           </div>
         {/if}
       </div>
+      <button
+        class="x collapse"
+        onclick={() => (collapsed = true)}
+        title="Collapse panel"
+        aria-label="Collapse panel">⟩</button
+      >
       <button class="x" onclick={() => app.selectNode(null)} aria-label="Close">✕</button>
     </header>
 
@@ -181,8 +296,11 @@
     {/if}
 
     <!-- Open a remote control session: the pikvm-style handle for this
-         machine's screen, audio passthrough and control. -->
-    {#if isRemoteApp && (node.relationship.kind === "mine" || node.relationship.kind === "shared")}
+         machine's screen, audio passthrough and control. Owner/fleet only —
+         sharing is one-directional: when you share your stuff *with* someone,
+         their machine isn't yours to drive, so it never offers a remote
+         control (the far side would refuse it anyway). -->
+    {#if isRemoteApp && node.relationship.kind === "mine"}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
       </button>
@@ -348,8 +466,11 @@
       </section>
     {/if}
 
-    <!-- Capabilities — folded by default: the count is the summary, the
-         full device list is a click away instead of a wall. -->
+    <!-- Capabilities — folded by default, and only for devices in your
+         fleet: a mesh peer that isn't yours has nothing here for you to
+         wire, so "Its stuff" shows for your own / owned / co-fleet machines
+         only. -->
+    {#if inMyFleet}
     <section class="block">
       <button
         class="stuff-toggle"
@@ -399,24 +520,91 @@
       {/if}
     </section>
     {/if}
+    {/if}
+      </div>
+    {/if}
   </aside>
 {/if}
 
 <style>
+  /* A real sidebar: it shares the stage's flex row, so selecting a node
+     reflows the graph to the left instead of covering it. Width is set
+     inline (resizable + persisted); this is just the first-paint fallback. */
   .drawer {
-    position: absolute;
-    top: 0;
-    right: 0;
+    position: relative;
+    flex-shrink: 0;
     height: 100%;
     width: 24rem;
     max-width: 92vw;
     background: var(--surface);
     border-left: 1px solid var(--line);
     box-shadow: var(--shadow-lg);
-    overflow-y: auto;
-    padding: 1rem 1.1rem 2rem;
+    overflow: hidden;
     z-index: 20;
     animation: slidein 0.16s ease;
+  }
+  .drawer.collapsed {
+    width: 2.75rem;
+  }
+  .drawer.resizing {
+    user-select: none;
+  }
+  .drawer-body {
+    height: 100%;
+    overflow-y: auto;
+    padding: 1rem 1.1rem 2rem;
+  }
+  /* The grab edge — a hair-line that lights up on hover/drag. */
+  .resizer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    height: 100%;
+    width: 8px;
+    cursor: ew-resize;
+    z-index: 5;
+    touch-action: none;
+  }
+  .resizer::after {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 0;
+    width: 2px;
+    height: 100%;
+    background: transparent;
+    transition: background 0.12s ease;
+  }
+  .resizer:hover::after,
+  .drawer.resizing .resizer::after {
+    background: var(--accent);
+  }
+  /* Collapsed: a thin rail with just the affordances to come back. */
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.7rem;
+    height: 100%;
+    padding: 0.7rem 0;
+  }
+  .rail-avatar {
+    font-size: 1.35rem;
+    line-height: 1;
+  }
+  .rail-btn {
+    border: none;
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 50%;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .rail-btn:hover {
+    background: var(--line-strong);
+    color: var(--ink);
   }
   @keyframes slidein {
     from {

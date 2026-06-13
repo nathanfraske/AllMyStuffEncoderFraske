@@ -2343,6 +2343,17 @@ class AppStore {
     );
   }
 
+  /** Copy a room's join id — the `room:…` handle others paste into "Join
+   *  with an id" to knock — to the clipboard. */
+  async copyRoomId(roomId: string) {
+    try {
+      await navigator.clipboard.writeText(roomId);
+      this.toast("ok", "Join ID copied");
+    } catch {
+      this.toast("warn", "Couldn't copy the join ID");
+    }
+  }
+
   /** Join a room (or bring an already-joined one back on screen). On the
    *  desktop this opens the room's *dedicated OS window* — the call lives
    *  there, movable and full-screenable like a console window; re-joining
@@ -3363,12 +3374,16 @@ class AppStore {
       }
       return;
     }
-    // Demo/web: drop ourselves from the simulated roster.
+    // Demo/web: drop ourselves from the simulated roster, then re-derive
+    // relationships so the devices we no longer co-own revert to unclaimed
+    // (and the graph regroups them out of "yours") — the same convergence
+    // the backend's roster push triggers.
     if (!this.ownedFleet) return;
     const members = this.ownedFleet.members.filter((m) => !this.isMe(m.device));
     this.ownedFleet = members.length
       ? { ...this.ownedFleet, version: this.ownedFleet.version + 1, members }
       : null;
+    this.reconcileFleetRelationships();
     this.toast("ok", "Left the fleet");
   }
 

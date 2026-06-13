@@ -1295,10 +1295,14 @@
     text-align: center;
     pointer-events: none;
   }
+  /* The bar wraps instead of overflowing: on a narrow console the groups
+     fall onto extra rows rather than squashing the stage or clipping their
+     controls. */
   .controls {
     display: flex;
     align-items: center;
-    gap: 0.8rem;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.7rem;
     padding: 0.6rem 0.7rem;
     background: #1a1730;
     border-top: 1px solid #2c2740;
@@ -1307,6 +1311,7 @@
   .toggles,
   .quick {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.4rem;
   }
   .toggle,
@@ -1338,8 +1343,8 @@
   }
   .pills {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.3rem;
-    flex-shrink: 0;
   }
   .pill-wrap {
     position: relative;
@@ -1412,9 +1417,8 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    flex: 1;
+    flex: 1 1 10rem;
     min-width: 0;
-    overflow: hidden;
     flex-wrap: wrap;
   }
   .chip {
@@ -1454,6 +1458,7 @@
   }
   .end {
     flex-shrink: 0;
+    margin-left: auto;
     background: oklch(0.2 0.05 14);
     border: 1px solid oklch(0.38 0.11 14);
     color: oklch(0.82 0.1 14);

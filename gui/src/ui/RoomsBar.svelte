@@ -60,6 +60,47 @@
   function presentCount(roomId: string): number {
     return (app.roomPresence[roomId] ?? []).filter((m) => !app.isMe(m)).length;
   }
+
+  // ---- per-room settings menu -----------------------------------------
+  //
+  // Each room's actions live behind one ⋯ button now (clearer than a bare
+  // ✕, and room to grow): Copy Join ID, leave the call, and a red leave /
+  // close. The menu is fixed-positioned off the button so the rooms list's
+  // own scroll never clips it.
+  let menuFor = $state<string | null>(null);
+  let menuPos = $state<{ right: number; bottom: number } | null>(null);
+
+  function openMenu(e: MouseEvent, roomId: string) {
+    e.stopPropagation();
+    if (menuFor === roomId) {
+      menuFor = null;
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Anchor the menu's bottom-right just above the button (the bar lives at
+    // the screen's bottom-left, so it opens up-and-left).
+    menuPos = {
+      right: Math.max(8, window.innerWidth - rect.right),
+      bottom: Math.max(8, window.innerHeight - rect.top + 6),
+    };
+    menuFor = roomId;
+  }
+
+  function copyId(roomId: string) {
+    void app.copyRoomId(roomId);
+    menuFor = null;
+  }
+
+  // Close the menu on any outside pointer-down (the button + the menu itself
+  // are exempt so they can toggle / be clicked).
+  $effect(() => {
+    function onDown(e: PointerEvent) {
+      const t = e.target as Element | null;
+      if (!t?.closest?.(".r-menu, .r-gear")) menuFor = null;
+    }
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  });
 </script>
 
 <div class="bar">
@@ -181,22 +222,67 @@
               · {memberSummary(r.members)}{present > 0 ? ` · ${present} in now` : ""}
             </div>
           </div>
-          {#if joined}
-            {#if app.roomOpenId !== r.id}
-              <button class="btn small primary" onclick={() => app.joinRoom(r.id)}>Open</button>
-            {/if}
-            <button class="btn small" onclick={() => app.leaveRoomEverywhere(r.id)}>Leave</button>
-          {:else}
+          {#if joined && app.roomOpenId !== r.id}
+            <button class="btn small primary" onclick={() => app.joinRoom(r.id)}>Open</button>
+          {:else if !joined}
             <button class="btn small primary" onclick={() => app.joinRoom(r.id)}>Join</button>
           {/if}
           <button
-            class="btn small ghost x"
-            title={app.isRoomHost(r)
-              ? "Close this room — you host it, so it ends for everyone"
-              : "Remove this room from this device"}
-            aria-label={app.isRoomHost(r) ? "Close room" : "Remove room"}
-            onclick={() => app.deleteRoom(r.id)}>✕</button
+            class="btn small ghost r-gear"
+            title="Room settings"
+            aria-label="Room settings"
+            aria-haspopup="menu"
+            aria-expanded={menuFor === r.id}
+            onclick={(e) => openMenu(e, r.id)}>⋯</button
           >
+          {#if menuFor === r.id && menuPos}
+            <div
+              class="r-menu"
+              role="menu"
+              style="right: {menuPos.right}px; bottom: {menuPos.bottom}px;"
+            >
+              <button class="r-menu-item" role="menuitem" onclick={() => copyId(r.id)}>
+                <span class="rm-icon" aria-hidden="true">📋</span>
+                <span class="rm-text">
+                  <span class="rm-label">Copy Join ID</span>
+                  <span class="rm-sub">share it so a machine can ask in</span>
+                </span>
+              </button>
+              {#if joined}
+                <button
+                  class="r-menu-item"
+                  role="menuitem"
+                  onclick={() => {
+                    app.leaveRoomEverywhere(r.id);
+                    menuFor = null;
+                  }}
+                >
+                  <span class="rm-icon" aria-hidden="true">⏏</span>
+                  <span class="rm-text">
+                    <span class="rm-label">Leave call</span>
+                    <span class="rm-sub">hang up — the room stays listed</span>
+                  </span>
+                </button>
+              {/if}
+              <div class="r-menu-sep"></div>
+              <button
+                class="r-menu-item danger"
+                role="menuitem"
+                onclick={() => {
+                  app.deleteRoom(r.id);
+                  menuFor = null;
+                }}
+              >
+                <span class="rm-icon" aria-hidden="true">🚪</span>
+                <span class="rm-text">
+                  <span class="rm-label">{app.isRoomHost(r) ? "Close room" : "Leave room"}</span>
+                  <span class="rm-sub"
+                    >{app.isRoomHost(r) ? "ends it for everyone" : "removes it from this device"}</span
+                  >
+                </span>
+              </button>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>
@@ -417,11 +503,77 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .x {
-    padding: 0.25rem 0.4rem;
+  .r-gear {
+    flex-shrink: 0;
+    padding: 0.25rem 0.45rem;
     color: var(--ink-faint);
+    font-weight: 700;
   }
-  .x:hover {
+  .r-gear:hover {
+    color: var(--ink);
+  }
+  .r-menu {
+    position: fixed;
+    z-index: 70;
+    min-width: 13rem;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg);
+    padding: 0.35rem;
+    animation: rmenu 0.12s ease;
+  }
+  @keyframes rmenu {
+    from {
+      transform: translateY(4px);
+      opacity: 0;
+    }
+  }
+  .r-menu-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--ink);
+    text-align: left;
+    padding: 0.4rem 0.5rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    font: inherit;
+  }
+  .r-menu-item:hover {
+    background: var(--surface-2);
+  }
+  .rm-icon {
+    font-size: 0.95rem;
+    line-height: 1.25;
+    flex-shrink: 0;
+  }
+  .rm-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .rm-label {
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .rm-sub {
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    line-height: 1.3;
+  }
+  .r-menu-sep {
+    height: 1px;
+    background: var(--line);
+    margin: 0.3rem 0.2rem;
+  }
+  .r-menu-item.danger .rm-label {
     color: var(--danger);
+  }
+  .r-menu-item.danger:hover {
+    background: var(--danger-soft);
   }
 </style>
