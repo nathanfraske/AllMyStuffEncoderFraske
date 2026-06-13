@@ -535,6 +535,7 @@ fn run_capture(
             &mut stats,
             &mut reporter,
             VideoStatusState::CameraFailed,
+            None,
         );
         drop(session);
         // A camera whose stream died mid-route (unplugged) ends with the
@@ -635,7 +636,13 @@ fn run_capture(
     // (see `wayland_capture`). When no token is stored yet, the consent
     // dialog needs a human at this machine — say so to the viewer before
     // the wait. A failed or refused session degrades to the per-grab
-    // path below, which keeps explaining itself in-band.
+    // path below, which keeps explaining itself in-band — and so does a
+    // session that *opens* but never delivers a frame: a restored grant
+    // can point at an output the compositor no longer paints (silent
+    // token restores skip the initial frame some compositors only send
+    // on fresh consent; a KVM-switched or re-plugged monitor strands the
+    // grant entirely), and without a deadline that's a black stage
+    // forever with "display asleep" as a wrong diagnosis.
     #[cfg(target_os = "linux")]
     if wayland_session() {
         if !crate::wayland_capture::has_restore_token(monitor_id) {
@@ -644,7 +651,7 @@ fn run_capture(
         match crate::wayland_capture::open(monitor_id) {
             Ok((session, frames)) => {
                 tracing::info!("wayland screencast session started for {route_id}");
-                let result = pump_frames(
+                let result = pump_frames_with_stall(
                     stop,
                     fps,
                     &frames,
@@ -653,6 +660,8 @@ fn run_capture(
                     &mut encoder,
                     &mut stats,
                     &mut reporter,
+                    VideoStatusState::DisplayAsleep,
+                    Some(WAYLAND_FIRST_FRAME_DEADLINE),
                 );
                 drop(session);
                 match result {
@@ -747,12 +756,25 @@ fn wayland_session() -> bool {
 /// damage-driven backend, not a problem.
 const FIRST_FRAME_STALL: Duration = Duration::from_secs(5);
 
+/// How long a Wayland portal session may stay frameless before the
+/// route gives up on it and degrades to per-frame grabs. Longer than
+/// [`FIRST_FRAME_STALL`] so the viewer still hears the honest interim
+/// status, and long enough for two wake pulses (one per ~3 s) to coax
+/// out a first frame if sleep really was the story. Wayland-only: on
+/// Windows/macOS a frameless session reliably *is* a dark display and
+/// the wait is the right behaviour, but a portal stream restored from
+/// a token can be silently dead on an awake desktop, and only the
+/// one-shot path (the Screenshot portal) still produces pixels there.
+const WAYLAND_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(8);
+
 /// Drain a session's frame channel into the encoder, paced to the target
 /// rate: each tick encodes the *freshest* pending frame; a backlog is
 /// skipped, never transcoded late. Generic over the session's frame type
 /// (`raw` extracts RGBA + dimensions) so the platform backends — our DXGI
-/// duplication, the Wayland portal stream, xcap's recorders — share one
-/// pump.
+/// duplication, xcap's recorders — share one pump. (The Wayland arm
+/// calls [`pump_frames_with_stall`] directly: it's the one session a
+/// first-frame deadline applies to.)
+#[cfg(any(windows, target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn pump_frames<T, X>(
     stop: &AtomicBool,
@@ -777,6 +799,7 @@ where
         stats,
         reporter,
         VideoStatusState::DisplayAsleep,
+        None,
     )
 }
 
@@ -784,6 +807,10 @@ where
 /// caller: a frameless screen session is a dark display (worth wake
 /// pressure on the panel), a frameless camera is the camera failing —
 /// different words to the viewer, and no point lighting the screen.
+/// `first_frame_deadline` bounds how long the session may stay
+/// frameless before the pump gives up with an error (so the caller can
+/// degrade to another capture path); `None` waits as long as the route
+/// lives. Only the first frame is ever held to it.
 #[allow(clippy::too_many_arguments)]
 fn pump_frames_with_stall<T, X>(
     stop: &AtomicBool,
@@ -795,6 +822,7 @@ fn pump_frames_with_stall<T, X>(
     stats: &mut StreamStats,
     reporter: &mut StatusReporter,
     stall_state: VideoStatusState,
+    first_frame_deadline: Option<Duration>,
 ) -> Result<(), String>
 where
     X: Fn(T) -> (Vec<u8>, u32, u32),
@@ -824,6 +852,14 @@ where
                     }
                     if started.elapsed() >= FIRST_FRAME_STALL {
                         reporter.report(stall_state, None);
+                    }
+                    if let Some(deadline) = first_frame_deadline {
+                        if started.elapsed() >= deadline {
+                            return Err(format!(
+                                "no frame within {}s of session start",
+                                deadline.as_secs()
+                            ));
+                        }
                     }
                 }
                 continue;
@@ -1468,6 +1504,31 @@ mod tests {
         assert_eq!(fit_within_even(3024, 1964, 1920), (1920, 1246));
         assert_eq!(fit_within_even(1919, 1081, 1920), (1918, 1080));
         assert_eq!(fit_within_even(1, 1, 1920), (2, 2));
+    }
+
+    #[test]
+    fn a_frameless_session_pump_errors_at_the_deadline() {
+        let stop = AtomicBool::new(false);
+        // Sender stays alive and silent: the pump must give up on the
+        // deadline, not on a disconnect.
+        let (_tx, rx) = mpsc::channel::<(Vec<u8>, u32, u32)>();
+        let mut stats = StreamStats::new("r", VideoMode::Mjpeg);
+        let mut enc = StreamEncoder::Mjpeg(test_frame_encoder());
+        let mut reporter = StatusReporter::new(Arc::new(|_, _| {}));
+        let err = pump_frames_with_stall(
+            &stop,
+            30,
+            &rx,
+            |f: (Vec<u8>, u32, u32)| f,
+            &|_| true,
+            &mut enc,
+            &mut stats,
+            &mut reporter,
+            VideoStatusState::CameraFailed,
+            Some(Duration::from_millis(300)),
+        )
+        .expect_err("a frameless session past the deadline must end");
+        assert!(err.contains("no frame within"), "{err}");
     }
 
     #[test]

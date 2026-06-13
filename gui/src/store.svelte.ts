@@ -155,6 +155,24 @@ const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 /** localStorage key for this device's rooms list. */
 const ROOMS_STORE_KEY = "allmystuff.rooms.v1";
 
+/** Daemon peer statuses that mean "reachable right now". `active` is the
+ *  obvious one; `shelved` is the topology selector parking a healthy link
+ *  to bound connection count — its data channel stays open (heartbeats,
+ *  routes and consoles all still ride it), so painting the machine
+ *  offline would be wrong. Everything else is either transient
+ *  (`sighted` / `handshaking` / `reconnecting`) or terminal
+ *  (`offline` / `error`). */
+const CONNECTED_STATUSES = new Set(["active", "shelved"]);
+
+/** How long a machine that was just connected keeps reading online while
+ *  its daemon status dips through a transient state (an ICE restart, a
+ *  re-handshake after a network blip) or it briefly vanishes from the
+ *  peer list (its daemon restarting). Five graph polls' worth: long
+ *  enough to swallow every routine transport rebuild, short enough that
+ *  a genuinely gone machine isn't painted reachable for long. An
+ *  explicit `offline`/`error` status skips the grace entirely. */
+const PRESENCE_GRACE_MS = 15_000;
+
 /** The send channels a room can have live, each owning the routes its
  *  toggle created. `mic` is the call (your voice); `sound` is the
  *  machine's loopback — kept strictly apart on purpose. */
@@ -453,6 +471,13 @@ class AppStore {
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
 
+  /** When each machine (canonical pubkey) was last seen in a connected
+   *  daemon status — the memory behind [`PRESENCE_GRACE_MS`], so the
+   *  graph holds a recently-live node online through transport blips
+   *  instead of flapping it offline on every 3 s poll that lands
+   *  mid-rebuild. */
+  private lastConnectedAt = new Map<string, number>();
+
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
@@ -678,7 +703,20 @@ class AppStore {
         addNet(p.device_id, netName);
         const e = live.get(p.device_id) ?? { label: p.label?.trim() || shortId(p.device_id), online: false };
         if (p.label?.trim()) e.label = p.label.trim();
-        if (p.status === "active") e.online = true;
+        const canon = canonicalNodeId(p.device_id);
+        if (CONNECTED_STATUSES.has(p.status)) {
+          e.online = true;
+          this.lastConnectedAt.set(canon, Date.now());
+        } else if (p.status === "offline" || p.status === "error") {
+          // The daemon's explicit verdict — no grace, and no lingering
+          // marker for the vanish sweep below to resurrect it with.
+          this.lastConnectedAt.delete(canon);
+        } else if (this.withinPresenceGrace(canon)) {
+          // Transient (sighted / handshaking / reconnecting): a link
+          // mid-rebuild. Recently-connected machines hold online through
+          // it so an ICE blip doesn't flog the graph offline/online.
+          e.online = true;
+        }
         live.set(p.device_id, e);
       }
       for (const r of roster) addNet(r.device_id, netName);
@@ -743,15 +781,26 @@ class AppStore {
     // A machine that's no longer in any roster/peer set has dropped offline.
     // Compare by canonical pubkey so a presence node (display id) isn't wrongly
     // marked offline just because the daemon lists it under the bare pubkey.
+    // Recently-connected machines get the same grace as a transient status:
+    // a daemon restarting mid-poll reports *nobody* for a few seconds, and
+    // without the grace that blanks the whole graph offline and back.
     const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
     for (const n of this.catalog.nodes) {
-      if (n.kind !== "this" && !this.isLocalMachine(n.id) && !knownCanon.has(canonicalNodeId(n.id))) {
-        n.online = false;
+      const canon = canonicalNodeId(n.id);
+      if (n.kind !== "this" && !this.isLocalMachine(n.id) && !knownCanon.has(canon)) {
+        n.online = this.withinPresenceGrace(canon);
       }
     }
     // A freshly-discovered device may belong to someone we already share
     // with — fold it into that share.
     this.reconcileShares();
+  }
+
+  /** Whether `canon` (a canonical pubkey) was in a connected status
+   *  recently enough that a transient dip should not read as offline. */
+  private withinPresenceGrace(canon: string): boolean {
+    const seen = this.lastConnectedAt.get(canon);
+    return seen !== undefined && Date.now() - seen < PRESENCE_GRACE_MS;
   }
 
   /** Whether `id` names this machine — by the live local id or the daemon
