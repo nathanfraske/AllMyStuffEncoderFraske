@@ -19,6 +19,7 @@
   import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalsPopup from "./ApprovalsPopup.svelte";
+  import ClaimSheet from "./ClaimSheet.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
@@ -102,8 +103,17 @@
       >
         <b>{app.mineCount}</b> yours{#if app.fleetName}&nbsp;· {app.fleetName}{/if}
       </button>
-      <span class="chip"><b>{app.sharedCount}</b> shared</span>
+      <button
+        class="chip shared"
+        onclick={() => app.openSettings("sharing")}
+        title="People & fleets you're sharing with"
+      >
+        <b>{app.sharedCount}</b> shared
+      </button>
       <span class="net-anchor">
+        <!-- One networks control: the colored presence dot is the icon, the
+             name carries a chevron into a menu that holds both the on/off
+             switches and the network-settings button (no separate button). -->
         <button
           class="chip net"
           class:live={app.backendConnected && app.networks.length > 0}
@@ -111,7 +121,7 @@
             e.stopPropagation();
             app.netMenuOpen = !app.netMenuOpen;
           }}
-          title="Your networks — switch them on or off"
+          title="Your networks — switch them on or off, or open network settings"
           aria-haspopup="menu"
           aria-expanded={app.netMenuOpen}
         >
@@ -126,6 +136,7 @@
                   ? "networks off"
                   : "no network"}
           {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
+          <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
         </button>
         {#if app.netMenuOpen}
           <NetworkMenu />
@@ -143,7 +154,16 @@
           {app.freshJoins.length === 1 ? "device wants in" : "devices want in"}
         </button>
       {/if}
-      <button class="btn" onclick={() => app.openSettings("networks")} title="Networks, identity & approvals">🌐 Networks</button>
+      <!-- A device offering itself for adoption: the brand-accent twin of the
+           join nudge — claiming is the step right after joining, so it's just
+           as hard to miss. Opens the Claim sheet. -->
+      {#if app.claimables.length > 0}
+        <button class="nudge claim" onclick={() => app.openClaim()} title="A device is ready to claim">
+          <span class="nudge-mark claim-mark" aria-hidden="true">＋</span>
+          {app.claimables.length}
+          {app.claimables.length === 1 ? "device to claim" : "devices to claim"}
+        </button>
+      {/if}
       <button class="btn" onclick={() => app.hydrateFromBackend()} title="Scan this machine">↻ Scan</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
@@ -164,6 +184,9 @@
   {/if}
   {#if app.approvalsOpen}
     <ApprovalsPopup />
+  {/if}
+  {#if app.claimOpen}
+    <ClaimSheet />
   {/if}
   <!-- The web preview's in-page console + terminal + files; on the desktop
        these sessions open in their own windows instead and never activate
@@ -236,11 +259,13 @@
     gap: 0.4rem;
     margin-left: auto;
   }
-  .chip.yours {
+  .chip.yours,
+  .chip.shared {
     cursor: pointer;
     transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .chip.yours:hover {
+  .chip.yours:hover,
+  .chip.shared:hover {
     background: var(--surface);
     border-color: var(--accent);
   }
@@ -269,11 +294,28 @@
     color: var(--ok);
     border-color: oklch(0.8 0.17 150 / 0.3);
   }
+  /* The presence dot *is* the networks icon — colored from the chip (red
+     when there's no live network, green when joined) and given a soft halo
+     once live so it reads as lit rather than greyed. */
   .net-dot {
-    width: 7px;
-    height: 7px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: currentColor;
+    flex-shrink: 0;
+  }
+  .chip.net.live .net-dot {
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.18);
+  }
+  .net-chevron {
+    font-size: 0.62rem;
+    line-height: 1;
+    margin-left: 0.05rem;
+    opacity: 0.7;
+    transition: transform 0.12s ease;
+  }
+  .net-chevron.open {
+    transform: rotate(180deg);
   }
   .actions {
     display: flex;
@@ -321,6 +363,31 @@
     }
     100% {
       box-shadow: 0 0 0 0 oklch(0.79 0.14 75 / 0);
+    }
+  }
+  /* The claim nudge — same shape as the join nudge, in the brand accent, so
+     "a device is ready to claim" is its own distinct, welcoming call. */
+  .nudge.claim {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    animation: claim-pulse 1.8s ease-out infinite;
+  }
+  .nudge.claim:hover {
+    background: oklch(0.64 0.255 350 / 0.26);
+  }
+  .nudge-mark.claim-mark {
+    background: var(--accent);
+  }
+  @keyframes claim-pulse {
+    0% {
+      box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0.45);
+    }
+    70% {
+      box-shadow: 0 0 0 8px oklch(0.64 0.255 350 / 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0);
     }
   }
   .gear {

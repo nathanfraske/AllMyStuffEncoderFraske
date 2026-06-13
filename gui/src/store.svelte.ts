@@ -266,6 +266,10 @@ class AppStore {
   settingsTab = $state<SettingsTab>("networks");
   /** The "a new device wants to join" approval popup (the code-grid nudge). */
   approvalsOpen = $state(false);
+  /** The "claim a device" sheet — the forefront adoption surface, opened from
+   *  the top-bar nudge or a device's drawer. Claiming is the step right after
+   *  joining a network, so it gets the same prominence the join nudge has. */
+  claimOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
@@ -524,6 +528,20 @@ class AppStore {
    *  session — what the top-bar nudge counts and the popup shows. */
   freshJoins = $derived(
     this.pendingJoins.filter((j) => !this.dismissedJoins.includes(canonicalNodeId(j.peer.device_id))),
+  );
+
+  /** Devices offering themselves for adoption that you can actually take —
+   *  running AllMyStuff, still unclaimed, in claim mode, and not already owned
+   *  by someone else. The mirror of `freshJoins` for the claim step: what the
+   *  top-bar "ready to claim" nudge counts and the Claim sheet lists. */
+  claimables = $derived(
+    this.catalog.nodes.filter(
+      (n) =>
+        isAppNode(n) &&
+        n.relationship.kind === "unclaimed" &&
+        n.claimable === true &&
+        !(n.owner && !this.isMe(n.owner)),
+    ),
   );
 
   /** Canonical pubkeys of every device in your owned fleet (you included), so
@@ -3267,6 +3285,12 @@ class AppStore {
   openApprovals() {
     if (this.freshJoins.length === 0) return;
     this.approvalsOpen = true;
+  }
+
+  /** Open the "claim a device" sheet (the adoption nudge's target). */
+  openClaim() {
+    if (this.claimables.length === 0) return;
+    this.claimOpen = true;
   }
 
   /** Approve a pending join straight from the popup. */

@@ -24,7 +24,19 @@
   const routeId = $derived(target.startsWith("share:") ? target.slice(6) : null);
 
   const ready = $derived.by(() => {
-    if (capId) return !!app.capability(capId);
+    if (capId) {
+      const cap = app.capability(capId);
+      if (!cap) return false;
+      // The popout boots its own store from nothing, so a source peer can read
+      // `unclaimed` for a beat before its ownership/fleet gossip converges.
+      // Wiring then would route-propose against an unclaimed node and toast a
+      // spurious "isn't yours yet — claim it first" — a red herring, since the
+      // stream was already authorized wherever it was popped out from. Hold the
+      // wire until the relationship settles (it never stays unclaimed for a
+      // machine you own or share).
+      const node = app.machineByAnyId(cap.node);
+      return !!node && node.relationship.kind !== "unclaimed";
+    }
     if (routeId) return app.catalog.routes.some((r) => r.id === routeId);
     return false;
   });
