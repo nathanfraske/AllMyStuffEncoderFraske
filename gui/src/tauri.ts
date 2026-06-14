@@ -977,21 +977,55 @@ function newNetworkInternalId(): string {
 /** Build the NetworkConfig payload `mesh_network_add` expects. Defaults the
  *  signaling relay + STUN + TURN to MyOwnMesh's reference servers so a freshly
  *  created/joined network connects out of the box; the Servers pane can change
- *  any of them later. */
+ *  any of them later. Importing a network-settings file passes the file's own
+ *  servers in instead — an empty list there is sent as "none" (the daemon
+ *  resolves empty signaling to its built-in relay either way). */
 export function buildNetworkConfig(args: {
   networkId: string;
   label?: string;
   autoApprove?: boolean;
+  signaling?: string[];
+  stun?: string[];
+  turn?: { url: string; username?: string; credential?: string }[];
 }): Record<string, unknown> {
+  const signaling = args.signaling ?? [MYOWNMESH_SIGNALING];
+  const stun = args.stun ?? [MYOWNMESH_STUN];
+  const turn = args.turn ?? [
+    { url: MYOWNMESH_TURN_URL, username: MYOWNMESH_TURN_USER, credential: MYOWNMESH_TURN_PASS },
+  ];
   return {
     id: newNetworkInternalId(),
     network_id: args.networkId,
     label: args.label?.trim() || undefined,
-    signaling: { servers: [MYOWNMESH_SIGNALING] },
-    stun_servers: [{ urls: [MYOWNMESH_STUN] }],
-    turn_servers: [
-      { urls: [MYOWNMESH_TURN_URL], username: MYOWNMESH_TURN_USER, credential: MYOWNMESH_TURN_PASS },
-    ],
+    signaling: signaling.length > 0 ? { servers: signaling } : undefined,
+    stun_servers: stun.length > 0 ? stun.map((u) => ({ urls: [u] })) : undefined,
+    turn_servers:
+      turn.length > 0
+        ? turn.map((t) => ({
+            urls: [t.url],
+            username: t.username || undefined,
+            credential: t.credential || undefined,
+          }))
+        : undefined,
     auto_approve: args.autoApprove ?? false,
   };
+}
+
+/** Save a network-settings envelope to a user-chosen `.json` file. Opens the
+ *  native save dialog for the path, then writes via the backend (the webview
+ *  can't write arbitrary paths itself). Returns the saved path, or null when
+ *  the user cancels (or there's no desktop backend). */
+export async function exportNetworkFile(
+  defaultName: string,
+  envelope: unknown,
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const path = await save({
+    defaultPath: defaultName,
+    filters: [{ name: "AllMyStuff network settings", extensions: ["json"] }],
+  });
+  if (!path) return null;
+  await invokeReq<unknown>("mesh_network_export_file", { path, config: envelope });
+  return path;
 }

@@ -16,6 +16,11 @@ import {
 } from "./catalog";
 import { demoCatalog } from "./mock";
 import {
+  exportNetworkSettings,
+  networkAddPayloadFromEnvelope,
+  tryParseNetworkSettings,
+} from "./network-settings";
+import {
   buildNetworkConfig,
   claimNode,
   clientLog,
@@ -26,6 +31,7 @@ import {
   type VideoLocalEvent,
   consoleWindowTarget,
   disabledNetworks,
+  exportNetworkFile,
   disconnectRoute,
   emitRoomLocal,
   emitVideoLocal,
@@ -3522,6 +3528,65 @@ class AppStore {
       await this.refreshNetworks();
     } catch (e) {
       this.toast("warn", `Couldn't join: ${errMsg(e)}`);
+    }
+  }
+
+  /** Save a network's full settings (handle + signaling/STUN/TURN) to a JSON
+   *  file you can hand to another device — the no-typing twin of "Copy id".
+   *  Works for live or parked networks; pulls the full config if it isn't
+   *  already loaded. */
+  async exportNetwork(configId: string) {
+    if (!this.backendConnected) {
+      this.toast("info", "Exporting a network needs the desktop app");
+      return;
+    }
+    let cfg =
+      this.networkConfig(configId) ??
+      this.disabledNets.find((c) => c.id === configId || c.network_id === configId) ??
+      null;
+    if (!cfg) {
+      await this.loadNetworkConfigs();
+      cfg = this.networkConfig(configId) ?? null;
+    }
+    if (!cfg) {
+      this.toast("warn", "Couldn't find that network's settings to export");
+      return;
+    }
+    try {
+      const env = exportNetworkSettings(cfg);
+      const base = (env.label || env.network_id || "network").replace(/[^\w.-]+/g, "_").slice(0, 48);
+      const saved = await exportNetworkFile(`${base}.network-settings.json`, env);
+      if (saved) this.toast("ok", `Exported ${env.label || env.network_id}`);
+    } catch (e) {
+      this.toast("warn", `Couldn't export the network: ${errMsg(e)}`);
+    }
+  }
+
+  /** Add a network from a network-settings file's contents — the third, and
+   *  easiest, way onto a network (no handle to paste, no servers to re-enter).
+   *  Tolerant: a file that isn't one of ours just warns. Skips a network
+   *  you're already on rather than making a confusing duplicate. */
+  async importNetworkSettings(text: string) {
+    if (!this.backendConnected) {
+      this.toast("info", "Importing a network needs the desktop app");
+      return;
+    }
+    const env = tryParseNetworkSettings(text);
+    if (!env) {
+      this.toast("warn", "That file isn't an AllMyStuff network-settings export");
+      return;
+    }
+    if (this.networks.some((n) => n.network_id === env.network_id)) {
+      this.toast("info", `Already on ${env.label || env.network_id}`);
+      return;
+    }
+    try {
+      await meshNetworkAdd(networkAddPayloadFromEnvelope(env));
+      this.toast("ok", `Imported ${env.label || env.network_id}`);
+      await this.refreshNetworks();
+      await this.loadNetworkConfigs();
+    } catch (e) {
+      this.toast("warn", `Couldn't import the network: ${errMsg(e)}`);
     }
   }
 
