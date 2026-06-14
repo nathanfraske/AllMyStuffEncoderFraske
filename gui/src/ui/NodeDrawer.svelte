@@ -291,10 +291,6 @@
       </section>
     {/if}
 
-    {#if node.kind === "this"}
-      <button class="btn small rescan" onclick={() => app.hydrateFromBackend()}>↻ Re-scan this machine</button>
-    {/if}
-
     <!-- Open a remote control session: the pikvm-style handle for this
          machine's screen, audio passthrough and control. Owner/fleet only —
          sharing is one-directional: when you share your stuff *with* someone,
@@ -464,6 +460,14 @@
           {/each}
         </ul>
       </section>
+    {/if}
+
+    <!-- Re-scan this machine's hardware — sits right above its own "Its
+         stuff" list because a fresh scan is what fills that list. Only the
+         local device can be scanned on demand; a remote's stuff comes from
+         its presence advert, so the button is gated to "this". -->
+    {#if node.kind === "this"}
+      <button class="btn small rescan" onclick={() => app.hydrateFromBackend()}>↻ Re-scan this machine</button>
     {/if}
 
     <!-- Capabilities — folded by default, and only for devices in your
