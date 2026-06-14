@@ -20,6 +20,7 @@
 mod audio;
 mod byte_queues;
 mod camera_capture;
+mod clipboard;
 mod control_client;
 mod daemon_spawn;
 mod files;
@@ -152,17 +153,13 @@ async fn send_input(
     mesh.inner().send_input(route_id, action).await
 }
 
-/// Push this machine's clipboard down an active outbound clipboard route —
-/// the console calls this the moment it forwards a paste.
+/// Read this machine's clipboard and push it down an active outbound
+/// clipboard route — the console calls this the moment it forwards a paste.
+/// The backend does the read (the only place that can see file references on
+/// the OS clipboard) and streams text, an image, or files.
 #[tauri::command]
-async fn send_clipboard(
-    mesh: State<'_, Arc<Mesh>>,
-    route_id: String,
-    event: serde_json::Value,
-) -> Result<(), String> {
-    let event: allmystuff_session::ClipboardEvent =
-        serde_json::from_value(event).map_err(|e| e.to_string())?;
-    mesh.inner().send_clipboard(route_id, event).await
+async fn clipboard_paste(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
+    mesh.inner().clipboard_paste(route_id).await
 }
 
 /// Register the calling window's interest in a route's inbound video.
@@ -912,7 +909,7 @@ fn main() {
             claim_node,
             set_claimable,
             send_input,
-            send_clipboard,
+            clipboard_paste,
             video_watch,
             video_poll,
             video_unwatch,

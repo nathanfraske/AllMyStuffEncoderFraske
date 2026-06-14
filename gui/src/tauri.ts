@@ -6,7 +6,6 @@
 import type {
   Capability,
   CheckOutcome,
-  ClipboardEvent,
   FileEvent,
   RoomWireMessage,
   IdentityInfo,
@@ -232,12 +231,14 @@ export function sendInput(routeId: string, action: InputAction): Promise<null> {
   return tryInvoke("send_input", { routeId, action });
 }
 
-/** Push this machine's clipboard down an active outbound clipboard route —
- *  the console calls this the instant it forwards a paste, so the far side
- *  writes our content to its clipboard before the paste keystroke (right
- *  behind this on the same ordered channel) lands. */
-export function sendClipboard(routeId: string, event: ClipboardEvent): Promise<null> {
-  return tryInvoke("send_clipboard", { routeId, event });
+/** Read this machine's clipboard and push it down an active outbound
+ *  clipboard route — the console calls this the instant it forwards a paste,
+ *  so the far side writes our content (text, an image, or files) to its
+ *  clipboard before the paste keystroke (right behind it on the same ordered
+ *  channel) lands. The read happens in the backend: it's the only side that
+ *  can see file references on the OS clipboard. */
+export function clipboardPaste(routeId: string): Promise<null> {
+  return tryInvoke("clipboard_paste", { routeId });
 }
 
 /** Decode one wire packet (28-byte little-endian header + payload) out
@@ -626,21 +627,6 @@ export async function clipboardRead(): Promise<string> {
     return (await readText()) ?? "";
   }
   return navigator.clipboard.readText();
-}
-
-/** Read this machine's clipboard as a [`ClipboardEvent`] for a send-on-paste.
- *  Text today — the everyday case, and the one WebKitGTK reads reliably;
- *  images and files are the planned cross-machine copy/paste, carried by the
- *  same wire shape once their platform paths land. Returns null when the
- *  clipboard is empty or unreadable (nothing to send). */
-export async function readLocalClipboard(): Promise<ClipboardEvent | null> {
-  try {
-    const text = await clipboardRead();
-    if (text) return { kind: "text", text };
-  } catch (e) {
-    console.warn("clipboard read failed:", e);
-  }
-  return null;
 }
 
 /** Open a link in the system browser (terminal web-links). Tauri routes it

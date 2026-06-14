@@ -71,9 +71,8 @@ import {
   terminalWindowTarget,
   filesWindowTarget,
   scanSelf,
-  sendClipboard,
+  clipboardPaste,
   sendInput,
-  readLocalClipboard,
   sessionSnapshot,
   setClaimable,
   setNetworkEnabled,
@@ -1621,16 +1620,14 @@ class AppStore {
 
   /** Push this machine's clipboard down the live clipboard route — called
    *  the instant the console forwards a paste, so the remote pastes our
-   *  content. Resolves once the frame is on the wire; the caller releases
-   *  the paste keystroke after, keeping the order the remote needs (write
-   *  clipboard, then inject paste). No-op when clipboard passthrough is off
-   *  or the clipboard is empty. */
+   *  content (text, an image, or files). The backend reads the clipboard and
+   *  streams it; this resolves once it's all on the wire, and the caller then
+   *  releases the paste keystroke, keeping the order the remote needs (write
+   *  clipboard, then inject paste). No-op when clipboard passthrough is off. */
   async sendConsoleClipboard(): Promise<void> {
     const route = this.consoleClipboardLive;
     if (!route) return;
-    const event = await readLocalClipboard();
-    if (!event) return;
-    await sendClipboard(route, event);
+    await clipboardPaste(route);
   }
 
   /** Connect one session leg (a console channel, a room toggle) through

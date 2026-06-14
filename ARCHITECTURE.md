@@ -471,14 +471,22 @@ Tauri 2 + Svelte 5, a client of the daemon.
    A **clipboard route** (`MediaKind::Clipboard`, the synthetic per-machine
    `clipboard` endpoint) rides the same plane as a third console toggle
    next to audio and control, default-on in a session. To keep each
-   machine's clipboard its own, it carries nothing until you *paste*:
-   the console intercepts the paste chord, pushes this machine's clipboard
-   as a `"clip"` frame over `CHANNEL_MEDIA`, and only then forwards the
-   paste keystroke — both ordered to the same peer, so the sink writes the
-   clipboard (gated exactly like input injection) before the injected paste
-   reads it. Text is wired; the `ClipboardEvent` shape also carries images
-   and file names for the planned cross-machine copy/paste, accepted on the
-   wire today and written once their platform paths land.
+   machine's clipboard its own, it carries nothing until you *paste*: the
+   console intercepts the paste chord and the backend reads this machine's
+   clipboard and pushes it as `"clip"` frames over `CHANNEL_MEDIA`, only
+   then forwarding the paste keystroke — both ordered to the same peer, so
+   the sink writes the clipboard (gated exactly like input injection) before
+   the injected paste reads it. **Text** rides one frame; an **image** or a
+   set of **files** rides a chunked transfer (`open` manifest → base64
+   `chunk`s → `close`, split under the channel's ~64 KiB ceiling like a
+   video frame), file bytes streaming from disk and landing in a per-transfer
+   staging dir whose paths the receiver's OS clipboard is then pointed at —
+   so a paste in a file manager materializes them. The OS-clipboard side
+   (reading copied file references, handing files back for paste — formats
+   the bundled clipboard-manager plugin can't touch) is `clipboard-rs`,
+   driven on one dedicated thread (`clipboard.rs`) that owns the single
+   clipboard context for the app's life, which is what keeps an X11
+   selection served after the paste.
 
 **A terminal session** is one more route on the same plumbing — and no sshd
 anywhere. A node that can host shells advertises `"terminal"` in its

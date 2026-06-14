@@ -14,6 +14,8 @@
 //! snapshots emitted after each change.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -29,13 +31,13 @@ use allmystuff_protocol::{
     CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
-    AudioFrame, ClipboardEvent, ClipboardFrame, Effect, FileEvent, FileFrame, InputAction,
-    InputEvent, MediaPayload, Session, TermEvent, TermFrame, VideoAssembler, VideoFrame,
-    VideoStatusFrame,
+    AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
+    FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session, TermEvent, TermFrame,
+    VideoAssembler, VideoFrame, VideoStatusFrame, CLIPBOARD_CHUNK_BYTES,
 };
-use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::audio::{AudioBridge, CaptureSource};
+use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
@@ -108,6 +110,16 @@ pub struct Mesh {
     /// Sequence for outbound clipboard frames (one stream per app run, like
     /// `input_seq` — clipboard rides alongside control).
     clipboard_seq: AtomicU64,
+    /// Transfer ids for outbound clipboard image/file pastes — scopes a
+    /// transfer's chunks, separate from the per-frame `clipboard_seq`.
+    clipboard_transfer: AtomicU64,
+    /// The OS clipboard on its own thread — reads on paste, writes on
+    /// receipt (see [`crate::clipboard`]).
+    clipboard: ClipboardService,
+    /// Inbound clipboard transfers being reassembled, keyed by (route,
+    /// transfer id). Image bytes accumulate in memory; file bytes stream to
+    /// a per-transfer staging dir.
+    clip_inbound: Mutex<HashMap<(String, u64), ClipInbound>>,
     /// This app run's random presence boot id — how peers detect that we
     /// (re)started and answer with their state (see `NodeProfile::boot`).
     boot_id: u64,
@@ -295,6 +307,9 @@ impl Mesh {
             video_out,
             input_seq: AtomicU64::new(0),
             clipboard_seq: AtomicU64::new(0),
+            clipboard_transfer: AtomicU64::new(0),
+            clipboard: ClipboardService::spawn(),
+            clip_inbound: Mutex::new(HashMap::new()),
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
@@ -2282,9 +2297,9 @@ impl Mesh {
                 }
             }
             MediaKind::Clipboard => {
-                // Nothing to start eagerly: the source pushes a frame per
-                // paste (`send_clipboard`), and the sink writes it straight
-                // to the OS clipboard on arrival (`handle_clipboard_frame`).
+                // Nothing to start eagerly: the source reads + streams its
+                // clipboard per paste (`clipboard_paste`), and the sink
+                // reassembles + writes it on arrival (`handle_clipboard_frame`).
                 // Say the link is live so "awaiting accept" isn't the last
                 // word on a working clipboard route.
                 if from_node == me {
@@ -3372,16 +3387,15 @@ impl Mesh {
         self.send_media_value(&peer, payload).await
     }
 
-    /// Front-end command: push this machine's clipboard down an active
-    /// outbound clipboard route — sent the instant the console forwards a
-    /// paste, so the far side pastes *our* content. This machine must be the
-    /// route's source side; the far end gates the write the same way it
-    /// gates input injection.
-    pub async fn send_clipboard(
-        self: &Arc<Self>,
-        route_id: String,
-        event: ClipboardEvent,
-    ) -> Result<(), String> {
+    /// Front-end command: read this machine's clipboard and push it down an
+    /// active outbound clipboard route — called the instant the console
+    /// forwards a paste, so the far side pastes *our* content. Text rides one
+    /// frame; an image or files ride a chunked transfer (the same shape the
+    /// video/term/file planes use). This machine must be the route's source
+    /// side; the far end gates the write the same way it gates input
+    /// injection. The bytes are read here (the only place that can see file
+    /// references on the OS clipboard).
+    pub async fn clipboard_paste(self: &Arc<Self>, route_id: String) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let peer = {
             let st = self.state.lock();
@@ -3398,19 +3412,125 @@ impl Mesh {
             }
             r.peer.to_string()
         };
+        // Read the OS clipboard off its dedicated thread (a blocking call).
+        let svc = self.clipboard.clone();
+        let clip = tokio::task::spawn_blocking(move || svc.read())
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(clip) = clip else {
+            return Ok(()); // empty / unreadable clipboard — nothing to paste
+        };
+        match clip {
+            LocalClip::Text(text) => {
+                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Text { text })
+                    .await
+            }
+            LocalClip::Image(png) => {
+                let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
+                let items = vec![ClipboardItem {
+                    name: "image.png".into(),
+                    size: png.len() as u64,
+                }];
+                self.send_clip_frame(
+                    &peer,
+                    &route_id,
+                    ClipboardEvent::Open {
+                        transfer,
+                        content: ClipboardContentKind::Image,
+                        items,
+                    },
+                )
+                .await?;
+                for piece in png.chunks(CLIPBOARD_CHUNK_BYTES) {
+                    self.send_clip_frame(
+                        &peer,
+                        &route_id,
+                        ClipboardEvent::Chunk {
+                            transfer,
+                            item: 0,
+                            data: piece.to_vec(),
+                        },
+                    )
+                    .await?;
+                }
+                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Close { transfer })
+                    .await
+            }
+            LocalClip::Files(files) => {
+                let total: u64 = files.iter().map(|f| f.size).sum();
+                if total > MAX_CLIPBOARD_BYTES {
+                    return Err(format!(
+                        "clipboard files are too large to paste across ({total} bytes)"
+                    ));
+                }
+                let transfer = self.clipboard_transfer.fetch_add(1, Ordering::Relaxed);
+                let items = files
+                    .iter()
+                    .map(|f| ClipboardItem {
+                        name: f.name.clone(),
+                        size: f.size,
+                    })
+                    .collect();
+                self.send_clip_frame(
+                    &peer,
+                    &route_id,
+                    ClipboardEvent::Open {
+                        transfer,
+                        content: ClipboardContentKind::Files,
+                        items,
+                    },
+                )
+                .await?;
+                for (i, f) in files.iter().enumerate() {
+                    // Stream each file from disk in channel-sized pieces, so a
+                    // big paste never loads the whole file into memory.
+                    let mut file = std::fs::File::open(&f.path).map_err(|e| e.to_string())?;
+                    let mut buf = vec![0u8; CLIPBOARD_CHUNK_BYTES];
+                    loop {
+                        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+                        if n == 0 {
+                            break;
+                        }
+                        self.send_clip_frame(
+                            &peer,
+                            &route_id,
+                            ClipboardEvent::Chunk {
+                                transfer,
+                                item: i as u32,
+                                data: buf[..n].to_vec(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Close { transfer })
+                    .await
+            }
+        }
+    }
+
+    /// Send one clipboard frame to `peer` on `route_id`, fire-and-forget over
+    /// the media channel (the same path control input rides).
+    async fn send_clip_frame(
+        &self,
+        peer: &str,
+        route_id: &str,
+        event: ClipboardEvent,
+    ) -> Result<(), String> {
         let seq = self.clipboard_seq.fetch_add(1, Ordering::Relaxed);
         let frame = ClipboardFrame::new(route_id, seq, event);
         let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
-        self.send_media_value(&peer, payload).await
+        self.send_media_value(peer, payload).await
     }
 
-    /// Sink side: a peer pasted into this machine, so write their clipboard
-    /// content to the local OS clipboard. Gated exactly like input injection
-    /// — a live clipboard route that sinks here from this sender, *and* the
-    /// sender being this device's owner or a co-owned fleet member — since
-    /// writing the clipboard is part of driving the machine. The paste
-    /// keystroke rides the control route right behind this on the same
-    /// ordered channel, so by the time it injects, the clipboard is set.
+    /// Sink side: a peer pasted into this machine, so reassemble and write
+    /// their clipboard content to the local OS clipboard. Gated exactly like
+    /// input injection — a live clipboard route that sinks here from this
+    /// sender, *and* the sender being this device's owner or a co-owned fleet
+    /// member — since writing the clipboard is part of driving the machine.
+    /// Text is one frame; an image or files arrive as a chunked transfer that
+    /// commits on `Close`. The paste keystroke rides right behind the `Close`
+    /// on the same ordered channel, so the clipboard is set before it injects.
     fn handle_clipboard_frame(&self, from: &str, frame: ClipboardFrame) {
         if !(self.inbound_media_ok(&frame.route, from, MediaKind::Clipboard)
             && self.sender_may_control(from))
@@ -3418,24 +3538,82 @@ impl Mesh {
             tracing::warn!("dropped clipboard from {from}: not an authorized controller");
             return;
         }
+        let route = frame.route;
         match frame.event {
-            ClipboardEvent::Text { text } => {
-                if let Err(e) = self.app.clipboard().write_text(text) {
-                    tracing::warn!("clipboard write failed: {e}");
+            ClipboardEvent::Text { text } => self.clipboard.set_text(text),
+            ClipboardEvent::Open {
+                transfer,
+                content,
+                items,
+            } => {
+                let total: u64 = items.iter().map(|i| i.size).sum();
+                if total > MAX_CLIPBOARD_BYTES {
+                    tracing::warn!("clipboard transfer too large ({total} bytes) — refused");
+                    return;
+                }
+                if content == ClipboardContentKind::Files {
+                    let dir = crate::clipboard::staging_dir(transfer);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!("clipboard staging dir failed: {e}");
+                        return;
+                    }
+                }
+                self.clip_inbound
+                    .lock()
+                    .insert((route, transfer), ClipInbound::new(content, items));
+            }
+            ClipboardEvent::Chunk {
+                transfer,
+                item,
+                data,
+            } => {
+                let key = (route, transfer);
+                let mut inbound = self.clip_inbound.lock();
+                let Some(t) = inbound.get_mut(&key) else {
+                    return; // unknown / already-dropped transfer
+                };
+                t.received += data.len() as u64;
+                let over = t.received > MAX_CLIPBOARD_BYTES;
+                if !over {
+                    match t.content {
+                        ClipboardContentKind::Image => t.image.extend_from_slice(&data),
+                        ClipboardContentKind::Files => {
+                            if let Some(name) = t.items.get(item as usize).map(|i| i.name.clone()) {
+                                let first = !t.started[item as usize];
+                                t.started[item as usize] = true;
+                                let path =
+                                    crate::clipboard::staging_dir(transfer).join(safe_name(&name));
+                                if let Err(e) = append_chunk(&path, &data, first) {
+                                    tracing::warn!("clipboard stage write failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                // `t`'s borrow ends above; only now can the map be mutated.
+                if over {
+                    inbound.remove(&key);
+                    tracing::warn!("clipboard transfer exceeded cap — dropped");
                 }
             }
-            // Images and files are the planned cross-machine copy/paste:
-            // accepted on the wire today, written once the platform paths
-            // land. Logged, never an error, so a forward-looking sender
-            // never trips the receiver.
-            ClipboardEvent::Image { mime, data } => {
-                tracing::info!(
-                    "clipboard image ({mime}, {} bytes) — not yet written",
-                    data.len()
-                );
-            }
-            ClipboardEvent::Files { names } => {
-                tracing::info!("clipboard files {names:?} — not yet written");
+            ClipboardEvent::Close { transfer } => {
+                let entry = self.clip_inbound.lock().remove(&(route, transfer));
+                let Some(t) = entry else {
+                    return;
+                };
+                match t.content {
+                    ClipboardContentKind::Image => self.clipboard.set_image(t.image),
+                    ClipboardContentKind::Files => {
+                        let dir = crate::clipboard::staging_dir(transfer);
+                        let paths = t
+                            .items
+                            .iter()
+                            .map(|i| dir.join(safe_name(&i.name)).to_string_lossy().into_owned())
+                            .collect();
+                        self.clipboard.set_files(paths);
+                    }
+                }
             }
         }
     }
@@ -3779,6 +3957,61 @@ fn key_tail(key: &str) -> &str {
     } else {
         key
     }
+}
+
+/// Most bytes a single clipboard paste may move across — a guard against a
+/// pathological "copy a huge folder, paste over the mesh". Generous for real
+/// copy/paste (documents, images, a handful of files).
+const MAX_CLIPBOARD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// An inbound clipboard transfer being reassembled (see
+/// [`Mesh::handle_clipboard_frame`]).
+struct ClipInbound {
+    content: ClipboardContentKind,
+    items: Vec<ClipboardItem>,
+    /// Per-item: whether its staging file exists yet — so the first chunk
+    /// truncates and the rest append.
+    started: Vec<bool>,
+    /// Accumulated bytes for an image transfer (files stream to disk).
+    image: Vec<u8>,
+    /// Running total, enforced against [`MAX_CLIPBOARD_BYTES`].
+    received: u64,
+}
+
+impl ClipInbound {
+    fn new(content: ClipboardContentKind, items: Vec<ClipboardItem>) -> Self {
+        let n = items.len();
+        ClipInbound {
+            content,
+            items,
+            started: vec![false; n],
+            image: Vec::new(),
+            received: 0,
+        }
+    }
+}
+
+/// Keep only a path's final component, so a crafted item name can't write
+/// outside the staging dir.
+fn safe_name(name: &str) -> String {
+    Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into())
+}
+
+/// Append one staging-file piece — the first chunk creates+truncates, the
+/// rest append.
+fn append_chunk(path: &Path, data: &[u8], first: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if first {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(path)?.write_all(data)
 }
 
 fn parse_media(s: &str) -> MediaKind {

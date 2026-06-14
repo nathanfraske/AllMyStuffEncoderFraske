@@ -26,6 +26,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
+# Cross-platform *rich* clipboard — text, image, and crucially file lists
+# (CF_HDROP on Windows, file URLs on macOS, text/uri-list on Linux), which
+# the clipboard-manager plugin can't read or write. This is the OS-clipboard
+# side of cross-machine copy/paste; the bytes still move over the files
+# plane / media channel.
+clipboard-rs = "0.2"
 
 # Async runtime — control-socket client + Tauri commands. "process"
 # backs the daemon self-update the spawner runs when the installed
