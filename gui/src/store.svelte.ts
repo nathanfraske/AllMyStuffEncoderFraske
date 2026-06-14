@@ -3573,6 +3573,44 @@ class AppStore {
     }
   }
 
+  /** Restart the live network(s) — leave and immediately re-join from the
+   *  parked config, tearing down each transport and reconnecting without
+   *  touching settings. The top bar's refresh control: a clean reconnect for
+   *  when a network goes quiet (stuck handshaking, peers fallen silent). It
+   *  acts on every currently-joined network, since the control is global. */
+  async restartNetwork() {
+    if (!this.backendConnected) {
+      this.toast("info", "Nothing live to restart — connect to a network first");
+      return;
+    }
+    const joined = (Array.isArray(this.networks) ? this.networks : []).slice();
+    if (joined.length === 0) {
+      this.toast("warn", "No live network to restart");
+      return;
+    }
+    const many = joined.length > 1;
+    this.toast("info", many ? "Restarting networks — reconnecting…" : "Restarting the network — reconnecting…");
+    let failed = 0;
+    for (const n of joined) {
+      // `config_id` is the stable local key the off→on round-trip parks and
+      // takes the config back under; fall back to the wire id just in case.
+      const key = n.config_id || n.network_id;
+      try {
+        await setNetworkEnabled(key, false);
+        await setNetworkEnabled(key, true);
+      } catch (e) {
+        failed++;
+        this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
+      }
+    }
+    // Re-sync regardless of partial failure so the pills/graph match reality
+    // (a failed re-join leaves that network parked, recoverable from the menu).
+    await this.refreshNetworks();
+    await this.loadDisabledNetworks();
+    await this.syncMeshGraph();
+    if (failed === 0) this.toast("ok", many ? "Networks restarted" : "Network restarted");
+  }
+
   /** Demo/web twin of the toggle: move the network between the live and
    *  parked lists, and quiet the devices that were only reachable on it. */
   private demoToggleNetwork(key: string, on: boolean) {

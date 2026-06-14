@@ -164,7 +164,11 @@
           {app.claimables.length === 1 ? "device to claim" : "devices to claim"}
         </button>
       {/if}
-      <button class="btn" onclick={() => app.hydrateFromBackend()} title="Scan this machine">↻ Scan</button>
+      <!-- The refresh control: reconnect the live network(s) — leave and
+           re-join from the parked config, a clean transport restart for when
+           a network goes quiet. (Scanning *this* machine's hardware now lives
+           in its device drawer, above "Its stuff".) -->
+      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart network — reconnect" aria-label="Restart network">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
         {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
@@ -389,6 +393,12 @@
     100% {
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0);
     }
+  }
+  /* Icon-only refresh — same tighter footprint as the gear so the two
+     trailing controls read as a pair. */
+  .refresh {
+    font-size: 1rem;
+    padding: 0.5rem 0.7rem;
   }
   .gear {
     position: relative;
