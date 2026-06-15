@@ -205,6 +205,24 @@ pub fn render(inv: &Inventory) -> String {
         }
     }
 
+    // Listening services — the "sites" peers can reach through the proxy.
+    if !inv.listening.is_empty() {
+        section(&mut s, "Sites");
+        for svc in &inv.listening {
+            let scope = if svc.loopback { " · local-only" } else { "" };
+            let proc = if svc.process.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", svc.process)
+            };
+            item(
+                &mut s,
+                "port",
+                &format!(":{} — {}{scope}{proc}", svc.port, svc.name),
+            );
+        }
+    }
+
     s
 }
 
@@ -357,6 +375,7 @@ mod tests {
             cameras: vec![],
             inputs: vec![],
             usb: vec![],
+            listening: vec![],
         };
         let out = render(&inv);
         assert!(out.contains("demo-box"));

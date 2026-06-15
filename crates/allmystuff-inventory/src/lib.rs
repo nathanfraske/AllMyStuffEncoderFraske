@@ -40,6 +40,13 @@ mod dedupe;
 mod sys;
 mod types;
 
+// Listening-service discovery (the "sites" source): pure port/banner
+// classification + a `/proc/net/tcp` parser, plus an opt-in active probe.
+// Public so the pure helpers are reachable (and never read as dead code on
+// platforms whose `collect_listening` is a scaffold) — the same shape as
+// `report`.
+pub mod listening;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -80,6 +87,11 @@ pub fn scan() -> Inventory {
         cameras: platform_cameras(),
         inputs: platform_inputs(),
         usb: platform_usb(),
+        // Passive only — which ports are in LISTEN, classified by the
+        // well-known-port table. The active banner probe
+        // ([`listening::probe_services`]) is a separate, opt-in step a
+        // caller runs off this hot path, since `scan` must stay cheap.
+        listening: platform_listening(),
     };
     ensure_category_defaults(&mut inv);
     inv
@@ -210,6 +222,7 @@ platform_dispatch!(
 platform_dispatch!(platform_cameras, Vec<Camera>, collect_cameras);
 platform_dispatch!(platform_inputs, Vec<InputDevice>, collect_inputs);
 platform_dispatch!(platform_usb, Vec<UsbDevice>, collect_usb);
+platform_dispatch!(platform_listening, Vec<ListeningService>, collect_listening);
 
 /// Fill in NVIDIA VRAM + model from `nvidia-smi` when it's on PATH.
 /// amdgpu reports VRAM through sysfs already (handled in `linux.rs`);

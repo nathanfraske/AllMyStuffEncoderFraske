@@ -299,6 +299,15 @@ fn parse_usb_id(device_id: &str) -> Option<(String, String)> {
         .then_some((vid, pid))
 }
 
+/// Listening-service discovery isn't implemented on Windows yet (Linux is the
+/// reference; the equivalent here would query `Get-NetTCPConnection -State
+/// Listen` / `netstat -ano`). Scaffolded to an empty list so the Sites plane
+/// shows no sites for a Windows host rather than failing — the same
+/// degrade-to-nothing contract as every other probe.
+pub fn collect_listening() -> Vec<ListeningService> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

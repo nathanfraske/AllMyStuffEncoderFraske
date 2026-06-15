@@ -23,8 +23,8 @@ pub mod control;
 pub use app::{
     ControlMessage, InventorySummary, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
     RoomAccess, RoomEvent, RoomMessage, RouteControl, ShareControl, SharedEntry, SharedFileMeta,
-    APP_ID, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    FEATURE_CAMERA, FEATURE_FILES, FEATURE_MEDIA_LANES, FEATURE_ROOMS, FEATURE_TERMINAL,
-    PROTOCOL_VERSION,
+    SiteAdvert, APP_ID, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
+    CHANNEL_ROOMS, FEATURE_CAMERA, FEATURE_FILES, FEATURE_MEDIA_LANES, FEATURE_ROOMS, FEATURE_SITES,
+    FEATURE_TERMINAL, PROTOCOL_VERSION,
 };
 pub use control::{ClientId, Request, Response, ServerOut};

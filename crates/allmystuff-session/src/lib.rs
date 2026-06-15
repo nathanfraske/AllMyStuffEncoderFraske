@@ -33,8 +33,9 @@ pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
     ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, FileEntry, FileEvent,
-    FileFrame, InputAction, InputEvent, MediaPayload, TermEvent, TermFrame, VideoAssembler,
-    VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
+    FileFrame, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent, TermFrame,
+    VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
+    SITE_CHUNK_BYTES,
 };
 
 /// Which side of a route we are.
@@ -391,6 +392,7 @@ mod tests {
             claimable: false,
             boot: 0,
             features: vec![],
+            sites: vec![],
         }
     }
 

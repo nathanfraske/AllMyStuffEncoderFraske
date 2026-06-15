@@ -817,6 +817,36 @@ fn gpu_vendor_name(v: GpuVendor) -> String {
 }
 
 // =======================================================================
+// listening services: /proc/net/tcp + /proc/net/tcp6 (the "sites" source)
+// =======================================================================
+
+/// Enumerate the TCP ports this machine is listening on, classified by the
+/// well-known-port table. Passive and cheap — no sockets opened, no
+/// `/proc/<pid>` walk — so it's safe on the synchronous presence-build path
+/// (an active banner probe is [`crate::listening::probe_services`], run off
+/// this path). Reads `/proc/net/tcp` (IPv4) + `/proc/net/tcp6` and merges
+/// per port; degrades to an empty list where `/proc/net` isn't readable.
+pub fn collect_listening() -> Vec<ListeningService> {
+    use crate::listening::{dedupe_by_port, parse_proc_net_tcp, service_from_port};
+
+    let mut rows = Vec::new();
+    if let Ok(v4) = fs::read_to_string("/proc/net/tcp") {
+        rows.extend(parse_proc_net_tcp(&v4, false));
+    }
+    if let Ok(v6) = fs::read_to_string("/proc/net/tcp6") {
+        rows.extend(parse_proc_net_tcp(&v6, true));
+    }
+    dedupe_by_port(rows)
+        .into_iter()
+        // `process` is left blank: resolving the owning process means
+        // walking every `/proc/<pid>/fd`, too heavy for this hot path and
+        // not carried on the wire (peers never see it). The field stays for
+        // a future, opt-in local enrichment.
+        .map(|r| service_from_port(r.port, r.loopback, String::new()))
+        .collect()
+}
+
+// =======================================================================
 // network: enrich sysinfo with /sys/class/net link type + speed
 // =======================================================================
 

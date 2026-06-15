@@ -278,6 +278,15 @@ fn clean_hex_id(s: &str) -> String {
     format!("{:0>4}", t.to_lowercase())
 }
 
+/// Listening-service discovery isn't implemented on macOS yet (Linux is the
+/// reference; the equivalent here would parse `lsof -nP -iTCP -sTCP:LISTEN`).
+/// Scaffolded to an empty list so the Sites plane simply shows no sites for
+/// a Mac host rather than failing — the same degrade-to-nothing contract as
+/// every other probe.
+pub fn collect_listening() -> Vec<ListeningService> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

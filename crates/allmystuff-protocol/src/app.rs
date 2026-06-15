@@ -68,6 +68,14 @@ pub const FEATURE_FILES: &str = "files";
 pub const FEATURE_ROOMS: &str = "rooms";
 
 /// Feature tag a node advertises in [`NodeProfile::features`] when it can
+/// host **sites** — reverse-proxy a TCP service it's listening on (a local
+/// web app, a database) over the mesh to a peer, who reaches it through a
+/// locally-mapped port. The advertised [`NodeProfile::sites`] are the *only*
+/// ports such a host will proxy; a peer only offers a site route to a node
+/// that advertises this tag, and an older build never sees the plane.
+pub const FEATURE_SITES: &str = "sites";
+
+/// Feature tag a node advertises in [`NodeProfile::features`] when it can
 /// *stream* its cameras (a capture backend feeds its video routes). The
 /// cameras themselves have always ridden presence as capabilities; this
 /// says selecting one will actually produce pixels — a console pointed at
@@ -147,6 +155,51 @@ pub struct NodeProfile {
     /// feature is only ever offered to a peer that advertises it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// The **sites** this node exposes — TCP services it's willing to
+    /// reverse-proxy over the mesh (see [`SiteAdvert`]). The owner curates
+    /// this; it's the exhaustive set a peer may ask the host to proxy, so a
+    /// connection to anything *not* listed is refused (the advert is the
+    /// allow-list, not just a hint). Additive: absent (an older peer)
+    /// decodes as empty, and empty serializes *without* the key, so the
+    /// presence shape an older receiver sees is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<SiteAdvert>,
+}
+
+/// One site a node exposes — a TCP service it's listening on that it's
+/// willing to reverse-proxy over the mesh. Rides the presence advert
+/// ([`NodeProfile::sites`]); the bytes themselves never touch presence (a
+/// connection is a route, tunneled on the media channel). The set is the
+/// host's allow-list: it only proxies a port that appears here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteAdvert {
+    /// Stable id, mirroring the scan's `ListeningService.id` (`tcp:8080`),
+    /// so a mapped site keeps its identity across rescans and restarts.
+    pub id: String,
+    /// Friendly label — "HTTP", "PostgreSQL", or "Port 8080".
+    pub label: String,
+    /// The TCP port the host is listening on (and will proxy to on
+    /// loopback). The host re-checks an inbound request's port against this
+    /// set before connecting, so a peer can't pivot to an unadvertised port.
+    pub port: u16,
+    /// URL scheme a client reaches it with — "http", "https", "ssh", … — or
+    /// empty for a bare TCP service the proxy still tunnels. A web scheme
+    /// (`http`/`https`) is what lets the UI offer "open in browser".
+    #[serde(default)]
+    pub scheme: String,
+    /// `true` when the host bound it to loopback only — the prime
+    /// reverse-proxy case (not reachable on its LAN, but the mesh carries
+    /// it). Cosmetic; the proxy works the same either way.
+    #[serde(default)]
+    pub loopback: bool,
+}
+
+impl SiteAdvert {
+    /// `true` for a web service the UI can "open in browser" — its scheme is
+    /// `http` or `https`.
+    pub fn is_web(&self) -> bool {
+        self.scheme == "http" || self.scheme == "https"
+    }
 }
 
 /// One device in an owned fleet — a machine the same owner has claimed, so
@@ -469,10 +522,61 @@ mod tests {
             claimable: false,
             boot: 7,
             features: vec![FEATURE_TERMINAL.into()],
+            sites: vec![SiteAdvert {
+                id: "tcp:8080".into(),
+                label: "HTTP".into(),
+                port: 8080,
+                scheme: "http".into(),
+                loopback: true,
+            }],
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn presence_sites_accept_skew_both_ways() {
+        // An older peer's advert has no `sites` — it decodes as empty
+        // rather than failing (the node never vanishes from the graph).
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert!(p.sites.is_empty());
+
+        // No sites serializes *without* the key, so an older receiver sees
+        // exactly the presence shape it always did.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("sites"));
+
+        // A populated list round-trips, and `is_web` keys on the scheme.
+        let p = NodeProfile {
+            sites: vec![
+                SiteAdvert {
+                    id: "tcp:5432".into(),
+                    label: "PostgreSQL".into(),
+                    port: 5432,
+                    scheme: "postgres".into(),
+                    loopback: true,
+                },
+                SiteAdvert {
+                    id: "tcp:443".into(),
+                    label: "HTTPS".into(),
+                    port: 443,
+                    scheme: "https".into(),
+                    loopback: false,
+                },
+            ],
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"sites\""));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.sites, p.sites);
+        assert!(!back.sites[0].is_web(), "postgres isn't web");
+        assert!(back.sites[1].is_web(), "https is web");
     }
 
     #[test]
