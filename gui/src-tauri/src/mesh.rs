@@ -689,9 +689,7 @@ impl Mesh {
     async fn restamp_profile(self: &Arc<Self>) {
         let sites = {
             let inv = allmystuff_inventory::scan();
-            let exposed: std::collections::BTreeSet<String> =
-                self.sites.exposed_ids().into_iter().collect();
-            allmystuff_bridge::sites::sites_from_inventory(&inv, &exposed)
+            allmystuff_bridge::sites::sites_from_inventory(&inv, &self.sites.exposed_map())
         };
         {
             let mut st = self.state.lock();
@@ -776,12 +774,9 @@ impl Mesh {
             },
             // Only the services the owner opted to expose (the exposed set is
             // the host's allow-list); a scan that found a dozen listeners
-            // advertises only those. Empty until the user exposes one.
-            sites: {
-                let exposed: std::collections::BTreeSet<String> =
-                    self.sites.exposed_ids().into_iter().collect();
-                allmystuff_bridge::sites::sites_from_inventory(&inv, &exposed)
-            },
+            // advertises only those, each under its chosen name. Empty until
+            // the user exposes one.
+            sites: allmystuff_bridge::sites::sites_from_inventory(&inv, &self.sites.exposed_map()),
         }
     }
 
@@ -3109,18 +3104,22 @@ impl Mesh {
         listening
     }
 
-    /// The ids of the services this machine currently advertises.
-    pub fn site_exposed(&self) -> Vec<String> {
-        self.sites.exposed_ids()
+    /// The services this machine currently advertises, as id → display name.
+    pub fn site_exposed(&self) -> std::collections::BTreeMap<String, String> {
+        self.sites.exposed_map()
     }
 
-    /// Set the exposed set and re-stamp presence so peers see the change.
-    pub async fn site_set_exposed(self: &Arc<Self>, ids: Vec<String>) -> Vec<String> {
-        let set = self.sites.set_exposed(ids);
+    /// Set the exposed set (id → display name) and re-stamp presence so peers
+    /// see the change.
+    pub async fn site_set_exposed(
+        self: &Arc<Self>,
+        exposed: std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let map = self.sites.set_exposed(exposed);
         // Rebuild + re-advertise this node's profile (its `sites` follow the
         // exposed set). Re-broadcast so peers' Sites tabs update promptly.
         self.restamp_profile().await;
-        set
+        map
     }
 
     /// Every site this device currently has mapped: `(node, host_port,

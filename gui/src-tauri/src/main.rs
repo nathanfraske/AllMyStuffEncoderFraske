@@ -366,20 +366,21 @@ async fn site_scan(
         .map_err(|e| e.to_string())
 }
 
-/// The ids of the services this machine currently advertises (exposes).
+/// The services this machine currently advertises, as id → display name
+/// (empty name = the classified default).
 #[tauri::command]
-fn site_exposed(mesh: State<'_, Arc<Mesh>>) -> Vec<String> {
+fn site_exposed(mesh: State<'_, Arc<Mesh>>) -> std::collections::BTreeMap<String, String> {
     mesh.site_exposed()
 }
 
-/// Set which listening services this machine advertises. Re-broadcasts
-/// presence so peers' Sites tabs update; returns the new exposed set.
+/// Set which listening services this machine advertises (id → display name).
+/// Re-broadcasts presence so peers' Sites tabs update; returns the new set.
 #[tauri::command]
 async fn site_set_exposed(
     mesh: State<'_, Arc<Mesh>>,
-    ids: Vec<String>,
-) -> Result<Vec<String>, String> {
-    Ok(mesh.inner().site_set_exposed(ids).await)
+    exposed: std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    Ok(mesh.inner().site_set_exposed(exposed).await)
 }
 
 /// Map a peer's site to a local port — set up the reverse-proxy route and

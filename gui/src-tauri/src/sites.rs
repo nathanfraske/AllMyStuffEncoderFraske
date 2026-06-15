@@ -29,7 +29,7 @@
 //! protocol…) keeps flowing both ways for its whole life, exactly as it
 //! would direct. The proxy never interprets the stream; it just carries it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -74,19 +74,21 @@ pub struct ClientMapping {
     accept_handle: JoinHandle<()>,
 }
 
-/// Persisted shape: just the exposed-service ids. Additive + `#[serde(default)]`
-/// so an older file (or none) loads as "nothing exposed".
+/// Persisted shape: the exposed services as id → display name (empty name =
+/// use the scan's classified default). Additive + `#[serde(default)]` so an
+/// older file (or none) loads as "nothing exposed".
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Persisted {
     #[serde(default)]
-    exposed: Vec<String>,
+    exposed: BTreeMap<String, String>,
 }
 
 pub struct SitesProxy {
-    /// The listening-service ids (`tcp:8080`) this machine advertises — the
-    /// opt-in exposed set, persisted. Empty by default: nothing is shared
-    /// until the owner says so.
-    exposed: Mutex<BTreeSet<String>>,
+    /// The services this machine advertises — the opt-in exposed set, mapping
+    /// each listening-service id (`tcp:8080`) to the display name to
+    /// advertise it under (empty = the classified default). Persisted; empty
+    /// by default, so nothing is shared until the owner says so.
+    exposed: Mutex<BTreeMap<String, String>>,
     path: Option<PathBuf>,
     /// Every live tunneled connection, keyed by `(route_id, conn)`. Both
     /// host and client sides register here.
@@ -109,7 +111,7 @@ impl SitesProxy {
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
-            .map(|p| p.exposed.into_iter().collect())
+            .map(|p| p.exposed)
             .unwrap_or_default();
         SitesProxy {
             exposed: Mutex::new(exposed),
@@ -121,27 +123,26 @@ impl SitesProxy {
 
     // ---- exposure (the host's allow-list) -----------------------------
 
-    /// The exposed-service ids, sorted (stable for the UI).
-    pub fn exposed_ids(&self) -> Vec<String> {
-        self.exposed.lock().iter().cloned().collect()
+    /// The exposed services as id → display name (the value is empty for one
+    /// advertised under its classified default). Drives presence and the UI.
+    pub fn exposed_map(&self) -> BTreeMap<String, String> {
+        self.exposed.lock().clone()
     }
 
-    /// Replace the exposed set and persist it. Returns the new set.
-    pub fn set_exposed(&self, ids: Vec<String>) -> Vec<String> {
-        let set: BTreeSet<String> = ids.into_iter().collect();
-        {
-            let mut e = self.exposed.lock();
-            *e = set.clone();
-            persist(&self.path, &e);
-        }
-        set.into_iter().collect()
+    /// Replace the exposed set (id → name) and persist it. Returns the new
+    /// map.
+    pub fn set_exposed(&self, map: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut e = self.exposed.lock();
+        *e = map;
+        persist(&self.path, &e);
+        e.clone()
     }
 
     /// Is `port` one this machine currently advertises? The host gate: the
     /// exposed id encodes the port (`tcp:<port>`), so this needs no scan —
     /// the client's claimed port is checked against *our own* exposed set.
     pub fn is_port_exposed(&self, port: u16) -> bool {
-        self.exposed.lock().contains(&format!("tcp:{port}"))
+        self.exposed.lock().contains_key(&format!("tcp:{port}"))
     }
 
     // ---- connection table ---------------------------------------------
@@ -269,13 +270,13 @@ impl ClientMapping {
     }
 }
 
-fn persist(path: &Option<PathBuf>, exposed: &BTreeSet<String>) -> bool {
+fn persist(path: &Option<PathBuf>, exposed: &BTreeMap<String, String>) -> bool {
     let Some(path) = path else { return true };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let persisted = Persisted {
-        exposed: exposed.iter().cloned().collect(),
+        exposed: exposed.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
         Ok(json) => std::fs::write(path, json).is_ok(),
@@ -299,16 +300,19 @@ mod tests {
     #[test]
     fn exposed_set_round_trips_and_gates_ports() {
         let proxy = SitesProxy {
-            exposed: Mutex::new(BTreeSet::new()),
+            exposed: Mutex::new(BTreeMap::new()),
             path: None, // no disk in the test
             conns: Mutex::new(HashMap::new()),
             mappings: Mutex::new(HashMap::new()),
         };
-        assert!(proxy.exposed_ids().is_empty());
+        assert!(proxy.exposed_map().is_empty());
         assert!(!proxy.is_port_exposed(8080));
 
-        let set = proxy.set_exposed(vec!["tcp:8080".into(), "tcp:5432".into()]);
-        assert_eq!(set, vec!["tcp:5432".to_string(), "tcp:8080".to_string()]);
+        let map = proxy.set_exposed(BTreeMap::from([
+            ("tcp:8080".to_string(), "My App".to_string()),
+            ("tcp:5432".to_string(), String::new()),
+        ]));
+        assert_eq!(map.get("tcp:8080").map(String::as_str), Some("My App"));
         // The gate keys on the port encoded in the exposed id — no scan.
         assert!(proxy.is_port_exposed(8080));
         assert!(proxy.is_port_exposed(5432));

@@ -867,18 +867,22 @@ export async function siteScan(): Promise<ListeningService[]> {
   return Array.isArray(r) ? r : [];
 }
 
-/** The ids of the listening services this machine currently *advertises*
- *  (exposes to the mesh). Persisted backend-side and reflected in presence. */
-export async function siteExposed(): Promise<string[]> {
-  const r = await tryInvoke<string[]>("site_exposed");
-  return Array.isArray(r) ? r : [];
+/** The services this machine currently *advertises* (exposes to the mesh),
+ *  as id → display name (empty = the classified default). Persisted
+ *  backend-side and reflected in presence. */
+export async function siteExposed(): Promise<Record<string, string>> {
+  const r = await tryInvoke<Record<string, string>>("site_exposed");
+  return r && typeof r === "object" ? r : {};
 }
 
-/** Set which listening services this machine advertises. Returns the new
- *  exposed set (the backend re-broadcasts presence so peers see the change). */
-export async function siteSetExposed(ids: string[]): Promise<string[]> {
-  const r = await tryInvoke<string[]>("site_set_exposed", { ids });
-  return Array.isArray(r) ? r : ids;
+/** Set which listening services this machine advertises (id → display name).
+ *  Returns the new exposed map (the backend re-broadcasts presence so peers
+ *  see the change). */
+export async function siteSetExposed(
+  exposed: Record<string, string>,
+): Promise<Record<string, string>> {
+  const r = await tryInvoke<Record<string, string>>("site_set_exposed", { exposed });
+  return r && typeof r === "object" ? r : exposed;
 }
 
 /** A live local mapping of a remote site: the host port and the local port

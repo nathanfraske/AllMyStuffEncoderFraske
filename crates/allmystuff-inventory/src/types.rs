@@ -378,6 +378,12 @@ pub struct ListeningService {
     /// permissions) — never load-bearing.
     #[serde(default)]
     pub process: String,
+    /// The HTML `<title>` of the page served here, when the active probe
+    /// could fetch one (an `http` site — `https` needs TLS the probe
+    /// doesn't carry). The UI offers it as the default name when exposing
+    /// the site, so "My Grafana" beats "Port 3000". Empty when there's none.
+    #[serde(default)]
+    pub title: String,
 }
 
 /// What a listening port is speaking — a best-effort classification, never

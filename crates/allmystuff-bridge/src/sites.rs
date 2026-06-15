@@ -8,26 +8,38 @@
 //! allow-list — the proxy refuses to dial any port that isn't on it, so a
 //! peer can never pivot to an unadvertised local service.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use allmystuff_inventory::Inventory;
 use allmystuff_protocol::SiteAdvert;
 
 /// Build the [`SiteAdvert`]s a node should publish, given its scan and the
-/// set of listening-service ids (`tcp:8080`) the owner chose to expose.
-/// Opt-in by construction: a discovered service not in `exposed` is simply
-/// omitted, so a freshly-started dev server never auto-broadcasts and the
-/// presence advert only changes when the owner changes their selection.
-pub fn sites_from_inventory(inv: &Inventory, exposed: &BTreeSet<String>) -> Vec<SiteAdvert> {
+/// owner's exposed selection: a map of listening-service id (`tcp:8080`) →
+/// the display name to advertise it under. Opt-in by construction — a
+/// discovered service not in `exposed` is omitted — so a freshly-started dev
+/// server never auto-broadcasts. The name a remote shows is the map's value
+/// when non-empty (the owner's custom name, which propagates as the advert's
+/// `label`), else the scan's classified name.
+pub fn sites_from_inventory(
+    inv: &Inventory,
+    exposed: &BTreeMap<String, String>,
+) -> Vec<SiteAdvert> {
     inv.listening
         .iter()
-        .filter(|svc| exposed.contains(&svc.id))
-        .map(|svc| SiteAdvert {
-            id: svc.id.clone(),
-            label: svc.name.clone(),
-            port: svc.port,
-            scheme: svc.scheme.clone(),
-            loopback: svc.loopback,
+        .filter_map(|svc| {
+            let name = exposed.get(&svc.id)?;
+            let label = if name.trim().is_empty() {
+                svc.name.clone()
+            } else {
+                name.clone()
+            };
+            Some(SiteAdvert {
+                id: svc.id.clone(),
+                label,
+                port: svc.port,
+                scheme: svc.scheme.clone(),
+                loopback: svc.loopback,
+            })
         })
         .collect()
 }
@@ -76,7 +88,15 @@ mod tests {
             scheme: kind.scheme().into(),
             loopback,
             process: String::new(),
+            title: String::new(),
         }
+    }
+
+    fn exposed(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect()
     }
 
     fn inv_with(listening: Vec<ListeningService>) -> Inventory {
@@ -92,9 +112,9 @@ mod tests {
             svc("tcp:5432", 5432, ServiceKind::Postgres, true),
             svc("tcp:22", 22, ServiceKind::Ssh, false),
         ]);
-        // Only the web app is exposed; the database and SSH stay private.
-        let exposed: BTreeSet<String> = ["tcp:8080".to_string()].into_iter().collect();
-        let adverts = sites_from_inventory(&inv, &exposed);
+        // Only the web app is exposed (no custom name → classified default);
+        // the database and SSH stay private.
+        let adverts = sites_from_inventory(&inv, &exposed(&[("tcp:8080", "")]));
         assert_eq!(adverts.len(), 1);
         assert_eq!(adverts[0].port, 8080);
         assert_eq!(adverts[0].label, "HTTP");
@@ -103,7 +123,19 @@ mod tests {
         assert!(adverts[0].is_web());
 
         // Nothing opted in → nothing advertised (the default).
-        assert!(sites_from_inventory(&inv, &BTreeSet::new()).is_empty());
+        assert!(sites_from_inventory(&inv, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn custom_name_becomes_the_advertised_label() {
+        let inv = inv_with(vec![svc("tcp:3000", 3000, ServiceKind::Http, true)]);
+        // A custom name (e.g. from the page <title>) rides as the advert's
+        // label, so a remote's Sites list reads "My Grafana", not "HTTP".
+        let adverts = sites_from_inventory(&inv, &exposed(&[("tcp:3000", "My Grafana")]));
+        assert_eq!(adverts[0].label, "My Grafana");
+        // A blank name falls back to the classified default.
+        let adverts = sites_from_inventory(&inv, &exposed(&[("tcp:3000", "   ")]));
+        assert_eq!(adverts[0].label, "HTTP");
     }
 
     #[test]

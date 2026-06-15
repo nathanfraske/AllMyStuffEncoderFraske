@@ -158,6 +158,9 @@ export interface ListeningService {
   scheme: string;
   loopback: boolean;
   process: string;
+  /** The page `<title>` the probe fetched (http sites), offered as the
+   *  default name when exposing. Empty when there was none. */
+  title: string;
 }
 
 /** A site this machine has mapped to a local port — the live reverse-proxy

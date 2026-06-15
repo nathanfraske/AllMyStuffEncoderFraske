@@ -234,6 +234,7 @@ pub fn service_from_port(port: u16, loopback: bool, process: String) -> Listenin
         scheme: kind.scheme().to_string(),
         loopback,
         process,
+        title: String::new(),
     }
 }
 
@@ -326,6 +327,15 @@ pub fn probe_services(services: &mut [ListeningService], timeout: Duration) {
             svc.name = service_name(kind, svc.port);
             svc.scheme = kind.scheme().to_string();
         }
+        // For a web site, fetch its page `<title>` — a far better default
+        // name than "Port 3000" when the owner exposes it. Plain HTTP only
+        // (the probe carries no TLS), so an `https` site keeps its scheme
+        // name and the owner types one; the title is purely a suggestion.
+        if svc.kind == ServiceKind::Http {
+            if let Some(title) = probe_http_title(svc.port, timeout) {
+                svc.title = title;
+            }
+        }
     }
 }
 
@@ -354,6 +364,69 @@ fn probe_port(port: u16, timeout: Duration) -> Option<ServiceKind> {
         .ok()?;
     let n = stream.read(&mut buf).ok()?;
     classify_banner(&buf[..n])
+}
+
+/// Maximum bytes read while hunting for a web page's `<title>` — enough for
+/// the headers + a normal `<head>`, capped so a streaming/huge response
+/// can't run the probe long.
+const TITLE_READ_CAP: usize = 32 * 1024;
+
+/// Fetch `http://127.0.0.1:port/` and return its HTML `<title>`, if any.
+/// Plain HTTP over `std::net` (no TLS, no deps); reads until it has the
+/// `</title>`, hits [`TITLE_READ_CAP`], or the timeout/EOF. `None` on any
+/// failure — it's only ever a default-name suggestion.
+fn probe_http_title(port: u16, timeout: Duration) -> Option<String> {
+    use std::io::Write as _;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut body = Vec::new();
+    let mut buf = [0u8; 4096];
+    while body.len() < TITLE_READ_CAP {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                // The title lives in <head>, near the top — stop as soon as
+                // we've seen the closing tag.
+                if body.windows(8).any(|w| w.eq_ignore_ascii_case(b"</title>")) {
+                    break;
+                }
+            }
+        }
+    }
+    extract_html_title(&String::from_utf8_lossy(&body))
+}
+
+/// Pull the trimmed, whitespace-collapsed text of the first `<title>…</title>`
+/// out of an HTML document (a couple of the common entities decoded, capped
+/// to a sane length). Pure. `None` when there's no non-empty title.
+pub fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    // Skip past the rest of the opening tag (it may carry attributes).
+    let text_start = open + lower[open..].find('>')? + 1;
+    let close_rel = lower[text_start..].find("</title>")?;
+    let raw = &html[text_start..text_start + close_rel];
+
+    let decoded = raw
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'");
+    // Collapse runs of whitespace (titles often wrap across lines).
+    let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(80).collect())
 }
 
 #[cfg(test)]
@@ -512,6 +585,27 @@ postgres  890 casey    7u  IPv4 0x456      0t0  TCP 127.0.0.1:5432 (LISTEN)
             "LocalAddress":"127.0.0.1","LocalPort":"8080","Process":"caddy"
         })];
         assert_eq!(services_from_nettcp_rows(&stringy)[0].port, 8080);
+    }
+
+    #[test]
+    fn extracts_html_title() {
+        assert_eq!(
+            extract_html_title("<html><head><title>My Dev App</title></head>").as_deref(),
+            Some("My Dev App")
+        );
+        // Attributes on the tag, and a title wrapped across lines, collapse.
+        assert_eq!(
+            extract_html_title("<TITLE data-x='1'>\n  Grafana\n  Dashboard\n</TITLE>").as_deref(),
+            Some("Grafana Dashboard")
+        );
+        // A couple of common entities decode.
+        assert_eq!(
+            extract_html_title("<title>Tom &amp; Jerry &#39;24</title>").as_deref(),
+            Some("Tom & Jerry '24")
+        );
+        // No title, or an empty one, yields nothing (caller keeps its default).
+        assert_eq!(extract_html_title("<html><body>hi</body></html>"), None);
+        assert_eq!(extract_html_title("<title>   </title>"), None);
     }
 
     #[test]

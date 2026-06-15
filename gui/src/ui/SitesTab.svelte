@@ -1,66 +1,33 @@
 <script lang="ts">
-  // The Sites tab of the bottom-left sidebar. Two halves:
-  //
-  //  * **This machine** — the TCP services the scan found this box listening
-  //    on, each with an Expose toggle. Exposing one advertises it to the
-  //    mesh so your fleet can reach it through the reverse proxy; nothing is
-  //    exposed by default (a local dev server never auto-broadcasts).
-  //  * **Reachable machines** — your fleet's machines that expose sites,
-  //    grouped per machine. Map one to a local port (direct when free, else
-  //    remapped) and open it: a web site in the browser, a bare TCP service
-  //    by copying its localhost:<port> address for whatever client speaks it.
+  // The Sites tab. Top: the sites your other fleet machines expose, grouped
+  // per machine, each mappable to a local port and then Open (browser) /
+  // Copy (address) / Unmap. Bottom (collapsed by default): "Your ports" —
+  // the services this machine is listening on, each exposable to the fleet
+  // under a name (prefilled from the page <title> when there is one).
   import { app } from "../store.svelte";
-  import { displayName, siteIcon, siteIsWeb, type SiteAdvert } from "../types";
+  import { displayName, siteIcon, type ListeningService, type SiteAdvert } from "../types";
 
-  function portLabel(svc: { port: number }): string {
-    return `:${svc.port}`;
+  // Whether the "Your ports" section is expanded — collapsed at first so the
+  // fleet's sites lead.
+  let portsOpen = $state(false);
+
+  // Per-row name drafts for the expose inputs, so typing a name doesn't
+  // re-render away. Falls back to the advertised name, then the probed
+  // default (page title) / classified name.
+  let names = $state<Record<string, string>>({});
+  function nameFor(svc: ListeningService): string {
+    return names[svc.id] ?? (app.exposeName(svc.id) || app.defaultSiteName(svc));
   }
 </script>
 
 <div class="sites">
-  <!-- This machine's services, with expose toggles. -->
-  <section class="block">
-    <h5 class="block-head">This machine</h5>
-    {#if app.myListening.length === 0}
-      <p class="hint faint">
-        No listening services found{app.backendConnected ? "" : " (demo)"} — start a local
-        server and it'll appear here to expose.
-      </p>
-    {:else}
-      <ul class="list">
-        {#each app.myListening as svc (svc.id)}
-          {@const exposed = app.isExposed(svc.id)}
-          <li class="row">
-            <span class="s-icon" aria-hidden="true">{siteIcon(svc.scheme)}</span>
-            <span class="s-main">
-              <span class="s-name">{svc.name}<span class="s-port">{portLabel(svc)}</span></span>
-              <span class="s-sub">
-                {#if svc.loopback}<span class="tag">local-only</span>{/if}
-                {#if svc.process}{svc.process}{/if}
-              </span>
-            </span>
-            <button
-              class="btn small"
-              class:primary={!exposed}
-              class:ghost={exposed}
-              title={exposed ? "Stop advertising this service to your mesh" : "Advertise this service so your fleet can reach it"}
-              onclick={() => app.toggleExpose(svc.id)}
-            >
-              {exposed ? "✓ Exposed" : "Expose"}
-            </button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-  </section>
-
   <!-- Sites exposed by your other machines. -->
   <section class="block">
     <h5 class="block-head">Around your fleet</h5>
     {#if app.sitesByMachine.length === 0}
       <p class="hint faint">
-        No sites from your other machines yet. Expose a service on one of them, or claim more
-        devices into your fleet.
+        No sites from your other machines yet. Expose a service below, or on one of your other
+        machines, to reach it here.
       </p>
     {:else}
       {#each app.sitesByMachine as group (group.node.id)}
@@ -87,13 +54,16 @@
                 {#if mapping}
                   <button
                     class="btn small primary"
-                    title={siteIsWeb(site) ? "Open in your browser" : "Copy its local address"}
-                    onclick={() => app.openSite(mapping)}
+                    title="Open in your browser"
+                    onclick={() => app.openSite(mapping)}>Open</button
                   >
-                    {siteIsWeb(site) ? "Open" : "Copy"}
-                  </button>
                   <button
-                    class="btn small ghost s-unmap"
+                    class="btn small ghost"
+                    title="Copy its local address"
+                    onclick={() => app.copySite(mapping)}>Copy</button
+                  >
+                  <button
+                    class="btn small ghost s-x"
                     title="Unmap — stop proxying it here"
                     aria-label="Unmap"
                     onclick={() => app.unmapSite(group.node.id, site.id)}>✕</button
@@ -112,6 +82,65 @@
       {/each}
     {/if}
   </section>
+
+  <!-- This machine's services — collapsed by default. -->
+  <section class="block ports">
+    <button class="ports-head" aria-expanded={portsOpen} onclick={() => (portsOpen = !portsOpen)}>
+      <span class="ports-chevron" class:open={portsOpen} aria-hidden="true">▸</span>
+      Your ports
+      {#if Object.keys(app.exposedSites).length > 0}
+        <span class="count">{Object.keys(app.exposedSites).length} exposed</span>
+      {/if}
+    </button>
+    {#if portsOpen}
+      {#if app.myListening.length === 0}
+        <p class="hint faint">
+          No listening services found{app.backendConnected ? "" : " (demo)"} — start a local
+          server and it'll appear here to expose.
+        </p>
+      {:else}
+        <ul class="list">
+          {#each app.myListening as svc (svc.id)}
+            {@const exposed = app.isExposed(svc.id)}
+            <li class="row" class:lit={exposed}>
+              <span class="s-icon" aria-hidden="true">{siteIcon(svc.scheme)}</span>
+              <span class="s-main">
+                <span class="s-name">{svc.name}<span class="s-port">:{svc.port}</span></span>
+                <span class="s-sub">
+                  {#if svc.loopback}<span class="tag">local-only</span>{/if}
+                  {#if svc.process}{svc.process}{/if}
+                </span>
+              </span>
+              <input
+                class="name-in"
+                placeholder={app.defaultSiteName(svc)}
+                value={nameFor(svc)}
+                title="Name your fleet sees this site under"
+                oninput={(e) => (names[svc.id] = (e.currentTarget as HTMLInputElement).value)}
+                onkeydown={(e) => {
+                  if (e.key === "Enter" && exposed) app.expose(svc.id, nameFor(svc));
+                }}
+                onblur={() => exposed && app.expose(svc.id, nameFor(svc))}
+              />
+              {#if exposed}
+                <button
+                  class="btn small ghost"
+                  title="Stop advertising this service"
+                  onclick={() => app.unexpose(svc.id)}>Stop</button
+                >
+              {:else}
+                <button
+                  class="btn small primary"
+                  title="Advertise this service to your fleet under this name"
+                  onclick={() => app.expose(svc.id, nameFor(svc))}>Expose</button
+                >
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {/if}
+  </section>
 </div>
 
 <style>
@@ -119,8 +148,6 @@
     display: flex;
     flex-direction: column;
     gap: 0.7rem;
-    max-height: 22rem;
-    overflow-y: auto;
   }
   .block-head {
     margin: 0 0 0.4rem;
@@ -172,10 +199,13 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
+    gap: 0.4rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
     padding: 0.4rem 0.4rem 0.4rem 0.5rem;
+  }
+  .row.lit {
+    box-shadow: inset 0 0 0 1px var(--accent);
   }
   .s-icon {
     font-size: 0.95rem;
@@ -224,12 +254,60 @@
     font-weight: 700;
     color: var(--ink-faint);
   }
-  .s-unmap {
+  .s-x {
     flex-shrink: 0;
     padding: 0.25rem 0.4rem;
     color: var(--ink-faint);
   }
-  .s-unmap:hover {
+  .s-x:hover {
     color: var(--danger);
+  }
+  .name-in {
+    flex: 1.2;
+    min-width: 4rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.25rem 0.4rem;
+    font-size: 0.74rem;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .ports-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    padding: 0.2rem 0;
+    margin-bottom: 0.3rem;
+  }
+  .ports-head:hover {
+    color: var(--ink);
+  }
+  .ports-chevron {
+    transition: transform 0.12s ease;
+    font-size: 0.7rem;
+  }
+  .ports-chevron.open {
+    transform: rotate(90deg);
+  }
+  .count {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: none;
+    letter-spacing: 0;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border-radius: var(--r-pill);
+    padding: 0 0.32rem;
   }
 </style>

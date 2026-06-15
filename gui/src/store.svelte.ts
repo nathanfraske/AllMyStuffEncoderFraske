@@ -480,10 +480,10 @@ class AppStore {
    *  Seeded with demo data in web mode, replaced by a real scan under the
    *  backend. */
   myListening = $state<ListeningService[]>([]);
-  /** The ids of *this* machine's services currently advertised to the mesh
-   *  (the opt-in exposed set). Mirrors the backend's persisted set; the
-   *  local node's advertised `sites` follow it. */
-  exposedSites = $state<string[]>([]);
+  /** *This* machine's services currently advertised to the mesh, as
+   *  id → display name (empty = the classified default). Mirrors the
+   *  backend's persisted set; the local node's advertised `sites` follow it. */
+  exposedSites = $state<Record<string, string>>({});
   /** Sites this device has mapped to a local port — the live reverse-proxy
    *  bindings, keyed for lookup by `"<node>::<site>"`. */
   siteMappings = $state<SiteMapping[]>([]);
@@ -2119,11 +2119,17 @@ class AppStore {
   /** Seed the Sites tab with demo data in web mode (no scan to run). */
   private seedDemoSites() {
     this.myListening = [
-      { id: "tcp:5173", name: "HTTP", port: 5173, kind: "http", scheme: "http", loopback: true, process: "vite" },
-      { id: "tcp:8000", name: "HTTP", port: 8000, kind: "http", scheme: "http", loopback: true, process: "python" },
-      { id: "tcp:22", name: "SSH", port: 22, kind: "ssh", scheme: "ssh", loopback: false, process: "sshd" },
+      { id: "tcp:5173", name: "HTTP", port: 5173, kind: "http", scheme: "http", loopback: true, process: "vite", title: "My Project — Dev" },
+      { id: "tcp:8000", name: "HTTP", port: 8000, kind: "http", scheme: "http", loopback: true, process: "python", title: "" },
+      { id: "tcp:22", name: "SSH", port: 22, kind: "ssh", scheme: "ssh", loopback: false, process: "sshd", title: "" },
     ];
-    this.exposedSites = ["tcp:5173"];
+    this.exposedSites = { "tcp:5173": "My Project — Dev" };
+  }
+
+  /** The default name to offer when exposing a discovered service: the page
+   *  `<title>` the probe found, else the classified service name. */
+  defaultSiteName(svc: ListeningService): string {
+    return svc.title.trim() || svc.name;
   }
 
   private mappingFromInfo(info: { node: string; port: number; localPort: number }): SiteMapping {
@@ -2141,16 +2147,30 @@ class AppStore {
 
   /** Whether this machine currently advertises a discovered service. */
   isExposed(siteId: string): boolean {
-    return this.exposedSites.includes(siteId);
+    return siteId in this.exposedSites;
   }
 
-  /** Toggle whether one of this machine's listening services is advertised
-   *  to the mesh (the opt-in exposure choice). Pushes the new set to the
-   *  backend, which re-broadcasts presence. */
-  async toggleExpose(siteId: string) {
-    const next = this.isExposed(siteId)
-      ? this.exposedSites.filter((id) => id !== siteId)
-      : [...this.exposedSites, siteId];
+  /** The name this machine advertises a service under (empty = default). */
+  exposeName(siteId: string): string {
+    return this.exposedSites[siteId] ?? "";
+  }
+
+  /** Expose one of this machine's listening services to the mesh under
+   *  `name` (the opt-in exposure choice). Idempotent re-naming: calling
+   *  again with a new name just updates it. Pushes to the backend, which
+   *  re-broadcasts presence so peers' Sites lists update. */
+  async expose(siteId: string, name: string) {
+    await this.pushExposed({ ...this.exposedSites, [siteId]: name });
+  }
+
+  /** Stop advertising a service. */
+  async unexpose(siteId: string) {
+    const next = { ...this.exposedSites };
+    delete next[siteId];
+    await this.pushExposed(next);
+  }
+
+  private async pushExposed(next: Record<string, string>) {
     this.exposedSites = next;
     if (this.backendConnected) {
       this.exposedSites = await siteSetExposed(next);
@@ -2209,17 +2229,20 @@ class AppStore {
     if (this.backendConnected) await siteUnmap(m.node, m.port);
   }
 
-  /** Open a mapped site: a web site in the system browser, a bare TCP
-   *  service by copying its `localhost:<port>` address to the clipboard so
-   *  the user can paste it into whatever client speaks it. */
+  /** Open a mapped site in the system browser — a plain navigation to its
+   *  local address (`http(s)://localhost:<port>`, defaulting to http for a
+   *  bare TCP service so the button always does something). */
   openSite(m: SiteMapping) {
+    const scheme = siteIsWeb(m) ? m.scheme : "http";
+    void openExternal(`${scheme}://localhost:${m.localPort}`);
+  }
+
+  /** Copy a mapped site's `localhost:<port>` address to the clipboard — for
+   *  pasting into whatever client speaks it (a DB tool, an ssh command). */
+  copySite(m: SiteMapping) {
     const url = this.siteUrl(m);
-    if (siteIsWeb(m)) {
-      void openExternal(url);
-      return;
-    }
     void navigator.clipboard?.writeText(url).then(
-      () => this.toast("ok", `Copied ${url} — point your client there`),
+      () => this.toast("ok", `Copied ${url}`),
       () => this.toast("warn", `Reach it at ${url}`),
     );
   }

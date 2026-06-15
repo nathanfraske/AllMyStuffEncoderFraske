@@ -183,8 +183,8 @@
   </header>
 
   <main class="stage">
-    <Graph />
     <Sidebar />
+    <Graph />
     <NodeDrawer />
     <RoomPanel />
   </main>
