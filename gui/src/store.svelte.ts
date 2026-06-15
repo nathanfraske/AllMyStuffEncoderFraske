@@ -107,8 +107,10 @@ import {
   setNetworkEnabled,
   updateApply,
   updateCheck,
+  updateLatestVersion,
   updateSetPrefs,
   updateStatus,
+  upgradeNode,
   type SessionSnapshot,
 } from "./tauri";
 import {
@@ -118,6 +120,7 @@ import {
   FEATURE_SITES,
   FEATURE_TERMINAL,
   isAppNode,
+  isOlderVersion,
   networkDisplayName,
   siteIsWeb,
   type Capability,
@@ -588,6 +591,11 @@ class AppStore {
   updateBusy = $state(false);
   /** Result of the last manual "check now", for the Updates pane. */
   updateOutcome = $state<CheckOutcome | null>(null);
+  /** The channel's latest release version, learned once (read-only) so the
+   *  drawer can tell which of your fleet machines are behind it. Null until
+   *  loaded; stays null in web mode / if the feed can't be reached. */
+  latestRelease = $state<string | null>(null);
+  private latestReleaseLoading = false;
 
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
@@ -1095,6 +1103,10 @@ class AppStore {
       // Sites it exposes for reverse-proxying (the Sites sidebar lists
       // them) — absent/empty from an older peer or one exposing nothing.
       node.sites = p.sites ?? [];
+      // The AllMyStuff version it's running — let it tell when the machine
+      // is behind the channel and offer an upgrade. Absent (older peer) =
+      // unknown, and the upgrade button stays hidden.
+      node.version = p.version;
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -4474,6 +4486,52 @@ class AppStore {
     } catch (e) {
       this.toast("warn", `Couldn't save update settings: ${errMsg(e)}`);
     }
+  }
+
+  /** Learn the channel's latest release version (once, read-only). Called
+   *  lazily when a remote AllMyStuff machine is opened, so we only reach the
+   *  release feed when there's a reason to. Best-effort: a failure just
+   *  leaves `latestRelease` unset and the upgrade affordance hidden. */
+  async loadLatestRelease(force = false) {
+    if (!isTauri()) return;
+    if (this.latestReleaseLoading) return;
+    if (this.latestRelease && !force) return;
+    this.latestReleaseLoading = true;
+    try {
+      const v = await updateLatestVersion();
+      if (v) this.latestRelease = v;
+    } catch {
+      /* offline / no feed — the upgrade button just stays hidden */
+    } finally {
+      this.latestReleaseLoading = false;
+    }
+  }
+
+  /** Whether `node` is a remote AllMyStuff machine running a version older
+   *  than the channel's latest release — i.e. we can offer to upgrade it.
+   *  Needs both the remote's advertised version and the latest release known;
+   *  the drawer additionally gates on the machine being yours (owner/fleet),
+   *  the same rule the far side enforces before acting. */
+  upgradeAvailable(node: MeshNode | null | undefined): boolean {
+    if (!node || node.kind === "this" || !isAppNode(node)) return false;
+    return isOlderVersion(node.version, this.latestRelease ?? undefined);
+  }
+
+  /** Ask a fleet machine to update itself to the channel's latest release and
+   *  restart. The far side enforces owner/fleet and decides if there's
+   *  anything to do; its next presence advert (the new version) is the
+   *  confirmation — the button disappears when the upgrade lands. */
+  upgradeRemote(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    if (!this.backendConnected) {
+      this.toast("info", "Upgrading a machine needs the desktop app");
+      return;
+    }
+    upgradeNode(nodeId).catch((e) => {
+      this.toast("warn", `Couldn't ask ${n.label} to upgrade: ${String(e)}`);
+    });
+    this.toast("info", `Asking ${n.label} to upgrade and restart…`);
   }
 
   private describeCheckOutcome(o: CheckOutcome | null) {

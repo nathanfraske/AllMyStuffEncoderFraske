@@ -533,6 +533,18 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
     })
 }
 
+/// The latest release version on the configured channel — read-only. It
+/// fetches the channel feed and returns the release tag (e.g. `"0.2.0"`)
+/// without staging, applying, or touching any local state. This is what
+/// lets one machine tell that *another* (whose running version rides its
+/// presence advert) is behind the channel, so it can offer to upgrade it.
+/// `Ok(None)` only when the feed carries no usable tag.
+pub async fn latest_version() -> Result<Option<String>> {
+    let au = load_auto_update();
+    let release = fetch_release(&au).await?;
+    Ok(release_tag(&release).ok())
+}
+
 /// Current updater status (no network access).
 pub fn status() -> Result<UpdateStatus> {
     let au = load_auto_update();

@@ -171,6 +171,12 @@
     }
   });
 
+  // When a remote AllMyStuff machine is shown, learn the channel's latest
+  // release (once) so we can tell whether it's behind and offer an upgrade.
+  $effect(() => {
+    if (isRemoteApp) void app.loadLatestRelease();
+  });
+
   function startResize(e: PointerEvent) {
     resizing = true;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
@@ -308,6 +314,21 @@
       </section>
     {/if}
 
+    <!-- Upgrade this machine: it's a fleet box running an AllMyStuff older
+         than the channel's latest release. The far side runs its own
+         self-updater and restarts; its next presence advert (the new
+         version) makes this button disappear. Fleet/owner only — the same
+         rule the far side enforces before acting. -->
+    {#if isRemoteApp && inMyFleet && app.upgradeAvailable(node)}
+      <button
+        class="btn console-open upgrade-open"
+        title="Update {displayName(node)} to {app.latestRelease} and restart it"
+        onclick={() => app.upgradeRemote(node.id)}
+      >
+        ⬆ Upgrade AllMyStuff
+      </button>
+    {/if}
+
     <!-- Open a remote control session: the pikvm-style handle for this
          machine's screen, audio passthrough and control. Owner/fleet only —
          sharing is one-directional: when you share your stuff *with* someone,
@@ -334,6 +355,24 @@
     {#if isRemoteApp && app.terminalAllowed(node)}
       <button class="btn console-open" onclick={() => app.openTerminal(node.id)}>
         📟 Open Terminal
+      </button>
+    {/if}
+
+    <!-- The local device's claim-mode toggle, given pride of place as a
+         button (in the same slot + style the remote machines' buttons use)
+         while this machine isn't yet in a fleet: an unowned device's most
+         useful action, filling the space it would otherwise leave empty. The
+         hover spells out what it does; the colour flips on when active. Once
+         it's in a fleet, re-offering it for adoption is a rare "reclaim", so
+         it drops to the quieter checkbox down in the relationship block. -->
+    {#if node.kind === "this" && !app.isFleetMember(node.id)}
+      <button
+        class="btn console-open claim-toggle"
+        class:on={node.claimable}
+        title="Offer this device so another of mine can adopt it"
+        onclick={() => app.setLocalClaimable(!(node.claimable ?? false))}
+      >
+        {node.claimable ? "🔓 Disallow Claiming" : "🔒 Allow Claiming"}
       </button>
     {/if}
 
@@ -445,14 +484,19 @@
               </div>
             </div>
           {/if}
-          <label class="adopt">
-            <input
-              type="checkbox"
-              checked={node.claimable ?? false}
-              onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
-            />
-            <span>{node.claimable ? "Offering this device for adoption" : "Offer this device so another of mine can adopt it"}</span>
-          </label>
+          <!-- In a fleet, the claim toggle is the quieter checkbox (re-offering
+               an already-owned machine is a rare "reclaim"); outside a fleet it
+               lives as the prominent button up in the actions slot. -->
+          {#if app.isFleetMember(node.id)}
+            <label class="adopt">
+              <input
+                type="checkbox"
+                checked={node.claimable ?? false}
+                onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
+              />
+              <span>{node.claimable ? "Offering this device for adoption" : "Offer this device so another of mine can adopt it"}</span>
+            </label>
+          {/if}
         {:else}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
         {/if}
@@ -1202,6 +1246,34 @@
   .console-open {
     width: 100%;
     margin-bottom: 0.8rem;
+  }
+  /* "Upgrade available" — an accent-tinted call to action, distinct from the
+     solid-accent Remote Control so it reads as "something new", not "the
+     primary thing". Fills on hover to confirm it's clickable. */
+  .upgrade-open {
+    justify-content: center;
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 650;
+  }
+  .upgrade-open:hover {
+    background: var(--accent);
+    color: #fff;
+  }
+  /* The local device's claim toggle. Off reads as a neutral action; on flips
+     to the accent fill so "this machine is offering itself" is unmistakable
+     at a glance — the colour is the state, the label is the next action. */
+  .claim-toggle {
+    justify-content: center;
+  }
+  .claim-toggle.on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .claim-toggle.on:hover {
+    background: var(--accent-ink);
   }
   .adopt {
     display: flex;

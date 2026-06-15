@@ -60,6 +60,9 @@ export interface SessionSnapshot {
     /** Sites the peer exposes for reverse-proxying (from its presence
      *  advert). Absent — an older peer, or one exposing nothing — is empty. */
     sites?: SiteAdvert[];
+    /** The AllMyStuff version the peer is running, from its advert. Absent
+     *  from an older peer — "unknown". */
+    version?: string;
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -190,6 +193,17 @@ export async function claimNode(node: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("claim_node", { node });
+}
+
+/** Ask one of your fleet machines to update its AllMyStuff to the channel's
+ *  latest release and restart. The target enforces owner/fleet before acting;
+ *  its next presence advert (the new version) confirms it landed. Throws when
+ *  the backend couldn't deliver the ask (the machine dropped offline, no
+ *  shared network). No-op in web mode. */
+export async function upgradeNode(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("upgrade_node", { node });
 }
 
 /** Put this device into / out of claim mode so another of your machines can
@@ -960,6 +974,13 @@ export function updateApply(): Promise<{ applied: string | null } | null> {
 
 export function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus | null> {
   return tryInvoke<UpdateStatus>("update_set_prefs", { prefs });
+}
+
+/** The latest release version on the configured channel (read-only — it
+ *  doesn't stage or apply anything). Null in web mode, or if the feed had no
+ *  usable tag. Used to tell whether a remote machine is behind the channel. */
+export function updateLatestVersion(): Promise<string | null> {
+  return tryInvoke<string>("update_latest_version");
 }
 
 /** Subscribe to live session snapshots. Returns an unlisten fn (or a no-op

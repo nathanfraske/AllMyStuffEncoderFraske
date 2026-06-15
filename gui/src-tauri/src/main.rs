@@ -134,6 +134,14 @@ async fn claim_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), Stri
     mesh.inner().claim(node).await
 }
 
+/// Ask one of your fleet machines to update its AllMyStuff to the channel's
+/// latest release and restart. The target enforces owner/fleet before acting;
+/// its next presence advert (the new version) confirms it landed.
+#[tauri::command]
+async fn upgrade_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
+    mesh.inner().request_upgrade(node).await
+}
+
 /// Put this device into / out of claim mode so another of your machines can
 /// adopt it. Returns whether it's now claimable.
 #[tauri::command]
@@ -942,6 +950,16 @@ async fn update_set_prefs(prefs: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The latest release version on the configured channel (read-only — no
+/// staging). The graph compares it to each remote's advertised version to
+/// decide whether to offer that machine an upgrade.
+#[tauri::command]
+async fn update_latest_version() -> Result<Option<String>, String> {
+    allmystuff_updater::latest_version()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Pi / aarch64 Linux WebKitGTK rendering workaround — paint on the CPU so
 /// the animated SVG graph doesn't corrupt or wedge the compositor. Kept in
 /// sync with MyOwnMesh and MyOwnLLM.
@@ -991,6 +1009,7 @@ fn main() {
             disconnect_route,
             client_log,
             claim_node,
+            upgrade_node,
             set_claimable,
             send_input,
             clipboard_paste,
@@ -1050,6 +1069,7 @@ fn main() {
             update_check,
             update_apply,
             update_set_prefs,
+            update_latest_version,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
