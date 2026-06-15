@@ -216,7 +216,11 @@ impl SitesProxy {
     /// The local ports already bound by this device — what
     /// [`allmystuff_bridge::sites::allocate_local_port`] avoids reusing.
     pub fn taken_local_ports(&self) -> BTreeSet<u16> {
-        self.mappings.lock().values().map(|m| m.local_port).collect()
+        self.mappings
+            .lock()
+            .values()
+            .map(|m| m.local_port)
+            .collect()
     }
 
     /// Every live mapping as `(node, host_port, local_port)`, for the UI.
@@ -250,7 +254,12 @@ impl SitesProxy {
 }
 
 impl ClientMapping {
-    pub fn new(node: String, host_port: u16, local_port: u16, accept_handle: JoinHandle<()>) -> Self {
+    pub fn new(
+        node: String,
+        host_port: u16,
+        local_port: u16,
+        accept_handle: JoinHandle<()>,
+    ) -> Self {
         ClientMapping {
             node,
             host_port,

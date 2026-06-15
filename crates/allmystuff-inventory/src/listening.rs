@@ -149,8 +149,8 @@ pub fn classify_port(port: u16) -> ServiceKind {
         5900..=5910 => ServiceKind::Vnc,
         // The web sweet spot — server defaults and the popular dev-server
         // ports. A probe confirms, but http is the right default guess.
-        80 | 591 | 2375 | 3000 | 4000 | 5000 | 5173 | 8000 | 8008 | 8080 | 8081 | 8088
-        | 8888 | 9000 | 9090 => ServiceKind::Http,
+        80 | 591 | 2375 | 3000 | 4000 | 5000 | 5173 | 8000 | 8008 | 8080 | 8081 | 8088 | 8888
+        | 9000 | 9090 => ServiceKind::Http,
         _ => ServiceKind::Other,
     }
 }
@@ -309,10 +309,26 @@ mod tests {
         // site. 22 listens on 0.0.0.0 *and* ::1: any non-loopback bind wins,
         // so it's reachable off-box.
         let rows = vec![
-            ProcListen { port: 8080, loopback: true, inode: 200 },
-            ProcListen { port: 8080, loopback: true, inode: 100 },
-            ProcListen { port: 22, loopback: false, inode: 5 },
-            ProcListen { port: 22, loopback: true, inode: 9 },
+            ProcListen {
+                port: 8080,
+                loopback: true,
+                inode: 200,
+            },
+            ProcListen {
+                port: 8080,
+                loopback: true,
+                inode: 100,
+            },
+            ProcListen {
+                port: 22,
+                loopback: false,
+                inode: 5,
+            },
+            ProcListen {
+                port: 22,
+                loopback: true,
+                inode: 9,
+            },
         ];
         let merged = dedupe_by_port(rows);
         assert_eq!(merged.len(), 2);

@@ -1142,7 +1142,10 @@ mod tests {
     #[test]
     fn site_frames_round_trip_and_demux() {
         let events = vec![
-            SiteEvent::Open { conn: 1, port: 8080 },
+            SiteEvent::Open {
+                conn: 1,
+                port: 8080,
+            },
             SiteEvent::Data {
                 conn: 1,
                 data: vec![0x47, 0x45, 0x54],

@@ -2518,11 +2518,10 @@ impl Mesh {
     /// Whether `peer` advertised the media-lane pool in its presence features.
     fn peer_supports_lanes(&self, peer: &str) -> bool {
         let canon = pubkey_part(peer);
-        self.state
-            .lock()
-            .peer_features
-            .get(canon)
-            .is_some_and(|f| f.iter().any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES))
+        self.state.lock().peer_features.get(canon).is_some_and(|f| {
+            f.iter()
+                .any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES)
+        })
     }
 
     /// The lane an outbound H.264 video route to `peer` rides, or `None` for
@@ -2621,7 +2620,8 @@ impl Mesh {
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
-                tx.try_send((peer.clone(), route_id.clone(), packet)).is_ok()
+                tx.try_send((peer.clone(), route_id.clone(), packet))
+                    .is_ok()
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
@@ -3167,10 +3167,8 @@ impl Mesh {
         }
         // Start accepting local connections; each becomes one tunneled conn.
         let accept = self.spawn_site_accept(route_id.clone(), node.clone(), port, listener);
-        self.sites.add_mapping(
-            route_id,
-            ClientMapping::new(node, port, local_port, accept),
-        );
+        self.sites
+            .add_mapping(route_id, ClientMapping::new(node, port, local_port, accept));
         Ok(local_port)
     }
 
@@ -3205,7 +3203,9 @@ impl Mesh {
                 return Ok((listener, port));
             }
         }
-        Err(format!("couldn't bind a local port for the site on :{host_port}"))
+        Err(format!(
+            "couldn't bind a local port for the site on :{host_port}"
+        ))
     }
 
     /// Client side: accept local connections on `listener` and tunnel each
@@ -3248,7 +3248,9 @@ impl Mesh {
                     None => {
                         mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn })
                             .await;
-                        tracing::warn!("site route {route_id} at connection cap — refused conn {conn}");
+                        tracing::warn!(
+                            "site route {route_id} at connection cap — refused conn {conn}"
+                        );
                     }
                 }
             }
@@ -3378,7 +3380,10 @@ impl Mesh {
                 && is_site_route(&r.route)
                 && pubkey_part(r.peer.as_str()) == pubkey_part(from))
             {
-                tracing::debug!("site frame for {} refused (route not live here)", frame.route);
+                tracing::debug!(
+                    "site frame for {} refused (route not live here)",
+                    frame.route
+                );
                 return;
             }
             (
@@ -3391,7 +3396,10 @@ impl Mesh {
             // The proxy *into* this machine — as privileged as the terminal,
             // so the same owner/fleet gate, re-cleared per frame.
             if !self.sender_may_control(from) {
-                tracing::warn!("dropped site frame from {}: not an authorized controller", short_id(from));
+                tracing::warn!(
+                    "dropped site frame from {}: not an authorized controller",
+                    short_id(from)
+                );
                 return;
             }
             match frame.event {
@@ -3480,7 +3488,8 @@ impl Mesh {
                 Err(e) => {
                     tracing::warn!("site connect to 127.0.0.1:{port} failed: {e}");
                     mesh.sites.close_conn(&route_id, conn);
-                    mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn }).await;
+                    mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn })
+                        .await;
                 }
             }
         });

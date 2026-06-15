@@ -385,11 +385,7 @@ async fn site_set_exposed(
 /// Map a peer's site to a local port — set up the reverse-proxy route and
 /// bind a local listener. Returns `{ localPort }`.
 #[tauri::command]
-async fn site_map(
-    mesh: State<'_, Arc<Mesh>>,
-    node: String,
-    port: u16,
-) -> Result<Value, String> {
+async fn site_map(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<Value, String> {
     let local_port = mesh.inner().site_map(node, port).await?;
     Ok(json!({ "localPort": local_port }))
 }
