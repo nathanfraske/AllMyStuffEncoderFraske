@@ -13,10 +13,8 @@
   import NetworkDevices from "./NetworkDevices.svelte";
 
   let nameInput = $state("");
-  let newLabel = $state("");
   let joinId = $state("");
-  let joinLabel = $state("");
-  let mode = $state<"none" | "create" | "join">("none");
+  let mode = $state<"none" | "join">("none");
   let copied = $state("");
 
   const sub = $derived(app.networksSubtab);
@@ -38,15 +36,9 @@
   async function saveName() {
     await app.setIdentityLabel(trimmedName);
   }
-  async function create() {
-    await app.createNetwork(newLabel);
-    newLabel = "";
-    mode = "none";
-  }
   async function join() {
-    await app.joinNetwork(joinId, joinLabel);
+    await app.joinNetwork(joinId);
     joinId = "";
-    joinLabel = "";
     mode = "none";
   }
   async function copyHandle(handle: string) {
@@ -111,7 +103,6 @@
       <div class="sec-head">
         <h4>Your networks — joined {app.networks.length}</h4>
         <div class="seg">
-          <button class="btn small" class:on={mode === "create"} onclick={() => (mode = mode === "create" ? "none" : "create")}>＋ Create</button>
           <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
         </div>
@@ -122,20 +113,17 @@
         so it's never just “the” mesh. Share a network's handle to add a device to it.
       </p>
 
-      {#if mode === "create"}
+      {#if mode === "join"}
         <div class="row">
-          <input class="field" placeholder="Name (optional, e.g. Home)" bind:value={newLabel} />
-          <button class="btn small primary" onclick={create}>Create</button>
+          <input
+            class="field"
+            placeholder="network name OR leave blank to generate one"
+            bind:value={joinId}
+            onkeydown={(e) => e.key === "Enter" && join()}
+          />
+          <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A fresh network id is generated for you, on MyOwnMesh's default servers.</p>
-      {:else if mode === "join"}
-        <div class="row">
-          <input class="field" placeholder="Network handle (paste from the other device)" bind:value={joinId} />
-        </div>
-        <div class="row">
-          <input class="field" placeholder="Name (optional)" bind:value={joinLabel} />
-          <button class="btn small primary" disabled={!joinId.trim()} onclick={join}>Join</button>
-        </div>
+        <p class="hint">A network is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one.</p>
       {/if}
 
       <ul class="nets">

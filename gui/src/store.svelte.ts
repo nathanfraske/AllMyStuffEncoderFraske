@@ -20,6 +20,7 @@ import {
   networkAddPayloadFromEnvelope,
   tryParseNetworkSettings,
 } from "./network-settings";
+import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
   claimNode,
@@ -52,7 +53,6 @@ import {
   meshIdentitySetLabel,
   meshConfigShow,
   meshNetworkAdd,
-  meshNetworkIdGenerate,
   meshNetworkRemove,
   meshNetworks,
   meshNetworkUpdate,
@@ -3506,28 +3506,24 @@ class AppStore {
     }
   }
 
-  async createNetwork(label?: string, autoApprove = false): Promise<string | null> {
-    try {
-      const networkId = await meshNetworkIdGenerate();
-      await meshNetworkAdd(buildNetworkConfig({ networkId, label, autoApprove }));
-      this.toast("ok", `Created network ${label?.trim() || networkId}`);
-      await this.refreshNetworks();
-      return networkId;
-    } catch (e) {
-      this.toast("warn", `Couldn't create network: ${errMsg(e)}`);
-      return null;
+  /** Get onto a network by name. A blank name generates a memorable 5-word
+   *  one. There's no separate "create": a network is just a name two devices
+   *  agree on (the signaling handle is a hash of it), so joining a name nobody
+   *  else is on *is* creating it. Typed names are canonicalized (lowercased,
+   *  spaces → hyphens) so "Beach House" and "beach-house" meet on the same one. */
+  async joinNetwork(rawName: string) {
+    const typed = rawName.trim();
+    const id = typed ? canonicalNetworkId(typed) : generateNetworkPhrase();
+    if (id.length < 3 || id.length > 64) {
+      this.toast("warn", "A network name needs 3–64 letters, digits or hyphens");
+      return;
     }
-  }
-
-  async joinNetwork(networkId: string, label?: string) {
-    const id = networkId.trim();
-    if (!id) return;
     try {
-      await meshNetworkAdd(buildNetworkConfig({ networkId: id, label }));
-      this.toast("ok", `Joined ${label?.trim() || id}`);
+      await meshNetworkAdd(buildNetworkConfig({ networkId: id }));
+      this.toast("ok", typed ? `Joined ${id}` : `Created ${id}`);
       await this.refreshNetworks();
     } catch (e) {
-      this.toast("warn", `Couldn't join: ${errMsg(e)}`);
+      this.toast("warn", `Couldn't ${typed ? "join" : "set up"} the network: ${errMsg(e)}`);
     }
   }
 
