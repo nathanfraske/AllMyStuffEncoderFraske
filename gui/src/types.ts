@@ -163,6 +163,19 @@ export interface ListeningService {
   title: string;
 }
 
+/** One service a fleet machine reports when you manage its exposure remotely
+ *  (mirrors the Rust `SiteService`) — the same shape as a `ListeningService`
+ *  minus the local-only `kind`. */
+export interface SiteService {
+  id: string;
+  name: string;
+  port: number;
+  scheme: string;
+  loopback: boolean;
+  process: string;
+  title: string;
+}
+
 /** A site this machine has mapped to a local port — the live reverse-proxy
  *  binding. `url` is what to open (a `http(s)://localhost:<localPort>` for a
  *  web site, else the bare `localhost:<localPort>` address to point a client

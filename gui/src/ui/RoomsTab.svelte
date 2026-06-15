@@ -418,7 +418,8 @@
   .rooms li {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.4rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
     padding: 0.45rem 0.4rem 0.45rem 0.55rem;
@@ -428,7 +429,7 @@
     box-shadow: 0 0 0 1.5px var(--accent);
   }
   .r-main {
-    flex: 1;
+    flex: 1 1 8rem;
     min-width: 0;
   }
   .r-name {

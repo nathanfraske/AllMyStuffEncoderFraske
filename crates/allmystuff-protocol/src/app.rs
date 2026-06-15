@@ -374,14 +374,64 @@ pub enum RoomEvent {
     Shares { files: Vec<SharedEntry> },
 }
 
-/// Point-to-point control traffic. Tagged on `t` so route, share, and
-/// ownership negotiation share one channel.
+/// Point-to-point control traffic. Tagged on `t` so route, share,
+/// ownership, and site management share one channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlMessage {
     Route(RouteControl),
     Share(ShareControl),
     Ownership(OwnershipControl),
+    Site(SiteControl),
+}
+
+/// One listening service on a machine, as reported to a co-owned fleet
+/// member managing it remotely ([`SiteControl::Sites`]). Mirrors the scan's
+/// `ListeningService` without the protocol crate depending on the inventory
+/// crate — the backend fills it from a scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteService {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    #[serde(default)]
+    pub scheme: String,
+    #[serde(default)]
+    pub loopback: bool,
+    #[serde(default)]
+    pub process: String,
+    /// The page `<title>` the probe fetched (http), a default-name hint.
+    #[serde(default)]
+    pub title: String,
+}
+
+/// Remotely managing a co-owned machine's sites — what powers the "Its
+/// sites" controls in a fleet device's drawer. Authorized exactly like the
+/// site proxy and the terminal: only the device's owner or a fleet member is
+/// answered (the mesh authenticates the sender), so a stranger can't list or
+/// re-expose your services. An older peer that doesn't know the `site` tag
+/// drops the whole control message ([`ControlMessage`] fails to decode) —
+/// the manager just sees no remote sites, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SiteControl {
+    /// "List your sites" — a fleet member asking what this machine is
+    /// listening on and what it currently exposes, to manage it.
+    List,
+    /// The answer: every discovered service, plus the current exposed map
+    /// (id → advertised name).
+    Sites {
+        services: Vec<SiteService>,
+        #[serde(default)]
+        exposed: std::collections::BTreeMap<String, String>,
+    },
+    /// "Advertise exactly these" — the new exposed map (id → name) for this
+    /// machine to publish. Applied only from the owner/fleet; the machine
+    /// persists it and re-broadcasts presence.
+    SetExposed {
+        #[serde(default)]
+        exposed: std::collections::BTreeMap<String, String>,
+    },
 }
 
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
@@ -854,6 +904,43 @@ mod tests {
         assert_eq!(j["owner"], "my-laptop");
         let back: ControlMessage = serde_json::from_value(j).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn site_control_round_trips_and_tags() {
+        // The "list your sites" request.
+        let m = ControlMessage::Site(SiteControl::List);
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["t"], "site");
+        assert_eq!(j["kind"], "list");
+        assert_eq!(serde_json::from_value::<ControlMessage>(j).unwrap(), m);
+
+        // The reply, carrying the full service list + the exposed map.
+        let m = ControlMessage::Site(SiteControl::Sites {
+            services: vec![SiteService {
+                id: "tcp:3000".into(),
+                name: "HTTP".into(),
+                port: 3000,
+                scheme: "http".into(),
+                loopback: true,
+                process: "grafana".into(),
+                title: "My Grafana".into(),
+            }],
+            exposed: std::collections::BTreeMap::from([("tcp:3000".into(), "My Grafana".into())]),
+        });
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "sites");
+        assert_eq!(j["services"][0]["port"], 3000);
+        assert_eq!(j["exposed"]["tcp:3000"], "My Grafana");
+        assert_eq!(serde_json::from_value::<ControlMessage>(j).unwrap(), m);
+
+        // The "advertise exactly these" command.
+        let m = ControlMessage::Site(SiteControl::SetExposed {
+            exposed: std::collections::BTreeMap::from([("tcp:8080".into(), "App".into())]),
+        });
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "set_exposed");
+        assert_eq!(serde_json::from_value::<ControlMessage>(j).unwrap(), m);
     }
 
     #[test]

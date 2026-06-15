@@ -27,8 +27,8 @@ use tokio::sync::mpsc;
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
     ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RoomMessage,
-    RouteControl, SharedFileMeta, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, PROTOCOL_VERSION,
+    RouteControl, SharedFileMeta, SiteControl, SiteService, CHANNEL_CONTROL, CHANNEL_MEDIA,
+    CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -959,15 +959,25 @@ impl Mesh {
                             return;
                         }
                     }
-                    let effects = {
-                        let mut st = self.state.lock();
-                        st.session
-                            .as_mut()
-                            .map(|s| s.handle(NodeId::from(from.as_str()), msg))
-                            .unwrap_or_default()
-                    };
-                    self.process_effects(effects).await;
-                    self.emit_snapshot();
+                    // Site management (list a co-owned machine's sites,
+                    // re-expose them) rides this channel but is the backend's
+                    // to handle, gated owner/fleet — the session never sees it.
+                    match msg {
+                        ControlMessage::Site(sc) => {
+                            self.handle_site_control(&from, sc).await;
+                        }
+                        msg => {
+                            let effects = {
+                                let mut st = self.state.lock();
+                                st.session
+                                    .as_mut()
+                                    .map(|s| s.handle(NodeId::from(from.as_str()), msg))
+                                    .unwrap_or_default()
+                            };
+                            self.process_effects(effects).await;
+                            self.emit_snapshot();
+                        }
+                    }
                 }
             }
             CHANNEL_MEDIA => {
@@ -3126,6 +3136,96 @@ impl Mesh {
     /// local_port)`.
     pub fn site_mappings(&self) -> Vec<(String, u16, u16)> {
         self.sites.list_mappings()
+    }
+
+    // ---- remote site management (a fleet device's drawer) -------------
+
+    /// Ask a co-owned machine for its full site list (to manage its exposure
+    /// from its drawer). The reply lands as the `allmystuff://node-sites`
+    /// event. Fire-and-forget; the far side gates on owner/fleet.
+    pub async fn site_remote_list(self: &Arc<Self>, node: String) -> Result<(), String> {
+        self.send_control(&node, &ControlMessage::Site(SiteControl::List))
+            .await
+    }
+
+    /// Tell a co-owned machine to advertise exactly `exposed` (id → name).
+    /// The far side gates on owner/fleet, applies it, and re-advertises.
+    pub async fn site_remote_set_exposed(
+        self: &Arc<Self>,
+        node: String,
+        exposed: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.send_control(
+            &node,
+            &ControlMessage::Site(SiteControl::SetExposed { exposed }),
+        )
+        .await
+    }
+
+    /// One inbound site-management control message. `List` / `SetExposed` are
+    /// privileged (they read or change what this machine exposes), so only an
+    /// owner/fleet sender is answered — the same gate as the proxy itself.
+    /// `Sites` is a reply we surface to the front-end.
+    async fn handle_site_control(self: &Arc<Self>, from: &str, sc: SiteControl) {
+        match sc {
+            SiteControl::List => {
+                if !self.sender_may_control(from) {
+                    tracing::warn!("site list from {} refused: not owner/fleet", short_id(from));
+                    return;
+                }
+                // Scan + probe is blocking, so do it off the event loop, then
+                // reply to the asking machine.
+                let mesh = self.clone();
+                let peer = from.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let scan = mesh.clone();
+                    let Ok((services, exposed)) = tokio::task::spawn_blocking(move || {
+                        let services = scan
+                            .site_scan()
+                            .into_iter()
+                            .map(|s| SiteService {
+                                id: s.id,
+                                name: s.name,
+                                port: s.port,
+                                scheme: s.scheme,
+                                loopback: s.loopback,
+                                process: s.process,
+                                title: s.title,
+                            })
+                            .collect::<Vec<_>>();
+                        (services, scan.sites.exposed_map())
+                    })
+                    .await
+                    else {
+                        return;
+                    };
+                    let _ = mesh
+                        .send_control(
+                            &peer,
+                            &ControlMessage::Site(SiteControl::Sites { services, exposed }),
+                        )
+                        .await;
+                });
+            }
+            SiteControl::Sites { services, exposed } => {
+                // A managed machine's answer — hand it to the drawer.
+                let _ = self.app.emit(
+                    "allmystuff://node-sites",
+                    serde_json::json!({ "from": from, "services": services, "exposed": exposed }),
+                );
+            }
+            SiteControl::SetExposed { exposed } => {
+                if !self.sender_may_control(from) {
+                    tracing::warn!(
+                        "site set-exposed from {} refused: not owner/fleet",
+                        short_id(from)
+                    );
+                    return;
+                }
+                self.sites.set_exposed(exposed);
+                self.restamp_profile().await;
+            }
+        }
     }
 
     /// Map a peer's site to a local port: bind a local listener (direct port

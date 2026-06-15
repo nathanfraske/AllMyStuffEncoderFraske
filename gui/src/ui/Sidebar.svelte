@@ -11,9 +11,11 @@
 
   const WIDTH_KEY = "allmystuff.sidebar.width.v1";
   const COLLAPSED_KEY = "allmystuff.sidebar.collapsed.v1";
-  const MIN_W = 240;
+  const MIN_W = 232;
   const MAX_W = 520;
-  const DEFAULT_W = 336;
+  // Default to the narrow (min) width, expanded — the panel stays out of the
+  // graph's way but its content is laid out to wrap multi-line when narrow.
+  const DEFAULT_W = MIN_W;
 
   function loadWidth(): number {
     try {

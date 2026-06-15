@@ -406,6 +406,23 @@ fn site_mappings(mesh: State<'_, Arc<Mesh>>) -> Vec<Value> {
         .collect()
 }
 
+/// Ask a co-owned fleet machine for its full site list, to manage its
+/// exposure from its drawer. The reply arrives as `allmystuff://node-sites`.
+#[tauri::command]
+async fn site_remote_list(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
+    mesh.inner().site_remote_list(node).await
+}
+
+/// Tell a co-owned fleet machine to advertise exactly `exposed` (id → name).
+#[tauri::command]
+async fn site_remote_set_exposed(
+    mesh: State<'_, Arc<Mesh>>,
+    node: String,
+    exposed: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    mesh.inner().site_remote_set_exposed(node, exposed).await
+}
+
 /// Open (or focus) a dedicated console window for `node` — its own OS
 /// window, so several remote consoles can be on screen at once. The window
 /// loads the same app with `?console=<node>`, which renders just the
@@ -1001,6 +1018,8 @@ fn main() {
             site_map,
             site_unmap,
             site_mappings,
+            site_remote_list,
+            site_remote_set_exposed,
             session_snapshot,
             room_send,
             room_share_files,

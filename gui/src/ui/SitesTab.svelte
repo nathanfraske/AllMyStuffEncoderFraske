@@ -51,30 +51,32 @@
                     <span class="s-sub"><span class="tag">local-only</span></span>
                   {/if}
                 </span>
-                {#if mapping}
-                  <button
-                    class="btn small primary"
-                    title="Open in your browser"
-                    onclick={() => app.openSite(mapping)}>Open</button
-                  >
-                  <button
-                    class="btn small ghost"
-                    title="Copy its local address"
-                    onclick={() => app.copySite(mapping)}>Copy</button
-                  >
-                  <button
-                    class="btn small ghost s-x"
-                    title="Unmap — stop proxying it here"
-                    aria-label="Unmap"
-                    onclick={() => app.unmapSite(group.node.id, site.id)}>✕</button
-                  >
-                {:else}
-                  <button
-                    class="btn small"
-                    title="Map this site to a local port through the mesh proxy"
-                    onclick={() => app.mapSite(group.node.id, site as SiteAdvert)}>Map</button
-                  >
-                {/if}
+                <div class="row-actions">
+                  {#if mapping}
+                    <button
+                      class="btn small primary"
+                      title="Open in your browser"
+                      onclick={() => app.openSite(mapping)}>Open</button
+                    >
+                    <button
+                      class="btn small ghost"
+                      title="Copy its local address"
+                      onclick={() => app.copySite(mapping)}>Copy</button
+                    >
+                    <button
+                      class="btn small ghost s-x"
+                      title="Unmap — stop proxying it here"
+                      aria-label="Unmap"
+                      onclick={() => app.unmapSite(group.node.id, site.id)}>✕</button
+                    >
+                  {:else}
+                    <button
+                      class="btn small"
+                      title="Map this site to a local port through the mesh proxy"
+                      onclick={() => app.mapSite(group.node.id, site as SiteAdvert)}>Map</button
+                    >
+                  {/if}
+                </div>
               </li>
             {/each}
           </ul>
@@ -111,30 +113,32 @@
                   {#if svc.process}{svc.process}{/if}
                 </span>
               </span>
-              <input
-                class="name-in"
-                placeholder={app.defaultSiteName(svc)}
-                value={nameFor(svc)}
-                title="Name your fleet sees this site under"
-                oninput={(e) => (names[svc.id] = (e.currentTarget as HTMLInputElement).value)}
-                onkeydown={(e) => {
-                  if (e.key === "Enter" && exposed) app.expose(svc.id, nameFor(svc));
-                }}
-                onblur={() => exposed && app.expose(svc.id, nameFor(svc))}
-              />
-              {#if exposed}
-                <button
-                  class="btn small ghost"
-                  title="Stop advertising this service"
-                  onclick={() => app.unexpose(svc.id)}>Stop</button
-                >
-              {:else}
-                <button
-                  class="btn small primary"
-                  title="Advertise this service to your fleet under this name"
-                  onclick={() => app.expose(svc.id, nameFor(svc))}>Expose</button
-                >
-              {/if}
+              <div class="row-actions">
+                <input
+                  class="name-in"
+                  placeholder={app.defaultSiteName(svc)}
+                  value={nameFor(svc)}
+                  title="Name your fleet sees this site under"
+                  oninput={(e) => (names[svc.id] = (e.currentTarget as HTMLInputElement).value)}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter" && exposed) app.expose(svc.id, nameFor(svc));
+                  }}
+                  onblur={() => exposed && app.expose(svc.id, nameFor(svc))}
+                />
+                {#if exposed}
+                  <button
+                    class="btn small ghost"
+                    title="Stop advertising this service"
+                    onclick={() => app.unexpose(svc.id)}>Stop</button
+                  >
+                {:else}
+                  <button
+                    class="btn small primary"
+                    title="Advertise this service to your fleet under this name"
+                    onclick={() => app.expose(svc.id, nameFor(svc))}>Expose</button
+                  >
+                {/if}
+              </div>
             </li>
           {/each}
         </ul>
@@ -199,7 +203,8 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.4rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
     padding: 0.4rem 0.4rem 0.4rem 0.5rem;
@@ -212,10 +217,20 @@
     flex-shrink: 0;
   }
   .s-main {
-    flex: 1;
+    flex: 1 1 6rem;
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* The actions cluster sits inline when the panel is wide and wraps to its
+     own line when it's narrow (the min-width sidebar), so the controls never
+     squash — "ports go multi-line". */
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex: 1 1 10rem;
+    min-width: 0;
   }
   .s-name {
     font-size: 0.82rem;
@@ -263,8 +278,8 @@
     color: var(--danger);
   }
   .name-in {
-    flex: 1.2;
-    min-width: 4rem;
+    flex: 1 1 4rem;
+    min-width: 3.5rem;
     border: 1px solid var(--line-strong);
     border-radius: var(--r-sm);
     padding: 0.25rem 0.4rem;

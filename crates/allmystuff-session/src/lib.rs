@@ -259,6 +259,10 @@ impl Session {
             ControlMessage::Route(rc) => self.handle_route(from, rc),
             ControlMessage::Share(sc) => vec![Effect::Share { from, message: sc }],
             ControlMessage::Ownership(oc) => vec![Effect::Ownership { from, message: oc }],
+            // Site management (list / set-exposed) is handled by the backend
+            // before the session ever sees it — it touches no route state —
+            // so the state machine just ignores it.
+            ControlMessage::Site(_) => Vec::new(),
         }
     }
 

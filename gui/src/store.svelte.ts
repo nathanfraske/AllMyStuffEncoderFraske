@@ -92,6 +92,10 @@ import {
   siteMap,
   siteUnmap,
   siteMappings,
+  siteRemoteList,
+  siteRemoteSetExposed,
+  onNodeSites,
+  type NodeSitesEvent,
   roomWindowTarget,
   terminalWindowTarget,
   filesWindowTarget,
@@ -487,6 +491,10 @@ class AppStore {
   /** Sites this device has mapped to a local port — the live reverse-proxy
    *  bindings, keyed for lookup by `"<node>::<site>"`. */
   siteMappings = $state<SiteMapping[]>([]);
+  /** A fleet machine's full site list + exposed map, fetched on demand when
+   *  you open its drawer to manage exposure remotely. Keyed by canonical
+   *  node id; filled by the `allmystuff://node-sites` reply. */
+  remoteSites = $state<Record<string, { services: ListeningService[]; exposed: Record<string, string> }>>({});
 
   /** This window's id on the same-device room bus — local events echo to
    *  every window (the sender included), and this is how we drop ours. */
@@ -740,6 +748,7 @@ class AppStore {
     await this.pullSessionSnapshot();
     await this.loadOwnedFleet();
     await this.loadSites();
+    await onNodeSites((e) => this.applyNodeSites(e));
     await this.loadUpdateStatus();
     await this.loadDisabledNetworks();
     this.startMeshPolling();
@@ -2245,6 +2254,89 @@ class AppStore {
       () => this.toast("ok", `Copied ${url}`),
       () => this.toast("warn", `Reach it at ${url}`),
     );
+  }
+
+  // ---- managing a device's exposure (this machine *or* a fleet member) ---
+  //
+  // The drawer's "Its sites" controls work the same on your own machine and a
+  // co-owned fleet member — locally it's the persisted set, remotely it's a
+  // gated control message — so these verbs take the node id and dispatch.
+
+  /** A managed machine's full discovered services (this machine: the live
+   *  scan; a fleet member: its last reported list). */
+  deviceServices(nodeId: string): ListeningService[] {
+    if (this.isMe(nodeId)) return this.myListening;
+    return this.remoteSites[canonicalNodeId(nodeId)]?.services ?? [];
+  }
+
+  private deviceExposed(nodeId: string): Record<string, string> {
+    if (this.isMe(nodeId)) return this.exposedSites;
+    return this.remoteSites[canonicalNodeId(nodeId)]?.exposed ?? {};
+  }
+
+  deviceIsExposed(nodeId: string, siteId: string): boolean {
+    return siteId in this.deviceExposed(nodeId);
+  }
+
+  deviceExposeName(nodeId: string, siteId: string): string {
+    return this.deviceExposed(nodeId)[siteId] ?? "";
+  }
+
+  /** Fetch a fleet member's site list so its drawer can manage exposure (a
+   *  no-op for this machine, whose list is already live). The reply repaints
+   *  the drawer via {@link applyNodeSites}. */
+  ensureDeviceSites(nodeId: string) {
+    if (this.isMe(nodeId) || !this.backendConnected) return;
+    void siteRemoteList(nodeId);
+  }
+
+  /** Expose a service on a managed machine under `name` — locally persisted,
+   *  or a gated control message to a fleet member. */
+  async exposeOnDevice(nodeId: string, siteId: string, name: string) {
+    if (this.isMe(nodeId)) {
+      await this.expose(siteId, name);
+      return;
+    }
+    await this.pushRemoteExposed(nodeId, { ...this.deviceExposed(nodeId), [siteId]: name });
+  }
+
+  /** Stop exposing a service on a managed machine. */
+  async unexposeOnDevice(nodeId: string, siteId: string) {
+    if (this.isMe(nodeId)) {
+      await this.unexpose(siteId);
+      return;
+    }
+    const next = { ...this.deviceExposed(nodeId) };
+    delete next[siteId];
+    await this.pushRemoteExposed(nodeId, next);
+  }
+
+  private async pushRemoteExposed(nodeId: string, next: Record<string, string>) {
+    // Optimistic: reflect it locally so the drawer updates immediately; the
+    // member re-advertises and a fresh list will confirm.
+    const key = canonicalNodeId(nodeId);
+    const cur = this.remoteSites[key];
+    if (cur) this.remoteSites = { ...this.remoteSites, [key]: { ...cur, exposed: next } };
+    if (this.backendConnected) await siteRemoteSetExposed(nodeId, next);
+  }
+
+  /** A fleet member answered with its site list (the `node-sites` reply). */
+  private applyNodeSites(e: NodeSitesEvent) {
+    const services: ListeningService[] = (e.services ?? []).map((s) => ({
+      id: s.id,
+      name: s.name,
+      port: s.port,
+      // SiteService carries no `kind`; the drawer keys off the scheme.
+      kind: "",
+      scheme: s.scheme,
+      loopback: s.loopback,
+      process: s.process,
+      title: s.title,
+    }));
+    this.remoteSites = {
+      ...this.remoteSites,
+      [canonicalNodeId(e.from)]: { services, exposed: e.exposed ?? {} },
+    };
   }
 
   // ---- ownership / claiming ---------------------------------------

@@ -20,6 +20,7 @@ import type {
   RosterPeer,
   SharedFileMeta,
   SiteAdvert,
+  SiteService,
   TermEvent,
   UpdatePrefs,
   UpdateStatus,
@@ -909,6 +910,35 @@ export function siteUnmap(node: string, port: number): Promise<null> {
 export async function siteMappings(): Promise<SiteMappingInfo[]> {
   const r = await tryInvoke<SiteMappingInfo[]>("site_mappings");
   return Array.isArray(r) ? r : [];
+}
+
+/** Ask a co-owned fleet machine for its full site list (to manage its
+ *  exposure from its drawer). The reply arrives via {@link onNodeSites}. */
+export function siteRemoteList(node: string): Promise<null> {
+  return tryInvoke("site_remote_list", { node });
+}
+
+/** Tell a co-owned fleet machine to advertise exactly `exposed` (id → name). */
+export function siteRemoteSetExposed(
+  node: string,
+  exposed: Record<string, string>,
+): Promise<null> {
+  return tryInvoke("site_remote_set_exposed", { node, exposed });
+}
+
+/** A managed machine's answer to {@link siteRemoteList}: its full discovered
+ *  services + its current exposed map. */
+export interface NodeSitesEvent {
+  from: string;
+  services: SiteService[];
+  exposed: Record<string, string>;
+}
+
+/** Subscribe to fleet machines' site-list replies. No-op in web mode. */
+export async function onNodeSites(cb: (e: NodeSitesEvent) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<NodeSitesEvent>("allmystuff://node-sites", (e) => cb(e.payload));
 }
 
 // ---- self-update -------------------------------------------------------

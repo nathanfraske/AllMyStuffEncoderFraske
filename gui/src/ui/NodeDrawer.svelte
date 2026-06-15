@@ -7,9 +7,11 @@
     originIcon,
     humanBytes,
     mediaColor,
+    siteIcon,
     type Capability,
     type Grant,
     type GrantRole,
+    type ListeningService,
     type MediaKind,
   } from "../types";
 
@@ -117,6 +119,21 @@
   /** Whether the capability list is expanded — starts folded so the drawer
    *  leads with the relationship, not a wall of devices. */
   let stuffOpen = $state(false);
+  /** Whether the "Its sites" section is expanded (its own collapse, under
+   *  "Its stuff"). Opening it fetches a fleet member's site list. */
+  let sitesOpen = $state(false);
+  /** Per-row name drafts for the expose inputs in "Its sites". */
+  let exposeNames = $state<Record<string, string>>({});
+
+  const deviceSites = $derived(node ? app.deviceServices(node.id) : []);
+  function exposeNameFor(svc: ListeningService): string {
+    if (!node) return "";
+    return exposeNames[svc.id] ?? (app.deviceExposeName(node.id, svc.id) || app.defaultSiteName(svc));
+  }
+  // Pull a fleet member's site list whenever the section is open for it.
+  $effect(() => {
+    if (sitesOpen && node) app.ensureDeviceSites(node.id);
+  });
 
   // ---- sidebar sizing --------------------------------------------------
   //
@@ -523,6 +540,68 @@
       {/each}
       {/if}
     </section>
+
+    <!-- Its sites — the services this machine exposes over the mesh proxy.
+         For your own machine, and any co-owned fleet member, you can expose /
+         rename / stop them right here (remotely for a fleet member). -->
+    {#if isAppNode(node)}
+    <section class="block">
+      <button
+        class="stuff-toggle"
+        onclick={() => (sitesOpen = !sitesOpen)}
+        aria-expanded={sitesOpen}
+      >
+        <span class="stuff-chevron" class:open={sitesOpen} aria-hidden="true">▸</span>
+        <h4 class="stuff-title">Its sites</h4>
+        <span class="stuff-count">
+          {deviceSites.filter((s) => app.deviceIsExposed(node.id, s.id)).length} exposed
+        </span>
+      </button>
+      {#if sitesOpen}
+        {#if deviceSites.length === 0}
+          <p class="sites-empty">
+            {app.isMe(node.id)
+              ? "No listening services found."
+              : "No services reported — it may be offline or older."}
+          </p>
+        {:else}
+          <ul class="dsites">
+            {#each deviceSites as svc (svc.id)}
+              {@const exposed = app.deviceIsExposed(node.id, svc.id)}
+              <li class="dsite" class:lit={exposed}>
+                <span class="ds-icon" aria-hidden="true">{siteIcon(svc.scheme)}</span>
+                <div class="ds-main">
+                  <div class="ds-name">{svc.name}<span class="ds-port">:{svc.port}</span></div>
+                  <div class="ds-sub">
+                    {#if svc.loopback}<span class="tag">local-only</span>{/if}
+                    {#if svc.process}{svc.process}{/if}
+                  </div>
+                </div>
+                <div class="ds-controls">
+                  <input
+                    class="ds-in"
+                    placeholder={app.defaultSiteName(svc)}
+                    value={exposeNameFor(svc)}
+                    title="Name your fleet sees this site under"
+                    oninput={(e) => (exposeNames[svc.id] = (e.currentTarget as HTMLInputElement).value)}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter" && exposed) app.exposeOnDevice(node.id, svc.id, exposeNameFor(svc));
+                    }}
+                    onblur={() => exposed && app.exposeOnDevice(node.id, svc.id, exposeNameFor(svc))}
+                  />
+                  {#if exposed}
+                    <button class="btn small ghost" onclick={() => app.unexposeOnDevice(node.id, svc.id)}>Stop</button>
+                  {:else}
+                    <button class="btn small primary" onclick={() => app.exposeOnDevice(node.id, svc.id, exposeNameFor(svc))}>Expose</button>
+                  {/if}
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
+    </section>
+    {/if}
     {/if}
     {/if}
       </div>
@@ -531,6 +610,84 @@
 {/if}
 
 <style>
+  .sites-empty {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    margin: 0.3rem 0 0;
+  }
+  .dsites {
+    list-style: none;
+    margin: 0.3rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .dsite {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    background: var(--surface-2);
+    border-radius: var(--r-sm);
+    padding: 0.4rem 0.45rem;
+  }
+  .dsite.lit {
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .ds-icon {
+    font-size: 0.95rem;
+    flex-shrink: 0;
+  }
+  .ds-main {
+    flex: 1;
+    min-width: 6rem;
+  }
+  .ds-name {
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .ds-port {
+    color: var(--ink-faint);
+    font-weight: 500;
+    margin-left: 0.2rem;
+    font-family: var(--mono);
+    font-size: 0.76rem;
+  }
+  .ds-sub {
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  .ds-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex: 1 1 100%;
+  }
+  .ds-in {
+    flex: 1;
+    min-width: 4rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.25rem 0.4rem;
+    font-size: 0.74rem;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .tag {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    padding: 0 0.32rem;
+    font-size: 0.62rem;
+    font-weight: 700;
+    color: var(--ink-faint);
+  }
+
   /* A real sidebar: it shares the stage's flex row, so selecting a node
      reflows the graph to the left instead of covering it. Width is set
      inline (resizable + persisted); this is just the first-paint fallback. */
