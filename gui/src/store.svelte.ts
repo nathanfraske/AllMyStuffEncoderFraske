@@ -19,7 +19,19 @@ import {
   exportNetworkSettings,
   networkAddPayloadFromEnvelope,
   tryParseNetworkSettings,
+  venuesFromEnvelope,
 } from "./network-settings";
+import {
+  loadNetworkVenues,
+  loadVenues,
+  newVenueId,
+  PUBLIC_VENUE_ID,
+  saveNetworkVenues,
+  saveVenues,
+  unionServers,
+  type Venue,
+} from "./venues";
+import { fetchVenueServers } from "./venue-settings";
 import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
@@ -124,7 +136,7 @@ import {
 } from "./types";
 
 /** Which pane the settings panel is showing. */
-export type SettingsTab = "networks" | "updates" | "fleet" | "sharing";
+export type SettingsTab = "networks" | "venues" | "updates" | "fleet" | "sharing";
 
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
@@ -470,8 +482,16 @@ class AppStore {
   /** Full per-network configs (signaling/STUN/TURN) from the daemon — the
    *  Servers pane reads + round-trips these. Keyed implicitly by `id`. */
   networkConfigs = $state<NetworkConfigFull[]>([]);
-  /** config_id currently selected in the Servers pane. */
+  /** config_id currently selected in the Servers/Venue pane. */
   serversNetwork = $state<string | null>(null);
+  /** All venues — the named signaling/STUN/TURN sets a mesh "calls out" at,
+   *  built-in Public first. App-side only (localStorage); compiled into each
+   *  mesh's per-network config as the union of its venues. */
+  venues = $state<Venue[]>(loadVenues());
+  /** network_id → the venue ids that mesh uses (effective servers = union). */
+  networkVenues = $state<Record<string, string[]>>(loadNetworkVenues());
+  /** The venue open in the Venues tab editor (null = list view). */
+  venueDraft = $state<Venue | null>(null);
   /** Networks switched *off* but kept — their full parked configs. The
    *  pill menu lists these under the live ones; enabling re-joins. */
   disabledNets = $state<NetworkConfigFull[]>([]);
@@ -3511,15 +3531,23 @@ class AppStore {
    *  agree on (the signaling handle is a hash of it), so joining a name nobody
    *  else is on *is* creating it. Typed names are canonicalized (lowercased,
    *  spaces → hyphens) so "Beach House" and "beach-house" meet on the same one. */
-  async joinNetwork(rawName: string) {
+  async joinNetwork(rawName: string, venueIds: string[] = [PUBLIC_VENUE_ID]) {
     const typed = rawName.trim();
     const id = typed ? canonicalNetworkId(typed) : generateNetworkPhrase();
     if (id.length < 3 || id.length > 64) {
       this.toast("warn", "A network name needs 3–64 letters, digits or hyphens");
       return;
     }
+    // Compile the chosen venue(s) into the mesh's servers (union); remember
+    // the choice so it shows in the Venue pane and survives edits.
+    const venues = venueIds.map((v) => this.venueById(v)).filter((v): v is Venue => !!v);
+    const s = unionServers(venues);
     try {
-      await meshNetworkAdd(buildNetworkConfig({ networkId: id }));
+      await meshNetworkAdd(
+        buildNetworkConfig({ networkId: id, signaling: s.signaling, stun: s.stun, turn: s.turn }),
+      );
+      this.networkVenues[id] = venues.map((v) => v.id);
+      this.persistNetworkVenues();
       this.toast("ok", typed ? `Joined ${id}` : `Created ${id}`);
       await this.refreshNetworks();
     } catch (e) {
@@ -3549,7 +3577,10 @@ class AppStore {
       return;
     }
     try {
-      const env = exportNetworkSettings(cfg);
+      // Bundle the mesh's custom venues so importing the file brings them too;
+      // the built-in Public one is on every device already, so it's left out.
+      const venues = this.venuesForNetwork(cfg.network_id).filter((v) => !v.builtin);
+      const env = exportNetworkSettings(cfg, venues);
       const base = (env.label || env.network_id || "network").replace(/[^\w.-]+/g, "_").slice(0, 48);
       const saved = await exportNetworkFile(`${base}.network-settings.json`, env);
       if (saved) this.toast("ok", `Exported ${env.label || env.network_id}`);
@@ -3581,6 +3612,17 @@ class AppStore {
       this.toast("ok", `Imported ${env.label || env.network_id}`);
       await this.refreshNetworks();
       await this.loadNetworkConfigs();
+      // Recreate the venues the mesh travelled with, map the mesh to them, and
+      // refresh any remote ones from their host. The flat servers in the file
+      // already seeded the right config, so this is for future edits/updates.
+      const brought = venuesFromEnvelope(env);
+      if (brought.length) {
+        this.venues = [...this.venues, ...brought];
+        this.persistVenues();
+        this.networkVenues[env.network_id] = brought.map((v) => v.id);
+        this.persistNetworkVenues();
+        for (const v of brought) if (v.url) void this.refreshVenue(v.id);
+      }
     } catch (e) {
       this.toast("warn", `Couldn't import the network: ${errMsg(e)}`);
     }
@@ -3768,6 +3810,124 @@ class AppStore {
     } catch (e) {
       this.toast("warn", `Couldn't save servers: ${errMsg(e)}`);
     }
+  }
+
+  // ---- venues (the named "where a mesh calls out" sets; app-side) --
+
+  venueById(id: string): Venue | undefined {
+    return this.venues.find((v) => v.id === id);
+  }
+
+  /** The venues a mesh uses, by its wire id. Defaults to Public when unmapped
+   *  (matching the daemon defaults a fresh mesh already gets). */
+  venuesForNetwork(networkId: string): Venue[] {
+    const ids = this.networkVenues[networkId];
+    if (!ids || ids.length === 0) {
+      const pub = this.venueById(PUBLIC_VENUE_ID);
+      return pub ? [pub] : [];
+    }
+    return ids.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
+  }
+
+  private persistVenues() {
+    saveVenues(this.venues);
+  }
+  private persistNetworkVenues() {
+    saveNetworkVenues(this.networkVenues);
+  }
+
+  /** Create or replace a venue (matched by id), persist it, and re-apply it to
+   *  every live mesh that uses it so an edit propagates. */
+  async saveVenue(v: Venue) {
+    const i = this.venues.findIndex((x) => x.id === v.id);
+    if (i >= 0) this.venues[i] = v;
+    else this.venues = [...this.venues, v];
+    this.persistVenues();
+    await this.reapplyVenue(v.id);
+  }
+
+  /** Delete a venue (never the built-in Public one). Meshes that used it fall
+   *  back to Public, re-applied. */
+  async deleteVenue(id: string) {
+    const v = this.venueById(id);
+    if (!v || v.builtin || id === PUBLIC_VENUE_ID) return;
+    this.venues = this.venues.filter((x) => x.id !== id);
+    this.persistVenues();
+    const affected: string[] = [];
+    for (const [nid, ids] of Object.entries(this.networkVenues)) {
+      if (ids.includes(id)) {
+        const next = ids.filter((x) => x !== id);
+        if (next.length) this.networkVenues[nid] = next;
+        else delete this.networkVenues[nid];
+        affected.push(nid);
+      }
+    }
+    this.persistNetworkVenues();
+    for (const nid of affected) await this.applyNetworkVenuesByWireId(nid);
+    if (this.venueDraft?.id === id) this.venueDraft = null;
+    this.toast("info", `Removed ${v.label}`);
+  }
+
+  /** Re-fetch a remote venue's servers from its url, cache them, and re-apply
+   *  to any mesh using it. */
+  async refreshVenue(id: string) {
+    const v = this.venueById(id);
+    if (!v?.url) return;
+    try {
+      const s = await fetchVenueServers(v.url);
+      await this.saveVenue({ ...v, signaling: s.signaling, stun: s.stun, turn: s.turn, fetchedAt: Date.now() });
+      this.toast("ok", `Refreshed ${v.label}`);
+    } catch (e) {
+      this.toast("warn", `Couldn't reach ${v.label}: ${errMsg(e)}`);
+    }
+  }
+
+  /** Point a mesh at a set of venues: write the union of their servers to the
+   *  daemon (reconnecting it) and remember the choice. */
+  async setNetworkVenues(configId: string, venueIds: string[]) {
+    const cfg = this.networkConfig(configId);
+    if (!cfg) return;
+    const venues = venueIds.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
+    this.networkVenues[cfg.network_id] = venues.map((v) => v.id);
+    this.persistNetworkVenues();
+    await this.updateNetworkServers(configId, unionServers(venues));
+  }
+
+  /** Re-apply a venue to every live mesh that uses it (after an edit). */
+  private async reapplyVenue(venueId: string) {
+    for (const [nid, ids] of Object.entries(this.networkVenues)) {
+      if (ids.includes(venueId)) await this.applyNetworkVenuesByWireId(nid);
+    }
+  }
+
+  /** Recompute + write a mesh's union, found by wire id. */
+  private async applyNetworkVenuesByWireId(networkId: string) {
+    const cfg = this.networkConfigs.find((c) => c.network_id === networkId);
+    if (!cfg) return;
+    await this.updateNetworkServers(cfg.id, unionServers(this.venuesForNetwork(networkId)));
+  }
+
+  /** Save a mesh's current inline servers as a new named venue and switch the
+   *  mesh onto it — the escape hatch from editing raw servers. */
+  saveServersAsVenue(configId: string, label: string): Venue | undefined {
+    const cfg = this.networkConfig(configId);
+    if (!cfg) return;
+    const v: Venue = {
+      id: newVenueId(),
+      label: label.trim() || "New venue",
+      signaling: cfg.signaling?.servers ?? [],
+      stun: (cfg.stun_servers ?? []).flatMap((s) => s.urls),
+      turn: (cfg.turn_servers ?? []).map((t) => ({
+        url: t.urls[0] ?? "",
+        username: t.username ?? "",
+        credential: t.credential ?? "",
+      })),
+    };
+    this.venues = [...this.venues, v];
+    this.persistVenues();
+    this.networkVenues[cfg.network_id] = [v.id];
+    this.persistNetworkVenues();
+    return v;
   }
 
   /** Load the roster + live peers for one network (the approvals view). */

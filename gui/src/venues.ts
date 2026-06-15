@@ -116,3 +116,34 @@ export function saveVenues(venues: Venue[]): void {
     /* ignore quota / unavailable storage */
   }
 }
+
+const NETWORK_VENUES_KEY = "ams.network-venues.v1";
+
+/** Load the mesh→venue map (keyed by `network_id`, the portable wire id, so
+ *  the choice survives re-adds and matches imported meshes). */
+export function loadNetworkVenues(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(NETWORK_VENUES_KEY);
+    if (raw) {
+      const m = JSON.parse(raw) as unknown;
+      if (m && typeof m === "object") {
+        const out: Record<string, string[]> = {};
+        for (const [k, v] of Object.entries(m as Record<string, unknown>)) {
+          if (Array.isArray(v)) out[k] = v.filter((x): x is string => typeof x === "string");
+        }
+        return out;
+      }
+    }
+  } catch {
+    /* ignore corrupt storage */
+  }
+  return {};
+}
+
+export function saveNetworkVenues(map: Record<string, string[]>): void {
+  try {
+    localStorage.setItem(NETWORK_VENUES_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
+}
