@@ -52,9 +52,15 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms", "camera"],
+      features: ["terminal", "files", "rooms", "camera", "sites"],
       owner: "this",
       summary: { os: "Windows 11", cpu: "Ryzen 7 7700", ram_bytes: 32 * 2 ** 30, device_count: 11 },
+      // A couple of self-hosted services it exposes — a Grafana dashboard
+      // (web) and a Postgres (a bare TCP service the proxy still tunnels).
+      sites: [
+        { id: "tcp:3000", label: "HTTP", port: 3000, scheme: "http", loopback: true },
+        { id: "tcp:5432", label: "PostgreSQL", port: 5432, scheme: "postgres", loopback: true },
+      ],
     },
     {
       id: "tv",
@@ -63,9 +69,11 @@ export function demoCatalog(): Catalog {
       relationship: { kind: "mine" },
       online: true,
       app: true,
-      features: ["terminal", "files", "rooms", "camera"],
+      features: ["terminal", "files", "rooms", "camera", "sites"],
       owner: "this",
       summary: { os: "Linux", cpu: "Amlogic S905", ram_bytes: 4 * 2 ** 30, device_count: 5 },
+      // A media server the living-room box runs.
+      sites: [{ id: "tcp:8096", label: "HTTP", port: 8096, scheme: "http", loopback: false }],
     },
     {
       id: "studio",

@@ -278,6 +278,23 @@ fn clean_hex_id(s: &str) -> String {
     format!("{:0>4}", t.to_lowercase())
 }
 
+/// Enumerate the TCP ports this machine is listening on, via `lsof` (there's
+/// no `/proc/net/tcp` on macOS). `-n -P` skip DNS/port-name lookups; `-iTCP
+/// -sTCP:LISTEN` selects listening TCP sockets. Run as the user, lsof sees
+/// the user's own servers (a dev server, a database) without elevation.
+/// Degrades to an empty list if lsof isn't there or finds nothing.
+pub fn collect_listening() -> Vec<ListeningService> {
+    let Ok(out) = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    // lsof exits non-zero when nothing matches; parse whatever it printed.
+    let text = String::from_utf8_lossy(&out.stdout);
+    crate::listening::services_from_lsof(&text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

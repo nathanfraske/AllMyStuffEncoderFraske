@@ -513,10 +513,7 @@ fn pipewire_consume(
             let format = data.format.format();
             let bpp: usize = match format {
                 VideoFormat::RGB => 3,
-                VideoFormat::RGBA
-                | VideoFormat::RGBx
-                | VideoFormat::BGRx
-                | VideoFormat::BGRA => 4,
+                VideoFormat::RGBA | VideoFormat::RGBx | VideoFormat::BGRx | VideoFormat::BGRA => 4,
                 other => {
                     drops.warn("format", || {
                         format!("screencast format {other:?} unsupported — frame dropped")

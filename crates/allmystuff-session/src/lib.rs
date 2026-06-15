@@ -33,8 +33,9 @@ pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
     ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, FileEntry, FileEvent,
-    FileFrame, InputAction, InputEvent, MediaPayload, TermEvent, TermFrame, VideoAssembler,
-    VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
+    FileFrame, InputAction, InputEvent, MediaPayload, SiteEvent, SiteFrame, TermEvent, TermFrame,
+    VideoAssembler, VideoFrame, VideoStatusFrame, VideoStatusState, CLIPBOARD_CHUNK_BYTES,
+    SITE_CHUNK_BYTES,
 };
 
 /// Which side of a route we are.
@@ -258,6 +259,10 @@ impl Session {
             ControlMessage::Route(rc) => self.handle_route(from, rc),
             ControlMessage::Share(sc) => vec![Effect::Share { from, message: sc }],
             ControlMessage::Ownership(oc) => vec![Effect::Ownership { from, message: oc }],
+            // Site management (list / set-exposed) is handled by the backend
+            // before the session ever sees it — it touches no route state —
+            // so the state machine just ignores it.
+            ControlMessage::Site(_) => Vec::new(),
         }
     }
 
@@ -391,6 +396,7 @@ mod tests {
             claimable: false,
             boot: 0,
             features: vec![],
+            sites: vec![],
         }
     }
 

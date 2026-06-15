@@ -28,6 +28,7 @@ mod input_inject;
 mod mesh;
 mod networks_store;
 mod ownership;
+mod sites;
 mod terminal;
 mod video;
 mod video_decode;
@@ -348,6 +349,78 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---- sites (the reverse proxy) -----------------------------------------
+
+/// This machine's discovered listening TCP services (with an active banner
+/// probe), so the Sites tab can offer each to expose. The probe does
+/// blocking socket I/O, so it runs off the command executor.
+#[tauri::command]
+async fn site_scan(
+    mesh: State<'_, Arc<Mesh>>,
+) -> Result<Vec<allmystuff_inventory::ListeningService>, String> {
+    let mesh = mesh.inner().clone();
+    tokio::task::spawn_blocking(move || mesh.site_scan())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The services this machine currently advertises, as id → display name
+/// (empty name = the classified default).
+#[tauri::command]
+fn site_exposed(mesh: State<'_, Arc<Mesh>>) -> std::collections::BTreeMap<String, String> {
+    mesh.site_exposed()
+}
+
+/// Set which listening services this machine advertises (id → display name).
+/// Re-broadcasts presence so peers' Sites tabs update; returns the new set.
+#[tauri::command]
+async fn site_set_exposed(
+    mesh: State<'_, Arc<Mesh>>,
+    exposed: std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    Ok(mesh.inner().site_set_exposed(exposed).await)
+}
+
+/// Map a peer's site to a local port — set up the reverse-proxy route and
+/// bind a local listener. Returns `{ localPort }`.
+#[tauri::command]
+async fn site_map(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<Value, String> {
+    let local_port = mesh.inner().site_map(node, port).await?;
+    Ok(json!({ "localPort": local_port }))
+}
+
+/// Tear a site mapping down (unbind the local listener, drop the route).
+#[tauri::command]
+async fn site_unmap(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<(), String> {
+    mesh.inner().site_unmap(node, port).await
+}
+
+/// Every site this machine currently has mapped: `{ node, port, localPort }`.
+#[tauri::command]
+fn site_mappings(mesh: State<'_, Arc<Mesh>>) -> Vec<Value> {
+    mesh.site_mappings()
+        .into_iter()
+        .map(|(node, port, local_port)| json!({ "node": node, "port": port, "localPort": local_port }))
+        .collect()
+}
+
+/// Ask a co-owned fleet machine for its full site list, to manage its
+/// exposure from its drawer. The reply arrives as `allmystuff://node-sites`.
+#[tauri::command]
+async fn site_remote_list(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
+    mesh.inner().site_remote_list(node).await
+}
+
+/// Tell a co-owned fleet machine to advertise exactly `exposed` (id → name).
+#[tauri::command]
+async fn site_remote_set_exposed(
+    mesh: State<'_, Arc<Mesh>>,
+    node: String,
+    exposed: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    mesh.inner().site_remote_set_exposed(node, exposed).await
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -939,6 +1012,14 @@ fn main() {
             file_unwatch,
             file_download,
             open_files_window,
+            site_scan,
+            site_exposed,
+            site_set_exposed,
+            site_map,
+            site_unmap,
+            site_mappings,
+            site_remote_list,
+            site_remote_set_exposed,
             session_snapshot,
             room_send,
             room_share_files,

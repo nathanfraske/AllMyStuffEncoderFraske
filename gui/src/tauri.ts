@@ -11,6 +11,7 @@ import type {
   IdentityInfo,
   InputAction,
   InventorySummary,
+  ListeningService,
   MediaKind,
   NetworkConfigFull,
   NetworkSummary,
@@ -18,6 +19,8 @@ import type {
   PeerInfo,
   RosterPeer,
   SharedFileMeta,
+  SiteAdvert,
+  SiteService,
   TermEvent,
   UpdatePrefs,
   UpdateStatus,
@@ -54,6 +57,9 @@ export interface SessionSnapshot {
     /** App features the peer advertises ("terminal", …). Absent from an
      *  older peer — same as empty. */
     features?: string[];
+    /** Sites the peer exposes for reverse-proxying (from its presence
+     *  advert). Absent — an older peer, or one exposing nothing — is empty. */
+    sites?: SiteAdvert[];
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -847,6 +853,92 @@ export async function onVideoLocal(cb: (e: VideoLocalEvent) => void): Promise<()
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<VideoLocalEvent>("allmystuff://video-local", (e) => cb(e.payload));
+}
+
+// ---- sites (the reverse-proxy plane) -----------------------------------
+//
+// All of these degrade in web mode (no backend): the scan is empty, the
+// exposed set is empty, and a map/unmap is a no-op — so the Sites sidebar
+// falls back to its demo data and stays interactive.
+
+/** This machine's discovered listening TCP services (the full set, so the
+ *  owner can choose which to expose). Empty in web mode. */
+export async function siteScan(): Promise<ListeningService[]> {
+  const r = await tryInvoke<ListeningService[]>("site_scan");
+  return Array.isArray(r) ? r : [];
+}
+
+/** The services this machine currently *advertises* (exposes to the mesh),
+ *  as id → display name (empty = the classified default). Persisted
+ *  backend-side and reflected in presence. */
+export async function siteExposed(): Promise<Record<string, string>> {
+  const r = await tryInvoke<Record<string, string>>("site_exposed");
+  return r && typeof r === "object" ? r : {};
+}
+
+/** Set which listening services this machine advertises (id → display name).
+ *  Returns the new exposed map (the backend re-broadcasts presence so peers
+ *  see the change). */
+export async function siteSetExposed(
+  exposed: Record<string, string>,
+): Promise<Record<string, string>> {
+  const r = await tryInvoke<Record<string, string>>("site_set_exposed", { exposed });
+  return r && typeof r === "object" ? r : exposed;
+}
+
+/** A live local mapping of a remote site: the host port and the local port
+ *  this machine bound the tunnel on. */
+export interface SiteMappingInfo {
+  node: string;
+  port: number;
+  localPort: number;
+}
+
+/** Map a peer's site to a local port — sets up the reverse-proxy route and
+ *  binds a local listener. Returns the bound local port (the same number
+ *  when free, else a remapped one), or null in web mode. */
+export function siteMap(node: string, port: number): Promise<{ localPort: number } | null> {
+  return tryInvoke<{ localPort: number }>("site_map", { node, port });
+}
+
+/** Tear a site mapping down (unbinds the local listener, drops the route). */
+export function siteUnmap(node: string, port: number): Promise<null> {
+  return tryInvoke("site_unmap", { node, port });
+}
+
+/** Every site this machine currently has mapped. Empty in web mode. */
+export async function siteMappings(): Promise<SiteMappingInfo[]> {
+  const r = await tryInvoke<SiteMappingInfo[]>("site_mappings");
+  return Array.isArray(r) ? r : [];
+}
+
+/** Ask a co-owned fleet machine for its full site list (to manage its
+ *  exposure from its drawer). The reply arrives via {@link onNodeSites}. */
+export function siteRemoteList(node: string): Promise<null> {
+  return tryInvoke("site_remote_list", { node });
+}
+
+/** Tell a co-owned fleet machine to advertise exactly `exposed` (id → name). */
+export function siteRemoteSetExposed(
+  node: string,
+  exposed: Record<string, string>,
+): Promise<null> {
+  return tryInvoke("site_remote_set_exposed", { node, exposed });
+}
+
+/** A managed machine's answer to {@link siteRemoteList}: its full discovered
+ *  services + its current exposed map. */
+export interface NodeSitesEvent {
+  from: string;
+  services: SiteService[];
+  exposed: Record<string, string>;
+}
+
+/** Subscribe to fleet machines' site-list replies. No-op in web mode. */
+export async function onNodeSites(cb: (e: NodeSitesEvent) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<NodeSitesEvent>("allmystuff://node-sites", (e) => cb(e.payload));
 }
 
 // ---- self-update -------------------------------------------------------

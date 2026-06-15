@@ -403,6 +403,75 @@ impl ClipboardFrame {
     }
 }
 
+/// One frame of a **site** route — AllMyStuff's reverse proxy. A site route
+/// carries a raw TCP service (a local web app, a database) across the mesh:
+/// the *client* side accepts local TCP connections on a mapped port and
+/// tunnels each one to the *host*, which connects it to `127.0.0.1:<port>`
+/// and pumps bytes back. One route multiplexes many connections — a browser
+/// opens several at once — so every frame names its `conn` (a client-minted
+/// id scoping that connection within the route), exactly as a [`FileFrame`]
+/// names its `req`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteFrame {
+    /// Tag for demuxing off the shared media channel. Always `"site"`.
+    pub t: MediaTagSite,
+    pub route: String,
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: SiteEvent,
+}
+
+/// What happened on one tunneled connection of a site route. The client
+/// opens (`Open`), both ends stream (`Data`), and either end closes
+/// (`Close`). The host validates `Open`'s `port` against the site it
+/// advertised before connecting — the advert is the allow-list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SiteEvent {
+    /// Client → host: open a tunnel to the site's port. `conn` scopes this
+    /// connection's frames within the route; `port` is the advertised site
+    /// port the host must re-validate before dialing loopback.
+    Open { conn: u64, port: u16 },
+    /// Either direction: one chunk of `conn`'s byte stream (base64 on the
+    /// wire — the channel is JSON, like every media frame). Capped well
+    /// under the daemon's ~64 KiB message ceiling by the sender.
+    Data {
+        conn: u64,
+        #[serde(with = "bytes_b64")]
+        data: Vec<u8>,
+    },
+    /// Either direction: `conn`'s stream ended (EOF, reset, or teardown).
+    /// The other side closes its half of the local socket.
+    Close { conn: u64 },
+}
+
+impl SiteEvent {
+    /// The connection id this event belongs to, whatever its kind.
+    pub fn conn(&self) -> u64 {
+        match self {
+            SiteEvent::Open { conn, .. }
+            | SiteEvent::Data { conn, .. }
+            | SiteEvent::Close { conn } => *conn,
+        }
+    }
+}
+
+impl SiteFrame {
+    pub fn new(route: impl Into<String>, seq: u64, event: SiteEvent) -> Self {
+        SiteFrame {
+            t: MediaTagSite::Site,
+            route: route.into(),
+            seq,
+            event,
+        }
+    }
+}
+
+/// Max raw bytes per [`SiteEvent::Data`] frame before base64 — kept well
+/// under the daemon channel's ~64 KiB message ceiling once base64 (×4/3)
+/// and the JSON envelope are added, the same budget the files plane uses.
+pub const SITE_CHUNK_BYTES: usize = 40 * 1024;
+
 /// Everything that can arrive on the media channel, demuxed by the `t`
 /// tag (no tag = audio, the original frame shape).
 #[derive(Debug, Clone, PartialEq)]
@@ -414,6 +483,7 @@ pub enum MediaPayload {
     Terminal(TermFrame),
     File(FileFrame),
     Clipboard(ClipboardFrame),
+    Site(SiteFrame),
 }
 
 impl MediaPayload {
@@ -437,6 +507,7 @@ impl MediaPayload {
             Some("clip") => serde_json::from_value(payload)
                 .ok()
                 .map(MediaPayload::Clipboard),
+            Some("site") => serde_json::from_value(payload).ok().map(MediaPayload::Site),
             Some(_) => None,
             None => serde_json::from_value(payload)
                 .ok()
@@ -454,6 +525,7 @@ impl MediaPayload {
             MediaPayload::Terminal(f) => &f.route,
             MediaPayload::File(f) => &f.route,
             MediaPayload::Clipboard(f) => &f.route,
+            MediaPayload::Site(f) => &f.route,
         }
     }
 }
@@ -494,6 +566,13 @@ pub enum MediaTagClipboard {
     #[default]
     #[serde(rename = "clip")]
     Clipboard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MediaTagSite {
+    #[default]
+    #[serde(rename = "site")]
+    Site,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1055,6 +1134,53 @@ mod tests {
         assert_eq!(
             MediaPayload::decode(serde_json::json!({
                 "t": "clip", "route": "r", "seq": 1, "kind": "hologram"
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn site_frames_round_trip_and_demux() {
+        let events = vec![
+            SiteEvent::Open {
+                conn: 1,
+                port: 8080,
+            },
+            SiteEvent::Data {
+                conn: 1,
+                data: vec![0x47, 0x45, 0x54],
+            },
+            SiteEvent::Close { conn: 1 },
+        ];
+        for event in events {
+            let conn = event.conn();
+            let f = SiteFrame::new("route:a:site→b:site-view:0", 2, event);
+            let v = serde_json::to_value(&f).unwrap();
+            assert_eq!(v["t"], "site");
+            assert_eq!(v["conn"], conn);
+            let back: SiteFrame = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(f, back);
+            assert!(matches!(
+                MediaPayload::decode(v),
+                Some(MediaPayload::Site(g)) if g.seq == 2
+            ));
+        }
+        // Tunneled bytes travel as base64, never raw.
+        let f = SiteFrame::new(
+            "r",
+            0,
+            SiteEvent::Data {
+                conn: 9,
+                data: vec![0xFF],
+            },
+        );
+        assert!(serde_json::to_string(&f)
+            .unwrap()
+            .contains("\"data\":\"/w==\""));
+        // A newer peer's new event kind fails *that frame only*.
+        assert_eq!(
+            MediaPayload::decode(serde_json::json!({
+                "t": "site", "route": "r", "seq": 1, "kind": "warp"
             })),
             None
         );

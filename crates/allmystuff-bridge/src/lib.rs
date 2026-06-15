@@ -32,6 +32,8 @@ use allmystuff_graph::{Capability, Flow, MediaKind, NodeId};
 use allmystuff_inventory::{InputKind, Inventory};
 use allmystuff_protocol::InventorySummary;
 
+pub mod sites;
+
 /// One additional capturable screen beyond the primary — supplied by the
 /// caller that actually owns a capture stack (the GUI, from its monitor
 /// enumeration), since the cross-platform inventory can't promise its
@@ -282,6 +284,7 @@ mod tests {
             cameras: vec![],
             inputs: vec![],
             usb: vec![],
+            listening: vec![],
         }
     }
 

@@ -27,13 +27,14 @@ use tokio::sync::mpsc;
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
     ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RoomMessage,
-    RouteControl, SharedFileMeta, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, PROTOCOL_VERSION,
+    RouteControl, SharedFileMeta, SiteControl, SiteService, CHANNEL_CONTROL, CHANNEL_MEDIA,
+    CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
-    FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session, TermEvent, TermFrame,
-    VideoAssembler, VideoFrame, VideoStatusFrame, CLIPBOARD_CHUNK_BYTES,
+    FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session, SiteEvent, SiteFrame,
+    TermEvent, TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame, CLIPBOARD_CHUNK_BYTES,
+    SITE_CHUNK_BYTES,
 };
 
 use crate::audio::{AudioBridge, CaptureSource};
@@ -42,6 +43,7 @@ use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge};
@@ -78,6 +80,13 @@ pub struct Mesh {
     /// Sequence for outbound file frames (requests viewer-side, response
     /// streams host-side — one stream per app run, like `term_seq`).
     file_seq: AtomicU64,
+    /// Mesh-native sites: this machine's exposed-service allow-list + the
+    /// live reverse-proxy connections (client mappings sinking here, host
+    /// tunnels sourcing here). See [`SitesProxy`].
+    sites: SitesProxy,
+    /// Sequence for outbound site frames (one stream per app run, like the
+    /// other media-plane sequences).
+    site_seq: AtomicU64,
     /// Viewer-side download sinks: a `(route, req)` whose `Chunk`s should
     /// stream straight to a local file (the Downloads folder) instead of
     /// the window's queue — registered by `file_download` *before* the
@@ -290,6 +299,8 @@ impl Mesh {
             term_seq: AtomicU64::new(0),
             files: FilesPlane::new(),
             file_seq: AtomicU64::new(0),
+            sites: SitesProxy::load(),
+            site_seq: AtomicU64::new(0),
             downloads: Mutex::new(HashMap::new()),
             shared: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -671,6 +682,52 @@ impl Mesh {
         self.broadcast_presence().await;
     }
 
+    /// Recompute this node's advertised `sites` from a fresh scan + the
+    /// current exposed set, then re-broadcast presence — so a change to what
+    /// the owner exposes reaches peers' Sites tabs promptly. User-triggered
+    /// and rare, so the scan here is well off any hot path.
+    async fn restamp_profile(self: &Arc<Self>) {
+        // Scan off the async runtime (lsof on macOS, /proc walks on Linux).
+        let mesh = self.clone();
+        let sites = tokio::task::spawn_blocking(move || {
+            let inv = allmystuff_inventory::scan();
+            allmystuff_bridge::sites::sites_from_inventory(&inv, &mesh.sites.exposed_map())
+        })
+        .await
+        .unwrap_or_default();
+        let count = sites.len();
+        {
+            let mut st = self.state.lock();
+            if let Some(p) = st.profile.as_mut() {
+                p.sites = sites;
+            }
+        }
+        tracing::info!("re-advertising {count} exposed site(s) to peers");
+        self.reassert_presence().await;
+        // Our own UI (and any console window) reflects the change at once.
+        self.emit_snapshot();
+    }
+
+    /// Push this node's presence out so a change reaches every connected
+    /// peer: the broadcast to all, *and* a targeted send to each peer the
+    /// session already knows. The targeted half is the belt-and-suspenders —
+    /// a `ChannelSendAll` can miss an already-connected peer mid-session,
+    /// where a `ChannelSendTo` per peer lands (the same path that answers a
+    /// peer that just restarted).
+    async fn reassert_presence(self: &Arc<Self>) {
+        self.broadcast_presence().await;
+        let peers: Vec<String> = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|s| s.peers().map(|p| p.node.to_string()).collect())
+                .unwrap_or_default()
+        };
+        for peer in peers {
+            self.send_presence_to(&peer).await;
+        }
+    }
+
     /// All joined networks' config ids. The daemon wraps the list as
     /// `{ "networks": [...] }`, so we read that field (an earlier version
     /// called `as_array()` on the wrapper and always got nothing — which left
@@ -736,12 +793,18 @@ impl Mesh {
                     allmystuff_protocol::FEATURE_FILES.to_string(),
                     allmystuff_protocol::FEATURE_ROOMS.to_string(),
                     allmystuff_protocol::FEATURE_CAMERA.to_string(),
+                    allmystuff_protocol::FEATURE_SITES.to_string(),
                 ];
                 if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
                     f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
                 }
                 f
             },
+            // Only the services the owner opted to expose (the exposed set is
+            // the host's allow-list); a scan that found a dozen listeners
+            // advertises only those, each under its chosen name. Empty until
+            // the user exposes one.
+            sites: allmystuff_bridge::sites::sites_from_inventory(&inv, &self.sites.exposed_map()),
         }
     }
 
@@ -924,15 +987,25 @@ impl Mesh {
                             return;
                         }
                     }
-                    let effects = {
-                        let mut st = self.state.lock();
-                        st.session
-                            .as_mut()
-                            .map(|s| s.handle(NodeId::from(from.as_str()), msg))
-                            .unwrap_or_default()
-                    };
-                    self.process_effects(effects).await;
-                    self.emit_snapshot();
+                    // Site management (list a co-owned machine's sites,
+                    // re-expose them) rides this channel but is the backend's
+                    // to handle, gated owner/fleet — the session never sees it.
+                    match msg {
+                        ControlMessage::Site(sc) => {
+                            self.handle_site_control(&from, sc).await;
+                        }
+                        msg => {
+                            let effects = {
+                                let mut st = self.state.lock();
+                                st.session
+                                    .as_mut()
+                                    .map(|s| s.handle(NodeId::from(from.as_str()), msg))
+                                    .unwrap_or_default()
+                            };
+                            self.process_effects(effects).await;
+                            self.emit_snapshot();
+                        }
+                    }
                 }
             }
             CHANNEL_MEDIA => {
@@ -1019,6 +1092,7 @@ impl Mesh {
                     MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
                     MediaPayload::File(frame) => self.handle_file_frame(&from, frame),
                     MediaPayload::Clipboard(frame) => self.handle_clipboard_frame(&from, frame),
+                    MediaPayload::Site(frame) => self.handle_site_frame(&from, frame),
                 }
             }
             CHANNEL_OWNED => {
@@ -1500,6 +1574,10 @@ impl Mesh {
         self.release_audio_lanes(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
+        // The unmapping (client) side gets no local StopMedia effect — only
+        // the wire Teardown goes out — so close the listener + connections
+        // here, or they'd leak (the port stays bound, the accept loop runs).
+        self.sites.stop_route(&route_id);
         self.drop_downloads(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
@@ -1568,6 +1646,9 @@ impl Mesh {
                     self.injector.release_route(&id);
                     self.terminal.stop(&id);
                     self.files.stop(&id);
+                    // A site route ending closes its local listener (client
+                    // side) and every tunneled connection it carried.
+                    self.sites.stop_route(&id);
                     self.drop_downloads(&id);
                 }
                 Effect::Share { from, message } => {
@@ -2375,6 +2456,26 @@ impl Mesh {
                     );
                 }
             }
+            MediaKind::Generic if is_site_route(route) => {
+                // Nothing to start eagerly. The *client* (sink) already bound
+                // its local listener at `site_map` time and opens tunnels as
+                // connections arrive; the *host* (source) reacts to each
+                // `SiteEvent::Open` (re-checking its own exposed allow-list)
+                // in `handle_site_frame`. Just confirm the link is live.
+                if from_node == me && to_node != me {
+                    tracing::info!(
+                        "route {} active — hosting site for {}",
+                        route.id,
+                        short_id(&to_node)
+                    );
+                } else if to_node == me && from_node != me {
+                    tracing::info!(
+                        "route {} active — site proxy from {}",
+                        route.id,
+                        short_id(&from_node)
+                    );
+                }
+            }
             other => {
                 tracing::info!(
                     "route {} active ({other:?}); media transport for it is a follow-up",
@@ -2450,11 +2551,10 @@ impl Mesh {
     /// Whether `peer` advertised the media-lane pool in its presence features.
     fn peer_supports_lanes(&self, peer: &str) -> bool {
         let canon = pubkey_part(peer);
-        self.state
-            .lock()
-            .peer_features
-            .get(canon)
-            .is_some_and(|f| f.iter().any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES))
+        self.state.lock().peer_features.get(canon).is_some_and(|f| {
+            f.iter()
+                .any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES)
+        })
     }
 
     /// The lane an outbound H.264 video route to `peer` rides, or `None` for
@@ -2553,7 +2653,8 @@ impl Mesh {
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
-                tx.try_send((peer.clone(), route_id.clone(), packet)).is_ok()
+                tx.try_send((peer.clone(), route_id.clone(), packet))
+                    .is_ok()
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
@@ -3013,6 +3114,524 @@ impl Mesh {
         let frame = FileFrame::new(&route_id, seq, event);
         let payload = serde_json::to_value(&frame).map_err(|e| e.to_string())?;
         self.send_media_value(&peer, payload).await
+    }
+
+    // ---- sites (the reverse proxy) --------------------------------------
+
+    /// This machine's discovered listening services (the full set, so the
+    /// UI can offer each to expose). The active banner probe runs here, off
+    /// the presence-build path, with a short per-port timeout.
+    pub fn site_scan(&self) -> Vec<allmystuff_inventory::ListeningService> {
+        let mut listening = allmystuff_inventory::scan().listening;
+        allmystuff_inventory::listening::probe_services(
+            &mut listening,
+            std::time::Duration::from_millis(200),
+        );
+        // Diagnostic: which listening ports the scan found (set
+        // ALLMYSTUFF_GUI_LOG=info to see it). "0 found" on a box that's
+        // clearly serving means the platform probe came up empty.
+        tracing::info!(
+            "site scan found {} listening service(s): {}",
+            listening.len(),
+            listening
+                .iter()
+                .map(|s| format!(":{}", s.port))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        listening
+    }
+
+    /// The services this machine currently advertises, as id → display name.
+    pub fn site_exposed(&self) -> std::collections::BTreeMap<String, String> {
+        self.sites.exposed_map()
+    }
+
+    /// Set the exposed set (id → display name) and re-stamp presence so peers
+    /// see the change.
+    pub async fn site_set_exposed(
+        self: &Arc<Self>,
+        exposed: std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let map = self.sites.set_exposed(exposed);
+        // Rebuild + re-advertise this node's profile (its `sites` follow the
+        // exposed set). Re-broadcast so peers' Sites tabs update promptly.
+        self.restamp_profile().await;
+        map
+    }
+
+    /// Every site this device currently has mapped: `(node, host_port,
+    /// local_port)`.
+    pub fn site_mappings(&self) -> Vec<(String, u16, u16)> {
+        self.sites.list_mappings()
+    }
+
+    // ---- remote site management (a fleet device's drawer) -------------
+
+    /// Ask a co-owned machine for its full site list (to manage its exposure
+    /// from its drawer). The reply lands as the `allmystuff://node-sites`
+    /// event. Fire-and-forget; the far side gates on owner/fleet.
+    pub async fn site_remote_list(self: &Arc<Self>, node: String) -> Result<(), String> {
+        self.send_control(&node, &ControlMessage::Site(SiteControl::List))
+            .await
+    }
+
+    /// Tell a co-owned machine to advertise exactly `exposed` (id → name).
+    /// The far side gates on owner/fleet, applies it, and re-advertises.
+    pub async fn site_remote_set_exposed(
+        self: &Arc<Self>,
+        node: String,
+        exposed: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.send_control(
+            &node,
+            &ControlMessage::Site(SiteControl::SetExposed { exposed }),
+        )
+        .await
+    }
+
+    /// One inbound site-management control message. `List` / `SetExposed` are
+    /// privileged (they read or change what this machine exposes), so only an
+    /// owner/fleet sender is answered — the same gate as the proxy itself.
+    /// `Sites` is a reply we surface to the front-end.
+    async fn handle_site_control(self: &Arc<Self>, from: &str, sc: SiteControl) {
+        match sc {
+            SiteControl::List => {
+                if !self.sender_may_control(from) {
+                    tracing::warn!("site list from {} refused: not owner/fleet", short_id(from));
+                    return;
+                }
+                // Scan + probe is blocking, so do it off the event loop, then
+                // reply to the asking machine.
+                let mesh = self.clone();
+                let peer = from.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let scan = mesh.clone();
+                    let Ok((services, exposed)) = tokio::task::spawn_blocking(move || {
+                        let services = scan
+                            .site_scan()
+                            .into_iter()
+                            .map(|s| SiteService {
+                                id: s.id,
+                                name: s.name,
+                                port: s.port,
+                                scheme: s.scheme,
+                                loopback: s.loopback,
+                                process: s.process,
+                                title: s.title,
+                            })
+                            .collect::<Vec<_>>();
+                        (services, scan.sites.exposed_map())
+                    })
+                    .await
+                    else {
+                        return;
+                    };
+                    let _ = mesh
+                        .send_control(
+                            &peer,
+                            &ControlMessage::Site(SiteControl::Sites { services, exposed }),
+                        )
+                        .await;
+                });
+            }
+            SiteControl::Sites { services, exposed } => {
+                // A managed machine's answer — hand it to the drawer.
+                let _ = self.app.emit(
+                    "allmystuff://node-sites",
+                    serde_json::json!({ "from": from, "services": services, "exposed": exposed }),
+                );
+            }
+            SiteControl::SetExposed { exposed } => {
+                if !self.sender_may_control(from) {
+                    tracing::warn!(
+                        "site set-exposed from {} refused: not owner/fleet",
+                        short_id(from)
+                    );
+                    return;
+                }
+                self.sites.set_exposed(exposed);
+                self.restamp_profile().await;
+            }
+        }
+    }
+
+    /// Map a peer's site to a local port: bind a local listener (direct port
+    /// when free, else remapped), offer the reverse-proxy route, and start
+    /// the accept loop. Returns the bound local port. The far side gates the
+    /// offer owner/fleet and re-checks every connection's port against its
+    /// own exposed allow-list.
+    pub async fn site_map(self: &Arc<Self>, node: String, port: u16) -> Result<u16, String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        if pubkey_part(&node) == pubkey_part(&me) {
+            return Err("that's this device".into());
+        }
+        // Already mapped? Hand back the existing local port (idempotent).
+        if let Some((_, _, lp)) = self
+            .sites
+            .list_mappings()
+            .into_iter()
+            .find(|(n, hp, _)| pubkey_part(n) == pubkey_part(&node) && *hp == port)
+        {
+            return Ok(lp);
+        }
+        // Bind a local listener, preferring the same port number, then a free
+        // one — the OS is the final arbiter, so retry on a lost race.
+        let (listener, local_port) = self.bind_site_listener(port).await?;
+        // Mint the route: generic media, source `<host>:site`, sink a
+        // per-mapping viewer endpoint (never a catalog capability — shape is
+        // the contract, like terminal/files).
+        let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
+        let from = format!("{node}:site");
+        let to = format!("{me}:site-view:{}-{seq}", port);
+        let route_id = format!("route:{from}→{to}");
+        // Offer the route through the session (drives offer→accept→active).
+        let msg = {
+            let mut st = self.state.lock();
+            let s = st.session.as_mut().ok_or("mesh not ready")?;
+            let route = Route {
+                id: route_id.clone(),
+                from: from.clone().into(),
+                to: to.clone().into(),
+                media: MediaKind::Generic,
+            };
+            s.offer(route, node.as_str(), Vec::new(), Vec::new())
+        };
+        if let Err(e) = self.send_control(&node, &msg).await {
+            let mut st = self.state.lock();
+            if let Some(s) = st.session.as_mut() {
+                let _ = s.teardown(&route_id);
+            }
+            return Err(e);
+        }
+        // Start accepting local connections; each becomes one tunneled conn.
+        let accept = self.spawn_site_accept(route_id.clone(), node.clone(), port, listener);
+        self.sites
+            .add_mapping(route_id, ClientMapping::new(node, port, local_port, accept));
+        Ok(local_port)
+    }
+
+    /// Unmap a site: tear the route down (closing the listener + every
+    /// connection via `StopMedia`) and tell the host.
+    pub async fn site_unmap(self: &Arc<Self>, node: String, port: u16) -> Result<(), String> {
+        let Some(route_id) = self.sites.route_for(&node, port) else {
+            return Ok(()); // nothing mapped — idempotent
+        };
+        self.disconnect(route_id).await
+    }
+
+    /// Bind a local TCP listener for a site, preferring the host's port
+    /// number ("direct"), falling back to a remapped high port, and finally
+    /// to an OS-assigned one — so a mapping always lands somewhere.
+    async fn bind_site_listener(
+        &self,
+        host_port: u16,
+    ) -> Result<(tokio::net::TcpListener, u16), String> {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let taken = self.sites.taken_local_ports();
+        let preferred = allmystuff_bridge::sites::allocate_local_port(host_port, &taken);
+        // Bind loopback only — a mapped site is for *this* machine's clients,
+        // never re-exposed onto this machine's LAN.
+        for candidate in [preferred, 0] {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, candidate));
+            if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+                let port = listener
+                    .local_addr()
+                    .map(|a| a.port())
+                    .map_err(|e| e.to_string())?;
+                return Ok((listener, port));
+            }
+        }
+        Err(format!(
+            "couldn't bind a local port for the site on :{host_port}"
+        ))
+    }
+
+    /// Client side: accept local connections on `listener` and tunnel each
+    /// over `route_id`. One mesh route multiplexes every connection by a
+    /// client-minted `conn` id.
+    fn spawn_site_accept(
+        self: &Arc<Self>,
+        route_id: String,
+        peer: String,
+        host_port: u16,
+        listener: tokio::net::TcpListener,
+    ) -> tauri::async_runtime::JoinHandle<()> {
+        let mesh = self.clone();
+        tauri::async_runtime::spawn(async move {
+            // Wait for the host to accept before taking connections — until
+            // the route is active a tunnel's `Open` would be dropped, leaving
+            // a connecting client hung. (Pending TCP connections sit in the
+            // OS backlog meanwhile.) If the host rejects or never answers, we
+            // give up and the listener closes with this task.
+            if !mesh.await_route_active(&route_id).await {
+                tracing::warn!("site route {route_id} never went active — not accepting");
+                return;
+            }
+            let mut next_conn: u64 = 0;
+            loop {
+                let (socket, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::debug!("site listener {route_id} stopped: {e}");
+                        return;
+                    }
+                };
+                next_conn += 1;
+                let conn = next_conn;
+                // Register the channel before wiring, then tunnel (the
+                // client sends `Open` so the host dials loopback). Over the
+                // per-route cap → refuse this one cleanly.
+                match mesh.sites.open_conn(&route_id, conn) {
+                    Some(rx) => mesh.wire_conn(&route_id, &peer, conn, socket, rx, Some(host_port)),
+                    None => {
+                        mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn })
+                            .await;
+                        tracing::warn!(
+                            "site route {route_id} at connection cap — refused conn {conn}"
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Poll until a route is active (it just went through offer→accept), or
+    /// give up after ~5s — the client's accept loop gate, so it never opens a
+    /// tunnel the host isn't ready for (and bails cleanly if the host
+    /// rejected the offer). Returns whether it became active.
+    async fn await_route_active(&self, route_id: &str) -> bool {
+        for _ in 0..100 {
+            let active = {
+                let st = self.state.lock();
+                st.session
+                    .as_ref()
+                    .and_then(|s| s.route(route_id))
+                    .map(|r| r.is_active())
+            };
+            match active {
+                Some(true) => return true,
+                None => return false, // route gone (torn down / never made)
+                Some(false) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        false
+    }
+
+    /// Wire one tunneled connection whose inbound channel is already
+    /// registered (via `open_conn`, so `rx` is its receiver): split the
+    /// socket, spawn the inbound writer and the socket→mesh reader, and
+    /// attach the reader. Read and write run as independent tasks — full
+    /// duplex — so a WebSocket-upgraded (or otherwise long-lived,
+    /// bidirectional) connection flows both ways for its whole life. When
+    /// `open_port` is set (the client side), a `SiteEvent::Open` goes first
+    /// so the host dials loopback. Shared by both ends.
+    fn wire_conn(
+        self: &Arc<Self>,
+        route_id: &str,
+        peer: &str,
+        conn: u64,
+        socket: tokio::net::TcpStream,
+        rx: mpsc::Receiver<Vec<u8>>,
+        open_port: Option<u16>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut read_half, mut write_half) = socket.into_split();
+
+        // Inbound bytes (from the peer) → this connection's socket. Detached:
+        // it ends when `tx` is dropped (close_conn / teardown), then shuts
+        // the write half so the local client sees a clean close. It drains
+        // any bytes that were buffered before the socket was wired.
+        let mut rx = rx;
+        tauri::async_runtime::spawn(async move {
+            while let Some(bytes) = rx.recv().await {
+                if write_half.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            let _ = write_half.shutdown().await;
+        });
+
+        // Socket bytes → the peer, as `SiteEvent::Data` frames (backpressured
+        // by the mesh send — a slow link parks this read, never drops bytes).
+        // On EOF a `Close`, then close_conn (dropping `tx` stops the writer).
+        let mesh = self.clone();
+        let rid = route_id.to_string();
+        let peer_s = peer.to_string();
+        let reader = tauri::async_runtime::spawn(async move {
+            if let Some(port) = open_port {
+                mesh.send_site_event(&peer_s, &rid, SiteEvent::Open { conn, port })
+                    .await;
+            }
+            let mut buf = vec![0u8; SITE_CHUNK_BYTES];
+            loop {
+                match read_half.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        mesh.send_site_event(
+                            &peer_s,
+                            &rid,
+                            SiteEvent::Data {
+                                conn,
+                                data: buf[..n].to_vec(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            mesh.send_site_event(&peer_s, &rid, SiteEvent::Close { conn })
+                .await;
+            mesh.sites.close_conn(&rid, conn);
+        });
+
+        self.sites.attach_reader(route_id, conn, reader);
+    }
+
+    /// Send one `SiteEvent` to `peer` on the media channel, fire-and-forget
+    /// (a send failure is logged; the route's teardown handles the rest).
+    async fn send_site_event(self: &Arc<Self>, peer: &str, route_id: &str, event: SiteEvent) {
+        let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = SiteFrame::new(route_id, seq, event);
+        if let Ok(payload) = serde_json::to_value(&frame) {
+            if let Err(e) = self.send_media_value(peer, payload).await {
+                tracing::debug!("site frame to {} failed: {e}", short_id(peer));
+            }
+        }
+    }
+
+    /// One inbound site frame. Which side we are comes from the route: a
+    /// frame for a route that *sources* here lands on the host (it dials
+    /// loopback); one that *sinks* here lands on the client (it writes to a
+    /// local socket). Either way the route must be live, a site route, and
+    /// from this exact peer; the host additionally re-checks the sender is an
+    /// authorized controller and the requested port is one *it* advertises.
+    fn handle_site_frame(self: &Arc<Self>, from: &str, frame: SiteFrame) {
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        let (hosts_here, views_here) = {
+            let st = self.state.lock();
+            let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
+                return;
+            };
+            if !(r.is_active()
+                && is_site_route(&r.route)
+                && pubkey_part(r.peer.as_str()) == pubkey_part(from))
+            {
+                tracing::debug!(
+                    "site frame for {} refused (route not live here)",
+                    frame.route
+                );
+                return;
+            }
+            (
+                node_of(r.route.from.as_str()) == me,
+                node_of(r.route.to.as_str()) == me,
+            )
+        };
+
+        if hosts_here {
+            // The proxy *into* this machine — as privileged as the terminal,
+            // so the same owner/fleet gate, re-cleared per frame.
+            if !self.sender_may_control(from) {
+                tracing::warn!(
+                    "dropped site frame from {}: not an authorized controller",
+                    short_id(from)
+                );
+                return;
+            }
+            match frame.event {
+                SiteEvent::Open { conn, port } => {
+                    // The load-bearing control: dial only a port *we* expose,
+                    // never the client's free choice. Over the per-route cap,
+                    // or unexposed → refuse with a `Close`.
+                    let rx = if self.sites.is_port_exposed(port) {
+                        self.sites.open_conn(&frame.route, conn)
+                    } else {
+                        tracing::warn!(
+                            "site open from {} for :{port} refused — not an exposed service",
+                            short_id(from)
+                        );
+                        None
+                    };
+                    match rx {
+                        Some(rx) => self.spawn_site_host_connect(
+                            frame.route.clone(),
+                            from.to_string(),
+                            conn,
+                            port,
+                            rx,
+                        ),
+                        None => {
+                            let mesh = self.clone();
+                            let (route, peer) = (frame.route.clone(), from.to_string());
+                            tauri::async_runtime::spawn(async move {
+                                mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
+                                    .await;
+                            });
+                        }
+                    }
+                }
+                SiteEvent::Data { conn, data } => self.feed_site_conn(&frame.route, conn, data),
+                SiteEvent::Close { conn } => self.sites.close_conn(&frame.route, conn),
+            }
+        } else if views_here {
+            // The client end — the host's bytes for one of our mapped
+            // connections. We never receive `Open` here (we mint those).
+            match frame.event {
+                SiteEvent::Data { conn, data } => self.feed_site_conn(&frame.route, conn, data),
+                SiteEvent::Close { conn } => self.sites.close_conn(&frame.route, conn),
+                SiteEvent::Open { conn, .. } => {
+                    tracing::debug!("ignoring unexpected site Open {conn} on the client side");
+                }
+            }
+        }
+    }
+
+    /// Deliver inbound bytes to a connection's local socket. Non-blocking:
+    /// if the socket is too backed up to take more (its queue is full), the
+    /// connection is *reset* rather than dropping bytes or growing unbounded
+    /// — a TCP client just reconnects.
+    fn feed_site_conn(self: &Arc<Self>, route_id: &str, conn: u64, data: Vec<u8>) {
+        let Some(tx) = self.sites.conn_tx(route_id, conn) else {
+            return; // unknown/closed connection
+        };
+        if tx.try_send(data).is_err() {
+            self.sites.close_conn(route_id, conn);
+        }
+    }
+
+    /// Host side: a validated `Open` whose channel is already registered
+    /// (`rx` is its receiver). Connect to the local service and wire the
+    /// tunnel; inbound `Data` that arrived during the connect sits buffered
+    /// in `rx` and is drained once the writer starts. A failed connect closes
+    /// the connection back to the client (and drops its registration).
+    fn spawn_site_host_connect(
+        self: &Arc<Self>,
+        route_id: String,
+        peer: String,
+        conn: u64,
+        port: u16,
+        rx: mpsc::Receiver<Vec<u8>>,
+    ) {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let mesh = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(socket) => {
+                    // The host doesn't send Open (the client already did).
+                    mesh.wire_conn(&route_id, &peer, conn, socket, rx, None);
+                }
+                Err(e) => {
+                    tracing::warn!("site connect to 127.0.0.1:{port} failed: {e}");
+                    mesh.sites.close_conn(&route_id, conn);
+                    mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn })
+                        .await;
+                }
+            }
+        });
     }
 
     // ---- Shared Files (the call's "Shared Files" area) ------------------
@@ -3827,6 +4446,13 @@ fn is_shared_route(route: &Route) -> bool {
     route.media == MediaKind::Generic && route.from.as_str().ends_with(":shared")
 }
 
+/// Whether `route` is a site (reverse-proxy) session: generic media whose
+/// source endpoint is a machine's `…:site` handle — the same shape-as-
+/// contract scheme the terminal and files use.
+fn is_site_route(route: &Route) -> bool {
+    route.media == MediaKind::Generic && route.from.as_str().ends_with(":site")
+}
+
 /// What an audio route this machine sources should capture: the synthetic
 /// `system-audio` capability advertises "what this machine plays", so it
 /// captures the machine's own output (loopback); every other audio source
@@ -3858,6 +4484,9 @@ fn privileged_offer_refusal(
     }
     if is_files_route(route) {
         return Some("not authorized: file access is owner/fleet only".into());
+    }
+    if is_site_route(route) {
+        return Some("not authorized: site access is owner/fleet only".into());
     }
     None
 }

@@ -93,6 +93,10 @@ export interface MeshNode {
   /** App features this node advertises in presence ("terminal", …).
    *  Absent (an older peer) means none — the matching buttons stay hidden. */
   features?: string[];
+  /** The sites this node exposes — TCP services it's willing to reverse-proxy
+   *  over the mesh (from its presence advert). The owner curates this; absent
+   *  means none. The Sites sidebar lists them per machine. */
+  sites?: SiteAdvert[];
   /** Friendly names of the networks this device has been seen on. You can be
    *  on several networks at once and a device may share only some of them, so
    *  the graph shows which — it's never just "the" mesh. */
@@ -113,6 +117,81 @@ export const FEATURE_FILES = "files";
  *  without this tag the machine advertising them predates the transport,
  *  and the console says so instead of waiting on pixels that never come. */
 export const FEATURE_CAMERA = "camera";
+
+/** The presence feature tag for the sites plane (mirrors the Rust
+ *  `FEATURE_SITES`): the node can reverse-proxy a TCP service it's listening
+ *  on over the mesh. A node without it (an older build) never advertises
+ *  sites and is never offered a site route. */
+export const FEATURE_SITES = "sites";
+
+// ---- sites (the reverse-proxy plane) ----------------------------------
+
+/** One site a node exposes — a TCP service it reverse-proxies over the mesh
+ *  (mirrors the Rust `SiteAdvert`). The advertised set is the host's
+ *  allow-list: it only proxies a port that appears here. */
+export interface SiteAdvert {
+  /** Stable id (`tcp:8080`), mirroring the scan's `ListeningService.id`. */
+  id: string;
+  /** Friendly label — "HTTP", "PostgreSQL", "Port 8080". */
+  label: string;
+  port: number;
+  /** URL scheme a client reaches it with ("http", "ssh", …) or "" for a bare
+   *  TCP service. A web scheme is what lets the UI offer "open in browser". */
+  scheme?: string;
+  /** `true` when the host bound it to loopback only (the prime proxy case). */
+  loopback?: boolean;
+}
+
+/** Whether a site is a web service the UI can "open in browser". */
+export function siteIsWeb(s: { scheme?: string }): boolean {
+  return s.scheme === "http" || s.scheme === "https";
+}
+
+/** One TCP service discovered on *this* machine (mirrors the Rust
+ *  `ListeningService`) — what the Sites sidebar lists under "this machine"
+ *  so the owner can choose which to expose. */
+export interface ListeningService {
+  id: string;
+  name: string;
+  port: number;
+  kind: string;
+  scheme: string;
+  loopback: boolean;
+  process: string;
+  /** The page `<title>` the probe fetched (http sites), offered as the
+   *  default name when exposing. Empty when there was none. */
+  title: string;
+}
+
+/** One service a fleet machine reports when you manage its exposure remotely
+ *  (mirrors the Rust `SiteService`) — the same shape as a `ListeningService`
+ *  minus the local-only `kind`. */
+export interface SiteService {
+  id: string;
+  name: string;
+  port: number;
+  scheme: string;
+  loopback: boolean;
+  process: string;
+  title: string;
+}
+
+/** A site this machine has mapped to a local port — the live reverse-proxy
+ *  binding. `url` is what to open (a `http(s)://localhost:<localPort>` for a
+ *  web site, else the bare `localhost:<localPort>` address to point a client
+ *  at). UI state, not on any wire. */
+export interface SiteMapping {
+  /** The node hosting the site (canonical/display id). */
+  node: string;
+  /** The site id (`tcp:8080`). */
+  site: string;
+  /** The host's port (what it listens on). */
+  port: number;
+  /** The local port this machine bound for the tunnel. */
+  localPort: number;
+  scheme: string;
+  label: string;
+}
 
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
  *  The local node and any node we've had presence from count as app nodes. */
@@ -507,8 +586,28 @@ export function originIcon(origin: string, media: MediaKind): string {
     storage: "🗂",
     system: "🔉",
     viewer: "📺",
+    site: "🌐",
   };
   return map[origin] ?? MEDIA[media].icon;
+}
+
+/** A glyph for a site, by its scheme — a globe for the web, a plug for a
+ *  bare TCP service, and recognisable marks for the common protocols. */
+export function siteIcon(scheme: string | undefined): string {
+  switch (scheme) {
+    case "http":
+    case "https":
+      return "🌐";
+    case "ssh":
+      return "🔑";
+    case "postgres":
+    case "mysql":
+    case "mongodb":
+    case "redis":
+      return "🗄";
+    default:
+      return "🔌";
+  }
 }
 
 export function flowArrow(flow: Flow): string {

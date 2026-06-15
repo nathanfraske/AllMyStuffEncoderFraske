@@ -299,6 +299,19 @@ fn parse_usb_id(device_id: &str) -> Option<(String, String)> {
         .then_some((vid, pid))
 }
 
+/// Enumerate the TCP ports this machine is listening on, via
+/// `Get-NetTCPConnection -State Listen`, tagged with each socket's owning
+/// process name (cosmetic — `Get-Process` is SilentlyContinue, so a PID we
+/// can't open just leaves the name blank). Degrades to an empty list when
+/// PowerShell isn't available or nothing is listening.
+pub fn collect_listening() -> Vec<ListeningService> {
+    let script = "Get-NetTCPConnection -State Listen | ForEach-Object { \
+        [PSCustomObject]@{ LocalAddress = $_.LocalAddress; LocalPort = $_.LocalPort; \
+        Process = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } } \
+        | ConvertTo-Json -Compress";
+    crate::listening::services_from_nettcp_rows(&rows(script))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
