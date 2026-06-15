@@ -13,13 +13,13 @@ gui/
 │   │   ├── App.svelte        # shell: top bar + stage + sheets
 │   │   ├── Graph.svelte      # the node graph (SVG edges + HTML node cards, shared pan/zoom)
 │   │   ├── NodeDrawer.svelte # click a node → stats, devices, connections, sharing
-│   │   ├── GroupsBar.svelte  # bundle + send isolatable groups (the RDC kit)
-│   │   ├── AddNodeModal.svelte # the "mine vs sharing" decision
+│   │   ├── RoomsBar.svelte   # start/join virtual rooms; RoomPanel/RoomTile/RoomHost run a call
+│   │   ├── ClaimSheet.svelte # the "mine vs sharing" decision (with ShareSheet)
 │   │   ├── ShareSheet.svelte # the one-tap permission moment
 │   │   └── Toasts.svelte
 │   ├── types.ts              # TS mirror of the graph model + visual helpers
 │   ├── catalog.ts            # routing + authorization rules (port of allmystuff-graph)
-│   ├── store.svelte.ts       # app state (runes) + the connect/share/group verbs
+│   ├── store.svelte.ts       # app state (runes) + the connect/share/room verbs (fleet + rooms)
 │   ├── mock.ts               # demo graph so the app is alive with no backend
 │   └── tauri.ts              # backend bridge (degrades to web mode)
 └── src-tauri/                # Tauri (Rust) backend — its own Cargo workspace
@@ -47,7 +47,7 @@ system webview, so building the desktop app on Linux needs `libgtk-3-dev` and
 replaces the demo "this device" with a real scan and the mesh commands light
 up. Without one (a plain `pnpm dev` in a browser, or this repo's CI build),
 the demo graph stands in so the whole experience — clicking nodes, drawing
-connections, the share sheet, groups — works offline.
+connections, the share sheet, rooms — works offline.
 
 ## Backend events
 
