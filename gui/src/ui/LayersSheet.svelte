@@ -16,14 +16,14 @@
     <header class="head">
       <div class="head-text">
         <div class="title">How AllMyStuff connects</div>
-        <div class="sub">The layers of connection — mesh, fleet, the servers that link them, and sharing.</div>
+        <div class="sub">Venue and mesh, your fleet, and sharing — you connect where both venue and mesh line up.</div>
       </div>
       <button class="x" onclick={onclose} aria-label="Close">✕</button>
     </header>
     <div class="art">
       <img
         src="/connection-layers.svg"
-        alt="The layers of connection in AllMyStuff: a private mesh network you own, your fleet of devices grouped by owner, the Signal, STUN and TURN servers that link devices across the internet, and the sharing that decides who may do what."
+        alt="How AllMyStuff connects: a venue is a signal layer (Signal/STUN/TURN) that hosts meshes; a mesh is your channel that travels with you between venues; you can see another person only where you share both the same venue and the same mesh; your fleet is your own devices; and sharing grants a specific thing to the owner so any of their devices can use it."
       />
     </div>
   </div>
