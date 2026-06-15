@@ -48,9 +48,13 @@ just fmt        # cargo fmt --all
 allmystuff                 # open the desktop app (allmystuff-gui)
 allmystuff scan            # pretty inventory of this machine
 allmystuff scan --json     # the same, as JSON
-allmystuff capabilities    # what this machine would expose on the mesh
-allmystuff update          # update to the latest release
+allmystuff capabilities    # what this machine would expose on the mesh (aliases: caps, graph)
+allmystuff update          # update to the latest release (both binaries)
+allmystuff update check    # check the release feed for a newer version
+allmystuff update apply    # apply a staged update
 allmystuff update status   # version, channel, policy, feed, staged update
+allmystuff update enable   # turn automatic updates on
+allmystuff update disable  # turn automatic updates off
 ```
 
 From a source checkout, `cargo run -p allmystuff-cli -- <cmd>`. A real
@@ -116,9 +120,12 @@ For two machines to see each other, both need the daemon joined to the
 - connecting an audio capability (e.g. a mic → another machine's speakers)
   negotiates a route and starts a live `cpal` audio stream.
 
-v1 of the media plane uses the **default** input/output device and
-transports mono; mapping a specific scanned device to a `cpal` device, and
-video/screen/input transport, are the next milestones.
+Audio, screen, input, camera, terminal, and file transport all **ship**
+today — they negotiate per route and stream over the mesh (see the Status
+table in [README](README.md)). The audio plane still uses the **default**
+input/output device and transports mono; per-device audio mapping (a
+specific scanned device to a `cpal` device) and **storage transport** are
+the remaining next milestones (see ARCHITECTURE.md "Next milestones").
 
 ## Help us test on your hardware
 

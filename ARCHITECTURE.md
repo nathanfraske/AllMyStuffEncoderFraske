@@ -36,7 +36,7 @@ crates/
 ├── allmystuff-graph       # the device graph + authorization model
 ├── allmystuff-protocol    # wire types: myownmesh control mirror + app messages
 ├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
-├── allmystuff-session     # live presence + the route offer/accept handshake + AudioFrame
+├── allmystuff-session     # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
 ├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
 └── allmystuff-cli         # `allmystuff` (opens the GUI) + scan / capabilities / update
 ```
@@ -376,7 +376,8 @@ Tauri 2 + Svelte 5, a client of the daemon.
    input for a scanned mic — and streams it
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
-   speak the lane (myownmesh ≥ 0.2.4), as PCM `AudioFrame`s over
+   speak the lane (myownmesh ≥ 0.2.4 — the actually-bundled daemon pin is
+   v0.2.7, see `.myownmesh-rev`), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step
@@ -426,7 +427,8 @@ Tauri 2 + Svelte 5, a client of the daemon.
    silently dropped by older peers). Stream integrity itself is the
    daemon's job: myownmesh ≥ 0.2.2 reassembles access units
    sequence-aware, so packet loss or a late NACK retransmit costs one
-   frame, never a corrupt unit in a decoder.
+   frame, never a corrupt unit in a decoder. (These are floor thresholds;
+   the actually-bundled daemon pin is v0.2.7 — see `.myownmesh-rev`.)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;
