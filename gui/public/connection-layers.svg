@@ -1,33 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" id="cl-poster" viewBox="0 0 1320 870" width="1320" height="870" role="img" aria-labelledby="t d">
-  <title id="t">How AllMyStuff connects — venue and mesh as a line-of-sight match</title>
-  <desc id="d">A venue is a signal layer (Signal/STUN/TURN) that hosts meshes. A mesh is your private channel and travels with you from venue to venue. You can see another person only when you share both the same venue and the same mesh — a line of sight. Your fleet is your own devices, which come with you. Sharing grants a specific thing — a service inside one device — to the owner, so any of their devices can use it.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" id="cl-poster" viewBox="0 0 1320 880" width="1320" height="880" role="img" aria-labelledby="t d">
+  <title id="t">How AllMyStuff connects — a mesh is a beacon you call at venues</title>
+  <desc id="d">A mesh is a beacon: a name you call out to find each other. A venue is a signal layer (Signal/STUN/TURN) — a place you call that name. You broadcast your mesh at one or more venues, and you meet whoever calls the same name at a venue you both use. Your fleet is your own devices, which carry the beacon with you. Sharing grants a specific thing — a service inside one device — to the owner, so any of their devices can use it.</desc>
 
   <defs>
     <style>
       #cl-poster .eyebrow{font:600 14px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.22em;fill:oklch(0.64 0.255 350)}
       #cl-poster .h1{font:700 40px 'Saira Condensed','Arial Narrow',system-ui,sans-serif;fill:oklch(0.93 0.012 285);letter-spacing:.004em}
       #cl-poster .sub{font:400 16.5px 'Saira',system-ui,sans-serif;fill:oklch(0.75 0.02 285)}
-      #cl-poster .axis{font:700 12px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.14em;fill:oklch(0.58 0.025 285)}
-      #cl-poster .vlab{font:700 22px 'Saira Condensed','Arial Narrow',system-ui,sans-serif;letter-spacing:.14em;fill:oklch(0.82 0.15 90)}
-      #cl-poster .vsub{font:600 11px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.1em;fill:oklch(0.75 0.02 285)}
-      #cl-poster .vtiny{font:400 11.5px 'Saira',system-ui,sans-serif;fill:oklch(0.58 0.025 285)}
-      #cl-poster .mlab{font:700 20px 'Saira Condensed','Arial Narrow',system-ui,sans-serif;letter-spacing:.1em;fill:oklch(0.86 0.015 285)}
-      #cl-poster .msub{font:400 12px 'Saira',system-ui,sans-serif;fill:oklch(0.58 0.025 285)}
-      #cl-poster .travel{font:700 11.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.08em;fill:oklch(0.64 0.255 350)}
-      #cl-poster .who{font:600 13px 'Saira',system-ui,sans-serif}
-      #cl-poster .beam{font:700 12.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.18em;fill:oklch(0.93 0.012 285)}
-      #cl-poster .fleet{font:700 12px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.1em;fill:oklch(0.64 0.255 350)}
+      #cl-poster .who{font:600 14px 'Saira',system-ui,sans-serif}
+      #cl-poster .fleet{font:700 11.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.12em;fill:oklch(0.64 0.255 350)}
+      #cl-poster .beacon{font:700 15px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.06em;fill:oklch(0.64 0.255 350)}
+      #cl-poster .vlab{font:700 19px 'Saira Condensed','Arial Narrow',system-ui,sans-serif;letter-spacing:.14em;fill:oklch(0.82 0.15 90)}
+      #cl-poster .vsub{font:600 10.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.1em;fill:oklch(0.75 0.02 285)}
+      #cl-poster .beam{font:700 12.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.16em;fill:oklch(0.93 0.012 285)}
       #cl-poster .tiny{font:400 11.5px 'Saira',system-ui,sans-serif;fill:oklch(0.58 0.025 285)}
       #cl-poster .tok{font:600 13px 'Saira',system-ui,sans-serif;fill:oklch(0.93 0.012 285)}
       #cl-poster .share{font:700 13px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.16em;fill:oklch(0.64 0.255 350)}
-      #cl-poster .leg{font:600 12.5px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.03em;fill:oklch(0.75 0.02 285)}
+      #cl-poster .leg{font:600 12px 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:.03em;fill:oklch(0.75 0.02 285)}
       #cl-poster .ac{fill:oklch(0.64 0.255 350)} #cl-poster .vi{fill:oklch(0.62 0.2 292)} #cl-poster .te{fill:oklch(0.75 0.15 195)} #cl-poster .ok{fill:oklch(0.8 0.17 150)} #cl-poster .am{fill:oklch(0.82 0.15 90)} #cl-poster .fa{fill:oklch(0.58 0.025 285)}
-      #cl-poster .flow{stroke-dasharray:2 9;animation:cl-flow 1.1s linear infinite}
+      #cl-poster .call{stroke-dasharray:2 7;animation:cl-flow 1.0s linear infinite}
       #cl-poster .beamflow{stroke-dasharray:3 10;animation:cl-flow 0.9s linear infinite}
-      @keyframes cl-flow{to{stroke-dashoffset:-22}}
+      #cl-poster .flow{stroke-dasharray:2 9;animation:cl-flow 1.1s linear infinite}
+      @keyframes cl-flow{to{stroke-dashoffset:-18}}
       #cl-poster .pulse{animation:cl-pulse 2.4s ease-in-out infinite}
       @keyframes cl-pulse{0%,100%{opacity:.5}50%{opacity:1}}
-      @media (prefers-reduced-motion:reduce){#cl-poster .flow,#cl-poster .beamflow{animation:none}#cl-poster .pulse{animation:none}}
+      @media (prefers-reduced-motion:reduce){#cl-poster .call,#cl-poster .beamflow,#cl-poster .flow{animation:none}#cl-poster .pulse{animation:none}}
     </style>
 
     <radialGradient id="glowV" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="oklch(0.62 0.2 292)" stop-opacity="0.5"/><stop offset="100%" stop-color="oklch(0.62 0.2 292)" stop-opacity="0"/></radialGradient>
@@ -41,15 +38,13 @@
     <g id="i-monitor" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="11.5" rx="1.4"/><path d="M9 20 H15 M12 16 V20"/></g>
     <g id="i-person" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><circle cx="12" cy="8" r="3.9"/><path d="M5.4 20 a6.6 6.6 0 0 1 13.2 0"/></g>
     <g id="i-venue" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3.5 20 V9 L12 3.5 L20.5 9 V20 Z"/><path d="M9 20 V13.5 h6 V20"/><path d="M12 3.5 V1.4"/></g>
-    <g id="i-mesh" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 5 L6 18 M12 5 L18 17 M6 18 L18 17"/><circle cx="12" cy="5" r="2.4" fill="currentColor" stroke="none"/><circle cx="6" cy="18" r="2.1" fill="currentColor" stroke="none"/><circle cx="18" cy="17" r="2.1" fill="currentColor" stroke="none"/></g>
+    <g id="i-signal" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="14" r="1.7" fill="currentColor" stroke="none"/><path d="M8.2 10.2 a5.4 5.4 0 0 0 0 7.6 M15.8 10.2 a5.4 5.4 0 0 1 0 7.6"/><path d="M5.6 7.6 a9 9 0 0 0 0 12.8 M18.4 7.6 a9 9 0 0 1 0 12.8"/></g>
     <g id="i-check" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 l4.5 4.5 L19 7"/></g>
-    <g id="i-x" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M7 7 L17 17 M17 7 L7 17"/></g>
-    <g id="i-signal" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="14" r="1.6" fill="currentColor" stroke="none"/><path d="M8.4 10.5 a5 5 0 0 0 0 7 M15.6 10.5 a5 5 0 0 1 0 7"/></g>
   </defs>
 
   <!-- backdrop -->
-  <rect width="1320" height="870" fill="oklch(0.135 0.022 285)"/>
-  <rect width="1320" height="870" fill="url(#dots)"/>
+  <rect width="1320" height="880" fill="oklch(0.135 0.022 285)"/>
+  <rect width="1320" height="880" fill="url(#dots)"/>
   <ellipse cx="160" cy="80" rx="600" ry="340" fill="url(#glowV)"/>
   <ellipse cx="1180" cy="80" rx="520" ry="320" fill="url(#glowM)"/>
 
@@ -57,128 +52,110 @@
   <path d="M60 70 h26" stroke="oklch(0.64 0.255 350)" stroke-opacity="0.5" stroke-width="1.5"/>
   <text class="eyebrow" x="96" y="75">HOW ALLMYSTUFF CONNECTS</text>
   <g transform="translate(1246,40) scale(0.4)" fill="oklch(0.64 0.255 350)"><g stroke="oklch(0.64 0.255 350)" stroke-width="13" fill="none" stroke-linecap="round"><path d="M128 74 L77 165 M128 74 L181 160 M77 165 L181 160"/></g><circle cx="128" cy="72" r="27"/><circle cx="76" cy="166" r="22"/><circle cx="182" cy="160" r="22"/></g>
-  <text class="h1" x="58" y="118">Same venue, same mesh — then you see each other.</text>
-  <text class="sub" x="60" y="148">A venue (signal layer) hosts the meeting. A mesh is your private channel — it travels with you between venues. You connect only where both line up.</text>
+  <text class="h1" x="58" y="118">A mesh is a name you call out.</text>
+  <text class="sub" x="60" y="148">A venue is a place you call it (Signal/STUN/TURN). You meet whoever calls the same name at a venue you both use — your fleet comes along.</text>
 
-  <!-- ============ THE GRID: venue (columns) × mesh (rows) ============ -->
-  <!-- the Home mesh band spans BOTH venue columns: one channel, hosted by either venue -->
-  <rect x="240" y="262" width="1020" height="300" rx="14" fill="oklch(0.64 0.255 350 / 0.05)" stroke="oklch(0.64 0.255 350 / 0.4)" stroke-dasharray="4 5"/>
-
-  <!-- grid frame -->
-  <line x1="240" y1="170" x2="240" y2="590" stroke="oklch(0.245 0.03 285)"/>
-  <line x1="750" y1="170" x2="750" y2="590" stroke="oklch(0.245 0.03 285)"/>
-  <line x1="60" y1="262" x2="1260" y2="262" stroke="oklch(0.245 0.03 285)"/>
-  <line x1="60" y1="562" x2="1260" y2="562" stroke="oklch(0.245 0.03 285)"/>
-
-  <!-- axis corner -->
-  <text class="axis" x="150" y="206" text-anchor="middle">VENUES →</text>
-  <text class="axis" x="150" y="228" text-anchor="middle">MESH ↓</text>
-  <text class="vtiny" x="150" y="248" text-anchor="middle">your two coordinates</text>
-
-  <!-- venue column headers -->
-  <use href="#i-venue" width="26" height="26" x="372" y="182" color="oklch(0.82 0.15 90)"/>
-  <text class="vlab" x="412" y="202" >PUBLIC VENUE</text>
-  <text class="vsub" x="372" y="226">A SIGNAL LAYER · SIGNAL · STUN · TURN</text>
-  <text class="vtiny" x="372" y="246">shared &amp; free — find each other · your address · a relay if blocked</text>
-
-  <use href="#i-venue" width="26" height="26" x="876" y="182" color="oklch(0.82 0.15 90)"/>
-  <text class="vlab" x="916" y="202">YOUR OWN VENUE</text>
-  <text class="vsub" x="876" y="226">A SIGNAL LAYER YOU SELF-HOST</text>
-  <text class="vtiny" x="876" y="246">same job, your hardware — the private-line twin</text>
-
-  <!-- mesh row header (Home) -->
-  <use href="#i-mesh" width="22" height="22" x="92" y="350" color="oklch(0.64 0.255 350)"/>
-  <text class="mlab" x="124" y="368">HOME</text>
-  <text class="msub" x="92" y="392">a mesh — your channel</text>
-  <text class="travel" x="92" y="423">↔ TRAVELS WITH YOU</text>
-  <text class="tiny" x="92" y="441">the same mesh,</text>
-  <text class="tiny" x="92" y="457">reachable at either venue</text>
-
-  <!-- ===== CELL (Public venue × Home mesh): you + Alex, both match → line of sight ===== -->
-  <!-- you + your fleet -->
-  <g><circle cx="330" cy="392" r="24" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="2"/><use href="#i-person" width="27" height="27" x="316.5" y="378.5" color="oklch(0.93 0.012 285)"/></g>
-  <text class="who ac" x="330" y="430" text-anchor="middle">you</text>
-  <g stroke="oklch(0.64 0.255 350 / 0.45)" stroke-width="1.5" fill="none"><path d="M330 392 L300 330"/><path d="M330 392 L300 470"/></g>
-  <g><circle cx="300" cy="330" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="289" y="319" color="oklch(0.93 0.012 285)"/></g>
-  <g><circle cx="300" cy="470" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="1.6"/><use href="#i-phone" width="22" height="22" x="289" y="459" color="oklch(0.93 0.012 285)"/></g>
-  <text class="fleet" x="300" y="512" text-anchor="middle">YOUR FLEET</text>
-  <text class="tiny" x="300" y="528" text-anchor="middle">your devices — they come with you</text>
-
-  <!-- the line of sight -->
-  <line x1="358" y1="392" x2="626" y2="392" stroke="oklch(0.64 0.255 350)" stroke-width="9" stroke-opacity="0.18" stroke-linecap="round"/>
-  <line x1="358" y1="392" x2="626" y2="392" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" class="beamflow"/>
-  <text class="beam" x="492" y="372" text-anchor="middle">LINE OF SIGHT</text>
-  <g transform="translate(440,402)"><rect x="0" y="0" width="104" height="22" rx="11" fill="oklch(0.21 0.028 285)" stroke="oklch(0.8 0.17 150 / 0.5)"/><use href="#i-check" width="12" height="12" x="9" y="5" color="oklch(0.8 0.17 150)"/><text class="tiny" x="26" y="15" style="fill:oklch(0.8 0.17 150)">both match</text></g>
-
-  <!-- Alex (same venue, same mesh) -->
-  <g><circle cx="654" cy="392" r="24" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="2"/><use href="#i-person" width="27" height="27" x="640.5" y="378.5" color="oklch(0.93 0.012 285)"/></g>
-  <text class="who vi" x="654" y="430" text-anchor="middle">Alex</text>
-  <g><circle cx="690" cy="338" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="679" y="327" color="oklch(0.93 0.012 285)"/></g>
-  <text class="tiny" x="654" y="520" text-anchor="middle" style="fill:oklch(0.62 0.2 292)">here you can see each other</text>
-
-  <!-- ===== CELL (Your own venue × Home mesh): same mesh, different venue → no line of sight ===== -->
-  <g opacity="0.45">
-    <g><circle cx="1000" cy="392" r="24" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="2" stroke-dasharray="3 3"/><use href="#i-person" width="27" height="27" x="986.5" y="378.5" color="oklch(0.75 0.02 285)"/></g>
-    <text class="who vi" x="1000" y="430" text-anchor="middle">Alex?</text>
-    <g><circle cx="1040" cy="340" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.4" stroke-dasharray="3 3"/><use href="#i-phone" width="22" height="22" x="1029" y="329" color="oklch(0.75 0.02 285)"/></g>
+  <!-- ============ YOU (left) ============ -->
+  <g>
+    <g stroke="oklch(0.64 0.255 350 / 0.4)" stroke-width="1.5" fill="none"><path d="M175 405 L112 348"/><path d="M175 405 L112 462"/></g>
+    <g><circle cx="175" cy="405" r="26" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="2"/><use href="#i-person" width="29" height="29" x="160.5" y="390.5" color="oklch(0.93 0.012 285)"/></g>
+    <text class="who ac" x="175" y="446" text-anchor="middle">you</text>
+    <g><circle cx="112" cy="348" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="101" y="337" color="oklch(0.93 0.012 285)"/></g>
+    <g><circle cx="112" cy="462" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)" stroke-width="1.6"/><use href="#i-phone" width="22" height="22" x="101" y="451" color="oklch(0.93 0.012 285)"/></g>
+    <text class="fleet" x="120" y="500" text-anchor="middle">YOUR FLEET</text>
+    <text class="tiny" x="120" y="516" text-anchor="middle">your devices carry the beacon</text>
+    <!-- beacon tag (the mesh = a name) -->
+    <g transform="translate(110,286)"><rect x="0" y="0" width="132" height="32" rx="16" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)"/><use href="#i-signal" width="20" height="20" x="10" y="6" color="oklch(0.64 0.255 350)"/><text class="beacon" x="38" y="22">"home"</text></g>
+    <text class="tiny" x="176" y="338" text-anchor="middle">your mesh = this name</text>
   </g>
-  <line x1="770" y1="392" x2="970" y2="392" stroke="oklch(0.58 0.025 285)" stroke-width="2" stroke-dasharray="3 7"/>
-  <g transform="translate(852,381)"><circle cx="11" cy="11" r="13" fill="oklch(0.175 0.025 285)" stroke="oklch(0.58 0.025 285)"/><use href="#i-x" width="14" height="14" x="4" y="4" color="oklch(0.7 0.19 14)"/></g>
-  <text class="tiny" x="1000" y="476" text-anchor="middle">same mesh, different venue —</text>
-  <text class="tiny" x="1000" y="492" text-anchor="middle">no shared coordinate, no line of sight</text>
 
-  <!-- other meshes hint -->
-  <text class="msub" x="150" y="586" text-anchor="middle" style="fill:oklch(0.52 0.02 285)">WORK · OFF-GRID · …</text>
-  <text class="tiny" x="700" y="586" text-anchor="middle" style="fill:oklch(0.5 0.02 285)">↕ your other meshes are more rows — pick a mesh to step into it; each works exactly the same across venues</text>
+  <!-- ============ ALEX (right) ============ -->
+  <g>
+    <g stroke="oklch(0.62 0.2 292 / 0.4)" stroke-width="1.5" fill="none"><path d="M1145 405 L1208 348"/><path d="M1145 405 L1208 462"/></g>
+    <g><circle cx="1145" cy="405" r="26" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="2"/><use href="#i-person" width="29" height="29" x="1130.5" y="390.5" color="oklch(0.93 0.012 285)"/></g>
+    <text class="who vi" x="1145" y="446" text-anchor="middle">Alex</text>
+    <g><circle cx="1208" cy="348" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="1197" y="337" color="oklch(0.93 0.012 285)"/></g>
+    <g><circle cx="1208" cy="462" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-phone" width="22" height="22" x="1197" y="451" color="oklch(0.93 0.012 285)"/></g>
+    <text class="fleet vi" x="1200" y="500" text-anchor="middle" style="fill:oklch(0.62 0.2 292)">ALEX'S FLEET</text>
+    <g transform="translate(1078,286)"><rect x="0" y="0" width="132" height="32" rx="16" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)"/><use href="#i-signal" width="20" height="20" x="10" y="6" color="oklch(0.62 0.2 292)"/><text class="beacon" x="38" y="22" style="fill:oklch(0.62 0.2 292)">"home"</text></g>
+    <text class="tiny" x="1144" y="338" text-anchor="middle">same name</text>
+  </g>
+
+  <!-- ============ VENUES (the places you call the name) ============ -->
+  <!-- Public venue: both call "home" here -> line of sight -->
+  <rect x="388" y="262" width="544" height="156" rx="16" fill="oklch(0.82 0.15 90 / 0.05)" stroke="oklch(0.82 0.15 90 / 0.4)"/>
+  <use href="#i-venue" width="22" height="22" x="408" y="278" color="oklch(0.82 0.15 90)"/>
+  <text class="vlab" x="438" y="296">PUBLIC VENUE</text>
+  <text class="vsub" x="408" y="316">A SIGNAL LAYER · SIGNAL · STUN · TURN · SHARED, FREE</text>
+  <!-- you call in -->
+  <path d="M201 398 C 300 372, 340 360, 404 356" stroke="oklch(0.64 0.255 350)" stroke-width="2" fill="none" class="call"/>
+  <!-- alex calls in -->
+  <path d="M1119 398 C 1020 372, 980 360, 916 356" stroke="oklch(0.62 0.2 292)" stroke-width="2" fill="none" class="call"/>
+  <!-- they meet: line of sight across the venue -->
+  <line x1="404" y1="372" x2="916" y2="372" stroke="oklch(0.64 0.255 350)" stroke-width="9" stroke-opacity="0.16" stroke-linecap="round"/>
+  <line x1="404" y1="372" x2="916" y2="372" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" class="beamflow"/>
+  <circle cx="404" cy="372" r="5" fill="oklch(0.64 0.255 350)"/><circle cx="916" cy="372" r="5" fill="oklch(0.62 0.2 292)"/>
+  <text class="beam" x="660" y="366" text-anchor="middle">LINE OF SIGHT</text>
+  <text class="tiny" x="660" y="400" text-anchor="middle" style="fill:oklch(0.8 0.17 150)">you both call “home” here → you can see each other</text>
+
+  <!-- Your own venue: only you call "home" here (multi-venue) -->
+  <rect x="388" y="446" width="544" height="132" rx="16" fill="oklch(0.62 0.2 292 / 0.05)" stroke="oklch(0.62 0.2 292 / 0.4)"/>
+  <use href="#i-venue" width="22" height="22" x="408" y="462" color="oklch(0.62 0.2 292)"/>
+  <text class="vlab" x="438" y="480" style="fill:oklch(0.62 0.2 292)">YOUR OWN VENUE</text>
+  <text class="vsub" x="408" y="500">A SIGNAL LAYER YOU SELF-HOST · PRIVATE</text>
+  <!-- you also call here -->
+  <path d="M201 452 C 300 484, 350 506, 404 518" stroke="oklch(0.64 0.255 350)" stroke-width="2" fill="none" class="call"/>
+  <circle cx="404" cy="518" r="5" fill="oklch(0.64 0.255 350)"/>
+  <line x1="404" y1="518" x2="536" y2="518" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" stroke-opacity="0.6" stroke-dasharray="3 6"/>
+  <text class="tiny" x="430" y="540" style="font-size:12px;fill:oklch(0.75 0.02 285)">you call “home” here too — a mesh can be broadcast at many venues.</text>
+  <text class="tiny" x="430" y="558">(Alex isn't at this venue, so you can't meet here — only where you both call it.)</text>
+
+  <text class="tiny" x="660" y="606" text-anchor="middle" style="font-size:12.5px;fill:oklch(0.7 0.02 285)">a venue only <tspan style="fill:oklch(0.93 0.012 285)">hosts</tspan> the call — the same mesh works at any venue; you meet only where you <tspan style="fill:oklch(0.93 0.012 285)">both</tspan> call it</text>
 
   <!-- ============ SHARING STRIP ============ -->
-  <g transform="translate(60,614)">
-    <rect x="0" y="0" width="1200" height="158" rx="16" fill="oklch(0.175 0.025 285)" stroke="oklch(0.245 0.03 285)"/>
-    <rect x="0" y="0" width="6" height="158" rx="3" fill="oklch(0.8 0.17 150)"/>
-    <text class="share" x="34" y="34">SHARING — once you can see each other</text>
-    <text class="tiny" x="34" y="54" style="font-size:12.5px;fill:oklch(0.75 0.02 285)">grant a <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">thing</tspan> (one service in one device) to the <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">owner</tspan> — so any of their devices can use it</text>
+  <g transform="translate(60,632)">
+    <rect x="0" y="0" width="1200" height="150" rx="16" fill="oklch(0.175 0.025 285)" stroke="oklch(0.245 0.03 285)"/>
+    <rect x="0" y="0" width="6" height="150" rx="3" fill="oklch(0.8 0.17 150)"/>
+    <text class="share" x="34" y="32">SHARING — once you can see each other</text>
+    <text class="tiny" x="34" y="52" style="font-size:12.5px;fill:oklch(0.75 0.02 285)">grant a <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">thing</tspan> (one service in one device) to the <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">owner</tspan> — so any of their devices can use it</text>
 
-    <!-- the thing -->
-    <rect x="40" y="74" width="172" height="64" rx="12" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)"/>
-    <use href="#i-monitor" width="20" height="20" x="56" y="86" color="oklch(0.64 0.255 350)"/>
-    <text class="tok" x="82" y="100">Screen</text>
-    <text class="tiny" x="56" y="120" style="fill:oklch(0.75 0.02 285)">a service on your laptop</text>
-    <use href="#i-check" width="13" height="13" x="56" y="125" color="oklch(0.8 0.17 150)"/>
-    <text class="tok" x="74" y="135" style="font-size:11.5px">granted</text>
+    <rect x="40" y="70" width="172" height="62" rx="12" fill="oklch(0.21 0.028 285)" stroke="oklch(0.64 0.255 350)"/>
+    <use href="#i-monitor" width="20" height="20" x="56" y="82" color="oklch(0.64 0.255 350)"/>
+    <text class="tok" x="82" y="96">Screen</text>
+    <text class="tiny" x="56" y="116" style="fill:oklch(0.75 0.02 285)">a service on your laptop</text>
+    <use href="#i-check" width="13" height="13" x="56" y="120" color="oklch(0.8 0.17 150)"/>
+    <text class="tok" x="74" y="130" style="font-size:11.5px">granted</text>
 
-    <!-- to the owner -->
-    <path d="M212 106 H300" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" fill="none" class="flow"/>
-    <path d="M300 106 l-9 -6 M300 106 l-9 6" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-    <text class="tiny" x="256" y="96" text-anchor="middle" style="fill:oklch(0.75 0.02 285)">to the OWNER</text>
-    <g><circle cx="334" cy="106" r="24" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="2"/><use href="#i-person" width="27" height="27" x="320.5" y="92.5" color="oklch(0.93 0.012 285)"/></g>
-    <text class="who vi" x="334" y="146" text-anchor="middle" style="font-size:12px">Alex · the owner</text>
+    <path d="M212 101 H300" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" fill="none" class="flow"/>
+    <path d="M300 101 l-9 -6 M300 101 l-9 6" stroke="oklch(0.64 0.255 350)" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+    <text class="tiny" x="256" y="91" text-anchor="middle" style="fill:oklch(0.75 0.02 285)">to the OWNER</text>
+    <g><circle cx="334" cy="101" r="23" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="2"/><use href="#i-person" width="26" height="26" x="321" y="88" color="oklch(0.93 0.012 285)"/></g>
+    <text class="who vi" x="334" y="140" text-anchor="middle" style="font-size:12px">Alex · the owner</text>
 
-    <!-- any of the owner's devices -->
     <g stroke="oklch(0.62 0.2 292)" stroke-width="2" fill="none" stroke-dasharray="2 4" stroke-linecap="round">
-      <path d="M358 92 L430 70"/><path d="M362 106 H432"/><path d="M358 120 L430 142"/>
+      <path d="M357 88 L430 66"/><path d="M361 101 H432"/><path d="M357 114 L430 136"/>
     </g>
-    <g><circle cx="454" cy="66" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="443" y="55" color="oklch(0.93 0.012 285)"/></g>
-    <g><circle cx="456" cy="106" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-phone" width="22" height="22" x="445" y="95" color="oklch(0.93 0.012 285)"/></g>
-    <g><circle cx="454" cy="146" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-tv" width="22" height="22" x="443" y="135" color="oklch(0.93 0.012 285)"/></g>
-    <text class="tiny" x="488" y="103" style="fill:oklch(0.62 0.2 292)">any of Alex's devices</text>
-    <text class="tiny" x="488" y="119" style="fill:oklch(0.62 0.2 292)">can open it ✓</text>
+    <g><circle cx="454" cy="62" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-laptop" width="22" height="22" x="443" y="51" color="oklch(0.93 0.012 285)"/></g>
+    <g><circle cx="456" cy="101" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-phone" width="22" height="22" x="445" y="90" color="oklch(0.93 0.012 285)"/></g>
+    <g><circle cx="454" cy="140" r="18" fill="oklch(0.21 0.028 285)" stroke="oklch(0.62 0.2 292)" stroke-width="1.6"/><use href="#i-tv" width="22" height="22" x="443" y="129" color="oklch(0.93 0.012 285)"/></g>
+    <text class="tiny" x="488" y="98" style="fill:oklch(0.62 0.2 292)">any of Alex's devices</text>
+    <text class="tiny" x="488" y="114" style="fill:oklch(0.62 0.2 292)">can open it ✓</text>
 
-    <!-- recap on the right -->
-    <line x1="700" y1="30" x2="700" y2="128" stroke="oklch(0.245 0.03 285)"/>
-    <text class="tiny" x="730" y="60" style="font-size:13px;fill:oklch(0.75 0.02 285)">A grant follows the <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">person</tspan>, not one</text>
-    <text class="tiny" x="730" y="80" style="font-size:13px;fill:oklch(0.75 0.02 285)">machine — so a new device of theirs</text>
-    <text class="tiny" x="730" y="100" style="font-size:13px;fill:oklch(0.75 0.02 285)">inherits it, and you can revoke it any</text>
-    <text class="tiny" x="730" y="120" style="font-size:13px;fill:oklch(0.75 0.02 285)">time. Nothing flows until you allow it.</text>
+    <line x1="700" y1="28" x2="700" y2="122" stroke="oklch(0.245 0.03 285)"/>
+    <text class="tiny" x="730" y="58" style="font-size:13px;fill:oklch(0.75 0.02 285)">A grant follows the <tspan style="fill:oklch(0.93 0.012 285);font-weight:600">person</tspan>, not one</text>
+    <text class="tiny" x="730" y="78" style="font-size:13px;fill:oklch(0.75 0.02 285)">machine — a new device of theirs inherits</text>
+    <text class="tiny" x="730" y="98" style="font-size:13px;fill:oklch(0.75 0.02 285)">it, and you can revoke it any time.</text>
+    <text class="tiny" x="730" y="118" style="font-size:13px;fill:oklch(0.75 0.02 285)">Nothing flows until you allow it.</text>
   </g>
 
   <!-- ============ LEGEND ============ -->
-  <g transform="translate(60,810)">
-    <use href="#i-venue" width="15" height="15" x="0" y="-12" color="oklch(0.82 0.15 90)"/>
-    <text class="leg" x="22" y="0"><tspan class="am">VENUE</tspan> = a signal layer (hosts meshes)</text>
-    <use href="#i-mesh" width="15" height="15" x="372" y="-12" color="oklch(0.64 0.255 350)"/>
-    <text class="leg" x="394" y="0"><tspan class="ac">MESH</tspan> = your channel (travels with you)</text>
-    <line x1="760" y1="-4" x2="800" y2="-4" stroke="oklch(0.64 0.255 350)" stroke-width="3"/>
-    <text class="leg" x="808" y="0">beam = <tspan class="ac">line of sight</tspan> (both match)</text>
+  <g transform="translate(60,818)">
+    <use href="#i-signal" width="15" height="15" x="0" y="-12" color="oklch(0.64 0.255 350)"/>
+    <text class="leg" x="22" y="0"><tspan class="ac">MESH</tspan> = a beacon (a name you call)</text>
+    <use href="#i-venue" width="15" height="15" x="372" y="-12" color="oklch(0.82 0.15 90)"/>
+    <text class="leg" x="394" y="0"><tspan class="am">VENUE</tspan> = a signal layer (where you call it)</text>
+    <line x1="800" y1="-4" x2="840" y2="-4" stroke="oklch(0.64 0.255 350)" stroke-width="3"/>
+    <text class="leg" x="848" y="0"><tspan class="ac">line of sight</tspan> = same name, shared venue</text>
   </g>
-  <text class="leg" x="60" y="852" style="fill:oklch(0.58 0.025 285)">pick a venue → join a mesh → see whoever shares both → grant a friend a thing, and any of their devices can use it</text>
+  <text class="leg" x="60" y="858" style="fill:oklch(0.58 0.025 285)">name a mesh (beacon) → call it at one or more venues → meet whoever calls the same name where you both are → grant a friend a thing, and any of their devices can use it</text>
 </svg>

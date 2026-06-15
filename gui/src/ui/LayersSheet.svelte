@@ -16,14 +16,14 @@
     <header class="head">
       <div class="head-text">
         <div class="title">How AllMyStuff connects</div>
-        <div class="sub">Venue and mesh, your fleet, and sharing — you connect where both venue and mesh line up.</div>
+        <div class="sub">A mesh is a beacon (a name); a venue is where you call it. You meet on a shared name and venue.</div>
       </div>
       <button class="x" onclick={onclose} aria-label="Close">✕</button>
     </header>
     <div class="art">
       <img
         src="/connection-layers.svg"
-        alt="How AllMyStuff connects: a venue is a signal layer (Signal/STUN/TURN) that hosts meshes; a mesh is your channel that travels with you between venues; you can see another person only where you share both the same venue and the same mesh; your fleet is your own devices; and sharing grants a specific thing to the owner so any of their devices can use it."
+        alt="How AllMyStuff connects: a mesh is a beacon — a name you call out; a venue is a signal layer (Signal/STUN/TURN) where you call it; you broadcast your mesh at one or more venues and meet whoever calls the same name at a venue you share; your fleet is your own devices, which carry the beacon; and sharing grants a specific thing to the owner so any of their devices can use it."
       />
     </div>
   </div>
