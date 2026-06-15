@@ -1,0 +1,290 @@
+//! The sites plane — AllMyStuff's reverse proxy.
+//!
+//! A *site* is a TCP service a machine is listening on (a local web app, a
+//! database) that its owner chose to expose. This plane carries it across
+//! the mesh so another of your machines can reach it through a locally-mapped
+//! port — direct (the same number) when free, else remapped.
+//!
+//! Like [`crate::files::FilesPlane`], this struct is **state only**; the
+//! [`crate::mesh::Mesh`] owns the async tasks (it captures the `Arc<Mesh>`
+//! they need to send mesh frames). Two halves:
+//!
+//!  * **Host** (the machine the service runs on): on a [`SiteEvent::Open`]
+//!    it connects to `127.0.0.1:<port>` — but only after re-checking the
+//!    port is one it *currently advertises* ([`SitesProxy::is_port_exposed`]),
+//!    the load-bearing control, so a peer can't pivot to an unexposed local
+//!    service — and pumps bytes both ways.
+//!  * **Client** (the machine reaching it): a local `TcpListener` accepts
+//!    connections on the mapped port; each becomes one tunneled `conn`.
+//!
+//! One mesh route per (host, site) multiplexes every connection by `conn`
+//! id. The byte transport is the JSON media channel (base64 like the files
+//! plane), so this is for light/occasional access, not bulk throughput.
+//!
+//! It's a **transparent layer-4 tunnel** — raw bytes, no HTTP parsing, no
+//! idle timeout, and each connection's read and write directions run as
+//! independent tasks (full duplex). So it isn't limited to request/response
+//! HTTP: a connection that the client upgrades to a **WebSocket** (or that
+//! speaks Server-Sent Events, HTTP keep-alive, gRPC, SSH, a database wire
+//! protocol…) keeps flowing both ways for its whole life, exactly as it
+//! would direct. The proxy never interprets the stream; it just carries it.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+
+use parking_lot::Mutex;
+use tauri::async_runtime::JoinHandle;
+use tokio::sync::mpsc;
+
+/// Most simultaneous tunneled connections one site route will carry. A
+/// browser opens several at once; this bounds a hostile or runaway peer to a
+/// finite table. Further `Open`s are refused (the connection simply fails on
+/// the client, exactly like a busy server).
+pub const MAX_CONNS_PER_ROUTE: usize = 64;
+
+/// Inbound frames buffered per connection before the local socket write must
+/// catch up. Beyond it the connection is *reset* (never corrupted or grown
+/// unbounded) — a TCP client just reconnects.
+pub const CONN_QUEUE: usize = 256;
+
+/// One live tunneled connection's handles. Dropping `tx` closes the inbound
+/// channel, which ends the socket-*writer* task; aborting `read_handle` ends
+/// the socket-*reader* task — together they tear one connection down on
+/// either side.
+struct ConnHandle {
+    /// Inbound bytes for this connection → its local socket-writer task.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// The socket→mesh reader task, aborted when the connection closes.
+    read_handle: JoinHandle<()>,
+}
+
+/// A site this machine has mapped to a local port — the client-side binding.
+pub struct ClientMapping {
+    /// The host node (canonical/display id) the site lives on.
+    pub node: String,
+    /// The host's port (what it listens on).
+    pub host_port: u16,
+    /// The local port this machine bound the tunnel on.
+    pub local_port: u16,
+    /// The accept loop for the local listener, aborted on unmap.
+    accept_handle: JoinHandle<()>,
+}
+
+/// Persisted shape: just the exposed-service ids. Additive + `#[serde(default)]`
+/// so an older file (or none) loads as "nothing exposed".
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Persisted {
+    #[serde(default)]
+    exposed: Vec<String>,
+}
+
+pub struct SitesProxy {
+    /// The listening-service ids (`tcp:8080`) this machine advertises — the
+    /// opt-in exposed set, persisted. Empty by default: nothing is shared
+    /// until the owner says so.
+    exposed: Mutex<BTreeSet<String>>,
+    path: Option<PathBuf>,
+    /// Every live tunneled connection, keyed by `(route_id, conn)`. Both
+    /// host and client sides register here.
+    conns: Mutex<HashMap<(String, u64), ConnHandle>>,
+    /// Client-side mappings, keyed by the site route id.
+    mappings: Mutex<HashMap<String, ClientMapping>>,
+}
+
+impl Default for SitesProxy {
+    fn default() -> Self {
+        Self::load()
+    }
+}
+
+impl SitesProxy {
+    /// Load the persisted exposed set from disk (empty when there's none).
+    pub fn load() -> Self {
+        let path = store_path();
+        let exposed = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
+            .map(|p| p.exposed.into_iter().collect())
+            .unwrap_or_default();
+        SitesProxy {
+            exposed: Mutex::new(exposed),
+            path,
+            conns: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // ---- exposure (the host's allow-list) -----------------------------
+
+    /// The exposed-service ids, sorted (stable for the UI).
+    pub fn exposed_ids(&self) -> Vec<String> {
+        self.exposed.lock().iter().cloned().collect()
+    }
+
+    /// Replace the exposed set and persist it. Returns the new set.
+    pub fn set_exposed(&self, ids: Vec<String>) -> Vec<String> {
+        let set: BTreeSet<String> = ids.into_iter().collect();
+        {
+            let mut e = self.exposed.lock();
+            *e = set.clone();
+            persist(&self.path, &e);
+        }
+        set.into_iter().collect()
+    }
+
+    /// Is `port` one this machine currently advertises? The host gate: the
+    /// exposed id encodes the port (`tcp:<port>`), so this needs no scan —
+    /// the client's claimed port is checked against *our own* exposed set.
+    pub fn is_port_exposed(&self, port: u16) -> bool {
+        self.exposed.lock().contains(&format!("tcp:{port}"))
+    }
+
+    // ---- connection table ---------------------------------------------
+
+    /// How many connections a route is currently carrying — checked against
+    /// [`MAX_CONNS_PER_ROUTE`] before wiring a new one (a soft cap: a tiny
+    /// race may let it tip one or two over, which is harmless).
+    pub fn route_conn_count(&self, route: &str) -> usize {
+        self.conns.lock().keys().filter(|(r, _)| r == route).count()
+    }
+
+    /// Register a live connection's handles.
+    pub fn register_conn(
+        &self,
+        route: &str,
+        conn: u64,
+        tx: mpsc::Sender<Vec<u8>>,
+        read_handle: JoinHandle<()>,
+    ) {
+        self.conns
+            .lock()
+            .insert((route.to_string(), conn), ConnHandle { tx, read_handle });
+    }
+
+    /// The inbound-bytes sender for one connection, if it's still live.
+    pub fn conn_tx(&self, route: &str, conn: u64) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.conns
+            .lock()
+            .get(&(route.to_string(), conn))
+            .map(|h| h.tx.clone())
+    }
+
+    /// Close one connection: drop its inbound sender (the writer task's
+    /// channel closes → it shuts the socket) and abort its reader. Idempotent.
+    pub fn close_conn(&self, route: &str, conn: u64) {
+        if let Some(h) = self.conns.lock().remove(&(route.to_string(), conn)) {
+            h.read_handle.abort();
+        }
+    }
+
+    // ---- client-side mappings -----------------------------------------
+
+    pub fn add_mapping(&self, route: String, mapping: ClientMapping) {
+        self.mappings.lock().insert(route, mapping);
+    }
+
+    /// The route id mapping `(node, host_port)`, if this device has it mapped.
+    /// Matched on the exact node id the UI passed (map and unmap both use the
+    /// graph's id), so no canonical/display reconciliation is needed here.
+    pub fn route_for(&self, node: &str, host_port: u16) -> Option<String> {
+        self.mappings
+            .lock()
+            .iter()
+            .find(|(_, m)| m.node == node && m.host_port == host_port)
+            .map(|(route, _)| route.clone())
+    }
+
+    /// The local ports already bound by this device — what
+    /// [`allmystuff_bridge::sites::allocate_local_port`] avoids reusing.
+    pub fn taken_local_ports(&self) -> BTreeSet<u16> {
+        self.mappings.lock().values().map(|m| m.local_port).collect()
+    }
+
+    /// Every live mapping as `(node, host_port, local_port)`, for the UI.
+    pub fn list_mappings(&self) -> Vec<(String, u16, u16)> {
+        self.mappings
+            .lock()
+            .values()
+            .map(|m| (m.node.clone(), m.host_port, m.local_port))
+            .collect()
+    }
+
+    /// Tear a site route down completely: abort its accept loop (if any) and
+    /// close every connection it carried. Safe on either side, idempotent —
+    /// called on unmap and on route teardown.
+    pub fn stop_route(&self, route: &str) {
+        if let Some(m) = self.mappings.lock().remove(route) {
+            m.accept_handle.abort();
+        }
+        let drained: Vec<u64> = {
+            let conns = self.conns.lock();
+            conns
+                .keys()
+                .filter(|(r, _)| r == route)
+                .map(|(_, c)| *c)
+                .collect()
+        };
+        for conn in drained {
+            self.close_conn(route, conn);
+        }
+    }
+}
+
+impl ClientMapping {
+    pub fn new(node: String, host_port: u16, local_port: u16, accept_handle: JoinHandle<()>) -> Self {
+        ClientMapping {
+            node,
+            host_port,
+            local_port,
+            accept_handle,
+        }
+    }
+}
+
+fn persist(path: &Option<PathBuf>, exposed: &BTreeSet<String>) -> bool {
+    let Some(path) = path else { return true };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let persisted = Persisted {
+        exposed: exposed.iter().cloned().collect(),
+    };
+    match serde_json::to_string_pretty(&persisted) {
+        Ok(json) => std::fs::write(path, json).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// `~/.myownmesh/allmystuff-sites.json`, honouring `MYOWNMESH_HOME` — the
+/// same home the identity, ownership record, and networks store use.
+fn store_path() -> Option<PathBuf> {
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".myownmesh").join("allmystuff-sites.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposed_set_round_trips_and_gates_ports() {
+        let proxy = SitesProxy {
+            exposed: Mutex::new(BTreeSet::new()),
+            path: None, // no disk in the test
+            conns: Mutex::new(HashMap::new()),
+            mappings: Mutex::new(HashMap::new()),
+        };
+        assert!(proxy.exposed_ids().is_empty());
+        assert!(!proxy.is_port_exposed(8080));
+
+        let set = proxy.set_exposed(vec!["tcp:8080".into(), "tcp:5432".into()]);
+        assert_eq!(set, vec!["tcp:5432".to_string(), "tcp:8080".to_string()]);
+        // The gate keys on the port encoded in the exposed id — no scan.
+        assert!(proxy.is_port_exposed(8080));
+        assert!(proxy.is_port_exposed(5432));
+        assert!(!proxy.is_port_exposed(22), "never exposed → never proxied");
+    }
+}

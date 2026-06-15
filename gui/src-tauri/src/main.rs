@@ -28,6 +28,7 @@ mod input_inject;
 mod mesh;
 mod networks_store;
 mod ownership;
+mod sites;
 mod terminal;
 mod video;
 mod video_decode;
@@ -348,6 +349,64 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
     .build()
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---- sites (the reverse proxy) -----------------------------------------
+
+/// This machine's discovered listening TCP services (with an active banner
+/// probe), so the Sites tab can offer each to expose. The probe does
+/// blocking socket I/O, so it runs off the command executor.
+#[tauri::command]
+async fn site_scan(
+    mesh: State<'_, Arc<Mesh>>,
+) -> Result<Vec<allmystuff_inventory::ListeningService>, String> {
+    let mesh = mesh.inner().clone();
+    tokio::task::spawn_blocking(move || mesh.site_scan())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The ids of the services this machine currently advertises (exposes).
+#[tauri::command]
+fn site_exposed(mesh: State<'_, Arc<Mesh>>) -> Vec<String> {
+    mesh.site_exposed()
+}
+
+/// Set which listening services this machine advertises. Re-broadcasts
+/// presence so peers' Sites tabs update; returns the new exposed set.
+#[tauri::command]
+async fn site_set_exposed(
+    mesh: State<'_, Arc<Mesh>>,
+    ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    Ok(mesh.inner().site_set_exposed(ids).await)
+}
+
+/// Map a peer's site to a local port — set up the reverse-proxy route and
+/// bind a local listener. Returns `{ localPort }`.
+#[tauri::command]
+async fn site_map(
+    mesh: State<'_, Arc<Mesh>>,
+    node: String,
+    port: u16,
+) -> Result<Value, String> {
+    let local_port = mesh.inner().site_map(node, port).await?;
+    Ok(json!({ "localPort": local_port }))
+}
+
+/// Tear a site mapping down (unbind the local listener, drop the route).
+#[tauri::command]
+async fn site_unmap(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<(), String> {
+    mesh.inner().site_unmap(node, port).await
+}
+
+/// Every site this machine currently has mapped: `{ node, port, localPort }`.
+#[tauri::command]
+fn site_mappings(mesh: State<'_, Arc<Mesh>>) -> Vec<Value> {
+    mesh.site_mappings()
+        .into_iter()
+        .map(|(node, port, local_port)| json!({ "node": node, "port": port, "localPort": local_port }))
+        .collect()
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -939,6 +998,12 @@ fn main() {
             file_unwatch,
             file_download,
             open_files_window,
+            site_scan,
+            site_exposed,
+            site_set_exposed,
+            site_map,
+            site_unmap,
+            site_mappings,
             session_snapshot,
             room_send,
             room_share_files,
