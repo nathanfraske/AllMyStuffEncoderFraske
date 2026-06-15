@@ -50,12 +50,16 @@ pub const CONN_QUEUE: usize = 256;
 /// One live tunneled connection's handles. Dropping `tx` closes the inbound
 /// channel, which ends the socket-*writer* task; aborting `read_handle` ends
 /// the socket-*reader* task — together they tear one connection down on
-/// either side.
+/// either side. The connection is registered (with `tx`) the moment it
+/// opens, so inbound `Data` that beats the socket wiring is *buffered* in
+/// the channel, never dropped; `read_handle` is attached once the reader
+/// task exists (immediately on the client, post-`connect` on the host).
 struct ConnHandle {
     /// Inbound bytes for this connection → its local socket-writer task.
     tx: mpsc::Sender<Vec<u8>>,
     /// The socket→mesh reader task, aborted when the connection closes.
-    read_handle: JoinHandle<()>,
+    /// `None` only during the brief window before the reader is attached.
+    read_handle: Option<JoinHandle<()>>,
 }
 
 /// A site this machine has mapped to a local port — the client-side binding.
@@ -142,24 +146,36 @@ impl SitesProxy {
 
     // ---- connection table ---------------------------------------------
 
-    /// How many connections a route is currently carrying — checked against
-    /// [`MAX_CONNS_PER_ROUTE`] before wiring a new one (a soft cap: a tiny
-    /// race may let it tip one or two over, which is harmless).
-    pub fn route_conn_count(&self, route: &str) -> usize {
-        self.conns.lock().keys().filter(|(r, _)| r == route).count()
+    /// Open a connection: if the route is under its [`MAX_CONNS_PER_ROUTE`]
+    /// cap, register the inbound channel **now** and hand back its receiver
+    /// (for the socket-writer task to drain). Registering up front is what
+    /// lets [`Self::conn_tx`] accept inbound `Data` that arrives before the
+    /// socket is wired (it buffers in the channel) — no first-bytes drop.
+    /// `None` when the route is at its cap (the caller refuses the conn).
+    pub fn open_conn(&self, route: &str, conn: u64) -> Option<mpsc::Receiver<Vec<u8>>> {
+        let mut conns = self.conns.lock();
+        if conns.keys().filter(|(r, _)| r == route).count() >= MAX_CONNS_PER_ROUTE {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
+        conns.insert(
+            (route.to_string(), conn),
+            ConnHandle {
+                tx,
+                read_handle: None,
+            },
+        );
+        Some(rx)
     }
 
-    /// Register a live connection's handles.
-    pub fn register_conn(
-        &self,
-        route: &str,
-        conn: u64,
-        tx: mpsc::Sender<Vec<u8>>,
-        read_handle: JoinHandle<()>,
-    ) {
-        self.conns
-            .lock()
-            .insert((route.to_string(), conn), ConnHandle { tx, read_handle });
+    /// Attach the socket→mesh reader once it's spawned. If the connection was
+    /// already closed in the meantime (a teardown during `connect`), the
+    /// reader is aborted instead, so nothing is orphaned.
+    pub fn attach_reader(&self, route: &str, conn: u64, read_handle: JoinHandle<()>) {
+        match self.conns.lock().get_mut(&(route.to_string(), conn)) {
+            Some(h) => h.read_handle = Some(read_handle),
+            None => read_handle.abort(),
+        }
     }
 
     /// The inbound-bytes sender for one connection, if it's still live.
@@ -174,7 +190,9 @@ impl SitesProxy {
     /// channel closes → it shuts the socket) and abort its reader. Idempotent.
     pub fn close_conn(&self, route: &str, conn: u64) {
         if let Some(h) = self.conns.lock().remove(&(route.to_string(), conn)) {
-            h.read_handle.abort();
+            if let Some(reader) = h.read_handle {
+                reader.abort();
+            }
         }
     }
 

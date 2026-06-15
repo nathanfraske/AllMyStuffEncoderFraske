@@ -1541,6 +1541,10 @@ impl Mesh {
         self.release_audio_lanes(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
+        // The unmapping (client) side gets no local StopMedia effect — only
+        // the wire Teardown goes out — so close the listener + connections
+        // here, or they'd leak (the port stays bound, the accept loop runs).
+        self.sites.stop_route(&route_id);
         self.drop_downloads(&route_id);
         if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
             // Best-effort: the route is gone locally either way.
@@ -3236,9 +3240,17 @@ impl Mesh {
                 };
                 next_conn += 1;
                 let conn = next_conn;
-                // The client opens the tunnel; the host validates the port.
-                mesh.start_site_conn(&route_id, &peer, conn, socket, Some(host_port))
-                    .await;
+                // Register the channel before wiring, then tunnel (the
+                // client sends `Open` so the host dials loopback). Over the
+                // per-route cap → refuse this one cleanly.
+                match mesh.sites.open_conn(&route_id, conn) {
+                    Some(rx) => mesh.wire_conn(&route_id, &peer, conn, socket, rx, Some(host_port)),
+                    None => {
+                        mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn })
+                            .await;
+                        tracing::warn!("site route {route_id} at connection cap — refused conn {conn}");
+                    }
+                }
             }
         })
     }
@@ -3265,35 +3277,31 @@ impl Mesh {
         false
     }
 
-    /// Wire one tunneled connection: split the socket, spawn the inbound
-    /// writer and the socket→mesh reader, and register it. Read and write run
-    /// as independent tasks — full duplex — so a WebSocket-upgraded (or
-    /// otherwise long-lived, bidirectional) connection flows both ways for
-    /// its whole life. When `open_port` is set (the client side), a
-    /// `SiteEvent::Open` goes first so the host dials loopback. Shared by
-    /// both ends.
-    async fn start_site_conn(
+    /// Wire one tunneled connection whose inbound channel is already
+    /// registered (via `open_conn`, so `rx` is its receiver): split the
+    /// socket, spawn the inbound writer and the socket→mesh reader, and
+    /// attach the reader. Read and write run as independent tasks — full
+    /// duplex — so a WebSocket-upgraded (or otherwise long-lived,
+    /// bidirectional) connection flows both ways for its whole life. When
+    /// `open_port` is set (the client side), a `SiteEvent::Open` goes first
+    /// so the host dials loopback. Shared by both ends.
+    fn wire_conn(
         self: &Arc<Self>,
         route_id: &str,
         peer: &str,
         conn: u64,
         socket: tokio::net::TcpStream,
+        rx: mpsc::Receiver<Vec<u8>>,
         open_port: Option<u16>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Soft per-route connection cap — bounds a runaway/hostile peer.
-        if self.sites.route_conn_count(route_id) >= crate::sites::MAX_CONNS_PER_ROUTE {
-            self.send_site_event(peer, route_id, SiteEvent::Close { conn })
-                .await;
-            tracing::warn!("site route {route_id} at connection cap — refused conn {conn}");
-            return;
-        }
         let (mut read_half, mut write_half) = socket.into_split();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(crate::sites::CONN_QUEUE);
 
         // Inbound bytes (from the peer) → this connection's socket. Detached:
         // it ends when `tx` is dropped (close_conn / teardown), then shuts
-        // the write half so the local client sees a clean close.
+        // the write half so the local client sees a clean close. It drains
+        // any bytes that were buffered before the socket was wired.
+        let mut rx = rx;
         tauri::async_runtime::spawn(async move {
             while let Some(bytes) = rx.recv().await {
                 if write_half.write_all(&bytes).await.is_err() {
@@ -3336,7 +3344,7 @@ impl Mesh {
             mesh.sites.close_conn(&rid, conn);
         });
 
-        self.sites.register_conn(route_id, conn, tx, reader);
+        self.sites.attach_reader(route_id, conn, reader);
     }
 
     /// Send one `SiteEvent` to `peer` on the media channel, fire-and-forget
@@ -3389,20 +3397,34 @@ impl Mesh {
             match frame.event {
                 SiteEvent::Open { conn, port } => {
                     // The load-bearing control: dial only a port *we* expose,
-                    // never the client's free choice.
-                    if !self.sites.is_port_exposed(port) {
+                    // never the client's free choice. Over the per-route cap,
+                    // or unexposed → refuse with a `Close`.
+                    let rx = if self.sites.is_port_exposed(port) {
+                        self.sites.open_conn(&frame.route, conn)
+                    } else {
                         tracing::warn!(
                             "site open from {} for :{port} refused — not an exposed service",
                             short_id(from)
                         );
-                        let mesh = self.clone();
-                        let (route, peer) = (frame.route.clone(), from.to_string());
-                        tauri::async_runtime::spawn(async move {
-                            mesh.send_site_event(&peer, &route, SiteEvent::Close { conn }).await;
-                        });
-                        return;
+                        None
+                    };
+                    match rx {
+                        Some(rx) => self.spawn_site_host_connect(
+                            frame.route.clone(),
+                            from.to_string(),
+                            conn,
+                            port,
+                            rx,
+                        ),
+                        None => {
+                            let mesh = self.clone();
+                            let (route, peer) = (frame.route.clone(), from.to_string());
+                            tauri::async_runtime::spawn(async move {
+                                mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
+                                    .await;
+                            });
+                        }
                     }
-                    self.spawn_site_host_connect(frame.route.clone(), from.to_string(), conn, port);
                 }
                 SiteEvent::Data { conn, data } => self.feed_site_conn(&frame.route, conn, data),
                 SiteEvent::Close { conn } => self.sites.close_conn(&frame.route, conn),
@@ -3433,14 +3455,18 @@ impl Mesh {
         }
     }
 
-    /// Host side: a validated `Open` — connect to the local service and wire
-    /// the tunnel. A failed connect closes the connection back to the client.
+    /// Host side: a validated `Open` whose channel is already registered
+    /// (`rx` is its receiver). Connect to the local service and wire the
+    /// tunnel; inbound `Data` that arrived during the connect sits buffered
+    /// in `rx` and is drained once the writer starts. A failed connect closes
+    /// the connection back to the client (and drops its registration).
     fn spawn_site_host_connect(
         self: &Arc<Self>,
         route_id: String,
         peer: String,
         conn: u64,
         port: u16,
+        rx: mpsc::Receiver<Vec<u8>>,
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
         let mesh = self.clone();
@@ -3449,10 +3475,11 @@ impl Mesh {
             match tokio::net::TcpStream::connect(addr).await {
                 Ok(socket) => {
                     // The host doesn't send Open (the client already did).
-                    mesh.start_site_conn(&route_id, &peer, conn, socket, None).await;
+                    mesh.wire_conn(&route_id, &peer, conn, socket, rx, None);
                 }
                 Err(e) => {
                     tracing::warn!("site connect to 127.0.0.1:{port} failed: {e}");
+                    mesh.sites.close_conn(&route_id, conn);
                     mesh.send_site_event(&peer, &route_id, SiteEvent::Close { conn }).await;
                 }
             }
