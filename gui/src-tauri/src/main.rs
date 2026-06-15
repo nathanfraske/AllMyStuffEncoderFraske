@@ -806,6 +806,17 @@ async fn network_set_enabled(
     }
 }
 
+/// Write a network-settings envelope (the GUI's flat, shareable JSON for a
+/// network's handle + servers) to disk. Pretty-printed so it's easy to read
+/// by hand. Import is a renderer-side `<input type="file">` read, so there's
+/// no symmetric import command here.
+#[tauri::command]
+async fn mesh_network_export_file(path: String, config: Value) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(&config).map_err(|e| format!("serialise: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(())
+}
+
 /// Set this device's display-name override. Persists in the daemon identity
 /// and updates the live presence profile so peers see the new name on the
 /// next broadcast. An empty string resets the name to the hostname.
@@ -948,6 +959,7 @@ fn main() {
             disabled_networks,
             network_set_enabled,
             mesh_config_show,
+            mesh_network_export_file,
             mesh_network_id_generate,
             mesh_roster_approve,
             mesh_roster_remove,

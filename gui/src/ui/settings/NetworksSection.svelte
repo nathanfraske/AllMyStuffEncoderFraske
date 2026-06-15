@@ -13,10 +13,8 @@
   import NetworkDevices from "./NetworkDevices.svelte";
 
   let nameInput = $state("");
-  let newLabel = $state("");
   let joinId = $state("");
-  let joinLabel = $state("");
-  let mode = $state<"none" | "create" | "join">("none");
+  let mode = $state<"none" | "join">("none");
   let copied = $state("");
 
   const sub = $derived(app.networksSubtab);
@@ -38,15 +36,9 @@
   async function saveName() {
     await app.setIdentityLabel(trimmedName);
   }
-  async function create() {
-    await app.createNetwork(newLabel);
-    newLabel = "";
-    mode = "none";
-  }
   async function join() {
-    await app.joinNetwork(joinId, joinLabel);
+    await app.joinNetwork(joinId);
     joinId = "";
-    joinLabel = "";
     mode = "none";
   }
   async function copyHandle(handle: string) {
@@ -57,6 +49,20 @@
     } catch {
       app.toast("warn", "Couldn't copy — select it by hand");
     }
+  }
+
+  // Import = the no-typing way onto a network: pick a settings file the other
+  // device exported and the network (handle + servers) is recreated here.
+  let importInput = $state<HTMLInputElement | null>(null);
+  function onImportFile(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0] ?? null;
+    input.value = ""; // so re-picking the same file still fires onchange
+    if (!file) return;
+    file
+      .text()
+      .then((text) => app.importNetworkSettings(text))
+      .catch((err) => app.toast("warn", `Couldn't read that file: ${String(err)}`));
   }
 </script>
 
@@ -97,29 +103,27 @@
       <div class="sec-head">
         <h4>Your networks — joined {app.networks.length}</h4>
         <div class="seg">
-          <button class="btn small" class:on={mode === "create"} onclick={() => (mode = mode === "create" ? "none" : "create")}>＋ Create</button>
           <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
+          <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
         </div>
       </div>
+      <input bind:this={importInput} type="file" accept=".json,application/json" hidden onchange={onImportFile} />
       <p class="hint">
         You can be on as many networks as you like — devices on any of them show up,
         so it's never just “the” mesh. Share a network's handle to add a device to it.
       </p>
 
-      {#if mode === "create"}
+      {#if mode === "join"}
         <div class="row">
-          <input class="field" placeholder="Name (optional, e.g. Home)" bind:value={newLabel} />
-          <button class="btn small primary" onclick={create}>Create</button>
+          <input
+            class="field"
+            placeholder="network name OR leave blank to generate one"
+            bind:value={joinId}
+            onkeydown={(e) => e.key === "Enter" && join()}
+          />
+          <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A fresh network id is generated for you, on MyOwnMesh's default servers.</p>
-      {:else if mode === "join"}
-        <div class="row">
-          <input class="field" placeholder="Network handle (paste from the other device)" bind:value={joinId} />
-        </div>
-        <div class="row">
-          <input class="field" placeholder="Name (optional)" bind:value={joinLabel} />
-          <button class="btn small primary" disabled={!joinId.trim()} onclick={join}>Join</button>
-        </div>
+        <p class="hint">A network is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one.</p>
       {/if}
 
       <ul class="nets">
@@ -130,6 +134,7 @@
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
             <button class="btn small" title="Copy this network's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+            <button class="btn small" title="Save this network's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
             <button class="btn small" title="Edit this network's servers" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Servers</button>
             <button class="btn small" title="Switch this network off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
             <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>

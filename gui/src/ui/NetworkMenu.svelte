@@ -30,7 +30,7 @@
 
   {#if app.networks.length === 0 && app.disabledNets.length === 0}
     <p class="menu-empty">
-      No networks yet — create or join one from
+      No networks yet — join or import one from
       <button class="linkish" onclick={() => (close(), app.openSettings("networks"))}>Settings</button>.
     </p>
   {/if}
