@@ -687,17 +687,45 @@ impl Mesh {
     /// the owner exposes reaches peers' Sites tabs promptly. User-triggered
     /// and rare, so the scan here is well off any hot path.
     async fn restamp_profile(self: &Arc<Self>) {
-        let sites = {
+        // Scan off the async runtime (lsof on macOS, /proc walks on Linux).
+        let mesh = self.clone();
+        let sites = tokio::task::spawn_blocking(move || {
             let inv = allmystuff_inventory::scan();
-            allmystuff_bridge::sites::sites_from_inventory(&inv, &self.sites.exposed_map())
-        };
+            allmystuff_bridge::sites::sites_from_inventory(&inv, &mesh.sites.exposed_map())
+        })
+        .await
+        .unwrap_or_default();
+        let count = sites.len();
         {
             let mut st = self.state.lock();
             if let Some(p) = st.profile.as_mut() {
                 p.sites = sites;
             }
         }
+        tracing::info!("re-advertising {count} exposed site(s) to peers");
+        self.reassert_presence().await;
+        // Our own UI (and any console window) reflects the change at once.
+        self.emit_snapshot();
+    }
+
+    /// Push this node's presence out so a change reaches every connected
+    /// peer: the broadcast to all, *and* a targeted send to each peer the
+    /// session already knows. The targeted half is the belt-and-suspenders —
+    /// a `ChannelSendAll` can miss an already-connected peer mid-session,
+    /// where a `ChannelSendTo` per peer lands (the same path that answers a
+    /// peer that just restarted).
+    async fn reassert_presence(self: &Arc<Self>) {
         self.broadcast_presence().await;
+        let peers: Vec<String> = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|s| s.peers().map(|p| p.node.to_string()).collect())
+                .unwrap_or_default()
+        };
+        for peer in peers {
+            self.send_presence_to(&peer).await;
+        }
     }
 
     /// All joined networks' config ids. The daemon wraps the list as

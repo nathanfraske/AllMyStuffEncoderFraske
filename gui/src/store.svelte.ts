@@ -1132,6 +1132,18 @@ class AppStore {
     }
     this.routeStates = states;
 
+    // Reconcile site mappings against what each host now advertises: a host
+    // that's online but no longer lists a site we'd mapped has stopped
+    // exposing it — tear our local mapping down so the dead port is freed
+    // (and the row disappears). Only when the host is online, so a brief
+    // drop-off doesn't unmap.
+    for (const m of [...this.siteMappings]) {
+      const host = this.machineByAnyId(m.node);
+      if (host?.online && !(host.sites ?? []).some((s) => s.id === m.site)) {
+        void this.unmapSite(m.node, m.site);
+      }
+    }
+
     // A console waiting on its video backbone: the route just went
     // active, so bring the session's default legs (audio, control,
     // clipboard) up now — sequenced behind the picture instead of racing
