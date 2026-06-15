@@ -11,7 +11,7 @@
   import SharingSection from "./settings/SharingSection.svelte";
 
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
-    { id: "networks", label: "Networks", icon: "🌐" },
+    { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "venues", label: "Venues", icon: "📡" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },

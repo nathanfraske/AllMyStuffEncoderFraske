@@ -71,7 +71,7 @@
 
 <div class="section">
   <div class="head">
-    <h3>Networks</h3>
+    <h3>Meshes</h3>
     <div class="subtabs">
       <button class:active={sub === "status"} onclick={() => (app.networksSubtab = "status")}>Status</button>
       <button class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
@@ -104,7 +104,7 @@
     <!-- Your networks (with add/join + per-network handle) -->
     <section class="block">
       <div class="sec-head">
-        <h4>Your networks — joined {app.networks.length}</h4>
+        <h4>Your meshes — joined {app.networks.length}</h4>
         <div class="seg">
           <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
@@ -113,14 +113,14 @@
       <input bind:this={importInput} type="file" accept=".json,application/json" hidden onchange={onImportFile} />
       <p class="hint">
         You can be on as many networks as you like — devices on any of them show up,
-        so it's never just “the” mesh. Share a network's handle to add a device to it.
+        so it's never just “the” mesh. Share a mesh's handle to add a device to it.
       </p>
 
       {#if mode === "join"}
         <div class="row">
           <input
             class="field"
-            placeholder="network name OR leave blank to generate one"
+            placeholder="mesh name OR leave blank to generate one"
             bind:value={joinId}
             onkeydown={(e) => e.key === "Enter" && join()}
           />
@@ -131,7 +131,7 @@
           </select>
           <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A network is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one. The venue is where it calls out (Public by default).</p>
+        <p class="hint">A mesh is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one. The venue is where it calls out (Public by default).</p>
       {/if}
 
       <ul class="nets">
@@ -141,10 +141,10 @@
               <span class="net-name">{networkDisplayName(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
-            <button class="btn small" title="Copy this network's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
-            <button class="btn small" title="Save this network's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
-            <button class="btn small" title="Choose where this network calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
-            <button class="btn small" title="Switch this network off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
+            <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+            <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
+            <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+            <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
             <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
           </li>
         {/each}
@@ -209,7 +209,7 @@
             </li>
           {/each}
           {#if app.roster.length === 0 && pending.length === 0}
-            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this network.</li>
+            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this mesh.</li>
           {/if}
         </ul>
       </section>

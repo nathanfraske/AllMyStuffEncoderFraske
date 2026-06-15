@@ -126,7 +126,7 @@
             e.stopPropagation();
             app.netMenuOpen = !app.netMenuOpen;
           }}
-          title="Your networks — switch them on or off, or open network settings"
+          title="Your meshes — switch them on or off, or open mesh settings"
           aria-haspopup="menu"
           aria-expanded={app.netMenuOpen}
         >
@@ -134,12 +134,12 @@
           {!app.backendConnected
             ? "demo mode"
             : app.networks.length > 1
-              ? `${app.networks.length} networks`
+              ? `${app.networks.length} meshes`
               : app.activeNetwork
                 ? networkDisplayName(app.activeNetwork)
                 : app.disabledNets.length > 0
-                  ? "networks off"
-                  : "no network"}
+                  ? "meshes off"
+                  : "no mesh"}
           {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
           <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
         </button>
@@ -153,7 +153,7 @@
       <!-- A device asking to join: the outlined, pulsing nudge that opens the
            approval popup (the code-grid panel). -->
       {#if app.freshJoins.length > 0}
-        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your network">
+        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your mesh">
           <span class="nudge-mark" aria-hidden="true">!</span>
           {app.freshJoins.length}
           {app.freshJoins.length === 1 ? "device wants in" : "devices want in"}
@@ -174,7 +174,7 @@
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
       <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
-      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart network — reconnect" aria-label="Restart network">↻</button>
+      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
         {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}

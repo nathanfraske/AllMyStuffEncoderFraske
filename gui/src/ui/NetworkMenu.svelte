@@ -25,12 +25,12 @@
   });
 </script>
 
-<div class="net-menu" role="menu" aria-label="Your networks">
-  <div class="menu-head">Your networks</div>
+<div class="net-menu" role="menu" aria-label="Your meshes">
+  <div class="menu-head">Your meshes</div>
 
   {#if app.networks.length === 0 && app.disabledNets.length === 0}
     <p class="menu-empty">
-      No networks yet — join or import one from
+      No meshes yet — join or import one from
       <button class="linkish" onclick={() => (close(), app.openSettings("networks"))}>Settings</button>.
     </p>
   {/if}
@@ -47,7 +47,7 @@
         role="switch"
         aria-checked="true"
         aria-label="Disable {networkDisplayName(n)}"
-        title="Disable — leave this network but keep it for later"
+        title="Disable — leave this mesh but keep it for later"
         onclick={() => app.toggleNetworkEnabled(n.config_id, false)}
       >
         <span class="knob"></span>
@@ -67,7 +67,7 @@
         role="switch"
         aria-checked="false"
         aria-label="Enable {networkDisplayName(c)}"
-        title="Enable — re-join this network"
+        title="Enable — re-join this mesh"
         onclick={() => app.toggleNetworkEnabled(c.id, true)}
       >
         <span class="knob"></span>
@@ -81,7 +81,7 @@
       onclick={() => {
         close();
         app.openSettings("networks");
-      }}>⚙ Manage networks…</button
+      }}>⚙ Manage meshes…</button
     >
   </div>
 </div>

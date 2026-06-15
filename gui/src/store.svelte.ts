@@ -3535,7 +3535,7 @@ class AppStore {
     const typed = rawName.trim();
     const id = typed ? canonicalNetworkId(typed) : generateNetworkPhrase();
     if (id.length < 3 || id.length > 64) {
-      this.toast("warn", "A network name needs 3–64 letters, digits or hyphens");
+      this.toast("warn", "A mesh name needs 3–64 letters, digits or hyphens");
       return;
     }
     // Compile the chosen venue(s) into the mesh's servers (union); remember
