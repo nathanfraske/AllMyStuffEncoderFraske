@@ -145,7 +145,7 @@ pub fn classify_port(port: u16) -> ServiceKind {
         3389 => ServiceKind::Rdp,
         5432 => ServiceKind::Postgres,
         6379 => ServiceKind::Redis,
-        27017 | 27018 | 27019 => ServiceKind::Mongodb,
+        27017..=27019 => ServiceKind::Mongodb,
         5900..=5910 => ServiceKind::Vnc,
         // The web sweet spot — server defaults and the popular dev-server
         // ports. A probe confirms, but http is the right default guess.
