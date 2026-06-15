@@ -9,11 +9,13 @@
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { networkDisplayName } from "../../types";
+  import { PUBLIC_VENUE_ID } from "../../venues";
   import NetworkServers from "./NetworkServers.svelte";
   import NetworkDevices from "./NetworkDevices.svelte";
 
   let nameInput = $state("");
   let joinId = $state("");
+  let joinVenue = $state(PUBLIC_VENUE_ID);
   let mode = $state<"none" | "join">("none");
   let copied = $state("");
 
@@ -37,8 +39,9 @@
     await app.setIdentityLabel(trimmedName);
   }
   async function join() {
-    await app.joinNetwork(joinId);
+    await app.joinNetwork(joinId, [joinVenue]);
     joinId = "";
+    joinVenue = PUBLIC_VENUE_ID;
     mode = "none";
   }
   async function copyHandle(handle: string) {
@@ -68,10 +71,10 @@
 
 <div class="section">
   <div class="head">
-    <h3>Networks</h3>
+    <h3>Meshes</h3>
     <div class="subtabs">
       <button class:active={sub === "status"} onclick={() => (app.networksSubtab = "status")}>Status</button>
-      <button class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Servers</button>
+      <button class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
       <button class:active={sub === "devices"} onclick={() => (app.networksSubtab = "devices")}>Devices</button>
     </div>
   </div>
@@ -101,7 +104,7 @@
     <!-- Your networks (with add/join + per-network handle) -->
     <section class="block">
       <div class="sec-head">
-        <h4>Your networks — joined {app.networks.length}</h4>
+        <h4>Your meshes — joined {app.networks.length}</h4>
         <div class="seg">
           <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
@@ -110,20 +113,25 @@
       <input bind:this={importInput} type="file" accept=".json,application/json" hidden onchange={onImportFile} />
       <p class="hint">
         You can be on as many networks as you like — devices on any of them show up,
-        so it's never just “the” mesh. Share a network's handle to add a device to it.
+        so it's never just “the” mesh. Share a mesh's handle to add a device to it.
       </p>
 
       {#if mode === "join"}
         <div class="row">
           <input
             class="field"
-            placeholder="network name OR leave blank to generate one"
+            placeholder="mesh name OR leave blank to generate one"
             bind:value={joinId}
             onkeydown={(e) => e.key === "Enter" && join()}
           />
+          <select class="venue-pick" title="Which venue this mesh calls out at" bind:value={joinVenue}>
+            {#each app.venues as v (v.id)}
+              <option value={v.id}>{v.label}</option>
+            {/each}
+          </select>
           <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A network is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one.</p>
+        <p class="hint">A mesh is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one. The venue is where it calls out (Public by default).</p>
       {/if}
 
       <ul class="nets">
@@ -133,10 +141,10 @@
               <span class="net-name">{networkDisplayName(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
-            <button class="btn small" title="Copy this network's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
-            <button class="btn small" title="Save this network's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
-            <button class="btn small" title="Edit this network's servers" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Servers</button>
-            <button class="btn small" title="Switch this network off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
+            <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+            <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
+            <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+            <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
             <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
           </li>
         {/each}
@@ -201,7 +209,7 @@
             </li>
           {/each}
           {#if app.roster.length === 0 && pending.length === 0}
-            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this network.</li>
+            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this mesh.</li>
           {/if}
         </ul>
       </section>
@@ -276,6 +284,22 @@
     font-family: inherit;
   }
   .field:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .venue-pick {
+    flex-shrink: 0;
+    max-width: 11rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    padding: 0.45rem 0.5rem;
+    font-size: 0.82rem;
+    font-family: inherit;
+  }
+  .venue-pick:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);

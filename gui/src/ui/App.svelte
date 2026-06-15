@@ -28,6 +28,7 @@
   import Terminal from "./Terminal.svelte";
   import TerminalHost from "./TerminalHost.svelte";
   import VideoPopoutHost from "./VideoPopoutHost.svelte";
+  import LayersSheet from "./LayersSheet.svelte";
   import Toasts from "./Toasts.svelte";
 
   // When this webview is a dedicated console window (`?console=<node>`),
@@ -46,6 +47,10 @@
   // (kept in sync by scripts/bump-version.sh); empty in the in-browser
   // preview, where the badge below simply doesn't render.
   let version = $state("");
+
+  // The "how it works" sheet — the venue graphic that explains mesh / fleet /
+  // servers / sharing in one picture. Local UI state; opened from the top bar.
+  let infoOpen = $state(false);
 
   onMount(() => {
     if (consoleTarget || terminalTarget || filesTarget || roomTarget || videoTarget) return;
@@ -121,7 +126,7 @@
             e.stopPropagation();
             app.netMenuOpen = !app.netMenuOpen;
           }}
-          title="Your networks — switch them on or off, or open network settings"
+          title="Your meshes — switch them on or off, or open mesh settings"
           aria-haspopup="menu"
           aria-expanded={app.netMenuOpen}
         >
@@ -129,12 +134,12 @@
           {!app.backendConnected
             ? "demo mode"
             : app.networks.length > 1
-              ? `${app.networks.length} networks`
+              ? `${app.networks.length} meshes`
               : app.activeNetwork
                 ? networkDisplayName(app.activeNetwork)
                 : app.disabledNets.length > 0
-                  ? "networks off"
-                  : "no network"}
+                  ? "meshes off"
+                  : "no mesh"}
           {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
           <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
         </button>
@@ -148,7 +153,7 @@
       <!-- A device asking to join: the outlined, pulsing nudge that opens the
            approval popup (the code-grid panel). -->
       {#if app.freshJoins.length > 0}
-        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your network">
+        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your mesh">
           <span class="nudge-mark" aria-hidden="true">!</span>
           {app.freshJoins.length}
           {app.freshJoins.length === 1 ? "device wants in" : "devices want in"}
@@ -168,7 +173,8 @@
            re-join from the parked config, a clean transport restart for when
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
-      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart network — reconnect" aria-label="Restart network">↻</button>
+      <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
+      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
         {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
@@ -191,6 +197,9 @@
   {/if}
   {#if app.claimOpen}
     <ClaimSheet />
+  {/if}
+  {#if infoOpen}
+    <LayersSheet onclose={() => (infoOpen = false)} />
   {/if}
   <!-- The web preview's in-page console + terminal + files; on the desktop
        these sessions open in their own windows instead and never activate
@@ -393,6 +402,19 @@
     100% {
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0);
     }
+  }
+  /* Icon-only "how it works" — opens the venue graphic. Same tight footprint
+     as refresh/gear, with the glyph as a bold accent so it reads as help, not
+     another setting. */
+  .help {
+    font-size: 0.95rem;
+    font-weight: 800;
+    padding: 0.5rem 0.72rem;
+    color: var(--accent-ink);
+  }
+  .help:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
   /* Icon-only refresh — same tighter footprint as the gear so the two
      trailing controls read as a pair. */

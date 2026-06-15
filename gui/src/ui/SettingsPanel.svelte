@@ -5,12 +5,14 @@
   // the top-bar gear opens it, the Networks button deep-links to a pane.
   import { app, type SettingsTab } from "../store.svelte";
   import NetworksSection from "./settings/NetworksSection.svelte";
+  import VenuesSection from "./settings/VenuesSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
 
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
-    { id: "networks", label: "Networks", icon: "🌐" },
+    { id: "networks", label: "Meshes", icon: "🌐" },
+    { id: "venues", label: "Venues", icon: "📡" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "updates", label: "Updates", icon: "⬆️" },
@@ -49,6 +51,8 @@
     <section class="content">
       {#if app.settingsTab === "networks"}
         <NetworksSection />
+      {:else if app.settingsTab === "venues"}
+        <VenuesSection />
       {:else if app.settingsTab === "fleet"}
         <FleetSection />
       {:else if app.settingsTab === "sharing"}

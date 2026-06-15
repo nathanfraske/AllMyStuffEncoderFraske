@@ -20,6 +20,8 @@
 
 import { buildNetworkConfig } from "./tauri";
 import type { NetworkConfigFull } from "./types";
+import { exportVenue, isVenueExport, venueFromExport, type VenueExport } from "./venue-settings";
+import type { Venue } from "./venues";
 
 export const NETWORK_SETTINGS_KIND = "allmystuff.network-settings";
 export const NETWORK_SETTINGS_VERSION = 1;
@@ -45,11 +47,17 @@ export interface NetworkSettingsExport {
   signaling_servers: string[];
   stun_servers: string[];
   turn_servers: EnvelopeTurn[];
+  /** The venues this mesh uses, travelling with it so importing the mesh
+   *  brings them too. Each is exported by its own rule (remote → just its url,
+   *  static → its servers). The flat *_servers above remain the union, so
+   *  older AllMyStuff / MyOwnMesh files still import. Optional; older builds
+   *  ignore it. */
+  venues?: VenueExport[];
 }
 
 /** Flatten a daemon `NetworkConfigFull` into the shareable envelope —
  *  strips the local `id` and the urls-array nesting. */
-export function exportNetworkSettings(cfg: NetworkConfigFull): NetworkSettingsExport {
+export function exportNetworkSettings(cfg: NetworkConfigFull, venues: Venue[] = []): NetworkSettingsExport {
   return {
     kind: NETWORK_SETTINGS_KIND,
     version: NETWORK_SETTINGS_VERSION,
@@ -62,7 +70,15 @@ export function exportNetworkSettings(cfg: NetworkConfigFull): NetworkSettingsEx
       ...(t.username ? { username: t.username } : {}),
       ...(t.credential ? { credential: t.credential } : {}),
     })),
+    ...(venues.length ? { venues: venues.map(exportVenue) } : {}),
   };
+}
+
+/** Recreate the venues an imported mesh brought with it — remote ones come
+ *  back pointing at their url (servers fetched separately), static ones with
+ *  their servers inline. Empty when the file predates venue-aware exports. */
+export function venuesFromEnvelope(env: NetworkSettingsExport): Venue[] {
+  return (env.venues ?? []).filter(isVenueExport).map(venueFromExport);
 }
 
 /** Cheap shape check: does this parsed value carry a marker we accept and a
@@ -107,6 +123,7 @@ function coerce(raw: NetworkSettingsExport): NetworkSettingsExport {
     signaling_servers: strings(raw.signaling_servers),
     stun_servers: strings(raw.stun_servers),
     turn_servers: turn,
+    ...(Array.isArray(raw.venues) ? { venues: raw.venues.filter(isVenueExport) } : {}),
   };
 }
 
