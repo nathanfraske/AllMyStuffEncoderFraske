@@ -299,13 +299,17 @@ fn parse_usb_id(device_id: &str) -> Option<(String, String)> {
         .then_some((vid, pid))
 }
 
-/// Listening-service discovery isn't implemented on Windows yet (Linux is the
-/// reference; the equivalent here would query `Get-NetTCPConnection -State
-/// Listen` / `netstat -ano`). Scaffolded to an empty list so the Sites plane
-/// shows no sites for a Windows host rather than failing — the same
-/// degrade-to-nothing contract as every other probe.
+/// Enumerate the TCP ports this machine is listening on, via
+/// `Get-NetTCPConnection -State Listen`, tagged with each socket's owning
+/// process name (cosmetic — `Get-Process` is SilentlyContinue, so a PID we
+/// can't open just leaves the name blank). Degrades to an empty list when
+/// PowerShell isn't available or nothing is listening.
 pub fn collect_listening() -> Vec<ListeningService> {
-    Vec::new()
+    let script = "Get-NetTCPConnection -State Listen | ForEach-Object { \
+        [PSCustomObject]@{ LocalAddress = $_.LocalAddress; LocalPort = $_.LocalPort; \
+        Process = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } } \
+        | ConvertTo-Json -Compress";
+    crate::listening::services_from_nettcp_rows(&rows(script))
 }
 
 #[cfg(test)]

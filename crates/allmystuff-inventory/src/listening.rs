@@ -104,6 +104,124 @@ fn is_loopback_hex(addr_hex: &str, ipv6: bool) -> bool {
     }
 }
 
+// ---- macOS (lsof) -----------------------------------------------------
+
+/// One `LISTEN` socket parsed from a line of `lsof -nP -iTCP -sTCP:LISTEN`
+/// — the macOS source (there's no `/proc/net/tcp` there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsofListen {
+    pub port: u16,
+    /// Bound only to loopback (127.0.0.0/8 or ::1).
+    pub loopback: bool,
+    /// The owning process (lsof's `COMMAND` column).
+    pub process: String,
+}
+
+/// Build the [`ListeningService`]s from `lsof -nP -iTCP -sTCP:LISTEN`
+/// output: parse each `LISTEN` row, then collapse to one service per port (a
+/// server usually binds both IPv4 and IPv6). A port is loopback-only iff
+/// *every* bind for it was loopback. Pure, so it's fixture-tested without a
+/// Mac present.
+pub fn services_from_lsof(content: &str) -> Vec<ListeningService> {
+    use std::collections::BTreeMap;
+    let mut by_port: BTreeMap<u16, (bool, String)> = BTreeMap::new();
+    for r in parse_lsof_listen(content) {
+        by_port
+            .entry(r.port)
+            .and_modify(|(lb, proc)| {
+                // Any non-loopback bind makes the port reachable off-box.
+                *lb = *lb && r.loopback;
+                if proc.is_empty() {
+                    *proc = r.process.clone();
+                }
+            })
+            .or_insert((r.loopback, r.process));
+    }
+    by_port
+        .into_iter()
+        .map(|(port, (loopback, process))| service_from_port(port, loopback, process))
+        .collect()
+}
+
+/// Parse the `LISTEN` rows out of `lsof -nP -iTCP -sTCP:LISTEN` output, one
+/// per (process, bound address). The header row and anything malformed are
+/// skipped. Pure.
+pub fn parse_lsof_listen(content: &str) -> Vec<LsofListen> {
+    content.lines().filter_map(parse_lsof_line).collect()
+}
+
+/// One lsof line → its listening socket. The `NAME` column (the bound
+/// `addr:port`) is the token right before the trailing `(LISTEN)`, and the
+/// `COMMAND` column is the first token — robust to lsof's column spacing.
+fn parse_lsof_line(line: &str) -> Option<LsofListen> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let listen_pos = toks.iter().position(|t| t.starts_with("(LISTEN"))?;
+    let process = toks.first()?.to_string();
+    let name = toks.get(listen_pos.checked_sub(1)?)?;
+    // Split host from port on the *last* colon (IPv6 addresses are bracketed,
+    // e.g. `[::1]:5173`, so only the final colon separates the port).
+    let (host, port_s) = name.rsplit_once(':')?;
+    let port: u16 = port_s.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some(LsofListen {
+        port,
+        loopback: is_loopback_host(host),
+        process,
+    })
+}
+
+/// Is an lsof / Get-NetTCPConnection host part a loopback bind? `127.x` and
+/// `::1` (bracketed or not) are loopback-only; a wildcard (`*`, `0.0.0.0`,
+/// `[::]`, `::`) or a specific interface address is reachable off-box. Pure.
+fn is_loopback_host(host: &str) -> bool {
+    host == "[::1]" || host == "::1" || host.starts_with("127.")
+}
+
+// ---- Windows (Get-NetTCPConnection) -----------------------------------
+
+/// Build the [`ListeningService`]s from the rows of a `Get-NetTCPConnection
+/// -State Listen | ConvertTo-Json` dump (Windows), already normalised to one
+/// JSON object per row (the Windows module's `rows` helper). Reads
+/// `LocalAddress`, `LocalPort`, and the owning `Process` name; collapses to
+/// one service per port. Pure, so it's fixture-tested without Windows.
+pub fn services_from_nettcp_rows(rows: &[serde_json::Value]) -> Vec<ListeningService> {
+    use std::collections::BTreeMap;
+    let mut by_port: BTreeMap<u16, (bool, String)> = BTreeMap::new();
+    for row in rows {
+        let Some(port) = nettcp_port(&row["LocalPort"]) else {
+            continue;
+        };
+        if port == 0 {
+            continue;
+        }
+        let addr = row["LocalAddress"].as_str().unwrap_or("");
+        let process = row["Process"].as_str().unwrap_or("").trim().to_string();
+        let loopback = is_loopback_host(addr);
+        by_port
+            .entry(port)
+            .and_modify(|(lb, proc)| {
+                *lb = *lb && loopback;
+                if proc.is_empty() {
+                    *proc = process.clone();
+                }
+            })
+            .or_insert((loopback, process));
+    }
+    by_port
+        .into_iter()
+        .map(|(port, (loopback, process))| service_from_port(port, loopback, process))
+        .collect()
+}
+
+/// `LocalPort` is a JSON number, but tolerate a stringified one too.
+fn nettcp_port(v: &serde_json::Value) -> Option<u16> {
+    v.as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 /// Build a [`ListeningService`] for a port from the well-known-port table.
 /// `process` is the best-effort owning process name (or empty).
 pub fn service_from_port(port: u16, loopback: bool, process: String) -> ListeningService {
@@ -337,6 +455,75 @@ mod tests {
         assert_eq!(p8080.inode, 100, "lowest non-zero inode kept");
         let p22 = merged.iter().find(|r| r.port == 22).unwrap();
         assert!(!p22.loopback, "a wildcard bind makes the port off-box");
+    }
+
+    #[test]
+    fn parses_lsof_listen_output() {
+        // A real-shaped `lsof -nP -iTCP -sTCP:LISTEN` dump: a Vite dev server
+        // on loopback v4+v6 (one site, local-only), an off-box server on *,
+        // and the header row (must be skipped).
+        let content = "\
+COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+node    12345 casey   23u  IPv4 0xabc      0t0  TCP 127.0.0.1:5173 (LISTEN)
+node    12345 casey   24u  IPv6 0xdef      0t0  TCP [::1]:5173 (LISTEN)
+ControlCe 567 casey   18u  IPv4 0x123      0t0  TCP *:7000 (LISTEN)
+postgres  890 casey    7u  IPv4 0x456      0t0  TCP 127.0.0.1:5432 (LISTEN)
+";
+        let services = services_from_lsof(content);
+        // Three distinct ports (5173 merged across v4+v6).
+        assert_eq!(services.len(), 3, "{services:?}");
+
+        let vite = services.iter().find(|s| s.port == 5173).unwrap();
+        assert!(vite.loopback, "127.0.0.1 + ::1 only → local-only");
+        assert_eq!(vite.process, "node");
+        assert_eq!(vite.kind, ServiceKind::Http);
+
+        let ctrl = services.iter().find(|s| s.port == 7000).unwrap();
+        assert!(!ctrl.loopback, "a `*` bind is on every interface");
+
+        let pg = services.iter().find(|s| s.port == 5432).unwrap();
+        assert_eq!(pg.kind, ServiceKind::Postgres);
+        assert!(pg.loopback);
+    }
+
+    #[test]
+    fn parses_nettcp_rows() {
+        // Get-NetTCPConnection JSON: a dev server on loopback v4+v6 (one
+        // local-only site), an off-box game server on 0.0.0.0, and Postgres.
+        let rows = vec![
+            serde_json::json!({"LocalAddress":"127.0.0.1","LocalPort":5173,"Process":"node"}),
+            serde_json::json!({"LocalAddress":"::1","LocalPort":5173,"Process":"node"}),
+            serde_json::json!({"LocalAddress":"0.0.0.0","LocalPort":7000,"Process":"Steam"}),
+            serde_json::json!({"LocalAddress":"127.0.0.1","LocalPort":5432,"Process":"postgres"}),
+        ];
+        let services = services_from_nettcp_rows(&rows);
+        assert_eq!(services.len(), 3, "{services:?}");
+
+        let vite = services.iter().find(|s| s.port == 5173).unwrap();
+        assert!(vite.loopback, "127.0.0.1 + ::1 only → local-only");
+        assert_eq!(vite.process, "node");
+        assert_eq!(vite.kind, ServiceKind::Http);
+
+        let steam = services.iter().find(|s| s.port == 7000).unwrap();
+        assert!(!steam.loopback, "0.0.0.0 is on every interface");
+
+        // A stringified port (some ConvertTo-Json shapes) still parses.
+        let stringy = vec![serde_json::json!({
+            "LocalAddress":"127.0.0.1","LocalPort":"8080","Process":"caddy"
+        })];
+        assert_eq!(services_from_nettcp_rows(&stringy)[0].port, 8080);
+    }
+
+    #[test]
+    fn lsof_host_loopback_detection() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("*"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("[::]"));
+        assert!(!is_loopback_host("192.168.1.5"));
     }
 
     #[test]

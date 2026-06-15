@@ -3094,6 +3094,18 @@ impl Mesh {
             &mut listening,
             std::time::Duration::from_millis(200),
         );
+        // Diagnostic: which listening ports the scan found (set
+        // ALLMYSTUFF_GUI_LOG=info to see it). "0 found" on a box that's
+        // clearly serving means the platform probe came up empty.
+        tracing::info!(
+            "site scan found {} listening service(s): {}",
+            listening.len(),
+            listening
+                .iter()
+                .map(|s| format!(":{}", s.port))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         listening
     }
 
