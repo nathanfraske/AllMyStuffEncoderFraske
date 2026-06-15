@@ -11,6 +11,7 @@ import type {
   IdentityInfo,
   InputAction,
   InventorySummary,
+  ListeningService,
   MediaKind,
   NetworkConfigFull,
   NetworkSummary,
@@ -18,6 +19,7 @@ import type {
   PeerInfo,
   RosterPeer,
   SharedFileMeta,
+  SiteAdvert,
   TermEvent,
   UpdatePrefs,
   UpdateStatus,
@@ -54,6 +56,9 @@ export interface SessionSnapshot {
     /** App features the peer advertises ("terminal", …). Absent from an
      *  older peer — same as empty. */
     features?: string[];
+    /** Sites the peer exposes for reverse-proxying (from its presence
+     *  advert). Absent — an older peer, or one exposing nothing — is empty. */
+    sites?: SiteAdvert[];
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -847,6 +852,59 @@ export async function onVideoLocal(cb: (e: VideoLocalEvent) => void): Promise<()
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<VideoLocalEvent>("allmystuff://video-local", (e) => cb(e.payload));
+}
+
+// ---- sites (the reverse-proxy plane) -----------------------------------
+//
+// All of these degrade in web mode (no backend): the scan is empty, the
+// exposed set is empty, and a map/unmap is a no-op — so the Sites sidebar
+// falls back to its demo data and stays interactive.
+
+/** This machine's discovered listening TCP services (the full set, so the
+ *  owner can choose which to expose). Empty in web mode. */
+export async function siteScan(): Promise<ListeningService[]> {
+  const r = await tryInvoke<ListeningService[]>("site_scan");
+  return Array.isArray(r) ? r : [];
+}
+
+/** The ids of the listening services this machine currently *advertises*
+ *  (exposes to the mesh). Persisted backend-side and reflected in presence. */
+export async function siteExposed(): Promise<string[]> {
+  const r = await tryInvoke<string[]>("site_exposed");
+  return Array.isArray(r) ? r : [];
+}
+
+/** Set which listening services this machine advertises. Returns the new
+ *  exposed set (the backend re-broadcasts presence so peers see the change). */
+export async function siteSetExposed(ids: string[]): Promise<string[]> {
+  const r = await tryInvoke<string[]>("site_set_exposed", { ids });
+  return Array.isArray(r) ? r : ids;
+}
+
+/** A live local mapping of a remote site: the host port and the local port
+ *  this machine bound the tunnel on. */
+export interface SiteMappingInfo {
+  node: string;
+  port: number;
+  localPort: number;
+}
+
+/** Map a peer's site to a local port — sets up the reverse-proxy route and
+ *  binds a local listener. Returns the bound local port (the same number
+ *  when free, else a remapped one), or null in web mode. */
+export function siteMap(node: string, port: number): Promise<{ localPort: number } | null> {
+  return tryInvoke<{ localPort: number }>("site_map", { node, port });
+}
+
+/** Tear a site mapping down (unbinds the local listener, drops the route). */
+export function siteUnmap(node: string, port: number): Promise<null> {
+  return tryInvoke("site_unmap", { node, port });
+}
+
+/** Every site this machine currently has mapped. Empty in web mode. */
+export async function siteMappings(): Promise<SiteMappingInfo[]> {
+  const r = await tryInvoke<SiteMappingInfo[]>("site_mappings");
+  return Array.isArray(r) ? r : [];
 }
 
 // ---- self-update -------------------------------------------------------

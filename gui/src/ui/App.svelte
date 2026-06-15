@@ -14,7 +14,7 @@
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
   import NetworkMenu from "./NetworkMenu.svelte";
-  import RoomsBar from "./RoomsBar.svelte";
+  import Sidebar from "./Sidebar.svelte";
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -184,7 +184,7 @@
 
   <main class="stage">
     <Graph />
-    <RoomsBar />
+    <Sidebar />
     <NodeDrawer />
     <RoomPanel />
   </main>

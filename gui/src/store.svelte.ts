@@ -80,11 +80,18 @@ import {
   onSubscription,
   onVideoLocal,
   openConsoleWindow,
+  openExternal,
   openRoomWindow,
   openTerminalWindow,
   openVideoWindow,
   ownedRoster,
   roomSend,
+  siteScan,
+  siteExposed,
+  siteSetExposed,
+  siteMap,
+  siteUnmap,
+  siteMappings,
   roomWindowTarget,
   terminalWindowTarget,
   filesWindowTarget,
@@ -104,14 +111,19 @@ import {
   FEATURE_CAMERA,
   FEATURE_FILES,
   FEATURE_ROOMS,
+  FEATURE_SITES,
   FEATURE_TERMINAL,
   isAppNode,
   networkDisplayName,
+  siteIsWeb,
   type Capability,
   type Catalog,
   type CheckOutcome,
   type Grant,
   type IdentityInfo,
+  type ListeningService,
+  type SiteAdvert,
+  type SiteMapping,
   type InputAction,
   type MediaKind,
   type MeshNode,
@@ -458,6 +470,24 @@ class AppStore {
   private sharedReqToken: Record<string, string> = {};
   private sharedViewSeq = 0;
   private sharedReqSeq = 1;
+
+  // ---- sites (the reverse-proxy plane) ------------------------------
+  /** Which sidebar tab is showing — the rooms/sites bar is one tabbed
+   *  panel now. */
+  sidebarTab = $state<"rooms" | "sites">("rooms");
+  /** This machine's discovered listening TCP services (the full set), so
+   *  the Sites tab can list them under "this machine" with expose toggles.
+   *  Seeded with demo data in web mode, replaced by a real scan under the
+   *  backend. */
+  myListening = $state<ListeningService[]>([]);
+  /** The ids of *this* machine's services currently advertised to the mesh
+   *  (the opt-in exposed set). Mirrors the backend's persisted set; the
+   *  local node's advertised `sites` follow it. */
+  exposedSites = $state<string[]>([]);
+  /** Sites this device has mapped to a local port — the live reverse-proxy
+   *  bindings, keyed for lookup by `"<node>::<site>"`. */
+  siteMappings = $state<SiteMapping[]>([]);
+
   /** This window's id on the same-device room bus — local events echo to
    *  every window (the sender included), and this is how we drop ours. */
   private readonly windowToken = `w_${Math.random().toString(36).slice(2, 10)}`;
@@ -709,6 +739,7 @@ class AppStore {
     // ownership) until something next changed, and wrongly refuse to open.
     await this.pullSessionSnapshot();
     await this.loadOwnedFleet();
+    await this.loadSites();
     await this.loadUpdateStatus();
     await this.loadDisabledNetworks();
     this.startMeshPolling();
@@ -722,6 +753,7 @@ class AppStore {
         void this.refreshNetworks().then(() => this.syncMeshGraph());
         void this.pullSessionSnapshot();
         void this.loadOwnedFleet();
+        void this.loadSites();
         void this.loadDisabledNetworks();
       }
       this.backendConnected = live;
@@ -1051,6 +1083,9 @@ class AppStore {
       // App features it supports ("terminal", …) — absent from an older
       // peer means none, and the matching buttons stay hidden.
       node.features = p.features ?? [];
+      // Sites it exposes for reverse-proxying (the Sites sidebar lists
+      // them) — absent/empty from an older peer or one exposing nothing.
+      node.sites = p.sites ?? [];
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -2012,6 +2047,181 @@ class AppStore {
    *  settles when the disconnect is on the wire. */
   filesDisconnect(routeId: string): Promise<unknown> {
     return this.disconnect(routeId);
+  }
+
+  // ---- sites (the reverse-proxy plane) ------------------------------
+
+  /** Whether `node` can host sites at all: it runs AllMyStuff and its
+   *  presence advertises the feature (an older build doesn't). */
+  sitesSupported(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_SITES);
+  }
+
+  /** The gate for reaching a peer's sites — the same owner/fleet rule as the
+   *  terminal and files (a reverse proxy into a machine's services is just
+   *  as privileged), checked against the facts the far side enforces. Sites
+   *  shared with another *person* via a grant ride the pending
+   *  share-enforcement work; today, like control/terminal/files, access is
+   *  fleet-direct. */
+  sitesAllowed(node: MeshNode | undefined): boolean {
+    if (!node || this.isMe(node.id) || !this.sitesSupported(node)) return false;
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet;
+  }
+
+  /** The machines whose sites this device can reach, each with its exposed
+   *  sites — what the Sites tab groups by. Only fleet/owned machines that
+   *  actually expose something appear (the gate the far side enforces). */
+  sitesByMachine = $derived.by<{ node: MeshNode; sites: SiteAdvert[] }[]>(() => {
+    const out: { node: MeshNode; sites: SiteAdvert[] }[] = [];
+    for (const n of this.catalog.nodes) {
+      if (this.isMe(n.id)) continue;
+      const sites = n.sites ?? [];
+      if (sites.length === 0 || !this.sitesAllowed(n)) continue;
+      out.push({ node: n, sites });
+    }
+    return out;
+  });
+
+  /** The live mapping for one site, if this device has mapped it. */
+  siteMappingFor(nodeId: string, siteId: string): SiteMapping | undefined {
+    return this.siteMappings.find((m) => sameMachine(m.node, nodeId) && m.site === siteId);
+  }
+
+  /** The address a mapped site is reachable at locally — a clickable URL for
+   *  a web site, else the bare `localhost:<port>` to point a client at. */
+  siteUrl(m: SiteMapping): string {
+    return siteIsWeb(m) ? `${m.scheme}://localhost:${m.localPort}` : `localhost:${m.localPort}`;
+  }
+
+  /** Load this machine's listening services + exposed set + live mappings
+   *  from the backend (called once the session is up). In web mode it seeds
+   *  believable demo data so the Sites tab is alive in the preview. */
+  async loadSites() {
+    // Gate on the runtime, not `backendConnected` — this runs during init,
+    // before the subscription flips that flag, but the commands themselves
+    // degrade to empty if the session isn't ready yet (a later call refills).
+    if (!isTauri()) {
+      this.seedDemoSites();
+      return;
+    }
+    const [listening, exposed, mappings] = await Promise.all([
+      siteScan(),
+      siteExposed(),
+      siteMappings(),
+    ]);
+    this.myListening = listening;
+    this.exposedSites = exposed;
+    this.siteMappings = mappings.map((m) => this.mappingFromInfo(m));
+  }
+
+  /** Seed the Sites tab with demo data in web mode (no scan to run). */
+  private seedDemoSites() {
+    this.myListening = [
+      { id: "tcp:5173", name: "HTTP", port: 5173, kind: "http", scheme: "http", loopback: true, process: "vite" },
+      { id: "tcp:8000", name: "HTTP", port: 8000, kind: "http", scheme: "http", loopback: true, process: "python" },
+      { id: "tcp:22", name: "SSH", port: 22, kind: "ssh", scheme: "ssh", loopback: false, process: "sshd" },
+    ];
+    this.exposedSites = ["tcp:5173"];
+  }
+
+  private mappingFromInfo(info: { node: string; port: number; localPort: number }): SiteMapping {
+    // Resolve the advert so the mapping carries a label + scheme for the UI.
+    const advert = this.node(info.node)?.sites?.find((s) => s.port === info.port);
+    return {
+      node: info.node,
+      site: advert?.id ?? `tcp:${info.port}`,
+      port: info.port,
+      localPort: info.localPort,
+      scheme: advert?.scheme ?? "",
+      label: advert?.label ?? `Port ${info.port}`,
+    };
+  }
+
+  /** Whether this machine currently advertises a discovered service. */
+  isExposed(siteId: string): boolean {
+    return this.exposedSites.includes(siteId);
+  }
+
+  /** Toggle whether one of this machine's listening services is advertised
+   *  to the mesh (the opt-in exposure choice). Pushes the new set to the
+   *  backend, which re-broadcasts presence. */
+  async toggleExpose(siteId: string) {
+    const next = this.isExposed(siteId)
+      ? this.exposedSites.filter((id) => id !== siteId)
+      : [...this.exposedSites, siteId];
+    this.exposedSites = next;
+    if (this.backendConnected) {
+      this.exposedSites = await siteSetExposed(next);
+    }
+  }
+
+  /** Map a peer's site to a local port — sets up the reverse-proxy and binds
+   *  a local listener, then records the mapping. Re-mapping an already-mapped
+   *  site just returns its mapping. */
+  async mapSite(nodeId: string, site: SiteAdvert) {
+    const node = this.node(nodeId);
+    if (!node) return;
+    if (!this.sitesAllowed(node)) {
+      this.toast("warn", `Sites are owner/fleet only — ${node.label} isn't yours`);
+      return;
+    }
+    const existing = this.siteMappingFor(nodeId, site.id);
+    if (existing) return;
+    if (!this.backendConnected) {
+      // Web preview: simulate a mapping so the flow is demoable.
+      const localPort = this.demoLocalPort(site.port);
+      this.siteMappings = [
+        ...this.siteMappings,
+        { node: nodeId, site: site.id, port: site.port, localPort, scheme: site.scheme ?? "", label: site.label },
+      ];
+      this.toast("ok", `Mapped ${node.label}'s ${site.label} to localhost:${localPort} (demo)`);
+      return;
+    }
+    const r = await siteMap(nodeId, site.port);
+    if (!r) {
+      this.toast("warn", `Couldn't map ${site.label} from ${node.label}`);
+      return;
+    }
+    this.siteMappings = [
+      ...this.siteMappings,
+      { node: nodeId, site: site.id, port: site.port, localPort: r.localPort, scheme: site.scheme ?? "", label: site.label },
+    ];
+    this.toast("ok", `${node.label}'s ${site.label} is at localhost:${r.localPort}`);
+  }
+
+  /** A demo local port that doesn't collide with an existing demo mapping. */
+  private demoLocalPort(preferred: number): number {
+    const taken = new Set(this.siteMappings.map((m) => m.localPort));
+    if (preferred >= 1024 && !taken.has(preferred)) return preferred;
+    let p = 47000;
+    while (taken.has(p)) p += 1;
+    return p;
+  }
+
+  /** Tear a site mapping down — unbinds the local listener and drops the
+   *  route. */
+  async unmapSite(nodeId: string, siteId: string) {
+    const m = this.siteMappingFor(nodeId, siteId);
+    if (!m) return;
+    this.siteMappings = this.siteMappings.filter((x) => x !== m);
+    if (this.backendConnected) await siteUnmap(m.node, m.port);
+  }
+
+  /** Open a mapped site: a web site in the system browser, a bare TCP
+   *  service by copying its `localhost:<port>` address to the clipboard so
+   *  the user can paste it into whatever client speaks it. */
+  openSite(m: SiteMapping) {
+    const url = this.siteUrl(m);
+    if (siteIsWeb(m)) {
+      void openExternal(url);
+      return;
+    }
+    void navigator.clipboard?.writeText(url).then(
+      () => this.toast("ok", `Copied ${url} — point your client there`),
+      () => this.toast("warn", `Reach it at ${url}`),
+    );
   }
 
   // ---- ownership / claiming ---------------------------------------
