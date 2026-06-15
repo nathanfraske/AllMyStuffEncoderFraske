@@ -26,9 +26,9 @@ use tokio::sync::mpsc;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
-    ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request, RoomMessage,
-    RouteControl, SharedFileMeta, SiteControl, SiteService, CHANNEL_CONTROL, CHANNEL_MEDIA,
-    CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
+    AppControl, ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request,
+    RoomMessage, RouteControl, SharedFileMeta, SiteControl, SiteService, CHANNEL_CONTROL,
+    CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -805,6 +805,12 @@ impl Mesh {
             // advertises only those, each under its chosen name. Empty until
             // the user exposes one.
             sites: allmystuff_bridge::sites::sites_from_inventory(&inv, &self.sites.exposed_map()),
+            // The build this process is running, so a fleet peer can tell
+            // when this machine is behind the channel's latest release and
+            // offer to upgrade it. It's the running binary's own version: a
+            // staged update only becomes our reported version once we restart
+            // onto it (which an `Upgrade` triggers), so this stays honest.
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
@@ -1658,6 +1664,51 @@ impl Mesh {
                     );
                 }
                 Effect::Ownership { from, message } => self.handle_ownership(from, message).await,
+                Effect::App { from, message } => self.handle_app_control(from, message).await,
+            }
+        }
+    }
+
+    /// Apply an inbound app-control command. These are fleet-only — a machine
+    /// only acts on the say-so of its owner or a fleet co-member (the same
+    /// rule a terminal/remote-control offer is screened by), so a command
+    /// from anyone else is logged and dropped.
+    async fn handle_app_control(self: &Arc<Self>, from: NodeId, message: AppControl) {
+        if !self.sender_may_control(from.as_str()) {
+            tracing::warn!(
+                "app-control {:?} from {} ignored: not owner/fleet",
+                message,
+                short_id(from.as_str())
+            );
+            return;
+        }
+        match message {
+            AppControl::Upgrade => {
+                tracing::info!(
+                    "upgrade requested by {} — running self-update",
+                    short_id(from.as_str())
+                );
+                // Download + apply off the inbound-frame task (it does network
+                // I/O), then restart onto the new build. The peer gets no
+                // reply: our next presence advert (the new version) is the
+                // confirmation, and the button it pressed disappears when the
+                // upgrade lands — exactly how a claim confirms by re-advert.
+                let app = self.app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match allmystuff_updater::update_now().await {
+                        Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
+                            tracing::info!(
+                                "self-update applied {to} ({}) — restarting",
+                                components.join("+")
+                            );
+                            app.restart();
+                        }
+                        Ok(other) => {
+                            tracing::info!("upgrade request: nothing to do ({other:?})")
+                        }
+                        Err(e) => tracing::warn!("upgrade request failed: {e}"),
+                    }
+                });
             }
         }
     }
@@ -1934,6 +1985,18 @@ impl Mesh {
         let me = self.local_node_id().ok_or("mesh not ready")?;
         tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: ask a fleet machine to update itself to the
+    /// channel's latest release and restart. The far side enforces owner/fleet
+    /// before acting (and decides there's nothing to do if it's already
+    /// current); its next presence advert — carrying the new version — is the
+    /// confirmation. A send the daemon couldn't deliver is surfaced so the UI
+    /// can say so rather than leaving the ask hanging.
+    pub async fn request_upgrade(self: &Arc<Self>, node: String) -> Result<(), String> {
+        tracing::info!("asking {} to upgrade + restart", short_id(&node));
+        let msg = ControlMessage::App(AppControl::Upgrade);
         self.send_control(&node, &msg).await
     }
 

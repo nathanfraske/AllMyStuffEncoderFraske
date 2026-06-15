@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use allmystuff_graph::{NodeId, Route};
 use allmystuff_protocol::{
-    ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
+    AppControl, ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
 };
 
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
@@ -122,6 +122,10 @@ pub enum Effect {
         from: NodeId,
         message: OwnershipControl,
     },
+    /// An app-level command arrived (e.g. "upgrade yourself and restart").
+    /// The session has no state to change for it — it just forwards intent;
+    /// the backend screens the sender (owner/fleet) and carries it out.
+    App { from: NodeId, message: AppControl },
 }
 
 /// The live session for this node.
@@ -263,6 +267,7 @@ impl Session {
             // before the session ever sees it — it touches no route state —
             // so the state machine just ignores it.
             ControlMessage::Site(_) => Vec::new(),
+            ControlMessage::App(ac) => vec![Effect::App { from, message: ac }],
         }
     }
 
@@ -397,6 +402,7 @@ mod tests {
             boot: 0,
             features: vec![],
             sites: vec![],
+            version: String::new(),
         }
     }
 
@@ -616,6 +622,19 @@ mod tests {
             effects.as_slice(),
             [Effect::Ownership { from, message: OwnershipControl::Claim { owner } }]
                 if from == &NodeId::from("phone") && owner == &NodeId::from("phone")
+        ));
+    }
+
+    #[test]
+    fn app_messages_surface_for_the_backend() {
+        // An app-level command (upgrade) is pure intent — the session changes
+        // no state, it just forwards it; the backend screens the sender and
+        // carries it out.
+        let mut s = Session::new("puck");
+        let effects = s.handle("laptop".into(), ControlMessage::App(AppControl::Upgrade));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::App { from, message: AppControl::Upgrade }] if from == &NodeId::from("laptop")
         ));
     }
 }

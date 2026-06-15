@@ -164,6 +164,15 @@ pub struct NodeProfile {
     /// presence shape an older receiver sees is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<SiteAdvert>,
+    /// The AllMyStuff version this node is running — its binary's
+    /// `CARGO_PKG_VERSION` (e.g. `"0.1.11"`). It lets a peer notice that one
+    /// of its own machines is behind the channel's latest release and offer
+    /// to upgrade it ([`AppControl::Upgrade`]). Absent from an older peer
+    /// (`default`) decodes as empty — "unknown" — so the upgrade affordance
+    /// simply never appears for it; empty serializes *without* the key, so an
+    /// older receiver sees exactly the presence shape it always did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
 }
 
 /// One site a node exposes — a TCP service it's listening on that it's
@@ -375,7 +384,7 @@ pub enum RoomEvent {
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share,
-/// ownership, and site management share one channel.
+/// ownership, site management, and app-level commands share one channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -383,6 +392,7 @@ pub enum ControlMessage {
     Share(ShareControl),
     Ownership(OwnershipControl),
     Site(SiteControl),
+    App(AppControl),
 }
 
 /// One listening service on a machine, as reported to a co-owned fleet
@@ -432,6 +442,25 @@ pub enum SiteControl {
         #[serde(default)]
         exposed: std::collections::BTreeMap<String, String>,
     },
+}
+
+/// App-level commands one of *your own* machines asks another to perform on
+/// itself — things outside the route/share/ownership lifecycle. The receiver
+/// enforces that the sender is its owner or a fleet co-member before acting
+/// (the same rule that gates a terminal or remote-control session), so a
+/// stranger on the mesh can never drive it. An older peer doesn't know the
+/// `app` tag and drops the whole message, so a command simply goes
+/// unanswered there — never misinterpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AppControl {
+    /// "Update yourself and restart." Sent to a fleet machine running an
+    /// AllMyStuff older than the channel's latest release. The receiver runs
+    /// its self-updater and, if a newer build was applied, relaunches — its
+    /// next presence advert (carrying the new [`NodeProfile::version`]) is
+    /// the confirmation, exactly as a claim confirms by re-advertising its
+    /// new owner.
+    Upgrade,
 }
 
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
@@ -579,6 +608,7 @@ mod tests {
                 scheme: "http".into(),
                 loopback: true,
             }],
+            version: "0.1.11".into(),
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
@@ -627,6 +657,44 @@ mod tests {
         assert_eq!(back.sites, p.sites);
         assert!(!back.sites[0].is_web(), "postgres isn't web");
         assert!(back.sites[1].is_web(), "https is web");
+    }
+
+    #[test]
+    fn presence_version_accepts_skew_both_ways() {
+        // An older peer's advert has no `version` — it decodes as empty
+        // ("unknown") rather than failing, so the node never vanishes.
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert!(p.version.is_empty());
+
+        // Empty version serializes *without* the key, so an older receiver
+        // sees exactly the presence shape it always did.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("version"));
+
+        // A populated version round-trips.
+        let p = NodeProfile {
+            version: "0.2.0".into(),
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"version\":\"0.2.0\""));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.version, "0.2.0");
+    }
+
+    #[test]
+    fn app_control_upgrade_round_trips() {
+        let msg = ControlMessage::App(AppControl::Upgrade);
+        let s = serde_json::to_string(&msg).unwrap();
+        // Tagged `t: "app"` at the outer level, `kind: "upgrade"` within.
+        assert!(s.contains("\"t\":\"app\""));
+        assert!(s.contains("\"kind\":\"upgrade\""));
+        let back: ControlMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(msg, back);
     }
 
     #[test]

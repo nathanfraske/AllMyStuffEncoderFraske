@@ -97,6 +97,11 @@ export interface MeshNode {
    *  over the mesh (from its presence advert). The owner curates this; absent
    *  means none. The Sites sidebar lists them per machine. */
   sites?: SiteAdvert[];
+  /** The AllMyStuff version this node is running, from its presence advert
+   *  (e.g. "0.1.11"). Absent from an older peer (or the in-browser demo) —
+   *  the upgrade affordance only appears once we know both this and the
+   *  channel's latest release. */
+  version?: string;
   /** Friendly names of the networks this device has been seen on. You can be
    *  on several networks at once and a device may share only some of them, so
    *  the graph shows which — it's never just "the" mesh. */
@@ -617,6 +622,41 @@ export function flowArrow(flow: Flow): string {
 /** "out", "in", or "both" — plain words for the consumer UI. */
 export function flowWord(flow: Flow): string {
   return flow === "source" ? "sends" : flow === "sink" ? "receives" : "both ways";
+}
+
+/** Compare two semver-ish versions the way the Rust `compare_semver` does:
+ *  a numeric MAJOR.MINOR.PATCH compare, with a bare version outranking a
+ *  pre-release of the same core and pre-releases ordered lexicographically.
+ *  Returns -1 / 0 / 1 for a<b / a==b / a>b. Kept in lockstep with
+ *  `allmystuff-updater`'s policy so the GUI's "is it behind?" answer matches
+ *  the updater's. */
+export function compareVersions(a: string, b: string): number {
+  const split = (v: string): { core: number[]; pre: string } => {
+    const dash = v.indexOf("-");
+    const core = (dash >= 0 ? v.slice(0, dash) : v)
+      .split(".")
+      .slice(0, 3)
+      .map((p) => Number.parseInt(p, 10) || 0);
+    while (core.length < 3) core.push(0);
+    return { core, pre: dash >= 0 ? v.slice(dash + 1) : "" };
+  };
+  const x = split(a);
+  const y = split(b);
+  for (let i = 0; i < 3; i += 1) {
+    if (x.core[i] !== y.core[i]) return x.core[i] < y.core[i] ? -1 : 1;
+  }
+  if (x.pre === y.pre) return 0;
+  // A bare version (no pre-release) outranks a pre-release of the same core.
+  if (x.pre === "") return 1;
+  if (y.pre === "") return -1;
+  return x.pre < y.pre ? -1 : 1;
+}
+
+/** True when version `a` is strictly older than `b`. Empty/unknown versions
+ *  are never "older" — there's nothing to compare. */
+export function isOlderVersion(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  return compareVersions(a, b) < 0;
 }
 
 export function humanBytes(bytes: number): string {
