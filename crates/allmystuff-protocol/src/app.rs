@@ -314,7 +314,7 @@ pub struct RoomMessage {
 /// How a room admits a machine that asks to join ([`RoomEvent::Knock`])
 /// without holding an invite. The host states it on every
 /// [`RoomEvent::Invite`]; only the host ever enforces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoomAccess {
     /// Anyone on a shared mesh who knocks with the room's id is admitted
@@ -324,6 +324,21 @@ pub enum RoomAccess {
     /// host's invites (no field on the wire) read as.
     #[default]
     Invite,
+}
+
+// Lenient decode: an access mode a newer host introduced that this build
+// doesn't recognise reads as the *safe* default (invite-only) rather than
+// failing the whole `Invite` message — so a future access policy can never
+// stop an older member from learning about (and being listed in) the room.
+// `#[serde(other)]` isn't available on a string-valued enum, so this is the
+// hand-rolled equivalent.
+impl<'de> Deserialize<'de> for RoomAccess {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "open" => RoomAccess::Open,
+            _ => RoomAccess::Invite,
+        })
+    }
 }
 
 /// The events of a room's membership + chat plane.
@@ -381,6 +396,12 @@ pub enum RoomEvent {
     /// members ignore it from anyone but the host. Replacement semantics —
     /// an uploader that's gone offline simply drops off the next list.
     Shares { files: Vec<SharedEntry> },
+    /// A room event a newer build introduced that this one doesn't know.
+    /// Decodes here (the message still parses) and is ignored, instead of
+    /// failing the whole [`RoomMessage`] — so one unknown event kind can't
+    /// drop a roster or chat the receiver *does* understand.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Point-to-point control traffic. Tagged on `t` so route, share,
@@ -393,6 +414,12 @@ pub enum ControlMessage {
     Ownership(OwnershipControl),
     Site(SiteControl),
     App(AppControl),
+    /// A control kind a newer build introduced that this one doesn't know.
+    /// Decodes here and is ignored, so an unrecognised `t` can never fail the
+    /// decode of the whole control channel — the route/share/ownership
+    /// traffic this build *does* understand keeps flowing.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One listening service on a machine, as reported to a co-owned fleet
@@ -442,6 +469,10 @@ pub enum SiteControl {
         #[serde(default)]
         exposed: std::collections::BTreeMap<String, String>,
     },
+    /// A site-management kind a newer build introduced. Ignored here rather
+    /// than failing the enclosing [`ControlMessage`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// App-level commands one of *your own* machines asks another to perform on
@@ -461,6 +492,10 @@ pub enum AppControl {
     /// the confirmation, exactly as a claim confirms by re-advertising its
     /// new owner.
     Upgrade,
+    /// An app-level command a newer build introduced. Ignored here rather
+    /// than failing the enclosing [`ControlMessage`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
@@ -522,6 +557,12 @@ pub enum RouteControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fps: Option<u32>,
     },
+    /// A route-control kind a newer build introduced (a future negotiation
+    /// step). Decodes here and is ignored, so it can't fail the whole
+    /// [`ControlMessage`] and take the live route handshake — `Offer` /
+    /// `Accept` / `Teardown` — down with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Negotiating a *shared* relationship and its grants. This is how the
@@ -547,6 +588,10 @@ pub enum ShareControl {
     /// Either side withdraws a previously-granted permission. Revocation
     /// is unilateral — you can always take back your own stuff.
     Revoke { grant_id: String },
+    /// A share-control kind a newer build introduced. Ignored here rather
+    /// than failing the enclosing [`ControlMessage`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Adopting an unowned device that's been put up for adoption. Ownership is
@@ -569,6 +614,10 @@ pub enum OwnershipControl {
     /// The owner relinquishes the device, returning it to unowned. Only the
     /// current owner's release is honoured.
     Release,
+    /// An ownership kind a newer build introduced. Ignored here rather than
+    /// failing the enclosing [`ControlMessage`].
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -1043,5 +1092,83 @@ mod tests {
         assert_eq!(j["kind"], "invite");
         let back: ControlMessage = serde_json::from_value(j).unwrap();
         assert_eq!(m, back);
+    }
+
+    // ---- forward-compatibility: a newer build's additions never break a
+    // ---- consumer that doesn't recognise them ---------------------------
+
+    #[test]
+    fn control_message_unknown_top_tag_decodes_to_unknown() {
+        // A `t` this build has never heard of — the shape of a control kind
+        // a future release adds. It must decode (to `Unknown`), not error,
+        // so the rest of the control channel keeps working.
+        let v = serde_json::json!({ "t": "teleport", "whatever": 1 });
+        let m: ControlMessage = serde_json::from_value(v).expect("unknown tag must not error");
+        assert_eq!(m, ControlMessage::Unknown);
+    }
+
+    #[test]
+    fn unknown_nested_route_kind_does_not_poison_control_message() {
+        // The load-bearing case: a *new* RouteControl kind nested inside a
+        // known `ControlMessage::Route`. An older peer must still decode the
+        // envelope (as `Route(Unknown)`) instead of dropping the whole
+        // message — that's what kept video handshakes brittle.
+        let v = serde_json::json!({ "t": "route", "kind": "renegotiate", "route_id": "r1" });
+        let m: ControlMessage =
+            serde_json::from_value(v).expect("unknown nested kind must not error");
+        assert_eq!(m, ControlMessage::Route(RouteControl::Unknown));
+    }
+
+    #[test]
+    fn every_control_sub_enum_has_a_catch_all() {
+        for v in [
+            serde_json::json!({ "t": "share", "kind": "future" }),
+            serde_json::json!({ "t": "ownership", "kind": "future" }),
+            serde_json::json!({ "t": "site", "kind": "future" }),
+            serde_json::json!({ "t": "app", "kind": "future" }),
+        ] {
+            serde_json::from_value::<ControlMessage>(v).expect("sub-enum must tolerate new kinds");
+        }
+    }
+
+    #[test]
+    fn room_message_unknown_event_decodes_via_flatten() {
+        // RoomEvent rides RoomMessage `#[serde(flatten)]`, so this also
+        // proves flatten + a catch-all variant cooperate: an unknown room
+        // event keeps the roster/chat plane parseable.
+        let v = serde_json::json!({ "room": "room:1", "name": "Den", "kind": "reaction" });
+        let m: RoomMessage = serde_json::from_value(v).expect("unknown room event must not error");
+        assert_eq!(m.event, RoomEvent::Unknown);
+        assert_eq!(m.room, "room:1");
+    }
+
+    #[test]
+    fn unknown_room_access_reads_as_invite_only() {
+        // A future access policy must never stop an older member learning of
+        // the room: it falls back to the safe (most restrictive) default.
+        let v = serde_json::json!({
+            "kind": "invite", "members": [], "access": "knock_with_password"
+        });
+        let m: RoomEvent = serde_json::from_value(v).expect("unknown access must not error");
+        assert!(matches!(
+            m,
+            RoomEvent::Invite {
+                access: RoomAccess::Invite,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn node_profile_ignores_unknown_fields() {
+        // A profile from a newer build carries fields this one has never
+        // seen; they must be ignored, not rejected (no `deny_unknown_fields`
+        // may ever creep onto presence, or peers vanish from the graph).
+        let json = r#"{
+            "protocol": 1, "node": "new", "label": "New", "hostname": "new",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1},
+            "teleport_range": 42, "vibes": ["immaculate"]
+        }"#;
+        serde_json::from_str::<NodeProfile>(json).expect("unknown profile fields must be ignored");
     }
 }
