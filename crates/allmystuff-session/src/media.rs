@@ -104,6 +104,11 @@ pub enum InputAction {
         code: Option<String>,
         down: bool,
     },
+    /// An input kind a newer build introduced. Decodes here and is ignored
+    /// rather than failing the whole frame, so a future action can never
+    /// drop the keyboard/mouse events this build does understand.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One event of a terminal route's stream — the byte-level conversation
@@ -141,6 +146,10 @@ pub enum TermEvent {
         #[serde(default)]
         code: Option<i32>,
     },
+    /// A terminal event a newer build introduced. Ignored rather than
+    /// failing the whole frame.
+    #[serde(other)]
+    Unknown,
 }
 
 impl TermFrame {
@@ -286,10 +295,16 @@ pub enum FileEvent {
     Ok { req: u64 },
     /// The request failed, with the host's reason.
     Err { req: u64, reason: String },
+    /// A files-plane event a newer build introduced. Ignored rather than
+    /// failing the whole frame.
+    #[serde(other)]
+    Unknown,
 }
 
 impl FileEvent {
-    /// The request id this event belongs to, whatever its kind.
+    /// The request id this event belongs to, whatever its kind. An
+    /// unrecognised (newer-build) event belongs to no request we track, so
+    /// it reads as `0` — it is dropped before this is consulted anyway.
     pub fn req(&self) -> u64 {
         match self {
             FileEvent::List { req, .. }
@@ -303,6 +318,7 @@ impl FileEvent {
             | FileEvent::Chunk { req, .. }
             | FileEvent::Ok { req }
             | FileEvent::Err { req, .. } => *req,
+            FileEvent::Unknown => 0,
         }
     }
 }
@@ -368,14 +384,34 @@ pub enum ClipboardEvent {
     },
     /// Every chunk delivered — assemble and write to the OS clipboard.
     Close { transfer: u64 },
+    /// A clipboard event a newer build introduced. Ignored rather than
+    /// failing the whole frame.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether a clipboard transfer carries an image or a set of files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardContentKind {
     Image,
     Files,
+    /// A content kind a newer build introduced. The transfer is ignored
+    /// rather than failing the [`ClipboardEvent::Open`] decode.
+    Unknown,
+}
+
+// Lenient decode: a content kind this build doesn't recognise reads as
+// `Unknown` instead of erroring (`#[serde(other)]` isn't available on a
+// string-valued enum), so a future clipboard kind can't fail the `Open`.
+impl<'de> Deserialize<'de> for ClipboardContentKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "image" => ClipboardContentKind::Image,
+            "files" => ClipboardContentKind::Files,
+            _ => ClipboardContentKind::Unknown,
+        })
+    }
 }
 
 /// One piece of a clipboard transfer: a file's base name (or `image.png`
@@ -443,15 +479,22 @@ pub enum SiteEvent {
     /// Either direction: `conn`'s stream ended (EOF, reset, or teardown).
     /// The other side closes its half of the local socket.
     Close { conn: u64 },
+    /// A site event a newer build introduced. Ignored rather than failing
+    /// the whole frame.
+    #[serde(other)]
+    Unknown,
 }
 
 impl SiteEvent {
-    /// The connection id this event belongs to, whatever its kind.
+    /// The connection id this event belongs to, whatever its kind. An
+    /// unrecognised (newer-build) event scopes to no connection we track, so
+    /// it reads as `0` — it is dropped before this is consulted anyway.
     pub fn conn(&self) -> u64 {
         match self {
             SiteEvent::Open { conn, .. }
             | SiteEvent::Data { conn, .. }
             | SiteEvent::Close { conn } => *conn,
+            SiteEvent::Unknown => 0,
         }
     }
 }
@@ -588,7 +631,7 @@ pub enum MediaTagVStat {
 /// stage. Sent on state *changes* only; a peer that doesn't know the
 /// `vstat` tag (or a state added since its build) drops the frame unread
 /// ([`MediaPayload::decode`]'s unknown-tag rule).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoStatusState {
     /// Frames are flowing (clears any earlier condition).
@@ -613,6 +656,29 @@ pub enum VideoStatusState {
     /// (V4L2's EBUSY, a Windows exclusive lock) or an OS camera-permission
     /// denial. `detail` carries the OS error text.
     CameraFailed,
+    /// A status a newer build introduced. Reads as "not Ok" (the safe side:
+    /// the stage shows as not-flowing rather than the frame failing to
+    /// decode), so a future condition can never drop a status frame.
+    Unknown,
+}
+
+// Lenient decode: a status this build doesn't recognise reads as `Unknown`
+// rather than erroring (`#[serde(other)]` isn't available on a string-valued
+// enum). `Unknown` is deliberately not `Ok`, so the viewer treats the stage
+// as not-flowing — the safe default for an unknown condition.
+impl<'de> Deserialize<'de> for VideoStatusState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "ok" => VideoStatusState::Ok,
+            "waiting_consent" => VideoStatusState::WaitingConsent,
+            "display_asleep" => VideoStatusState::DisplayAsleep,
+            "no_monitor" => VideoStatusState::NoMonitor,
+            "grab_failed" => VideoStatusState::GrabFailed,
+            "no_camera" => VideoStatusState::NoCamera,
+            "camera_failed" => VideoStatusState::CameraFailed,
+            _ => VideoStatusState::Unknown,
+        })
+    }
 }
 
 /// One capture-status change of a display route, host → viewer.
@@ -1070,13 +1136,15 @@ mod tests {
             MediaPayload::decode(ok),
             Some(MediaPayload::File(f)) if f.seq == 5
         ));
-        // A newer peer's new event kind fails *that frame only*.
-        assert_eq!(
+        // A newer peer's new event kind decodes to `Unknown` (the frame
+        // still parses) and is ignored by the handler — it never fails the
+        // decode and so can't take the route's other frames down with it.
+        assert!(matches!(
             MediaPayload::decode(serde_json::json!({
                 "t": "file", "route": "r", "seq": 4, "kind": "teleport"
             })),
-            None
-        );
+            Some(MediaPayload::File(f)) if f.event == FileEvent::Unknown
+        ));
     }
 
     #[test]
@@ -1130,13 +1198,14 @@ mod tests {
         assert!(serde_json::to_string(&f)
             .unwrap()
             .contains("\"data\":\"/w==\""));
-        // A newer peer's new content kind fails *that frame only*.
-        assert_eq!(
+        // A newer peer's new event kind decodes to `Unknown` rather than
+        // failing the frame (handlers ignore it).
+        assert!(matches!(
             MediaPayload::decode(serde_json::json!({
                 "t": "clip", "route": "r", "seq": 1, "kind": "hologram"
             })),
-            None
-        );
+            Some(MediaPayload::Clipboard(g)) if g.event == ClipboardEvent::Unknown
+        ));
     }
 
     #[test]
@@ -1177,25 +1246,27 @@ mod tests {
         assert!(serde_json::to_string(&f)
             .unwrap()
             .contains("\"data\":\"/w==\""));
-        // A newer peer's new event kind fails *that frame only*.
-        assert_eq!(
+        // A newer peer's new event kind decodes to `Unknown` rather than
+        // failing the frame (handlers ignore it).
+        assert!(matches!(
             MediaPayload::decode(serde_json::json!({
                 "t": "site", "route": "r", "seq": 1, "kind": "warp"
             })),
-            None
-        );
+            Some(MediaPayload::Site(g)) if g.event == SiteEvent::Unknown
+        ));
     }
 
     #[test]
-    fn term_frame_with_an_unknown_kind_drops_alone() {
-        // A newer peer's new event kind fails *that frame only* — decode
-        // returns None and the stream's surviving frames are unaffected.
-        assert_eq!(
+    fn term_frame_with_an_unknown_kind_decodes_to_unknown() {
+        // A newer peer's new event kind decodes to `Unknown` (the frame
+        // still parses) and the handler ignores it — the stream's surviving
+        // frames are unaffected, and one new kind can't fail the decode.
+        assert!(matches!(
             MediaPayload::decode(serde_json::json!({
                 "t": "term", "route": "r", "seq": 4, "kind": "hologram"
             })),
-            None
-        );
+            Some(MediaPayload::Terminal(f)) if f.event == TermEvent::Unknown
+        ));
         let ok = serde_json::to_value(TermFrame::new("r", 5, TermEvent::Data { bytes: vec![1] }))
             .unwrap();
         assert!(matches!(
@@ -1337,5 +1408,72 @@ mod tests {
         });
         let p = MediaPayload::decode(legacy).expect("legacy audio decodes");
         assert_eq!(p.route(), "route:mic→spk");
+    }
+
+    // ---- forward-compatibility: a newer build's frame kinds never break a
+    // ---- consumer that doesn't recognise them ---------------------------
+
+    #[test]
+    fn unknown_flattened_event_kinds_decode_to_unknown() {
+        // Every flattened media event enum must tolerate a kind a future
+        // build adds, decoding to `Unknown` rather than failing the frame —
+        // which would otherwise drop the whole route's stream.
+        let term: TermFrame = serde_json::from_value(
+            serde_json::json!({ "t": "term", "route": "r", "seq": 0, "kind": "title" }),
+        )
+        .expect("unknown term event");
+        assert_eq!(term.event, TermEvent::Unknown);
+
+        let site: SiteFrame = serde_json::from_value(
+            serde_json::json!({ "t": "site", "route": "r", "seq": 0, "kind": "reset" }),
+        )
+        .expect("unknown site event");
+        assert_eq!(site.event, SiteEvent::Unknown);
+
+        let input: InputEvent = serde_json::from_value(
+            serde_json::json!({ "t": "input", "route": "r", "seq": 0, "kind": "gesture" }),
+        )
+        .expect("unknown input action");
+        assert_eq!(input.action, InputAction::Unknown);
+
+        let clip: ClipboardFrame = serde_json::from_value(
+            serde_json::json!({ "t": "clip", "route": "r", "seq": 0, "kind": "html" }),
+        )
+        .expect("unknown clipboard event");
+        assert_eq!(clip.event, ClipboardEvent::Unknown);
+    }
+
+    #[test]
+    fn unknown_string_enums_fall_back_safely() {
+        // A clipboard content kind a newer build adds doesn't fail the
+        // `Open` decode…
+        let open: ClipboardFrame = serde_json::from_value(serde_json::json!({
+            "t": "clip", "route": "r", "seq": 0, "kind": "open",
+            "transfer": 1, "content": "rich_text", "items": []
+        }))
+        .expect("unknown clipboard content kind");
+        assert!(matches!(
+            open.event,
+            ClipboardEvent::Open {
+                content: ClipboardContentKind::Unknown,
+                ..
+            }
+        ));
+
+        // …and a video status a newer build adds reads as "not Ok" rather
+        // than dropping the status frame.
+        let vstat: VideoStatusFrame = serde_json::from_value(serde_json::json!({
+            "t": "vstat", "route": "r", "state": "throttled"
+        }))
+        .expect("unknown video status");
+        assert_eq!(vstat.state, VideoStatusState::Unknown);
+    }
+
+    #[test]
+    fn media_payload_still_drops_unknown_top_level_tag() {
+        // The top-level demux already dropped unknown `t`s; keep that
+        // contract (a brand-new media *plane* is ignored, never an error).
+        let v = serde_json::json!({ "t": "hologram", "route": "r", "seq": 0 });
+        assert!(MediaPayload::decode(v).is_none());
     }
 }

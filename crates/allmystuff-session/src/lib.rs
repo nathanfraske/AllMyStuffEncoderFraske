@@ -268,6 +268,10 @@ impl Session {
             // so the state machine just ignores it.
             ControlMessage::Site(_) => Vec::new(),
             ControlMessage::App(ac) => vec![Effect::App { from, message: ac }],
+            // A control kind a newer peer introduced that this build doesn't
+            // know (decoded as `Unknown` rather than failing the message):
+            // nothing to drive here.
+            ControlMessage::Unknown => Vec::new(),
         }
     }
 
@@ -367,6 +371,10 @@ impl Session {
                 }
                 effects
             }
+            // A route-control kind a newer peer introduced that this build
+            // doesn't know (decoded as `Unknown` rather than failing the
+            // whole control message): no state change.
+            RouteControl::Unknown => Vec::new(),
         }
     }
 }

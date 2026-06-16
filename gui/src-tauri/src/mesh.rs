@@ -1710,6 +1710,10 @@ impl Mesh {
                     }
                 });
             }
+            // An app command a newer build introduced that this one doesn't
+            // implement (decoded as `Unknown` rather than failing the
+            // control message) — nothing to act on.
+            AppControl::Unknown => {}
         }
     }
 
@@ -2896,6 +2900,8 @@ impl Mesh {
                 // viewer's request — a viewer ends a session by tearing
                 // the route down.
                 TermEvent::Exit { .. } => {}
+                // A terminal event a newer viewer introduced — ignore it.
+                TermEvent::Unknown => {}
             }
         } else if views_here {
             match frame.event {
@@ -2914,6 +2920,8 @@ impl Mesh {
                     );
                 }
                 TermEvent::Resize { .. } => {}
+                // A terminal event a newer host introduced — ignore it.
+                TermEvent::Unknown => {}
             }
         }
     }
@@ -2963,6 +2971,8 @@ impl Mesh {
                 self.send_media_value(&peer, payload).await
             }
             TermEvent::Exit { .. } => Err("exit is reported by the host, not sent".into()),
+            // We never originate an `Unknown` event; reject it for exhaustiveness.
+            TermEvent::Unknown => Err("unknown terminal event".into()),
         }
     }
 
@@ -3316,6 +3326,8 @@ impl Mesh {
                 self.sites.set_exposed(exposed);
                 self.restamp_profile().await;
             }
+            // A site-management kind a newer build introduced — ignore it.
+            SiteControl::Unknown => {}
         }
     }
 
@@ -3638,6 +3650,8 @@ impl Mesh {
                 }
                 SiteEvent::Data { conn, data } => self.feed_site_conn(&frame.route, conn, data),
                 SiteEvent::Close { conn } => self.sites.close_conn(&frame.route, conn),
+                // A site event a newer client introduced — ignore it.
+                SiteEvent::Unknown => {}
             }
         } else if views_here {
             // The client end — the host's bytes for one of our mapped
@@ -3648,6 +3662,8 @@ impl Mesh {
                 SiteEvent::Open { conn, .. } => {
                     tracing::debug!("ignoring unexpected site Open {conn} on the client side");
                 }
+                // A site event a newer host introduced — ignore it.
+                SiteEvent::Unknown => {}
             }
         }
     }
@@ -4271,6 +4287,9 @@ impl Mesh {
                                 }
                             }
                         }
+                        // A content kind a newer build introduced — drop the
+                        // bytes (we've nowhere to put them).
+                        ClipboardContentKind::Unknown => {}
                     }
                 }
                 // `t`'s borrow ends above; only now can the map be mutated.
@@ -4295,8 +4314,13 @@ impl Mesh {
                             .collect();
                         self.clipboard.set_files(paths);
                     }
+                    // A content kind a newer build introduced — nothing to
+                    // commit to the OS clipboard.
+                    ClipboardContentKind::Unknown => {}
                 }
             }
+            // A clipboard event a newer build introduced — ignore it.
+            ClipboardEvent::Unknown => {}
         }
     }
 

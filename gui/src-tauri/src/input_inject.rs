@@ -182,6 +182,10 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                     None => Ok(()),
                 }
             }
+            // An input kind a newer viewer introduced that this build can't
+            // inject — nothing to do (it decoded as `Unknown` rather than
+            // failing the whole frame).
+            InputAction::Unknown => Ok(()),
         };
         if let Err(e) = result {
             tracing::debug!("input injection event failed: {e}");
