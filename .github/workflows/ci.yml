@@ -97,7 +97,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         working-directory: node
         run: cargo fmt --check
+      # clippy on the Linux reference platform only. This engine is the former
+      # GUI backend, which CI has always treated as compile-checked (not
+      # clippy'd) on macOS/Windows — `cargo test` below still builds every
+      # target there, so the platform-specific capture/input code is verified;
+      # `-D warnings` lint policy stays on Linux, matching that history.
       - name: clippy
+        if: matrix.os == 'ubuntu-latest'
         working-directory: node
         run: cargo clippy --all-targets -- -D warnings
       - name: test
