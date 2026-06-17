@@ -85,11 +85,16 @@ pub struct Mesh {
     /// pump onto the same route, which would fan the shell's output out twice
     /// (the cause of doubled/tripled terminals on a multi-network peer).
     term_pumps: Mutex<std::collections::HashSet<String>>,
-    /// Highest terminal-frame `seq` already taken per *viewer* route. The
-    /// host's pump numbers frames strictly increasing per route, so a frame
-    /// whose seq we've already seen is a duplicate delivery (the same send
-    /// arriving on several shared networks) — dropped, not re-shown.
+    /// Highest terminal-frame `seq` already taken per route, each direction:
+    /// `term_rx_seq` is output the *viewer* takes from the host;
+    /// `term_in_seq` is input the *host* takes from the viewer. Both sending
+    /// sides number a route's frames strictly increasing, so a seq we've
+    /// already seen is a duplicate delivery (the same send arriving on several
+    /// shared networks) — dropped, not re-applied. Without the input one, a
+    /// keystroke redelivered N times is written to the PTY N times and the
+    /// shell echoes `aaaa`.
     term_rx_seq: Mutex<HashMap<String, u64>>,
+    term_in_seq: Mutex<HashMap<String, u64>>,
     /// Mesh-native file sessions: filesystem ops this machine hosts for
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
@@ -331,6 +336,7 @@ impl Mesh {
             term_seq: AtomicU64::new(0),
             term_pumps: Mutex::new(std::collections::HashSet::new()),
             term_rx_seq: Mutex::new(HashMap::new()),
+            term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
@@ -1742,6 +1748,7 @@ impl Mesh {
                     // never grow unbounded over a long session).
                     self.term_pumps.lock().remove(&id);
                     self.term_rx_seq.lock().remove(&id);
+                    self.term_in_seq.lock().remove(&id);
                     self.files.stop(&id);
                     // A site route ending closes its local listener (client
                     // side) and every tunneled connection it carried.
@@ -3215,14 +3222,15 @@ impl Mesh {
         }
     }
 
-    /// Whether a viewer-side terminal frame is fresh (record its seq and take
-    /// it) or a duplicate to drop. The host pump numbers a route's frames
-    /// strictly increasing, so any seq at or below the last we took is the
-    /// same send arriving again — the same offer/frame riding more than one
+    /// Whether a terminal frame on `route` is fresh (record its seq and take
+    /// it) or a duplicate to drop — used both for output the viewer takes
+    /// (`term_rx_seq`) and input the host takes (`term_in_seq`). Each sending
+    /// side numbers a route's frames strictly increasing, so any seq at or
+    /// below the last we took is the same send arriving again over another
     /// shared network (control and media ride them all). A forward jump (the
-    /// pump skipped ahead after a broadcast lag) is still fresh.
-    fn accept_term_seq(&self, route: &str, seq: u64) -> bool {
-        let mut seqs = self.term_rx_seq.lock();
+    /// sender skipped ahead after a broadcast lag) is still fresh.
+    fn accept_term_seq(seqs: &Mutex<HashMap<String, u64>>, route: &str, seq: u64) -> bool {
+        let mut seqs = seqs.lock();
         match seqs.get(route) {
             Some(&last) if seq <= last => false,
             _ => {
@@ -3267,6 +3275,14 @@ impl Mesh {
                 tracing::warn!("dropped terminal input from {from}: not an authorized controller");
                 return;
             }
+            // Drop a duplicate keystroke/resize: the viewer numbers its
+            // outbound frames strictly increasing, so a seq we've already
+            // applied is the same send redelivered on another shared network.
+            // Without this the PTY is written N times and the shell echoes
+            // `aaaa` for one keypress.
+            if !Self::accept_term_seq(&self.term_in_seq, &frame.route, frame.seq) {
+                return;
+            }
             match frame.event {
                 TermEvent::Data { bytes } => {
                     let _ = self.terminal.write(&frame.route, bytes);
@@ -3286,7 +3302,7 @@ impl Mesh {
             // arriving again over another shared network. Without this the
             // window paints every byte — and the shell appears to echo every
             // keystroke — once per shared network: the doubled/tripled terminal.
-            if !self.accept_term_seq(&frame.route, frame.seq) {
+            if !Self::accept_term_seq(&self.term_rx_seq, &frame.route, frame.seq) {
                 return;
             }
             match frame.event {
@@ -5355,32 +5371,49 @@ mod tests {
     }
 
     #[test]
-    fn viewer_drops_duplicate_terminal_frames_by_seq() {
+    fn dedup_collapses_duplicate_terminal_frames_by_seq() {
         // The dedup that collapses a frame delivered on several shared
-        // networks back to one: the host pump numbers a route's frames
-        // strictly increasing, so a seq already taken is a duplicate.
+        // networks back to one (both directions): the sending side numbers a
+        // route's frames strictly increasing, so a seq already taken is a
+        // duplicate. A different route, and the other direction's map, each
+        // keep an independent counter.
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let out = &mesh.term_rx_seq;
+        let inp = &mesh.term_in_seq;
 
-        assert!(mesh.accept_term_seq("r", 0), "first frame is fresh");
+        assert!(Mesh::accept_term_seq(out, "r", 0), "first frame is fresh");
         assert!(
-            !mesh.accept_term_seq("r", 0),
+            !Mesh::accept_term_seq(out, "r", 0),
             "same seq again is a duplicate"
         );
-        assert!(mesh.accept_term_seq("r", 1), "the next seq is fresh");
-        assert!(!mesh.accept_term_seq("r", 1), "and its duplicate drops");
+        assert!(Mesh::accept_term_seq(out, "r", 1), "the next seq is fresh");
         assert!(
-            !mesh.accept_term_seq("r", 0),
+            !Mesh::accept_term_seq(out, "r", 1),
+            "and its duplicate drops"
+        );
+        assert!(
+            !Mesh::accept_term_seq(out, "r", 0),
             "an older straggler drops too"
         );
-        assert!(mesh.accept_term_seq("r", 2), "advancing is fresh");
+        assert!(Mesh::accept_term_seq(out, "r", 2), "advancing is fresh");
         assert!(
-            mesh.accept_term_seq("r", 9),
-            "a forward jump (pump skipped after a lag) is still fresh"
+            Mesh::accept_term_seq(out, "r", 9),
+            "a forward jump (sender skipped after a lag) is still fresh"
         );
         assert!(
-            mesh.accept_term_seq("other", 0),
+            Mesh::accept_term_seq(out, "other", 0),
             "a different route has its own independent counter"
+        );
+        // The input map (host taking keystrokes) is wholly independent of the
+        // output map — the same route+seq is fresh again here.
+        assert!(
+            Mesh::accept_term_seq(inp, "r", 0),
+            "input dedup is independent of output dedup"
+        );
+        assert!(
+            !Mesh::accept_term_seq(inp, "r", 0),
+            "but still drops its own duplicates"
         );
     }
 
