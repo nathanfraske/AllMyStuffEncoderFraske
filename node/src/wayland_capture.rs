@@ -738,7 +738,7 @@ mod tests {
         let mut cleared = back;
         cleared.remove(&monitor_key(Some(7)));
         write_tokens(&path, &cleared);
-        assert!(read_tokens(&path).get("monitor:7").is_none());
+        assert!(!read_tokens(&path).contains_key("monitor:7"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

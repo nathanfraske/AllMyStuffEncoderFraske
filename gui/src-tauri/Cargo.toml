@@ -26,78 +26,39 @@ tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
-# Cross-platform *rich* clipboard — text, image, and crucially file lists
-# (CF_HDROP on Windows, file URLs on macOS, text/uri-list on Linux), which
-# the clipboard-manager plugin can't read or write. This is the OS-clipboard
-# side of cross-machine copy/paste; the bytes still move over the files
-# plane / media channel.
-clipboard-rs = "0.2"
 
-# Async runtime — control-socket client + Tauri commands. "process"
-# backs the daemon self-update the spawner runs when the installed
-# myownmesh is older than the pin.
+# The headless mesh **node engine** — every media plane (screen / camera /
+# audio / input / terminal / files / clipboard / sites), the route handshake,
+# presence, ownership, and the daemon spawner. It used to live right here in
+# `src/`; it was lifted into its own crate so `allmystuff serve` can run it
+# with no webview. The GUI is now a thin Tauri shell over it that supplies a
+# Tauri-backed `UiSink` for front-end events. All the heavy native deps
+# (cpal / xcap / openh264 / nokhwa / opus / enigo / portable-pty /
+# clipboard-rs / interprocess / pipewire / … ) come transitively through it,
+# which is why they're no longer listed here.
+allmystuff-node = { path = "../../node" }
+
+# Async runtime — Tauri commands run on it; `setup` spawns the daemon
+# bring-up + session start on it.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process"] }
-
-# Local IPC: same crate the daemon uses, so control-socket address
-# resolution stays identical across both ends of the wire.
-interprocess = { version = "2", features = ["tokio"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
-dirs = "5"
 parking_lot = "0.12"
 
-# System RNG for minting a fleet's shared key (the owned-roster grouping
-# secret). Already in the resolved tree via Tauri/Tokio; pulled in directly
-# here so the key generation is explicit.
-getrandom = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# AllMyStuff's own crates — the scanner, the graph model, the wire types,
-# and the hardware→capability bridge. Pulled by path from the sibling
-# workspace; the GUI is the one place all four come together.
+# AllMyStuff's own library crates — the scanner, the graph model, the wire
+# types, the hardware→capability bridge, the session types, and the updater.
+# `main.rs` uses these directly (e.g. `scan_self`, the update commands); the
+# rest of the engine reaches them through `allmystuff-node`.
 allmystuff-inventory = { path = "../../crates/allmystuff-inventory" }
 allmystuff-graph = { path = "../../crates/allmystuff-graph" }
 allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../../crates/allmystuff-bridge" }
 allmystuff-session = { path = "../../crates/allmystuff-session" }
 allmystuff-updater = { path = "../../crates/allmystuff-updater" }
-
-# Cross-platform audio capture + playback for the media plane — CoreAudio
-# on macOS, WASAPI on Windows, ALSA on Linux. Same crate (and version)
-# MyOwnLLM uses for its audio.
-cpal = "0.15"
-# Cross-platform PTY for the mesh-native terminal — openpty on Unix,
-# ConPTY on Windows — so a terminal session behaves the same across the
-# whole OS matrix without an sshd anywhere. WezTerm's own PTY layer.
-portable-pty = "0.9"
-xcap = "0.9"
-# `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
-# speed on typical x86-64 desktops, plain safe Rust elsewhere.
-jpeg-encoder = { version = "0.7", features = ["simd"] }
-enigo = "0.6"
-# Camera capture for video routes — V4L2 on Linux, AVFoundation on macOS,
-# Media Foundation on Windows, one API over all three. Frames decode to
-# RGBA (its `decoding` default carries the MJPEG path most webcams speak,
-# mozjpeg built from source like openh264/opus) and feed the same encoder
-# pipeline screens use.
-nokhwa = { version = "0.10", features = ["input-native"] }
-# H.264 encode for the mesh's video track lane (Cisco's encoder, built
-# from source — needs only a C/C++ toolchain). MJPEG stays as the
-# fallback wherever this can't run or the peer can't decode.
-openh264 = "0.9"
-# Opus encode/decode for the mesh's audio track lane (libopus, built
-# from source like openh264). The PCM-over-channel stream stays as the
-# fallback for older daemons/peers, exactly like MJPEG for video.
-opus = "0.3"
-# Access units ride the daemon control socket as base64 (same encoding
-# the session crate's media frames use).
-base64 = "0.22"
-# The per-pixel hot loops (frame downscale/strip), split out so dev
-# builds optimize them — see the crate's manifest for the why.
-allmystuff-pixels = { path = "pixels" }
 
 # PR_SET_PDEATHSIG for the daemon lifetime tie (see
 # daemon_spawn::tie_daemon_lifetime) — the kernel SIGKILLs the daemon

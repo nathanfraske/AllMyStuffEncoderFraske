@@ -17,33 +17,35 @@
     windows_subsystem = "windows"
 )]
 
-mod audio;
-mod byte_queues;
-mod camera_capture;
-mod clipboard;
-mod control_client;
-mod daemon_spawn;
-mod files;
-mod input_inject;
-mod mesh;
-mod networks_store;
-mod ownership;
-mod sites;
-mod terminal;
-mod video;
-mod video_decode;
-mod wake;
-#[cfg(target_os = "linux")]
-mod wayland_capture;
-mod win_capture;
-
 use std::sync::Arc;
 
-use control_client::{ControlClient, Request, Response};
-use mesh::Mesh;
+// The node engine used to be these modules right here; it now lives in the
+// `allmystuff-node` crate so `allmystuff serve` can run it headless. This
+// shell links the same code and supplies a Tauri-backed `UiSink`.
+use allmystuff_node::control_client::{ControlClient, Request, Response};
+use allmystuff_node::mesh::Mesh;
+use allmystuff_node::{daemon_spawn, networks_store, video, UiSink};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tauri::{Manager, RunEvent, State};
+use tauri::{Emitter, Manager, RunEvent, State};
+
+/// The GUI's [`UiSink`]: forwards engine events onto Tauri's event bus so the
+/// Svelte front-end can react, and restarts the webview app when a fleet
+/// "upgrade this machine" lands a new build. (The `allmystuff-serve` binary
+/// swaps in a logging sink instead — same engine, no webview.)
+struct TauriSink {
+    app: tauri::AppHandle,
+}
+
+impl UiSink for TauriSink {
+    fn emit(&self, event: &str, payload: Value) {
+        let _ = self.app.emit(event, payload);
+    }
+
+    fn restart(&self) -> ! {
+        self.app.restart()
+    }
+}
 
 struct AppState {
     client: Arc<ControlClient>,
@@ -1073,7 +1075,12 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
-            let mesh = Mesh::new(client.clone(), handle.clone());
+            let mesh = Mesh::new(
+                client.clone(),
+                Arc::new(TauriSink {
+                    app: handle.clone(),
+                }),
+            );
             app.manage(mesh.clone());
             let client = client.clone();
             tauri::async_runtime::spawn(async move {

@@ -9,6 +9,8 @@
 #   - gui/src-tauri/Cargo.toml      [package].version  (separate workspace)
 #   - gui/src-tauri/Cargo.lock      allmystuff-gui [[package]] version
 #   - gui/package.json              "version"
+#   - node/Cargo.toml               [package].version  (separate workspace)
+#   - node/Cargo.lock               allmystuff-node [[package]] version
 #
 # The GUI lives in its own Cargo workspace (so `cargo build --workspace`
 # at the root stays fast — no Tauri compile), so its version doesn't
@@ -40,6 +42,8 @@ WORKSPACE_TOML="$ROOT/Cargo.toml"
 GUI_TAURI_TOML="$ROOT/gui/src-tauri/Cargo.toml"
 GUI_TAURI_LOCK="$ROOT/gui/src-tauri/Cargo.lock"
 GUI_PACKAGE_JSON="$ROOT/gui/package.json"
+NODE_TOML="$ROOT/node/Cargo.toml"
+NODE_LOCK="$ROOT/node/Cargo.lock"
 
 if [ ! -f "$WORKSPACE_TOML" ]; then
     echo "error: $WORKSPACE_TOML not found" >&2
@@ -146,6 +150,60 @@ pattern = re.compile(
 new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
 if n != 1:
     print(f"warning: could not find allmystuff-gui in {path} (skipping)", file=sys.stderr)
+else:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    print(f"bumped {path} -> {version}")
+PY
+fi
+
+# --- node sub-workspace (the headless engine + allmystuff-serve) --------
+
+if [ -f "$NODE_TOML" ]; then
+    # node/Cargo.toml — bump the [package].version (separate workspace, so it
+    # doesn't inherit from [workspace.package]). The serve binary embeds this
+    # as CARGO_PKG_VERSION and puts it on the wire in its presence advert, so
+    # it has to track the release like the GUI's does.
+    python3 - "$NODE_TOML" "$VERSION" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+pattern = re.compile(
+    r'(\[package\][^\[]*?\n\s*version\s*=\s*")[^"]*(")',
+    re.DOTALL,
+)
+new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
+if n != 1:
+    print(f"error: could not find [package].version in {path}", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+print(f"bumped {path} -> {version}")
+PY
+fi
+
+if [ -f "$NODE_LOCK" ]; then
+    # node/Cargo.lock — bump the [[package]] entry whose name is
+    # "allmystuff-node".
+    python3 - "$NODE_LOCK" "$VERSION" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+pattern = re.compile(
+    r'(name\s*=\s*"allmystuff-node"\s*\nversion\s*=\s*")[^"]*(")',
+)
+new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
+if n != 1:
+    print(f"warning: could not find allmystuff-node in {path} (skipping)", file=sys.stderr)
 else:
     with open(path, "w", encoding="utf-8") as f:
         f.write(new_content)

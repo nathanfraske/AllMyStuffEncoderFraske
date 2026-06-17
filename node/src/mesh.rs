@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+
+use crate::UiSink;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
@@ -53,7 +54,11 @@ pub struct Mesh {
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
     media_pipe: MediaPipe,
-    app: AppHandle,
+    /// Where node events surface. The GUI wires this to Tauri's event bus
+    /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
+    /// sink — the events are all front-end concerns, so a node with no UI
+    /// simply drops them. See [`crate::UiSink`].
+    sink: Arc<dyn UiSink>,
     audio: Arc<AudioBridge>,
     /// Screen + camera capture for the display/video routes this machine
     /// sources (the far end of a console session looking at us, a room
@@ -281,7 +286,7 @@ struct State {
 }
 
 impl Mesh {
-    pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
+    pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
         // Shallow queues both: at most a few frames in flight, so a slow
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
@@ -290,7 +295,7 @@ impl Mesh {
         let mesh = Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
-            app,
+            sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
             video_decode: Arc::new(DecodeBridge::new()),
@@ -339,7 +344,7 @@ impl Mesh {
         // plane is exactly the "connected but nothing arrives" mystery.
         {
             let mesh = mesh.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some(out) = audio_rx.recv().await {
                     let (peer, result) = match out {
@@ -367,7 +372,7 @@ impl Mesh {
         }
         {
             let mesh = mesh.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, route_id, packet)) = video_rx.recv().await {
                     let outcome = match packet {
@@ -468,10 +473,6 @@ impl Mesh {
             })
             .await
             .map_err(|e| e.to_string())
-    }
-
-    fn network(&self) -> Option<String> {
-        self.state.lock().network.clone()
     }
 
     /// The network to reach `peer` on: the one we last saw them advertise on,
@@ -582,7 +583,7 @@ impl Mesh {
 
         // Event loop.
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             while let Some(value) = rx.recv().await {
                 mesh.handle_value(value).await;
             }
@@ -599,7 +600,7 @@ impl Mesh {
     fn spawn_inventory_watch(self: &Arc<Self>) {
         const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(10);
         let mesh = Arc::downgrade(self);
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 tokio::time::sleep(INVENTORY_RESCAN).await;
                 let Some(mesh) = mesh.upgrade() else {
@@ -890,12 +891,12 @@ impl Mesh {
                         if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
                             let mesh = self.clone();
                             let device = device.to_string();
-                            tauri::async_runtime::spawn(async move {
+                            tokio::spawn(async move {
                                 mesh.ownership_check(Some(&device)).await;
                             });
                         }
                     }
-                    let _ = self.app.emit("allmystuff://event", event.clone());
+                    self.sink.emit("allmystuff://event", event.clone());
                 }
             }
             _ => {}
@@ -1069,7 +1070,7 @@ impl Mesh {
                                 .map(|d| format!(" ({d})"))
                                 .unwrap_or_default()
                         );
-                        let _ = self.app.emit(
+                        self.sink.emit(
                             "allmystuff://video-status",
                             serde_json::json!({
                                 "route": status.route,
@@ -1149,8 +1150,7 @@ impl Mesh {
                 // discipline as every other channel — a message this build
                 // doesn't understand is dropped, never an error.
                 if let Ok(msg) = serde_json::from_value::<RoomMessage>(payload) {
-                    let _ = self
-                        .app
+                    self.sink
                         .emit("allmystuff://room", json!({ "from": from, "message": msg }));
                 }
             }
@@ -1347,7 +1347,7 @@ impl Mesh {
                     // out the periodic IDR (rate-limited inside).
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
-                        tauri::async_runtime::spawn(async move {
+                        tokio::spawn(async move {
                             let _ = mesh.request_refresh(rid).await;
                         });
                     }
@@ -1392,7 +1392,7 @@ impl Mesh {
         // also shaves the poll interval off delivery latency. Coalesced
         // by construction: no further pokes until the queue drains.
         if w.queue.len() == 1 {
-            let _ = self.app.emit("allmystuff://video-ready", route_id);
+            self.sink.emit("allmystuff://video-ready", json!(route_id));
         }
     }
 
@@ -1409,7 +1409,7 @@ impl Mesh {
         };
         w.queue.clear();
         w.queue.push_back(packet);
-        let _ = self.app.emit("allmystuff://video-ready", route_id);
+        self.sink.emit("allmystuff://video-ready", json!(route_id));
     }
 
     /// Front-end command: offer a route from `from` to `to`.
@@ -1658,7 +1658,7 @@ impl Mesh {
                     self.drop_downloads(&id);
                 }
                 Effect::Share { from, message } => {
-                    let _ = self.app.emit(
+                    self.sink.emit(
                         "allmystuff://share",
                         json!({ "from": from.to_string(), "message": message }),
                     );
@@ -1693,15 +1693,15 @@ impl Mesh {
                 // reply: our next presence advert (the new version) is the
                 // confirmation, and the button it pressed disappears when the
                 // upgrade lands — exactly how a claim confirms by re-advert.
-                let app = self.app.clone();
-                tauri::async_runtime::spawn(async move {
+                let sink = self.sink.clone();
+                tokio::spawn(async move {
                     match allmystuff_updater::update_now().await {
                         Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
                             tracing::info!(
                                 "self-update applied {to} ({}) — restarting",
                                 components.join("+")
                             );
-                            app.restart();
+                            sink.restart();
                         }
                         Ok(other) => {
                             tracing::info!("upgrade request: nothing to do ({other:?})")
@@ -1807,7 +1807,7 @@ impl Mesh {
                 self.broadcast_owned().await;
                 self.emit_owned();
                 // Surface the claim feedback for the claimer's toast, too.
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://ownership",
                     json!({
                         "from": from.to_string(),
@@ -1822,7 +1822,7 @@ impl Mesh {
                     short_id(from.as_str()),
                     other
                 );
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://ownership",
                     json!({ "from": from.to_string(), "message": other }),
                 );
@@ -1965,8 +1965,7 @@ impl Mesh {
 
     /// Push the current fleet roster to the front-end.
     fn emit_owned(&self) {
-        let _ = self
-            .app
+        self.sink
             .emit("allmystuff://owned", self.owned_roster_value());
     }
 
@@ -2732,7 +2731,7 @@ impl Mesh {
                 };
                 let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
                 let peer = status_peer.clone();
-                tauri::async_runtime::spawn(async move {
+                tokio::spawn(async move {
                     let Ok(payload) = serde_json::to_value(&frame) else {
                         return;
                     };
@@ -2759,7 +2758,7 @@ impl Mesh {
                 short_id(&peer)
             );
             let mesh = self.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let _ = mesh.disconnect(rid).await;
             });
             return;
@@ -2771,7 +2770,7 @@ impl Mesh {
                     short_id(&peer)
                 );
                 let mesh = self.clone();
-                tauri::async_runtime::spawn(async move {
+                tokio::spawn(async move {
                     let mut seq: u64 = 0;
                     let mut last_ok = std::time::Instant::now();
                     let mut last_warn = std::time::Instant::now() - WARN_EVERY;
@@ -2832,7 +2831,7 @@ impl Mesh {
                 // tear the route down.
                 tracing::warn!("route {rid} — shell didn't start: {e}");
                 let mesh = self.clone();
-                tauri::async_runtime::spawn(async move {
+                tokio::spawn(async move {
                     let note = format!("[couldn't start a shell here: {e}]\r\n");
                     for frame in [
                         TermFrame::new(
@@ -2910,11 +2909,12 @@ impl Mesh {
                         // Queue went empty → non-empty: poke the window to
                         // drain (a lost poke costs latency, never bytes —
                         // the safety poll catches up).
-                        let _ = self.app.emit("allmystuff://term-ready", &frame.route);
+                        self.sink
+                            .emit("allmystuff://term-ready", json!(frame.route));
                     }
                 }
                 TermEvent::Exit { code } => {
-                    let _ = self.app.emit(
+                    self.sink.emit(
                         "allmystuff://term-exit",
                         json!({ "route": frame.route, "code": code }),
                     );
@@ -3098,7 +3098,8 @@ impl Mesh {
                 return;
             };
             if self.files.enqueue(&frame.route, bytes) {
-                let _ = self.app.emit("allmystuff://file-ready", &frame.route);
+                self.sink
+                    .emit("allmystuff://file-ready", json!(frame.route));
             }
         }
     }
@@ -3113,7 +3114,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
                 let frame = FileFrame::new(&rid, seq, ev);
@@ -3132,7 +3133,7 @@ impl Mesh {
     /// viewer, fire-and-forget.
     fn send_file_event(self: &Arc<Self>, route_id: String, peer: String, event: FileEvent) {
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
             let frame = FileFrame::new(&route_id, seq, event);
             if let Ok(payload) = serde_json::to_value(&frame) {
@@ -3278,7 +3279,7 @@ impl Mesh {
                 // reply to the asking machine.
                 let mesh = self.clone();
                 let peer = from.to_string();
-                tauri::async_runtime::spawn(async move {
+                tokio::spawn(async move {
                     let scan = mesh.clone();
                     let Ok((services, exposed)) = tokio::task::spawn_blocking(move || {
                         let services = scan
@@ -3310,7 +3311,7 @@ impl Mesh {
             }
             SiteControl::Sites { services, exposed } => {
                 // A managed machine's answer — hand it to the drawer.
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://node-sites",
                     serde_json::json!({ "from": from, "services": services, "exposed": exposed }),
                 );
@@ -3431,9 +3432,9 @@ impl Mesh {
         peer: String,
         host_port: u16,
         listener: tokio::net::TcpListener,
-    ) -> tauri::async_runtime::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()> {
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             // Wait for the host to accept before taking connections — until
             // the route is active a tunnel's `Open` would be dropped, leaving
             // a connecting client hung. (Pending TCP connections sit in the
@@ -3518,7 +3519,7 @@ impl Mesh {
         // the write half so the local client sees a clean close. It drains
         // any bytes that were buffered before the socket was wired.
         let mut rx = rx;
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
                 if write_half.write_all(&bytes).await.is_err() {
                     break;
@@ -3533,7 +3534,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer_s = peer.to_string();
-        let reader = tauri::async_runtime::spawn(async move {
+        let reader = tokio::spawn(async move {
             if let Some(port) = open_port {
                 mesh.send_site_event(&peer_s, &rid, SiteEvent::Open { conn, port })
                     .await;
@@ -3641,7 +3642,7 @@ impl Mesh {
                         None => {
                             let mesh = self.clone();
                             let (route, peer) = (frame.route.clone(), from.to_string());
-                            tauri::async_runtime::spawn(async move {
+                            tokio::spawn(async move {
                                 mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
                                     .await;
                             });
@@ -3696,7 +3697,7 @@ impl Mesh {
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             match tokio::net::TcpStream::connect(addr).await {
                 Ok(socket) => {
@@ -3863,7 +3864,7 @@ impl Mesh {
             map.remove(&key);
             drop(map);
             let _ = std::fs::remove_file(&path);
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-saved",
                 json!({ "route": route_id, "req": req, "path": null, "error": e.to_string() }),
             );
@@ -3876,7 +3877,7 @@ impl Mesh {
             };
             drop(map);
             let _ = sink.file.sync_all();
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-saved",
                 json!({
                     "route": route_id, "req": req,
@@ -3887,7 +3888,7 @@ impl Mesh {
             sink.last_progress = std::time::Instant::now();
             let written = sink.written;
             drop(map);
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-progress",
                 json!({ "route": route_id, "req": req, "written": written, "total": total }),
             );
@@ -3906,7 +3907,7 @@ impl Mesh {
             return;
         };
         let _ = std::fs::remove_file(&sink.path);
-        let _ = self.app.emit(
+        self.sink.emit(
             "allmystuff://file-saved",
             json!({ "route": route_id, "req": req, "path": null, "error": reason }),
         );
@@ -4405,11 +4406,11 @@ impl Mesh {
     }
 
     fn emit_snapshot(&self) {
-        let _ = self.app.emit("allmystuff://session", self.snapshot());
+        self.sink.emit("allmystuff://session", self.snapshot());
     }
 
     fn emit_status(&self, status: &str, error: Option<&str>) {
-        let _ = self.app.emit(
+        self.sink.emit(
             "allmystuff://subscription",
             json!({ "status": status, "error": error }),
         );

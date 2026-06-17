@@ -57,6 +57,42 @@ jobs:
       - run: pnpm check
       - run: pnpm build
 
+  # The headless mesh node (its own workspace): the engine the GUI links + the
+  # `allmystuff-serve` binary `allmystuff serve` runs. Same media stack as the
+  # GUI backend, minus the webview — built and tested on all three platforms
+  # so the headless node compiles everywhere it ships.
+  node:
+    name: Node · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - name: Linux media deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
+            libgbm-dev libudev-dev
+      - name: rustfmt
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: node
+        run: cargo fmt --check
+      - name: clippy
+        working-directory: node
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        working-directory: node
+        run: cargo test
+
   # The Tauri backend (its own workspace): cpal audio bridge + mesh session
   # + control client. Compile-checked on all three platforms — this is what
   # verifies the streaming code the headless dev container can't link.

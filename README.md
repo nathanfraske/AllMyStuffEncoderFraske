@@ -82,13 +82,16 @@ daemon never blocks you from exploring. Pass `--no-mesh` (Unix) /
 The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
 writable) on Unix and `%LOCALAPPDATA%\Programs\AllMyStuff` on
 Windows, and adds the directory to PATH if it isn't already there.
-The desktop app goes in by default; pass `--no-gui` (Unix) or
-`-NoGui` (Windows) for a CLI-only install on a headless box — that
-skips the daemon too, since only the desktop app uses it. The GUI
-binary relies on the system webview (libwebkit2gtk / WebView2 /
-WKWebView); for full OS integration (menu entry, icon, the mesh
-daemon bundled inside the package) grab the `.deb` / `.AppImage` /
-`.dmg` / `.msi` bundle from Releases instead.
+Every install also drops `allmystuff-serve` — the **headless node**
+that `allmystuff serve` runs (see [Headless](#headless-serve--service)
+below) — and, since both it and the app run on the mesh, the daemon.
+The desktop app goes in by default; pass `--no-gui` (Unix) or `-NoGui`
+(Windows) for a headless box — that skips only the webview app, keeping
+the node and the daemon so `allmystuff serve` works out of the box. The
+GUI binary relies on the system webview (libwebkit2gtk / WebView2 /
+WKWebView); for full OS integration (menu entry, icon, the mesh daemon
+bundled inside the package) grab the `.deb` / `.AppImage` / `.dmg` /
+`.msi` bundle from Releases instead.
 
 Prefer a tarball directly? The portable binaries
 (`allmystuff-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
@@ -180,22 +183,61 @@ allmystuff-protocol    # lib — mirror of the myownmesh control socket + AllMyS
 allmystuff-bridge      # lib — turns an Inventory into routable graph capabilities (+ presence summary)
 allmystuff-session     # lib — live presence + the route offer/accept handshake + media frame types
 allmystuff-updater     # lib — self-update: release feed, SHA-256 verify, stage-then-apply
-allmystuff-cli         # bin — `allmystuff scan` / `capabilities` / `update`, headless
+allmystuff-cli         # bin — `allmystuff` scan / capabilities / update / serve / service, headless
+node/                  # lib + bin — the mesh node engine + `allmystuff-serve` (headless, no webview)
 gui/                   # app — Tauri 2 backend + Svelte 5 front-end (the graph)
 ```
 
 - **The library workspace builds and tests with nothing but `cargo`** — no
   webview, no daemon, no network. The graph model and authorization rules are
   pure and heavily tested.
-- **The GUI is a sidecar client.** It scans the machine locally and talks to
-  a running `myownmesh serve` over the daemon's line-delimited JSON control
-  socket — exactly how the MyOwnMesh GUI and MyOwnLLM do it. The mesh version
-  it targets is pinned in [`.myownmesh-rev`](.myownmesh-rev).
+- **One engine, two front ends.** The whole node — presence, the route
+  handshake, and every media plane (screen / camera / audio / input / terminal
+  / files / clipboard) — lives in `node/` (`allmystuff-node`). The GUI links it
+  and feeds events to its webview; `allmystuff-serve` links the same code and
+  runs it headless. Either way it's a **sidecar client** of a running
+  `myownmesh serve`, talked to over the daemon's line-delimited JSON control
+  socket. The mesh version it targets is pinned in
+  [`.myownmesh-rev`](.myownmesh-rev).
 - **Two sources of truth, one set of rules.** The routing/authorization logic
   is ported to TypeScript so the graph is fully interactive on its own; the
   Rust `Catalog` enforces the identical rules before anything hits the wire.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full tour.
+
+## Headless: serve & service
+
+A box with no screen is still worth putting on the mesh — a home server
+whose disk you want to reach, a desktop you'll remote into, a machine
+that just hosts a room's screen share. `allmystuff serve` runs the node
+with **no GUI**: it shows up on the graph, advertises this machine's
+capabilities, and serves them to peers — a console watching its screen
+(**monitor out**, where a display is attached), a fleet member opening a
+terminal, a room pulling its system audio. It links the same engine the
+desktop app does; the only thing missing is the window.
+
+```sh
+allmystuff serve                        # run this machine on the mesh, headless
+ALLMYSTUFF_CLAIMABLE=1 allmystuff serve  # …and let one of your machines adopt it
+```
+
+It's self-contained: AllMyStuff rides on a `myownmesh serve` daemon, and
+`allmystuff serve` **spawns and supervises that daemon itself** — one
+process brings up both.
+
+To keep it running across logout and reboot, install it as an OS service
+(systemd on Linux, launchd on macOS), mirroring `myownmesh service`:
+
+```sh
+allmystuff service install            # install + start; runs at login
+sudo allmystuff service --system install   # …or at boot, system-wide
+allmystuff service status             # installed / enabled / running
+allmystuff service stop | restart | uninstall
+```
+
+Because the node supervises the daemon, **one service runs both** — there's
+no second unit to install. (Windows has no service backend yet; register
+`allmystuff serve` as a Task Scheduler task instead.)
 
 ## What a scan sees
 
@@ -237,14 +279,20 @@ The graph in action (on this machine's real devices):
 The desktop app opens straight into a populated demo graph even with no
 mesh, so you can explore the whole experience — clicking nodes, drawing
 connections, the share sheet, rooms — offline. A bare `allmystuff` opens
-it; the subcommands (`scan`, `capabilities`, `update`) are for headless
-boxes and scripts.
+it; the subcommands (`scan`, `capabilities`, `update`, and the headless
+`serve` / `service`) are for headless boxes and scripts.
 
 From a source checkout it's two commands:
 
 ```sh
 just setup    # one-time: build deps, Rust, Node, pnpm, GUI deps
 just dev      # run the app with hot reload
+```
+
+The headless node is its own workspace under `node/`; build it directly with:
+
+```sh
+cargo build --release --manifest-path node/Cargo.toml   # builds allmystuff-serve
 ```
 
 The full CLI reference, the desktop-app dependencies, the live-mesh setup,

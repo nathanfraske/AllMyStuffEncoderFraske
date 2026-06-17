@@ -22,11 +22,15 @@ gui/
 │   ├── store.svelte.ts       # app state (runes) + the connect/share/room verbs (fleet + rooms)
 │   ├── mock.ts               # demo graph so the app is alive with no backend
 │   └── tauri.ts              # backend bridge (degrades to web mode)
-└── src-tauri/                # Tauri (Rust) backend — its own Cargo workspace
-    ├── src/main.rs           # commands (scan_self, mesh_*, update_*) + event pump
-    ├── src/control_client.rs # daemon control-socket transport
-    └── src/daemon_spawn.rs   # launch `myownmesh serve` if needed
+└── src-tauri/                # Tauri (Rust) shell — its own Cargo workspace
+    └── src/main.rs           # commands (scan_self, mesh_*, update_*) + a TauriSink
+                              # over the allmystuff-node engine (../../node)
 ```
+
+The mesh node itself — the control-socket transport, the daemon spawner, and
+every media plane — lives in the **`allmystuff-node`** crate (`../node`), which
+this shell links and `allmystuff serve` runs headless. `src-tauri` is just the
+webview wiring on top.
 
 ## Develop
 

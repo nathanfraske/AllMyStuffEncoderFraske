@@ -725,9 +725,8 @@ fn run_capture(
             }
         }
     }
-    let monitor = select_monitor(monitor_id).map_err(|e| {
+    let monitor = select_monitor(monitor_id).inspect_err(|e| {
         reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
-        e
     })?;
     run_oneshot_capture(
         stop,

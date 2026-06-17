@@ -1,0 +1,186 @@
+# The headless mesh node. This is the engine that the desktop GUI's Tauri
+# backend used to *be*: presence + the route handshake + every media plane
+# (screen / camera / audio / input / terminal / files / clipboard / sites).
+# It was lifted out of `gui/src-tauri` so it can run with no webview at all
+# — `allmystuff serve` on a headless box — while the GUI links the very same
+# code and supplies a Tauri-backed [`UiSink`] for its front-end events.
+#
+# Its own Cargo workspace (an empty `[workspace]` table) keeps the heavy
+# media stack (xcap / cpal / openh264 / nokhwa / opus / …) out of the root
+# library workspace, exactly like `gui/` — see the root `Cargo.toml`.
+[workspace]
+
+[package]
+name = "allmystuff-node"
+version = "0.1.13"
+description = "AllMyStuff headless mesh node — runs this machine on the mesh (presence + screen/camera/audio/input/terminal/files routes) with no GUI."
+authors = ["Chris Paul"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.88.0"
+
+# The engine, linked by both the GUI and the serve binary.
+[lib]
+name = "allmystuff_node"
+path = "src/lib.rs"
+
+# The headless daemon: `allmystuff serve` runs this. Supervises a `myownmesh
+# serve` daemon, advertises this machine, and serves its capabilities.
+[[bin]]
+name = "allmystuff-serve"
+path = "src/bin/serve.rs"
+
+[dependencies]
+# Async runtime — control-socket client + the media-plane tasks. "process"
+# backs the daemon self-update the spawner runs when the installed myownmesh
+# is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
+# shutdown.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process", "signal"] }
+
+# Local IPC: same crate the daemon uses, so control-socket address
+# resolution stays identical across both ends of the wire.
+interprocess = { version = "2", features = ["tokio"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "5"
+parking_lot = "0.12"
+
+# System RNG for minting a fleet's shared key (the owned-roster grouping
+# secret).
+getrandom = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# AllMyStuff's own crates — the scanner, the graph model, the wire types,
+# the hardware→capability bridge, the session state machine, and the
+# self-updater. Pulled by path from the sibling library workspace.
+allmystuff-inventory = { path = "../crates/allmystuff-inventory" }
+allmystuff-graph = { path = "../crates/allmystuff-graph" }
+allmystuff-protocol = { path = "../crates/allmystuff-protocol" }
+allmystuff-bridge = { path = "../crates/allmystuff-bridge" }
+allmystuff-session = { path = "../crates/allmystuff-session" }
+allmystuff-updater = { path = "../crates/allmystuff-updater" }
+
+# Cross-platform audio capture + playback for the media plane — CoreAudio
+# on macOS, WASAPI on Windows, ALSA on Linux.
+cpal = "0.15"
+# Cross-platform PTY for the mesh-native terminal — openpty on Unix, ConPTY
+# on Windows — so a terminal session behaves the same across the whole OS
+# matrix without an sshd anywhere.
+portable-pty = "0.9"
+# Screen capture (PipeWire / AVFoundation; the in-house DXGI path on
+# Windows lives in win_capture.rs).
+xcap = "0.9"
+# `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
+# speed on typical x86-64 desktops, plain safe Rust elsewhere.
+jpeg-encoder = { version = "0.7", features = ["simd"] }
+# Keyboard/mouse injection for inbound input/terminal control routes.
+enigo = "0.6"
+# Camera capture for video routes — V4L2 / AVFoundation / Media Foundation.
+nokhwa = { version = "0.10", features = ["input-native"] }
+# H.264 encode/decode for the mesh's video track lane (Cisco's encoder,
+# built from source). MJPEG stays the fallback.
+openh264 = "0.9"
+# Opus encode/decode for the mesh's audio track lane (libopus, built from
+# source). PCM-over-channel stays the fallback.
+opus = "0.3"
+# Access units ride the daemon control socket as base64.
+base64 = "0.22"
+# Cross-platform *rich* clipboard — text, image, and file lists — for the
+# clipboard plane. The clipboard-manager bits the GUI used are a webview
+# concern and stay in the GUI; this is the OS-clipboard side the node owns.
+clipboard-rs = "0.2"
+# The per-pixel hot loops (frame downscale/strip), split out so dev builds
+# optimize them — see the crate's manifest.
+allmystuff-pixels = { path = "pixels" }
+
+# PR_SET_PDEATHSIG for the daemon lifetime tie (daemon_spawn). libloading
+# dlopens libpulse-simple at runtime for system-audio capture; zbus drives
+# the ScreenCast portal (wayland_capture) and the keep-awake inhibitor
+# (wake); pipewire consumes the portal's stream; xcb makes the DPMS
+# "light the panel" call.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+libloading = "0.8"
+zbus = "5"
+pipewire = "0.9"
+xcb = { version = "1", features = ["dpms"] }
+
+# IOKit power assertions (NoDisplaySleep) while hosting a screen stream.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+# In-house DXGI Output Duplication for screen capture, the virtual-desktop
+# absolute mouse move, and the job-object daemon lifetime tie.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# The media plane touches every screen pixel every frame; the crates doing
+# that work get speed while the rest stays optimized for size — and dev
+# builds get the same treatment so a source-run streams at a usable rate.
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+[profile.release.package.openh264]
+opt-level = 3
+[profile.release.package.openh264-sys2]
+opt-level = 3
+[profile.release.package.xcap]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
+[profile.release.package.nokhwa]
+opt-level = 3
+[profile.release.package.nokhwa-core]
+opt-level = 3
+[profile.release.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+[profile.dev.package.nokhwa]
+opt-level = 3
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+[profile.dev.package.mozjpeg]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3

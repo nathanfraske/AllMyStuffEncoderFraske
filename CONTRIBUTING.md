@@ -55,9 +55,15 @@ allmystuff update apply    # apply a staged update
 allmystuff update status   # version, channel, policy, feed, staged update
 allmystuff update enable   # turn automatic updates on
 allmystuff update disable  # turn automatic updates off
+
+allmystuff serve           # run this machine on the mesh, headless (no GUI)
+allmystuff service install  # keep `serve` running across reboots (systemd/launchd)
+allmystuff service status   # installed / enabled / running (also: start|stop|restart|uninstall)
+allmystuff service --system install  # …as a boot service, system-wide (needs root)
 ```
 
-From a source checkout, `cargo run -p allmystuff-cli -- <cmd>`. A real
+`serve` / `service` run the headless node — see [The headless node](#the-headless-node)
+below. From a source checkout, `cargo run -p allmystuff-cli -- <cmd>`. A real
 inventory of the machine this was built on:
 
 ```text
@@ -127,6 +133,31 @@ input/output device and transports mono; per-device audio mapping (a
 specific scanned device to a `cpal` device) and **storage transport** are
 the remaining next milestones (see ARCHITECTURE.md "Next milestones").
 
+## The headless node
+
+The node engine — presence, the route handshake, and every media plane
+(screen / camera / audio / input / terminal / files / clipboard) — lives in
+its own workspace under `node/` (`allmystuff-node`). The desktop app links it
+and feeds events to its webview; the `allmystuff-serve` binary links the same
+code and runs it headless, which is what `allmystuff serve` execs. The seam is
+the `UiSink` trait — a Tauri-backed one in the GUI, a logging one in serve.
+
+Because it carries the heavy media stack (xcap / cpal / openh264 / nokhwa /
+enigo / portable-pty / …), it's a **separate Cargo workspace** like `gui/`, so
+the root `cargo build --workspace` never drags it in. `just setup` already
+installs everything it links.
+
+```sh
+just serve              # run the node from source (cargo run -p … allmystuff-serve)
+just node-check         # fmt-check + clippy + test for the node workspace
+cargo build --release --manifest-path node/Cargo.toml   # build allmystuff-serve
+```
+
+`allmystuff serve` spawns and supervises the `myownmesh` daemon itself (the
+same `daemon_spawn` logic the GUI uses), so one process — and one
+`allmystuff service` unit — brings up the whole node. `ALLMYSTUFF_CLAIMABLE=1`
+starts it adoptable; `ALLMYSTUFF_LOG` tunes its log filter.
+
 ## Help us test on your hardware
 
 The maintainers develop on Linux, and CI compiles + unit-tests the
@@ -151,8 +182,11 @@ Every PR runs (`.github/workflows/ci.yml`):
   test suite (so the platform scanners + updater are verified where they
   run), and a `capabilities` smoke test.
 - **GUI front-end** — `svelte-check` + `vite build`.
-- **GUI backend** on Linux + macOS + Windows — `cargo check` of the Tauri +
-  `cpal` backend (the streaming code the dev container can't link).
+- **Node** on Linux + macOS + Windows — fmt, clippy `-D warnings`, and the
+  test suite for the headless node engine + the `allmystuff-serve` binary
+  (the media/mesh code, built where it ships).
+- **GUI backend** on Linux + macOS + Windows — `cargo check` of the Tauri
+  shell (which links the node engine) + its tests.
 
 ## Conventions
 

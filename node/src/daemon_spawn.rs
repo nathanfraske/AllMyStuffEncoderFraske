@@ -354,12 +354,22 @@ pub fn find_daemon_binary() -> Result<(PathBuf, DaemonSource)> {
         }
     }
 
-    // 3. Dev source slot written by build.rs (build-time manifest dir).
-    let dev_slot = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries")
-        .join(&exe_triple);
-    if usable(&dev_slot) {
-        return Ok((dev_slot, DaemonSource::DevBuild));
+    // 3. Dev source slot written by the GUI's build.rs. That stages the
+    // sidecar under `gui/src-tauri/binaries`; this engine crate sits beside
+    // `gui/` at the repo root (`node/`), so reach across to it from the
+    // build-time manifest dir.
+    if let Some(dev_slot) = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent() // repo root (AllMyStuff/)
+        .map(|root| {
+            root.join("gui")
+                .join("src-tauri")
+                .join("binaries")
+                .join(&exe_triple)
+        })
+    {
+        if usable(&dev_slot) {
+            return Ok((dev_slot, DaemonSource::DevBuild));
+        }
     }
 
     // 4. Side-by-side MyOwnMesh checkout (release first, then debug).
@@ -388,13 +398,12 @@ pub fn find_daemon_binary() -> Result<(PathBuf, DaemonSource)> {
 }
 
 /// `../MyOwnMesh/target/<profile>/myownmesh` relative to the AllMyStuff repo
-/// root. CARGO_MANIFEST_DIR here is `gui/src-tauri`, so the repo root is two
-/// parents up and the sibling checkout one more.
+/// root. CARGO_MANIFEST_DIR here is `node/`, so the repo root is one parent
+/// up and the side-by-side checkout one more.
 fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     Some(
         PathBuf::from(manifest_dir)
-            .parent()? // gui/
             .parent()? // AllMyStuff/
             .parent()? // workspace dir (AllMyStuff + MyOwnMesh side by side)
             .join("MyOwnMesh")

@@ -65,9 +65,10 @@ jobs:
           [[ "$got_gui_pkg"   == "$EXPECTED" ]] || fail "gui/package.json version is $got_gui_pkg, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
           echo "Manifest versions match tag $TAG ($EXPECTED)."
 
-      # The Tauri GUI links the webkit/GTK stack and (via cpal) ALSA; the
-      # headless CLI doesn't, but installing here covers both build steps in
-      # one place.
+      # The Tauri GUI links the webkit/GTK stack, and both it and the headless
+      # node binary link the media stack (ALSA via cpal, PipeWire/gbm via xcap,
+      # xkbcommon via enigo). The bare CLI needs none of it, but installing
+      # everything here covers all three build steps in one place.
       - name: Linux deps
         if: runner.os == 'Linux'
         run: |
@@ -113,6 +114,12 @@ jobs:
           workspaces: gui/src-tauri -> target
           key: gui-${{ matrix.platform.os }}
 
+      - name: Cache (node workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node -> target
+          key: node-${{ matrix.platform.os }}
+
       # No `version:` — pnpm/action-setup@v4 reads the version from
       # gui/package.json's `packageManager` field. Pinning a different
       # `version:` here causes pnpm 10+ to refuse to run with
@@ -138,6 +145,14 @@ jobs:
       # binary too, and the self-updater can fetch it as its own asset.
       - name: Build CLI
         run: cargo build --release --bin allmystuff --target ${{ matrix.platform.target }}
+
+      # Build the headless node binary (`allmystuff-serve`, what `allmystuff
+      # serve` runs). It carries the whole media/mesh engine, so it links the
+      # same native stack as the GUI (minus the webview). Shipped alongside
+      # the CLI so a headless `allmystuff serve` / `allmystuff service` works
+      # without the desktop app.
+      - name: Build node serve binary
+        run: cargo build --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target ${{ matrix.platform.target }}
 
       # Build the Tauri GUI bundle. tauri-action runs `pnpm tauri build`
       # under the hood and uploads the resulting installers (.deb /
@@ -210,6 +225,32 @@ jobs:
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-gui
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
             rm -f dist-bin/allmystuff-gui
+          fi
+
+      # Package the portable node binary so a headless box can fetch
+      # `allmystuff-serve-<platform>.<ext>` (the installer drops it next to
+      # the CLI, and `allmystuff serve` / `service` find it there).
+      - name: Package portable node binary
+        shell: bash
+        run: |
+          set -e
+          BIN=node/target/${{ matrix.platform.target }}/release/allmystuff-serve
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          if [[ ! -f "$BIN" ]]; then
+            echo "node serve binary not found at $BIN"; exit 1
+          fi
+          mkdir -p dist-bin
+          NAME="allmystuff-serve-${{ matrix.platform.name }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$BIN" "dist-bin/allmystuff-serve.exe"
+            (cd dist-bin && 7z a "${NAME}.zip" allmystuff-serve.exe)
+            (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            rm -f dist-bin/allmystuff-serve.exe
+          else
+            cp "$BIN" "dist-bin/allmystuff-serve"
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff-serve
+            (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            rm -f dist-bin/allmystuff-serve
           fi
 
       - uses: softprops/action-gh-release@v2
