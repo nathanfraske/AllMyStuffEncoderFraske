@@ -224,7 +224,8 @@ impl TerminalHost {
         if let Some(sid) = session_id {
             let mut sessions = self.sessions.lock();
             if let Some(s) = sessions.get_mut(sid) {
-                s.attachers.insert(route_id.to_string(), Attacher { cols, rows });
+                s.attachers
+                    .insert(route_id.to_string(), Attacher { cols, rows });
                 // Snapshot and subscribe under the scrollback guard so the
                 // split is consistent: snapshot = everything broadcast
                 // before, rx = everything broadcast after.
@@ -533,7 +534,8 @@ impl TerminalHost {
             a.cols = cols;
             a.rows = rows;
         } else {
-            s.attachers.insert(route_id.to_string(), Attacher { cols, rows });
+            s.attachers
+                .insert(route_id.to_string(), Attacher { cols, rows });
         }
         let (rc, rr) = reconcile_size(&s.attachers);
         match s.ctl_tx.try_send(CtlMsg::Resize { cols: rc, rows: rr }) {
@@ -938,11 +940,19 @@ mod tests {
         let host = TerminalHost::new();
         // First attacher creates the session.
         let a = host
-            .open_with(Some("sess1"), "rA", 80, 24, sh("echo fan-out-marker; sleep 5"))
+            .open_with(
+                Some("sess1"),
+                "rA",
+                80,
+                24,
+                sh("echo fan-out-marker; sleep 5"),
+            )
             .unwrap();
         assert!(a.created);
         // Second attaches to the same id.
-        let b = host.open_with(Some("sess1"), "rB", 80, 24, sh("unused")).unwrap();
+        let b = host
+            .open_with(Some("sess1"), "rB", 80, 24, sh("unused"))
+            .unwrap();
         assert!(!b.created, "second open ATTACHES");
         let mut rxa = a.rx;
         let mut rxb = b.rx;
@@ -971,7 +981,13 @@ mod tests {
         ensure_runtime();
         let host = TerminalHost::new();
         let a = host
-            .open_with(Some("sb1"), "rA", 80, 24, sh("echo scrollback-token; sleep 5"))
+            .open_with(
+                Some("sb1"),
+                "rA",
+                80,
+                24,
+                sh("echo scrollback-token; sleep 5"),
+            )
             .unwrap();
         let mut rxa = a.rx;
         // Make sure the output has been produced (and thus appended to
@@ -981,7 +997,9 @@ mod tests {
             |x| String::from_utf8_lossy(x).contains("scrollback-token"),
             "token on A",
         );
-        let b = host.open_with(Some("sb1"), "rB", 80, 24, sh("unused")).unwrap();
+        let b = host
+            .open_with(Some("sb1"), "rB", 80, 24, sh("unused"))
+            .unwrap();
         assert!(!b.created);
         assert!(
             String::from_utf8_lossy(&b.scrollback).contains("scrollback-token"),
@@ -996,8 +1014,12 @@ mod tests {
     fn shared_input_reaches_one_shell() {
         ensure_runtime();
         let host = TerminalHost::new();
-        let a = host.open_with(Some("si1"), "rA", 80, 24, sh("cat")).unwrap();
-        let b = host.open_with(Some("si1"), "rB", 80, 24, sh("unused")).unwrap();
+        let a = host
+            .open_with(Some("si1"), "rA", 80, 24, sh("cat"))
+            .unwrap();
+        let b = host
+            .open_with(Some("si1"), "rB", 80, 24, sh("unused"))
+            .unwrap();
         let mut rxa = a.rx;
         let mut rxb = b.rx;
         // Input on B's route reaches the one shell; cat echoes it, both see it.
@@ -1027,14 +1049,22 @@ mod tests {
     fn detach_does_not_kill() {
         ensure_runtime();
         let host = TerminalHost::new();
-        let a = host.open_with(Some("dt1"), "rA", 80, 24, sh("cat")).unwrap();
-        let b = host.open_with(Some("dt1"), "rB", 80, 24, sh("unused")).unwrap();
+        let a = host
+            .open_with(Some("dt1"), "rA", 80, 24, sh("cat"))
+            .unwrap();
+        let b = host
+            .open_with(Some("dt1"), "rB", 80, 24, sh("unused"))
+            .unwrap();
         let mut rxb = b.rx;
         drop(a.rx);
         // Detaching A leaves the shell alive for B.
         host.detach("rA");
         assert!(!host.write("rA", b"x".to_vec()), "detached route is gone");
-        assert_eq!(host.list_sessions().len(), 1, "session still live after detach");
+        assert_eq!(
+            host.list_sessions().len(),
+            1,
+            "session still live after detach"
+        );
         // B still drives and receives.
         assert!(host.write("rB", b"still-here\n".to_vec()));
         bcast_read_until(
@@ -1057,7 +1087,9 @@ mod tests {
         let _a = host
             .open_with(Some("rz1"), "rA", 100, 40, sh("read line; stty size"))
             .unwrap();
-        let b = host.open_with(Some("rz1"), "rB", 80, 50, sh("unused")).unwrap();
+        let b = host
+            .open_with(Some("rz1"), "rB", 80, 50, sh("unused"))
+            .unwrap();
         let mut rxb = b.rx;
         std::thread::sleep(Duration::from_millis(150));
         // Newline releases the `read`, then stty prints the reconciled size.
@@ -1075,9 +1107,13 @@ mod tests {
     fn double_open_reattaches() {
         ensure_runtime();
         let host = TerminalHost::new();
-        let first = host.open_with(Some("dup"), "rA", 80, 24, sh("sleep 5")).unwrap();
+        let first = host
+            .open_with(Some("dup"), "rA", 80, 24, sh("sleep 5"))
+            .unwrap();
         assert!(first.created, "first open creates");
-        let second = host.open_with(Some("dup"), "rB", 80, 24, sh("unused")).unwrap();
+        let second = host
+            .open_with(Some("dup"), "rB", 80, 24, sh("unused"))
+            .unwrap();
         assert!(!second.created, "second open on the same id ATTACHES");
         assert_eq!(second.session_id, "dup");
         host.close("dup");
