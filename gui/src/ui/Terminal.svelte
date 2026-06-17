@@ -89,6 +89,11 @@
   /** Every shell the host currently has open (its answer to our query) —
    *  the single source for the menu and the shared-with badges. */
   let hostSessions = $state<TerminalSessionInfo[]>([]);
+  /** The "Other Terminals" button, measured to anchor the (fixed-position)
+   *  menu — it must escape the header's `overflow` to be visible at all. */
+  let attachBtn = $state<HTMLButtonElement | null>(null);
+  /** Viewport coords for the menu's top-right corner, from the button rect. */
+  let menuPos = $state({ top: 0, right: 0 });
 
   /** session id → live attacher count, from the host's list. */
   const attacherCounts = $derived.by(() => {
@@ -122,10 +127,15 @@
     if (list.length || app.isMe(host)) hostSessions = list;
   }
 
-  /** Toggle the menu; on open, (re)query the host's open shells. */
+  /** Toggle the menu; on open, anchor it to the button and (re)query the
+   *  host's open shells. */
   async function togglePicker() {
     pickerOpen = !pickerOpen;
     if (!pickerOpen) return;
+    if (attachBtn) {
+      const r = attachBtn.getBoundingClientRect();
+      menuPos = { top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) };
+    }
     pickerLoading = true;
     await refreshHostSessions();
     pickerLoading = false;
@@ -612,6 +622,7 @@
           <button class="tab-new" title="New shell (Ctrl+Shift+T)" onclick={() => newTab()}>＋</button>
           <div class="picker">
             <button
+              bind:this={attachBtn}
               class="tab-attach"
               class:open={pickerOpen}
               title="Join a shell already open on {displayName(node)} (shared, tmux-style)"
@@ -629,7 +640,12 @@
                 aria-label="Close the other-terminals menu"
                 onclick={() => (pickerOpen = false)}
               ></button>
-              <div class="picker-menu" role="menu" aria-label="Other open terminals">
+              <div
+                class="picker-menu"
+                role="menu"
+                aria-label="Other open terminals"
+                style="top: {menuPos.top}px; right: {menuPos.right}px;"
+              >
                 <div class="picker-head">Other shells open on {displayName(node)}</div>
                 {#if pickerLoading}
                   <div class="picker-empty">Looking…</div>
@@ -939,9 +955,11 @@
     z-index: 70;
   }
   .picker-menu {
-    position: absolute;
-    top: calc(100% + 0.35rem);
-    right: 0;
+    /* Fixed, not absolute: the header (`.terminal` overflow:hidden, `.tabs`
+       overflow:auto) would otherwise clip a dropdown that escapes the tab
+       strip — it rendered but was invisible. Anchored to the button's
+       measured rect (see `menuPos`). */
+    position: fixed;
     z-index: 71;
     width: 19rem;
     max-height: 60vh;
