@@ -24,12 +24,13 @@
     clipboardWrite,
     closeThisWindow,
     onTermExit,
+    onTerminalSessions,
     onThisWindowClose,
     openExternal,
     termSend,
     watchTerminal,
   } from "../tauri";
-  import { displayName } from "../types";
+  import { displayName, type TerminalSessionInfo } from "../types";
 
   let { host, windowed = false }: { host: string; windowed?: boolean } = $props();
 
@@ -43,6 +44,10 @@
     status: TabStatus;
     /** The line the overlay shows for rejected/ended tabs. */
     note: string;
+    /** When this tab was opened by *attaching* to an existing shared shell,
+     *  the session id it asked for — passed on the Offer and used to restart
+     *  back into the same shared session. null = "new shell". */
+    attachSession: string | null;
   }
 
   /** The non-reactive half of a tab: the emulator and everything that
@@ -68,7 +73,63 @@
   let runtimesReady = $state(0);
   let unlistenExit: (() => void) | null = null;
   let unlistenClose: (() => void) | null = null;
+  let unlistenSessions: (() => void) | null = null;
   let bellTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ---- multi-attach session picker ------------------------------------
+  // The "Attach…" affordance: discover the host's open shells (its own, or
+  // a remote machine's over the mesh) and join one as a *shared* session.
+
+  let pickerOpen = $state(false);
+  let pickerLoading = $state(false);
+  let pickerSessions = $state<TerminalSessionInfo[]>([]);
+  // session id → live attacher count, learned from the picker list; the tab
+  // header reads it to badge a shared shell ("shared · N").
+  let attacherCounts = $state<Record<string, number>>({});
+
+  function applySessions(list: TerminalSessionInfo[]) {
+    pickerSessions = list;
+    const counts: Record<string, number> = {};
+    for (const s of list) counts[s.session_id] = s.attachers;
+    attacherCounts = counts;
+    pickerLoading = false;
+  }
+
+  /** Toggle the picker; on open, (re)query the host's sessions. Local hosts
+   *  answer at once; a remote host's reply lands on the sessions event. */
+  async function togglePicker() {
+    pickerOpen = !pickerOpen;
+    if (!pickerOpen) return;
+    pickerLoading = true;
+    pickerSessions = [];
+    const list = await app.listTerminalSessions(host);
+    // A non-empty list is the local (synchronous) answer; an empty one may
+    // just mean a remote reply is still in flight — the event fills it in.
+    applySessions(list);
+  }
+
+  /** Attach a new tab to a discovered shared session, then close the picker. */
+  function attachTo(session: TerminalSessionInfo) {
+    newTab(session.session_id);
+    pickerOpen = false;
+  }
+
+  /** A human age like "3m" / "2h" for a session created at `unix` seconds. */
+  function ageLabel(unix: number): string {
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - unix));
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+    return `${Math.floor(secs / 86400)}d`;
+  }
+
+  /** Live attacher count for a tab's session (from the snapshot's resolved id
+   *  + the last picker query), or 0 when unknown. */
+  function tabAttachers(t: TabMeta): number {
+    if (!t.routeId) return 0;
+    const sid = app.routeSessions[t.routeId];
+    return sid ? (attacherCounts[sid] ?? 0) : 0;
+  }
 
   // ---- byte plumbing ---------------------------------------------------
 
@@ -90,16 +151,23 @@
 
   // ---- tab lifecycle ---------------------------------------------------
 
-  function newTab() {
+  /** Open a new tab. With `session` set it *attaches* to that already-running
+   *  shared shell on the host (tmux-style — same scrollback, same keyboard);
+   *  without it, a fresh shell is minted. */
+  function newTab(session?: string) {
     const id = nextTabId++;
-    const routeId = app.terminalConnect(host);
-    console.debug(`[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}`);
+    const routeId = app.terminalConnect(host, session);
+    console.debug(
+      `[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}` +
+        (session ? ` attaching to ${session}` : ""),
+    );
     tabs.push({
       id,
       routeId,
-      title: `Shell ${id}`,
+      title: session ? `↳ ${session}` : `Shell ${id}`,
       status: routeId ? "connecting" : "offline",
       note: routeId ? "" : "Live terminals need the desktop app.",
+      attachSession: session ?? null,
     });
     activeId = id;
   }
@@ -351,7 +419,9 @@
     rt.stopWatch?.();
     rt.stopWatch = null;
     rt.started = false;
-    t.routeId = app.terminalConnect(host);
+    // Restart back into the same shared session when this tab was attached;
+    // otherwise mint a fresh shell.
+    t.routeId = app.terminalConnect(host, t.attachSession ?? undefined);
     t.status = t.routeId ? "connecting" : "offline";
     t.note = t.routeId ? "" : "Live terminals need the desktop app.";
     rt.term.write("\r\n\x1b[2m── new session ──\x1b[0m\r\n");
@@ -444,10 +514,28 @@
       // held until the teardowns are on the wire (see onThisWindowClose).
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
+    // A remote host's answer to a sessions query (and its own pushes after a
+    // tab attaches/detaches) — fills the picker and keeps the "shared · N"
+    // badge live for our open tabs.
+    void onTerminalSessions((ev) => {
+      if (app.isSameMachine(ev.from, host)) applySessions(ev.sessions);
+    }).then((u) => (unlistenSessions = u));
+    // Keep the shared-attacher badge current while tabs are live: re-query
+    // the host on a slow cadence (the count changes only when someone
+    // attaches/detaches, so this is cheap and off any hot path).
+    const countPoll = setInterval(() => {
+      if (tabs.some((t) => t.routeId && app.routeSessions[t.routeId])) {
+        void app.listTerminalSessions(host).then((list) => {
+          if (list.length) applySessions(list);
+        });
+      }
+    }, 4000);
     return () => {
       clearInterval(sessionPoll);
+      clearInterval(countPoll);
       unlistenExit?.();
       unlistenClose?.();
+      unlistenSessions?.();
       if (bellTimer) clearTimeout(bellTimer);
     };
   });
@@ -478,16 +566,22 @@
         </div>
         <div class="tabs" role="tablist" aria-label="Shells">
           {#each tabs as t (t.id)}
+            {@const shared = tabAttachers(t)}
             <div class="tab" class:active={t.id === activeId}>
               <button
                 class="tab-pick"
                 role="tab"
                 aria-selected={t.id === activeId}
-                title={t.title}
+                title={shared > 1 ? `${t.title} · shared with ${shared - 1} other` : t.title}
                 onclick={() => selectTab(t.id)}
               >
                 <span class="tab-state {t.status}"></span>
                 <span class="tab-label">{t.title}</span>
+                {#if shared > 1}
+                  <span class="tab-shared" title="Shared session — {shared} viewers attached"
+                    >👥{shared}</span
+                  >
+                {/if}
               </button>
               <button class="tab-x" title="Close this shell" onclick={() => void closeTab(t.id)}>
                 ✕
@@ -495,6 +589,44 @@
             </div>
           {/each}
           <button class="tab-new" title="New shell (Ctrl+Shift+T)" onclick={() => newTab()}>＋</button>
+          <div class="picker">
+            <button
+              class="tab-attach"
+              class:open={pickerOpen}
+              title="Attach to an existing shell on this machine"
+              aria-expanded={pickerOpen}
+              onclick={() => void togglePicker()}>⇲ Attach</button
+            >
+            {#if pickerOpen}
+              <!-- Click-away backdrop, then the menu above it. -->
+              <button
+                class="picker-scrim"
+                aria-label="Close session picker"
+                onclick={() => (pickerOpen = false)}
+              ></button>
+              <div class="picker-menu" role="menu" aria-label="Open terminal sessions">
+                <div class="picker-head">Open sessions on {displayName(node)}</div>
+                {#if pickerLoading}
+                  <div class="picker-empty">Looking…</div>
+                {:else if pickerSessions.length === 0}
+                  <div class="picker-empty">
+                    No open shells here yet. Use ＋ to start one — then it shows up here for another
+                    window (or fleet member) to attach to.
+                  </div>
+                {:else}
+                  {#each pickerSessions as s (s.session_id)}
+                    <button class="picker-row" role="menuitem" onclick={() => attachTo(s)}>
+                      <span class="picker-title">{s.title}</span>
+                      <span class="picker-meta">
+                        {#if s.attachers > 0}<span class="picker-att">👥 {s.attachers}</span>{/if}
+                        <span class="picker-age">{ageLabel(s.created_unix)}</span>
+                      </span>
+                    </button>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
+          </div>
         </div>
         <button class="x" onclick={() => void endAll()} aria-label="Close">✕</button>
       </header>
@@ -722,6 +854,108 @@
   .tab-new:hover {
     color: #efecfb;
     border-color: #6f64ab;
+  }
+  .tab-shared {
+    font-size: 0.62rem;
+    color: #9fd3ff;
+    background: #21344a;
+    border-radius: 5px;
+    padding: 0 0.22rem;
+    flex-shrink: 0;
+  }
+  .picker {
+    position: relative;
+    flex-shrink: 0;
+  }
+  .tab-attach {
+    border: 1px solid #494173;
+    background: none;
+    color: #b9b2d6;
+    height: 1.65rem;
+    border-radius: 7px;
+    font-size: 0.72rem;
+    padding: 0 0.5rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tab-attach:hover,
+  .tab-attach.open {
+    color: #efecfb;
+    border-color: #6f64ab;
+    background: #2a2548;
+  }
+  .picker-scrim {
+    position: fixed;
+    inset: 0;
+    border: none;
+    background: transparent;
+    cursor: default;
+    z-index: 70;
+  }
+  .picker-menu {
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    right: 0;
+    z-index: 71;
+    width: 19rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: #1c1930;
+    border: 1px solid #3a3460;
+    border-radius: 9px;
+    box-shadow: 0 14px 40px rgba(10, 8, 20, 0.6);
+    padding: 0.3rem;
+  }
+  .picker-head {
+    color: #9a93b8;
+    font-size: 0.68rem;
+    padding: 0.3rem 0.4rem 0.4rem;
+    border-bottom: 1px solid #2c2745;
+    margin-bottom: 0.25rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .picker-empty {
+    color: #8f88ad;
+    font-size: 0.74rem;
+    line-height: 1.45;
+    padding: 0.5rem 0.45rem;
+  }
+  .picker-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    width: 100%;
+    border: none;
+    background: none;
+    color: #d7d2ec;
+    border-radius: 6px;
+    padding: 0.4rem 0.45rem;
+    cursor: pointer;
+    text-align: left;
+  }
+  .picker-row:hover {
+    background: #2c2750;
+  }
+  .picker-title {
+    font-size: 0.78rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .picker-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    color: #8f88ad;
+  }
+  .picker-att {
+    color: #9fd3ff;
   }
   .x {
     border: none;

@@ -498,6 +498,25 @@ pub enum AppControl {
     Unknown,
 }
 
+/// One open terminal session a host advertises in answer to a
+/// [`RouteControl::TerminalSessionsRequest`] — the row shape the viewer's
+/// session picker renders so a fleet member (or another window of this very
+/// machine) can discover and attach to a *shared* shell instead of always
+/// minting a new one. Mirrors the host engine's `SessionInfo` without the
+/// node crate's `terminal` types leaking into the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSessionInfo {
+    /// The host-side session id an [`RouteControl::Offer::session`] names to
+    /// attach (`term-N`, or whatever the host minted).
+    pub session_id: String,
+    /// Friendly title (the shell's, falling back to the session id).
+    pub title: String,
+    /// Unix seconds the session was created — the picker shows its age.
+    pub created_unix: u64,
+    /// How many viewers are currently attached — `> 1` means already shared.
+    pub attachers: usize,
+}
+
 /// Lifecycle of a single cross-node route. The sourcing side offers; the
 /// other side accepts to start media flowing, or rejects with a reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,9 +545,28 @@ pub enum RouteControl {
         /// offerer is the route's sink (the console's listen leg).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         audio: Vec<String>,
+        /// For a **terminal** route: the host-side terminal session this
+        /// viewer wants to attach to — `Some(id)` joins that already-running
+        /// shell (tmux-style multi-attach: it shares the shell, the
+        /// scrollback, and the keyboard with whoever else is attached),
+        /// `None` mints a fresh shell. Meaningless on every other media
+        /// kind. Absent on older offers (`default`) decodes as `None`
+        /// (always a new shell — exactly v1's behaviour), and `None`
+        /// serializes *without* the key so an older host sees the offer
+        /// shape it always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
-    /// "Go ahead" — media may start.
-    Accept { route_id: String },
+    /// "Go ahead" — media may start. For a terminal route the host echoes
+    /// the **resolved** session id it attached this route to (the minted
+    /// `term-N` for a new shell, or the existing id for an attach), so the
+    /// viewer can show "shared with N" and re-attach later. Absent on a
+    /// non-terminal accept, or from an older host (`default` → `None`).
+    Accept {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
     /// "No" — with a human reason ("not authorized", "device busy").
     Reject { route_id: String, reason: String },
     /// "Stop" — either side can tear a live route down.
@@ -557,6 +595,19 @@ pub enum RouteControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fps: Option<u32>,
     },
+    /// "List your open terminal sessions" — a viewer asking a host (its
+    /// owner/fleet, enforced host-side exactly like a terminal offer) which
+    /// shells it already has running, so the picker can offer to *attach* to
+    /// one instead of always spawning a new shell. An older host doesn't
+    /// know the kind and drops it (it decodes as [`RouteControl::Unknown`]
+    /// rather than failing the control channel) — the picker simply shows no
+    /// existing sessions, never an error.
+    TerminalSessionsRequest,
+    /// The host's answer to [`TerminalSessionsRequest`]: every terminal
+    /// session it currently has open, for the viewer's picker. Each row
+    /// names the `session_id` an [`Offer::session`](RouteControl::Offer)
+    /// attaches to. An older viewer drops this (it decodes as `Unknown`).
+    TerminalSessions { sessions: Vec<TerminalSessionInfo> },
     /// A route-control kind a newer build introduced (a future negotiation
     /// step). Decodes here and is ignored, so it can't fail the whole
     /// [`ControlMessage`] and take the live route handshake — `Offer` /
@@ -794,6 +845,7 @@ mod tests {
                 route,
                 video: vec!["h264".into()],
                 audio: Vec::new(),
+                session: None,
             },
             _ => unreachable!(),
         };
@@ -821,6 +873,7 @@ mod tests {
                 route,
                 video: Vec::new(),
                 audio: vec!["opus".into()],
+                session: None,
             },
             _ => unreachable!(),
         };
@@ -828,6 +881,116 @@ mod tests {
         assert!(s.contains("\"audio\":[\"opus\"]"));
         let back: RouteControl = serde_json::from_str(&s).unwrap();
         assert_eq!(offered, back);
+    }
+
+    #[test]
+    fn route_offer_session_accepts_skew_both_ways() {
+        // An offer with no `session` — the v1 / new-shell case — decodes
+        // as `None` (always a fresh shell), exactly today's behaviour.
+        let legacy = r#"{"kind":"offer","route":{
+            "id":"route:h:terminal→v:term-view:1","from":"h:terminal","to":"v:term-view:1","media":"generic"
+        }}"#;
+        let rc: RouteControl = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(rc, RouteControl::Offer { session: None, .. }));
+
+        // `None` serializes *without* the key, so an older host sees exactly
+        // the offer shape it always did (and `video`/`audio` stay invisible).
+        let s = serde_json::to_string(&rc).unwrap();
+        assert!(!s.contains("session"));
+
+        // An attach offer — `session: Some(id)` — round-trips and rides the
+        // wire under `"session"`.
+        let attach = match rc {
+            RouteControl::Offer { route, .. } => RouteControl::Offer {
+                route,
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: Some("term-3".into()),
+            },
+            _ => unreachable!(),
+        };
+        let s = serde_json::to_string(&attach).unwrap();
+        assert!(s.contains("\"session\":\"term-3\""));
+        let back: RouteControl = serde_json::from_str(&s).unwrap();
+        assert_eq!(attach, back);
+    }
+
+    #[test]
+    fn route_accept_session_accepts_skew_both_ways() {
+        // An older host's accept has no `session` — it decodes as `None`
+        // (the viewer just doesn't learn a shared id), never an error.
+        let legacy = r#"{"kind":"accept","route_id":"r1"}"#;
+        let rc: RouteControl = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(rc, RouteControl::Accept { session: None, .. }));
+        let s = serde_json::to_string(&rc).unwrap();
+        assert!(!s.contains("session"));
+
+        // The terminal host echoes the resolved session id on accept.
+        let accept = RouteControl::Accept {
+            route_id: "r1".into(),
+            session: Some("term-7".into()),
+        };
+        let s = serde_json::to_string(&accept).unwrap();
+        assert!(s.contains("\"session\":\"term-7\""));
+        let back: RouteControl = serde_json::from_str(&s).unwrap();
+        assert_eq!(accept, back);
+    }
+
+    #[test]
+    fn terminal_sessions_round_trip_and_tag() {
+        // The viewer's "list your sessions" request.
+        let m = ControlMessage::Route(RouteControl::TerminalSessionsRequest);
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["t"], "route");
+        assert_eq!(j["kind"], "terminal_sessions_request");
+        assert_eq!(serde_json::from_value::<ControlMessage>(j).unwrap(), m);
+
+        // The host's reply, carrying the open-session rows the picker shows.
+        let m = ControlMessage::Route(RouteControl::TerminalSessions {
+            sessions: vec![
+                TerminalSessionInfo {
+                    session_id: "term-1".into(),
+                    title: "term-1".into(),
+                    created_unix: 1_700_000_000,
+                    attachers: 2,
+                },
+                TerminalSessionInfo {
+                    session_id: "term-2".into(),
+                    title: "vim".into(),
+                    created_unix: 1_700_000_500,
+                    attachers: 1,
+                },
+            ],
+        });
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["kind"], "terminal_sessions");
+        assert_eq!(j["sessions"][0]["session_id"], "term-1");
+        assert_eq!(j["sessions"][0]["attachers"], 2);
+        assert_eq!(j["sessions"][1]["title"], "vim");
+        let back: ControlMessage = serde_json::from_value(j).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn old_peer_drops_terminal_session_kinds_to_unknown() {
+        // An older build that never heard of the terminal-sessions kinds must
+        // decode them as `Route(Unknown)` — never fail the control channel,
+        // so the route/offer/accept traffic it *does* know keeps flowing.
+        for v in [
+            serde_json::json!({ "t": "route", "kind": "terminal_sessions_request" }),
+            serde_json::json!({ "t": "route", "kind": "terminal_sessions", "sessions": [] }),
+        ] {
+            // Re-tag to an unknown kind to model the *old* peer's view: it
+            // wouldn't recognise the kind name, so it lands on the catch-all.
+            // (Here the build *does* know them, so we instead assert a truly
+            // unknown nested kind still decodes — the same forward-compat
+            // guarantee these ride behind.)
+            let _known: ControlMessage = serde_json::from_value(v).expect("known kind decodes");
+        }
+        let unknown = serde_json::json!({ "t": "route", "kind": "terminal_attach_v2" });
+        let m: ControlMessage =
+            serde_json::from_value(unknown).expect("unknown kind must not error");
+        assert_eq!(m, ControlMessage::Route(RouteControl::Unknown));
     }
 
     #[test]

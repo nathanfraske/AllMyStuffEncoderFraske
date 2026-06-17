@@ -82,6 +82,17 @@ pub struct LiveRoute {
     /// same contract as `video`, for the mesh's Opus lane.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<String>,
+    /// For a **terminal** route, the host-side shell session this route is
+    /// (or wants to be) bound to — tmux-style multi-attach. On an *outbound*
+    /// (viewer) route it starts as the session the viewer asked to attach to
+    /// (`None` = "give me a new shell") and is overwritten with the
+    /// **resolved** id the host echoes on `Accept`; on an *inbound* (host)
+    /// route it's the attach target the viewer asked for, replaced with the
+    /// minted/attached id once the backend has actually opened the session.
+    /// `None` everywhere else. The viewer's UI reads it to show "shared with
+    /// N" and to re-attach. Skipped on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_session: Option<String>,
 }
 
 impl LiveRoute {
@@ -212,6 +223,22 @@ impl Session {
         video: Vec<String>,
         audio: Vec<String>,
     ) -> ControlMessage {
+        self.offer_terminal(route, peer, video, audio, None)
+    }
+
+    /// [`offer`](Self::offer) with a terminal **session** to attach to —
+    /// the multi-attach entry point. `session = Some(id)` joins that
+    /// already-running shell on the host (shared scrollback + keyboard);
+    /// `None` mints a new shell (and is exactly what [`offer`](Self::offer)
+    /// does). Meaningless on non-terminal routes (the host ignores it).
+    pub fn offer_terminal(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        session: Option<String>,
+    ) -> ControlMessage {
         let peer = peer.into();
         self.routes.insert(
             route.id.clone(),
@@ -222,13 +249,26 @@ impl Session {
                 state: RouteState::Offered,
                 video: video.clone(),
                 audio: audio.clone(),
+                term_session: session.clone(),
             },
         );
         ControlMessage::Route(RouteControl::Offer {
             route,
             video,
             audio,
+            session,
         })
+    }
+
+    /// Record the **resolved** terminal session id the backend bound a
+    /// route to (the minted `term-N` for a new shell, or the existing id for
+    /// an attach), so the snapshot surfaces it to the UI and a later
+    /// re-attach knows the id. Host-side, called once `terminal.open` has
+    /// run; the matching id then rides the viewer's `Accept`.
+    pub fn set_term_session(&mut self, route_id: &str, session: String) {
+        if let Some(r) = self.routes.get_mut(route_id) {
+            r.term_session = Some(session);
+        }
     }
 
     /// Locally tear a route down. Returns the message to send the peer (if
@@ -281,6 +321,7 @@ impl Session {
                 route,
                 video,
                 audio,
+                session,
             } => {
                 let accept = self.auto_accept;
                 let state = if accept {
@@ -297,14 +338,26 @@ impl Session {
                         state,
                         video,
                         audio,
+                        // The session the viewer asked to attach to (a
+                        // terminal route); the backend resolves it to the
+                        // real id once it opens the shell, via
+                        // [`set_term_session`](Self::set_term_session).
+                        term_session: session,
                     },
                 );
                 if accept {
+                    // The resolved terminal session id isn't known until the
+                    // backend has actually opened the PTY (it happens while
+                    // carrying out `StartMedia`). The host therefore re-sends
+                    // the Accept carrying the resolved id from `start_media`;
+                    // this first Accept (no session) starts the viewer's
+                    // media at once, exactly as v1.
                     vec![
                         Effect::Send {
                             peer: from,
                             message: ControlMessage::Route(RouteControl::Accept {
                                 route_id: route.id.clone(),
+                                session: None,
                             }),
                         },
                         Effect::StartMedia(route),
@@ -313,8 +366,17 @@ impl Session {
                     Vec::new()
                 }
             }
-            RouteControl::Accept { route_id } => {
+            RouteControl::Accept { route_id, session } => {
                 if let Some(r) = self.routes.get_mut(&route_id) {
+                    // The host's accept may echo the resolved terminal session
+                    // id (which shell this route actually attached to) — record
+                    // it so the viewer's UI can show "shared with N" and
+                    // re-attach later. A late accept that only carries the id
+                    // (the host's follow-up once the PTY is open) updates the
+                    // already-active route without re-starting media.
+                    if let Some(s) = session {
+                        r.term_session = Some(s);
+                    }
                     if r.origin == Origin::Outbound && r.state == RouteState::Offered {
                         r.state = RouteState::Active;
                         return vec![Effect::StartMedia(r.route.clone())];
@@ -370,6 +432,14 @@ impl Session {
                     }
                 }
                 effects
+            }
+            // The terminal-sessions picker plane (a viewer asking a host to
+            // list its open shells, and the host's answer) touches no route
+            // state — the backend handles it directly against the terminal
+            // host, gated owner/fleet, exactly like site management. The
+            // state machine just ignores it.
+            RouteControl::TerminalSessionsRequest | RouteControl::TerminalSessions { .. } => {
+                Vec::new()
             }
             // A route-control kind a newer peer introduced that this build
             // doesn't know (decoded as `Unknown` rather than failing the
@@ -447,10 +517,103 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r1".into(),
+                session: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
         assert!(matches!(effects.as_slice(), [Effect::StartMedia(r)] if r.id == "r1"));
+    }
+
+    #[test]
+    fn terminal_attach_session_threads_through_offer_and_accept() {
+        // Viewer side: offering with a session to attach records it and puts
+        // it on the wire; the host's accept echoing the resolved id updates
+        // the live route (so the UI can show "shared with N").
+        let mut s = Session::new("this");
+        let msg = s.offer_terminal(
+            route("t1"),
+            "desk",
+            Vec::new(),
+            Vec::new(),
+            Some("term-2".into()),
+        );
+        assert!(matches!(
+            msg,
+            ControlMessage::Route(RouteControl::Offer { session: Some(ref id), .. }) if id == "term-2"
+        ));
+        assert_eq!(
+            s.route("t1").unwrap().term_session.as_deref(),
+            Some("term-2")
+        );
+
+        let effects = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "t1".into(),
+                session: Some("term-2".into()),
+            }),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::StartMedia(r)] if r.id == "t1"));
+        assert_eq!(
+            s.route("t1").unwrap().term_session.as_deref(),
+            Some("term-2")
+        );
+
+        // A bare new-shell offer carries no session; the host's accept may
+        // still echo back the *minted* id, which a later accept updates
+        // without re-starting media.
+        let mut s = Session::new("this");
+        s.offer(route("t2"), "desk", Vec::new(), Vec::new());
+        assert_eq!(s.route("t2").unwrap().term_session, None);
+        s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "t2".into(),
+                session: None,
+            }),
+        );
+        // Host's follow-up accept once the PTY is open, carrying the minted id.
+        let fx = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "t2".into(),
+                session: Some("term-5".into()),
+            }),
+        );
+        assert!(
+            fx.is_empty(),
+            "a late accept on a live route restarts nothing"
+        );
+        assert_eq!(
+            s.route("t2").unwrap().term_session.as_deref(),
+            Some("term-5")
+        );
+    }
+
+    #[test]
+    fn host_records_requested_attach_and_resolves_it() {
+        // Host side: an inbound terminal offer carrying a session records the
+        // viewer's attach target; the backend then resolves it to the real id.
+        let mut s = Session::new("desk");
+        s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("t1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: Some("term-2".into()),
+            }),
+        );
+        assert_eq!(
+            s.route("t1").unwrap().term_session.as_deref(),
+            Some("term-2")
+        );
+        // The backend opened/attached the PTY and recorded the resolved id.
+        s.set_term_session("t1", "term-2".into());
+        assert_eq!(
+            s.route("t1").unwrap().term_session.as_deref(),
+            Some("term-2")
+        );
     }
 
     #[test]
@@ -462,13 +625,14 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                session: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
         // Replies Accept and starts media.
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::Send { message: ControlMessage::Route(RouteControl::Accept { route_id }), .. } if route_id == "r1"
+            Effect::Send { message: ControlMessage::Route(RouteControl::Accept { route_id, .. }), .. } if route_id == "r1"
         )));
         assert!(effects
             .iter()
@@ -485,6 +649,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                session: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Incoming);
@@ -520,6 +685,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                session: None,
             }),
         );
         let effects = s.handle(
@@ -541,6 +707,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                session: None,
             }),
         );
         let effects = s.drop_peer(&"this".into());
@@ -557,6 +724,7 @@ mod tests {
                 route: route("r1"),
                 video: Vec::new(),
                 audio: Vec::new(),
+                session: None,
             }),
         );
         // The route's peer may re-key and tune it.
