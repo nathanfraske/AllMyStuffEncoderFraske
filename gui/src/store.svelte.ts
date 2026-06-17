@@ -1939,9 +1939,15 @@ class AppStore {
   // ---- terminal (the mesh-native shell) ----------------------------
 
   /** Whether `node` can host a terminal at all: it runs AllMyStuff and its
-   *  presence advertises the feature (an older build simply doesn't). */
+   *  presence advertises the feature (an older build simply doesn't). The
+   *  machine we're sitting at is always capable — the running binary *is* the
+   *  terminal host — and its own presence features aren't self-populated
+   *  (features arrive from peers), so check identity, not the advertised
+   *  list, for self. */
   terminalSupported(node: MeshNode | undefined): boolean {
-    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_TERMINAL);
+    if (!node) return false;
+    if (this.isMe(node.id)) return true;
+    return isAppNode(node) && (node.features ?? []).includes(FEATURE_TERMINAL);
   }
 
   /** The gate for "Open Terminal" — a mirror of the host's own rule
