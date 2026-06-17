@@ -79,6 +79,17 @@ pub struct Mesh {
     /// Sequence for viewer-side outbound terminal frames (keystrokes,
     /// resizes — one stream per app run, like `input_seq`).
     term_seq: AtomicU64,
+    /// Viewer-route ids that already have a live host/loopback output pump.
+    /// Exactly one pump per route: a duplicate `StartMedia` — e.g. the offer
+    /// delivered on more than one shared network — must not spawn a second
+    /// pump onto the same route, which would fan the shell's output out twice
+    /// (the cause of doubled/tripled terminals on a multi-network peer).
+    term_pumps: Mutex<std::collections::HashSet<String>>,
+    /// Highest terminal-frame `seq` already taken per *viewer* route. The
+    /// host's pump numbers frames strictly increasing per route, so a frame
+    /// whose seq we've already seen is a duplicate delivery (the same send
+    /// arriving on several shared networks) — dropped, not re-shown.
+    term_rx_seq: Mutex<HashMap<String, u64>>,
     /// Mesh-native file sessions: filesystem ops this machine hosts for
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
@@ -318,6 +329,8 @@ impl Mesh {
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
+            term_pumps: Mutex::new(std::collections::HashSet::new()),
+            term_rx_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
@@ -1724,6 +1737,11 @@ impl Mesh {
                     // machine holding the keys it injected.
                     self.injector.release_route(&id);
                     self.terminal.stop(&id);
+                    // Drop this route's terminal pump/dedup bookkeeping so a
+                    // later route reusing the id starts clean (and the maps
+                    // never grow unbounded over a long session).
+                    self.term_pumps.lock().remove(&id);
+                    self.term_rx_seq.lock().remove(&id);
                     self.files.stop(&id);
                     // A site route ending closes its local listener (client
                     // side) and every tunneled connection it carried.
@@ -2844,6 +2862,17 @@ impl Mesh {
             });
             return;
         }
+        // One pump per viewer route. A duplicate `StartMedia` for this route
+        // — the offer arriving on more than one shared network, say — must
+        // not spawn a second pump onto it: two pumps fan the one shell's
+        // output out twice (doubled/tripled terminal). The first start wins;
+        // later duplicates are ignored until the pump ends and releases.
+        if !self.term_pumps.lock().insert(rid.clone()) {
+            tracing::debug!(
+                "route {rid} — terminal pump already running; ignoring duplicate start"
+            );
+            return;
+        }
         // The session the viewer asked to attach to: `Some(id)` joins that
         // shared shell (tmux-style — scrollback replayed, keyboard shared),
         // `None` mints a fresh one. The default emulator size is 80×24; the
@@ -2873,10 +2902,17 @@ impl Mesh {
                 self.record_and_announce_term_session(&route.id, &peer, &session_id);
                 let mesh = self.clone();
                 crate::spawn(async move {
-                    mesh.pump_term_attach(rid, peer, attach).await;
+                    mesh.clone()
+                        .pump_term_attach(rid.clone(), peer, attach)
+                        .await;
+                    // The pump ended (viewer detached, shell exited) — release
+                    // the route so a genuine fresh start can pump again.
+                    mesh.term_pumps.lock().remove(&rid);
                 });
             }
             Err(e) => {
+                // The shell never opened — release the route we just claimed.
+                self.term_pumps.lock().remove(&rid);
                 // Tell the viewer in its own terms — a terminal renders a
                 // line of text better than a silently vanished route — then
                 // tear the route down.
@@ -3072,6 +3108,15 @@ impl Mesh {
             });
             return;
         }
+        // One pump per route, exactly as the remote host path: a duplicate
+        // local `StartMedia` must not spawn a second loopback pump onto this
+        // route (which would double the window's output). First start wins.
+        if !self.term_pumps.lock().insert(rid.clone()) {
+            tracing::debug!(
+                "route {rid} — local terminal pump already running; ignoring duplicate"
+            );
+            return;
+        }
         // Buffer output from the very first byte — the shell's prompt is
         // produced right after Accept, before the window has subscribed, and
         // a dropped terminal byte never heals.
@@ -3121,7 +3166,7 @@ impl Mesh {
                         let msg = match rx.recv().await {
                             Ok(msg) => msg,
                             Err(RecvError::Lagged(_)) => continue,
-                            Err(RecvError::Closed) => return,
+                            Err(RecvError::Closed) => break,
                         };
                         match msg {
                             OutMsg::Data(bytes) => {
@@ -3140,13 +3185,17 @@ impl Mesh {
                                     json!({ "route": rid, "code": code }),
                                 );
                                 let _ = mesh.disconnect(rid.clone()).await;
-                                return;
+                                break;
                             }
                         }
                     }
+                    // Pump ended — release the route so a fresh start can pump.
+                    mesh.term_pumps.lock().remove(&rid);
                 });
             }
             Err(e) => {
+                // The shell never opened — release the route we just claimed.
+                self.term_pumps.lock().remove(&rid);
                 // Render the failure to the window in its own terms — a line
                 // of text, then the exit — then tear the route down.
                 tracing::warn!("route {rid} — local shell didn't start: {e}");
@@ -3162,6 +3211,23 @@ impl Mesh {
                 crate::spawn(async move {
                     let _ = mesh.disconnect(rid).await;
                 });
+            }
+        }
+    }
+
+    /// Whether a viewer-side terminal frame is fresh (record its seq and take
+    /// it) or a duplicate to drop. The host pump numbers a route's frames
+    /// strictly increasing, so any seq at or below the last we took is the
+    /// same send arriving again — the same offer/frame riding more than one
+    /// shared network (control and media ride them all). A forward jump (the
+    /// pump skipped ahead after a broadcast lag) is still fresh.
+    fn accept_term_seq(&self, route: &str, seq: u64) -> bool {
+        let mut seqs = self.term_rx_seq.lock();
+        match seqs.get(route) {
+            Some(&last) if seq <= last => false,
+            _ => {
+                seqs.insert(route.to_string(), seq);
+                true
             }
         }
     }
@@ -3216,6 +3282,13 @@ impl Mesh {
                 TermEvent::Unknown => {}
             }
         } else if views_here {
+            // Drop a duplicate delivery (see `accept_term_seq`): the same send
+            // arriving again over another shared network. Without this the
+            // window paints every byte — and the shell appears to echo every
+            // keystroke — once per shared network: the doubled/tripled terminal.
+            if !self.accept_term_seq(&frame.route, frame.seq) {
+                return;
+            }
             match frame.event {
                 TermEvent::Data { bytes } => {
                     if self.terminal.enqueue(&frame.route, bytes) {
@@ -5279,6 +5352,36 @@ mod tests {
             "session survives one detach with the remaining attacher",
         );
         mesh.terminal.close("shared");
+    }
+
+    #[test]
+    fn viewer_drops_duplicate_terminal_frames_by_seq() {
+        // The dedup that collapses a frame delivered on several shared
+        // networks back to one: the host pump numbers a route's frames
+        // strictly increasing, so a seq already taken is a duplicate.
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+
+        assert!(mesh.accept_term_seq("r", 0), "first frame is fresh");
+        assert!(
+            !mesh.accept_term_seq("r", 0),
+            "same seq again is a duplicate"
+        );
+        assert!(mesh.accept_term_seq("r", 1), "the next seq is fresh");
+        assert!(!mesh.accept_term_seq("r", 1), "and its duplicate drops");
+        assert!(
+            !mesh.accept_term_seq("r", 0),
+            "an older straggler drops too"
+        );
+        assert!(mesh.accept_term_seq("r", 2), "advancing is fresh");
+        assert!(
+            mesh.accept_term_seq("r", 9),
+            "a forward jump (pump skipped after a lag) is still fresh"
+        );
+        assert!(
+            mesh.accept_term_seq("other", 0),
+            "a different route has its own independent counter"
+        );
     }
 
     #[test]
