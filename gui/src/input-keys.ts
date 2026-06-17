@@ -16,8 +16,10 @@ import type { InputAction } from "./types";
 const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph"]);
 
 export interface KeyForwarder {
-  /** Forward one keydown/keyup. Auto-repeat is dropped (the remote OS
-   *  does its own key repeat); callers gate and `preventDefault()`. */
+  /** Forward one keydown/keyup. Auto-repeat *is* forwarded — as repeated
+   *  presses, because a synthetically injected key doesn't auto-repeat on
+   *  the remote OS the way a held hardware key does; callers gate and
+   *  `preventDefault()`. */
   onKey(e: KeyboardEvent, down: boolean): void;
   /** Lift everything still held (in reverse press order). Call when the
    *  matching keyups can no longer arrive — blur, control off, close. */
@@ -38,9 +40,19 @@ export function makeKeyForwarder(send: (action: InputAction) => void): KeyForwar
 
   return {
     onKey(e: KeyboardEvent, down: boolean) {
-      if (e.repeat) return;
       const code = e.code || undefined;
       const id = e.code || e.key;
+      // Auto-repeat: the remote OS only repeats its own hardware keys, never
+      // an injected (XTEST / SendInput / CGEvent) press — so a held key would
+      // type exactly once. Drive the repeat from here instead: forward each
+      // auto-repeat as another press and let the injector re-press it, already
+      // paced at the user's own key-repeat rate by the webview. Skip modifiers
+      // (a repeated Shift/Ctrl only churns the wire) and leave `held` alone —
+      // the key is already tracked from its first press.
+      if (e.repeat) {
+        if (down && !MODIFIER_KEYS.has(e.key)) send({ kind: "key", key: e.key, code, down: true });
+        return;
+      }
       if (down) {
         held.delete(id); // re-press keeps press order honest
         held.set(id, { key: e.key, code });
