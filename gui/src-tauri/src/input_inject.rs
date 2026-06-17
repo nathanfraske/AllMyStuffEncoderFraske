@@ -389,7 +389,9 @@ impl KeyTracker {
     fn press(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
         let k = self.resolve(key, code)?;
         let id = Self::identity(key, code);
-        // An old sender's auto-repeat re-presses; keep one entry.
+        // Auto-repeat arrives as a burst of re-presses (the remote OS won't
+        // repeat an injected key on its own); collapse them to a single held
+        // entry so the eventual keyup still lifts exactly once.
         self.pressed.retain(|(i, _)| *i != id);
         self.pressed.push((id, k));
         Some(k)

@@ -639,7 +639,12 @@
     // keystroke — so the remote writes our clipboard before it pastes.
     // Both ride the same ordered channel to the same peer, so sending the
     // frame and only then the keystroke keeps the order the remote needs.
-    if (down && !e.repeat && app.consoleClipboard && isPasteChord(e)) {
+    if (down && app.consoleClipboard && isPasteChord(e)) {
+      // Paste once per press: a held paste chord must not repeat-paste, and
+      // its forwarded repeat-downs would never get a matching keyup (the
+      // straggler line below swallows it), stranding the key down on the
+      // remote.
+      if (e.repeat) return;
       const key = e.key;
       const code = e.code || undefined;
       pasteHandled.add(e.code || e.key);
