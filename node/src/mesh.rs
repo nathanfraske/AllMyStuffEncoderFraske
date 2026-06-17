@@ -2827,10 +2827,16 @@ impl Mesh {
                                             // session) — the pump is the
                                             // watchdog.
                                             if last_ok.elapsed() > TERM_SEND_PATIENCE {
+                                                // Keep the shell alive — just detach this
+                                                // viewer. A vanished viewer is usually a
+                                                // network blip; the session lingers (idle-
+                                                // reaped much later) so a reconnecting viewer
+                                                // reattaches to the *same* shell and replays
+                                                // its scrollback, instead of losing the work.
                                                 tracing::warn!(
-                                                    "terminal {rid} — viewer unreachable; ending the session"
+                                                    "terminal {rid} — viewer unreachable; detaching (shell kept for reattach)"
                                                 );
-                                                let _ = mesh.disconnect(rid.clone()).await;
+                                                mesh.terminal.detach(&rid);
                                                 return;
                                             }
                                         }
