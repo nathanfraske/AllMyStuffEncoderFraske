@@ -119,6 +119,14 @@ pub struct Mesh {
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
     /// next forced IDR).
     video_out: mpsc::Sender<(String, String, VideoPacket)>,
+    /// The matching receivers, parked by [`Mesh::new`] and drained by the
+    /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
+    /// being spawned in `new` because the GUI builds the `Mesh` in a
+    /// *synchronous* Tauri `setup` (no ambient Tokio runtime to spawn on);
+    /// `start` is the first point guaranteed an async context, and on the
+    /// same runtime everything else runs on.
+    audio_rx: Mutex<Option<mpsc::Receiver<AudioOut>>>,
+    video_rx: Mutex<Option<mpsc::Receiver<(String, String, VideoPacket)>>>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// Sequence for outbound clipboard frames (one stream per app run, like
@@ -290,9 +298,9 @@ impl Mesh {
         // Shallow queues both: at most a few frames in flight, so a slow
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
-        let (audio_out, mut audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, mut video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
-        let mesh = Arc::new(Mesh {
+        let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
+        let (video_out, video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
+        Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
             sink,
@@ -321,6 +329,8 @@ impl Mesh {
             ownership: Arc::new(Ownership::load()),
             audio_out,
             video_out,
+            audio_rx: Mutex::new(Some(audio_rx)),
+            video_rx: Mutex::new(Some(video_rx)),
             input_seq: AtomicU64::new(0),
             clipboard_seq: AtomicU64::new(0),
             clipboard_transfer: AtomicU64::new(0),
@@ -336,14 +346,21 @@ impl Mesh {
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
-        });
+        })
+    }
 
-        // Forwarders: drain captured frames out to peers on the media
-        // channel, both bounded (see the field docs). Send
-        // failures are *surfaced* (rate-limited): a silently-dying media
-        // plane is exactly the "connected but nothing arrives" mystery.
-        {
-            let mesh = mesh.clone();
+    /// Spawn the media forwarders that drain captured frames out to peers on
+    /// the media channel, both bounded (see the field docs). Send failures are
+    /// *surfaced* (rate-limited): a silently-dying media plane is exactly the
+    /// "connected but nothing arrives" mystery.
+    ///
+    /// Called from [`Mesh::start`] rather than [`Mesh::new`] so the tasks land
+    /// on the runtime `start` runs on — `new` is built in the GUI's sync Tauri
+    /// `setup`, where `tokio::spawn` would panic with "no reactor running".
+    /// Idempotent: the receivers are taken once, so a second call is a no-op.
+    fn spawn_media_forwarders(self: &Arc<Self>) {
+        if let Some(mut audio_rx) = self.audio_rx.lock().take() {
+            let mesh = self.clone();
             tokio::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some(out) = audio_rx.recv().await {
@@ -370,8 +387,8 @@ impl Mesh {
                 }
             });
         }
-        {
-            let mesh = mesh.clone();
+        if let Some(mut video_rx) = self.video_rx.lock().take() {
+            let mesh = self.clone();
             tokio::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, route_id, packet)) = video_rx.recv().await {
@@ -407,7 +424,6 @@ impl Mesh {
                 }
             });
         }
-        mesh
     }
 
     /// Send one media-channel payload to `peer` (canonicalised to the bare
@@ -512,6 +528,10 @@ impl Mesh {
     /// Bring the session online: identify, pick a network, subscribe, and
     /// start pumping events. Safe to call once the daemon socket is up.
     pub async fn start(self: Arc<Self>) {
+        // Spawn the media forwarders now that we're on a runtime (see
+        // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
+        self.spawn_media_forwarders();
+
         let (tx, mut rx) = mpsc::channel::<Value>(512);
         let client_id = match self.client.subscribe_events(tx).await {
             Ok(id) => id,
@@ -4754,6 +4774,27 @@ mod tests {
             to: to.into(),
             media,
         }
+    }
+
+    struct NoopSink;
+    impl UiSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+        fn restart(&self) -> ! {
+            unreachable!("test sink never restarts")
+        }
+    }
+
+    /// Regression guard for the GUI crash where `Mesh::new` spawned its media
+    /// forwarders inline: the desktop app builds the `Mesh` in a *synchronous*
+    /// Tauri `setup` with no ambient Tokio runtime, so a `tokio::spawn` in
+    /// `new` panics with "there is no reactor running". This is a plain
+    /// `#[test]` (no `#[tokio::test]`) precisely so it runs without a runtime —
+    /// if `new` ever spawns again it will panic here. The forwarders are
+    /// deferred to `start`, which is always called from an async context.
+    #[test]
+    fn new_does_not_require_a_running_tokio_runtime() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let _mesh = Mesh::new(client, Arc::new(NoopSink));
     }
 
     #[test]
