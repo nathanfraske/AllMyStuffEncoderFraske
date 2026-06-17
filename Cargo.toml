@@ -9,12 +9,15 @@ members = [
     "crates/allmystuff-updater",
     "crates/allmystuff-cli",
 ]
-# The Tauri desktop app lives in its own Cargo workspace (`gui/src-tauri`)
-# so a `cargo build --workspace` at the root stays fast and webview-free —
-# the same split MyOwnMesh uses. The GUI is a *client* of the `myownmesh`
-# daemon and of these library crates; it never has to compile to test the
-# core.
-exclude = ["gui"]
+# The Tauri desktop app (`gui/src-tauri`) and the headless mesh node
+# (`node/` — the `allmystuff-node` engine + the `allmystuff-serve` binary)
+# each live in their own Cargo workspace so a `cargo build --workspace` at
+# the root stays fast and webview-free — the same split MyOwnMesh uses. The
+# GUI and the node are *clients* of the `myownmesh` daemon and of these
+# library crates; neither has to compile to test the core. (`node` carries
+# the heavy media deps — xcap/cpal/openh264/nokhwa/… — so it is deliberately
+# kept out of the lightweight library workspace.)
+exclude = ["gui", "node"]
 
 [workspace.package]
 version = "0.1.13"

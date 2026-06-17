@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+
+use crate::UiSink;
 
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
@@ -53,7 +54,11 @@ pub struct Mesh {
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
     media_pipe: MediaPipe,
-    app: AppHandle,
+    /// Where node events surface. The GUI wires this to Tauri's event bus
+    /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
+    /// sink — the events are all front-end concerns, so a node with no UI
+    /// simply drops them. See [`crate::UiSink`].
+    sink: Arc<dyn UiSink>,
     audio: Arc<AudioBridge>,
     /// Screen + camera capture for the display/video routes this machine
     /// sources (the far end of a console session looking at us, a room
@@ -114,6 +119,14 @@ pub struct Mesh {
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
     /// next forced IDR).
     video_out: mpsc::Sender<(String, String, VideoPacket)>,
+    /// The matching receivers, parked by [`Mesh::new`] and drained by the
+    /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
+    /// being spawned in `new` because the GUI builds the `Mesh` in a
+    /// *synchronous* Tauri `setup` (no ambient Tokio runtime to spawn on);
+    /// `start` is the first point guaranteed an async context, and on the
+    /// same runtime everything else runs on.
+    audio_rx: Mutex<Option<mpsc::Receiver<AudioOut>>>,
+    video_rx: Mutex<Option<mpsc::Receiver<(String, String, VideoPacket)>>>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// Sequence for outbound clipboard frames (one stream per app run, like
@@ -281,16 +294,16 @@ struct State {
 }
 
 impl Mesh {
-    pub fn new(client: Arc<ControlClient>, app: AppHandle) -> Arc<Self> {
+    pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
         // Shallow queues both: at most a few frames in flight, so a slow
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
-        let (audio_out, mut audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, mut video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
-        let mesh = Arc::new(Mesh {
+        let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
+        let (video_out, video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
+        Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
-            app,
+            sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
             video_decode: Arc::new(DecodeBridge::new()),
@@ -316,6 +329,8 @@ impl Mesh {
             ownership: Arc::new(Ownership::load()),
             audio_out,
             video_out,
+            audio_rx: Mutex::new(Some(audio_rx)),
+            video_rx: Mutex::new(Some(video_rx)),
             input_seq: AtomicU64::new(0),
             clipboard_seq: AtomicU64::new(0),
             clipboard_transfer: AtomicU64::new(0),
@@ -331,15 +346,22 @@ impl Mesh {
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
-        });
+        })
+    }
 
-        // Forwarders: drain captured frames out to peers on the media
-        // channel, both bounded (see the field docs). Send
-        // failures are *surfaced* (rate-limited): a silently-dying media
-        // plane is exactly the "connected but nothing arrives" mystery.
-        {
-            let mesh = mesh.clone();
-            tauri::async_runtime::spawn(async move {
+    /// Spawn the media forwarders that drain captured frames out to peers on
+    /// the media channel, both bounded (see the field docs). Send failures are
+    /// *surfaced* (rate-limited): a silently-dying media plane is exactly the
+    /// "connected but nothing arrives" mystery.
+    ///
+    /// Called from [`Mesh::start`] rather than [`Mesh::new`] so the tasks land
+    /// on the runtime `start` runs on — `new` is built in the GUI's sync Tauri
+    /// `setup`, where `tokio::spawn` would panic with "no reactor running".
+    /// Idempotent: the receivers are taken once, so a second call is a no-op.
+    fn spawn_media_forwarders(self: &Arc<Self>) {
+        if let Some(mut audio_rx) = self.audio_rx.lock().take() {
+            let mesh = self.clone();
+            crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some(out) = audio_rx.recv().await {
                     let (peer, result) = match out {
@@ -365,9 +387,9 @@ impl Mesh {
                 }
             });
         }
-        {
-            let mesh = mesh.clone();
-            tauri::async_runtime::spawn(async move {
+        if let Some(mut video_rx) = self.video_rx.lock().take() {
+            let mesh = self.clone();
+            crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, route_id, packet)) = video_rx.recv().await {
                     let outcome = match packet {
@@ -402,7 +424,6 @@ impl Mesh {
                 }
             });
         }
-        mesh
     }
 
     /// Send one media-channel payload to `peer` (canonicalised to the bare
@@ -470,10 +491,6 @@ impl Mesh {
             .map_err(|e| e.to_string())
     }
 
-    fn network(&self) -> Option<String> {
-        self.state.lock().network.clone()
-    }
-
     /// The network to reach `peer` on: the one we last saw them advertise on,
     /// falling back to the primary. This is what lets a connection cross to a
     /// peer that only shares a secondary network with us.
@@ -511,6 +528,17 @@ impl Mesh {
     /// Bring the session online: identify, pick a network, subscribe, and
     /// start pumping events. Safe to call once the daemon socket is up.
     pub async fn start(self: Arc<Self>) {
+        // Register the runtime we're on so the engine can spawn from any
+        // thread — capture/audio callbacks run on their own OS threads, where
+        // a bare `tokio::spawn` panics ("no reactor running"). All engine
+        // spawns go through `crate::spawn`, which uses this handle. Set first,
+        // before anything (the forwarders below) spawns.
+        crate::set_runtime(tokio::runtime::Handle::current());
+
+        // Spawn the media forwarders now that we're on a runtime (see
+        // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
+        self.spawn_media_forwarders();
+
         let (tx, mut rx) = mpsc::channel::<Value>(512);
         let client_id = match self.client.subscribe_events(tx).await {
             Ok(id) => id,
@@ -582,7 +610,7 @@ impl Mesh {
 
         // Event loop.
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             while let Some(value) = rx.recv().await {
                 mesh.handle_value(value).await;
             }
@@ -599,7 +627,7 @@ impl Mesh {
     fn spawn_inventory_watch(self: &Arc<Self>) {
         const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(10);
         let mesh = Arc::downgrade(self);
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             loop {
                 tokio::time::sleep(INVENTORY_RESCAN).await;
                 let Some(mesh) = mesh.upgrade() else {
@@ -890,12 +918,12 @@ impl Mesh {
                         if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
                             let mesh = self.clone();
                             let device = device.to_string();
-                            tauri::async_runtime::spawn(async move {
+                            crate::spawn(async move {
                                 mesh.ownership_check(Some(&device)).await;
                             });
                         }
                     }
-                    let _ = self.app.emit("allmystuff://event", event.clone());
+                    self.sink.emit("allmystuff://event", event.clone());
                 }
             }
             _ => {}
@@ -1069,7 +1097,7 @@ impl Mesh {
                                 .map(|d| format!(" ({d})"))
                                 .unwrap_or_default()
                         );
-                        let _ = self.app.emit(
+                        self.sink.emit(
                             "allmystuff://video-status",
                             serde_json::json!({
                                 "route": status.route,
@@ -1149,8 +1177,7 @@ impl Mesh {
                 // discipline as every other channel — a message this build
                 // doesn't understand is dropped, never an error.
                 if let Ok(msg) = serde_json::from_value::<RoomMessage>(payload) {
-                    let _ = self
-                        .app
+                    self.sink
                         .emit("allmystuff://room", json!({ "from": from, "message": msg }));
                 }
             }
@@ -1347,7 +1374,7 @@ impl Mesh {
                     // out the periodic IDR (rate-limited inside).
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
-                        tauri::async_runtime::spawn(async move {
+                        crate::spawn(async move {
                             let _ = mesh.request_refresh(rid).await;
                         });
                     }
@@ -1392,7 +1419,7 @@ impl Mesh {
         // also shaves the poll interval off delivery latency. Coalesced
         // by construction: no further pokes until the queue drains.
         if w.queue.len() == 1 {
-            let _ = self.app.emit("allmystuff://video-ready", route_id);
+            self.sink.emit("allmystuff://video-ready", json!(route_id));
         }
     }
 
@@ -1409,7 +1436,7 @@ impl Mesh {
         };
         w.queue.clear();
         w.queue.push_back(packet);
-        let _ = self.app.emit("allmystuff://video-ready", route_id);
+        self.sink.emit("allmystuff://video-ready", json!(route_id));
     }
 
     /// Front-end command: offer a route from `from` to `to`.
@@ -1658,7 +1685,7 @@ impl Mesh {
                     self.drop_downloads(&id);
                 }
                 Effect::Share { from, message } => {
-                    let _ = self.app.emit(
+                    self.sink.emit(
                         "allmystuff://share",
                         json!({ "from": from.to_string(), "message": message }),
                     );
@@ -1693,15 +1720,15 @@ impl Mesh {
                 // reply: our next presence advert (the new version) is the
                 // confirmation, and the button it pressed disappears when the
                 // upgrade lands — exactly how a claim confirms by re-advert.
-                let app = self.app.clone();
-                tauri::async_runtime::spawn(async move {
+                let sink = self.sink.clone();
+                crate::spawn(async move {
                     match allmystuff_updater::update_now().await {
                         Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
                             tracing::info!(
                                 "self-update applied {to} ({}) — restarting",
                                 components.join("+")
                             );
-                            app.restart();
+                            sink.restart();
                         }
                         Ok(other) => {
                             tracing::info!("upgrade request: nothing to do ({other:?})")
@@ -1807,7 +1834,7 @@ impl Mesh {
                 self.broadcast_owned().await;
                 self.emit_owned();
                 // Surface the claim feedback for the claimer's toast, too.
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://ownership",
                     json!({
                         "from": from.to_string(),
@@ -1822,7 +1849,7 @@ impl Mesh {
                     short_id(from.as_str()),
                     other
                 );
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://ownership",
                     json!({ "from": from.to_string(), "message": other }),
                 );
@@ -1965,8 +1992,7 @@ impl Mesh {
 
     /// Push the current fleet roster to the front-end.
     fn emit_owned(&self) {
-        let _ = self
-            .app
+        self.sink
             .emit("allmystuff://owned", self.owned_roster_value());
     }
 
@@ -2732,7 +2758,7 @@ impl Mesh {
                 };
                 let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
                 let peer = status_peer.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::spawn(async move {
                     let Ok(payload) = serde_json::to_value(&frame) else {
                         return;
                     };
@@ -2759,7 +2785,7 @@ impl Mesh {
                 short_id(&peer)
             );
             let mesh = self.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::spawn(async move {
                 let _ = mesh.disconnect(rid).await;
             });
             return;
@@ -2771,7 +2797,7 @@ impl Mesh {
                     short_id(&peer)
                 );
                 let mesh = self.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::spawn(async move {
                     let mut seq: u64 = 0;
                     let mut last_ok = std::time::Instant::now();
                     let mut last_warn = std::time::Instant::now() - WARN_EVERY;
@@ -2801,10 +2827,16 @@ impl Mesh {
                                             // session) — the pump is the
                                             // watchdog.
                                             if last_ok.elapsed() > TERM_SEND_PATIENCE {
+                                                // Keep the shell alive — just detach this
+                                                // viewer. A vanished viewer is usually a
+                                                // network blip; the session lingers (idle-
+                                                // reaped much later) so a reconnecting viewer
+                                                // reattaches to the *same* shell and replays
+                                                // its scrollback, instead of losing the work.
                                                 tracing::warn!(
-                                                    "terminal {rid} — viewer unreachable; ending the session"
+                                                    "terminal {rid} — viewer unreachable; detaching (shell kept for reattach)"
                                                 );
-                                                let _ = mesh.disconnect(rid.clone()).await;
+                                                mesh.terminal.detach(&rid);
                                                 return;
                                             }
                                         }
@@ -2832,7 +2864,7 @@ impl Mesh {
                 // tear the route down.
                 tracing::warn!("route {rid} — shell didn't start: {e}");
                 let mesh = self.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::spawn(async move {
                     let note = format!("[couldn't start a shell here: {e}]\r\n");
                     for frame in [
                         TermFrame::new(
@@ -2910,11 +2942,12 @@ impl Mesh {
                         // Queue went empty → non-empty: poke the window to
                         // drain (a lost poke costs latency, never bytes —
                         // the safety poll catches up).
-                        let _ = self.app.emit("allmystuff://term-ready", &frame.route);
+                        self.sink
+                            .emit("allmystuff://term-ready", json!(frame.route));
                     }
                 }
                 TermEvent::Exit { code } => {
-                    let _ = self.app.emit(
+                    self.sink.emit(
                         "allmystuff://term-exit",
                         json!({ "route": frame.route, "code": code }),
                     );
@@ -3098,7 +3131,8 @@ impl Mesh {
                 return;
             };
             if self.files.enqueue(&frame.route, bytes) {
-                let _ = self.app.emit("allmystuff://file-ready", &frame.route);
+                self.sink
+                    .emit("allmystuff://file-ready", json!(frame.route));
             }
         }
     }
@@ -3113,7 +3147,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
                 let frame = FileFrame::new(&rid, seq, ev);
@@ -3132,7 +3166,7 @@ impl Mesh {
     /// viewer, fire-and-forget.
     fn send_file_event(self: &Arc<Self>, route_id: String, peer: String, event: FileEvent) {
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
             let frame = FileFrame::new(&route_id, seq, event);
             if let Ok(payload) = serde_json::to_value(&frame) {
@@ -3278,7 +3312,7 @@ impl Mesh {
                 // reply to the asking machine.
                 let mesh = self.clone();
                 let peer = from.to_string();
-                tauri::async_runtime::spawn(async move {
+                crate::spawn(async move {
                     let scan = mesh.clone();
                     let Ok((services, exposed)) = tokio::task::spawn_blocking(move || {
                         let services = scan
@@ -3310,7 +3344,7 @@ impl Mesh {
             }
             SiteControl::Sites { services, exposed } => {
                 // A managed machine's answer — hand it to the drawer.
-                let _ = self.app.emit(
+                self.sink.emit(
                     "allmystuff://node-sites",
                     serde_json::json!({ "from": from, "services": services, "exposed": exposed }),
                 );
@@ -3431,9 +3465,9 @@ impl Mesh {
         peer: String,
         host_port: u16,
         listener: tokio::net::TcpListener,
-    ) -> tauri::async_runtime::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()> {
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             // Wait for the host to accept before taking connections — until
             // the route is active a tunnel's `Open` would be dropped, leaving
             // a connecting client hung. (Pending TCP connections sit in the
@@ -3518,7 +3552,7 @@ impl Mesh {
         // the write half so the local client sees a clean close. It drains
         // any bytes that were buffered before the socket was wired.
         let mut rx = rx;
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             while let Some(bytes) = rx.recv().await {
                 if write_half.write_all(&bytes).await.is_err() {
                     break;
@@ -3533,7 +3567,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer_s = peer.to_string();
-        let reader = tauri::async_runtime::spawn(async move {
+        let reader = crate::spawn(async move {
             if let Some(port) = open_port {
                 mesh.send_site_event(&peer_s, &rid, SiteEvent::Open { conn, port })
                     .await;
@@ -3641,7 +3675,7 @@ impl Mesh {
                         None => {
                             let mesh = self.clone();
                             let (route, peer) = (frame.route.clone(), from.to_string());
-                            tauri::async_runtime::spawn(async move {
+                            crate::spawn(async move {
                                 mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
                                     .await;
                             });
@@ -3696,7 +3730,7 @@ impl Mesh {
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
         let mesh = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn(async move {
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             match tokio::net::TcpStream::connect(addr).await {
                 Ok(socket) => {
@@ -3863,7 +3897,7 @@ impl Mesh {
             map.remove(&key);
             drop(map);
             let _ = std::fs::remove_file(&path);
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-saved",
                 json!({ "route": route_id, "req": req, "path": null, "error": e.to_string() }),
             );
@@ -3876,7 +3910,7 @@ impl Mesh {
             };
             drop(map);
             let _ = sink.file.sync_all();
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-saved",
                 json!({
                     "route": route_id, "req": req,
@@ -3887,7 +3921,7 @@ impl Mesh {
             sink.last_progress = std::time::Instant::now();
             let written = sink.written;
             drop(map);
-            let _ = self.app.emit(
+            self.sink.emit(
                 "allmystuff://file-progress",
                 json!({ "route": route_id, "req": req, "written": written, "total": total }),
             );
@@ -3906,7 +3940,7 @@ impl Mesh {
             return;
         };
         let _ = std::fs::remove_file(&sink.path);
-        let _ = self.app.emit(
+        self.sink.emit(
             "allmystuff://file-saved",
             json!({ "route": route_id, "req": req, "path": null, "error": reason }),
         );
@@ -4405,11 +4439,11 @@ impl Mesh {
     }
 
     fn emit_snapshot(&self) {
-        let _ = self.app.emit("allmystuff://session", self.snapshot());
+        self.sink.emit("allmystuff://session", self.snapshot());
     }
 
     fn emit_status(&self, status: &str, error: Option<&str>) {
-        let _ = self.app.emit(
+        self.sink.emit(
             "allmystuff://subscription",
             json!({ "status": status, "error": error }),
         );
@@ -4753,6 +4787,55 @@ mod tests {
             to: to.into(),
             media,
         }
+    }
+
+    struct NoopSink;
+    impl UiSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+        fn restart(&self) -> ! {
+            unreachable!("test sink never restarts")
+        }
+    }
+
+    /// Regression guard for the GUI crash where `Mesh::new` spawned its media
+    /// forwarders inline: the desktop app builds the `Mesh` in a *synchronous*
+    /// Tauri `setup` with no ambient Tokio runtime, so a `tokio::spawn` in
+    /// `new` panics with "there is no reactor running". This is a plain
+    /// `#[test]` (no `#[tokio::test]`) precisely so it runs without a runtime —
+    /// if `new` ever spawns again it will panic here. The forwarders are
+    /// deferred to `start`, which is always called from an async context.
+    #[test]
+    fn new_does_not_require_a_running_tokio_runtime() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let _mesh = Mesh::new(client, Arc::new(NoopSink));
+    }
+
+    /// Regression guard for the screen/audio outage: the engine fires tasks
+    /// from capture/audio OS threads (e.g. the DXGI status callback), where a
+    /// bare `tokio::spawn` panics with "no reactor running". Every engine spawn
+    /// goes through [`crate::spawn`], which must work off-runtime via the handle
+    /// `start` registers. Spawn from a plain `std::thread` (no ambient runtime)
+    /// and confirm the task actually runs.
+    #[test]
+    fn engine_spawn_runs_tasks_from_a_non_runtime_thread() {
+        let rt = tokio::runtime::Runtime::new().expect("build runtime");
+        crate::set_runtime(rt.handle().clone());
+        // Keep the runtime (and the registered handle) alive for the process —
+        // OnceLock holds the handle, and this is the only test that sets it.
+        std::mem::forget(rt);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // No ambient runtime here — `tokio::spawn` would panic.
+            crate::spawn(async move {
+                let _ = tx.send(());
+            });
+        })
+        .join()
+        .unwrap();
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned task should run on the registered runtime");
     }
 
     #[test]

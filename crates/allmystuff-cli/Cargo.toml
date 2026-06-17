@@ -22,3 +22,8 @@ allmystuff-bridge = { workspace = true }
 allmystuff-updater = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# `service` installs/queries an OS service (systemd/launchd). Pure-ish path +
+# argv builders with rich errors; `dirs` resolves the user's home for the
+# unit/plist location.
+anyhow = "1"
+dirs = "5"

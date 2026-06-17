@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
-use tauri::async_runtime::JoinHandle;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Most simultaneous tunneled connections one site route will carry. A
 /// browser opens several at once; this bounds a hostile or runaway peer to a

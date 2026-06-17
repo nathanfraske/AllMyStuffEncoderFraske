@@ -68,6 +68,11 @@ scan:
 caps:
     @cargo run -p allmystuff-cli -- capabilities
 
+# Run this machine on the mesh, headless (the node `allmystuff serve` runs).
+# Builds from the node workspace and spawns the myownmesh daemon itself.
+serve *ARGS:
+    @cargo run --manifest-path node/Cargo.toml --bin allmystuff-serve -- {{ARGS}}
+
 fmt:
     @cargo fmt --all
 
@@ -80,6 +85,11 @@ lint:
 test:
     @cargo test --workspace --no-fail-fast
 
+# The headless node engine lives in its own workspace (heavy media deps), so
+# its fmt/clippy/test don't ride the root `--workspace` flags — run them here.
+node-check:
+    @cd node && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
 # Typecheck + build the Svelte front-end (no webview needed).
 [unix]
 [doc("Typecheck + build the front-end.")]
@@ -91,8 +101,9 @@ gui-check:
 gui-check:
     @cd gui; pnpm install --frozen-lockfile; pnpm check; pnpm build
 
-# Everything CI runs: Rust fmt + clippy + test, then the GUI typecheck/build.
-check: fmt-check lint test gui-check
+# Everything CI runs: Rust fmt + clippy + test (library workspace + the node
+# engine), then the GUI typecheck/build.
+check: fmt-check lint test node-check gui-check
 
 # Cut a release: bump every crate's version (+ the GUI sub-workspace),
 # commit, push, trigger the workflow. Mirrors MyOwnMesh / MyOwnLLM — the
@@ -104,8 +115,8 @@ check: fmt-check lint test gui-check
 [doc("Cut a release: bump versions, commit, push, trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
-    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; then \
-        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; \
+    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock; then \
+        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock; \
         git commit -m "chore(release): {{VERSION}}"; \
     fi
     @git push

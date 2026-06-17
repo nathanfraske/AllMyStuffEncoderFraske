@@ -20,6 +20,8 @@ pub fn launch() -> ExitCode {
         eprintln!("allmystuff: no DISPLAY or WAYLAND_DISPLAY — can't open the desktop app.");
         eprintln!();
         eprintln!("On a headless box, use the CLI directly:");
+        eprintln!("  allmystuff serve           # run this machine on the mesh (no GUI)");
+        eprintln!("  allmystuff service install # …and keep it running across reboots");
         eprintln!("  allmystuff scan            # inventory this machine");
         eprintln!("  allmystuff capabilities    # what it would expose on the mesh");
         eprintln!("  allmystuff update          # update to the latest release");

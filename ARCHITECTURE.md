@@ -7,21 +7,40 @@ and the **mesh is a sidecar**, never an embedded dependency.
 ## One picture
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │            AllMyStuff GUI (gui/)          │
-                    │  Svelte 5 graph  ──invoke──►  Tauri (Rust)│
-                    └───────┬───────────────────────────┬──────┘
-            scan_self()     │                           │  control socket
-        (inventory+bridge)  │                           │  (line-delimited JSON)
-                            ▼                           ▼
-        ┌───────────────────────────┐        ┌────────────────────────┐
-        │   allmystuff-inventory    │        │   myownmesh serve       │
-        │   allmystuff-bridge       │        │   (separate process,    │
-        │   allmystuff-graph        │        │    pinned in            │
-        │   allmystuff-protocol     │        │    .myownmesh-rev)      │
-        └───────────────────────────┘        └────────────────────────┘
-              the library workspace               the mesh, sidecarred
+   ┌─────────────────────────────┐     ┌─────────────────────────────┐
+   │   AllMyStuff GUI (gui/)      │     │   allmystuff serve (node/)   │
+   │ Svelte 5 graph ─invoke─►Tauri│     │   headless — no webview      │
+   └──────────────┬──────────────┘     └──────────────┬──────────────┘
+                  │  TauriSink (UiSink)               │  LogSink (UiSink)
+                  └───────────────┬───────────────────┘
+                                  ▼
+                    ┌──────────────────────────────┐
+                    │   allmystuff-node engine      │   one engine, two
+                    │   presence · routes · every   │   front ends: the GUI
+                    │   media plane (screen/camera/ │   and the headless
+                    │   audio/input/terminal/files) │   serve binary both
+                    └───────┬───────────────┬───────┘   link it.
+          scan_self()       │               │  control socket
+      (inventory+bridge)    │               │  (line-delimited JSON)
+                            ▼               ▼
+        ┌───────────────────────────┐  ┌────────────────────────┐
+        │   allmystuff-inventory    │  │   myownmesh serve       │
+        │   allmystuff-bridge       │  │   (separate process,    │
+        │   allmystuff-graph        │  │    pinned in            │
+        │   allmystuff-protocol     │  │    .myownmesh-rev)      │
+        └───────────────────────────┘  └────────────────────────┘
+              the library workspace         the mesh, sidecarred
 ```
+
+The seam between the two front ends is the `UiSink` trait
+(`allmystuff-node`): `Mesh::new` takes one, the GUI hands it a Tauri-backed
+implementation (`app.emit`), and `allmystuff-serve` hands it a logging one.
+Nothing else in the engine knows whether a webview is attached — which is the
+whole reason the same code can stream a screen with or without a GUI. The
+headless binary also spawns and supervises the `myownmesh serve` daemon
+itself (the same `daemon_spawn` logic the GUI uses), so `allmystuff service`
+needs only one unit to bring the whole node up. See
+[the README's Headless section](README.md#headless-serve--service).
 
 The library workspace (`crates/`) compiles and tests with nothing but
 `cargo` — no webview, no daemon, no network. The GUI is its own Cargo
@@ -38,8 +57,17 @@ crates/
 ├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
 ├── allmystuff-session     # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
 ├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
-└── allmystuff-cli         # `allmystuff` (opens the GUI) + scan / capabilities / update
+└── allmystuff-cli         # `allmystuff` — opens the GUI, or scan / capabilities / update / serve / service
+
+node/                      # the headless node engine (its own workspace, heavy media deps)
+└── allmystuff-node        # the engine the GUI links + `allmystuff-serve` (runs it with no webview)
 ```
+
+The library workspace above stays lightweight on purpose. The node engine —
+the part that captures screens, encodes H.264/Opus, injects input, hosts PTYs
+— carries heavy native dependencies (xcap, cpal, openh264, nokhwa, enigo,
+portable-pty, …), so like the GUI it lives in its own Cargo workspace
+(`node/`) that the root `cargo build --workspace` never drags in.
 
 ### allmystuff-inventory
 
@@ -157,7 +185,19 @@ Tauri backend so "what this machine exposes" is computed once.
 
 Tauri 2 + Svelte 5, a client of the daemon.
 
-- **Backend** (`src-tauri/`) — `scan_self` (inventory + bridge), the live
+> **Where the backend code lives.** Everything in this section below — `mesh`,
+> `video`, `audio`, `camera_capture`, `wayland_capture` / `win_capture`,
+> `input_inject`, `terminal`, `files`, `clipboard`, `sites`, `control_client`,
+> `daemon_spawn`, … — now lives in the **`allmystuff-node`** crate
+> (`node/src/`), not under `gui/src-tauri/src/`. The GUI's `src-tauri` is a
+> thin Tauri shell: `main.rs` (the `#[tauri::command]` surface + the window
+> builder) plus a `TauriSink` that wires the engine's events onto Tauri's
+> event bus. The same modules, linked headless, are what `allmystuff serve`
+> runs. The module names below are unchanged — just read them under
+> `node/src/` rather than `gui/src-tauri/src/`.
+
+- **Backend** (`node/`, linked by `gui/src-tauri` and `allmystuff-serve`) —
+  `scan_self` (inventory + bridge), the live
   `mesh::Mesh` (subscribes to the presence/control/media channels, drives the
   `allmystuff-session` state machine, emits `allmystuff://session`
   snapshots), the `audio` bridge (capture → mesh → playback for active
@@ -377,7 +417,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
    speak the lane (myownmesh ≥ 0.2.4 — the actually-bundled daemon pin is
-   v0.2.7, see `.myownmesh-rev`), as PCM `AudioFrame`s over
+   v0.2.8, see `.myownmesh-rev`), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step
@@ -428,7 +468,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    daemon's job: myownmesh ≥ 0.2.2 reassembles access units
    sequence-aware, so packet loss or a late NACK retransmit costs one
    frame, never a corrupt unit in a decoder. (These are floor thresholds;
-   the actually-bundled daemon pin is v0.2.7 — see `.myownmesh-rev`.)
+   the actually-bundled daemon pin is v0.2.8 — see `.myownmesh-rev`.)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;

@@ -69,6 +69,7 @@ case "$ARCH_RAW" in
 esac
 ASSET="allmystuff-${OS}-${ARCH}.tar.gz"
 GUI_ASSET="allmystuff-gui-${OS}-${ARCH}.tar.gz"
+SERVE_ASSET="allmystuff-serve-${OS}-${ARCH}.tar.gz"
 MESH_ASSET="myownmesh-${OS}-${ARCH}.tar.gz"
 
 # Pick install prefix. Prefer /usr/local/bin if writable (or sudo is cached);
@@ -101,6 +102,17 @@ install_gui_binary() {
     sudo install -m 0755 "$src" "$PREFIX_DIR/allmystuff-gui"
   fi
   log "Installed: $PREFIX_DIR/allmystuff-gui"
+}
+
+install_serve_binary() {
+  src="$1"
+  mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
+  if [ -w "$PREFIX_DIR" ]; then
+    install -m 0755 "$src" "$PREFIX_DIR/allmystuff-serve"
+  else
+    sudo install -m 0755 "$src" "$PREFIX_DIR/allmystuff-serve"
+  fi
+  log "Installed: $PREFIX_DIR/allmystuff-serve"
 }
 
 ensure_on_path() {
@@ -241,6 +253,59 @@ try_release_gui() {
   tar -xzf "$_TRY_GUI_TMP/$GUI_ASSET" -C "$_TRY_GUI_TMP"
   install_gui_binary "$_TRY_GUI_TMP/allmystuff-gui"
   _cleanup_try_gui
+  trap - EXIT INT TERM
+  return 0
+}
+
+_TRY_SERVE_TMP=""
+_cleanup_try_serve() {
+  if [ -n "$_TRY_SERVE_TMP" ] && [ -d "$_TRY_SERVE_TMP" ]; then
+    rm -rf "$_TRY_SERVE_TMP"
+  fi
+  _TRY_SERVE_TMP=""
+}
+
+# Best-effort node install: fetch the portable `allmystuff-serve` tarball
+# and drop it next to the CLI. This is the headless node `allmystuff serve`
+# runs (and `allmystuff service` installs); without it those two commands
+# print a hint pointing here. Returns non-zero (without aborting the overall
+# install) if the asset is missing — an older release may predate it.
+try_release_serve() {
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+  api="https://api.github.com/repos/${REPO}/releases/latest"
+  if ! json="$(curl -fsSL "$api" 2>/dev/null)"; then
+    warn "GitHub releases unreachable; skipping the node binary."
+    return 1
+  fi
+  url="$(printf '%s' "$json" | grep -Eo "https://[^\"]+/${SERVE_ASSET}" | head -n1 || true)"
+  if [ -z "$url" ]; then
+    warn "No node asset matched ${SERVE_ASSET} in the latest release."
+    return 1
+  fi
+  sha_url="${url}.sha256"
+  log "Downloading $url"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "(dry-run) would download $url"
+    return 0
+  fi
+  _TRY_SERVE_TMP="$(mktemp -d)"
+  trap _cleanup_try_serve EXIT INT TERM
+  curl -fsSL "$url" -o "$_TRY_SERVE_TMP/$SERVE_ASSET"
+  if curl -fsSL "$sha_url" -o "$_TRY_SERVE_TMP/$SERVE_ASSET.sha256" 2>/dev/null; then
+    if ! (cd "$_TRY_SERVE_TMP" && (sha256sum -c "$SERVE_ASSET.sha256" 2>/dev/null || shasum -a 256 -c "$SERVE_ASSET.sha256")); then
+      warn "SHA256 verification failed for $SERVE_ASSET — not installing the node binary."
+      _cleanup_try_serve
+      trap - EXIT INT TERM
+      return 1
+    fi
+  else
+    warn "No SHA256 sidecar for the node binary; skipping integrity check."
+  fi
+  tar -xzf "$_TRY_SERVE_TMP/$SERVE_ASSET" -C "$_TRY_SERVE_TMP"
+  install_serve_binary "$_TRY_SERVE_TMP/allmystuff-serve"
+  _cleanup_try_serve
   trap - EXIT INT TERM
   return 0
 }
@@ -482,18 +547,38 @@ if [ "$INSTALL_GUI" = "true" ]; then
   fi
 fi
 
-# Mesh daemon — see the block above ensure_mesh for the rules. Only the
-# desktop app talks to the daemon, so a CLI-only install skips it; a GUI
-# built from source bundles its own (gui's build.rs).
+# The headless node binary (allmystuff-serve) — what `allmystuff serve` runs
+# and `allmystuff service` installs. Installed on every release install (it's
+# the whole point of a headless --no-gui box, and small enough to ship with a
+# desktop install too). A from-source CLI build skips it: it links the media
+# toolchain, out of scope for a curl|sh installer.
+SERVE_INSTALLED=false
+if [ "$INSTALLED_FROM_RELEASE" = "true" ]; then
+  if try_release_serve; then
+    SERVE_INSTALLED=true
+  else
+    warn "Node binary not installed; 'allmystuff serve' will print a hint until it is. Re-run the installer later, or build node/."
+  fi
+elif [ "$DRY_RUN" = "true" ]; then
+  log "(dry-run) would install the node binary ($SERVE_ASSET) next to allmystuff"
+else
+  warn "Built the CLI from source; skipping the node binary (needs the media toolchain)."
+  warn "Build it with:  cargo build --release --manifest-path node/Cargo.toml"
+fi
+
+# Mesh daemon — see the block above ensure_mesh for the rules. Both the
+# desktop app *and* the headless node (`allmystuff serve`) run on it, so it's
+# installed whenever either of them is; a from-source build skips it (a GUI
+# built from gui/ bundles its own, and scan/capabilities need no daemon).
 if [ "$INSTALL_MESH" != "true" ]; then
   log "Skipping the mesh daemon (--no-mesh)."
-elif [ "$INSTALL_GUI" != "true" ]; then
-  log "CLI-only install; skipping the mesh daemon (only the desktop app uses it)."
-elif [ "$GUI_INSTALLED" = "true" ]; then
+elif [ "$GUI_INSTALLED" = "true" ] || [ "$SERVE_INSTALLED" = "true" ]; then
+  ensure_mesh
+elif [ "$DRY_RUN" = "true" ]; then
   ensure_mesh
 else
-  log "Mesh: skipped — no desktop app was installed, and only the app uses the"
-  log "daemon (a GUI built from gui/ bundles its own)."
+  log "Mesh: skipped — neither the desktop app nor the node binary was"
+  log "installed (only they use the daemon; scan/capabilities don't)."
 fi
 
 if [ "$DRY_RUN" != "true" ]; then
@@ -509,6 +594,11 @@ fi
 log "  allmystuff scan            # pretty inventory of this machine"
 log "  allmystuff capabilities    # what this machine would expose on the mesh"
 log "  allmystuff update          # update to the latest release"
+if [ "$SERVE_INSTALLED" = "true" ] || [ "$DRY_RUN" = "true" ]; then
+  log "  allmystuff serve           # run this machine on the mesh, headless (no GUI)"
+  log "  allmystuff service install # …and keep it running across reboots (one service runs"
+  log "                             # both the node and the myownmesh daemon)"
+fi
 if [ "$INSTALL_GUI" = "true" ]; then
   log ""
   log "The app opens into a demo graph even with no mesh. Live machines run"

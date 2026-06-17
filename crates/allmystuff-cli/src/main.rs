@@ -6,6 +6,8 @@
 //!
 //! ```text
 //! allmystuff                 # open the desktop app
+//! allmystuff serve           # run this machine on the mesh, headless (no GUI)
+//! allmystuff service install # keep the node running across reboots (systemd/launchd)
 //! allmystuff scan            # pretty inventory of this machine
 //! allmystuff scan --json     # the same, as JSON
 //! allmystuff capabilities    # what this machine would expose on the mesh
@@ -13,6 +15,8 @@
 //! ```
 
 mod gui_launch;
+mod serve;
+mod service;
 
 use std::process::ExitCode;
 
@@ -38,6 +42,8 @@ fn main() -> ExitCode {
             println!("allmystuff {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        "serve" => serve::run(&args[1..]),
+        "service" => run_service(&args[1..]),
         "scan" => {
             let json = args.iter().any(|a| a == "--json");
             run_scan(json)
@@ -147,6 +153,76 @@ fn run_update(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `allmystuff service [--system] <install|start|stop|restart|status|uninstall>
+/// [--log FILTER]` — manage the OS background service (systemd/launchd),
+/// mirroring `myownmesh service`. The node it runs supervises the myownmesh
+/// daemon, so one service brings up both.
+fn run_service(args: &[String]) -> ExitCode {
+    let system = args.iter().any(|a| a == "--system");
+    // First non-flag token is the action.
+    let action = args
+        .iter()
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-'));
+    let cmd = match action {
+        Some("install") => service::ServiceCmd::Install {
+            log: flag_value(args, "--log"),
+        },
+        Some("start") => service::ServiceCmd::Start,
+        Some("stop") => service::ServiceCmd::Stop,
+        Some("restart") => service::ServiceCmd::Restart,
+        Some("status") => service::ServiceCmd::Status,
+        Some("uninstall") | Some("remove") => service::ServiceCmd::Uninstall,
+        Some(other) => {
+            eprintln!("allmystuff service: unknown subcommand `{other}`\n");
+            print_service_help();
+            return ExitCode::FAILURE;
+        }
+        None => {
+            print_service_help();
+            return ExitCode::FAILURE;
+        }
+    };
+    match service::run(system, cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("allmystuff service: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The value following `flag` in argv (`--log <FILTER>`), if present.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with('-'))
+        .cloned()
+}
+
+fn print_service_help() {
+    eprintln!(
+        "Usage: allmystuff service [--system] <install|start|stop|restart|status|uninstall> [--log FILTER]
+
+  install     install + start the service, and start it on its own — at login
+              (per-user) or at boot (--system)
+  start       start the installed service now
+  stop        stop it (stays installed)
+  restart     restart it
+  status      show installed / enabled / running
+  uninstall   stop, disable, and remove it
+
+  --system    manage the system-wide service (root, starts at boot) instead of
+              the per-user one (no root, starts at login)
+  --log F     (install) bake an ALLMYSTUFF_LOG filter into the service, e.g.
+              --log info,allmystuff_node=debug
+
+The service runs `allmystuff serve`, which spawns the myownmesh daemon itself —
+so one service runs both."
+    );
 }
 
 fn run_scan(json: bool) -> ExitCode {
@@ -271,6 +347,12 @@ USAGE:
     With no command, opens the desktop app (allmystuff-gui).
 
 COMMANDS:
+    serve           Run this machine on the mesh, headless (no GUI). Serves its
+                    screen/camera/audio/terminal/files to peers, and spawns the
+                    myownmesh daemon itself.
+    service         Install/manage serve as a background OS service so it
+                    survives reboots (install | start | stop | restart | status |
+                    uninstall; --system for a boot service). One service runs both.
     scan            Pretty inventory of this machine
     scan --json     Inventory as JSON
     capabilities    Capabilities this machine would expose on the mesh graph

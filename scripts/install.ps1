@@ -47,6 +47,7 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $asset = "allmystuff-windows-$arch.zip"
 $guiAsset = "allmystuff-gui-windows-$arch.zip"
+$serveAsset = "allmystuff-serve-windows-$arch.zip"
 $meshAsset = "myownmesh-windows-$arch.zip"
 
 function Install-FromZip([string]$zipPath) {
@@ -77,6 +78,18 @@ function Install-GuiFromZip([string]$zipPath) {
     $exe = Join-Path $Prefix "allmystuff-gui.exe"
     if (-not (Test-Path $exe)) {
         throw "allmystuff-gui.exe not found in $zipPath after extraction"
+    }
+    Log "Installed: $exe"
+}
+
+function Install-ServeFromZip([string]$zipPath) {
+    if (-not (Test-Path $Prefix)) {
+        New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+    }
+    Expand-Archive -Path $zipPath -DestinationPath $Prefix -Force
+    $exe = Join-Path $Prefix "allmystuff-serve.exe"
+    if (-not (Test-Path $exe)) {
+        throw "allmystuff-serve.exe not found in $zipPath after extraction"
     }
     Log "Installed: $exe"
 }
@@ -176,6 +189,59 @@ function Try-ReleaseGui {
         return $true
     } catch {
         Warn "GUI download/install failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Best-effort node install: fetch the portable `allmystuff-serve` zip and
+# drop it next to the CLI. This is the headless node `allmystuff serve` runs;
+# without it that command prints a hint pointing here. (Windows has no
+# `allmystuff service` backend yet — register `allmystuff serve` as a Task
+# Scheduler task instead — but the binary itself runs fine.)
+function Try-ReleaseServe {
+    $api = "https://api.github.com/repos/$Repo/releases/latest"
+    try {
+        $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "allmystuff-installer" }
+    } catch {
+        Warn "GitHub releases unreachable; skipping the node binary."
+        return $false
+    }
+    $match = $release.assets | Where-Object { $_.name -eq $serveAsset } | Select-Object -First 1
+    if (-not $match) {
+        Warn "No node asset matched $serveAsset in the latest release."
+        return $false
+    }
+    $url = $match.browser_download_url
+    Log "Downloading $url"
+    if ($DryRun) { Log "(dry-run) would download $url"; return $true }
+
+    $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "allmystuff-serve-install-$([guid]::NewGuid())")
+    try {
+        $zip = Join-Path $tmp $serveAsset
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        $shaFile = "$zip.sha256"
+        $haveSha = $true
+        try {
+            Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing
+        } catch {
+            Warn "No SHA256 sidecar for the node binary; skipping integrity check."
+            $haveSha = $false
+        }
+        if ($haveSha) {
+            $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
+            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+            if ($expected -ne $actual) {
+                Warn "SHA256 mismatch for $serveAsset — not installing the node binary."
+                return $false
+            }
+            Log "SHA256 OK"
+        }
+        Install-ServeFromZip $zip
+        return $true
+    } catch {
+        Warn "node download/install failed: $($_.Exception.Message)"
         return $false
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -405,18 +471,35 @@ if (-not $NoGui) {
     }
 }
 
-# Mesh daemon — see the block above Ensure-Mesh for the rules. Only the
-# desktop app talks to the daemon, so a CLI-only install skips it; a GUI
-# built from source bundles its own (gui's build.rs).
+# The headless node binary (allmystuff-serve) — what `allmystuff serve` runs.
+# Installed on every release install; a from-source CLI build skips it (it
+# links the media toolchain).
+$serveInstalled = $false
+if ($installedFromRelease) {
+    if (Try-ReleaseServe) {
+        $serveInstalled = $true
+    } else {
+        Warn "Node binary not installed; 'allmystuff serve' will print a hint until it is."
+    }
+} elseif ($DryRun) {
+    Log "(dry-run) would install the node binary ($serveAsset) next to allmystuff"
+} else {
+    Warn "Built the CLI from source; skipping the node binary (needs the media toolchain)."
+    Warn "Build it with:  cargo build --release --manifest-path node\Cargo.toml"
+}
+
+# Mesh daemon — see the block above Ensure-Mesh for the rules. Both the
+# desktop app *and* the headless node (`allmystuff serve`) run on it, so it's
+# installed whenever either is; a from-source build skips it.
 if ($NoMesh) {
     Log "Skipping the mesh daemon (-NoMesh)."
-} elseif ($NoGui) {
-    Log "CLI-only install; skipping the mesh daemon (only the desktop app uses it)."
-} elseif ($guiInstalled) {
+} elseif ($guiInstalled -or $serveInstalled) {
+    Ensure-Mesh
+} elseif ($DryRun) {
     Ensure-Mesh
 } else {
-    Log "Mesh: skipped — no desktop app was installed, and only the app uses the"
-    Log "daemon (a GUI built from gui\ bundles its own)."
+    Log "Mesh: skipped — neither the desktop app nor the node binary was"
+    Log "installed (only they use the daemon; scan/capabilities don't)."
 }
 
 if (-not $NoGui) {
@@ -430,5 +513,9 @@ if (-not $NoGui) {
     }
 } else {
     Log "Done. Try: allmystuff scan | allmystuff capabilities | allmystuff update"
+    if ($serveInstalled -or $DryRun) {
+        Log "Headless node: 'allmystuff serve' runs this machine on the mesh (no GUI)."
+        Log "On Windows, register it as a startup task (Task Scheduler) to keep it running."
+    }
 }
 Log "Open a new terminal so the updated PATH takes effect."

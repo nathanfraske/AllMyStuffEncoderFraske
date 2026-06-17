@@ -725,9 +725,8 @@ fn run_capture(
             }
         }
     }
-    let monitor = select_monitor(monitor_id).map_err(|e| {
+    let monitor = select_monitor(monitor_id).inspect_err(|e| {
         reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
-        e
     })?;
     run_oneshot_capture(
         stop,
@@ -765,6 +764,10 @@ const FIRST_FRAME_STALL: Duration = Duration::from_secs(5);
 /// the wait is the right behaviour, but a portal stream restored from
 /// a token can be silently dead on an awake desktop, and only the
 /// one-shot path (the Screenshot portal) still produces pixels there.
+///
+/// Linux-only: the sole caller is the Wayland capture arm, so the constant
+/// would be dead code elsewhere (and `-D warnings` rejects it on macOS/Windows).
+#[cfg(target_os = "linux")]
 const WAYLAND_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(8);
 
 /// Drain a session's frame channel into the encoder, paced to the target
