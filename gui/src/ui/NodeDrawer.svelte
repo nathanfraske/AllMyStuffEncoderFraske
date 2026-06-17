@@ -358,6 +358,16 @@
       </button>
     {/if}
 
+    <!-- Open a terminal to *this* machine — the same mesh-native terminal
+         UI, but the shell runs right here over a loopback route (no peer).
+         It's our own machine, so there's no support/ownership gate; only a
+         live backend is needed to carry it. -->
+    {#if node.kind === "this" && app.localTerminalAllowed}
+      <button class="btn console-open" onclick={() => app.openTerminal(node.id)}>
+        📟 Open Terminal
+      </button>
+    {/if}
+
     <!-- The local device's claim-mode toggle, given pride of place as a
          button (in the same slot + style the remote machines' buttons use)
          while this machine isn't yet in a fleet: an unowned device's most

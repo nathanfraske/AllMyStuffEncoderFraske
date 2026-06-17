@@ -1939,9 +1939,15 @@ class AppStore {
   // ---- terminal (the mesh-native shell) ----------------------------
 
   /** Whether `node` can host a terminal at all: it runs AllMyStuff and its
-   *  presence advertises the feature (an older build simply doesn't). */
+   *  presence advertises the feature (an older build simply doesn't). The
+   *  machine we're sitting at is always capable — the running binary *is* the
+   *  terminal host — and its own presence features aren't self-populated
+   *  (features arrive from peers), so check identity, not the advertised
+   *  list, for self. */
   terminalSupported(node: MeshNode | undefined): boolean {
-    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_TERMINAL);
+    if (!node) return false;
+    if (this.isMe(node.id)) return true;
+    return isAppNode(node) && (node.features ?? []).includes(FEATURE_TERMINAL);
   }
 
   /** The gate for "Open Terminal" — a mirror of the host's own rule
@@ -1949,31 +1955,50 @@ class AppStore {
    *  fleet member gets a shell. Deliberately *not* `relationship.kind`,
    *  which is a local label the user can set freely; this checks the same
    *  facts the far side will enforce, so the button never promises what
-   *  the host would refuse. */
+   *  the host would refuse. The machine we're sitting at is always allowed:
+   *  it's our own shell, opened over a loopback route (no peer). */
   terminalAllowed(node: MeshNode | undefined): boolean {
-    if (!node || this.isMe(node.id) || !this.terminalSupported(node)) return false;
+    if (!node) return false;
+    if (this.isMe(node.id)) return this.localTerminalAllowed;
+    if (!this.terminalSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
     return ownerIsMe || coFleet;
   }
 
-  /** Open a terminal on a remote machine. On the desktop this opens (or
-   *  focuses) the machine's dedicated terminal window — tabs inside it are
-   *  separate shells; the web preview keeps an in-page popover. */
+  /** Whether a terminal to *this* machine is offerable. The running binary
+   *  is the host, so the feature is always present and you always control
+   *  your own shell — the only requirement is a live backend (no backend,
+   *  nothing can flow). */
+  get localTerminalAllowed(): boolean {
+    return this.backendConnected;
+  }
+
+  /** Open a terminal on a machine. A remote machine gets a shell over the
+   *  mesh; *this* machine gets a local shell over a loopback route (no peer
+   *  — the same terminal UI, the same engine, a PTY right here). On the
+   *  desktop this opens (or focuses) the machine's dedicated terminal window
+   *  — tabs inside it are separate shells; the web preview keeps an in-page
+   *  popover. */
   openTerminal(nodeId: string) {
     const node = this.node(nodeId);
     if (!node) return;
     if (this.isMe(nodeId)) {
-      this.toast("warn", "That's this device");
-      return;
-    }
-    if (!this.terminalSupported(node)) {
-      this.toast("warn", `${node.label} doesn't support terminals (older AllMyStuff?)`);
-      return;
-    }
-    if (!this.terminalAllowed(node)) {
-      this.toast("warn", `Terminals are owner/fleet only — ${node.label} isn't yours`);
-      return;
+      // The local machine: it's our own shell, no support/ownership gate to
+      // mirror — just a live backend to carry it.
+      if (!this.localTerminalAllowed) {
+        this.toast("warn", "The local terminal needs the desktop app's backend");
+        return;
+      }
+    } else {
+      if (!this.terminalSupported(node)) {
+        this.toast("warn", `${node.label} doesn't support terminals (older AllMyStuff?)`);
+        return;
+      }
+      if (!this.terminalAllowed(node)) {
+        this.toast("warn", `Terminals are owner/fleet only — ${node.label} isn't yours`);
+        return;
+      }
     }
     if (isTauri()) {
       void openTerminalWindow(nodeId);
