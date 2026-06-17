@@ -68,6 +68,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The Opus bundled by `audiopus_sys` (via the `opus` crate) declares an
+    # ancient `cmake_minimum_required`, which CMake 4.x on the runners refuses
+    # outright. This shim re-enables the old policy floor for every CMake build
+    # in the job (Opus, and mozjpeg via nokhwa). Same fix the GUI backend and
+    # release jobs carry.
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,12 +83,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: node
+      # libgtk-3-dev + libwayland-dev aren't a webview dependency — they pull
+      # the X11 / XCB / Wayland system libs that the screen-capture (xcap) and
+      # input (enigo, xcb) crates link against. The GUI backend job gets these
+      # transitively through webkit/gtk; the headless node has to ask for them.
       - name: Linux media deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
-            libgbm-dev libudev-dev
+            libgbm-dev libudev-dev libgtk-3-dev libwayland-dev
       - name: rustfmt
         if: matrix.os == 'ubuntu-latest'
         working-directory: node
@@ -107,8 +118,13 @@ jobs:
     # verify the app compiles. build.rs stamps a stub so tauri-build's
     # externalBin check passes; the real bundle happens on dev / release
     # builds (and is exercised by `just dev`).
+    #
+    # CMAKE_POLICY_VERSION_MINIMUM re-enables the pre-3.5 policy floor that the
+    # Opus bundled by `audiopus_sys` (via the node engine's `opus` dep) needs —
+    # CMake 4.x on the runners rejects it otherwise.
     env:
       ALLMYSTUFF_SKIP_SIDECAR: "1"
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

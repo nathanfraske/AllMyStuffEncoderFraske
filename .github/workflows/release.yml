@@ -35,6 +35,11 @@ jobs:
           - { name: macos-x86_64,   os: macos-14,         target: x86_64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.platform.os }}
+    # The Opus bundled by `audiopus_sys` (via the node engine + GUI `opus` dep)
+    # declares a pre-3.5 `cmake_minimum_required` that CMake 4.x rejects; this
+    # shim re-enables the old policy floor for every CMake build in the job.
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
