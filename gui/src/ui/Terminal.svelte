@@ -76,39 +76,62 @@
   let unlistenSessions: (() => void) | null = null;
   let bellTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // ---- multi-attach session picker ------------------------------------
-  // The "Attach…" affordance: discover the host's open shells (its own, or
-  // a remote machine's over the mesh) and join one as a *shared* session.
+  // ---- "Other Terminals": join an already-open shell -------------------
+  // Discover shells already open on this host — started from another window
+  // of this machine, or by a fleet member — and join one as a *shared*
+  // session (tmux-style: same shell, same scrollback, same keyboard). The
+  // local host answers at once; a remote host answers over the mesh (the
+  // sessions event). The host's *full* list is the one source of truth; the
+  // menu and the per-tab "shared" badge are both derived from it.
 
   let pickerOpen = $state(false);
   let pickerLoading = $state(false);
-  let pickerSessions = $state<TerminalSessionInfo[]>([]);
-  // session id → live attacher count, learned from the picker list; the tab
-  // header reads it to badge a shared shell ("shared · N").
-  let attacherCounts = $state<Record<string, number>>({});
+  /** Every shell the host currently has open (its answer to our query) —
+   *  the single source for the menu and the shared-with badges. */
+  let hostSessions = $state<TerminalSessionInfo[]>([]);
 
-  function applySessions(list: TerminalSessionInfo[]) {
-    pickerSessions = list;
-    const counts: Record<string, number> = {};
-    for (const s of list) counts[s.session_id] = s.attachers;
-    attacherCounts = counts;
-    pickerLoading = false;
+  /** session id → live attacher count, from the host's list. */
+  const attacherCounts = $derived.by(() => {
+    const m: Record<string, number> = {};
+    for (const s of hostSessions) m[s.session_id] = s.attachers;
+    return m;
+  });
+
+  /** The session ids this window already shows as live tabs — so the menu
+   *  can leave them out and list only the *other* terminals. */
+  const mySessionIds = $derived.by(() => {
+    const ids = new Set<string>();
+    for (const t of tabs) {
+      const sid = t.routeId ? app.routeSessions[t.routeId] : undefined;
+      if (sid) ids.add(sid);
+    }
+    return ids;
+  });
+
+  /** What the menu lists: the host's open shells minus the ones this very
+   *  window already shows — the genuinely *other* terminals to join. */
+  const otherSessions = $derived(hostSessions.filter((s) => !mySessionIds.has(s.session_id)));
+
+  /** Pull the host's open shells into {@link hostSessions}. The local host
+   *  answers synchronously (and is authoritative — an empty answer means it
+   *  truly has none, so we clear); a remote host returns nothing here and
+   *  answers asynchronously on the sessions event, so an empty remote answer
+   *  leaves the last event-delivered list in place. */
+  async function refreshHostSessions() {
+    const list = await app.listTerminalSessions(host);
+    if (list.length || app.isMe(host)) hostSessions = list;
   }
 
-  /** Toggle the picker; on open, (re)query the host's sessions. Local hosts
-   *  answer at once; a remote host's reply lands on the sessions event. */
+  /** Toggle the menu; on open, (re)query the host's open shells. */
   async function togglePicker() {
     pickerOpen = !pickerOpen;
     if (!pickerOpen) return;
     pickerLoading = true;
-    pickerSessions = [];
-    const list = await app.listTerminalSessions(host);
-    // A non-empty list is the local (synchronous) answer; an empty one may
-    // just mean a remote reply is still in flight — the event fills it in.
-    applySessions(list);
+    await refreshHostSessions();
+    pickerLoading = false;
   }
 
-  /** Attach a new tab to a discovered shared session, then close the picker. */
+  /** Join one of the host's other shells in a new tab, then close the menu. */
   function attachTo(session: TerminalSessionInfo) {
     newTab(session.session_id);
     pickerOpen = false;
@@ -123,8 +146,7 @@
     return `${Math.floor(secs / 86400)}d`;
   }
 
-  /** Live attacher count for a tab's session (from the snapshot's resolved id
-   *  + the last picker query), or 0 when unknown. */
+  /** Live attacher count for a tab's shared session, or 0 when solo/unknown. */
   function tabAttachers(t: TabMeta): number {
     if (!t.routeId) return 0;
     const sid = app.routeSessions[t.routeId];
@@ -515,19 +537,18 @@
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
     // A remote host's answer to a sessions query (and its own pushes after a
-    // tab attaches/detaches) — fills the picker and keeps the "shared · N"
-    // badge live for our open tabs.
+    // tab attaches/detaches) — feeds the one source of truth, which keeps the
+    // open menu and the "shared · N" badges live.
     void onTerminalSessions((ev) => {
-      if (app.isSameMachine(ev.from, host)) applySessions(ev.sessions);
+      if (app.isSameMachine(ev.from, host)) hostSessions = ev.sessions;
     }).then((u) => (unlistenSessions = u));
-    // Keep the shared-attacher badge current while tabs are live: re-query
-    // the host on a slow cadence (the count changes only when someone
-    // attaches/detaches, so this is cheap and off any hot path).
+    // Keep the list current on a slow cadence — while the menu is open (so a
+    // shell another window/peer just opened shows up) or whenever a tab is on
+    // a known session (so its shared badge stays live). The count only moves
+    // when someone attaches/detaches, so this is cheap and off any hot path.
     const countPoll = setInterval(() => {
-      if (tabs.some((t) => t.routeId && app.routeSessions[t.routeId])) {
-        void app.listTerminalSessions(host).then((list) => {
-          if (list.length) applySessions(list);
-        });
+      if (pickerOpen || tabs.some((t) => t.routeId && app.routeSessions[t.routeId])) {
+        void refreshHostSessions();
       }
     }, 4000);
     return () => {
@@ -593,28 +614,42 @@
             <button
               class="tab-attach"
               class:open={pickerOpen}
-              title="Attach to an existing shell on this machine"
+              title="Join a shell already open on {displayName(node)} (shared, tmux-style)"
               aria-expanded={pickerOpen}
-              onclick={() => void togglePicker()}>⇲ Attach</button
+              onclick={() => void togglePicker()}
             >
+              👥 Other Terminals{#if otherSessions.length > 0}<span class="attach-count"
+                  >{otherSessions.length}</span
+                >{/if}
+            </button>
             {#if pickerOpen}
               <!-- Click-away backdrop, then the menu above it. -->
               <button
                 class="picker-scrim"
-                aria-label="Close session picker"
+                aria-label="Close the other-terminals menu"
                 onclick={() => (pickerOpen = false)}
               ></button>
-              <div class="picker-menu" role="menu" aria-label="Open terminal sessions">
-                <div class="picker-head">Open sessions on {displayName(node)}</div>
+              <div class="picker-menu" role="menu" aria-label="Other open terminals">
+                <div class="picker-head">Other shells open on {displayName(node)}</div>
                 {#if pickerLoading}
                   <div class="picker-empty">Looking…</div>
-                {:else if pickerSessions.length === 0}
+                {:else if otherSessions.length === 0}
                   <div class="picker-empty">
-                    No open shells here yet. Use ＋ to start one — then it shows up here for another
-                    window (or fleet member) to attach to.
+                    {#if hostSessions.length > 0}
+                      Every shell open here is already a tab in this window. Open another window — or
+                      have a fleet member open one — and it'll show up here to join.
+                    {:else if app.isMe(host)}
+                      No other shells open on this machine yet. Open one from another terminal window
+                      (here or from a fleet member) and it'll appear here — joining shares the shell,
+                      its scrollback and its keyboard.
+                    {:else}
+                      No other shells open on {displayName(node)} yet — or it's running an older
+                      AllMyStuff that can't share them. Shells started there (by its owner or a fleet
+                      member) show up here to join.
+                    {/if}
                   </div>
                 {:else}
-                  {#each pickerSessions as s (s.session_id)}
+                  {#each otherSessions as s (s.session_id)}
                     <button class="picker-row" role="menuitem" onclick={() => attachTo(s)}>
                       <span class="picker-title">{s.title}</span>
                       <span class="picker-meta">
@@ -868,6 +903,9 @@
     flex-shrink: 0;
   }
   .tab-attach {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
     border: 1px solid #494173;
     background: none;
     color: #b9b2d6;
@@ -883,6 +921,14 @@
     color: #efecfb;
     border-color: #6f64ab;
     background: #2a2548;
+  }
+  .attach-count {
+    font-size: 0.62rem;
+    color: #9fd3ff;
+    background: #21344a;
+    border-radius: 5px;
+    padding: 0 0.26rem;
+    line-height: 1.4;
   }
   .picker-scrim {
     position: fixed;
