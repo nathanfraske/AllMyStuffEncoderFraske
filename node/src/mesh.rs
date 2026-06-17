@@ -2491,7 +2491,15 @@ impl Mesh {
                 }
             }
             MediaKind::Generic if is_terminal_route(route) => {
-                if from_node == me && to_node != me {
+                if from_node == me && to_node == me {
+                    // Loopback: a terminal to the machine we're sitting at.
+                    // We're both shell *and* viewer — there's no peer to
+                    // negotiate frames with, so the PTY's output goes
+                    // straight into the local viewer queue (the same one the
+                    // remote path enqueues into), and the window drains it
+                    // exactly as it would a remote session.
+                    self.start_terminal_loopback(route);
+                } else if from_node == me && to_node != me {
                     // We're the shell end: spawn a PTY and pump it to the
                     // viewer (after re-clearing the owner/fleet gate).
                     self.start_terminal_host(route);
@@ -2886,6 +2894,89 @@ impl Mesh {
         }
     }
 
+    /// A **loopback** terminal route going active: a terminal to the very
+    /// machine we're sitting at, where this node is both shell *and* viewer.
+    /// There's no peer, so instead of framing the PTY's output onto the mesh
+    /// we feed it straight into the local viewer queue (the same one the
+    /// remote viewer path enqueues into) and poke the window — the Terminal
+    /// UI can't tell a loopback session from a remote one. Keystrokes and
+    /// resizes from the window short-circuit to `terminal.write/resize`
+    /// locally (see [`Self::term_send`]). The owner/fleet gate is re-cleared
+    /// for consistency with the remote host path — it's our own machine, so
+    /// it passes.
+    fn start_terminal_loopback(self: &Arc<Self>, route: &Route) {
+        let rid = route.id.clone();
+        // The peer here is ourselves; the gate must still pass (owner or a
+        // fleet member always controls their own machine), and re-running it
+        // keeps the loopback path honest with the remote one.
+        let peer = self
+            .route_peer(&rid)
+            .unwrap_or_else(|| node_of(route.to.as_str()));
+        if !self.sender_may_control(&peer) {
+            tracing::warn!(
+                "route {rid} — local terminal refused (not owner/fleet of this machine)"
+            );
+            let mesh = self.clone();
+            crate::spawn(async move {
+                let _ = mesh.disconnect(rid).await;
+            });
+            return;
+        }
+        // Buffer output from the very first byte — the shell's prompt is
+        // produced right after Accept, before the window has subscribed, and
+        // a dropped terminal byte never heals.
+        self.terminal.ensure_queue(&rid);
+        match self.terminal.spawn(&rid) {
+            Ok(mut out_rx) => {
+                tracing::info!("route {rid} active — local terminal on this machine");
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    while let Some(msg) = out_rx.recv().await {
+                        match msg {
+                            OutMsg::Data(bytes) => {
+                                // Straight into the local viewer queue. A
+                                // queue going empty → non-empty is the cue to
+                                // poke the window, exactly as the inbound
+                                // remote viewer path does.
+                                if mesh.terminal.enqueue(&rid, bytes) {
+                                    mesh.sink.emit("allmystuff://term-ready", json!(rid));
+                                }
+                            }
+                            OutMsg::Exit(code) => {
+                                tracing::info!("local terminal {rid} — shell ended ({code:?})");
+                                mesh.sink.emit(
+                                    "allmystuff://term-exit",
+                                    json!({ "route": rid, "code": code }),
+                                );
+                                let _ = mesh.disconnect(rid.clone()).await;
+                                return;
+                            }
+                        }
+                    }
+                    // Stream closed without an Exit: `stop` ran (teardown
+                    // already in motion) — nothing left to do.
+                });
+            }
+            Err(e) => {
+                // Render the failure to the window in its own terms — a line
+                // of text, then the exit — then tear the route down.
+                tracing::warn!("route {rid} — local shell didn't start: {e}");
+                let note = format!("[couldn't start a shell here: {e}]\r\n");
+                if self.terminal.enqueue(&rid, note.into_bytes()) {
+                    self.sink.emit("allmystuff://term-ready", json!(rid));
+                }
+                self.sink.emit(
+                    "allmystuff://term-exit",
+                    json!({ "route": rid, "code": serde_json::Value::Null }),
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    let _ = mesh.disconnect(rid).await;
+                });
+            }
+        }
+    }
+
     /// One inbound terminal frame. Which side we are comes from the route
     /// itself: keystrokes/resizes landing on the *host* (the route sources
     /// here) clear the same two gates as input injection — live route from
@@ -2968,7 +3059,7 @@ impl Mesh {
         event: TermEvent,
     ) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
-        let peer = {
+        let (peer, loopback) = {
             let st = self.state.lock();
             let r = st
                 .session
@@ -2979,8 +3070,28 @@ impl Mesh {
             {
                 return Err("route isn't an active terminal session here".into());
             }
-            r.peer.to_string()
+            // A terminal to this very machine has no peer to frame to: the
+            // shell is hosted right here, so input/resize go straight to the
+            // local PTY rather than out over the mesh.
+            let loopback = node_of(r.route.from.as_str()) == me;
+            (r.peer.to_string(), loopback)
         };
+        if loopback {
+            match event {
+                TermEvent::Data { bytes } => {
+                    let _ = self.terminal.write(&route_id, bytes);
+                    return Ok(());
+                }
+                TermEvent::Resize { cols, rows } => {
+                    let _ = self.terminal.resize(&route_id, cols, rows);
+                    return Ok(());
+                }
+                TermEvent::Exit { .. } => {
+                    return Err("exit is reported by the host, not sent".into())
+                }
+                TermEvent::Unknown => return Err("unknown terminal event".into()),
+            }
+        }
         match event {
             TermEvent::Data { bytes } => {
                 // A paste can be arbitrarily large: chunk to the channel
@@ -4853,6 +4964,42 @@ mod tests {
         // (the media is part of the contract, not just the suffix).
         let display = term_route("host:terminal", "me:term-view:1", MediaKind::Display);
         assert!(!is_terminal_route(&display));
+    }
+
+    #[test]
+    fn loopback_terminal_route_is_recognized_as_self_hosted() {
+        // The id the front-end mints for "open a terminal to the machine I'm
+        // sitting at": both endpoints are this node, source is `…:terminal`.
+        let me = "me";
+        let route = term_route(
+            &format!("{me}:terminal"),
+            &format!("{me}:term-view:1"),
+            MediaKind::Generic,
+        );
+        // It's a terminal route…
+        assert!(is_terminal_route(&route));
+        // …and the loopback predicate the new branch keys on (both ends are
+        // this node) holds — so `start_media` takes the loopback path and
+        // `term_send` short-circuits input/resize to the local PTY rather
+        // than framing it to a peer.
+        let from_node = node_of(route.from.as_str());
+        let to_node = node_of(route.to.as_str());
+        assert_eq!(from_node, me);
+        assert_eq!(to_node, me);
+        assert!(
+            from_node == me && to_node == me,
+            "a self-terminal is a loopback route"
+        );
+
+        // A remote terminal (viewer here, shell elsewhere) is NOT loopback —
+        // it keeps the framed-to-peer path.
+        let remote = term_route(
+            "host:terminal",
+            &format!("{me}:term-view:2"),
+            MediaKind::Generic,
+        );
+        assert!(is_terminal_route(&remote));
+        assert_ne!(node_of(remote.from.as_str()), node_of(remote.to.as_str()));
     }
 
     #[test]
