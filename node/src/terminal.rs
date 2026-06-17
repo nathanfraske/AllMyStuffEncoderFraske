@@ -224,8 +224,21 @@ impl TerminalHost {
         if let Some(sid) = session_id {
             let mut sessions = self.sessions.lock();
             if let Some(s) = sessions.get_mut(sid) {
-                s.attachers
-                    .insert(route_id.to_string(), Attacher { cols, rows });
+                // Join at the shell's *current* size, not this viewer's 80×24
+                // placeholder. The caller passes a placeholder size on attach
+                // (the real one arrives moments later via `resize`); folding it
+                // into the reconcile straight away would shrink the shared PTY
+                // to 80×24 for *everyone* until then — a wrong-width flash on
+                // the tabs already attached. Inheriting the current reconciled
+                // size leaves the PTY untouched until the real resize lands.
+                let (cur_cols, cur_rows) = reconcile_size(&s.attachers);
+                s.attachers.insert(
+                    route_id.to_string(),
+                    Attacher {
+                        cols: cur_cols,
+                        rows: cur_rows,
+                    },
+                );
                 // Snapshot and subscribe under the scrollback guard so the
                 // split is consistent: snapshot = everything broadcast
                 // before, rx = everything broadcast after.
@@ -1083,14 +1096,18 @@ mod tests {
     fn resize_reconciles_to_min() {
         ensure_runtime();
         let host = TerminalHost::new();
-        // A at 100x40, B at 80x50 → reconciled to 80 cols, 40 rows.
+        // A creates the shell at 100x40. B *attaches* — it joins at the
+        // shell's current size (no shrink: production passes a placeholder
+        // here, the real size arrives via `resize`), then B's real 80x50
+        // reconciles the shared PTY to 80 cols, 40 rows (the min each shows).
         let _a = host
             .open_with(Some("rz1"), "rA", 100, 40, sh("read line; stty size"))
             .unwrap();
         let b = host
-            .open_with(Some("rz1"), "rB", 80, 50, sh("unused"))
+            .open_with(Some("rz1"), "rB", 80, 24, sh("unused"))
             .unwrap();
         let mut rxb = b.rx;
+        assert!(host.resize("rB", 80, 50), "B's real size arrives");
         std::thread::sleep(Duration::from_millis(150));
         // Newline releases the `read`, then stty prints the reconciled size.
         assert!(host.write("rB", b"\n".to_vec()));
@@ -1100,6 +1117,32 @@ mod tests {
             "reconciled stty size 40 80",
         );
         host.close("rz1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_does_not_shrink_to_the_joiners_placeholder() {
+        ensure_runtime();
+        let host = TerminalHost::new();
+        // A creates the shell at 100x40.
+        let a = host
+            .open_with(Some("sz"), "rA", 100, 40, sh("read line; stty size"))
+            .unwrap();
+        let mut rxa = a.rx;
+        // B joins with the 80x24 placeholder the host always passes on attach
+        // (B's real size arrives later via `resize`). The shared PTY must stay
+        // 100x40 — a placeholder attach must not shrink it for A.
+        let _b = host
+            .open_with(Some("sz"), "rB", 80, 24, sh("unused"))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(host.write("rA", b"\n".to_vec()));
+        bcast_read_until(
+            &mut rxa,
+            |x| String::from_utf8_lossy(x).contains("40 100"),
+            "PTY stays 100x40 after a placeholder attach (no shrink)",
+        );
+        host.close("sz");
     }
 
     #[cfg(unix)]
