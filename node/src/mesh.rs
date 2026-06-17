@@ -361,7 +361,7 @@ impl Mesh {
     fn spawn_media_forwarders(self: &Arc<Self>) {
         if let Some(mut audio_rx) = self.audio_rx.lock().take() {
             let mesh = self.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some(out) = audio_rx.recv().await {
                     let (peer, result) = match out {
@@ -389,7 +389,7 @@ impl Mesh {
         }
         if let Some(mut video_rx) = self.video_rx.lock().take() {
             let mesh = self.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
                 while let Some((peer, route_id, packet)) = video_rx.recv().await {
                     let outcome = match packet {
@@ -528,6 +528,13 @@ impl Mesh {
     /// Bring the session online: identify, pick a network, subscribe, and
     /// start pumping events. Safe to call once the daemon socket is up.
     pub async fn start(self: Arc<Self>) {
+        // Register the runtime we're on so the engine can spawn from any
+        // thread — capture/audio callbacks run on their own OS threads, where
+        // a bare `tokio::spawn` panics ("no reactor running"). All engine
+        // spawns go through `crate::spawn`, which uses this handle. Set first,
+        // before anything (the forwarders below) spawns.
+        crate::set_runtime(tokio::runtime::Handle::current());
+
         // Spawn the media forwarders now that we're on a runtime (see
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
         self.spawn_media_forwarders();
@@ -603,7 +610,7 @@ impl Mesh {
 
         // Event loop.
         let mesh = self.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             while let Some(value) = rx.recv().await {
                 mesh.handle_value(value).await;
             }
@@ -620,7 +627,7 @@ impl Mesh {
     fn spawn_inventory_watch(self: &Arc<Self>) {
         const INVENTORY_RESCAN: std::time::Duration = std::time::Duration::from_secs(10);
         let mesh = Arc::downgrade(self);
-        tokio::spawn(async move {
+        crate::spawn(async move {
             loop {
                 tokio::time::sleep(INVENTORY_RESCAN).await;
                 let Some(mesh) = mesh.upgrade() else {
@@ -911,7 +918,7 @@ impl Mesh {
                         if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
                             let mesh = self.clone();
                             let device = device.to_string();
-                            tokio::spawn(async move {
+                            crate::spawn(async move {
                                 mesh.ownership_check(Some(&device)).await;
                             });
                         }
@@ -1367,7 +1374,7 @@ impl Mesh {
                     // out the periodic IDR (rate-limited inside).
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
-                        tokio::spawn(async move {
+                        crate::spawn(async move {
                             let _ = mesh.request_refresh(rid).await;
                         });
                     }
@@ -1714,7 +1721,7 @@ impl Mesh {
                 // confirmation, and the button it pressed disappears when the
                 // upgrade lands — exactly how a claim confirms by re-advert.
                 let sink = self.sink.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     match allmystuff_updater::update_now().await {
                         Ok(allmystuff_updater::UpdateNowOutcome::Updated { to, components }) => {
                             tracing::info!(
@@ -2751,7 +2758,7 @@ impl Mesh {
                 };
                 let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
                 let peer = status_peer.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let Ok(payload) = serde_json::to_value(&frame) else {
                         return;
                     };
@@ -2778,7 +2785,7 @@ impl Mesh {
                 short_id(&peer)
             );
             let mesh = self.clone();
-            tokio::spawn(async move {
+            crate::spawn(async move {
                 let _ = mesh.disconnect(rid).await;
             });
             return;
@@ -2790,7 +2797,7 @@ impl Mesh {
                     short_id(&peer)
                 );
                 let mesh = self.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let mut seq: u64 = 0;
                     let mut last_ok = std::time::Instant::now();
                     let mut last_warn = std::time::Instant::now() - WARN_EVERY;
@@ -2851,7 +2858,7 @@ impl Mesh {
                 // tear the route down.
                 tracing::warn!("route {rid} — shell didn't start: {e}");
                 let mesh = self.clone();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let note = format!("[couldn't start a shell here: {e}]\r\n");
                     for frame in [
                         TermFrame::new(
@@ -3134,7 +3141,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer = peer.to_string();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
                 let frame = FileFrame::new(&rid, seq, ev);
@@ -3153,7 +3160,7 @@ impl Mesh {
     /// viewer, fire-and-forget.
     fn send_file_event(self: &Arc<Self>, route_id: String, peer: String, event: FileEvent) {
         let mesh = self.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let seq = mesh.file_seq.fetch_add(1, Ordering::Relaxed);
             let frame = FileFrame::new(&route_id, seq, event);
             if let Ok(payload) = serde_json::to_value(&frame) {
@@ -3299,7 +3306,7 @@ impl Mesh {
                 // reply to the asking machine.
                 let mesh = self.clone();
                 let peer = from.to_string();
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     let scan = mesh.clone();
                     let Ok((services, exposed)) = tokio::task::spawn_blocking(move || {
                         let services = scan
@@ -3454,7 +3461,7 @@ impl Mesh {
         listener: tokio::net::TcpListener,
     ) -> tokio::task::JoinHandle<()> {
         let mesh = self.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             // Wait for the host to accept before taking connections — until
             // the route is active a tunnel's `Open` would be dropped, leaving
             // a connecting client hung. (Pending TCP connections sit in the
@@ -3539,7 +3546,7 @@ impl Mesh {
         // the write half so the local client sees a clean close. It drains
         // any bytes that were buffered before the socket was wired.
         let mut rx = rx;
-        tokio::spawn(async move {
+        crate::spawn(async move {
             while let Some(bytes) = rx.recv().await {
                 if write_half.write_all(&bytes).await.is_err() {
                     break;
@@ -3554,7 +3561,7 @@ impl Mesh {
         let mesh = self.clone();
         let rid = route_id.to_string();
         let peer_s = peer.to_string();
-        let reader = tokio::spawn(async move {
+        let reader = crate::spawn(async move {
             if let Some(port) = open_port {
                 mesh.send_site_event(&peer_s, &rid, SiteEvent::Open { conn, port })
                     .await;
@@ -3662,7 +3669,7 @@ impl Mesh {
                         None => {
                             let mesh = self.clone();
                             let (route, peer) = (frame.route.clone(), from.to_string());
-                            tokio::spawn(async move {
+                            crate::spawn(async move {
                                 mesh.send_site_event(&peer, &route, SiteEvent::Close { conn })
                                     .await;
                             });
@@ -3717,7 +3724,7 @@ impl Mesh {
     ) {
         use std::net::{Ipv4Addr, SocketAddr};
         let mesh = self.clone();
-        tokio::spawn(async move {
+        crate::spawn(async move {
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             match tokio::net::TcpStream::connect(addr).await {
                 Ok(socket) => {
@@ -4795,6 +4802,34 @@ mod tests {
     fn new_does_not_require_a_running_tokio_runtime() {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let _mesh = Mesh::new(client, Arc::new(NoopSink));
+    }
+
+    /// Regression guard for the screen/audio outage: the engine fires tasks
+    /// from capture/audio OS threads (e.g. the DXGI status callback), where a
+    /// bare `tokio::spawn` panics with "no reactor running". Every engine spawn
+    /// goes through [`crate::spawn`], which must work off-runtime via the handle
+    /// `start` registers. Spawn from a plain `std::thread` (no ambient runtime)
+    /// and confirm the task actually runs.
+    #[test]
+    fn engine_spawn_runs_tasks_from_a_non_runtime_thread() {
+        let rt = tokio::runtime::Runtime::new().expect("build runtime");
+        crate::set_runtime(rt.handle().clone());
+        // Keep the runtime (and the registered handle) alive for the process —
+        // OnceLock holds the handle, and this is the only test that sets it.
+        std::mem::forget(rt);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // No ambient runtime here — `tokio::spawn` would panic.
+            crate::spawn(async move {
+                let _ = tx.send(());
+            });
+        })
+        .join()
+        .unwrap();
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned task should run on the registered runtime");
     }
 
     #[test]
