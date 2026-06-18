@@ -502,7 +502,11 @@ fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
     }
     // Sibling of the running binary — the layout the installer drops the
     // whole trio in.
-    if let Some(sibling) = current.as_ref().and_then(|c| c.parent()).map(|d| d.join(kind.bin_name())) {
+    if let Some(sibling) = current
+        .as_ref()
+        .and_then(|c| c.parent())
+        .map(|d| d.join(kind.bin_name()))
+    {
         if sibling.exists() {
             return Some(sibling);
         }
@@ -946,8 +950,8 @@ async fn stage_release(
         // (older release) or a transient download error logs and continues so
         // a sibling hiccup never blocks the CLI update.
         let staged_one = async {
-            let asset = asset
-                .ok_or_else(|| Error::msg(format!("release has no asset {asset_name}")))?;
+            let asset =
+                asset.ok_or_else(|| Error::msg(format!("release has no asset {asset_name}")))?;
             let url = asset["browser_download_url"]
                 .as_str()
                 .ok_or_else(|| Error::msg("asset missing download url"))?;
@@ -1192,7 +1196,10 @@ mod tests {
         // regression that dropped it is exactly what left "updated" machines
         // advertising the old version. All three stems/binaries are distinct.
         let stems: Vec<_> = ALL_ARTIFACTS.iter().map(|k| k.asset_stem()).collect();
-        assert_eq!(stems, vec!["allmystuff", "allmystuff-gui", "allmystuff-serve"]);
+        assert_eq!(
+            stems,
+            vec!["allmystuff", "allmystuff-gui", "allmystuff-serve"]
+        );
         assert!(ALL_ARTIFACTS.contains(&ArtifactKind::Serve));
 
         let serve = platform_asset(ArtifactKind::Serve.asset_stem());
