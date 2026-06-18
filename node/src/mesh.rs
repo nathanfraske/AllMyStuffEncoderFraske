@@ -976,14 +976,15 @@ impl Mesh {
         match channel {
             CHANNEL_PRESENCE => {
                 if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
-                    // A boot id we haven't recorded for this peer means its
-                    // app just (re)started and missed our adverts — answer
-                    // with our presence + roster directly. This (plus the
-                    // connection-approved trigger) is what replaced the
-                    // periodic re-broadcast; the reply can't loop because
-                    // the peer then knows our boot id and stays quiet.
-                    // `boot == 0` is an older heartbeating peer: no reply
-                    // needed. Our own echo never replies to itself.
+                    // We answer a peer's presence with our own (+ roster) when
+                    // either it's the first we've heard of them this session or
+                    // their app just (re)started — so the bootstrap is mutual
+                    // even when our earlier advert raced their subscription and
+                    // was dropped. This (plus the connection-approved trigger)
+                    // is what replaced the periodic re-broadcast; the reply
+                    // can't loop because once we each hold the other's presence
+                    // neither condition fires again. `boot == 0` is an older
+                    // heartbeating peer. Our own echo never replies to itself.
                     let canon = pubkey_part(profile.node.as_str()).to_string();
                     self.state
                         .lock()
@@ -996,6 +997,18 @@ impl Mesh {
                         let mut st = self.state.lock();
                         st.peer_boots.insert(canon, profile.boot) != Some(profile.boot)
                     };
+                    // Whether this peer's presence was already on file *before*
+                    // we fold in this advert. A peer we don't yet know gets an
+                    // answer regardless of boot id, so a single dropped first
+                    // reply self-heals on their next frame instead of waiting
+                    // for a manual network refresh.
+                    let node_id = profile.node.clone();
+                    let known = {
+                        let st = self.state.lock();
+                        st.session
+                            .as_ref()
+                            .is_some_and(|s| s.peer(&node_id).is_some())
+                    };
                     let changed = {
                         let mut st = self.state.lock();
                         st.session
@@ -1003,10 +1016,15 @@ impl Mesh {
                             .map(|s| s.apply_presence(profile))
                             .unwrap_or(false)
                     };
-                    if new_boot {
+                    if new_boot || (!is_self && !known) {
                         tracing::info!(
-                            "peer {} (re)started — answering with our presence + roster",
-                            short_id(&from)
+                            "peer {} {} — answering with our presence + roster",
+                            short_id(&from),
+                            if new_boot {
+                                "(re)started"
+                            } else {
+                                "is new to us"
+                            }
                         );
                         self.ownership_check(Some(&from)).await;
                     }
