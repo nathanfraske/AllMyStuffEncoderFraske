@@ -122,6 +122,17 @@ impl MediaKind {
             MediaKind::Generic => "data",
         }
     }
+
+    /// The stable wire token (the serde snake_case form) — `generic`, not the
+    /// display `data` that [`MediaKind::label`] returns. Used in the
+    /// content-derived grant id, which must match the TypeScript mirror in
+    /// `gui/src/catalog.ts` byte-for-byte.
+    pub fn token(self) -> &'static str {
+        match self {
+            MediaKind::Generic => "generic",
+            other => other.label(),
+        }
+    }
 }
 
 /// Which way a capability can move its media.
@@ -225,6 +236,17 @@ impl GrantRole {
     pub fn allows_sink(self) -> bool {
         matches!(self, GrantRole::Consume | GrantRole::Both)
     }
+
+    /// The stable lower-case word for this role (the serde wire form) —
+    /// used in human text and in the content-derived grant id. Matches the
+    /// `"provide" | "consume" | "both"` union in `gui/src/catalog.ts`.
+    pub fn label(self) -> &'static str {
+        match self {
+            GrantRole::Provide => "provide",
+            GrantRole::Consume => "consume",
+            GrantRole::Both => "both",
+        }
+    }
 }
 
 /// A single scoped authorization on a share — "Alex may receive my
@@ -245,6 +267,49 @@ pub struct Grant {
 }
 
 impl Grant {
+    /// The **content-derived** id for a grant of this scope in `person`'s
+    /// share — `grant:{person}:{media}:{role}:{capability|*}`. Two
+    /// structurally identical grants therefore collapse to one id (the same
+    /// de-dupe the GUI does by `(media, role, capability)`), and the id is
+    /// **stable across a restart and identical on both peers**, so a persisted
+    /// grant reloads to the same id and a revoke can name a grant both ends
+    /// recompute. Mirrors `scopedGrantId` in `gui/src/catalog.ts` — the
+    /// formats must stay byte-for-byte identical.
+    pub fn id_for(
+        person: &PersonId,
+        media: MediaKind,
+        role: GrantRole,
+        capability: Option<&CapabilityId>,
+    ) -> String {
+        let cap = capability.map(CapabilityId::as_str).unwrap_or("*");
+        format!(
+            "grant:{}:{}:{}:{}",
+            person.as_str(),
+            media.token(),
+            role.label(),
+            cap
+        )
+    }
+
+    /// Build a grant whose [`Grant::id`] is derived from its scope rather than
+    /// minted at random — see [`Grant::id_for`]. The single way grants should
+    /// be created so persistence, de-dupe, and revoke-by-id all agree.
+    pub fn scoped(
+        person: &PersonId,
+        media: MediaKind,
+        role: GrantRole,
+        capability: Option<CapabilityId>,
+        label: impl Into<String>,
+    ) -> Grant {
+        Grant {
+            id: Grant::id_for(person, media, role, capability.as_ref()),
+            media,
+            role,
+            capability,
+            label: label.into(),
+        }
+    }
+
     /// Does this grant authorize a shared endpoint to act in `role` for
     /// `media` on `capability`?
     pub fn permits(&self, media: MediaKind, role: GrantRole, capability: &CapabilityId) -> bool {
