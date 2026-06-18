@@ -78,11 +78,13 @@ export interface MeshNode {
    *  or this machine's own scan). Not part of the Rust `MeshNode` — the GUI
    *  carries it alongside for display. */
   summary?: InventorySummary;
-  /** `true` once we've heard this node's AllMyStuff presence advert — i.e.
-   *  it's actually *running AllMyStuff*, not just a device on the mesh. A
-   *  node that's only known from the daemon's roster/peers (no app) has no
-   *  wireable capabilities, so the graph shows it but makes it un-targetable
-   *  and visually quieter. The local machine is always an app node. */
+  /** `true` once we know this node is *running AllMyStuff*, not just a device
+   *  on the mesh — set from the reliable mesh capability marker
+   *  (`CAP_TAG_ALLMYSTUFF`, off the daemon peer list) or its AllMyStuff
+   *  presence advert. A node known only as a bare daemon device (no marker, no
+   *  presence) has no wireable capabilities, so the graph shows it but makes
+   *  it un-targetable and visually quieter. The local machine is always an
+   *  app node. */
   app?: boolean;
   /** The node id that owns this device, from its presence advert. `owner`
    *  equal to the local node means the device says *you* own it. */
@@ -107,6 +109,12 @@ export interface MeshNode {
    *  the graph shows which — it's never just "the" mesh. */
   networks?: string[];
 }
+
+/** The mesh capability tag that marks a node as a real AllMyStuff app node
+ *  (mirrors the Rust `CAP_TAG_ALLMYSTUFF`). Carried on the reliable mesh
+ *  capability advert / daemon peer list, so `app` flips on from the polled
+ *  peer view even when a presence advert is dropped. */
+export const CAP_TAG_ALLMYSTUFF = "allmystuff";
 
 /** The presence feature tag for mesh-native terminal hosting (mirrors the
  *  Rust `FEATURE_TERMINAL`). */
@@ -308,6 +316,11 @@ export interface PeerInfo {
   verification_code_sent?: string | null;
   local_approve_sent?: boolean;
   remote_approve_seen?: boolean;
+  /** The peer's mesh capability advert, exchanged in the handshake and
+   *  carried in the peer list (reliable, unlike the bespoke presence advert).
+   *  The `allmystuff` tag (CAP_TAG_ALLMYSTUFF) marks it as an app node; the
+   *  remaining tags are its advertised features. `app_version` is its build. */
+  capabilities?: { tags?: string[]; app_version?: string | null } | null;
 }
 
 // ---- owned fleet (the gossiped "Owned" roster) ------------------------
