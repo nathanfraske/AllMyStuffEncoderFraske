@@ -869,6 +869,38 @@ impl Mesh {
         }
     }
 
+    /// Advertise an AllMyStuff marker (plus this build's features and version)
+    /// on the **mesh** capability matrix, so every peer learns through the
+    /// reliable handshake + peer-list that this is an app node — not a bare
+    /// `myownmesh` daemon — independent of the bespoke presence broadcast. The
+    /// receiver flips a peer to "on AllMyStuff" off its polled peer view, so a
+    /// dropped presence advert no longer leaves a connected peer mesh-only.
+    /// Idempotent: `CapabilitiesSet` replaces the advertised matrix, so
+    /// re-running it on each network sync is cheap.
+    async fn advertise_capabilities(&self) {
+        let (networks, profile) = {
+            let st = self.state.lock();
+            (st.networks.clone(), st.profile.clone())
+        };
+        let mut tags = vec![allmystuff_protocol::CAP_TAG_ALLMYSTUFF.to_string()];
+        if let Some(p) = &profile {
+            tags.extend(p.features.iter().cloned());
+        }
+        let capabilities = json!({
+            "tags": tags,
+            "app_version": env!("CARGO_PKG_VERSION"),
+        });
+        for network in networks {
+            let _ = self
+                .client
+                .request(&Request::CapabilitiesSet {
+                    network,
+                    capabilities: capabilities.clone(),
+                })
+                .await;
+        }
+    }
+
     async fn broadcast_presence(&self) {
         let (networks, profile) = {
             let st = self.state.lock();
@@ -2285,6 +2317,7 @@ impl Mesh {
             st.network = primary.clone();
         }
         self.subscribe_channels(client_id, &networks).await;
+        self.advertise_capabilities().await;
         self.broadcast_presence().await;
         self.broadcast_owned().await;
         self.emit_snapshot();

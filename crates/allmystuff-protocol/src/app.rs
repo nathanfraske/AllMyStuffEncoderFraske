@@ -49,6 +49,15 @@ pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 /// sees the channel, so the whole plane is additive.
 pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
 
+/// Capability tag this node advertises on the **mesh** capability matrix
+/// (MyOwnMesh `CapabilitiesSet`) — not the bespoke presence channel — to mark
+/// itself as a real AllMyStuff app node rather than a bare `myownmesh` daemon.
+/// It rides the reliable handshake + peer-list, so a peer learns "this device
+/// is on AllMyStuff" from the polled peer view even when a presence advert is
+/// dropped. The node's [`NodeProfile::features`] are advertised alongside it as
+/// tags, so a peer's action buttons light up from the peer list too.
+pub const CAP_TAG_ALLMYSTUFF: &str = "allmystuff";
+
 /// Feature tag a node advertises in [`NodeProfile::features`] when it can
 /// host mesh-native terminal sessions (spawn a PTY and stream it over the
 /// media channel). A peer only offers a terminal route to nodes that

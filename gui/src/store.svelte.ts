@@ -116,6 +116,7 @@ import {
   type SessionSnapshot,
 } from "./tauri";
 import {
+  CAP_TAG_ALLMYSTUFF,
   FEATURE_CAMERA,
   FEATURE_FILES,
   FEATURE_ROOMS,
@@ -844,7 +845,10 @@ class AppStore {
     if (!isTauri()) return;
     // Live peers are keyed by the full device id (`{pubkey}-{suffix}`) — the
     // same id presence + capabilities use, so they merge into one node.
-    const live = new Map<string, { label: string; online: boolean }>();
+    const live = new Map<
+      string,
+      { label: string; online: boolean; app: boolean; features: string[]; version?: string }
+    >();
     const rosterAll: RosterPeer[] = [];
     const joins: PendingJoin[] = [];
     // Which networks each machine is seen on (canonical pubkey → network
@@ -878,8 +882,25 @@ class AppStore {
           continue;
         }
         addNet(p.device_id, netName);
-        const e = live.get(p.device_id) ?? { label: p.label?.trim() || shortId(p.device_id), online: false };
+        const e = live.get(p.device_id) ?? {
+          label: p.label?.trim() || shortId(p.device_id),
+          online: false,
+          app: false,
+          features: [] as string[],
+          version: undefined as string | undefined,
+        };
         if (p.label?.trim()) e.label = p.label.trim();
+        // The reliable "on AllMyStuff" signal: a peer advertising the
+        // `allmystuff` capability tag on the mesh is an app node, and its
+        // remaining tags are the features it offers. This rides the handshake +
+        // daemon peer list, so a connected peer flips on without depending on
+        // the bespoke presence advert landing.
+        const tags = p.capabilities?.tags ?? [];
+        if (tags.includes(CAP_TAG_ALLMYSTUFF)) {
+          e.app = true;
+          e.features = tags.filter((t) => t !== CAP_TAG_ALLMYSTUFF);
+          if (p.capabilities?.app_version) e.version = p.capabilities.app_version;
+        }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
           e.online = true;
@@ -914,14 +935,22 @@ class AppStore {
     for (const r of rosterAll) {
       const covered = liveIds.some((id) => id === r.device_id || id.startsWith(`${r.device_id}-`));
       if (covered || known.has(r.device_id)) continue;
-      known.set(r.device_id, { label: r.label?.trim() || shortId(r.device_id), online: false });
+      known.set(r.device_id, {
+        label: r.label?.trim() || shortId(r.device_id),
+        online: false,
+        app: false,
+        features: [],
+        version: undefined,
+      });
     }
     // Upsert a node per known device (never the local machine). Discovered
     // devices start *unclaimed* — they're on the mesh but not yet yours; you
     // claim them (only if they offer it) or mark them shared from their
-    // drawer. A device known only from the daemon's roster/peers isn't
-    // running AllMyStuff yet (`app: false`) — presence is what flips that on,
-    // so we never downgrade a node the bespoke channel already enriched.
+    // drawer. "On AllMyStuff" (`app`) now comes from the reliable mesh
+    // capability marker carried in the peer list (CAP_TAG_ALLMYSTUFF), with
+    // the bespoke presence advert still enriching the rest — so a device that
+    // is a bare daemon (no marker) stays `app: false`, and we never downgrade
+    // a node presence already enriched.
     for (const [id, info] of known) {
       // "Self" is recognised by the live local id *and* the daemon identity's
       // device id — the latter is known as soon as the socket is up, before a
@@ -943,13 +972,23 @@ class AppStore {
           kind: "machine",
           relationship: { kind: "unclaimed" },
           online: info.online,
-          app: false,
+          app: info.app,
+          features: info.features,
+          version: info.version,
           networks: nodeNets,
         });
       } else {
         node.online = info.online;
         node.networks = nodeNets;
         if (!node.hostname && info.label) node.label = info.label;
+        // The mesh marker can flip a node *on* (app node), but it never
+        // downgrades one: presence may have already enriched it with richer
+        // detail (summary, owner, sites), so only fill what's still missing.
+        if (info.app) {
+          node.app = true;
+          if (!node.features?.length) node.features = info.features;
+          if (!node.version && info.version) node.version = info.version;
+        }
       }
     }
     // The local machine is on every network we've joined.
