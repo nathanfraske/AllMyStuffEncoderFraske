@@ -22,6 +22,7 @@ import type {
   SiteAdvert,
   SiteService,
   TermEvent,
+  TerminalSessionInfo,
   UpdatePrefs,
   UpdateStatus,
   VideoFrameMsg,
@@ -69,6 +70,10 @@ export interface SessionSnapshot {
     peer: string;
     origin: "outbound" | "inbound";
     state: { state: string; reason?: string };
+    /** For a terminal route: the resolved host-side shell session this route
+     *  is attached to (multi-attach). Absent on non-terminal routes, and from
+     *  an older peer. */
+    term_session?: string | null;
   }>;
 }
 
@@ -150,9 +155,14 @@ export function connectRoute(
   to: string,
   media: MediaKind,
   codec?: "auto" | "h264" | "mjpeg",
+  session?: string | null,
 ): Promise<string | null> {
   const video = (media === "display" || media === "video") && codec !== "mjpeg" ? ["h264"] : [];
-  return tryInvoke<string>("connect_route", { from, to, media, video });
+  // `session` is the terminal multi-attach hook: a non-null id makes the
+  // terminal Offer name an already-running host shell to attach to (shared,
+  // tmux-style); null/undefined (and every non-terminal route) mints a fresh
+  // one. Sent as null when absent so the backend's Option decodes cleanly.
+  return tryInvoke<string>("connect_route", { from, to, media, video, session: session ?? null });
 }
 
 /** The console's quality picks for a stream it's watching — each absent
@@ -459,6 +469,43 @@ export async function onTermExit(
   const { listen } = await import("@tauri-apps/api/event");
   return listen<{ route: string; code: number | null }>("allmystuff://term-exit", (e) =>
     cb(e.payload),
+  );
+}
+
+/** The host's authoritative shared-PTY size (`allmystuff://term-resize`):
+ *  which route, and the cols/rows every attacher renders at so a shared shell
+ *  wraps identically for all of them (a bigger window letterboxes to it). */
+export async function onTermResize(
+  cb: (e: { route: string; cols: number; rows: number }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; cols: number; rows: number }>("allmystuff://term-resize", (e) =>
+    cb(e.payload),
+  );
+}
+
+/** Ask `node` for its open terminal sessions — the picker's "attach to an
+ *  existing shell" list (multi-attach). The **local** machine answers
+ *  synchronously, returning the list here; a **remote** host answers
+ *  asynchronously, returning null while the reply arrives via
+ *  {@link onTerminalSessions}. Owner/fleet gated both ends; empty/null in
+ *  web mode (no backend). */
+export async function terminalSessions(node: string): Promise<TerminalSessionInfo[] | null> {
+  return tryInvoke<TerminalSessionInfo[] | null>("terminal_sessions", { node });
+}
+
+/** A host's answer to {@link terminalSessions} for a remote machine: its open
+ *  terminal sessions, tagged with which host they came from. No-op in web
+ *  mode. */
+export async function onTerminalSessions(
+  cb: (e: { from: string; sessions: TerminalSessionInfo[] }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string; sessions: TerminalSessionInfo[] }>(
+    "allmystuff://terminal-sessions",
+    (e) => cb(e.payload),
   );
 }
 

@@ -38,6 +38,11 @@ use crate::byte_queues::ByteQueues;
 pub enum OutMsg {
     /// A chunk of PTY output (≤ [`READ_BUF`] bytes).
     Data(Vec<u8>),
+    /// The shared PTY's reconciled size changed — every attacher renders its
+    /// emulator at this authoritative size (letterboxing a bigger window), so
+    /// the wrapping matches the one shell for everyone. Broadcast whenever an
+    /// attach/detach/resize moves the reconciled (minimum) size.
+    Resize { cols: u16, rows: u16 },
     /// The shell ended (`None` = killed by signal / no status).
     Exit(Option<i32>),
 }
@@ -132,6 +137,28 @@ struct PtySession {
     generation: u64,
     title: String,
     created_unix: u64,
+    /// The reconciled size last pushed to the PTY and broadcast to attachers,
+    /// so a no-op reconcile doesn't re-broadcast (and the viewers letterbox to
+    /// a size that only changes when it really does).
+    last_size: (u16, u16),
+}
+
+impl PtySession {
+    /// Resize the shared PTY to the reconciled (minimum) size of all current
+    /// attachers and, when that size actually changed, tell every attacher so
+    /// each renders its emulator at the one shared size (letterboxing a bigger
+    /// window). Returns whether the PTY control send succeeded.
+    fn reconcile(&mut self) -> bool {
+        let (cols, rows) = reconcile_size(&self.attachers);
+        let ok = self.ctl_tx.try_send(CtlMsg::Resize { cols, rows }).is_ok();
+        if (cols, rows) != self.last_size {
+            self.last_size = (cols, rows);
+            // Fire-and-forget: a lagging attacher catches the next one, and
+            // "no receivers yet" is fine (the next attach reconciles anew).
+            let _ = self.out_tx.send(OutMsg::Resize { cols, rows });
+        }
+        ok
+    }
 }
 
 /// The handle [`TerminalHost::open`] hands back: the live output stream plus
@@ -224,8 +251,21 @@ impl TerminalHost {
         if let Some(sid) = session_id {
             let mut sessions = self.sessions.lock();
             if let Some(s) = sessions.get_mut(sid) {
-                s.attachers
-                    .insert(route_id.to_string(), Attacher { cols, rows });
+                // Join at the shell's *current* size, not this viewer's 80×24
+                // placeholder. The caller passes a placeholder size on attach
+                // (the real one arrives moments later via `resize`); folding it
+                // into the reconcile straight away would shrink the shared PTY
+                // to 80×24 for *everyone* until then — a wrong-width flash on
+                // the tabs already attached. Inheriting the current reconciled
+                // size leaves the PTY untouched until the real resize lands.
+                let (cur_cols, cur_rows) = reconcile_size(&s.attachers);
+                s.attachers.insert(
+                    route_id.to_string(),
+                    Attacher {
+                        cols: cur_cols,
+                        rows: cur_rows,
+                    },
+                );
                 // Snapshot and subscribe under the scrollback guard so the
                 // split is consistent: snapshot = everything broadcast
                 // before, rx = everything broadcast after.
@@ -233,11 +273,9 @@ impl TerminalHost {
                     let sb = s.scrollback.lock();
                     (sb.snapshot(), s.out_tx.subscribe())
                 };
-                let reconciled = reconcile_size(&s.attachers);
-                let _ = s.ctl_tx.try_send(CtlMsg::Resize {
-                    cols: reconciled.0,
-                    rows: reconciled.1,
-                });
+                // Inheriting the current size, this is usually a no-op — but it
+                // keeps the PTY honest and re-broadcasts on the rare change.
+                s.reconcile();
                 drop(sessions);
                 self.route_to_session
                     .lock()
@@ -404,6 +442,7 @@ impl TerminalHost {
             generation: 1,
             title: sid.clone(),
             created_unix: now_unix(),
+            last_size: (cols, rows),
         };
         self.sessions.lock().insert(sid.clone(), session);
         self.route_to_session
@@ -438,13 +477,10 @@ impl TerminalHost {
                 if s.attachers.is_empty() {
                     now_empty = Some(s.generation);
                 } else {
-                    // Lost an attacher → reconcile up to whatever the rest
-                    // can show (the minimum over the survivors).
-                    let reconciled = reconcile_size(&s.attachers);
-                    let _ = s.ctl_tx.try_send(CtlMsg::Resize {
-                        cols: reconciled.0,
-                        rows: reconciled.1,
-                    });
+                    // Lost an attacher → reconcile up to whatever the rest can
+                    // show (the min over the survivors), and tell them so they
+                    // grow their emulators to match.
+                    s.reconcile();
                 }
             }
         }
@@ -452,6 +488,13 @@ impl TerminalHost {
         if let Some(gen) = now_empty {
             self.arm_idle_reaper(sid, gen);
         }
+    }
+
+    /// Whether `route_id` is currently attached to a live session here — the
+    /// host pump checks this each tick so a viewer that detached (closed its
+    /// tab) stops being streamed to, without killing the shared shell.
+    pub fn is_attached(&self, route_id: &str) -> bool {
+        self.route_to_session.lock().contains_key(route_id)
     }
 
     /// Kill the shell for a session id — the explicit "close this terminal"
@@ -537,13 +580,13 @@ impl TerminalHost {
             s.attachers
                 .insert(route_id.to_string(), Attacher { cols, rows });
         }
-        let (rc, rr) = reconcile_size(&s.attachers);
-        match s.ctl_tx.try_send(CtlMsg::Resize { cols: rc, rows: rr }) {
-            Ok(()) => true,
-            Err(_) => {
-                tracing::warn!("terminal {route_id}: resize dropped (shell not draining)");
-                false
-            }
+        // Reconcile to the min and, when it changed, broadcast the new shared
+        // size so every attacher letterboxes to it.
+        if s.reconcile() {
+            true
+        } else {
+            tracing::warn!("terminal {route_id}: resize dropped (shell not draining)");
+            false
         }
     }
 
@@ -765,6 +808,7 @@ mod tests {
                         return seen;
                     }
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Ok(OutMsg::Exit(_)) => break,
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -792,6 +836,7 @@ mod tests {
                         return seen;
                     }
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Ok(OutMsg::Exit(_)) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
                     std::thread::sleep(Duration::from_millis(20))
@@ -811,7 +856,7 @@ mod tests {
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(OutMsg::Exit(code)) => return code,
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
@@ -826,7 +871,7 @@ mod tests {
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(OutMsg::Exit(_)) => return true,
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return true,
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -920,7 +965,7 @@ mod tests {
                     ended = true;
                     break;
                 }
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     ended = true;
                     break;
@@ -1083,14 +1128,18 @@ mod tests {
     fn resize_reconciles_to_min() {
         ensure_runtime();
         let host = TerminalHost::new();
-        // A at 100x40, B at 80x50 → reconciled to 80 cols, 40 rows.
+        // A creates the shell at 100x40. B *attaches* — it joins at the
+        // shell's current size (no shrink: production passes a placeholder
+        // here, the real size arrives via `resize`), then B's real 80x50
+        // reconciles the shared PTY to 80 cols, 40 rows (the min each shows).
         let _a = host
             .open_with(Some("rz1"), "rA", 100, 40, sh("read line; stty size"))
             .unwrap();
         let b = host
-            .open_with(Some("rz1"), "rB", 80, 50, sh("unused"))
+            .open_with(Some("rz1"), "rB", 80, 24, sh("unused"))
             .unwrap();
         let mut rxb = b.rx;
+        assert!(host.resize("rB", 80, 50), "B's real size arrives");
         std::thread::sleep(Duration::from_millis(150));
         // Newline releases the `read`, then stty prints the reconciled size.
         assert!(host.write("rB", b"\n".to_vec()));
@@ -1100,6 +1149,32 @@ mod tests {
             "reconciled stty size 40 80",
         );
         host.close("rz1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_does_not_shrink_to_the_joiners_placeholder() {
+        ensure_runtime();
+        let host = TerminalHost::new();
+        // A creates the shell at 100x40.
+        let a = host
+            .open_with(Some("sz"), "rA", 100, 40, sh("read line; stty size"))
+            .unwrap();
+        let mut rxa = a.rx;
+        // B joins with the 80x24 placeholder the host always passes on attach
+        // (B's real size arrives later via `resize`). The shared PTY must stay
+        // 100x40 — a placeholder attach must not shrink it for A.
+        let _b = host
+            .open_with(Some("sz"), "rB", 80, 24, sh("unused"))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(host.write("rA", b"\n".to_vec()));
+        bcast_read_until(
+            &mut rxa,
+            |x| String::from_utf8_lossy(x).contains("40 100"),
+            "PTY stays 100x40 after a placeholder attach (no shrink)",
+        );
+        host.close("sz");
     }
 
     #[cfg(unix)]
@@ -1180,6 +1255,7 @@ mod tests {
                     exit = Some(code);
                     break;
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }

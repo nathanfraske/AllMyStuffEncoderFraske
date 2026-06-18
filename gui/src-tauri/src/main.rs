@@ -99,6 +99,9 @@ fn scan_full() -> Result<Value, String> {
 // ---- live mesh (presence + routing + audio) ---------------------------
 
 /// Offer a connection from one capability to another. Returns the route id.
+/// `session` is the terminal multi-attach hook: `Some(id)` makes a terminal
+/// Offer name an already-running host shell to attach to (shared, tmux-style),
+/// `None` (and every non-terminal route) mints a fresh one.
 #[tauri::command]
 async fn connect_route(
     mesh: State<'_, Arc<Mesh>>,
@@ -106,9 +109,10 @@ async fn connect_route(
     to: String,
     media: String,
     video: Option<Vec<String>>,
+    session: Option<String>,
 ) -> Result<String, String> {
     mesh.inner()
-        .connect(from, to, media, video.unwrap_or_default())
+        .connect_term(from, to, media, video.unwrap_or_default(), session)
         .await
 }
 
@@ -261,6 +265,19 @@ fn term_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Respon
 #[tauri::command]
 fn term_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
     mesh.term_unwatch(&route_id, token);
+}
+
+/// Ask `node` for its open terminal sessions (the picker's "attach to an
+/// existing shell" list). The **local** machine answers synchronously —
+/// the returned list is its own open shells; a **remote** host answers
+/// asynchronously, returning `null` here while the reply arrives as an
+/// `allmystuff://terminal-sessions` event. Owner/fleet gated both ends.
+#[tauri::command]
+async fn terminal_sessions(
+    mesh: State<'_, Arc<Mesh>>,
+    node: String,
+) -> Result<Option<Vec<allmystuff_protocol::TerminalSessionInfo>>, String> {
+    mesh.inner().request_terminal_sessions(node).await
 }
 
 /// Open (or focus) the dedicated terminal window for `node` — one OS
@@ -1026,6 +1043,7 @@ fn main() {
             term_watch,
             term_poll,
             term_unwatch,
+            terminal_sessions,
             open_terminal_window,
             file_send,
             file_watch,

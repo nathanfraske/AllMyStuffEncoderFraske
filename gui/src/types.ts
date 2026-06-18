@@ -403,6 +403,17 @@ export type TermEvent =
   | { kind: "resize"; cols: number; rows: number }
   | { kind: "exit"; code?: number | null };
 
+/** One open terminal session a host advertises for the multi-attach picker
+ *  (mirrors the Rust `TerminalSessionInfo`): the `session_id` an attach
+ *  Offer names, a friendly `title`, when it was created (unix seconds), and
+ *  how many viewers are currently attached (`> 1` = already shared). */
+export interface TerminalSessionInfo {
+  session_id: string;
+  title: string;
+  created_unix: number;
+  attachers: number;
+}
+
 /** One entry of a remote directory listing (mirrors the Rust `FileEntry`). */
 export interface FileEntry {
   name: string;

@@ -24,12 +24,14 @@
     clipboardWrite,
     closeThisWindow,
     onTermExit,
+    onTermResize,
+    onTerminalSessions,
     onThisWindowClose,
     openExternal,
     termSend,
     watchTerminal,
   } from "../tauri";
-  import { displayName } from "../types";
+  import { displayName, type TerminalSessionInfo } from "../types";
 
   let { host, windowed = false }: { host: string; windowed?: boolean } = $props();
 
@@ -43,6 +45,10 @@
     status: TabStatus;
     /** The line the overlay shows for rejected/ended tabs. */
     note: string;
+    /** When this tab was opened by *attaching* to an existing shared shell,
+     *  the session id it asked for — passed on the Offer and used to restart
+     *  back into the same shared session. null = "new shell". */
+    attachSession: string | null;
   }
 
   /** The non-reactive half of a tab: the emulator and everything that
@@ -68,7 +74,96 @@
   let runtimesReady = $state(0);
   let unlistenExit: (() => void) | null = null;
   let unlistenClose: (() => void) | null = null;
+  let unlistenSessions: (() => void) | null = null;
+  let unlistenResize: (() => void) | null = null;
   let bellTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ---- "Other Terminals": join an already-open shell -------------------
+  // Discover shells already open on this host — started from another window
+  // of this machine, or by a fleet member — and join one as a *shared*
+  // session (tmux-style: same shell, same scrollback, same keyboard). The
+  // local host answers at once; a remote host answers over the mesh (the
+  // sessions event). The host's *full* list is the one source of truth; the
+  // menu and the per-tab "shared" badge are both derived from it.
+
+  let pickerOpen = $state(false);
+  let pickerLoading = $state(false);
+  /** Every shell the host currently has open (its answer to our query) —
+   *  the single source for the menu and the shared-with badges. */
+  let hostSessions = $state<TerminalSessionInfo[]>([]);
+  /** The "Other Terminals" button, measured to anchor the (fixed-position)
+   *  menu — it must escape the header's `overflow` to be visible at all. */
+  let attachBtn = $state<HTMLButtonElement | null>(null);
+  /** Viewport coords for the menu's top-right corner, from the button rect. */
+  let menuPos = $state({ top: 0, right: 0 });
+
+  /** session id → live attacher count, from the host's list. */
+  const attacherCounts = $derived.by(() => {
+    const m: Record<string, number> = {};
+    for (const s of hostSessions) m[s.session_id] = s.attachers;
+    return m;
+  });
+
+  /** The session ids this window already shows as live tabs — so the menu
+   *  can leave them out and list only the *other* terminals. */
+  const mySessionIds = $derived.by(() => {
+    const ids = new Set<string>();
+    for (const t of tabs) {
+      const sid = t.routeId ? app.routeSessions[t.routeId] : undefined;
+      if (sid) ids.add(sid);
+    }
+    return ids;
+  });
+
+  /** What the menu lists: the host's open shells minus the ones this very
+   *  window already shows — the genuinely *other* terminals to join. */
+  const otherSessions = $derived(hostSessions.filter((s) => !mySessionIds.has(s.session_id)));
+
+  /** Pull the host's open shells into {@link hostSessions}. The local host
+   *  answers synchronously (and is authoritative — an empty answer means it
+   *  truly has none, so we clear); a remote host returns nothing here and
+   *  answers asynchronously on the sessions event, so an empty remote answer
+   *  leaves the last event-delivered list in place. */
+  async function refreshHostSessions() {
+    const list = await app.listTerminalSessions(host);
+    if (list.length || app.isMe(host)) hostSessions = list;
+  }
+
+  /** Toggle the menu; on open, anchor it to the button and (re)query the
+   *  host's open shells. */
+  async function togglePicker() {
+    pickerOpen = !pickerOpen;
+    if (!pickerOpen) return;
+    if (attachBtn) {
+      const r = attachBtn.getBoundingClientRect();
+      menuPos = { top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) };
+    }
+    pickerLoading = true;
+    await refreshHostSessions();
+    pickerLoading = false;
+  }
+
+  /** Join one of the host's other shells in a new tab, then close the menu. */
+  function attachTo(session: TerminalSessionInfo) {
+    newTab(session.session_id);
+    pickerOpen = false;
+  }
+
+  /** A human age like "3m" / "2h" for a session created at `unix` seconds. */
+  function ageLabel(unix: number): string {
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - unix));
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+    return `${Math.floor(secs / 86400)}d`;
+  }
+
+  /** Live attacher count for a tab's shared session, or 0 when solo/unknown. */
+  function tabAttachers(t: TabMeta): number {
+    if (!t.routeId) return 0;
+    const sid = app.routeSessions[t.routeId];
+    return sid ? (attacherCounts[sid] ?? 0) : 0;
+  }
 
   // ---- byte plumbing ---------------------------------------------------
 
@@ -90,16 +185,23 @@
 
   // ---- tab lifecycle ---------------------------------------------------
 
-  function newTab() {
+  /** Open a new tab. With `session` set it *attaches* to that already-running
+   *  shared shell on the host (tmux-style — same scrollback, same keyboard);
+   *  without it, a fresh shell is minted. */
+  function newTab(session?: string) {
     const id = nextTabId++;
-    const routeId = app.terminalConnect(host);
-    console.debug(`[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}`);
+    const routeId = app.terminalConnect(host, session);
+    console.debug(
+      `[terminal] tab ${id} opened — route ${routeId ?? "(none: web mode)"}` +
+        (session ? ` attaching to ${session}` : ""),
+    );
     tabs.push({
       id,
       routeId,
-      title: `Shell ${id}`,
+      title: session ? `↳ ${session}` : `Shell ${id}`,
       status: routeId ? "connecting" : "offline",
       note: routeId ? "" : "Live terminals need the desktop app.",
+      attachSession: session ?? null,
     });
     activeId = id;
   }
@@ -189,19 +291,23 @@
       }).dispose,
     );
 
-    // Emulator resized (fit ran) → the far PTY follows, debounced so a
-    // window drag doesn't machine-gun resizes down the channel.
+    // Report this window's *capacity* (the cols/rows it could show) to the
+    // host, debounced so a drag doesn't machine-gun the channel. The host
+    // reconciles the shared PTY to the smallest attached window and sends back
+    // the authoritative size this emulator actually renders at (handled in
+    // onMount). Capacity (reported) and render size (received) stay decoupled,
+    // so a bigger window letterboxes to the shared size instead of wrapping
+    // wrong — and the smallest window still drives the shell's size.
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    rt.cleanup.push(
-      term.onResize(({ cols, rows }) => {
-        if (resizeTimer) clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(() => {
-          const t = tabs.find((x) => x.id === tabId);
-          if (t?.routeId && t.status === "live")
-            void termSend(t.routeId, { kind: "resize", cols, rows }).catch(() => {});
-        }, 50);
-      }).dispose,
-    );
+    const reportCapacitySoon = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const t = tabs.find((x) => x.id === tabId);
+        const d = fit.proposeDimensions();
+        if (t?.routeId && t.status === "live" && d && d.cols > 0 && d.rows > 0)
+          void termSend(t.routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
+      }, 80);
+    };
     rt.cleanup.push(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
     });
@@ -245,9 +351,10 @@
       return true;
     });
 
-    // Keep the emulator fitted to its pane.
+    // Window grew/shrank → re-report capacity (not a local refit: the render
+    // size is the host's authoritative shared size, applied via term-resize).
     const ro = new ResizeObserver(() => {
-      if (el.clientWidth > 0 && el.clientHeight > 0) fit.fit();
+      if (el.clientWidth > 0 && el.clientHeight > 0) reportCapacitySoon();
     });
     ro.observe(el);
     rt.cleanup.push(() => ro.disconnect());
@@ -273,9 +380,10 @@
     rt.term.dispose();
   }
 
-  /** A tab's route went live: wire the byte stream and size the far PTY
-   *  to the emulator. Buffered output (the prompt that raced the window
-   *  boot) arrives on the first poll. */
+  /** A tab's route went live: wire the byte stream and tell the host this
+   *  window's capacity (the host reconciles and sends back the size to render
+   *  at). Buffered output (the prompt that raced the window boot) arrives on
+   *  the first poll. */
   function startSession(meta: TabMeta, rt: TabRuntime) {
     if (rt.started || !meta.routeId) return;
     rt.started = true;
@@ -289,9 +397,9 @@
       }
       rt.stopWatch = stop;
     });
-    void termSend(routeId, { kind: "resize", cols: rt.term.cols, rows: rt.term.rows }).catch(
-      () => {},
-    );
+    const d = rt.fit.proposeDimensions();
+    if (d && d.cols > 0 && d.rows > 0)
+      void termSend(routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
     rt.term.focus();
   }
 
@@ -351,7 +459,9 @@
     rt.stopWatch?.();
     rt.stopWatch = null;
     rt.started = false;
-    t.routeId = app.terminalConnect(host);
+    // Restart back into the same shared session when this tab was attached;
+    // otherwise mint a fresh shell.
+    t.routeId = app.terminalConnect(host, t.attachSession ?? undefined);
     t.status = t.routeId ? "connecting" : "offline";
     t.note = t.routeId ? "" : "Live terminals need the desktop app.";
     rt.term.write("\r\n\x1b[2m── new session ──\x1b[0m\r\n");
@@ -377,13 +487,17 @@
     focusActiveSoon();
   }
 
-  /** After a tab becomes visible its pane has real dimensions again —
-   *  refit and focus on the next frame. */
+  /** After a tab becomes visible its pane has real dimensions again — re-report
+   *  capacity (the host may grow the shared size back) and focus, next frame.
+   *  The render size stays the host's authoritative one, never a local refit. */
   function focusActiveSoon() {
     requestAnimationFrame(() => {
       const rt = runtimes.get(activeId);
+      const t = tabs.find((x) => x.id === activeId);
       if (rt) {
-        rt.fit.fit();
+        const d = rt.fit.proposeDimensions();
+        if (t?.routeId && t.status === "live" && d && d.cols > 0 && d.rows > 0)
+          void termSend(t.routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
         rt.term.focus();
       }
     });
@@ -444,10 +558,39 @@
       // held until the teardowns are on the wire (see onThisWindowClose).
       void onThisWindowClose(() => void endAll()).then((u) => (unlistenClose = u));
     }
+    // A remote host's answer to a sessions query (and its own pushes after a
+    // tab attaches/detaches) — feeds the one source of truth, which keeps the
+    // open menu and the "shared · N" badges live.
+    void onTerminalSessions((ev) => {
+      if (app.isSameMachine(ev.from, host)) hostSessions = ev.sessions;
+    }).then((u) => (unlistenSessions = u));
+    // The host's authoritative shared-PTY size for a route — render this tab's
+    // emulator at it (letterboxing a bigger window) so a shared shell wraps
+    // identically for everyone. The window keeps reporting its own capacity
+    // (above); the smallest attached window is what the host settles on.
+    void onTermResize((ev) => {
+      const t = tabs.find((x) => x.routeId === ev.route);
+      if (!t) return;
+      const rt = runtimes.get(t.id);
+      if (rt && ev.cols > 0 && ev.rows > 0 && (rt.term.cols !== ev.cols || rt.term.rows !== ev.rows))
+        rt.term.resize(ev.cols, ev.rows);
+    }).then((u) => (unlistenResize = u));
+    // Keep the list current on a slow cadence — while the menu is open (so a
+    // shell another window/peer just opened shows up) or whenever a tab is on
+    // a known session (so its shared badge stays live). The count only moves
+    // when someone attaches/detaches, so this is cheap and off any hot path.
+    const countPoll = setInterval(() => {
+      if (pickerOpen || tabs.some((t) => t.routeId && app.routeSessions[t.routeId])) {
+        void refreshHostSessions();
+      }
+    }, 4000);
     return () => {
       clearInterval(sessionPoll);
+      clearInterval(countPoll);
       unlistenExit?.();
       unlistenClose?.();
+      unlistenSessions?.();
+      unlistenResize?.();
       if (bellTimer) clearTimeout(bellTimer);
     };
   });
@@ -478,16 +621,22 @@
         </div>
         <div class="tabs" role="tablist" aria-label="Shells">
           {#each tabs as t (t.id)}
+            {@const shared = tabAttachers(t)}
             <div class="tab" class:active={t.id === activeId}>
               <button
                 class="tab-pick"
                 role="tab"
                 aria-selected={t.id === activeId}
-                title={t.title}
+                title={shared > 1 ? `${t.title} · shared with ${shared - 1} other` : t.title}
                 onclick={() => selectTab(t.id)}
               >
                 <span class="tab-state {t.status}"></span>
                 <span class="tab-label">{t.title}</span>
+                {#if shared > 1}
+                  <span class="tab-shared" title="Shared session — {shared} viewers attached"
+                    >👥{shared}</span
+                  >
+                {/if}
               </button>
               <button class="tab-x" title="Close this shell" onclick={() => void closeTab(t.id)}>
                 ✕
@@ -495,6 +644,64 @@
             </div>
           {/each}
           <button class="tab-new" title="New shell (Ctrl+Shift+T)" onclick={() => newTab()}>＋</button>
+          <div class="picker">
+            <button
+              bind:this={attachBtn}
+              class="tab-attach"
+              class:open={pickerOpen}
+              title="Join a shell already open on {displayName(node)} (shared, tmux-style)"
+              aria-expanded={pickerOpen}
+              onclick={() => void togglePicker()}
+            >
+              👥 Other Terminals{#if otherSessions.length > 0}<span class="attach-count"
+                  >{otherSessions.length}</span
+                >{/if}
+            </button>
+            {#if pickerOpen}
+              <!-- Click-away backdrop, then the menu above it. -->
+              <button
+                class="picker-scrim"
+                aria-label="Close the other-terminals menu"
+                onclick={() => (pickerOpen = false)}
+              ></button>
+              <div
+                class="picker-menu"
+                role="menu"
+                aria-label="Other open terminals"
+                style="top: {menuPos.top}px; right: {menuPos.right}px;"
+              >
+                <div class="picker-head">Other shells open on {displayName(node)}</div>
+                {#if pickerLoading}
+                  <div class="picker-empty">Looking…</div>
+                {:else if otherSessions.length === 0}
+                  <div class="picker-empty">
+                    {#if hostSessions.length > 0}
+                      Every shell open here is already a tab in this window. Open another window — or
+                      have a fleet member open one — and it'll show up here to join.
+                    {:else if app.isMe(host)}
+                      No other shells open on this machine yet. Open one from another terminal window
+                      (here or from a fleet member) and it'll appear here — joining shares the shell,
+                      its scrollback and its keyboard.
+                    {:else}
+                      No other shells open on {displayName(node)} yet — or it's running an older
+                      AllMyStuff that can't share them. Shells started there (by its owner or a fleet
+                      member) show up here to join.
+                    {/if}
+                  </div>
+                {:else}
+                  {#each otherSessions as s (s.session_id)}
+                    <button class="picker-row" role="menuitem" onclick={() => attachTo(s)}>
+                      <span class="picker-title">{s.title}</span>
+                      <span class="picker-meta">
+                        {#if s.attachers > 0}<span class="picker-att">👥 {s.attachers}</span>{/if}
+                        <span class="picker-age">{ageLabel(s.created_unix)}</span>
+                      </span>
+                    </button>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
+          </div>
         </div>
         <button class="x" onclick={() => void endAll()} aria-label="Close">✕</button>
       </header>
@@ -722,6 +929,121 @@
   .tab-new:hover {
     color: #efecfb;
     border-color: #6f64ab;
+  }
+  .tab-shared {
+    font-size: 0.62rem;
+    color: #9fd3ff;
+    background: #21344a;
+    border-radius: 5px;
+    padding: 0 0.22rem;
+    flex-shrink: 0;
+  }
+  .picker {
+    position: relative;
+    flex-shrink: 0;
+  }
+  .tab-attach {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border: 1px solid #494173;
+    background: none;
+    color: #b9b2d6;
+    height: 1.65rem;
+    border-radius: 7px;
+    font-size: 0.72rem;
+    padding: 0 0.5rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tab-attach:hover,
+  .tab-attach.open {
+    color: #efecfb;
+    border-color: #6f64ab;
+    background: #2a2548;
+  }
+  .attach-count {
+    font-size: 0.62rem;
+    color: #9fd3ff;
+    background: #21344a;
+    border-radius: 5px;
+    padding: 0 0.26rem;
+    line-height: 1.4;
+  }
+  .picker-scrim {
+    position: fixed;
+    inset: 0;
+    border: none;
+    background: transparent;
+    cursor: default;
+    z-index: 70;
+  }
+  .picker-menu {
+    /* Fixed, not absolute: the header (`.terminal` overflow:hidden, `.tabs`
+       overflow:auto) would otherwise clip a dropdown that escapes the tab
+       strip — it rendered but was invisible. Anchored to the button's
+       measured rect (see `menuPos`). */
+    position: fixed;
+    z-index: 71;
+    width: 19rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: #1c1930;
+    border: 1px solid #3a3460;
+    border-radius: 9px;
+    box-shadow: 0 14px 40px rgba(10, 8, 20, 0.6);
+    padding: 0.3rem;
+  }
+  .picker-head {
+    color: #9a93b8;
+    font-size: 0.68rem;
+    padding: 0.3rem 0.4rem 0.4rem;
+    border-bottom: 1px solid #2c2745;
+    margin-bottom: 0.25rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .picker-empty {
+    color: #8f88ad;
+    font-size: 0.74rem;
+    line-height: 1.45;
+    padding: 0.5rem 0.45rem;
+  }
+  .picker-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    width: 100%;
+    border: none;
+    background: none;
+    color: #d7d2ec;
+    border-radius: 6px;
+    padding: 0.4rem 0.45rem;
+    cursor: pointer;
+    text-align: left;
+  }
+  .picker-row:hover {
+    background: #2c2750;
+  }
+  .picker-title {
+    font-size: 0.78rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .picker-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    color: #8f88ad;
+  }
+  .picker-att {
+    color: #9fd3ff;
   }
   .x {
     border: none;

@@ -98,6 +98,8 @@ import {
   type NodeSitesEvent,
   roomWindowTarget,
   terminalWindowTarget,
+  terminalSessions,
+  onTerminalSessions,
   filesWindowTarget,
   scanSelf,
   clipboardPaste,
@@ -147,6 +149,7 @@ import {
   type Route,
   type SharedEntry,
   type SharedFileMeta,
+  type TerminalSessionInfo,
   type RouteLiveState,
   type VirtualRoom,
   type TurnEntry,
@@ -399,6 +402,11 @@ class AppStore {
    *  snapshot. A terminal tab watches its own route here to tell
    *  "connecting" from "active" from "rejected (reason)" / "torn_down". */
   routeStates = $state<Record<string, RouteLiveState>>({});
+  /** The resolved host-side terminal session id per terminal route id, from
+   *  the snapshot (the host echoes it on `Accept` for a shared shell). A
+   *  terminal tab reads it to label which shell it's on and to re-query the
+   *  host for the live attacher count ("shared with N"). */
+  routeSessions = $state<Record<string, string>>({});
   /** Per-app-run counter so each terminal tab mints a unique viewer-side
    *  endpoint (`{me}:term-view:…`) — unique endpoint, unique route id. */
   private termViewSeq = 0;
@@ -684,6 +692,13 @@ class AppStore {
   /** Whether an id refers to this very machine (any suffix form). */
   isMe(id: string): boolean {
     return sameMachine(id, this.localId);
+  }
+
+  /** Whether two ids name the same machine (canonical pubkey match) — the
+   *  public form of the module's `sameMachine`, used to match an inbound
+   *  event's `from` (a bare pubkey) against a host's display id. */
+  isSameMachine(a: string, b: string): boolean {
+    return sameMachine(a, b);
   }
 
   capsOf(nodeId: string): Capability[] {
@@ -1131,8 +1146,12 @@ class AppStore {
     // the per-route negotiation states for whoever watches one (a
     // terminal tab telling "connecting" from "rejected" by its reason).
     const states: Record<string, RouteLiveState> = {};
+    const sessions: Record<string, string> = {};
     for (const lr of snap.routes ?? []) {
       states[lr.route.id] = lr.state;
+      // The resolved terminal session id (multi-attach) the host bound this
+      // route to, when it sent one — the tab labels and re-queries by it.
+      if (lr.term_session) sessions[lr.route.id] = lr.term_session;
       const active = lr.state.state === "active";
       const id = lr.route.id;
       const exists = this.catalog.routes.some((r) => r.id === id);
@@ -1143,6 +1162,7 @@ class AppStore {
       }
     }
     this.routeStates = states;
+    this.routeSessions = sessions;
 
     // Reconcile site mappings against what each host now advertises: a host
     // that's online but no longer lists a site we'd mapped has stopped
@@ -2021,13 +2041,29 @@ class AppStore {
    *  and the binding authorization runs host-side against the owner/fleet
    *  rule. Returns the route id the tab watches, or null in web mode
    *  (no backend — nothing can flow). */
-  terminalConnect(hostNodeId: string): string | null {
+  terminalConnect(hostNodeId: string, session?: string | null): string | null {
     if (!this.backendConnected) return null;
     const from = `${hostNodeId}:terminal`;
     const n = ++this.termViewSeq;
     const to = `${this.localId}:term-view:${Date.now().toString(36)}-${n}`;
-    void connectRoute(from, to, "generic");
+    // `session` is the multi-attach hook: a non-null id makes the Offer name
+    // an already-running host shell to join (shared, tmux-style); null/absent
+    // mints a fresh shell — exactly what "New terminal" does.
+    void connectRoute(from, to, "generic", undefined, session ?? null);
     return `route:${from}→${to}`;
+  }
+
+  /** Discover a host's open terminal sessions for the multi-attach picker.
+   *  The **local** machine answers at once (its own shells); a **remote**
+   *  host answers asynchronously over the mesh, arriving as a
+   *  `allmystuff://terminal-sessions` event — so this returns the immediate
+   *  list (or an empty list while a remote reply is in flight) and the
+   *  caller subscribes to {@link onTerminalSessions} for the remote answer.
+   *  Empty in web mode (no backend, nothing to list). */
+  async listTerminalSessions(hostNodeId: string): Promise<TerminalSessionInfo[]> {
+    if (!this.backendConnected) return [];
+    const immediate = await terminalSessions(hostNodeId);
+    return immediate ?? [];
   }
 
   /** Tear one terminal session down (tab closed / window closing). The

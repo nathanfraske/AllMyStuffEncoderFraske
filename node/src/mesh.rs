@@ -28,8 +28,9 @@ use crate::UiSink;
 use allmystuff_graph::{MediaKind, NodeId, Route};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request,
-    RoomMessage, RouteControl, SharedFileMeta, SiteControl, SiteService, CHANNEL_CONTROL,
-    CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
+    RoomMessage, RouteControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo,
+    CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -78,6 +79,22 @@ pub struct Mesh {
     /// Sequence for viewer-side outbound terminal frames (keystrokes,
     /// resizes — one stream per app run, like `input_seq`).
     term_seq: AtomicU64,
+    /// Viewer-route ids that already have a live host/loopback output pump.
+    /// Exactly one pump per route: a duplicate `StartMedia` — e.g. the offer
+    /// delivered on more than one shared network — must not spawn a second
+    /// pump onto the same route, which would fan the shell's output out twice
+    /// (the cause of doubled/tripled terminals on a multi-network peer).
+    term_pumps: Mutex<std::collections::HashSet<String>>,
+    /// Highest terminal-frame `seq` already taken per route, each direction:
+    /// `term_rx_seq` is output the *viewer* takes from the host;
+    /// `term_in_seq` is input the *host* takes from the viewer. Both sending
+    /// sides number a route's frames strictly increasing, so a seq we've
+    /// already seen is a duplicate delivery (the same send arriving on several
+    /// shared networks) — dropped, not re-applied. Without the input one, a
+    /// keystroke redelivered N times is written to the PTY N times and the
+    /// shell echoes `aaaa`.
+    term_rx_seq: Mutex<HashMap<String, u64>>,
+    term_in_seq: Mutex<HashMap<String, u64>>,
     /// Mesh-native file sessions: filesystem ops this machine hosts for
     /// files routes sourcing here (gated like the terminal), and the
     /// response buffers files windows drain for routes sinking here.
@@ -263,6 +280,13 @@ const MAX_TERM_DATA_BYTES: usize = 16 * 1024;
 /// reaps a session whose peer silently vanished.
 const TERM_SEND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Initial PTY size for a freshly opened terminal session — the viewer's
+/// first `Resize` reconciles the shared PTY to its real emulator size
+/// moments later (and an attach to an existing session keeps that session's
+/// reconciled size). A sane 80×24 beats a 0×0 PTY in the gap.
+const TERM_INIT_COLS: u16 = 80;
+const TERM_INIT_ROWS: u16 = 24;
+
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -310,6 +334,9 @@ impl Mesh {
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
+            term_pumps: Mutex::new(std::collections::HashSet::new()),
+            term_rx_seq: Mutex::new(HashMap::new()),
+            term_in_seq: Mutex::new(HashMap::new()),
             files: FilesPlane::new(),
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
@@ -1022,11 +1049,24 @@ impl Mesh {
                         }
                     }
                     // Site management (list a co-owned machine's sites,
-                    // re-expose them) rides this channel but is the backend's
-                    // to handle, gated owner/fleet — the session never sees it.
+                    // re-expose them) and the terminal-sessions picker plane
+                    // (list this host's open shells, the host's answer) ride
+                    // this channel but are the backend's to handle, gated
+                    // owner/fleet — the session never sees them.
                     match msg {
                         ControlMessage::Site(sc) => {
                             self.handle_site_control(&from, sc).await;
+                        }
+                        ControlMessage::Route(RouteControl::TerminalSessionsRequest) => {
+                            self.handle_terminal_sessions_request(&from).await;
+                        }
+                        ControlMessage::Route(RouteControl::TerminalSessions { sessions }) => {
+                            // A host's answer to *our* picker request — surface
+                            // it to the front-end (it picks one to attach to).
+                            self.sink.emit(
+                                "allmystuff://terminal-sessions",
+                                json!({ "from": from, "sessions": sessions }),
+                            );
                         }
                         msg => {
                             let effects = {
@@ -1447,6 +1487,21 @@ impl Mesh {
         media: String,
         video: Vec<String>,
     ) -> Result<String, String> {
+        self.connect_term(from, to, media, video, None).await
+    }
+
+    /// [`connect`](Self::connect) with an optional terminal **session** to
+    /// attach to (the multi-attach entry point): `Some(id)` makes the
+    /// terminal Offer name that already-running host shell to join, `None`
+    /// (and every non-terminal route) mints a fresh session as before.
+    pub async fn connect_term(
+        self: &Arc<Self>,
+        from: String,
+        to: String,
+        media: String,
+        video: Vec<String>,
+        session: Option<String>,
+    ) -> Result<String, String> {
         // Only advertise transports the *whole* local stack can consume.
         // H.264 decode is always covered (WebCodecs where the webview has
         // it, the native decoder where it doesn't) — but inbound samples
@@ -1489,11 +1544,21 @@ impl Mesh {
             let effects = {
                 let mut st = self.state.lock();
                 let s = st.session.as_mut().ok_or("mesh not ready")?;
-                let _ = s.offer(route.clone(), me.as_str(), Vec::new(), Vec::new());
+                // Loopback terminals carry the attach session too, so two
+                // local windows can share one local shell (multi-attach to
+                // yourself); harmless `None` on every other loopback route.
+                let _ = s.offer_terminal(
+                    route.clone(),
+                    me.as_str(),
+                    Vec::new(),
+                    Vec::new(),
+                    session.clone(),
+                );
                 s.handle(
                     NodeId::from(me.as_str()),
                     ControlMessage::Route(RouteControl::Accept {
                         route_id: route.id.clone(),
+                        session: None,
                     }),
                 )
             };
@@ -1505,7 +1570,7 @@ impl Mesh {
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
-            s.offer(route.clone(), peer.as_str(), video, audio)
+            s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
         };
         if let Err(e) = self.send_control(&peer, &msg).await {
             // The peer never saw the offer — drop it rather than leave a
@@ -1677,7 +1742,18 @@ impl Mesh {
                     // A control route ending mid-chord must not leave this
                     // machine holding the keys it injected.
                     self.injector.release_route(&id);
-                    self.terminal.stop(&id);
+                    // A terminal route ending is one *viewer* leaving, not the
+                    // shell dying: detach (keep the shared shell alive for the
+                    // other attachers, host or remote; the last one leaving
+                    // arms the idle reaper), never kill. Closing a tab on one
+                    // machine must not end a session another still has open.
+                    self.terminal.detach(&id);
+                    // Drop this route's terminal pump/dedup bookkeeping so a
+                    // later route reusing the id starts clean (and the maps
+                    // never grow unbounded over a long session).
+                    self.term_pumps.lock().remove(&id);
+                    self.term_rx_seq.lock().remove(&id);
+                    self.term_in_seq.lock().remove(&id);
                     self.files.stop(&id);
                     // A site route ending closes its local listener (client
                     // side) and every tunneled connection it carried.
@@ -2798,75 +2874,57 @@ impl Mesh {
             });
             return;
         }
-        match self.terminal.spawn(&rid) {
-            Ok(mut out_rx) => {
+        // One pump per viewer route. A duplicate `StartMedia` for this route
+        // — the offer arriving on more than one shared network, say — must
+        // not spawn a second pump onto it: two pumps fan the one shell's
+        // output out twice (doubled/tripled terminal). The first start wins;
+        // later duplicates are ignored until the pump ends and releases.
+        if !self.term_pumps.lock().insert(rid.clone()) {
+            tracing::debug!(
+                "route {rid} — terminal pump already running; ignoring duplicate start"
+            );
+            return;
+        }
+        // The session the viewer asked to attach to: `Some(id)` joins that
+        // shared shell (tmux-style — scrollback replayed, keyboard shared),
+        // `None` mints a fresh one. The default emulator size is 80×24; the
+        // viewer's first resize reconciles the shared PTY to its real size.
+        let requested = self.requested_term_session(&route.id);
+        match self
+            .terminal
+            .open(requested.as_deref(), &rid, TERM_INIT_COLS, TERM_INIT_ROWS)
+        {
+            Ok(attach) => {
+                let session_id = attach.session_id.clone();
                 tracing::info!(
-                    "route {rid} active — hosting a terminal for {}",
-                    short_id(&peer)
+                    "route {rid} active — {} terminal session {session_id} for {} ({} now attached)",
+                    if attach.created { "hosting new" } else { "attaching to" },
+                    short_id(&peer),
+                    self.terminal
+                        .list_sessions()
+                        .iter()
+                        .find(|s| s.session_id == session_id)
+                        .map(|s| s.attachers)
+                        .unwrap_or(1),
                 );
+                // Record the resolved id on our (host) route and echo it to
+                // the viewer on a follow-up Accept, so its UI learns which
+                // shell this is (and how to re-attach). Best-effort: the
+                // first Accept already started the viewer's media.
+                self.record_and_announce_term_session(&route.id, &peer, &session_id);
                 let mesh = self.clone();
                 crate::spawn(async move {
-                    let mut seq: u64 = 0;
-                    let mut last_ok = std::time::Instant::now();
-                    let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                    while let Some(msg) = out_rx.recv().await {
-                        match msg {
-                            OutMsg::Data(bytes) => {
-                                for frame in
-                                    TermFrame::data_frames(&rid, seq, &bytes, MAX_TERM_DATA_BYTES)
-                                {
-                                    seq = frame.seq + 1;
-                                    let Ok(payload) = serde_json::to_value(&frame) else {
-                                        continue;
-                                    };
-                                    match mesh.send_media_value(&peer, payload).await {
-                                        Ok(()) => last_ok = std::time::Instant::now(),
-                                        Err(e) => {
-                                            if last_warn.elapsed() >= WARN_EVERY {
-                                                last_warn = std::time::Instant::now();
-                                                tracing::warn!(
-                                                    "terminal output to {} failed: {e}",
-                                                    short_id(&peer)
-                                                );
-                                            }
-                                            // Nothing else reaps a session
-                                            // whose viewer silently vanished
-                                            // (peer drops never reach the
-                                            // session) — the pump is the
-                                            // watchdog.
-                                            if last_ok.elapsed() > TERM_SEND_PATIENCE {
-                                                // Keep the shell alive — just detach this
-                                                // viewer. A vanished viewer is usually a
-                                                // network blip; the session lingers (idle-
-                                                // reaped much later) so a reconnecting viewer
-                                                // reattaches to the *same* shell and replays
-                                                // its scrollback, instead of losing the work.
-                                                tracing::warn!(
-                                                    "terminal {rid} — viewer unreachable; detaching (shell kept for reattach)"
-                                                );
-                                                mesh.terminal.detach(&rid);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            OutMsg::Exit(code) => {
-                                tracing::info!("terminal {rid} — shell ended ({code:?})");
-                                let frame = TermFrame::new(&rid, seq, TermEvent::Exit { code });
-                                if let Ok(payload) = serde_json::to_value(&frame) {
-                                    let _ = mesh.send_media_value(&peer, payload).await;
-                                }
-                                let _ = mesh.disconnect(rid.clone()).await;
-                                return;
-                            }
-                        }
-                    }
-                    // Stream closed without an Exit: `stop` ran, meaning a
-                    // teardown is already in motion — nothing left to do.
+                    mesh.clone()
+                        .pump_term_attach(rid.clone(), peer, attach)
+                        .await;
+                    // The pump ended (viewer detached, shell exited) — release
+                    // the route so a genuine fresh start can pump again.
+                    mesh.term_pumps.lock().remove(&rid);
                 });
             }
             Err(e) => {
+                // The shell never opened — release the route we just claimed.
+                self.term_pumps.lock().remove(&rid);
                 // Tell the viewer in its own terms — a terminal renders a
                 // line of text better than a silently vanished route — then
                 // tear the route down.
@@ -2890,6 +2948,164 @@ impl Mesh {
                     }
                     let _ = mesh.disconnect(rid).await;
                 });
+            }
+        }
+    }
+
+    /// The terminal session this route asked to attach to, from the session
+    /// snapshot — `Some(id)` for an explicit attach, `None` for "new shell".
+    fn requested_term_session(&self, route_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .and_then(|r| r.term_session.clone())
+    }
+
+    /// Record the resolved terminal session id on this (host) route, then
+    /// echo it to the viewer with a follow-up `Accept` so its UI learns the
+    /// shared id (for "shared with N" and re-attach). The first Accept the
+    /// session auto-sent already started the viewer's media; this one only
+    /// carries the resolved id.
+    fn record_and_announce_term_session(
+        self: &Arc<Self>,
+        route_id: &str,
+        peer: &str,
+        session: &str,
+    ) {
+        {
+            let mut st = self.state.lock();
+            if let Some(s) = st.session.as_mut() {
+                s.set_term_session(route_id, session.to_string());
+            }
+        }
+        self.emit_snapshot();
+        let mesh = self.clone();
+        let peer = peer.to_string();
+        let route_id = route_id.to_string();
+        let session = session.to_string();
+        crate::spawn(async move {
+            let _ = mesh
+                .send_control(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::Accept {
+                        route_id,
+                        session: Some(session),
+                    }),
+                )
+                .await;
+        });
+    }
+
+    /// Pump one attacher's view of a shared terminal session to its viewer:
+    /// replay the scrollback first (a fresh attach paints the current
+    /// screen), then forward the session's live broadcast — this attacher's
+    /// own pump to its own viewer route, so several viewers on one session
+    /// each get the output (and, via `term_send`→`terminal.write`, each type
+    /// into the one shell). `Lagged` skips ahead (output is live media);
+    /// `Closed`/`Exit` ends *this* viewer's pump only.
+    async fn pump_term_attach(
+        self: Arc<Self>,
+        rid: String,
+        peer: String,
+        attach: crate::terminal::TermAttach,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        let crate::terminal::TermAttach {
+            scrollback, mut rx, ..
+        } = attach;
+        let mut seq: u64 = 0;
+        let mut last_ok = std::time::Instant::now();
+        let mut last_warn = std::time::Instant::now() - WARN_EVERY;
+
+        // Replay the current screen to *this* viewer before the live stream.
+        if !scrollback.is_empty() {
+            for frame in TermFrame::data_frames(&rid, seq, &scrollback, MAX_TERM_DATA_BYTES) {
+                seq = frame.seq + 1;
+                if let Ok(payload) = serde_json::to_value(&frame) {
+                    let _ = self.send_media_value(&peer, payload).await;
+                }
+            }
+        }
+
+        loop {
+            let msg = match rx.recv().await {
+                Ok(msg) => msg,
+                // A slow attacher fell behind the broadcast ring — output is
+                // live media, so skip ahead rather than wedge the shell.
+                Err(RecvError::Lagged(n)) => {
+                    tracing::debug!("terminal {rid} — viewer lagged {n} chunks; skipping ahead");
+                    continue;
+                }
+                // The session ended (shell exited / closed) — end this pump.
+                Err(RecvError::Closed) => return,
+            };
+            // This viewer detached (closed its tab, or its route was torn
+            // down) — stop pumping to it. The shell lives on for the other
+            // attachers; the last one leaving arms the idle reaper. Checked
+            // here so a closed viewer's pump never keeps streaming to a dead
+            // route.
+            if !self.terminal.is_attached(&rid) {
+                return;
+            }
+            match msg {
+                OutMsg::Data(bytes) => {
+                    for frame in TermFrame::data_frames(&rid, seq, &bytes, MAX_TERM_DATA_BYTES) {
+                        seq = frame.seq + 1;
+                        let Ok(payload) = serde_json::to_value(&frame) else {
+                            continue;
+                        };
+                        match self.send_media_value(&peer, payload).await {
+                            Ok(()) => last_ok = std::time::Instant::now(),
+                            Err(e) => {
+                                if last_warn.elapsed() >= WARN_EVERY {
+                                    last_warn = std::time::Instant::now();
+                                    tracing::warn!(
+                                        "terminal output to {} failed: {e}",
+                                        short_id(&peer)
+                                    );
+                                }
+                                // Nothing else reaps a session whose viewer
+                                // silently vanished (peer drops never reach
+                                // the session) — the pump is the watchdog.
+                                // Detach this viewer only; the shell lives on
+                                // for the other attachers (or a re-attach
+                                // that replays scrollback), never killed
+                                // because one viewer's link blipped.
+                                if last_ok.elapsed() > TERM_SEND_PATIENCE {
+                                    tracing::warn!(
+                                        "terminal {rid} — viewer unreachable; detaching (shell kept for reattach)"
+                                    );
+                                    self.terminal.detach(&rid);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                OutMsg::Resize { cols, rows } => {
+                    // The shared PTY's authoritative size changed — tell this
+                    // viewer so it renders (letterboxes) to the one shell's
+                    // size and its wrapping matches everyone else's.
+                    let frame = TermFrame::new(&rid, seq, TermEvent::Resize { cols, rows });
+                    seq += 1;
+                    if let Ok(payload) = serde_json::to_value(&frame) {
+                        let _ = self.send_media_value(&peer, payload).await;
+                    }
+                }
+                OutMsg::Exit(code) => {
+                    tracing::info!("terminal {rid} — shell ended ({code:?})");
+                    let frame = TermFrame::new(&rid, seq, TermEvent::Exit { code });
+                    if let Ok(payload) = serde_json::to_value(&frame) {
+                        let _ = self.send_media_value(&peer, payload).await;
+                    }
+                    // The shell ended for *everyone* on this session — tear
+                    // this viewer's route down. Other attachers' pumps see
+                    // the same `Exit`/`Closed` and end on their own.
+                    let _ = self.disconnect(rid.clone()).await;
+                    return;
+                }
             }
         }
     }
@@ -2922,16 +3138,66 @@ impl Mesh {
             });
             return;
         }
+        // One pump per route, exactly as the remote host path: a duplicate
+        // local `StartMedia` must not spawn a second loopback pump onto this
+        // route (which would double the window's output). First start wins.
+        if !self.term_pumps.lock().insert(rid.clone()) {
+            tracing::debug!(
+                "route {rid} — local terminal pump already running; ignoring duplicate"
+            );
+            return;
+        }
         // Buffer output from the very first byte — the shell's prompt is
         // produced right after Accept, before the window has subscribed, and
         // a dropped terminal byte never heals.
         self.terminal.ensure_queue(&rid);
-        match self.terminal.spawn(&rid) {
-            Ok(mut out_rx) => {
-                tracing::info!("route {rid} active — local terminal on this machine");
+        // The session this local window asked to attach to: `Some(id)` lets
+        // two local windows share one local shell (multi-attach to yourself),
+        // `None` mints a fresh one — the same session model as the remote
+        // host path, just feeding the local queue instead of the mesh.
+        let requested = self.requested_term_session(&rid);
+        match self
+            .terminal
+            .open(requested.as_deref(), &rid, TERM_INIT_COLS, TERM_INIT_ROWS)
+        {
+            Ok(attach) => {
+                let session_id = attach.session_id.clone();
+                tracing::info!(
+                    "route {rid} active — local terminal session {session_id} ({})",
+                    if attach.created {
+                        "new shell"
+                    } else {
+                        "attached"
+                    },
+                );
+                // Record the resolved id locally so a snapshot surfaces it
+                // (the loopback UI shows the same "shared with N" line); there
+                // is no peer to Accept back to.
+                {
+                    let mut st = self.state.lock();
+                    if let Some(s) = st.session.as_mut() {
+                        s.set_term_session(&rid, session_id.clone());
+                    }
+                }
+                self.emit_snapshot();
+                let crate::terminal::TermAttach {
+                    scrollback, mut rx, ..
+                } = attach;
+                // Replay the current screen into this window's queue first
+                // (an attach to an already-running local shell paints it),
+                // then pump the shared broadcast in.
+                if !scrollback.is_empty() && self.terminal.enqueue(&rid, scrollback) {
+                    self.sink.emit("allmystuff://term-ready", json!(rid));
+                }
                 let mesh = self.clone();
                 crate::spawn(async move {
-                    while let Some(msg) = out_rx.recv().await {
+                    use tokio::sync::broadcast::error::RecvError;
+                    loop {
+                        let msg = match rx.recv().await {
+                            Ok(msg) => msg,
+                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
+                        };
                         match msg {
                             OutMsg::Data(bytes) => {
                                 // Straight into the local viewer queue. A
@@ -2942,6 +3208,14 @@ impl Mesh {
                                     mesh.sink.emit("allmystuff://term-ready", json!(rid));
                                 }
                             }
+                            OutMsg::Resize { cols, rows } => {
+                                // Two local windows sharing one shell: tell this
+                                // window the shared size so it letterboxes to it.
+                                mesh.sink.emit(
+                                    "allmystuff://term-resize",
+                                    json!({ "route": rid, "cols": cols, "rows": rows }),
+                                );
+                            }
                             OutMsg::Exit(code) => {
                                 tracing::info!("local terminal {rid} — shell ended ({code:?})");
                                 mesh.sink.emit(
@@ -2949,15 +3223,17 @@ impl Mesh {
                                     json!({ "route": rid, "code": code }),
                                 );
                                 let _ = mesh.disconnect(rid.clone()).await;
-                                return;
+                                break;
                             }
                         }
                     }
-                    // Stream closed without an Exit: `stop` ran (teardown
-                    // already in motion) — nothing left to do.
+                    // Pump ended — release the route so a fresh start can pump.
+                    mesh.term_pumps.lock().remove(&rid);
                 });
             }
             Err(e) => {
+                // The shell never opened — release the route we just claimed.
+                self.term_pumps.lock().remove(&rid);
                 // Render the failure to the window in its own terms — a line
                 // of text, then the exit — then tear the route down.
                 tracing::warn!("route {rid} — local shell didn't start: {e}");
@@ -2973,6 +3249,24 @@ impl Mesh {
                 crate::spawn(async move {
                     let _ = mesh.disconnect(rid).await;
                 });
+            }
+        }
+    }
+
+    /// Whether a terminal frame on `route` is fresh (record its seq and take
+    /// it) or a duplicate to drop — used both for output the viewer takes
+    /// (`term_rx_seq`) and input the host takes (`term_in_seq`). Each sending
+    /// side numbers a route's frames strictly increasing, so any seq at or
+    /// below the last we took is the same send arriving again over another
+    /// shared network (control and media ride them all). A forward jump (the
+    /// sender skipped ahead after a broadcast lag) is still fresh.
+    fn accept_term_seq(seqs: &Mutex<HashMap<String, u64>>, route: &str, seq: u64) -> bool {
+        let mut seqs = seqs.lock();
+        match seqs.get(route) {
+            Some(&last) if seq <= last => false,
+            _ => {
+                seqs.insert(route.to_string(), seq);
+                true
             }
         }
     }
@@ -3012,6 +3306,14 @@ impl Mesh {
                 tracing::warn!("dropped terminal input from {from}: not an authorized controller");
                 return;
             }
+            // Drop a duplicate keystroke/resize: the viewer numbers its
+            // outbound frames strictly increasing, so a seq we've already
+            // applied is the same send redelivered on another shared network.
+            // Without this the PTY is written N times and the shell echoes
+            // `aaaa` for one keypress.
+            if !Self::accept_term_seq(&self.term_in_seq, &frame.route, frame.seq) {
+                return;
+            }
             match frame.event {
                 TermEvent::Data { bytes } => {
                     let _ = self.terminal.write(&frame.route, bytes);
@@ -3027,6 +3329,13 @@ impl Mesh {
                 TermEvent::Unknown => {}
             }
         } else if views_here {
+            // Drop a duplicate delivery (see `accept_term_seq`): the same send
+            // arriving again over another shared network. Without this the
+            // window paints every byte — and the shell appears to echo every
+            // keystroke — once per shared network: the doubled/tripled terminal.
+            if !Self::accept_term_seq(&self.term_rx_seq, &frame.route, frame.seq) {
+                return;
+            }
             match frame.event {
                 TermEvent::Data { bytes } => {
                     if self.terminal.enqueue(&frame.route, bytes) {
@@ -3043,7 +3352,14 @@ impl Mesh {
                         json!({ "route": frame.route, "code": code }),
                     );
                 }
-                TermEvent::Resize { .. } => {}
+                TermEvent::Resize { cols, rows } => {
+                    // The host's authoritative shared size — the window renders
+                    // (letterboxes) to it so its wrapping matches the one shell.
+                    self.sink.emit(
+                        "allmystuff://term-resize",
+                        json!({ "route": frame.route, "cols": cols, "rows": rows }),
+                    );
+                }
                 // A terminal event a newer host introduced — ignore it.
                 TermEvent::Unknown => {}
             }
@@ -3134,6 +3450,67 @@ impl Mesh {
     /// the window on each `allmystuff://term-ready` poke or safety poll.
     pub fn term_poll(&self, route_id: &str) -> Vec<u8> {
         self.terminal.poll(route_id)
+    }
+
+    /// Front-end command: ask `node` for its open terminal sessions so the
+    /// picker can offer to *attach* to one (multi-attach) instead of always
+    /// minting a new shell. For a remote machine this fires a
+    /// [`RouteControl::TerminalSessionsRequest`]; the host's answer arrives
+    /// asynchronously as an `allmystuff://terminal-sessions` event. For the
+    /// **local** machine there's no peer to ask — we answer at once from our
+    /// own [`TerminalHost`], returning the list directly (and `None` for a
+    /// remote ask, whose reply rides the event). Gated owner/fleet exactly
+    /// like opening a terminal — the host re-checks it too.
+    pub async fn request_terminal_sessions(
+        self: &Arc<Self>,
+        node: String,
+    ) -> Result<Option<Vec<TerminalSessionInfo>>, String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        if pubkey_part(&node) == pubkey_part(&me) {
+            // Our own shells — answer straight from the local host.
+            return Ok(Some(self.terminal_session_infos()));
+        }
+        self.send_control(
+            &node,
+            &ControlMessage::Route(RouteControl::TerminalSessionsRequest),
+        )
+        .await?;
+        Ok(None)
+    }
+
+    /// The local terminal host's open sessions in the protocol's wire shape.
+    fn terminal_session_infos(&self) -> Vec<TerminalSessionInfo> {
+        self.terminal
+            .list_sessions()
+            .into_iter()
+            .map(|s| TerminalSessionInfo {
+                session_id: s.session_id,
+                title: s.title,
+                created_unix: s.created_unix,
+                attachers: s.attachers,
+            })
+            .collect()
+    }
+
+    /// Answer a viewer's [`RouteControl::TerminalSessionsRequest`]: reply on
+    /// the control channel with this host's open terminal sessions — gated by
+    /// the same owner/fleet check the terminal host itself uses, so a
+    /// stranger on the mesh can't even enumerate our shells.
+    async fn handle_terminal_sessions_request(self: &Arc<Self>, from: &str) {
+        if !self.sender_may_control(from) {
+            tracing::warn!(
+                "terminal-sessions request from {} ignored: not owner/fleet",
+                short_id(from)
+            );
+            return;
+        }
+        let sessions = self.terminal_session_infos();
+        let _ = self
+            .send_control(
+                from,
+                &ControlMessage::Route(RouteControl::TerminalSessions { sessions }),
+            )
+            .await;
     }
 
     /// One inbound file frame. Which side we are comes from the route
@@ -4947,6 +5324,136 @@ mod tests {
 
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("spawned task should run on the registered runtime");
+    }
+
+    /// Two routes attaching to one terminal session — the multi-attach
+    /// contract the mesh now drives — both see the shell's output, either can
+    /// type into the one shell, and the host's session list reports them as a
+    /// single shared session. This drives the same [`TerminalHost::open`] the
+    /// `start_terminal_host` pump uses (without needing a live daemon), so it
+    /// guards the mesh's view of sharing end to end.
+    #[cfg(unix)]
+    #[test]
+    fn two_routes_share_one_session_through_the_host() {
+        use crate::terminal::OutMsg;
+        use std::time::{Duration, Instant};
+
+        // The mesh's idle reaper / spawns need a runtime registered.
+        let rt = tokio::runtime::Runtime::new().expect("build runtime");
+        crate::set_runtime(rt.handle().clone());
+        std::mem::forget(rt);
+
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+
+        // First route creates the session; second attaches to the same id —
+        // exactly what an Offer carrying `session: Some(id)` resolves to.
+        let a = mesh
+            .terminal
+            .open(Some("shared"), "routeA", 80, 24)
+            .expect("create session");
+        assert!(a.created, "first open creates the session");
+        let b = mesh
+            .terminal
+            .open(Some("shared"), "routeB", 80, 24)
+            .expect("attach to session");
+        assert!(!b.created, "second open attaches to the shared session");
+
+        // The host's picker list reports one shared session with two viewers.
+        let infos = mesh.terminal_session_infos();
+        let shared = infos
+            .iter()
+            .find(|s| s.session_id == "shared")
+            .expect("session listed");
+        assert_eq!(shared.attachers, 2, "both routes counted as attachers");
+
+        // Either route can type into the one shell, and both pumps see it.
+        let mut rxa = a.rx;
+        let mut rxb = b.rx;
+        assert!(mesh.terminal.write("routeB", b"echo via-B\n".to_vec()));
+
+        let saw = |rx: &mut tokio::sync::broadcast::Receiver<OutMsg>, needle: &str| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            while Instant::now() < deadline {
+                match rx.try_recv() {
+                    Ok(OutMsg::Data(b)) => {
+                        seen.extend_from_slice(&b);
+                        if String::from_utf8_lossy(&seen).contains(needle) {
+                            return true;
+                        }
+                    }
+                    Ok(OutMsg::Resize { .. }) => {}
+                    Ok(OutMsg::Exit(_)) => return false,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+        assert!(saw(&mut rxa, "via-B"), "route A sees route B's input");
+        assert!(saw(&mut rxb, "via-B"), "route B sees its own echo");
+
+        // Detaching one viewer keeps the shell alive for the other.
+        mesh.terminal.detach("routeA");
+        assert_eq!(
+            mesh.terminal_session_infos()
+                .iter()
+                .find(|s| s.session_id == "shared")
+                .map(|s| s.attachers),
+            Some(1),
+            "session survives one detach with the remaining attacher",
+        );
+        mesh.terminal.close("shared");
+    }
+
+    #[test]
+    fn dedup_collapses_duplicate_terminal_frames_by_seq() {
+        // The dedup that collapses a frame delivered on several shared
+        // networks back to one (both directions): the sending side numbers a
+        // route's frames strictly increasing, so a seq already taken is a
+        // duplicate. A different route, and the other direction's map, each
+        // keep an independent counter.
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let out = &mesh.term_rx_seq;
+        let inp = &mesh.term_in_seq;
+
+        assert!(Mesh::accept_term_seq(out, "r", 0), "first frame is fresh");
+        assert!(
+            !Mesh::accept_term_seq(out, "r", 0),
+            "same seq again is a duplicate"
+        );
+        assert!(Mesh::accept_term_seq(out, "r", 1), "the next seq is fresh");
+        assert!(
+            !Mesh::accept_term_seq(out, "r", 1),
+            "and its duplicate drops"
+        );
+        assert!(
+            !Mesh::accept_term_seq(out, "r", 0),
+            "an older straggler drops too"
+        );
+        assert!(Mesh::accept_term_seq(out, "r", 2), "advancing is fresh");
+        assert!(
+            Mesh::accept_term_seq(out, "r", 9),
+            "a forward jump (sender skipped after a lag) is still fresh"
+        );
+        assert!(
+            Mesh::accept_term_seq(out, "other", 0),
+            "a different route has its own independent counter"
+        );
+        // The input map (host taking keystrokes) is wholly independent of the
+        // output map — the same route+seq is fresh again here.
+        assert!(
+            Mesh::accept_term_seq(inp, "r", 0),
+            "input dedup is independent of output dedup"
+        );
+        assert!(
+            !Mesh::accept_term_seq(inp, "r", 0),
+            "but still drops its own duplicates"
+        );
     }
 
     #[test]
