@@ -7,12 +7,15 @@ import type {
   Capability,
   CheckOutcome,
   FileEvent,
+  Grant,
   RoomWireMessage,
   IdentityInfo,
   InputAction,
   InventorySummary,
   ListeningService,
   MediaKind,
+  Person,
+  Share,
   NetworkConfigFull,
   NetworkSummary,
   OwnedRoster,
@@ -75,6 +78,10 @@ export interface SessionSnapshot {
      *  an older peer. */
     term_session?: string | null;
   }>;
+  /** Durable share relationships (person + unioned grants) the node has on
+   *  disk, so the GUI reclassifies a peer as *shared* with its grants across
+   *  a restart. Absent — nothing shared yet — is empty. */
+  shares?: Share[];
 }
 
 export function isTauri(): boolean {
@@ -203,6 +210,30 @@ export async function claimNode(node: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("claim_node", { node });
+}
+
+/** Persist an outbound grant to a person so it survives a restart — what
+ *  they may do with my stuff. The node is the durable source of truth; the
+ *  next session snapshot reflects it. No-op in web mode (the store keeps the
+ *  grant in its in-memory catalog). */
+export async function shareGrant(person: Person, node: string, grant: Grant): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("share_grant", { person, node, grant });
+}
+
+/** Revoke a grant by its (content-derived) id from a person's durable share. */
+export async function shareRevoke(person: string, grantId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("share_revoke", { person, grantId });
+}
+
+/** Stop sharing with a person entirely — drop the whole durable record. */
+export async function shareStop(person: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("share_stop", { person });
 }
 
 /** Ask one of your fleet machines to update its AllMyStuff to the channel's

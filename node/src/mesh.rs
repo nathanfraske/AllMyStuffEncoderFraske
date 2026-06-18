@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::UiSink;
 
-use allmystuff_graph::{MediaKind, NodeId, Route};
+use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request,
     RoomMessage, RouteControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo,
@@ -45,6 +45,7 @@ use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
@@ -126,6 +127,11 @@ pub struct Mesh {
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
+    /// Durable share relationships — who I share with and the grants in each
+    /// direction. Node-owned (enforcement lives here), persisted beside the
+    /// ownership record, and projected into [`Mesh::snapshot`] so the GUI
+    /// renders a peer as *shared* with its grants across a restart.
+    shares: Arc<Shares>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel. Bounded like video: a stalled
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
@@ -354,6 +360,7 @@ impl Mesh {
                 profile: None,
             }),
             ownership: Arc::new(Ownership::load()),
+            shares: Arc::new(Shares::load()),
             audio_out,
             video_out,
             audio_rx: Mutex::new(Some(audio_rx)),
@@ -1744,12 +1751,17 @@ impl Mesh {
         let network = st.network.clone();
         let peers: Vec<_> = session.peers().collect();
         let routes: Vec<_> = session.routes().collect();
+        // Durable shares (person + unioned grants) so the GUI reclassifies a
+        // peer as *shared* with its grants across a restart, rather than
+        // forgetting them and defaulting to unclaimed.
+        let shares = self.shares.shares();
         json!({
             "ready": true,
             "me": me,
             "network": network,
             "peers": peers,
             "routes": routes,
+            "shares": shares,
         })
     }
 
@@ -1759,6 +1771,29 @@ impl Mesh {
             .session
             .as_ref()
             .and_then(|s| s.route(route_id).map(|r| r.peer.to_string()))
+    }
+
+    // ---- shares (durable, person-scoped grants) -----------------------
+    //
+    // The GUI resolves the person + node and hands them down; the node is the
+    // source of truth (enforcement lives here) and the next [`Mesh::snapshot`]
+    // reflects the change. The wire negotiation (telling the peer) lands in a
+    // later phase — these just persist *my* policy so it survives a restart.
+
+    /// Record an **outbound** grant — what this person may do with my stuff —
+    /// and persist it.
+    pub fn share_grant(&self, person: Person, node: NodeId, grant: Grant) {
+        self.shares.grant(&person, &node, grant);
+    }
+
+    /// Revoke a grant by its (content-derived) id from a person's share.
+    pub fn share_revoke(&self, person: PersonId, grant_id: String) {
+        self.shares.revoke(&person, &grant_id);
+    }
+
+    /// Stop sharing with a person entirely — drop the whole durable record.
+    pub fn share_stop(&self, person: PersonId) {
+        self.shares.stop_sharing(&person);
     }
 
     async fn process_effects(self: &Arc<Self>, effects: Vec<Effect>) {

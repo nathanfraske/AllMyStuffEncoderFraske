@@ -22,6 +22,7 @@ use std::sync::Arc;
 // The node engine used to be these modules right here; it now lives in the
 // `allmystuff-node` crate so `allmystuff serve` can run it headless. This
 // shell links the same code and supplies a Tauri-backed `UiSink`.
+use allmystuff_graph::{Grant, Person};
 use allmystuff_node::control_client::{ControlClient, Request, Response};
 use allmystuff_node::mesh::Mesh;
 use allmystuff_node::{daemon_spawn, networks_store, video, UiSink};
@@ -155,6 +156,27 @@ async fn upgrade_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), St
 #[tauri::command]
 async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bool, String> {
     mesh.inner().set_claimable(claimable).await
+}
+
+/// Persist an outbound grant to a person — what they may do with my stuff —
+/// so it survives a restart. The GUI resolves the person and the node the
+/// grant is recorded against; the node is the durable source of truth and the
+/// next snapshot reflects it.
+#[tauri::command]
+fn share_grant(mesh: State<'_, Arc<Mesh>>, person: Person, node: String, grant: Grant) {
+    mesh.inner().share_grant(person, node.into(), grant);
+}
+
+/// Revoke a grant by its (content-derived) id from a person's durable share.
+#[tauri::command]
+fn share_revoke(mesh: State<'_, Arc<Mesh>>, person: String, grant_id: String) {
+    mesh.inner().share_revoke(person.into(), grant_id);
+}
+
+/// Stop sharing with a person entirely — drop the whole durable record.
+#[tauri::command]
+fn share_stop(mesh: State<'_, Arc<Mesh>>, person: String) {
+    mesh.inner().share_stop(person.into());
 }
 
 /// Forward one keyboard/mouse event down an active outbound input route —
@@ -1306,6 +1328,9 @@ fn main() {
             claim_node,
             upgrade_node,
             set_claimable,
+            share_grant,
+            share_revoke,
+            share_stop,
             send_input,
             clipboard_paste,
             video_watch,

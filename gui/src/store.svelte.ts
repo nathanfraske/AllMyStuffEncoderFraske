@@ -12,6 +12,7 @@ import {
   proposeRoomRoute,
   proposeRoute,
   requiredGrants,
+  scopedGrantId,
   type GrantRequest,
 } from "./catalog";
 import { demoCatalog } from "./mock";
@@ -36,6 +37,9 @@ import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
   claimNode,
+  shareGrant,
+  shareRevoke,
+  shareStop,
   clientLog,
   closeThisWindow,
   connectRoute,
@@ -160,6 +164,7 @@ import {
   type RoomWireMessage,
   type RosterPeer,
   type Route,
+  type Share,
   type SharedEntry,
   type SharedFileMeta,
   type TerminalSessionInfo,
@@ -221,7 +226,6 @@ function sameMachine(a: string, b: string): boolean {
 }
 
 let seq = 0;
-const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 
 /** localStorage key for this device's rooms list. */
 const ROOMS_STORE_KEY = "allmystuff.rooms.v1";
@@ -1259,6 +1263,7 @@ class AppStore {
       this.startConsoleAutoLegs();
     }
 
+    this.applyDurableShares(snap.shares ?? []);
     this.reconcileFleetRelationships();
     this.reconcileShares();
   }
@@ -4860,6 +4865,24 @@ class AppStore {
     }
   }
 
+  /** Re-hydrate the durable shares the node persisted: any peer whose owner
+   *  is a share partner on disk is reclassified *shared* with that person's
+   *  grants, so a restart remembers what you shared instead of forgetting it
+   *  and defaulting the peer to unclaimed. The node is the source of truth;
+   *  this never overrides a device you own. */
+  private applyDurableShares(shares: Share[]) {
+    if (!shares.length) return;
+    const byPerson = new Map(shares.map((s) => [s.person.id, s]));
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this" || this.isMe(n.id)) continue;
+      if (n.relationship.kind === "mine") continue;
+      const share = byPerson.get(this.personFor(n).id);
+      if (share) {
+        n.relationship = { kind: "shared", person: share.person, grants: [...share.grants] };
+      }
+    }
+  }
+
   /** Everyone you're sharing with, one entry per person/fleet: their
    *  nodes and every grant you've given them (with the node each grant is
    *  recorded on). Drives the Sharing settings pane. */
@@ -4887,6 +4910,7 @@ class AppStore {
         n.relationship = { kind: "unclaimed" };
       }
     }
+    void shareStop(personId).catch(() => {});
     this.reauthorize();
     if (name) this.toast("info", `Stopped sharing with ${name}`);
   }
@@ -4894,25 +4918,32 @@ class AppStore {
   grant(nodeId: string, grant: Grant) {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
-    const pid = n.relationship.person.id;
+    const person = n.relationship.person;
     // De-dupe by (media, role, capability) across the *person* — a grant
     // authorizes them wherever it happens to be recorded.
     const exists = this.catalog.nodes.some(
       (x) =>
         x.relationship.kind === "shared" &&
-        x.relationship.person.id === pid &&
+        x.relationship.person.id === person.id &&
         x.relationship.grants.some(
           (g) =>
             g.media === grant.media && g.role === grant.role && g.capability === grant.capability,
         ),
     );
-    if (!exists) n.relationship.grants.push(grant);
+    if (!exists) {
+      n.relationship.grants.push(grant);
+      // Persist to the node — the durable source of truth, so the grant
+      // survives a restart (no-op in web mode).
+      void shareGrant(person, nodeId, grant).catch(() => {});
+    }
   }
 
   revokeGrant(nodeId: string, grantId: string) {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
+    const personId = n.relationship.person.id;
     n.relationship.grants = n.relationship.grants.filter((g) => g.id !== grantId);
+    void shareRevoke(personId, grantId).catch(() => {});
     this.reauthorize();
     this.toast("info", "Permission removed");
   }
@@ -4946,7 +4977,9 @@ class AppStore {
 
 function requestToGrant(req: GrantRequest): Grant {
   return {
-    id: newId("grant"),
+    // Content-derived, stable id (mirrors Grant::scoped on the Rust side) so
+    // the grant persists, de-dupes, and revokes by the same id on both ends.
+    id: scopedGrantId(req.person, req.media, req.role, req.capability),
     media: req.media,
     role: req.role,
     capability: req.capability,
