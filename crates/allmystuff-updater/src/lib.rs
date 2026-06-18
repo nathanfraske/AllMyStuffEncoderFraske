@@ -4,9 +4,18 @@
 //! like `myownmesh update`, but self-contained — it keeps its own state
 //! under `~/.allmystuff/` and never links the mesh engine.
 //!
-//! Two binaries move in lockstep: the `allmystuff` CLI and the
-//! `allmystuff-gui` desktop app, shipped as
-//! `allmystuff[-gui]-<platform>.{tar.gz,zip}` with a `.sha256` sidecar.
+//! **Three** binaries move in lockstep, the same trio the installer drops
+//! side by side, each shipped as `<stem>-<platform>.{tar.gz,zip}` with a
+//! `.sha256` sidecar:
+//!
+//!   * `allmystuff`        — the CLI launcher (the running binary here);
+//!   * `allmystuff-gui`     — the desktop app a bare `allmystuff` opens;
+//!   * `allmystuff-serve`   — the node engine that carries the whole
+//!     mesh/media stack. This is the half that actually runs a machine on
+//!     the mesh *and the one that advertises this node's version to peers*
+//!     (`node`'s `CARGO_PKG_VERSION`), so leaving it behind is what makes an
+//!     "update" look like it did nothing.
+//!
 //! The flow is **stage now, apply on next launch**:
 //!
 //!   1. [`check_now`] / [`update_now`] fetch the release feed, compare
@@ -14,6 +23,13 @@
 //!      extract them into `~/.allmystuff/updates/<version>/`.
 //!   2. [`apply_pending_if_any`] (called first thing in `main`) atomically
 //!      renames the staged binaries over the installed ones.
+//!
+//! The CLI is the required half: if its swap fails, the staged marker is
+//! **kept** and the error surfaced so the next launch retries rather than
+//! reporting a phantom success. The GUI and node halves are best-effort —
+//! a host without one installed just updates the others. Each half carries
+//! its own downgrade guard so a stale marker can never roll a binary back,
+//! and so a half that lagged a previous partial update catches up.
 //!
 //! Package-manager installs (Homebrew, dpkg/apt, MSI) are detected and
 //! left to the OS updater.
@@ -263,20 +279,35 @@ fn current_version() -> &'static str {
 enum ArtifactKind {
     Cli,
     Gui,
+    Serve,
 }
+
+/// Every artifact a release ships, in apply order (the required CLI first).
+const ALL_ARTIFACTS: [ArtifactKind; 3] =
+    [ArtifactKind::Cli, ArtifactKind::Gui, ArtifactKind::Serve];
 
 impl ArtifactKind {
     fn as_str(self) -> &'static str {
         match self {
             ArtifactKind::Cli => "cli",
             ArtifactKind::Gui => "gui",
+            ArtifactKind::Serve => "serve",
         }
     }
-    /// Release-asset stem — `allmystuff` / `allmystuff-gui`.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cli" => Some(ArtifactKind::Cli),
+            "gui" => Some(ArtifactKind::Gui),
+            "serve" => Some(ArtifactKind::Serve),
+            _ => None,
+        }
+    }
+    /// Release-asset stem — `allmystuff` / `allmystuff-gui` / `allmystuff-serve`.
     fn asset_stem(self) -> &'static str {
         match self {
             ArtifactKind::Cli => "allmystuff",
             ArtifactKind::Gui => "allmystuff-gui",
+            ArtifactKind::Serve => "allmystuff-serve",
         }
     }
     fn bin_name(self) -> &'static str {
@@ -284,10 +315,27 @@ impl ArtifactKind {
             match self {
                 ArtifactKind::Cli => "allmystuff.exe",
                 ArtifactKind::Gui => "allmystuff-gui.exe",
+                ArtifactKind::Serve => "allmystuff-serve.exe",
             }
         } else {
             self.asset_stem()
         }
+    }
+    /// Env var that pins this binary's installed location (mirrors the CLI
+    /// launcher / `allmystuff serve`), or `None` for the CLI, which is always
+    /// the running exe or its sibling.
+    fn bin_env_override(self) -> Option<&'static str> {
+        match self {
+            ArtifactKind::Cli => None,
+            ArtifactKind::Gui => Some("ALLMYSTUFF_GUI_BIN"),
+            ArtifactKind::Serve => Some("ALLMYSTUFF_SERVE_BIN"),
+        }
+    }
+    /// The CLI is the half whose failure must not be swallowed — it's the
+    /// running binary and the one a bare `allmystuff` launches everything
+    /// else from. The GUI/node halves are best-effort.
+    fn is_required(self) -> bool {
+        matches!(self, ArtifactKind::Cli)
     }
 }
 
@@ -295,19 +343,50 @@ impl ArtifactKind {
 // Apply (runs at process start, or on demand).
 // ---------------------------------------------------------------------------
 
-/// Apply any staged update before real work starts. Idempotent; errors are
-/// logged and swallowed so an update problem never blocks boot. Call first
-/// in `main`.
+/// Apply any staged update before real work starts. Idempotent; a
+/// best-effort (GUI/node) failure is logged and swallowed so an update
+/// problem never blocks boot, but a failed *CLI* swap leaves the marker in
+/// place to retry next launch. Call this first in `main`.
 pub fn apply_pending_if_any() {
+    cleanup_old_replaced_binaries();
     if let Err(e) = apply_pending() {
         tracing::warn!("self-update apply skipped: {e}");
     }
 }
 
 /// Apply a staged update now, surfacing the applied version (the swap is on
-/// disk; it takes effect on next start), or `None` if nothing was pending.
+/// disk; it takes effect on next start), or `None` if nothing was pending
+/// (or nothing still needed applying). Errors only when the required CLI
+/// half couldn't be swapped — the marker is kept so a retry can succeed.
 pub fn apply_now() -> Result<Option<String>> {
+    cleanup_old_replaced_binaries();
     apply_pending()
+}
+
+/// One staged artifact parsed out of `pending.json`: a kind plus the path to
+/// the archive (or, legacy, the bare binary) it was downloaded to.
+struct StagedArtifact {
+    kind: ArtifactKind,
+    archive: PathBuf,
+}
+
+fn parse_pending_artifacts(doc: &serde_json::Value) -> Vec<StagedArtifact> {
+    let mut out = Vec::new();
+    if let Some(arts) = doc["artifacts"].as_array() {
+        for art in arts {
+            let Some(kind) = art["kind"].as_str().and_then(ArtifactKind::parse) else {
+                continue;
+            };
+            let Some(path) = art["path"].as_str() else {
+                continue;
+            };
+            out.push(StagedArtifact {
+                kind,
+                archive: PathBuf::from(path),
+            });
+        }
+    }
+    out
 }
 
 fn apply_pending() -> Result<Option<String>> {
@@ -318,27 +397,41 @@ fn apply_pending() -> Result<Option<String>> {
     let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
     let target_version = doc["version"].as_str().unwrap_or("?").to_string();
 
-    // Downgrade guard: never roll back below what's installed.
-    if !version_is_newer(&target_version, installed_version().as_deref()) {
+    let mut artifacts = parse_pending_artifacts(&doc);
+    if artifacts.is_empty() {
+        // A marker that lists nothing usable is junk — clear it.
         let _ = std::fs::remove_file(&pending);
         return Ok(None);
     }
+    // CLI first (the required half), then GUI / node (best-effort).
+    artifacts.sort_by_key(|a| if a.kind.is_required() { 0 } else { 1 });
 
-    let mut applied = Vec::new();
-    if let Some(arts) = doc["artifacts"].as_array() {
-        for art in arts {
-            let kind = match art["kind"].as_str() {
-                Some("cli") => ArtifactKind::Cli,
-                Some("gui") => ArtifactKind::Gui,
-                _ => continue,
-            };
-            let Some(archive) = art["path"].as_str() else {
-                continue;
-            };
-            match apply_one(kind, Path::new(archive)) {
-                Ok(true) => applied.push(kind.as_str().to_string()),
-                Ok(false) => {}
-                Err(e) => tracing::warn!("self-update: {} apply skipped: {e}", kind.as_str()),
+    let mut applied: Vec<&'static str> = Vec::new();
+    for art in &artifacts {
+        // Per-artifact downgrade guard: only swap a half that's actually
+        // behind, so a stale marker can't roll one back and a half that
+        // lagged a previous partial update still catches up.
+        if !artifact_needs_apply(art.kind, &target_version) {
+            continue;
+        }
+        match apply_one(art) {
+            Ok(true) => {
+                applied.push(art.kind.as_str());
+                // Stamp the version we just installed for the half that has
+                // no version we can read back (the GUI/node binaries), so a
+                // later check knows they're current.
+                record_artifact_version(art.kind, &target_version);
+            }
+            // Nothing installed to replace (e.g. a staged GUI on a host that
+            // has no GUI) — not an error.
+            Ok(false) => {}
+            Err(e) => {
+                if art.kind.is_required() {
+                    // Keep the marker so the next launch retries rather than
+                    // silently dropping the update and reporting success.
+                    return Err(e);
+                }
+                tracing::warn!("self-update: {} apply skipped: {e}", art.kind.as_str());
             }
         }
     }
@@ -347,7 +440,6 @@ fn apply_pending() -> Result<Option<String>> {
     if applied.is_empty() {
         return Ok(None);
     }
-    record_installed_version(&target_version);
     tracing::info!(
         "self-update applied {target_version} ({})",
         applied.join("+")
@@ -355,84 +447,175 @@ fn apply_pending() -> Result<Option<String>> {
     Ok(Some(target_version))
 }
 
+/// Per-artifact downgrade guard. The CLI compares against its own running
+/// version; the GUI/node halves against the version stamp the updater last
+/// wrote for them (absent stamp ⇒ unknown ⇒ allow, so a half installed out
+/// of band by the shell installer is synced on the first update).
+fn artifact_needs_apply(kind: ArtifactKind, target_version: &str) -> bool {
+    match kind {
+        ArtifactKind::Cli => version_is_newer(target_version, Some(current_version())),
+        _ => version_is_newer(target_version, installed_artifact_version(kind).as_deref()),
+    }
+}
+
 /// Swap one staged artifact over its installed counterpart. `Ok(false)`
 /// when there's nothing installed to replace (e.g. a staged GUI on a
 /// CLI-only host).
-fn apply_one(kind: ArtifactKind, archive: &Path) -> Result<bool> {
-    let Some(target) = installed_path(kind) else {
+fn apply_one(art: &StagedArtifact) -> Result<bool> {
+    let Some(target) = installed_path(art.kind) else {
         return Ok(false);
     };
-    let staged_dir = archive
+    let staged_dir = art
+        .archive
         .parent()
         .ok_or_else(|| Error::msg("staged archive has no parent"))?;
-    let binary = extract_binary(archive, staged_dir, kind.bin_name())?;
+    let binary = extract_binary(&art.archive, staged_dir, art.kind.bin_name())?;
     atomic_replace(&binary, &target)?;
     Ok(true)
 }
 
-/// Where an artifact is installed. The running binary for its own kind;
-/// a same-directory sibling for the other (the layout the release bundle
-/// installs both halves in).
+/// Where an artifact is installed, mirroring the CLI launcher's discovery
+/// (env override → running exe / sibling → `PATH`). Returns `None` when the
+/// host doesn't have that half (a headless box with no GUI, say), or when it
+/// lives in an OS bundle we shouldn't touch.
 fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
-    let current = std::env::current_exe().ok()?;
-    let running_is = current
-        .file_name()
-        .map(|n| n.to_string_lossy() == kind.bin_name())
-        .unwrap_or(false);
-    if running_is {
-        return Some(current);
+    let current = std::env::current_exe().ok();
+
+    // The kind matching the running binary is that binary itself.
+    if let Some(cur) = &current {
+        if cur
+            .file_name()
+            .map(|n| n.to_string_lossy() == kind.bin_name())
+            .unwrap_or(false)
+        {
+            return Some(cur.clone());
+        }
     }
-    let sibling = current.parent()?.join(kind.bin_name());
-    sibling.exists().then_some(sibling)
+    // Explicit override (e.g. ALLMYSTUFF_SERVE_BIN).
+    if let Some(var) = kind.bin_env_override() {
+        if let Some(p) = std::env::var_os(var) {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    // Sibling of the running binary — the layout the installer drops the
+    // whole trio in.
+    if let Some(sibling) = current
+        .as_ref()
+        .and_then(|c| c.parent())
+        .map(|d| d.join(kind.bin_name()))
+    {
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    // On PATH.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(kind.bin_name());
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
-/// Atomically replace `target` with `staged`. Same-dir temp + rename so the
-/// swap is atomic on the target's filesystem; on Windows a running exe is
-/// moved aside first.
+/// Atomically replace `target` with `staged`. A same-dir temp + rename keeps
+/// the swap atomic on the target's filesystem. Unix can rename over a running
+/// executable (the live process keeps its old inode); Windows can't, so the
+/// running binary is side-renamed to `<name>.old` (which Windows *does* allow
+/// while it's mapped) and rolled back if the swap-in then fails.
 fn atomic_replace(staged: &Path, target: &Path) -> Result<()> {
     let dir = target
         .parent()
         .ok_or_else(|| Error::msg("target has no parent dir"))?;
-    let tmp = dir.join(format!(
-        ".{}.new",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("allmystuff")
-    ));
-    std::fs::copy(staged, &tmp)?;
-    copy_exec_perms(target, &tmp);
+    let tmp = dir.join(format!(".allmystuff-update-{}.tmp", std::process::id()));
+    std::fs::copy(staged, &tmp).map_err(|e| {
+        Error::msg(format!(
+            "cannot copy staged binary into {}: {e}",
+            dir.display()
+        ))
+    })?;
+    set_exec_perms(&tmp);
 
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&tmp, target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        Ok(())
+    }
     #[cfg(windows)]
     {
-        // Can't overwrite a running/locked exe; move it aside first.
-        let old = dir.join(format!(
-            ".{}.old",
-            target
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("allmystuff")
-        ));
-        let _ = std::fs::remove_file(&old);
-        if target.exists() {
-            let _ = std::fs::rename(target, &old);
+        match std::fs::rename(&tmp, target) {
+            Ok(()) => Ok(()),
+            Err(_) => rename_via_side_swap_windows(&tmp, target).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            }),
         }
     }
+}
 
-    std::fs::rename(&tmp, target).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
+#[cfg(windows)]
+fn rename_via_side_swap_windows(src: &Path, dst: &Path) -> Result<()> {
+    let old = old_binary_path(dst);
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(dst, &old).map_err(|e| {
+        Error::msg(format!(
+            "could not rename running binary aside to {}: {e}",
+            old.display()
+        ))
     })?;
+    if let Err(e) = std::fs::rename(src, dst) {
+        // Roll back so we never leave the install without a binary.
+        let _ = std::fs::rename(&old, dst);
+        return Err(Error::msg(format!(
+            "swap-in failed after side-rename ({e}); restored original binary"
+        )));
+    }
     Ok(())
 }
 
+#[cfg(windows)]
+fn old_binary_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|s| s.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("allmystuff"));
+    name.push(".old");
+    target.with_file_name(name)
+}
+
+/// Delete the `<exe>.old` litter a previous Windows side-swap left behind —
+/// for every half we can locate. Cheap, idempotent, runs at startup.
+fn cleanup_old_replaced_binaries() {
+    #[cfg(windows)]
+    {
+        for kind in ALL_ARTIFACTS {
+            if let Some(p) = installed_path(kind) {
+                let old = old_binary_path(&p);
+                if old.exists() {
+                    let _ = std::fs::remove_file(&old);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
-fn copy_exec_perms(_from: &Path, to: &Path) {
+fn set_exec_perms(to: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o755));
 }
 #[cfg(not(unix))]
-fn copy_exec_perms(_from: &Path, _to: &Path) {}
+fn set_exec_perms(_to: &Path) {}
 
+/// True when `target` is strictly newer than `installed`, treating an
+/// unknown (`None`) installed version as "needs update" so an out-of-band
+/// install gets synced once.
 fn version_is_newer(target: &str, installed: Option<&str>) -> bool {
     match installed {
         Some(v) => compare_semver(target, v) == std::cmp::Ordering::Greater,
@@ -440,31 +623,37 @@ fn version_is_newer(target: &str, installed: Option<&str>) -> bool {
     }
 }
 
-/// Best-known installed version: the newer of the running binary and the
-/// last-applied stamp.
-fn installed_version() -> Option<String> {
-    let running = current_version().to_string();
-    match read_installed_stamp() {
-        Some(stamp) if compare_semver(&stamp, &running) == std::cmp::Ordering::Greater => {
-            Some(stamp)
-        }
-        _ => Some(running),
+/// The version stamp file for a half that exposes no readable version of its
+/// own (the GUI shell, the node engine). The CLI has no stamp — it's
+/// compared against its own running `CARGO_PKG_VERSION`.
+fn artifact_version_marker(kind: ArtifactKind) -> Option<PathBuf> {
+    match kind {
+        ArtifactKind::Cli => None,
+        _ => updates_dir()
+            .ok()
+            .map(|d| d.join(format!("{}.version", kind.as_str()))),
     }
 }
 
-fn read_installed_stamp() -> Option<String> {
-    let p = updates_dir().ok()?.join("installed.json");
-    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
-    doc["version"].as_str().map(str::to_string)
+fn installed_artifact_version(kind: ArtifactKind) -> Option<String> {
+    let s = std::fs::read_to_string(artifact_version_marker(kind)?).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
-fn record_installed_version(version: &str) {
-    if let Ok(dir) = updates_dir() {
-        let _ = std::fs::write(
-            dir.join("installed.json"),
-            serde_json::json!({ "version": version }).to_string(),
-        );
+fn record_artifact_version(kind: ArtifactKind, version: &str) {
+    if let Some(path) = artifact_version_marker(kind) {
+        let _ = std::fs::write(path, format!("{version}\n"));
     }
+}
+
+/// Whether the half `kind` should be brought to `latest`. False when it
+/// isn't installed on this host; otherwise the per-artifact downgrade guard.
+fn artifact_needs_update(kind: ArtifactKind, latest: &str) -> bool {
+    if installed_path(kind).is_none() {
+        return false;
+    }
+    artifact_needs_apply(kind, latest)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,8 +692,27 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
         });
     }
 
-    stage_release(&release, &latest, &[ArtifactKind::Cli, ArtifactKind::Gui]).await?;
+    // The CLI is behind (we're past the up-to-date check); stage the GUI and
+    // node halves beside it when they're behind too, so all three land in
+    // lockstep.
+    let want = wanted_artifacts(&current, &latest);
+    stage_release(&release, &latest, &want).await?;
     Ok(CheckOutcome::Staged { version: latest })
+}
+
+/// Which halves a release should bring forward: the CLI when it's behind, and
+/// each installed sibling (GUI, node) whose recorded version lags `latest`.
+fn wanted_artifacts(current: &str, latest: &str) -> Vec<ArtifactKind> {
+    ALL_ARTIFACTS
+        .into_iter()
+        .filter(|&kind| match kind {
+            // The CLI is gauged against the running binary's own version…
+            ArtifactKind::Cli => compare_semver(current, latest) == std::cmp::Ordering::Less,
+            // …the siblings against their recorded version stamp, and only
+            // when actually installed on this host.
+            _ => artifact_needs_update(kind, latest),
+        })
+        .collect()
 }
 
 /// User-driven "update everything now" — the surface behind a bare
@@ -520,12 +728,19 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
     let latest = release_tag(&release)?;
     let current = current_version().to_string();
 
-    if compare_semver(&current, &latest) != std::cmp::Ordering::Less {
+    // Nothing to do only when the CLI is current *and* every installed
+    // sibling already matches — otherwise a previous partial update left a
+    // half behind and we still have work to do.
+    let want = wanted_artifacts(&current, &latest);
+    if want.is_empty() {
         return Ok(UpdateNowOutcome::UpToDate { current, latest });
     }
 
     stamp_check_now();
-    let kinds = stage_release(&release, &latest, &[ArtifactKind::Cli, ArtifactKind::Gui]).await?;
+    let kinds = stage_release(&release, &latest, &want).await?;
+    // Apply right now rather than waiting for the next launch. A failed CLI
+    // swap propagates here (the marker is kept) so we never report a phantom
+    // success; a best-effort GUI/node hiccup is logged and the rest applied.
     apply_now()?;
     Ok(UpdateNowOutcome::Updated {
         to: latest,
@@ -660,9 +875,15 @@ fn detect_install_kind_from_path(path_str: &str) -> InstallKind {
         return InstallKind::PackageManager;
     }
     #[cfg(target_os = "windows")]
-    if path_str.contains("\\Program Files\\") || path_str.to_lowercase().contains("\\chocolatey\\")
     {
-        return InstallKind::PackageManager;
+        let lower = path_str.to_lowercase();
+        if lower.contains("\\program files\\")
+            || lower.contains("\\program files (x86)\\")
+            || lower.contains("\\chocolatey\\lib\\")
+            || lower.contains("\\scoop\\apps\\")
+        {
+            return InstallKind::PackageManager;
+        }
     }
     InstallKind::Raw
 }
@@ -720,24 +941,41 @@ async fn stage_release(
     let mut manifest = Vec::new();
     for &kind in want {
         let asset_name = platform_asset(kind.asset_stem());
-        let Some(asset) = assets
+        let asset = assets
             .iter()
-            .find(|a| a["name"].as_str() == Some(&asset_name))
-        else {
-            // The CLI-only or GUI-only release simply omits the other asset.
-            continue;
-        };
-        let url = asset["browser_download_url"]
-            .as_str()
-            .ok_or_else(|| Error::msg("asset missing download url"))?;
-        let dest = dir.join(&asset_name);
-        let expected = find_sha256(assets, &asset_name, &client).await;
-        download_and_verify(&client, url, &dest, expected.as_deref(), &asset_name).await?;
-        manifest.push(serde_json::json!({
-            "kind": kind.as_str(),
-            "path": dest.to_string_lossy(),
-        }));
-        staged.push(kind);
+            .find(|a| a["name"].as_str() == Some(&asset_name));
+
+        // The CLI is the required half — its asset must be present and must
+        // download. The GUI/node halves are best-effort: a missing asset
+        // (older release) or a transient download error logs and continues so
+        // a sibling hiccup never blocks the CLI update.
+        let staged_one = async {
+            let asset =
+                asset.ok_or_else(|| Error::msg(format!("release has no asset {asset_name}")))?;
+            let url = asset["browser_download_url"]
+                .as_str()
+                .ok_or_else(|| Error::msg("asset missing download url"))?;
+            let dest = dir.join(&asset_name);
+            let expected = find_sha256(assets, &asset_name, &client).await;
+            download_and_verify(&client, url, &dest, expected.as_deref(), &asset_name).await?;
+            Ok::<PathBuf, Error>(dest)
+        }
+        .await;
+
+        match staged_one {
+            Ok(dest) => {
+                manifest.push(serde_json::json!({
+                    "kind": kind.as_str(),
+                    "path": dest.to_string_lossy(),
+                }));
+                staged.push(kind);
+            }
+            Err(e) if kind.is_required() => return Err(e),
+            Err(e) => tracing::warn!(
+                "self-update: staging the {} half failed ({e}); skipping it",
+                kind.as_str()
+            ),
+        }
     }
     if staged.is_empty() {
         return Err(Error::msg("no matching platform asset in release"));
@@ -925,6 +1163,10 @@ fn extract_binary(archive: &Path, out_dir: &Path, bin_name: &str) -> Result<Path
 mod tests {
     use super::*;
 
+    /// `ALLMYSTUFF_HOME` is process-global; serialize the tests that mutate
+    /// it so cargo's parallel runner can't cross their temp dirs.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn install_kind_detection() {
         assert_eq!(
@@ -949,6 +1191,113 @@ mod tests {
     }
 
     #[test]
+    fn every_half_has_a_distinct_asset_and_bin_name() {
+        // The node engine (`allmystuff-serve`) is a first-class half — a
+        // regression that dropped it is exactly what left "updated" machines
+        // advertising the old version. All three stems/binaries are distinct.
+        let stems: Vec<_> = ALL_ARTIFACTS.iter().map(|k| k.asset_stem()).collect();
+        assert_eq!(
+            stems,
+            vec!["allmystuff", "allmystuff-gui", "allmystuff-serve"]
+        );
+        assert!(ALL_ARTIFACTS.contains(&ArtifactKind::Serve));
+
+        let serve = platform_asset(ArtifactKind::Serve.asset_stem());
+        assert!(serve.starts_with("allmystuff-serve-"));
+        // The serve stem must not collide with the CLI stem's prefix scan.
+        assert!(!serve.starts_with("allmystuff-windows"));
+        assert!(!serve.starts_with("allmystuff-linux"));
+        assert!(!serve.starts_with("allmystuff-macos"));
+
+        if cfg!(windows) {
+            assert_eq!(ArtifactKind::Serve.bin_name(), "allmystuff-serve.exe");
+        } else {
+            assert_eq!(ArtifactKind::Serve.bin_name(), "allmystuff-serve");
+        }
+        // Only the CLI is the required half.
+        assert!(ArtifactKind::Cli.is_required());
+        assert!(!ArtifactKind::Gui.is_required());
+        assert!(!ArtifactKind::Serve.is_required());
+    }
+
+    #[test]
+    fn artifact_kind_parse_roundtrips() {
+        for k in ALL_ARTIFACTS {
+            assert_eq!(ArtifactKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(ArtifactKind::parse("daemon"), None);
+    }
+
+    #[test]
+    fn version_gate_allows_newer_and_unknown_only() {
+        assert!(version_is_newer("0.1.16", Some("0.1.15")));
+        assert!(!version_is_newer("0.1.15", Some("0.1.15")));
+        assert!(!version_is_newer("0.1.14", Some("0.1.15")));
+        // Unknown installed version (no GUI/node stamp yet) ⇒ sync once, so a
+        // sibling installed out of band by the shell installer is brought
+        // into lockstep on the first update.
+        assert!(version_is_newer("0.1.15", None));
+    }
+
+    #[test]
+    fn cli_apply_guard_compares_against_running_version() {
+        // The CLI arm reads no files — it compares the target against the
+        // running binary's own version, so a stale marker can't downgrade it
+        // and a no-longer-needed apply is skipped.
+        assert!(artifact_needs_apply(ArtifactKind::Cli, "999.0.0"));
+        assert!(!artifact_needs_apply(ArtifactKind::Cli, current_version()));
+    }
+
+    #[test]
+    fn parse_pending_reads_all_kinds_and_skips_junk() {
+        let doc = serde_json::json!({
+            "version": "0.1.16",
+            "artifacts": [
+                { "kind": "cli", "path": "/u/0.1.16/allmystuff" },
+                { "kind": "gui", "path": "/u/0.1.16/allmystuff-gui" },
+                { "kind": "serve", "path": "/u/0.1.16/allmystuff-serve" },
+                { "kind": "mystery", "path": "/u/0.1.16/nope" },
+                { "kind": "cli" }
+            ]
+        });
+        let arts = parse_pending_artifacts(&doc);
+        assert_eq!(arts.len(), 3);
+        let kinds: Vec<_> = arts.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![ArtifactKind::Cli, ArtifactKind::Gui, ArtifactKind::Serve]
+        );
+        assert_eq!(
+            arts[2].archive,
+            std::path::PathBuf::from("/u/0.1.16/allmystuff-serve")
+        );
+    }
+
+    #[test]
+    fn artifact_version_stamps_round_trip() {
+        // GUI/node stamps live under the updates dir; the CLI has none (it's
+        // gauged against its own running version).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+
+        assert!(artifact_version_marker(ArtifactKind::Cli).is_none());
+        assert!(installed_artifact_version(ArtifactKind::Serve).is_none());
+
+        record_artifact_version(ArtifactKind::Serve, "0.1.16");
+        assert_eq!(
+            installed_artifact_version(ArtifactKind::Serve).as_deref(),
+            Some("0.1.16")
+        );
+        // A recorded stamp gates the apply guard: equal/older never re-applies,
+        // newer does.
+        assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.1.16"));
+        assert!(artifact_needs_apply(ArtifactKind::Serve, "0.1.17"));
+
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
     fn release_tag_handles_object_and_array() {
         let obj = serde_json::json!({ "tag_name": "v0.2.0" });
         assert_eq!(release_tag(&obj).unwrap(), "0.2.0");
@@ -958,6 +1307,7 @@ mod tests {
 
     #[test]
     fn config_round_trips_under_a_temp_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
         let au = AutoUpdateConfig {

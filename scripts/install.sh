@@ -423,9 +423,16 @@ mesh_min_version() {
   esac
 }
 
-# `myownmesh --version` → "0.2.4" (empty when the binary won't answer).
+# `myownmesh --version` → "0.2.9" (empty when it prints no version we can
+# recognize). Scans the output for the first semver-looking token rather than
+# trusting a fixed column, and falls back to stderr — a build suffix or a
+# version printed on stderr must not make a good daemon look unanswered.
 installed_mesh_version() {
-  "$1" --version 2>/dev/null | awk 'NR==1 {print $NF}' | tr -cd '0-9.'
+  v="$("$1" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
+  if [ -z "$v" ]; then
+    v="$("$1" --version 2>&1 | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
+  fi
+  printf '%s' "$v"
 }
 
 ensure_mesh() {
@@ -464,6 +471,11 @@ ensure_mesh() {
     ver="$(installed_mesh_version "$existing" || true)"
     if [ -n "$ver" ] && { [ -z "$min" ] || version_ge "$ver" "$min"; }; then
       log "Mesh: myownmesh is now v$ver."
+    elif [ -z "$ver" ]; then
+      # It ran `update` but prints no version we can read. That's a
+      # version-probe miss, not a failed update — don't cry wolf.
+      log "Mesh: myownmesh is installed and responded to 'update', but didn't"
+      log "report a readable version. Assuming it's fine; the app will use it."
     else
       warn "Mesh: couldn't bring myownmesh up to v${min:-a readable version} (see above)."
       warn "The app still runs — an older daemon just lacks the newer mesh"

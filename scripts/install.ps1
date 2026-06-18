@@ -280,12 +280,19 @@ function Get-MeshMinVersion {
     return $null
 }
 
-# `myownmesh --version` -> [version]0.2.4 ($null when it won't answer).
+# `myownmesh --version` -> [version]0.2.9 ($null when it prints no version
+# we can recognize). Scans the whole output (stdout + stderr) for the first
+# semver-looking token rather than trusting a fixed column or the exit code:
+# a build suffix ("0.2.9 (abc123)"), a version on stderr, or a quirky
+# non-zero exit must not make a perfectly good daemon look unanswered — that
+# false negative is what used to trip the "couldn't bring myownmesh up"
+# warning below even when the daemon was already current.
 function Get-MeshVersion([string]$exe) {
     try {
-        $out = (& $exe --version 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
-        return [version](("$out".Trim() -split '\s+')[-1].TrimStart('v'))
+        $raw = (& $exe --version 2>&1 | Out-String)
+        $m = [regex]::Match($raw, '\d+\.\d+(?:\.\d+)?')
+        if ($m.Success) { return [version]$m.Value }
+        return $null
     } catch {
         return $null
     }
@@ -378,6 +385,11 @@ function Ensure-Mesh {
         $ver = Get-MeshVersion $existing
         if ($ver -and (-not $min -or $ver -ge $min)) {
             Log "Mesh: myownmesh is now v$ver."
+        } elseif (-not $ver) {
+            # It ran `update` but prints no version we can read. That's a
+            # version-probe miss, not a failed update — don't cry wolf.
+            Log "Mesh: myownmesh is installed and responded to 'update', but didn't"
+            Log "report a readable version. Assuming it's fine; the app will use it."
         } else {
             Warn "Mesh: couldn't bring myownmesh up to v$min (see above). The app still runs —"
             Warn "an older daemon just lacks the newer mesh features. Retry later with: myownmesh update"
