@@ -472,6 +472,19 @@ export async function onTermExit(
   );
 }
 
+/** The host's authoritative shared-PTY size (`allmystuff://term-resize`):
+ *  which route, and the cols/rows every attacher renders at so a shared shell
+ *  wraps identically for all of them (a bigger window letterboxes to it). */
+export async function onTermResize(
+  cb: (e: { route: string; cols: number; rows: number }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; cols: number; rows: number }>("allmystuff://term-resize", (e) =>
+    cb(e.payload),
+  );
+}
+
 /** Ask `node` for its open terminal sessions — the picker's "attach to an
  *  existing shell" list (multi-attach). The **local** machine answers
  *  synchronously, returning the list here; a **remote** host answers

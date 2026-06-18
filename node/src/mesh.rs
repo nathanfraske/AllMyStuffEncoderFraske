@@ -3084,6 +3084,16 @@ impl Mesh {
                         }
                     }
                 }
+                OutMsg::Resize { cols, rows } => {
+                    // The shared PTY's authoritative size changed — tell this
+                    // viewer so it renders (letterboxes) to the one shell's
+                    // size and its wrapping matches everyone else's.
+                    let frame = TermFrame::new(&rid, seq, TermEvent::Resize { cols, rows });
+                    seq += 1;
+                    if let Ok(payload) = serde_json::to_value(&frame) {
+                        let _ = self.send_media_value(&peer, payload).await;
+                    }
+                }
                 OutMsg::Exit(code) => {
                     tracing::info!("terminal {rid} — shell ended ({code:?})");
                     let frame = TermFrame::new(&rid, seq, TermEvent::Exit { code });
@@ -3197,6 +3207,14 @@ impl Mesh {
                                 if mesh.terminal.enqueue(&rid, bytes) {
                                     mesh.sink.emit("allmystuff://term-ready", json!(rid));
                                 }
+                            }
+                            OutMsg::Resize { cols, rows } => {
+                                // Two local windows sharing one shell: tell this
+                                // window the shared size so it letterboxes to it.
+                                mesh.sink.emit(
+                                    "allmystuff://term-resize",
+                                    json!({ "route": rid, "cols": cols, "rows": rows }),
+                                );
                             }
                             OutMsg::Exit(code) => {
                                 tracing::info!("local terminal {rid} — shell ended ({code:?})");
@@ -3334,7 +3352,14 @@ impl Mesh {
                         json!({ "route": frame.route, "code": code }),
                     );
                 }
-                TermEvent::Resize { .. } => {}
+                TermEvent::Resize { cols, rows } => {
+                    // The host's authoritative shared size — the window renders
+                    // (letterboxes) to it so its wrapping matches the one shell.
+                    self.sink.emit(
+                        "allmystuff://term-resize",
+                        json!({ "route": frame.route, "cols": cols, "rows": rows }),
+                    );
+                }
                 // A terminal event a newer host introduced — ignore it.
                 TermEvent::Unknown => {}
             }
@@ -5358,6 +5383,7 @@ mod tests {
                             return true;
                         }
                     }
+                    Ok(OutMsg::Resize { .. }) => {}
                     Ok(OutMsg::Exit(_)) => return false,
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
                         std::thread::sleep(Duration::from_millis(20))

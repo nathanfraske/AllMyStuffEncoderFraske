@@ -24,6 +24,7 @@
     clipboardWrite,
     closeThisWindow,
     onTermExit,
+    onTermResize,
     onTerminalSessions,
     onThisWindowClose,
     openExternal,
@@ -74,6 +75,7 @@
   let unlistenExit: (() => void) | null = null;
   let unlistenClose: (() => void) | null = null;
   let unlistenSessions: (() => void) | null = null;
+  let unlistenResize: (() => void) | null = null;
   let bellTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ---- "Other Terminals": join an already-open shell -------------------
@@ -289,19 +291,23 @@
       }).dispose,
     );
 
-    // Emulator resized (fit ran) → the far PTY follows, debounced so a
-    // window drag doesn't machine-gun resizes down the channel.
+    // Report this window's *capacity* (the cols/rows it could show) to the
+    // host, debounced so a drag doesn't machine-gun the channel. The host
+    // reconciles the shared PTY to the smallest attached window and sends back
+    // the authoritative size this emulator actually renders at (handled in
+    // onMount). Capacity (reported) and render size (received) stay decoupled,
+    // so a bigger window letterboxes to the shared size instead of wrapping
+    // wrong — and the smallest window still drives the shell's size.
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    rt.cleanup.push(
-      term.onResize(({ cols, rows }) => {
-        if (resizeTimer) clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(() => {
-          const t = tabs.find((x) => x.id === tabId);
-          if (t?.routeId && t.status === "live")
-            void termSend(t.routeId, { kind: "resize", cols, rows }).catch(() => {});
-        }, 50);
-      }).dispose,
-    );
+    const reportCapacitySoon = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const t = tabs.find((x) => x.id === tabId);
+        const d = fit.proposeDimensions();
+        if (t?.routeId && t.status === "live" && d && d.cols > 0 && d.rows > 0)
+          void termSend(t.routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
+      }, 80);
+    };
     rt.cleanup.push(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
     });
@@ -345,9 +351,10 @@
       return true;
     });
 
-    // Keep the emulator fitted to its pane.
+    // Window grew/shrank → re-report capacity (not a local refit: the render
+    // size is the host's authoritative shared size, applied via term-resize).
     const ro = new ResizeObserver(() => {
-      if (el.clientWidth > 0 && el.clientHeight > 0) fit.fit();
+      if (el.clientWidth > 0 && el.clientHeight > 0) reportCapacitySoon();
     });
     ro.observe(el);
     rt.cleanup.push(() => ro.disconnect());
@@ -373,9 +380,10 @@
     rt.term.dispose();
   }
 
-  /** A tab's route went live: wire the byte stream and size the far PTY
-   *  to the emulator. Buffered output (the prompt that raced the window
-   *  boot) arrives on the first poll. */
+  /** A tab's route went live: wire the byte stream and tell the host this
+   *  window's capacity (the host reconciles and sends back the size to render
+   *  at). Buffered output (the prompt that raced the window boot) arrives on
+   *  the first poll. */
   function startSession(meta: TabMeta, rt: TabRuntime) {
     if (rt.started || !meta.routeId) return;
     rt.started = true;
@@ -389,9 +397,9 @@
       }
       rt.stopWatch = stop;
     });
-    void termSend(routeId, { kind: "resize", cols: rt.term.cols, rows: rt.term.rows }).catch(
-      () => {},
-    );
+    const d = rt.fit.proposeDimensions();
+    if (d && d.cols > 0 && d.rows > 0)
+      void termSend(routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
     rt.term.focus();
   }
 
@@ -479,13 +487,17 @@
     focusActiveSoon();
   }
 
-  /** After a tab becomes visible its pane has real dimensions again —
-   *  refit and focus on the next frame. */
+  /** After a tab becomes visible its pane has real dimensions again — re-report
+   *  capacity (the host may grow the shared size back) and focus, next frame.
+   *  The render size stays the host's authoritative one, never a local refit. */
   function focusActiveSoon() {
     requestAnimationFrame(() => {
       const rt = runtimes.get(activeId);
+      const t = tabs.find((x) => x.id === activeId);
       if (rt) {
-        rt.fit.fit();
+        const d = rt.fit.proposeDimensions();
+        if (t?.routeId && t.status === "live" && d && d.cols > 0 && d.rows > 0)
+          void termSend(t.routeId, { kind: "resize", cols: d.cols, rows: d.rows }).catch(() => {});
         rt.term.focus();
       }
     });
@@ -552,6 +564,17 @@
     void onTerminalSessions((ev) => {
       if (app.isSameMachine(ev.from, host)) hostSessions = ev.sessions;
     }).then((u) => (unlistenSessions = u));
+    // The host's authoritative shared-PTY size for a route — render this tab's
+    // emulator at it (letterboxing a bigger window) so a shared shell wraps
+    // identically for everyone. The window keeps reporting its own capacity
+    // (above); the smallest attached window is what the host settles on.
+    void onTermResize((ev) => {
+      const t = tabs.find((x) => x.routeId === ev.route);
+      if (!t) return;
+      const rt = runtimes.get(t.id);
+      if (rt && ev.cols > 0 && ev.rows > 0 && (rt.term.cols !== ev.cols || rt.term.rows !== ev.rows))
+        rt.term.resize(ev.cols, ev.rows);
+    }).then((u) => (unlistenResize = u));
     // Keep the list current on a slow cadence — while the menu is open (so a
     // shell another window/peer just opened shows up) or whenever a tab is on
     // a known session (so its shared badge stays live). The count only moves
@@ -567,6 +590,7 @@
       unlistenExit?.();
       unlistenClose?.();
       unlistenSessions?.();
+      unlistenResize?.();
       if (bellTimer) clearTimeout(bellTimer);
     };
   });

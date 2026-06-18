@@ -38,6 +38,11 @@ use crate::byte_queues::ByteQueues;
 pub enum OutMsg {
     /// A chunk of PTY output (≤ [`READ_BUF`] bytes).
     Data(Vec<u8>),
+    /// The shared PTY's reconciled size changed — every attacher renders its
+    /// emulator at this authoritative size (letterboxing a bigger window), so
+    /// the wrapping matches the one shell for everyone. Broadcast whenever an
+    /// attach/detach/resize moves the reconciled (minimum) size.
+    Resize { cols: u16, rows: u16 },
     /// The shell ended (`None` = killed by signal / no status).
     Exit(Option<i32>),
 }
@@ -132,6 +137,28 @@ struct PtySession {
     generation: u64,
     title: String,
     created_unix: u64,
+    /// The reconciled size last pushed to the PTY and broadcast to attachers,
+    /// so a no-op reconcile doesn't re-broadcast (and the viewers letterbox to
+    /// a size that only changes when it really does).
+    last_size: (u16, u16),
+}
+
+impl PtySession {
+    /// Resize the shared PTY to the reconciled (minimum) size of all current
+    /// attachers and, when that size actually changed, tell every attacher so
+    /// each renders its emulator at the one shared size (letterboxing a bigger
+    /// window). Returns whether the PTY control send succeeded.
+    fn reconcile(&mut self) -> bool {
+        let (cols, rows) = reconcile_size(&self.attachers);
+        let ok = self.ctl_tx.try_send(CtlMsg::Resize { cols, rows }).is_ok();
+        if (cols, rows) != self.last_size {
+            self.last_size = (cols, rows);
+            // Fire-and-forget: a lagging attacher catches the next one, and
+            // "no receivers yet" is fine (the next attach reconciles anew).
+            let _ = self.out_tx.send(OutMsg::Resize { cols, rows });
+        }
+        ok
+    }
 }
 
 /// The handle [`TerminalHost::open`] hands back: the live output stream plus
@@ -246,11 +273,9 @@ impl TerminalHost {
                     let sb = s.scrollback.lock();
                     (sb.snapshot(), s.out_tx.subscribe())
                 };
-                let reconciled = reconcile_size(&s.attachers);
-                let _ = s.ctl_tx.try_send(CtlMsg::Resize {
-                    cols: reconciled.0,
-                    rows: reconciled.1,
-                });
+                // Inheriting the current size, this is usually a no-op — but it
+                // keeps the PTY honest and re-broadcasts on the rare change.
+                s.reconcile();
                 drop(sessions);
                 self.route_to_session
                     .lock()
@@ -417,6 +442,7 @@ impl TerminalHost {
             generation: 1,
             title: sid.clone(),
             created_unix: now_unix(),
+            last_size: (cols, rows),
         };
         self.sessions.lock().insert(sid.clone(), session);
         self.route_to_session
@@ -451,13 +477,10 @@ impl TerminalHost {
                 if s.attachers.is_empty() {
                     now_empty = Some(s.generation);
                 } else {
-                    // Lost an attacher → reconcile up to whatever the rest
-                    // can show (the minimum over the survivors).
-                    let reconciled = reconcile_size(&s.attachers);
-                    let _ = s.ctl_tx.try_send(CtlMsg::Resize {
-                        cols: reconciled.0,
-                        rows: reconciled.1,
-                    });
+                    // Lost an attacher → reconcile up to whatever the rest can
+                    // show (the min over the survivors), and tell them so they
+                    // grow their emulators to match.
+                    s.reconcile();
                 }
             }
         }
@@ -557,13 +580,13 @@ impl TerminalHost {
             s.attachers
                 .insert(route_id.to_string(), Attacher { cols, rows });
         }
-        let (rc, rr) = reconcile_size(&s.attachers);
-        match s.ctl_tx.try_send(CtlMsg::Resize { cols: rc, rows: rr }) {
-            Ok(()) => true,
-            Err(_) => {
-                tracing::warn!("terminal {route_id}: resize dropped (shell not draining)");
-                false
-            }
+        // Reconcile to the min and, when it changed, broadcast the new shared
+        // size so every attacher letterboxes to it.
+        if s.reconcile() {
+            true
+        } else {
+            tracing::warn!("terminal {route_id}: resize dropped (shell not draining)");
+            false
         }
     }
 
@@ -785,6 +808,7 @@ mod tests {
                         return seen;
                     }
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Ok(OutMsg::Exit(_)) => break,
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -812,6 +836,7 @@ mod tests {
                         return seen;
                     }
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Ok(OutMsg::Exit(_)) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
                     std::thread::sleep(Duration::from_millis(20))
@@ -831,7 +856,7 @@ mod tests {
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(OutMsg::Exit(code)) => return code,
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
@@ -846,7 +871,7 @@ mod tests {
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(OutMsg::Exit(_)) => return true,
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return true,
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -940,7 +965,7 @@ mod tests {
                     ended = true;
                     break;
                 }
-                Ok(OutMsg::Data(_)) => {}
+                Ok(_) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     ended = true;
                     break;
@@ -1230,6 +1255,7 @@ mod tests {
                     exit = Some(code);
                     break;
                 }
+                Ok(OutMsg::Resize { .. }) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
