@@ -467,6 +467,13 @@ impl TerminalHost {
         }
     }
 
+    /// Whether `route_id` is currently attached to a live session here — the
+    /// host pump checks this each tick so a viewer that detached (closed its
+    /// tab) stops being streamed to, without killing the shared shell.
+    pub fn is_attached(&self, route_id: &str) -> bool {
+        self.route_to_session.lock().contains_key(route_id)
+    }
+
     /// Kill the shell for a session id — the explicit "close this terminal"
     /// (as opposed to a viewer merely [`detach`](Self::detach)ing). Removes
     /// the session and every route that mapped to it. Idempotent.

@@ -1742,7 +1742,12 @@ impl Mesh {
                     // A control route ending mid-chord must not leave this
                     // machine holding the keys it injected.
                     self.injector.release_route(&id);
-                    self.terminal.stop(&id);
+                    // A terminal route ending is one *viewer* leaving, not the
+                    // shell dying: detach (keep the shared shell alive for the
+                    // other attachers, host or remote; the last one leaving
+                    // arms the idle reaper), never kill. Closing a tab on one
+                    // machine must not end a session another still has open.
+                    self.terminal.detach(&id);
                     // Drop this route's terminal pump/dedup bookkeeping so a
                     // later route reusing the id starts clean (and the maps
                     // never grow unbounded over a long session).
@@ -3036,6 +3041,14 @@ impl Mesh {
                 // The session ended (shell exited / closed) — end this pump.
                 Err(RecvError::Closed) => return,
             };
+            // This viewer detached (closed its tab, or its route was torn
+            // down) — stop pumping to it. The shell lives on for the other
+            // attachers; the last one leaving arms the idle reaper. Checked
+            // here so a closed viewer's pump never keeps streaming to a dead
+            // route.
+            if !self.terminal.is_attached(&rid) {
+                return;
+            }
             match msg {
                 OutMsg::Data(bytes) => {
                     for frame in TermFrame::data_frames(&rid, seq, &bytes, MAX_TERM_DATA_BYTES) {
