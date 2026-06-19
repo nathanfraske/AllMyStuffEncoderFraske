@@ -156,11 +156,13 @@ fn run_update(args: &[String]) -> ExitCode {
 }
 
 /// `allmystuff service [--system] <install|start|stop|restart|status|uninstall>
-/// [--log FILTER]` — manage the OS background service (systemd/launchd),
-/// mirroring `myownmesh service`. The node it runs supervises the myownmesh
-/// daemon, so one service brings up both.
+/// [--log FILTER] [--json]` — manage the OS background service (systemd on
+/// Linux, launchd on macOS, the Service Control Manager on Windows), mirroring
+/// `myownmesh service`. The node it runs supervises the myownmesh daemon, so
+/// one service brings up both.
 fn run_service(args: &[String]) -> ExitCode {
     let system = args.iter().any(|a| a == "--system");
+    let json = args.iter().any(|a| a == "--json");
     // First non-flag token is the action.
     let action = args
         .iter()
@@ -173,6 +175,17 @@ fn run_service(args: &[String]) -> ExitCode {
         Some("start") => service::ServiceCmd::Start,
         Some("stop") => service::ServiceCmd::Stop,
         Some("restart") => service::ServiceCmd::Restart,
+        // `status --json` emits a stable one-line object for the desktop app's
+        // "Always On" tab; the bare form prints the human read-out.
+        Some("status") if json => {
+            return match service::print_status_json(system) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("allmystuff service: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some("status") => service::ServiceCmd::Status,
         Some("uninstall") | Some("remove") => service::ServiceCmd::Uninstall,
         Some(other) => {
@@ -205,23 +218,27 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn print_service_help() {
     eprintln!(
-        "Usage: allmystuff service [--system] <install|start|stop|restart|status|uninstall> [--log FILTER]
+        "Usage: allmystuff service [--system] <install|start|stop|restart|status|uninstall> [--log FILTER] [--json]
 
   install     install + start the service, and start it on its own — at login
               (per-user) or at boot (--system)
   start       start the installed service now
   stop        stop it (stays installed)
   restart     restart it
-  status      show installed / enabled / running
+  status      show installed / enabled / running  (add --json for a machine-readable line)
   uninstall   stop, disable, and remove it
 
   --system    manage the system-wide service (root, starts at boot) instead of
               the per-user one (no root, starts at login)
   --log F     (install) bake an ALLMYSTUFF_LOG filter into the service, e.g.
               --log info,allmystuff_node=debug
+  --json      (status) print {{ installed, running, enabled, … }} as one JSON line
 
-The service runs `allmystuff serve`, which spawns the myownmesh daemon itself —
-so one service runs both."
+Backends: systemd (Linux), launchd (macOS), the Service Control Manager (Windows).
+Windows services are system-wide (LocalSystem, start at boot), so --system is
+implied there and installing/controlling them needs an elevated (Administrator)
+prompt. The service runs the node, which spawns the myownmesh daemon itself —
+so one service runs both, and it keeps every half up to date on its own."
     );
 }
 
@@ -351,8 +368,9 @@ COMMANDS:
                     screen/camera/audio/terminal/files to peers, and spawns the
                     myownmesh daemon itself.
     service         Install/manage serve as a background OS service so it
-                    survives reboots (install | start | stop | restart | status |
-                    uninstall; --system for a boot service). One service runs both.
+                    survives reboots — systemd / launchd / Windows SCM (install |
+                    start | stop | restart | status | uninstall; --system for a
+                    boot service). One service runs both.
     scan            Pretty inventory of this machine
     scan --json     Inventory as JSON
     capabilities    Capabilities this machine would expose on the mesh graph

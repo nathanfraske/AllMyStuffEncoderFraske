@@ -104,6 +104,12 @@ import {
   scanSelf,
   clipboardPaste,
   sendInput,
+  serviceInstall,
+  serviceRestart,
+  serviceStart,
+  serviceStatus,
+  serviceStop,
+  serviceUninstall,
   sessionSnapshot,
   setClaimable,
   setNetworkEnabled,
@@ -114,7 +120,12 @@ import {
   updateSetPrefs,
   updateStatus,
   upgradeNode,
+  windowBehaviorGet,
+  windowBehaviorSet,
+  type ServiceActionResult,
+  type ServiceStatus,
   type SessionSnapshot,
+  type WindowBehavior,
 } from "./tauri";
 import {
   CAP_TAG_ALLMYSTUFF,
@@ -160,7 +171,13 @@ import {
 } from "./types";
 
 /** Which pane the settings panel is showing. */
-export type SettingsTab = "networks" | "venues" | "updates" | "fleet" | "sharing";
+export type SettingsTab =
+  | "networks"
+  | "venues"
+  | "updates"
+  | "fleet"
+  | "sharing"
+  | "always_on";
 
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
@@ -610,6 +627,16 @@ class AppStore {
    *  loaded; stays null in web mode / if the feed can't be reached. */
   latestRelease = $state<string | null>(null);
   private latestReleaseLoading = false;
+
+  // ---- "Always On": background service + window behaviour ----------
+  /** OS background-service status, for the Always On tab. Null until loaded
+   *  (or in web mode). */
+  serviceInfo = $state<ServiceStatus | null>(null);
+  /** A service install/start/stop/… is in flight (buttons disabled). */
+  serviceBusy = $state(false);
+  /** Whether closing / minimizing keeps the app in the tray. Null until read
+   *  from the backend (the source of truth). */
+  windowBehavior = $state<WindowBehavior | null>(null);
 
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
@@ -4434,6 +4461,10 @@ class AppStore {
     void this.loadOwnedFleet();
     void this.loadNetworkConfigs();
     if (tab === "updates") void this.loadUpdateStatus();
+    if (tab === "always_on") {
+      void this.loadServiceStatus();
+      void this.loadWindowBehavior();
+    }
   }
 
   /** Open the "a new device wants to join" approval popup (the code grid). */
@@ -4612,6 +4643,91 @@ class AppStore {
       if (next) this.updateInfo = next;
     } catch (e) {
       this.toast("warn", `Couldn't save update settings: ${errMsg(e)}`);
+    }
+  }
+
+  // ---- "Always On": background service ------------------------------
+
+  /** Read the OS background-service status for the Always On tab. */
+  async loadServiceStatus() {
+    if (!isTauri()) return;
+    try {
+      this.serviceInfo = await serviceStatus();
+    } catch (e) {
+      this.toast("warn", `Couldn't read service status: ${errMsg(e)}`);
+    }
+  }
+
+  /** Run a service mutation (install/start/stop/restart/uninstall), then
+   *  refresh status. Shared plumbing for the Always On buttons: it disables
+   *  them while in flight, surfaces the CLI's output, and re-reads status so
+   *  the pane reflects reality (important on Windows, where the elevated child
+   *  reports only by exit code). */
+  private async runServiceAction(
+    label: string,
+    action: () => Promise<ServiceActionResult>,
+  ) {
+    if (!isTauri()) {
+      this.toast("info", "The background service needs the desktop app");
+      return;
+    }
+    this.serviceBusy = true;
+    try {
+      const r = await action();
+      if (!r.ok) {
+        this.toast("warn", r.output || `Couldn't ${label} the service`);
+      } else {
+        this.toast("ok", `Service ${label} — done`);
+      }
+    } catch (e) {
+      this.toast("warn", `Couldn't ${label} the service: ${errMsg(e)}`);
+    } finally {
+      this.serviceBusy = false;
+      await this.loadServiceStatus();
+    }
+  }
+
+  installService() {
+    return this.runServiceAction("install", serviceInstall);
+  }
+  startService() {
+    return this.runServiceAction("start", serviceStart);
+  }
+  stopService() {
+    return this.runServiceAction("stop", serviceStop);
+  }
+  restartService() {
+    return this.runServiceAction("restart", serviceRestart);
+  }
+  uninstallService() {
+    return this.runServiceAction("uninstall", serviceUninstall);
+  }
+
+  // ---- "Always On": window behaviour --------------------------------
+
+  /** Read the persisted close/minimize-to-tray preference (backend-owned). */
+  async loadWindowBehavior() {
+    if (!isTauri()) return;
+    try {
+      this.windowBehavior = await windowBehaviorGet();
+    } catch (e) {
+      this.toast("warn", `Couldn't read window settings: ${errMsg(e)}`);
+    }
+  }
+
+  /** Update one window-behaviour toggle and persist it via the backend. */
+  async setWindowBehavior(patch: Partial<WindowBehavior>) {
+    if (!isTauri()) return;
+    const base = this.windowBehavior ?? { close_to_tray: true, minimize_to_tray: false };
+    const next = { ...base, ...patch };
+    // Optimistic: reflect immediately, reconcile with the stored value.
+    this.windowBehavior = next;
+    try {
+      const saved = await windowBehaviorSet(next);
+      if (saved) this.windowBehavior = saved;
+    } catch (e) {
+      this.toast("warn", `Couldn't save window settings: ${errMsg(e)}`);
+      void this.loadWindowBehavior();
     }
   }
 

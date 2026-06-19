@@ -748,6 +748,57 @@ pub async fn tick_forever() {
     }
 }
 
+/// Background auto-update for an **unattended** long-lived process — the
+/// headless `allmystuff-serve` node, including when it runs as an OS service
+/// (systemd / launchd / Windows SCM). Like [`tick_forever`], but a service
+/// box has no one to click "relaunch" and may not restart for months, so a
+/// staged update would otherwise never take effect. Here each staged update is
+/// *applied* immediately and `relaunch` is called to bring the new version up
+/// — the "always on, always current" half of self-update, on all three OSes.
+///
+/// `relaunch` must restart the process onto the just-applied binaries and not
+/// return: a re-exec on unix and on a Windows console; an exit that lets the
+/// Service Control Manager restart the service under Windows. It's only ever
+/// invoked after a successful apply, so it always runs the *new* binary. The
+/// same lockstep rules as elsewhere mean every installed half (CLI, GUI, node)
+/// that's reachable from this process is brought forward together, not just
+/// the node itself.
+///
+/// All the gating of [`tick_forever`] still applies (enabled flag, package
+/// manager, apply policy, interval), so this no-ops cleanly when auto-update
+/// is off or the install is package-managed — `relaunch` never fires then.
+pub async fn tick_forever_unattended(relaunch: fn() -> !) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    loop {
+        match check_now(false).await {
+            Ok(CheckOutcome::Staged { version }) => {
+                tracing::info!("self-update staged {version}; applying now (unattended node)");
+                match apply_now() {
+                    Ok(Some(applied)) => {
+                        tracing::info!(
+                            "self-update applied {applied}; relaunching to run the new version"
+                        );
+                        relaunch();
+                    }
+                    // Staged but nothing needed applying (already current on
+                    // disk), or a best-effort half hiccupped — keep serving the
+                    // running version and retry on the next tick.
+                    Ok(None) => tracing::warn!(
+                        "self-update staged {version} but nothing was applied; retrying next tick"
+                    ),
+                    Err(e) => {
+                        tracing::warn!("self-update apply failed: {e}; retrying next tick")
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("self-update check failed: {e}"),
+        }
+        let hours = load_auto_update().check_interval_hours.max(1);
+        tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+    }
+}
+
 /// User-driven "update everything now" — the surface behind a bare
 /// `allmystuff update`. Ignores policy + interval (consent implied) but
 /// still defers to the OS package manager. Applies to disk immediately;

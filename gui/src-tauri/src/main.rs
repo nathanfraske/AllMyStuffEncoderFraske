@@ -29,6 +29,8 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
 
+mod window_behavior;
+
 /// The GUI's [`UiSink`]: forwards engine events onto Tauri's event bus so the
 /// Svelte front-end can react, and restarts the webview app when a fleet
 /// "upgrade this machine" lands a new build. (The `allmystuff-serve` binary
@@ -1007,6 +1009,265 @@ fn workaround_pi_webkit_rendering() {
     }
 }
 
+// ---- "Always On" tab: background service + window behaviour ------------
+//
+// The service work is delegated to the `allmystuff` CLI (`allmystuff service
+// …`), the one place the systemd/launchd/SCM backends live — the GUI just
+// finds that binary and runs it. Status needs no privilege on any platform;
+// mutations need root/admin, so on Windows they're relaunched through a UAC
+// prompt, and on unix the GUI manages the per-user service (no privilege).
+
+/// Locate the `allmystuff` CLI binary, mirroring how the node binary is found:
+/// env override → beside this exe (the installer's layout) → `PATH` → the dev
+/// workspace target dir.
+fn find_cli_binary() -> Option<std::path::PathBuf> {
+    let exe = if cfg!(windows) {
+        "allmystuff.exe"
+    } else {
+        "allmystuff"
+    };
+    if let Some(p) = std::env::var_os("ALLMYSTUFF_CLI_BIN") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(c) = cur.parent().map(|d| d.join(exe)) {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let c = dir.join(exe);
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+    // Dev fallback: repo-root target/{release,debug}/allmystuff.
+    for profile in ["release", "debug"] {
+        if let Some(p) = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("target").join(profile).join(exe))
+        {
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The OS background-service status as JSON (`installed` / `running` /
+/// `enabled` / `supported` / …), from `allmystuff service status --json`.
+/// Querying needs no elevation, so this works without admin/sudo. Async +
+/// `spawn_blocking` so the subprocess never blocks the UI thread.
+#[tauri::command]
+async fn service_status() -> Result<Value, String> {
+    tokio::task::spawn_blocking(service_status_blocking)
+        .await
+        .map_err(|e| format!("service status task failed: {e}"))?
+}
+
+fn service_status_blocking() -> Result<Value, String> {
+    let cli =
+        find_cli_binary().ok_or_else(|| "couldn't find the allmystuff CLI binary".to_string())?;
+    let out = std::process::Command::new(&cli)
+        .args(["service", "status", "--json"])
+        .output()
+        .map_err(|e| format!("running allmystuff: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = stdout.trim();
+    serde_json::from_str::<Value>(stdout)
+        .map_err(|e| format!("parsing service status: {e} (got: {stdout})"))
+}
+
+/// Run an `allmystuff service <verb>` that *changes* the service. Returns
+/// `{ ok, output }`. On Windows this needs elevation, so it's relaunched
+/// through a UAC prompt (the elevated child runs in its own console, so we
+/// report by exit code and let the UI re-read status); elsewhere the per-user
+/// service needs no privilege, so it runs directly with its output captured.
+fn run_service_mutation(verb: &str) -> Result<Value, String> {
+    let cli =
+        find_cli_binary().ok_or_else(|| "couldn't find the allmystuff CLI binary".to_string())?;
+    #[cfg(windows)]
+    {
+        let exe = cli.to_string_lossy().replace('\'', "''");
+        let ps = format!(
+            "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList 'service','{verb}' \
+             -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
+             catch {{ exit 1223 }}"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+            .map_err(|e| format!("launching elevated allmystuff: {e}"))?;
+        let code = out.status.code().unwrap_or(-1);
+        if code == 1223 {
+            // ERROR_CANCELLED — the user declined the UAC prompt.
+            return Err("Administrator approval was declined.".to_string());
+        }
+        Ok(json!({
+            "ok": code == 0,
+            "output": if code == 0 {
+                format!("service {verb}: done")
+            } else {
+                format!("service {verb} failed (exit {code})")
+            },
+        }))
+    }
+    #[cfg(not(windows))]
+    {
+        let out = std::process::Command::new(&cli)
+            .args(["service", verb])
+            .output()
+            .map_err(|e| format!("running allmystuff: {e}"))?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            if !text.trim().is_empty() {
+                text.push('\n');
+            }
+            text.push_str(err.trim());
+        }
+        Ok(json!({ "ok": out.status.success(), "output": text.trim() }))
+    }
+}
+
+/// Run a service mutation off the UI thread. The blocking subprocess (and, on
+/// Windows, the elevated UAC wait) can take seconds, so it must not run inline
+/// on the main thread.
+async fn service_mutate(verb: &'static str) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || run_service_mutation(verb))
+        .await
+        .map_err(|e| format!("service {verb} task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn service_install() -> Result<Value, String> {
+    service_mutate("install").await
+}
+#[tauri::command]
+async fn service_start() -> Result<Value, String> {
+    service_mutate("start").await
+}
+#[tauri::command]
+async fn service_stop() -> Result<Value, String> {
+    service_mutate("stop").await
+}
+#[tauri::command]
+async fn service_restart() -> Result<Value, String> {
+    service_mutate("restart").await
+}
+#[tauri::command]
+async fn service_uninstall() -> Result<Value, String> {
+    service_mutate("uninstall").await
+}
+
+/// The persisted "Always On" window behaviour (close/minimize to tray).
+#[tauri::command]
+fn window_behavior_get(wb: State<'_, window_behavior::WindowBehavior>) -> Value {
+    let b = wb.get();
+    json!({ "close_to_tray": b.close_to_tray, "minimize_to_tray": b.minimize_to_tray })
+}
+
+#[tauri::command]
+fn window_behavior_set(
+    wb: State<'_, window_behavior::WindowBehavior>,
+    close_to_tray: bool,
+    minimize_to_tray: bool,
+) -> Value {
+    let b = wb.set(window_behavior::Behavior {
+        close_to_tray,
+        minimize_to_tray,
+    });
+    json!({ "close_to_tray": b.close_to_tray, "minimize_to_tray": b.minimize_to_tray })
+}
+
+/// Build the system-tray / menu-bar icon — the home AllMyStuff keeps while
+/// "Always On" hides its window. Left-click (or "Show AllMyStuff") brings the
+/// main window back; "Quit" exits for real.
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItemBuilder::with_id("show", "Show AllMyStuff").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit AllMyStuff").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("AllMyStuff")
+        .menu(&menu)
+        // Left-click reveals the window; the menu rides the right-click.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => reveal_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// Bring the main window back from the tray (or a minimized state) and focus it.
+fn reveal_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Native close/minimize handling for the **main** window only (secondary
+/// console / terminal / room windows always close normally): honour the
+/// persisted "Always On" preference by hiding to the tray instead of closing
+/// or minimizing to the taskbar.
+fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if window.label() != "main" {
+        return;
+    }
+    match event {
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            if window
+                .state::<window_behavior::WindowBehavior>()
+                .close_to_tray()
+            {
+                // Keep the process (and the tray) alive; the window just hides.
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        }
+        // No portable "minimized" event — catch the resize and check the state.
+        tauri::WindowEvent::Resized(_) => {
+            if window
+                .state::<window_behavior::WindowBehavior>()
+                .minimize_to_tray()
+                && window.is_minimized().unwrap_or(false)
+            {
+                let _ = window.hide();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_rendering();
@@ -1034,6 +1295,8 @@ fn main() {
             daemon_child: Mutex::new(None),
             disabled_networks: networks_store::DisabledNetworks::load(),
         })
+        .manage(window_behavior::WindowBehavior::load())
+        .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
             scan_self,
             scan_full,
@@ -1104,8 +1367,21 @@ fn main() {
             update_relaunch,
             update_set_prefs,
             update_latest_version,
+            service_status,
+            service_install,
+            service_start,
+            service_stop,
+            service_restart,
+            service_uninstall,
+            window_behavior_get,
+            window_behavior_set,
         ])
         .setup(move |app| {
+            // The tray icon is what keeps AllMyStuff reachable once "Always On"
+            // hides its window to the notification area / menu bar.
+            if let Err(e) = build_tray(app.handle()) {
+                tracing::warn!("couldn't create the tray icon: {e}");
+            }
             let handle = app.handle().clone();
             let mesh = Mesh::new(
                 client.clone(),

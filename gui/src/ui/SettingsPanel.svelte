@@ -9,12 +9,14 @@
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
+  import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
 
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "venues", label: "Venues", icon: "📡" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
+    { id: "always_on", label: "Always On", icon: "♾️" },
     { id: "updates", label: "Updates", icon: "⬆️" },
   ];
 
@@ -25,6 +27,10 @@
     app.settingsTab = tab;
     if (tab === "updates") void app.loadUpdateStatus();
     if (tab === "fleet") void app.loadOwnedFleet();
+    if (tab === "always_on") {
+      void app.loadServiceStatus();
+      void app.loadWindowBehavior();
+    }
   }
 </script>
 
@@ -57,6 +63,8 @@
         <FleetSection />
       {:else if app.settingsTab === "sharing"}
         <SharingSection />
+      {:else if app.settingsTab === "always_on"}
+        <AlwaysOnSection />
       {:else if app.settingsTab === "updates"}
         <UpdatesSection />
       {/if}
