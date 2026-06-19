@@ -424,6 +424,10 @@ where
 #[derive(Clone)]
 struct StreamData {
     format: VideoInfoRaw,
+    /// Diagnostic: how many times the `process` callback has fired. Its
+    /// staying at zero while the stream reports Streaming is the proof that
+    /// the server never drove a single buffer to us.
+    process_calls: u64,
 }
 
 /// Rate limit for the consumer's "why this frame was dropped" warns —
@@ -600,6 +604,7 @@ fn pipewire_consume(
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             format: Default::default(),
+            process_calls: 0,
         })
         .state_changed({
             let main_loop = main_loop.clone();
@@ -681,21 +686,38 @@ fn pipewire_consume(
             }
         })
         .process(move |stream, data| {
+            data.process_calls += 1;
+            let n = data.process_calls;
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 // Proves `process` is firing even when there's nothing to
                 // take — distinguishes "never streaming" from "streaming but
                 // starved".
-                drops.warn("dequeue", || {
-                    "screencast process woke with no buffer to dequeue".into()
-                });
+                if n <= 8 || n % 60 == 0 {
+                    tracing::info!("screencast process #{n}: woke with no buffer to dequeue");
+                }
                 return;
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
+                if n <= 8 {
+                    tracing::info!("screencast process #{n}: buffer with zero data planes");
+                }
                 drops.warn("planes", || {
                     "screencast buffer carried no data planes — frame dropped".into()
                 });
                 return;
+            }
+            // Loud first-frames diagnostic: what the server actually handed us
+            // on the first few process calls (plane count, chunk size, whether
+            // the data mapped). Silence of *all* "process #" lines means the
+            // server never drove a buffer despite reporting Streaming.
+            if n <= 8 {
+                let chunk = datas[0].chunk().size();
+                let mapped = datas[0].data().is_some();
+                tracing::info!(
+                    "screencast process #{n}: {} plane(s), chunk {chunk} bytes, mapped={mapped}",
+                    datas.len()
+                );
             }
             let size = data.format.size();
             let (w, h) = (size.width, size.height);
