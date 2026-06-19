@@ -146,12 +146,25 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
         .map(|s| s.0)
         .ok_or("portal returned no stream")?;
 
+    // The node the portal just minted lives on *its* PipeWire connection,
+    // not the session daemon's default graph — most compositors (Mutter
+    // included) only expose a screencast node over the fd handed back by
+    // OpenPipeWireRemote. The consumer must connect to that fd; connecting to
+    // the default daemon finds "no target node available" and the stream dies.
+    let pw_fd = match open_pipewire_remote(&portal, &session) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close_session(&conn, &session);
+            return Err(e);
+        }
+    };
+
     let (tx, rx) = std::sync::mpsc::channel::<RawFrame>();
     let (quit_tx, quit_rx) = channel::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("wayland-screencast".into())
         .spawn(move || {
-            if let Err(e) = pipewire_consume(node_id, tx, quit_rx) {
+            if let Err(e) = pipewire_consume(node_id, pw_fd, tx, quit_rx) {
                 tracing::warn!("wayland screencast pipewire loop ended: {e}");
             }
         })
@@ -299,6 +312,27 @@ fn start(
     })
 }
 
+/// Ask the portal for the PipeWire connection the started session's node
+/// lives on. Unlike the `Request`-based calls above this is a plain method
+/// that returns a file descriptor directly (no `Response` signal): the
+/// consumer connects its PipeWire context to this fd so the node id from
+/// `Start` actually resolves. Returns an owned fd (zbus dups the received
+/// one), ready to hand to `connect_fd_rc`.
+fn open_pipewire_remote(
+    portal: &Proxy<'static>,
+    session: &OwnedObjectPath,
+) -> Result<std::os::fd::OwnedFd, String> {
+    let options: HashMap<&str, Value> = HashMap::new();
+    let reply = portal
+        .call_method("OpenPipeWireRemote", &(session, options))
+        .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
+    let fd: zbus::zvariant::OwnedFd = reply
+        .body()
+        .deserialize()
+        .map_err(|e| format!("OpenPipeWireRemote reply: {e}"))?;
+    Ok(fd.into())
+}
+
 /// Tell the portal we walked away, so a still-open consent dialog is
 /// withdrawn instead of haunting the host's screen.
 fn close_session(conn: &Connection, session: &OwnedObjectPath) {
@@ -426,6 +460,7 @@ impl DropWarns {
 /// stride-aware copy — compositors pad rows on some resolutions.
 fn pipewire_consume(
     node_id: u32,
+    pw_fd: std::os::fd::OwnedFd,
     tx: Sender<RawFrame>,
     quit: channel::Receiver<()>,
 ) -> Result<(), String> {
@@ -433,7 +468,11 @@ fn pipewire_consume(
 
     let main_loop = MainLoopRc::new(None).map_err(|e| e.to_string())?;
     let context = ContextRc::new(&main_loop, None).map_err(|e| e.to_string())?;
-    let core = context.connect_rc(None).map_err(|e| e.to_string())?;
+    // Connect to the portal's PipeWire remote (the fd from OpenPipeWireRemote),
+    // not the default daemon — that's the only graph the screencast node is on.
+    let core = context
+        .connect_fd_rc(pw_fd, None)
+        .map_err(|e| e.to_string())?;
 
     let stream = StreamRc::new(
         core.clone(),
