@@ -1,15 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Merged into the macOS bundle by tauri-build. Without these usage
-     strings macOS silently denies the device (the capture stream runs and
+     strings macOS silently denies the resource (the capture stream runs and
      delivers pure zeros — no error, no prompt), which reads as "audio
      route active, no sound". In `just dev` the permission attaches to the
-     terminal that launched cargo instead; the bundle needs its own. -->
+     terminal that launched cargo instead; the bundle needs its own.
+
+     NSLocalNetworkUsageDescription is the same trap one layer down: on
+     macOS 14+ an app must hold the Local Network permission to reach peers
+     on the LAN, and the OS only ever prompts for it when this usage string
+     is present. The mesh's fastest path is a direct host↔host ICE pair
+     (local IPs); without the permission those candidates are silently
+     dropped, so a same-network peer is unreachable unless a TURN relay
+     happens to be available — which reads as "can't connect to the other
+     machines" with no error. The string makes macOS prompt (and lists the
+     app under Settings ▸ Privacy & Security ▸ Local Network), so the user
+     can actually grant it. -->
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>AllMyStuff streams this machine's microphone to the devices you wire it to.</string>
   <key>NSCameraUsageDescription</key>
   <string>AllMyStuff streams this machine's cameras to the devices you wire them to.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AllMyStuff connects directly to your other machines on the local network to stream screens, audio, and files between them.</string>
 </dict>
 </plist>
