@@ -454,72 +454,6 @@ impl DropWarns {
     }
 }
 
-/// The buffer parameters the consumer offers once a video format is
-/// negotiated, serialized as a `SPA_TYPE_OBJECT_ParamBuffers` pod for
-/// [`pipewire::stream::Stream::update_params`]. Declaring these is what
-/// actually starts frames flowing: a compositor (Mutter especially) finishes
-/// format negotiation and then waits for the consumer to say how it wants
-/// buffers before allocating any.
-///
-/// `dataType` is pinned to mappable memory (MemFd/MemPtr) on purpose — the
-/// consumer reads pixels through `MAP_BUFFERS`/`datas[0].data()`, so we must
-/// keep the compositor from handing back DMA-BUFs it can't read. `size` and
-/// `stride` are hints from the negotiated geometry; the real per-frame stride
-/// is still read from the buffer chunk (compositors pad rows).
-fn buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
-    use pipewire::spa::sys;
-    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
-
-    let stride = (width * bpp) as i32;
-    let size = stride * height as i32;
-    // Accept every buffer type the compositor might offer, DMA-BUF included:
-    // pinning to mappable-only made Mutter (which prefers DMA-BUF) unable to
-    // satisfy the request, so it allocated nothing and the stream sat
-    // frameless. Let it allocate its native buffers; `add_buffer` logs what
-    // we actually got, and the process path maps what it can.
-    let any_type = (1i32 << sys::SPA_DATA_MemPtr)
-        | (1i32 << sys::SPA_DATA_MemFd)
-        | (1i32 << sys::SPA_DATA_DmaBuf);
-    let obj = pod::Object {
-        type_: SpaTypes::ObjectParamBuffers.as_raw(),
-        id: ParamType::Buffers.as_raw(),
-        properties: vec![
-            pod::Property {
-                key: sys::SPA_PARAM_BUFFERS_buffers,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: 8,
-                        min: 2,
-                        max: 16,
-                    },
-                ))),
-            },
-            pod::Property::new(sys::SPA_PARAM_BUFFERS_blocks, pod::Value::Int(1)),
-            pod::Property::new(sys::SPA_PARAM_BUFFERS_size, pod::Value::Int(size)),
-            pod::Property::new(sys::SPA_PARAM_BUFFERS_stride, pod::Value::Int(stride)),
-            pod::Property {
-                key: sys::SPA_PARAM_BUFFERS_dataType,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Flags {
-                        default: any_type,
-                        flags: vec![],
-                    },
-                ))),
-            },
-        ],
-    };
-    Ok(
-        PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(obj))
-            .map_err(|e| e.to_string())?
-            .0
-            .into_inner(),
-    )
-}
-
 /// Connect to the portal's stream node and pump pictures into `tx`
 /// until the quit channel fires. Format negotiation and conversion
 /// mirror xcap's recorder (RGB/RGBA/RGBx/BGRx → packed RGBA), plus a
@@ -620,7 +554,7 @@ fn pipewire_consume(
             };
             tracing::info!("wayland screencast buffer allocated: spa_data type {dtype:?}");
         })
-        .param_changed(|stream, data, id, param| {
+        .param_changed(|_, data, id, param| {
             let Some(param) = param else { return };
             if id != ParamType::Format.as_raw() {
                 return;
@@ -641,34 +575,17 @@ fn pipewire_consume(
             }
             // The one line that proves format negotiation completed — its
             // absence after "session started" means the compositor never
-            // agreed on a format.
+            // agreed on a format. Buffer allocation is left to the library
+            // (MAP_BUFFERS), exactly as the stock pipewire video-capture
+            // example does — our own update_params(buffers) was overriding
+            // that and stalling the allocation.
             let size = data.format.size();
-            let fmt = data.format.format();
             tracing::info!(
-                "wayland screencast negotiated: {fmt:?} {}×{}",
+                "wayland screencast negotiated: {:?} {}×{}",
+                data.format.format(),
                 size.width,
                 size.height
             );
-            // Format alone doesn't start frames: the compositor (Mutter
-            // especially) then waits for us to declare *buffer* parameters
-            // before it allocates anything. Answer with them now — without
-            // this the stream sits negotiated-but-frameless and `process`
-            // never fires (the "no frame within 8s" we saw).
-            let bpp = match fmt {
-                VideoFormat::RGB => 3,
-                _ => 4,
-            };
-            match buffers_pod(size.width, size.height, bpp) {
-                Ok(bytes) => match Pod::from_bytes(&bytes) {
-                    Some(pod) => {
-                        if let Err(e) = stream.update_params(&mut [pod]) {
-                            tracing::warn!("screencast update_params(buffers): {e}");
-                        }
-                    }
-                    None => tracing::warn!("screencast buffers pod invalid"),
-                },
-                Err(e) => tracing::warn!("screencast buffers pod: {e}"),
-            }
         })
         .process(move |stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
