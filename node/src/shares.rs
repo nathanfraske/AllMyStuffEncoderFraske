@@ -129,6 +129,30 @@ impl Shares {
             .unwrap_or_default()
     }
 
+    /// The **outbound** grants this person holds from me — what they may do
+    /// with my stuff. This is the authoritative set an [`ShareControl::Invite`]
+    /// carries to the peer (sent whole, since the peer records inbound by
+    /// replacement), and the set a full "stop sharing" must revoke on the wire.
+    pub fn out_grants_for(&self, person: &PersonId) -> Vec<Grant> {
+        let i = self.inner.lock();
+        i.shares
+            .iter()
+            .find(|s| &s.person.id == person)
+            .map(|s| s.out_grants.clone())
+            .unwrap_or_default()
+    }
+
+    /// The peer nodes this person brings (canonical pubkey form) — who to tell
+    /// when a grant changes, so every device of theirs converges.
+    pub fn nodes_for(&self, person: &PersonId) -> Vec<NodeId> {
+        let i = self.inner.lock();
+        i.shares
+            .iter()
+            .find(|s| &s.person.id == person)
+            .map(|s| s.nodes.clone())
+            .unwrap_or_default()
+    }
+
     /// Record an **outbound** grant — what this person may do with my stuff.
     /// Authored by me; de-duped by the grant's (content-derived) id so two
     /// structurally identical grants collapse to one. Returns whether the
@@ -414,6 +438,36 @@ mod tests {
         // Both directions present in the one Share the catalog gate sees.
         assert_eq!(projected[0].grants.len(), 2);
         assert_eq!(projected[0].person.id, alex().id);
+    }
+
+    #[test]
+    fn out_grants_and_nodes_back_the_wire_invite() {
+        let sh = memory();
+        let node = NodeId::from("alexkey-AB12C");
+        sh.grant(&alex(), &node, screen_to_alex()); // outbound
+        let cam = Grant::scoped(
+            &alex().id,
+            MediaKind::Video,
+            GrantRole::Provide,
+            None,
+            "Send their camera",
+        );
+        sh.record_inbound(&alex(), &node, vec![cam]); // inbound, not mine to offer
+
+        // An Invite carries only what *I* extend (outbound), never what they
+        // extended to me — otherwise I'd "offer" their own grant back at them.
+        let out = sh.out_grants_for(&alex().id);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].media, MediaKind::Display);
+
+        // And the devices to send it to, in canonical-pubkey form.
+        let nodes = sh.nodes_for(&alex().id);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].as_str(), "alexkey");
+
+        // Unknown person → empty, never a panic.
+        assert!(sh.out_grants_for(&"person:nobody".into()).is_empty());
+        assert!(sh.nodes_for(&"person:nobody".into()).is_empty());
     }
 
     #[test]

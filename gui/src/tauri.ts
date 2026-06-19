@@ -266,6 +266,21 @@ export async function onOwnership(
   );
 }
 
+/** Share negotiation from a peer — someone invited us into a share, accepted
+ *  one we sent, declined, or revoked a grant. The session snapshot carries the
+ *  resulting grant set; this event is just the nudge to surface it (a toast).
+ *  No-op listener in web mode. */
+export async function onShare(
+  cb: (s: { from: string; kind: string; person?: string }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string; kind: string; person?: string }>(
+    "allmystuff://share",
+    (e) => cb(e.payload),
+  );
+}
+
 export function sessionSnapshot(): Promise<SessionSnapshot | null> {
   return tryInvoke<SessionSnapshot>("session_snapshot");
 }

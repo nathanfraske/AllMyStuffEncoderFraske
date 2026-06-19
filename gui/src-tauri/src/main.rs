@@ -163,20 +163,31 @@ async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bo
 /// grant is recorded against; the node is the durable source of truth and the
 /// next snapshot reflects it.
 #[tauri::command]
-fn share_grant(mesh: State<'_, Arc<Mesh>>, person: Person, node: String, grant: Grant) {
-    mesh.inner().share_grant(person, node.into(), grant);
+async fn share_grant(
+    mesh: State<'_, Arc<Mesh>>,
+    person: Person,
+    node: String,
+    grant: Grant,
+) -> Result<(), String> {
+    mesh.inner().share_grant(person, node.into(), grant).await
 }
 
-/// Revoke a grant by its (content-derived) id from a person's durable share.
+/// Revoke a grant by its (content-derived) id from a person's durable share,
+/// and tell their devices to drop it too.
 #[tauri::command]
-fn share_revoke(mesh: State<'_, Arc<Mesh>>, person: String, grant_id: String) {
-    mesh.inner().share_revoke(person.into(), grant_id);
+async fn share_revoke(
+    mesh: State<'_, Arc<Mesh>>,
+    person: String,
+    grant_id: String,
+) -> Result<(), String> {
+    mesh.inner().share_revoke(person.into(), grant_id).await
 }
 
-/// Stop sharing with a person entirely — drop the whole durable record.
+/// Stop sharing with a person entirely — drop the whole durable record and
+/// revoke each grant on their devices.
 #[tauri::command]
-fn share_stop(mesh: State<'_, Arc<Mesh>>, person: String) {
-    mesh.inner().share_stop(person.into());
+async fn share_stop(mesh: State<'_, Arc<Mesh>>, person: String) -> Result<(), String> {
+    mesh.inner().share_stop(person.into()).await
 }
 
 /// Forward one keyboard/mouse event down an active outbound input route —

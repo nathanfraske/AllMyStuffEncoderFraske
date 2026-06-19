@@ -81,6 +81,7 @@ import {
   onRoom,
   onRoomLocal,
   onSession,
+  onShare,
   onSubscription,
   onVideoLocal,
   openConsoleWindow,
@@ -845,6 +846,18 @@ class AppStore {
       if (o.message.kind === "claimed") this.toast("ok", `${who} joined your fleet`);
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
+    });
+    // Share negotiation: the session snapshot (above) already merges the
+    // resulting grants into the graph — this only surfaces the human nudge.
+    await onShare((s) => {
+      const who =
+        s.person?.trim() ||
+        this.catalog.nodes.find((n) => sameMachine(n.id, s.from))?.label ||
+        "Someone";
+      if (s.kind === "invite") this.toast("info", `${who} shared with you`);
+      else if (s.kind === "accept") this.toast("ok", `${who} accepted your share`);
+      else if (s.kind === "decline") this.toast("info", `${who} declined your share`);
+      else if (s.kind === "revoke") this.toast("info", `${who} changed what they share`);
     });
   }
 
