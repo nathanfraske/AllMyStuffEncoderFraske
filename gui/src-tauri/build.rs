@@ -37,6 +37,20 @@ fn main() {
             println!("cargo:warning=could not write sidecar stub: {stub_err}");
         }
     }
+    // The node binary the service runs (`allmystuff-serve`). Bundling it inside
+    // the app means the desktop "Install as a service" works on *every* install
+    // path — including a `.dmg`/`.msi`-only install that never ran the curl
+    // installer — not just where the CLI dropped it on PATH.
+    if let Err(e) = bundle_serve_sidecar() {
+        println!(
+            "cargo:warning=allmystuff-serve sidecar bundle skipped: {e} — the app \
+             still builds; at runtime it falls back to a sibling node build, \
+             `allmystuff-serve` on PATH, or the install dirs"
+        );
+        if let Err(stub_err) = write_serve_stub() {
+            println!("cargo:warning=could not write serve sidecar stub: {stub_err}");
+        }
+    }
     tauri_build::build();
 }
 
@@ -385,6 +399,89 @@ fn write_sidecar_stub() -> Result<(), String> {
     let bin_dir = binaries_dir();
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
     let p = sidecar_path();
+    if !p.exists() {
+        fs::write(&p, b"").map_err(|e| e.to_string())?;
+        make_executable(&p);
+    }
+    Ok(())
+}
+
+// --- allmystuff-serve sidecar (the node binary the OS service runs) ---------
+
+fn serve_sidecar_path() -> PathBuf {
+    binaries_dir().join(format!(
+        "allmystuff-serve-{}{}",
+        target_triple(),
+        exe_suffix()
+    ))
+}
+
+/// Stage `allmystuff-serve` into the sidecar slot so `externalBin` ships it.
+/// It's our own binary (built in the same release run, see release.yml's "Build
+/// node serve binary" step), so this is just a local lookup + copy — no network
+/// fetch like the daemon.
+fn bundle_serve_sidecar() -> Result<(), String> {
+    println!("cargo:rerun-if-env-changed=ALLMYSTUFF_SERVE_BIN");
+    let bin_dir = binaries_dir();
+    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+    let sidecar = serve_sidecar_path();
+
+    let src = locate_serve_binary().ok_or(
+        "allmystuff-serve not built (cargo build --release --manifest-path \
+         node/Cargo.toml --bin allmystuff-serve) and no ALLMYSTUFF_SERVE_BIN override",
+    )?;
+    let sig = format!("serve:{}:{}", src.display(), file_mtime(&src));
+    let sentinel = bin_dir.join(".bundled-serve");
+    if !staged_matches(&sidecar, &sentinel, &sig) {
+        stage(&src, &sidecar)?;
+        let _ = fs::write(&sentinel, &sig);
+        println!(
+            "cargo:warning=[serve sidecar] bundled allmystuff-serve from {}",
+            src.display()
+        );
+    }
+    Ok(())
+}
+
+/// Find a built `allmystuff-serve`: an `ALLMYSTUFF_SERVE_BIN` override, else the
+/// node workspace's target dir (with or without a `--target <triple>` segment,
+/// release before debug).
+fn locate_serve_binary() -> Option<PathBuf> {
+    let name = format!("allmystuff-serve{}", exe_suffix());
+    if let Some(p) = env::var_os("ALLMYSTUFF_SERVE_BIN") {
+        let p = PathBuf::from(p);
+        if nonempty_file(&p) {
+            return Some(p);
+        }
+    }
+    let node_target = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?)
+        .parent()? // gui
+        .parent()? // repo root
+        .join("node")
+        .join("target");
+    let triple = target_triple();
+    let candidates = [
+        node_target.join(&triple).join("release").join(&name),
+        node_target.join(&triple).join("debug").join(&name),
+        node_target.join("release").join(&name),
+        node_target.join("debug").join(&name),
+    ];
+    candidates.into_iter().find(|p| nonempty_file(p))
+}
+
+fn nonempty_file(p: &Path) -> bool {
+    p.metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Zero-byte placeholder for the serve sidecar slot — same role as
+/// [`write_sidecar_stub`], so a build with no staged `allmystuff-serve` still
+/// satisfies `externalBin` and the runtime falls back to PATH / install dirs.
+fn write_serve_stub() -> Result<(), String> {
+    let bin_dir = binaries_dir();
+    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+    let p = serve_sidecar_path();
     if !p.exists() {
         fs::write(&p, b"").map_err(|e| e.to_string())?;
         make_executable(&p);

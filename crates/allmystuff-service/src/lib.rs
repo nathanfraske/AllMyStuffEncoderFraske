@@ -1417,23 +1417,26 @@ fn serve_exe_name() -> &'static str {
 /// installer.
 ///
 /// Order: `ALLMYSTUFF_SERVE_BIN` → next to the running binary (the installer's
-/// layout) → `$PATH` → the installer's well-known destinations → the dev
-/// workspace target. The well-known destinations matter because a GUI launched
-/// from Finder/Dock or a desktop launcher inherits a minimal `PATH` that
-/// excludes `/usr/local/bin` and `~/.local/bin`, where the installer drops the
-/// node binary — so a `PATH`-only search would miss it.
+/// layout, and where the GUI bundles it as a sidecar) → `$PATH` → the
+/// installer's well-known destinations → the dev workspace target. The
+/// well-known destinations matter because a GUI launched from Finder/Dock or a
+/// desktop launcher inherits a minimal `PATH` that excludes `/usr/local/bin`
+/// and `~/.local/bin`, where the installer drops the node binary — so a
+/// `PATH`-only search would miss it. Zero-byte files are skipped, so a failed
+/// sidecar bundle (which stamps an empty stub) falls through rather than
+/// "finding" an unrunnable binary.
 pub fn find_serve_binary() -> Option<PathBuf> {
     let exe = serve_exe_name();
 
     if let Some(p) = std::env::var_os("ALLMYSTUFF_SERVE_BIN") {
         let p = PathBuf::from(p);
-        if p.exists() {
+        if runnable(&p) {
             return Some(p);
         }
     }
     if let Ok(current) = std::env::current_exe() {
         if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
-            if candidate.exists() {
+            if runnable(&candidate) {
                 return Some(candidate);
             }
         }
@@ -1441,25 +1444,34 @@ pub fn find_serve_binary() -> Option<PathBuf> {
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(exe);
-            if candidate.exists() {
+            if runnable(&candidate) {
                 return Some(candidate);
             }
         }
     }
     for dir in install_dirs() {
         let candidate = dir.join(exe);
-        if candidate.exists() {
+        if runnable(&candidate) {
             return Some(candidate);
         }
     }
     for profile in ["release", "debug"] {
         if let Some(p) = workspace_serve_path(profile, exe) {
-            if p.exists() {
+            if runnable(&p) {
                 return Some(p);
             }
         }
     }
     None
+}
+
+/// A binary candidate is usable only if it's a non-empty file — skips the
+/// zero-byte placeholder the GUI sidecar bundling stamps when it can't stage
+/// the real binary (so discovery falls through to PATH / the install dirs).
+fn runnable(p: &Path) -> bool {
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// The standard locations the AllMyStuff installer writes its binaries to (see
@@ -1518,6 +1530,20 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn runnable_skips_empty_and_missing() {
+        let dir = std::env::temp_dir().join(format!("ams-serve-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("stub");
+        let real = dir.join("real");
+        std::fs::write(&stub, b"").unwrap(); // the zero-byte sidecar placeholder
+        std::fs::write(&real, b"\x7fELF...").unwrap();
+        assert!(!runnable(&stub), "an empty stub must be skipped");
+        assert!(runnable(&real), "a non-empty binary is usable");
+        assert!(!runnable(&dir.join("nope")), "a missing path is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- systemd unit rendering ----
