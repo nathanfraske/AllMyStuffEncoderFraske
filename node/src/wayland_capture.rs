@@ -839,15 +839,6 @@ fn pipewire_consume(
         )
         .map_err(|e| e.to_string())?;
 
-    // Hold the stream active so it stays in Streaming and keeps consuming.
-    // Without this it reaches Streaming, then immediately falls back to Paused
-    // and produces no frames. (This errored before the registry-wait, when the
-    // node wasn't ready at connect; it's safe now the node is guaranteed
-    // present.)
-    if let Err(e) = stream.set_active(true) {
-        tracing::warn!("wayland screencast set_active: {e}");
-    }
-
     let _attached = quit.attach(main_loop.loop_(), {
         let main_loop = main_loop.clone();
         move |_| main_loop.quit()

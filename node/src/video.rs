@@ -919,7 +919,7 @@ const FIRST_FRAME_STALL: Duration = Duration::from_secs(5);
 /// Linux-only: the sole caller is the Wayland capture arm, so the constant
 /// would be dead code elsewhere (and `-D warnings` rejects it on macOS/Windows).
 #[cfg(target_os = "linux")]
-const WAYLAND_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(8);
+const WAYLAND_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Drain a session's frame channel into the encoder, paced to the target
 /// rate: each tick encodes the *freshest* pending frame; a backlog is
