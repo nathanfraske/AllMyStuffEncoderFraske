@@ -36,7 +36,7 @@
 //! route therefore keys its own token, and what it restores is whatever
 //! the user picked for that tab the first time.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -540,6 +540,33 @@ fn pipewire_consume(
         .connect_fd_rc(pw_fd, None)
         .map_err(|e| e.to_string())?;
 
+    // The portal's node propagates onto this fresh connection asynchronously.
+    // Binding the stream before the remote's initial registry has landed races
+    // the node into existence — the connect intermittently dies with "no
+    // target node available" (whoever wins the race decides). A sync roundtrip
+    // first drains that initial registry, so the node is reliably present
+    // before we touch the stream.
+    {
+        let synced = Rc::new(Cell::new(false));
+        let pending = core.sync(0).map_err(|e| e.to_string())?;
+        let _sync = core
+            .add_listener_local()
+            .done({
+                let synced = synced.clone();
+                let main_loop = main_loop.clone();
+                move |id, seq| {
+                    if id == pipewire::core::PW_ID_CORE && seq == pending {
+                        synced.set(true);
+                        main_loop.quit();
+                    }
+                }
+            })
+            .register();
+        while !synced.get() {
+            main_loop.run();
+        }
+    }
+
     let stream = StreamRc::new(
         core.clone(),
         "AllMyStuff",
@@ -801,14 +828,6 @@ fn pipewire_consume(
             &mut params,
         )
         .map_err(|e| e.to_string())?;
-
-    // Some compositors park a freshly-connected capture stream at Paused
-    // until the consumer marks itself active — without this it negotiates a
-    // format but never advances to Streaming, so the server produces no
-    // buffers and we stall frameless (the Connecting→Paused-and-stop we saw).
-    if let Err(e) = stream.set_active(true) {
-        tracing::warn!("wayland screencast set_active: {e}");
-    }
 
     let _attached = quit.attach(main_loop.loop_(), {
         let main_loop = main_loop.clone();
