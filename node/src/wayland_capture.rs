@@ -472,7 +472,14 @@ fn buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
 
     let stride = (width * bpp) as i32;
     let size = stride * height as i32;
-    let mappable = (1i32 << sys::SPA_DATA_MemFd) | (1i32 << sys::SPA_DATA_MemPtr);
+    // Accept every buffer type the compositor might offer, DMA-BUF included:
+    // pinning to mappable-only made Mutter (which prefers DMA-BUF) unable to
+    // satisfy the request, so it allocated nothing and the stream sat
+    // frameless. Let it allocate its native buffers; `add_buffer` logs what
+    // we actually got, and the process path maps what it can.
+    let any_type = (1i32 << sys::SPA_DATA_MemPtr)
+        | (1i32 << sys::SPA_DATA_MemFd)
+        | (1i32 << sys::SPA_DATA_DmaBuf);
     let obj = pod::Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
@@ -498,7 +505,7 @@ fn buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
                 value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: mappable,
+                        default: any_type,
                         flags: vec![],
                     },
                 ))),
@@ -564,9 +571,27 @@ fn pipewire_consume(
                     *stream_error.borrow_mut() = Some(e.clone());
                     main_loop.quit();
                 } else {
-                    tracing::debug!("wayland screencast stream: {old:?} → {new:?}");
+                    // At info while we chase the frameless-Mutter case: the
+                    // Paused→Streaming transition (or the lack of it) is the
+                    // tell for whether buffers ever started flowing.
+                    tracing::info!("wayland screencast stream: {old:?} → {new:?}");
                 }
             }
+        })
+        .add_buffer(|_, _, buffer| {
+            // The decisive probe for "negotiated but frameless": what kind of
+            // buffer did the compositor allocate? spa_data type 1=MemPtr,
+            // 2=MemFd (both mappable, our read path), 3=DmaBuf (Mutter's
+            // default, which MAP_BUFFERS can't hand us as CPU pixels).
+            let dtype = unsafe {
+                let buf = (*buffer).buffer;
+                if buf.is_null() || (*buf).n_datas == 0 {
+                    None
+                } else {
+                    Some((*(*buf).datas).type_)
+                }
+            };
+            tracing::info!("wayland screencast buffer allocated: spa_data type {dtype:?}");
         })
         .param_changed(|stream, data, id, param| {
             let Some(param) = param else { return };
@@ -620,6 +645,12 @@ fn pipewire_consume(
         })
         .process(move |stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
+                // Proves `process` is firing even when there's nothing to
+                // take — distinguishes "never streaming" from "streaming but
+                // starved".
+                drops.warn("dequeue", || {
+                    "screencast process woke with no buffer to dequeue".into()
+                });
                 return;
             };
             let datas = buffer.datas_mut();
