@@ -74,8 +74,18 @@ pub struct RawFrame {
 }
 
 /// The live capture: a compositor ScreenCast stream feeding the frame
-/// channel. Dropping it quits the PipeWire loop and joins its thread.
+/// channel. Dropping it quits the PipeWire loop, joins its thread, and only
+/// then closes the portal session.
+///
+/// The `conn`/`session` are held for the capture's whole lifetime on purpose:
+/// the portal ScreenCast session (and Mutter's PipeWire node behind it) lives
+/// only as long as the D-Bus connection that created it. Letting them drop
+/// when `open` returned closed the session out from under the freshly
+/// connected stream — the node was being torn down while we negotiated, so
+/// allocation/frames raced teardown and usually lost.
 pub struct WaylandSession {
+    conn: Connection,
+    session: OwnedObjectPath,
     quit: Option<channel::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -88,6 +98,9 @@ impl Drop for WaylandSession {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // Close the portal session now the stream is done with its node —
+        // not a moment before.
+        close_session(&self.conn, &self.session);
     }
 }
 
@@ -172,6 +185,10 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
 
     Ok((
         WaylandSession {
+            // Held — not dropped — so the portal session and its node outlive
+            // this call and stay up for the capture.
+            conn,
+            session,
             quit: Some(quit_tx),
             thread: Some(thread),
         },
