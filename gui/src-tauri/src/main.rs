@@ -1066,9 +1066,14 @@ fn workaround_pi_webkit_rendering() {
 // mutations need root/admin, so on Windows they're relaunched through a UAC
 // prompt, and on unix the GUI manages the per-user service (no privilege).
 
-/// Locate the `allmystuff` CLI binary, mirroring how the node binary is found:
-/// env override → beside this exe (the installer's layout) → `PATH` → the dev
-/// workspace target dir.
+/// Locate the `allmystuff` CLI binary that drives the OS service. Order: env
+/// override → beside this exe (the installer's layout) → `PATH` → the
+/// well-known install dirs → the dev workspace target. The well-known dirs
+/// matter because a GUI app launched from Finder/Dock (macOS) or a desktop
+/// launcher (Linux) inherits a *minimal* `PATH` that usually excludes
+/// `/usr/local/bin` and `~/.local/bin` — exactly where the installer drops the
+/// CLI — so a `PATH`-only search would miss it and the service controls would
+/// wrongly look unavailable.
 fn find_cli_binary() -> Option<std::path::PathBuf> {
     let exe = if cfg!(windows) {
         "allmystuff.exe"
@@ -1096,6 +1101,14 @@ fn find_cli_binary() -> Option<std::path::PathBuf> {
             }
         }
     }
+    // The installer's actual destinations (see install.sh / install.ps1), which
+    // a Finder/Dock/launcher-spawned app's minimal PATH won't include.
+    for dir in cli_install_dirs() {
+        let c = dir.join(exe);
+        if c.exists() {
+            return Some(c);
+        }
+    }
     // Dev fallback: repo-root target/{release,debug}/allmystuff.
     for profile in ["release", "debug"] {
         if let Some(p) = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1111,28 +1124,106 @@ fn find_cli_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Standard locations the AllMyStuff installer writes the CLI to, searched
+/// when it isn't beside the app or on PATH.
+fn cli_install_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        // Unix: the installer's non-root target. Windows: where it puts both
+        // binaries.
+        dirs.push(home.join(".local").join("bin"));
+        #[cfg(windows)]
+        dirs.push(
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("AllMyStuff"),
+        );
+    }
+    #[cfg(windows)]
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            std::path::PathBuf::from(la)
+                .join("Programs")
+                .join("AllMyStuff"),
+        );
+    }
+    #[cfg(unix)]
+    {
+        dirs.push("/usr/local/bin".into());
+        dirs.push("/opt/homebrew/bin".into()); // Apple-silicon Homebrew
+        dirs.push("/usr/bin".into());
+    }
+    dirs
+}
+
 /// The OS background-service status as JSON (`installed` / `running` /
 /// `enabled` / `supported` / …), from `allmystuff service status --json`.
 /// Querying needs no elevation, so this works without admin/sudo. Async +
 /// `spawn_blocking` so the subprocess never blocks the UI thread.
+///
+/// Whether this platform *has* a service layer is a static fact (Linux,
+/// macOS and Windows all do), so it's derived from the OS here and reported
+/// even when the CLI can't be reached. That keeps "couldn't find / run the
+/// CLI" from masquerading as "this platform has no background service" — a
+/// missing CLI sets `cli_missing`/`status_error`, not `supported: false`.
 #[tauri::command]
 async fn service_status() -> Result<Value, String> {
-    tokio::task::spawn_blocking(service_status_blocking)
+    tokio::task::spawn_blocking(service_status_value)
         .await
-        .map_err(|e| format!("service status task failed: {e}"))?
+        .map_err(|e| format!("service status task failed: {e}"))
 }
 
-fn service_status_blocking() -> Result<Value, String> {
-    let cli =
-        find_cli_binary().ok_or_else(|| "couldn't find the allmystuff CLI binary".to_string())?;
-    let out = std::process::Command::new(&cli)
+/// Backstop status when the CLI's own `--json` can't be obtained: the platform
+/// support known from the OS, plus a reason (`cli_missing` / `status_error`),
+/// and indeterminate live state.
+fn service_status_fallback(reason_key: &str, reason: String) -> Value {
+    let os = std::env::consts::OS;
+    let supported = matches!(os, "linux" | "macos" | "windows");
+    let mut v = json!({
+        "platform": os,
+        "supported": supported,
+        "manager": null,
+        "installed": false,
+        "running": null,
+        "enabled": null,
+    });
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(reason_key.to_string(), Value::String(reason));
+    }
+    v
+}
+
+fn service_status_value() -> Value {
+    let Some(cli) = find_cli_binary() else {
+        return service_status_fallback(
+            "cli_missing",
+            "couldn't find the `allmystuff` command-line tool to manage the service".into(),
+        );
+    };
+    let out = match std::process::Command::new(&cli)
         .args(["service", "status", "--json"])
         .output()
-        .map_err(|e| format!("running allmystuff: {e}"))?;
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return service_status_fallback("status_error", format!("running allmystuff: {e}"))
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stdout = stdout.trim();
-    serde_json::from_str::<Value>(stdout)
-        .map_err(|e| format!("parsing service status: {e} (got: {stdout})"))
+    match serde_json::from_str::<Value>(stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = if stderr.trim().is_empty() {
+                format!("couldn't parse service status: {e}")
+            } else {
+                format!("service status failed: {}", stderr.trim())
+            };
+            service_status_fallback("status_error", detail)
+        }
+    }
 }
 
 /// Run an `allmystuff service <verb>` that *changes* the service. Returns
@@ -1506,5 +1597,26 @@ mod tests {
     fn window_slug_flattens_to_label_charset() {
         assert_eq!(window_slug("cap:desk:cam/0"), "cap_desk_cam_0");
         assert_eq!(window_slug("plain-id_9"), "plain-id_9");
+    }
+
+    #[test]
+    fn service_status_fallback_reports_platform_support_not_unsupported() {
+        // The whole point of the fallback: a missing/erroring CLI must not read
+        // as "this platform has no service". Every OS the desktop app runs on
+        // (linux/macos/windows) has a service layer, so `supported` is true and
+        // the reason rides a `cli_missing`/`status_error` field instead.
+        let v = service_status_fallback("cli_missing", "no CLI".into());
+        assert_eq!(v["platform"], std::env::consts::OS);
+        assert_eq!(v["supported"], true);
+        assert_eq!(v["installed"], false);
+        assert_eq!(v["running"], Value::Null);
+        assert_eq!(v["cli_missing"], "no CLI");
+        // The other reason key is absent, not null.
+        assert!(v.get("status_error").is_none());
+
+        let e = service_status_fallback("status_error", "boom".into());
+        assert_eq!(e["supported"], true);
+        assert_eq!(e["status_error"], "boom");
+        assert!(e.get("cli_missing").is_none());
     }
 }

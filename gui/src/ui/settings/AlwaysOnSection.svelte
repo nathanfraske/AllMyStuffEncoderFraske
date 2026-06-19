@@ -14,25 +14,37 @@
   const wb = $derived(app.windowBehavior);
   const busy = $derived(app.serviceBusy);
 
+  const loaded = $derived(svc != null);
+  // All three desktop OSes have a service layer, so `supported` reflects the
+  // platform, not whether we could reach the CLI. A missing/erroring CLI sets
+  // cli_missing / status_error instead — those mean "can't manage it right
+  // now", never "this platform has no service".
   const supported = $derived(svc?.supported === true);
+  const cliMissing = $derived(!!svc?.cli_missing);
+  const statusError = $derived(svc?.status_error ?? null);
+  const unsupported = $derived(loaded && svc?.supported !== true);
+  const reachable = $derived(supported && !cliMissing && !statusError);
   const installed = $derived(svc?.installed === true);
   const running = $derived(svc?.running === true);
   const enabled = $derived(svc?.enabled === true);
 
-  // Platform-aware wording so the copy reads right on each OS.
+  // Platform-aware wording so the copy reads right on each OS — derived from
+  // the CLI's reported manager when we have it, else from the platform.
   const isMac = $derived(svc?.platform === "macos");
   const trayWord = $derived(isMac ? "menu bar" : "system tray");
   const startsWhen = $derived(svc?.scope === "system" ? "boot" : "login");
   const serviceKind = $derived(
-    svc?.manager === "windows-service"
+    svc?.manager === "windows-service" || svc?.platform === "windows"
       ? "Windows"
-      : svc?.manager === "launchd"
+      : svc?.manager === "launchd" || svc?.platform === "macos"
         ? "launchd"
-        : svc?.manager === "systemd"
+        : svc?.manager === "systemd" || svc?.platform === "linux"
           ? "systemd"
           : "background",
   );
-  const statusWord = $derived(!installed ? "Off" : running ? "Running" : "Stopped");
+  const statusWord = $derived(
+    !reachable ? "—" : !installed ? "Off" : running ? "Running" : "Stopped",
+  );
 
   let armedUninstall = $state(false);
   function uninstall() {
@@ -83,11 +95,27 @@
         <span class="pill" class:on={running} class:idle={installed && !running}>{statusWord}</span>
       </div>
 
-      {#if !supported}
+      {#if !loaded}
+        <p class="notice">Reading service status…</p>
+      {:else if unsupported}
         <p class="notice">
-          A background service isn't available on {platformLabel(svc?.platform)} here yet — you can
-          still run <code>allmystuff serve</code> by hand.
+          A background service isn't available on {platformLabel(svc?.platform)} — you can still run
+          <code>allmystuff serve</code> by hand.
         </p>
+      {:else if cliMissing}
+        <p class="notice">
+          A {serviceKind} background service is available here, but AllMyStuff couldn't find the
+          <code>allmystuff</code> command-line tool that manages it. Reinstall AllMyStuff (the CLI
+          ships alongside the app), or point <code>ALLMYSTUFF_CLI_BIN</code> at it.
+        </p>
+        <div class="actions">
+          <button class="btn" disabled={busy} onclick={() => app.loadServiceStatus()}>Retry</button>
+        </div>
+      {:else if statusError}
+        <p class="notice">Couldn't read the service status: {statusError}</p>
+        <div class="actions">
+          <button class="btn" disabled={busy} onclick={() => app.loadServiceStatus()}>Retry</button>
+        </div>
       {:else if !installed}
         <div class="actions">
           <button class="btn primary" disabled={busy} onclick={() => app.installService()}>

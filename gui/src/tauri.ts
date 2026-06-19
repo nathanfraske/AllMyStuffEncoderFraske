@@ -1106,18 +1106,23 @@ export function updateLatestVersion(): Promise<string | null> {
 // closing / minimizing keeps AllMyStuff alive in the tray. Both degrade to
 // null in web mode so the settings tab can render a "desktop only" note.
 
-/** Status of the OS background ("Always On") service. `supported` is false on
- *  a platform we don't manage; otherwise `installed`/`running`/`enabled`
- *  drive the buttons (`enabled`/`running` are null when not installed). */
+/** Status of the OS background ("Always On") service. `supported` reflects the
+ *  platform (Linux/macOS/Windows all have a service layer), so it stays true
+ *  even when the live state can't be read; `installed`/`running`/`enabled`
+ *  drive the buttons (null when not installed / indeterminate). `cli_missing`
+ *  or `status_error` is set when the `allmystuff` CLI that drives the service
+ *  couldn't be found or run — distinct from the platform being unsupported. */
 export interface ServiceStatus {
   platform: string;
   supported: boolean;
-  manager?: string;
+  manager?: string | null;
   scope?: string;
   installed?: boolean;
   running?: boolean | null;
   enabled?: boolean | null;
   needs_privilege?: boolean;
+  cli_missing?: string;
+  status_error?: string;
 }
 
 /** Result of a service mutation (install/start/stop/restart/uninstall). */
