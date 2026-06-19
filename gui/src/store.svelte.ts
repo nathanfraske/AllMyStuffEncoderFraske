@@ -110,6 +110,7 @@ import {
   updateApply,
   updateCheck,
   updateLatestVersion,
+  updateRelaunch,
   updateSetPrefs,
   updateStatus,
   upgradeNode,
@@ -600,6 +601,10 @@ class AppStore {
   updateBusy = $state(false);
   /** Result of the last manual "check now", for the Updates pane. */
   updateOutcome = $state<CheckOutcome | null>(null);
+  /** Version just applied to disk this session (via "Apply now") and now
+   *  awaiting a relaunch to actually run. Drives the Updates pane's
+   *  "Relaunch now" prompt. */
+  updateApplied = $state<string | null>(null);
   /** The channel's latest release version, learned once (read-only) so the
    *  drawer can tell which of your fleet machines are behind it. Null until
    *  loaded; stays null in web mode / if the feed can't be reached. */
@@ -4562,18 +4567,40 @@ class AppStore {
     }
   }
 
-  /** Apply a staged update to disk (it takes effect on next launch). */
+  /** Apply a staged update to disk now. The swap lands immediately, but the
+   *  running process keeps the old build until it relaunches — so we surface a
+   *  "Relaunch now" prompt rather than claiming it's already live. */
   async applyUpdate() {
     if (!isTauri()) return;
     this.updateBusy = true;
     try {
       const r = await updateApply();
-      if (r?.applied) this.toast("ok", `Update ${r.applied} staged — it applies on next launch`);
-      else this.toast("info", "Nothing staged to apply");
+      if (r?.applied) {
+        this.updateApplied = r.applied;
+        this.toast("ok", `Update ${r.applied} applied — relaunch to run it`);
+      } else this.toast("info", "Nothing staged to apply");
       this.updateInfo = (await updateStatus()) ?? this.updateInfo;
     } catch (e) {
       this.toast("warn", `Couldn't apply update: ${errMsg(e)}`);
     } finally {
+      this.updateBusy = false;
+    }
+  }
+
+  /** Apply any staged update and relaunch straight into it — the one-click
+   *  finish for both the "Relaunch & update" and "Relaunch now" buttons. The
+   *  app restarts on success, so control only returns here on failure. */
+  async relaunchUpdate() {
+    if (!isTauri()) {
+      this.toast("info", "Updates need the desktop app");
+      return;
+    }
+    this.updateBusy = true;
+    try {
+      await updateRelaunch();
+      // On success the process is already restarting; we won't reach here.
+    } catch (e) {
+      this.toast("warn", `Couldn't relaunch to update: ${errMsg(e)}`);
       this.updateBusy = false;
     }
   }

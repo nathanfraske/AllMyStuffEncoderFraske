@@ -961,6 +961,19 @@ async fn update_apply() -> Result<Value, String> {
     Ok(json!({ "applied": applied }))
 }
 
+/// Apply any staged self-update to disk and relaunch into it. Applying
+/// *before* the restart is what makes the relaunch land on the new version in
+/// one step: a bare restart would re-exec the still-old binary and only swap
+/// it in on the *following* boot (the running image keeps its old inode).
+/// Errors only when the required CLI half couldn't be swapped — the staged
+/// marker is kept so a later try can succeed; otherwise this never returns,
+/// because the process restarts.
+#[tauri::command]
+async fn update_relaunch(app: tauri::AppHandle) -> Result<(), String> {
+    allmystuff_updater::apply_now().map_err(|e| e.to_string())?;
+    app.restart()
+}
+
 #[tauri::command]
 async fn update_set_prefs(prefs: Value) -> Result<Value, String> {
     let prefs: allmystuff_updater::UpdatePrefs =
@@ -1088,6 +1101,7 @@ fn main() {
             update_status,
             update_check,
             update_apply,
+            update_relaunch,
             update_set_prefs,
             update_latest_version,
         ])
@@ -1118,6 +1132,12 @@ fn main() {
                 // presence, starts the event pump).
                 mesh.start().await;
             });
+            // Self-update ticker — the first check fires shortly after launch,
+            // then at the configured interval. Spawned unconditionally:
+            // `check_now` no-ops when auto-update is off or this is a
+            // package-managed install. Without this the in-app updater only
+            // ever checks when the user clicks "Check now".
+            tauri::async_runtime::spawn(allmystuff_updater::tick_forever());
             Ok(())
         })
         .build(tauri::generate_context!())

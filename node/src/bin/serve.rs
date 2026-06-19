@@ -139,6 +139,12 @@ async fn run() -> ExitCode {
     let mesh = Mesh::new(client.clone(), Arc::new(LogSink));
     mesh.clone().start().await;
 
+    // Self-update ticker: a headless node checks the release feed on its own
+    // and stages whatever its policy permits for the next launch — the same
+    // "set and forget" the desktop app gets. No-ops when auto-update is off or
+    // this is a package-managed install.
+    tokio::spawn(allmystuff_updater::tick_forever());
+
     match mesh.resolve_local_id().await {
         Some(id) => tracing::info!(device_id = %id, "serving this machine on the mesh"),
         None => tracing::warn!(

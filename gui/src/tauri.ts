@@ -1019,6 +1019,17 @@ export function updateApply(): Promise<{ applied: string | null } | null> {
   return tryInvoke<{ applied: string | null }>("update_apply");
 }
 
+/** Apply any staged update to disk and relaunch into the new version. The
+ *  process restarts on success, so this never resolves then — it only returns
+ *  (throwing) if the apply failed and we stayed on the old build. No-op in web
+ *  mode. Uses a raw invoke so the failure surfaces instead of being swallowed
+ *  to null like the graceful-degradation helpers above. */
+export async function updateRelaunch(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("update_relaunch");
+}
+
 export function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus | null> {
   return tryInvoke<UpdateStatus>("update_set_prefs", { prefs });
 }
