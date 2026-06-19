@@ -802,6 +802,14 @@ fn pipewire_consume(
         )
         .map_err(|e| e.to_string())?;
 
+    // Some compositors park a freshly-connected capture stream at Paused
+    // until the consumer marks itself active — without this it negotiates a
+    // format but never advances to Streaming, so the server produces no
+    // buffers and we stall frameless (the Connecting→Paused-and-stop we saw).
+    if let Err(e) = stream.set_active(true) {
+        tracing::warn!("wayland screencast set_active: {e}");
+    }
+
     let _attached = quit.attach(main_loop.loop_(), {
         let main_loop = main_loop.clone();
         move |_| main_loop.quit()
