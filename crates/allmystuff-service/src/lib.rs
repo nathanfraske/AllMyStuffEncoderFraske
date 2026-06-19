@@ -1,5 +1,10 @@
-//! `allmystuff service …` — install / start / stop / uninstall AllMyStuff as
-//! a background OS service.
+//! Install / start / stop / uninstall AllMyStuff as a background OS service.
+//!
+//! Shared by the `allmystuff` CLI (`allmystuff service …`) and the desktop
+//! app's "Always On" tab, so both manage the service identically — and so the
+//! GUI can do it **in-process** with no separate `allmystuff` binary to find
+//! (on unix it calls [`run`] directly; on Windows it re-launches its own
+//! binary elevated). Plain function calls, no subprocess to ourselves.
 //!
 //! This manages the **node process** (`allmystuff-serve`, what `allmystuff
 //! serve` runs) under the host init system so it survives logout/reboot. And
@@ -221,7 +226,7 @@ fn install(manager: Manager, scope: Scope, home: &Path, log: Option<String>) -> 
 
     // The unit runs the node binary (`allmystuff-serve`), not this CLI —
     // resolve it the same way `allmystuff serve` does.
-    let src = crate::serve::find_serve_binary()
+    let src = find_serve_binary()
         .ok_or_else(|| {
             anyhow!(
                 "couldn't find the `allmystuff-serve` node binary to run.\n\n\
@@ -999,7 +1004,7 @@ fn win_install(log: Option<String>) -> Result<()> {
     // installer dropped it (beside `allmystuff` and `allmystuff-gui`) is what
     // lets the node's background self-updater refresh all three halves in
     // lockstep — a copied-aside binary could only ever update itself.
-    let exec = crate::serve::find_serve_binary().ok_or_else(|| {
+    let exec = find_serve_binary().ok_or_else(|| {
         anyhow!(
             "couldn't find the `allmystuff-serve` node binary to run.\n\n\
              Re-run the installer (it installs the node), set ALLMYSTUFF_SERVE_BIN,\n\
@@ -1391,6 +1396,112 @@ fn enabled_is_on(word: &str) -> bool {
     matches!(
         word,
         "enabled" | "enabled-runtime" | "static" | "alias" | "indirect" | "loaded"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Locating the node binary the service runs
+// ---------------------------------------------------------------------------
+
+fn serve_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "allmystuff-serve.exe"
+    } else {
+        "allmystuff-serve"
+    }
+}
+
+/// Locate the `allmystuff-serve` node binary — the program the service runs.
+/// Used by `allmystuff serve` (which execs it), `service install` (which bakes
+/// its path into the unit/`sc` ImagePath), and the desktop app's in-process
+/// installer.
+///
+/// Order: `ALLMYSTUFF_SERVE_BIN` → next to the running binary (the installer's
+/// layout) → `$PATH` → the installer's well-known destinations → the dev
+/// workspace target. The well-known destinations matter because a GUI launched
+/// from Finder/Dock or a desktop launcher inherits a minimal `PATH` that
+/// excludes `/usr/local/bin` and `~/.local/bin`, where the installer drops the
+/// node binary — so a `PATH`-only search would miss it.
+pub fn find_serve_binary() -> Option<PathBuf> {
+    let exe = serve_exe_name();
+
+    if let Some(p) = std::env::var_os("ALLMYSTUFF_SERVE_BIN") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(exe);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    for dir in install_dirs() {
+        let candidate = dir.join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    for profile in ["release", "debug"] {
+        if let Some(p) = workspace_serve_path(profile, exe) {
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The standard locations the AllMyStuff installer writes its binaries to (see
+/// install.sh / install.ps1), searched when the node binary isn't beside the
+/// running app or on `PATH`.
+fn install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        #[cfg(windows)]
+        dirs.push(
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("AllMyStuff"),
+        );
+    }
+    #[cfg(windows)]
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(la).join("Programs").join("AllMyStuff"));
+    }
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin")); // Apple-silicon Homebrew
+        dirs.push(PathBuf::from("/usr/bin"));
+    }
+    dirs
+}
+
+fn workspace_serve_path(profile: &str, exe: &str) -> Option<PathBuf> {
+    // CARGO_MANIFEST_DIR = crates/allmystuff-service; repo root is two up, and
+    // the node engine's build output lives under `node/target/<profile>/`.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Some(
+        PathBuf::from(manifest_dir)
+            .parent()? // crates/
+            .parent()? // repo root
+            .join("node")
+            .join("target")
+            .join(profile)
+            .join(exe),
     )
 }
 

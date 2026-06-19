@@ -28,6 +28,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
+# "Start with computer" — registers a per-user login item (Windows Run key /
+# macOS LaunchAgent / Linux ~/.config/autostart), no admin needed.
+tauri-plugin-autostart = "2"
 
 # The headless mesh **node engine** — every media plane (screen / camera /
 # audio / input / terminal / files / clipboard / sites), the route handshake,
@@ -64,6 +67,9 @@ allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../../crates/allmystuff-bridge" }
 allmystuff-session = { path = "../../crates/allmystuff-session" }
 allmystuff-updater = { path = "../../crates/allmystuff-updater" }
+# Install/manage the OS background service in-process — the same crate the CLI
+# uses, so the "Always On" tab needs no separate `allmystuff` binary to find.
+allmystuff-service = { path = "../../crates/allmystuff-service" }
 
 # PR_SET_PDEATHSIG for the daemon lifetime tie (see
 # daemon_spawn::tie_daemon_lifetime) — the kernel SIGKILLs the daemon

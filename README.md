@@ -246,10 +246,14 @@ because a service box may run for months without a restart, the headless node
 straight onto it (re-exec under systemd/launchd; an SCM restart under Windows),
 keeping every half — CLI, GUI and node — current on its own.
 
-The desktop app exposes all of this under **Settings → Always On**: a one-click
-**Install as a service** (with the service's start/stop/restart/uninstall once
-it's in), plus the **close-to-tray / minimize-to-tray** toggles that keep the
-window a click away in the notification area (the menu bar on macOS).
+The desktop app exposes all of this under **Settings → Always On**: **Start
+with computer** (on by default) and **Start minimized**, a one-click **Install
+as a service** (with start/stop/restart/uninstall once it's in), and the
+**close-to-tray / minimize-to-tray** toggles that keep the window a click away
+in the notification area (the menu bar on macOS). The app manages the service
+**in-process** — there's no separate `allmystuff` command for it to hunt down —
+so on Linux/macOS it just installs the per-user service, and on Windows it
+prompts once for administrator approval.
 
 ## What a scan sees
 

@@ -1106,23 +1106,19 @@ export function updateLatestVersion(): Promise<string | null> {
 // closing / minimizing keeps AllMyStuff alive in the tray. Both degrade to
 // null in web mode so the settings tab can render a "desktop only" note.
 
-/** Status of the OS background ("Always On") service. `supported` reflects the
- *  platform (Linux/macOS/Windows all have a service layer), so it stays true
- *  even when the live state can't be read; `installed`/`running`/`enabled`
- *  drive the buttons (null when not installed / indeterminate). `cli_missing`
- *  or `status_error` is set when the `allmystuff` CLI that drives the service
- *  couldn't be found or run — distinct from the platform being unsupported. */
+/** Status of the OS background ("Always On") service, computed in-process.
+ *  `supported` reflects the platform (Linux/macOS/Windows all have a service
+ *  layer); `installed`/`running`/`enabled` drive the buttons (null when not
+ *  installed / indeterminate). */
 export interface ServiceStatus {
   platform: string;
   supported: boolean;
-  manager?: string | null;
+  manager?: string;
   scope?: string;
   installed?: boolean;
   running?: boolean | null;
   enabled?: boolean | null;
   needs_privilege?: boolean;
-  cli_missing?: string;
-  status_error?: string;
 }
 
 /** Result of a service mutation (install/start/stop/restart/uninstall). */
@@ -1163,10 +1159,12 @@ export function serviceUninstall(): Promise<ServiceActionResult> {
   return serviceAction("service_uninstall");
 }
 
-/** Whether closing / minimizing the window keeps AllMyStuff in the tray. */
+/** Window/startup behaviour: whether closing / minimizing keeps AllMyStuff in
+ *  the tray, and whether a login-item launch starts hidden. */
 export interface WindowBehavior {
   close_to_tray: boolean;
   minimize_to_tray: boolean;
+  start_minimized: boolean;
 }
 
 export function windowBehaviorGet(): Promise<WindowBehavior | null> {
@@ -1177,7 +1175,23 @@ export function windowBehaviorSet(b: WindowBehavior): Promise<WindowBehavior | n
   return tryInvoke<WindowBehavior>("window_behavior_set", {
     closeToTray: b.close_to_tray,
     minimizeToTray: b.minimize_to_tray,
+    startMinimized: b.start_minimized,
   });
+}
+
+/** Whether "Start with computer" (the OS login item) is registered. Null in
+ *  web mode. */
+export function autostartGet(): Promise<boolean | null> {
+  return tryInvoke<boolean>("autostart_get");
+}
+
+/** Register / unregister the login item. Uses a raw invoke so a failure throws
+ *  with its message rather than being swallowed to null. Returns the resulting
+ *  state. Throws in web mode is avoided by the isTauri guard. */
+export async function autostartSet(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("autostart_set", { enabled })) as boolean;
 }
 
 /** Subscribe to live session snapshots. Returns an unlisten fn (or a no-op

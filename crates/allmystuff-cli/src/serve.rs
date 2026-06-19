@@ -8,12 +8,14 @@
 //! box — and one `allmystuff service` (see [`crate::service`]) keeps it
 //! running across reboots.
 //!
-//! Discovery order mirrors the GUI launcher: `ALLMYSTUFF_SERVE_BIN` → next to
-//! this binary (the release layout) → `$PATH` → dev artefacts under
+//! Discovery (in [`allmystuff_service::find_serve_binary`]) mirrors the GUI
+//! launcher: `ALLMYSTUFF_SERVE_BIN` → next to this binary (the release layout)
+//! → `$PATH` → the installer's dirs → dev artefacts under
 //! `node/target/{debug,release}/`.
 
-use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+
+use allmystuff_service::find_serve_binary;
 
 /// Run the node. Forwards any extra args through to `allmystuff-serve` and,
 /// on Unix, *replaces* this process with it so a service manager tracks the
@@ -57,63 +59,4 @@ fn hand_off(serve: &std::path::Path, args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn serve_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "allmystuff-serve.exe"
-    } else {
-        "allmystuff-serve"
-    }
-}
-
-/// Locate the `allmystuff-serve` binary. Shared by `serve` (which execs it)
-/// and `service install` (which bakes its path into the unit's `ExecStart`).
-pub fn find_serve_binary() -> Option<PathBuf> {
-    let exe = serve_exe_name();
-
-    if let Some(p) = std::env::var_os("ALLMYSTUFF_SERVE_BIN") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(exe);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    for profile in ["release", "debug"] {
-        if let Some(p) = workspace_serve_path(profile, exe) {
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-fn workspace_serve_path(profile: &str, exe: &str) -> Option<PathBuf> {
-    // CARGO_MANIFEST_DIR = crates/allmystuff-cli; repo root is two up, and the
-    // node engine's build output lives under `node/target/<profile>/`.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Some(
-        PathBuf::from(manifest_dir)
-            .parent()? // crates/
-            .parent()? // repo root
-            .join("node")
-            .join("target")
-            .join(profile)
-            .join(exe),
-    )
 }

@@ -16,7 +16,6 @@
 
 mod gui_launch;
 mod serve;
-mod service;
 
 use std::process::ExitCode;
 
@@ -169,16 +168,16 @@ fn run_service(args: &[String]) -> ExitCode {
         .map(String::as_str)
         .find(|a| !a.starts_with('-'));
     let cmd = match action {
-        Some("install") => service::ServiceCmd::Install {
+        Some("install") => allmystuff_service::ServiceCmd::Install {
             log: flag_value(args, "--log"),
         },
-        Some("start") => service::ServiceCmd::Start,
-        Some("stop") => service::ServiceCmd::Stop,
-        Some("restart") => service::ServiceCmd::Restart,
+        Some("start") => allmystuff_service::ServiceCmd::Start,
+        Some("stop") => allmystuff_service::ServiceCmd::Stop,
+        Some("restart") => allmystuff_service::ServiceCmd::Restart,
         // `status --json` emits a stable one-line object for the desktop app's
         // "Always On" tab; the bare form prints the human read-out.
         Some("status") if json => {
-            return match service::print_status_json(system) {
+            return match allmystuff_service::print_status_json(system) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("allmystuff service: {e:#}");
@@ -186,8 +185,8 @@ fn run_service(args: &[String]) -> ExitCode {
                 }
             };
         }
-        Some("status") => service::ServiceCmd::Status,
-        Some("uninstall") | Some("remove") => service::ServiceCmd::Uninstall,
+        Some("status") => allmystuff_service::ServiceCmd::Status,
+        Some("uninstall") | Some("remove") => allmystuff_service::ServiceCmd::Uninstall,
         Some(other) => {
             eprintln!("allmystuff service: unknown subcommand `{other}`\n");
             print_service_help();
@@ -198,7 +197,7 @@ fn run_service(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match service::run(system, cmd) {
+    match allmystuff_service::run(system, cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("allmystuff service: {e:#}");
