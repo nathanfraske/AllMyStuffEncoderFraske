@@ -454,6 +454,63 @@ impl DropWarns {
     }
 }
 
+/// The buffer parameters the consumer offers after a format is negotiated,
+/// as a `SPA_TYPE_OBJECT_ParamBuffers` pod for
+/// [`pipewire::stream::Stream::update_params`].
+///
+/// `dataType` is pinned to **mappable** memory (MemFd/MemPtr) with no DMA-BUF:
+/// Mutter prefers DMA-BUF, which the consumer can't allocate or read without a
+/// GPU context, so without this the buffer negotiation finds no common type
+/// and the server never allocates (the negotiate-then-frameless stall). Pinning
+/// to SHM forces the compositor onto its CPU-readable path. `size`/`stride` are
+/// the geometry hints; the real per-frame stride is still read from the chunk.
+fn shm_buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
+    use pipewire::spa::sys;
+    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    let stride = (width * bpp) as i32;
+    let size = stride * height as i32;
+    let shm = (1i32 << sys::SPA_DATA_MemFd) | (1i32 << sys::SPA_DATA_MemPtr);
+    let obj = pod::Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![
+            pod::Property {
+                key: sys::SPA_PARAM_BUFFERS_buffers,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 8,
+                        min: 1,
+                        max: 32,
+                    },
+                ))),
+            },
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_blocks, pod::Value::Int(1)),
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_size, pod::Value::Int(size)),
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_stride, pod::Value::Int(stride)),
+            pod::Property {
+                key: sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags {
+                        default: shm,
+                        flags: vec![],
+                    },
+                ))),
+            },
+        ],
+    };
+    Ok(
+        PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(obj))
+            .map_err(|e| e.to_string())?
+            .0
+            .into_inner(),
+    )
+}
+
 /// Connect to the portal's stream node and pump pictures into `tx`
 /// until the quit channel fires. Format negotiation and conversion
 /// mirror xcap's recorder (RGB/RGBA/RGBx/BGRx → packed RGBA), plus a
@@ -554,8 +611,12 @@ fn pipewire_consume(
             };
             tracing::info!("wayland screencast buffer allocated: spa_data type {dtype:?}");
         })
-        .param_changed(|_, data, id, param| {
+        .param_changed(|stream, data, id, param| {
             let Some(param) = param else { return };
+            // Trace the negotiation: a Buffers param coming back after Format
+            // means the server is driving allocation; silence after Format
+            // means it's stuck on the buffer step.
+            tracing::info!("wayland screencast param_changed id={id}");
             if id != ParamType::Format.as_raw() {
                 return;
             }
@@ -573,19 +634,31 @@ fn pipewire_consume(
                 tracing::warn!("screencast format parse: {e:?}");
                 return;
             }
-            // The one line that proves format negotiation completed — its
-            // absence after "session started" means the compositor never
-            // agreed on a format. Buffer allocation is left to the library
-            // (MAP_BUFFERS), exactly as the stock pipewire video-capture
-            // example does — our own update_params(buffers) was overriding
-            // that and stalling the allocation.
             let size = data.format.size();
+            let fmt = data.format.format();
             tracing::info!(
-                "wayland screencast negotiated: {:?} {}×{}",
-                data.format.format(),
+                "wayland screencast negotiated: {fmt:?} {}×{}",
                 size.width,
                 size.height
             );
+            // Answer with SHM buffer params so the server allocates
+            // CPU-readable buffers (see `shm_buffers_pod`) — Mutter otherwise
+            // sticks on DMA-BUF we can't take, and never allocates at all.
+            let bpp = match fmt {
+                VideoFormat::RGB => 3,
+                _ => 4,
+            };
+            match shm_buffers_pod(size.width, size.height, bpp) {
+                Ok(bytes) => match Pod::from_bytes(&bytes) {
+                    Some(pod) => {
+                        if let Err(e) = stream.update_params(&mut [pod]) {
+                            tracing::warn!("screencast update_params(buffers): {e}");
+                        }
+                    }
+                    None => tracing::warn!("screencast buffers pod invalid"),
+                },
+                Err(e) => tracing::warn!("screencast buffers pod: {e}"),
+            }
         })
         .process(move |stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
