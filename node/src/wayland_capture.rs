@@ -36,7 +36,7 @@
 //! route therefore keys its own token, and what it restores is whatever
 //! the user picked for that tab the first time.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -74,8 +74,18 @@ pub struct RawFrame {
 }
 
 /// The live capture: a compositor ScreenCast stream feeding the frame
-/// channel. Dropping it quits the PipeWire loop and joins its thread.
+/// channel. Dropping it quits the PipeWire loop, joins its thread, and only
+/// then closes the portal session.
+///
+/// The `conn`/`session` are held for the capture's whole lifetime on purpose:
+/// the portal ScreenCast session (and Mutter's PipeWire node behind it) lives
+/// only as long as the D-Bus connection that created it. Letting them drop
+/// when `open` returned closed the session out from under the freshly
+/// connected stream — the node was being torn down while we negotiated, so
+/// allocation/frames raced teardown and usually lost.
 pub struct WaylandSession {
+    conn: Connection,
+    session: OwnedObjectPath,
     quit: Option<channel::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -88,6 +98,9 @@ impl Drop for WaylandSession {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // Close the portal session now the stream is done with its node —
+        // not a moment before.
+        close_session(&self.conn, &self.session);
     }
 }
 
@@ -97,6 +110,15 @@ impl Drop for WaylandSession {
 /// need a human.
 pub fn has_restore_token(monitor_id: Option<u32>) -> bool {
     load_token(&monitor_key(monitor_id)).is_some()
+}
+
+/// Drop the stored restore token for this monitor key, so the next
+/// [`open`] re-prompts for fresh consent instead of replaying the saved
+/// grant. Called when a restored session opened but never delivered a
+/// frame: the token is pointing at an output the compositor no longer
+/// paints, and replaying it would only strand the route again.
+pub fn forget_token(monitor_id: Option<u32>) {
+    save_token(&monitor_key(monitor_id), None);
 }
 
 /// Open a portal ScreenCast session (restoring a prior grant when a
@@ -137,12 +159,25 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
         .map(|s| s.0)
         .ok_or("portal returned no stream")?;
 
+    // The node the portal just minted lives on *its* PipeWire connection,
+    // not the session daemon's default graph — most compositors (Mutter
+    // included) only expose a screencast node over the fd handed back by
+    // OpenPipeWireRemote. The consumer must connect to that fd; connecting to
+    // the default daemon finds "no target node available" and the stream dies.
+    let pw_fd = match open_pipewire_remote(&portal, &session) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close_session(&conn, &session);
+            return Err(e);
+        }
+    };
+
     let (tx, rx) = std::sync::mpsc::channel::<RawFrame>();
     let (quit_tx, quit_rx) = channel::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("wayland-screencast".into())
         .spawn(move || {
-            if let Err(e) = pipewire_consume(node_id, tx, quit_rx) {
+            if let Err(e) = pipewire_consume(node_id, pw_fd, tx, quit_rx) {
                 tracing::warn!("wayland screencast pipewire loop ended: {e}");
             }
         })
@@ -150,6 +185,10 @@ pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFram
 
     Ok((
         WaylandSession {
+            // Held — not dropped — so the portal session and its node outlive
+            // this call and stay up for the capture.
+            conn,
+            session,
             quit: Some(quit_tx),
             thread: Some(thread),
         },
@@ -290,6 +329,27 @@ fn start(
     })
 }
 
+/// Ask the portal for the PipeWire connection the started session's node
+/// lives on. Unlike the `Request`-based calls above this is a plain method
+/// that returns a file descriptor directly (no `Response` signal): the
+/// consumer connects its PipeWire context to this fd so the node id from
+/// `Start` actually resolves. Returns an owned fd (zbus dups the received
+/// one), ready to hand to `connect_fd_rc`.
+fn open_pipewire_remote(
+    portal: &Proxy<'static>,
+    session: &OwnedObjectPath,
+) -> Result<std::os::fd::OwnedFd, String> {
+    let options: HashMap<&str, Value> = HashMap::new();
+    let reply = portal
+        .call_method("OpenPipeWireRemote", &(session, options))
+        .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
+    let fd: zbus::zvariant::OwnedFd = reply
+        .body()
+        .deserialize()
+        .map_err(|e| format!("OpenPipeWireRemote reply: {e}"))?;
+    Ok(fd.into())
+}
+
 /// Tell the portal we walked away, so a still-open consent dialog is
 /// withdrawn instead of haunting the host's screen.
 fn close_session(conn: &Connection, session: &OwnedObjectPath) {
@@ -381,6 +441,10 @@ where
 #[derive(Clone)]
 struct StreamData {
     format: VideoInfoRaw,
+    /// Diagnostic: how many times the `process` callback has fired. Its
+    /// staying at zero while the stream reports Streaming is the proof that
+    /// the server never drove a single buffer to us.
+    process_calls: u64,
 }
 
 /// Rate limit for the consumer's "why this frame was dropped" warns —
@@ -411,12 +475,73 @@ impl DropWarns {
     }
 }
 
+/// The buffer parameters the consumer offers after a format is negotiated,
+/// as a `SPA_TYPE_OBJECT_ParamBuffers` pod for
+/// [`pipewire::stream::Stream::update_params`].
+///
+/// `dataType` accepts every memory type — MemFd/MemPtr **and** DMA-BUF.
+/// GNOME 50's Mutter is DMA-BUF-first for screencast: a mappable-only request
+/// it can't satisfy dead-ends the buffer negotiation and it allocates nothing
+/// (the negotiate-then-frameless stall we traced). Accept its native buffers
+/// so allocation completes; `MAP_BUFFERS` maps what it can and `add_buffer`
+/// reports what we actually got. `size`/`stride` are geometry hints; the real
+/// per-frame stride is still read from the buffer chunk.
+fn shm_buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
+    use pipewire::spa::sys;
+    use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    let stride = (width * bpp) as i32;
+    let size = stride * height as i32;
+    let shm = (1i32 << sys::SPA_DATA_MemFd)
+        | (1i32 << sys::SPA_DATA_MemPtr)
+        | (1i32 << sys::SPA_DATA_DmaBuf);
+    let obj = pod::Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![
+            pod::Property {
+                key: sys::SPA_PARAM_BUFFERS_buffers,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 8,
+                        min: 1,
+                        max: 32,
+                    },
+                ))),
+            },
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_blocks, pod::Value::Int(1)),
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_size, pod::Value::Int(size)),
+            pod::Property::new(sys::SPA_PARAM_BUFFERS_stride, pod::Value::Int(stride)),
+            pod::Property {
+                key: sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags {
+                        default: shm,
+                        flags: vec![],
+                    },
+                ))),
+            },
+        ],
+    };
+    Ok(
+        PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(obj))
+            .map_err(|e| e.to_string())?
+            .0
+            .into_inner(),
+    )
+}
+
 /// Connect to the portal's stream node and pump pictures into `tx`
 /// until the quit channel fires. Format negotiation and conversion
 /// mirror xcap's recorder (RGB/RGBA/RGBx/BGRx → packed RGBA), plus a
 /// stride-aware copy — compositors pad rows on some resolutions.
 fn pipewire_consume(
     node_id: u32,
+    pw_fd: std::os::fd::OwnedFd,
     tx: Sender<RawFrame>,
     quit: channel::Receiver<()>,
 ) -> Result<(), String> {
@@ -424,7 +549,55 @@ fn pipewire_consume(
 
     let main_loop = MainLoopRc::new(None).map_err(|e| e.to_string())?;
     let context = ContextRc::new(&main_loop, None).map_err(|e| e.to_string())?;
-    let core = context.connect_rc(None).map_err(|e| e.to_string())?;
+    // Connect to the portal's PipeWire remote (the fd from OpenPipeWireRemote),
+    // not the default daemon — that's the only graph the screencast node is on.
+    let core = context
+        .connect_fd_rc(pw_fd, None)
+        .map_err(|e| e.to_string())?;
+
+    // The portal's node propagates onto this fresh connection asynchronously,
+    // at a variable time. Binding the stream before it lands races it and
+    // dies "no target node available" (or the negotiation stalls). A single
+    // sync roundtrip isn't enough — the node can register a beat late. So
+    // watch the registry and wait for *this* node id to actually appear before
+    // touching the stream, re-syncing a bounded number of times. If it never
+    // shows, bind anyway rather than hang.
+    {
+        let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
+        let found = Rc::new(Cell::new(false));
+        let _reg = registry
+            .add_listener_local()
+            .global({
+                let found = found.clone();
+                let main_loop = main_loop.clone();
+                move |g| {
+                    if g.id == node_id {
+                        found.set(true);
+                        main_loop.quit();
+                    }
+                }
+            })
+            .register();
+        let _core = core
+            .add_listener_local()
+            .done({
+                let main_loop = main_loop.clone();
+                move |_, _| main_loop.quit()
+            })
+            .register();
+        for _ in 0..40 {
+            if found.get() {
+                break;
+            }
+            let _ = core.sync(0);
+            main_loop.run();
+        }
+        if !found.get() {
+            tracing::warn!(
+                "wayland screencast node {node_id} never appeared in the registry; binding anyway"
+            );
+        }
+    }
 
     let stream = StreamRc::new(
         core.clone(),
@@ -448,6 +621,7 @@ fn pipewire_consume(
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             format: Default::default(),
+            process_calls: 0,
         })
         .state_changed({
             let main_loop = main_loop.clone();
@@ -457,12 +631,34 @@ fn pipewire_consume(
                     *stream_error.borrow_mut() = Some(e.clone());
                     main_loop.quit();
                 } else {
-                    tracing::debug!("wayland screencast stream: {old:?} → {new:?}");
+                    // At info while we chase the frameless-Mutter case: the
+                    // Paused→Streaming transition (or the lack of it) is the
+                    // tell for whether buffers ever started flowing.
+                    tracing::info!("wayland screencast stream: {old:?} → {new:?}");
                 }
             }
         })
-        .param_changed(|_, data, id, param| {
+        .add_buffer(|_, _, buffer| {
+            // The decisive probe for "negotiated but frameless": what kind of
+            // buffer did the compositor allocate? spa_data type 1=MemPtr,
+            // 2=MemFd (both mappable, our read path), 3=DmaBuf (Mutter's
+            // default, which MAP_BUFFERS can't hand us as CPU pixels).
+            let dtype = unsafe {
+                let buf = (*buffer).buffer;
+                if buf.is_null() || (*buf).n_datas == 0 {
+                    None
+                } else {
+                    Some((*(*buf).datas).type_)
+                }
+            };
+            tracing::info!("wayland screencast buffer allocated: spa_data type {dtype:?}");
+        })
+        .param_changed(|stream, data, id, param| {
             let Some(param) = param else { return };
+            // Trace the negotiation: a Buffers param coming back after Format
+            // means the server is driving allocation; silence after Format
+            // means it's stuck on the buffer step.
+            tracing::info!("wayland screencast param_changed id={id}");
             if id != ParamType::Format.as_raw() {
                 return;
             }
@@ -478,29 +674,67 @@ fn pipewire_consume(
             }
             if let Err(e) = data.format.parse(param) {
                 tracing::warn!("screencast format parse: {e:?}");
-            } else {
-                // The one line that proves negotiation completed — its
-                // absence after "session started" means the compositor
-                // never agreed on a format.
-                let size = data.format.size();
-                tracing::info!(
-                    "wayland screencast negotiated: {:?} {}×{}",
-                    data.format.format(),
-                    size.width,
-                    size.height
-                );
+                return;
+            }
+            let size = data.format.size();
+            let fmt = data.format.format();
+            tracing::info!(
+                "wayland screencast negotiated: {fmt:?} {}×{}",
+                size.width,
+                size.height
+            );
+            // Answer with SHM buffer params so the server allocates
+            // CPU-readable buffers (see `shm_buffers_pod`) — Mutter otherwise
+            // sticks on DMA-BUF we can't take, and never allocates at all.
+            let bpp = match fmt {
+                VideoFormat::RGB => 3,
+                _ => 4,
+            };
+            match shm_buffers_pod(size.width, size.height, bpp) {
+                Ok(bytes) => match Pod::from_bytes(&bytes) {
+                    Some(pod) => {
+                        if let Err(e) = stream.update_params(&mut [pod]) {
+                            tracing::warn!("screencast update_params(buffers): {e}");
+                        }
+                    }
+                    None => tracing::warn!("screencast buffers pod invalid"),
+                },
+                Err(e) => tracing::warn!("screencast buffers pod: {e}"),
             }
         })
         .process(move |stream, data| {
+            data.process_calls += 1;
+            let n = data.process_calls;
             let Some(mut buffer) = stream.dequeue_buffer() else {
+                // Proves `process` is firing even when there's nothing to
+                // take — distinguishes "never streaming" from "streaming but
+                // starved".
+                if n <= 8 || n % 60 == 0 {
+                    tracing::info!("screencast process #{n}: woke with no buffer to dequeue");
+                }
                 return;
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
+                if n <= 8 {
+                    tracing::info!("screencast process #{n}: buffer with zero data planes");
+                }
                 drops.warn("planes", || {
                     "screencast buffer carried no data planes — frame dropped".into()
                 });
                 return;
+            }
+            // Loud first-frames diagnostic: what the server actually handed us
+            // on the first few process calls (plane count, chunk size, whether
+            // the data mapped). Silence of *all* "process #" lines means the
+            // server never drove a buffer despite reporting Streaming.
+            if n <= 8 {
+                let chunk = datas[0].chunk().size();
+                let mapped = datas[0].data().is_some();
+                tracing::info!(
+                    "screencast process #{n}: {} plane(s), chunk {chunk} bytes, mapped={mapped}",
+                    datas.len()
+                );
             }
             let size = data.format.size();
             let (w, h) = (size.width, size.height);

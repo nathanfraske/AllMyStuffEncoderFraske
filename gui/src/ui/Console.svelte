@@ -26,6 +26,7 @@
     isTauri,
     onThisWindowClose,
     refreshRoute,
+    sendVideoFeedback,
     toggleWindowFullscreen,
     watchVideo,
     watchVideoStatus,
@@ -155,8 +156,51 @@
     { label: "H.264 · native decode", value: "native" },
     { label: "MJPEG", value: "mjpeg" },
   ];
-  let codecChoice = $state<CodecChoice>("auto");
   let openPill = $state<"res" | "fps" | "rate" | "codec" | null>(null);
+  // The codec pill reflects the *selected source's* transport (per-source in
+  // the store) plus this window's decode choice — so switching sources shows
+  // that source's codec, and "native" stays a window-local decode preference.
+  const codecChoice = $derived<CodecChoice>(
+    app.consoleCodec === "mjpeg"
+      ? "mjpeg"
+      : app.consoleCodec === "auto"
+        ? "auto"
+        : nativeDecode
+          ? "native"
+          : "h264",
+  );
+
+  // The Speed↔Quality slider: one knob that snaps to a preset curve of
+  // res/fps/rate. Codec stays Auto here — forcing a codec is a pills-only
+  // choice. Each stop reuses the same values the pills offer.
+  const QUALITY_STOPS = [
+    { label: "Speed", maxEdge: 1280, fps: 24, bitrate: 4_000_000 },
+    { label: "Smooth", maxEdge: 1920, fps: 30, bitrate: 8_000_000 },
+    { label: "Balanced", maxEdge: 1920, fps: 60, bitrate: 15_000_000 },
+    { label: "Crisp", maxEdge: 2560, fps: 60, bitrate: 25_000_000 },
+    { label: "Quality", maxEdge: 3840, fps: 60, bitrate: 40_000_000 },
+  ];
+  // Where the slider sits for the live tune: the nearest stop by resolution,
+  // defaulting to Balanced when everything is Auto — so it reflects reality
+  // on open and on a source switch.
+  const sliderPos = $derived.by(() => {
+    const t = app.consoleTune;
+    if (t.maxEdge == null && t.fps == null && t.bitrate == null) return 2;
+    let best = 2;
+    let bestD = Infinity;
+    QUALITY_STOPS.forEach((s, i) => {
+      const d = Math.abs((t.maxEdge ?? s.maxEdge) - s.maxEdge);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    });
+    return best;
+  });
+  function pickQuality(i: number) {
+    const s = QUALITY_STOPS[i];
+    app.setConsoleTune({ maxEdge: s.maxEdge, fps: s.fps, bitrate: s.bitrate });
+  }
 
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
     choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
@@ -174,7 +218,6 @@
     openPill = null;
   }
   function pickCodec(v: CodecChoice) {
-    codecChoice = v;
     openPill = null;
     // Where to decode is this window's choice; which transport to offer
     // is the store's (it re-offers the route when that part changes).
@@ -214,6 +257,8 @@
         nativeDecode = true;
       }
     }
+    let fbTick = 0;
+    let fbFailsSent = 0;
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       const inRate = inCount;
@@ -229,6 +274,14 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // Every other tick, report our decode health back to the streamer so
+      // it can adapt (receiver → sender). decode_fails is the delta since the
+      // last report; recv_fps is what we actually painted.
+      const fbRoute = app.consoleVideoLive;
+      if (fbRoute && ++fbTick % 2 === 0) {
+        void sendVideoFeedback(fbRoute, fps, decodeFails - fbFailsSent, queuePeek());
+        fbFailsSent = decodeFails;
+      }
     }, 1000);
     if (windowed) {
       // The OS chrome's ✕ must tear the session's routes down too — the
@@ -932,11 +985,31 @@
         {/if}
 
         {#if app.consoleVideoLive}
-          <div class="pills" role="group" aria-label="Stream quality">
-            {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
-            {@render pillMenu("fps", "FPS", FPS_CHOICES, app.consoleTune.fps, pickFps)}
-            {@render pillMenu("rate", "Rate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
-            <span class="pill-wrap">
+          <div class="quality">
+            {#if app.consoleControlMode === "slider"}
+              <!-- One Speed↔Quality knob (codec stays Auto) -->
+              <div class="slider-wrap" role="group" aria-label="Stream quality">
+                <span class="slider-end">Speed</span>
+                <input
+                  class="quality-slider"
+                  type="range"
+                  min="0"
+                  max={QUALITY_STOPS.length - 1}
+                  step="1"
+                  value={sliderPos}
+                  oninput={(e) => pickQuality(+e.currentTarget.value)}
+                  aria-label="Quality"
+                  title="Drag toward Speed (lighter, faster) or Quality (sharper, heavier)"
+                />
+                <span class="slider-end">Quality</span>
+                <span class="slider-now">{QUALITY_STOPS[sliderPos].label}</span>
+              </div>
+            {:else}
+              <div class="pills" role="group" aria-label="Stream quality">
+                {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
+                {@render pillMenu("fps", "FPS", FPS_CHOICES, app.consoleTune.fps, pickFps)}
+                {@render pillMenu("rate", "Rate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
+                <span class="pill-wrap">
               <button
                 class="pill"
                 class:tuned={codecChoice !== "auto"}
@@ -963,7 +1036,15 @@
                   {/each}
                 </div>
               {/if}
-            </span>
+                </span>
+              </div>
+            {/if}
+            <button
+              class="more"
+              title="Switch between the quality slider and the detailed controls"
+              aria-label="Toggle quality controls"
+              onclick={() => app.toggleConsoleControlMode()}>…</button
+            >
           </div>
         {/if}
 
@@ -1384,10 +1465,47 @@
   .t-icon {
     font-size: 0.95rem;
   }
+  .quality {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
   .pills {
     display: flex;
     flex-wrap: wrap;
     gap: 0.3rem;
+  }
+  .slider-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+  .slider-end {
+    font-size: 0.72rem;
+    color: #8a83a6;
+  }
+  .quality-slider {
+    width: 8.5rem;
+    accent-color: #7c6cff;
+    cursor: pointer;
+  }
+  .slider-now {
+    min-width: 4.2rem;
+    font-size: 0.74rem;
+    color: #c8c2e0;
+  }
+  .more {
+    border: 1px solid #322c47;
+    background: #14121f;
+    color: #c8c2e0;
+    border-radius: var(--r-pill);
+    padding: 0 0.5rem;
+    line-height: 1.55rem;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  .more:hover {
+    border-color: #4a4170;
   }
   .pill-wrap {
     position: relative;

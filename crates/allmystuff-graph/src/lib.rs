@@ -522,6 +522,78 @@ mod tests {
         assert!(json.contains(r#""id":"this""#));
     }
 
+    // ---- grant ids (stable, content-derived) --------------------------
+
+    #[test]
+    fn scoped_grant_id_is_stable_for_the_same_scope() {
+        let alex = alex().id;
+        let a = Grant::scoped(
+            &alex,
+            MediaKind::Display,
+            GrantRole::Consume,
+            None,
+            "Receive your screen",
+        );
+        // Same scope, different label → same id (it's derived from the scope,
+        // not the wording), so it de-dupes and a restart reloads to it.
+        let b = Grant::scoped(
+            &alex,
+            MediaKind::Display,
+            GrantRole::Consume,
+            None,
+            "Cast to them",
+        );
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.id, "grant:person:alex:display:consume:*");
+        assert_eq!(
+            a.id,
+            Grant::id_for(&alex, MediaKind::Display, GrantRole::Consume, None)
+        );
+    }
+
+    #[test]
+    fn scoped_grant_id_separates_role_media_capability_and_person() {
+        let alex = alex().id;
+        let bo: PersonId = "person:bo".into();
+        let cap: CapabilityId = "alex:speaker".into();
+        let base = Grant::scoped(&alex, MediaKind::Audio, GrantRole::Consume, None, "").id;
+        // Each axis that authorization keys on changes the id.
+        assert_ne!(
+            base,
+            Grant::scoped(&alex, MediaKind::Audio, GrantRole::Provide, None, "").id
+        );
+        assert_ne!(
+            base,
+            Grant::scoped(&alex, MediaKind::Video, GrantRole::Consume, None, "").id
+        );
+        assert_ne!(
+            base,
+            Grant::scoped(&alex, MediaKind::Audio, GrantRole::Consume, Some(cap), "").id
+        );
+        assert_ne!(
+            base,
+            Grant::scoped(&bo, MediaKind::Audio, GrantRole::Consume, None, "").id
+        );
+    }
+
+    #[test]
+    fn scoped_grant_still_permits_the_route_it_describes() {
+        // The deterministic id doesn't change what the grant authorizes.
+        let alex = alex().id;
+        let cap: CapabilityId = "alex:screen".into();
+        let g = Grant::scoped(
+            &alex,
+            MediaKind::Display,
+            GrantRole::Consume,
+            Some(cap.clone()),
+            "Receive your screen",
+        );
+        assert!(g.permits(MediaKind::Display, GrantRole::Consume, &cap));
+        // Wrong direction or a different pinned capability is not covered.
+        assert!(!g.permits(MediaKind::Display, GrantRole::Provide, &cap));
+        assert!(!g.permits(MediaKind::Display, GrantRole::Consume, &"alex:other".into()));
+    }
+
     // ---- helpers ------------------------------------------------------
 
     fn grant(cat: &mut Catalog, node: &str, g: Grant) {

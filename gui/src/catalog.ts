@@ -91,6 +91,25 @@ function grantPermits(g: Grant, media: MediaKind, role: GrantRole, capId: string
   return g.role === "both";
 }
 
+/** The content-derived, stable id for a grant of this scope in `person`'s
+ *  share — `grant:{person}:{media}:{role}:{capability|*}`. Mirrors
+ *  `Grant::id_for` in `allmystuff-graph` (model.rs) byte-for-byte: two
+ *  structurally identical grants collapse to one id, and the id is identical
+ *  across a restart and on both peers, so persistence, de-dupe, and
+ *  revoke-by-id all agree. Change both together.
+ *
+ *  `media` and `role` are already the snake_case wire tokens here
+ *  (`generic`, `provide`, …), matching `MediaKind::token` / `GrantRole::label`
+ *  on the Rust side. */
+export function scopedGrantId(
+  person: string,
+  media: MediaKind,
+  role: GrantRole,
+  capability: string | null,
+): string {
+  return `grant:${person}:${media}:${role}:${capability ?? "*"}`;
+}
+
 /** Returns a GrantRequest if the endpoint is on a shared node lacking
  *  coverage, otherwise null (mine, or already granted). A grant authorizes
  *  the *person*, not one machine — sharing with someone lets them route

@@ -22,6 +22,7 @@ use std::sync::Arc;
 // The node engine used to be these modules right here; it now lives in the
 // `allmystuff-node` crate so `allmystuff serve` can run it headless. This
 // shell links the same code and supplies a Tauri-backed `UiSink`.
+use allmystuff_graph::{Grant, Person};
 use allmystuff_node::control_client::{ControlClient, Request, Response};
 use allmystuff_node::mesh::Mesh;
 use allmystuff_node::{daemon_spawn, networks_store, video, UiSink};
@@ -157,6 +158,38 @@ async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bo
     mesh.inner().set_claimable(claimable).await
 }
 
+/// Persist an outbound grant to a person — what they may do with my stuff —
+/// so it survives a restart. The GUI resolves the person and the node the
+/// grant is recorded against; the node is the durable source of truth and the
+/// next snapshot reflects it.
+#[tauri::command]
+async fn share_grant(
+    mesh: State<'_, Arc<Mesh>>,
+    person: Person,
+    node: String,
+    grant: Grant,
+) -> Result<(), String> {
+    mesh.inner().share_grant(person, node.into(), grant).await
+}
+
+/// Revoke a grant by its (content-derived) id from a person's durable share,
+/// and tell their devices to drop it too.
+#[tauri::command]
+async fn share_revoke(
+    mesh: State<'_, Arc<Mesh>>,
+    person: String,
+    grant_id: String,
+) -> Result<(), String> {
+    mesh.inner().share_revoke(person.into(), grant_id).await
+}
+
+/// Stop sharing with a person entirely — drop the whole durable record and
+/// revoke each grant on their devices.
+#[tauri::command]
+async fn share_stop(mesh: State<'_, Arc<Mesh>>, person: String) -> Result<(), String> {
+    mesh.inner().share_stop(person.into()).await
+}
+
 /// Forward one keyboard/mouse event down an active outbound input route —
 /// the console window's control stream.
 #[tauri::command]
@@ -214,6 +247,22 @@ fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
 #[tauri::command]
 async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
     mesh.inner().request_refresh(route_id).await
+}
+
+/// Report the console's decode health for an inbound display route back to its
+/// streamer (receiver → sender), so the streamer can adapt the stream. Sent
+/// periodically by the console; best-effort, an old streamer drops it.
+#[tauri::command]
+async fn video_feedback(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    recv_fps: u32,
+    decode_fails: u32,
+    queue_depth: u32,
+) -> Result<(), String> {
+    mesh.inner()
+        .send_video_feedback(route_id, recv_fps, decode_fails, queue_depth)
+        .await
 }
 
 /// Ask the sender of an inbound display route to stream with these
@@ -1306,12 +1355,16 @@ fn main() {
             claim_node,
             upgrade_node,
             set_claimable,
+            share_grant,
+            share_revoke,
+            share_stop,
             send_input,
             clipboard_paste,
             video_watch,
             video_poll,
             video_unwatch,
             video_refresh,
+            video_feedback,
             tune_route,
             open_console_window,
             open_video_window,

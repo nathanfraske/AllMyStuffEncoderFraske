@@ -25,12 +25,12 @@ use tokio::sync::mpsc;
 
 use crate::UiSink;
 
-use allmystuff_graph::{MediaKind, NodeId, Route};
+use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request,
-    RoomMessage, RouteControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo,
-    CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    PROTOCOL_VERSION,
+    RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
+    CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -45,6 +45,7 @@ use crate::control_client::{ControlClient, MediaPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
+use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
@@ -126,6 +127,11 @@ pub struct Mesh {
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
+    /// Durable share relationships — who I share with and the grants in each
+    /// direction. Node-owned (enforcement lives here), persisted beside the
+    /// ownership record, and projected into [`Mesh::snapshot`] so the GUI
+    /// renders a peer as *shared* with its grants across a restart.
+    shares: Arc<Shares>,
     /// Outbound audio: capture callbacks push `(peer, frame)`; a forwarder
     /// task sends them on the media channel. Bounded like video: a stalled
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
@@ -354,6 +360,7 @@ impl Mesh {
                 profile: None,
             }),
             ownership: Arc::new(Ownership::load()),
+            shares: Arc::new(Shares::load()),
             audio_out,
             video_out,
             audio_rx: Mutex::new(Some(audio_rx)),
@@ -1744,12 +1751,17 @@ impl Mesh {
         let network = st.network.clone();
         let peers: Vec<_> = session.peers().collect();
         let routes: Vec<_> = session.routes().collect();
+        // Durable shares (person + unioned grants) so the GUI reclassifies a
+        // peer as *shared* with its grants across a restart, rather than
+        // forgetting them and defaulting to unclaimed.
+        let shares = self.shares.shares();
         json!({
             "ready": true,
             "me": me,
             "network": network,
             "peers": peers,
             "routes": routes,
+            "shares": shares,
         })
     }
 
@@ -1759,6 +1771,171 @@ impl Mesh {
             .session
             .as_ref()
             .and_then(|s| s.route(route_id).map(|r| r.peer.to_string()))
+    }
+
+    // ---- shares (durable, person-scoped grants) -----------------------
+    //
+    // The GUI resolves the person + node and hands them down; the node is the
+    // source of truth (enforcement lives here) and the next [`Mesh::snapshot`]
+    // reflects the change. These persist *my* policy so it survives a restart
+    // **and** tell the peer over the control channel, so a share is a mutual
+    // fact rather than one-sided local policy — what made it no better than a
+    // room. The send is best-effort: the durable record is written first, so a
+    // peer that's offline now just isn't notified yet (the local policy still
+    // holds, and a later phase re-asserts on reconnect).
+
+    /// Record an **outbound** grant — what this person may do with my stuff —
+    /// persist it, and offer my full current grant set to their device.
+    pub async fn share_grant(
+        &self,
+        person: Person,
+        node: NodeId,
+        grant: Grant,
+    ) -> Result<(), String> {
+        self.shares.grant(&person, &node, grant);
+        self.emit_snapshot();
+        self.send_share_invite(&person, &node).await
+    }
+
+    /// Tell `node` the full set of grants this person currently holds from me.
+    /// Sent whole because the peer records inbound by **replacement**, so the
+    /// complete set is the authoritative "here's everything you may do".
+    async fn send_share_invite(&self, person: &Person, node: &NodeId) -> Result<(), String> {
+        let grants = self.shares.out_grants_for(&person.id);
+        let msg = ControlMessage::Share(ShareControl::Invite {
+            from: self.local_person(),
+            grants,
+        });
+        self.send_control(node.as_str(), &msg).await
+    }
+
+    /// Revoke a grant by its (content-derived) id from a person's share, and
+    /// tell every device they bring to drop it too (revocation is unilateral —
+    /// the content-derived id names the same grant on both ends).
+    pub async fn share_revoke(&self, person: PersonId, grant_id: String) -> Result<(), String> {
+        self.shares.revoke(&person, &grant_id);
+        self.emit_snapshot();
+        let mut last_err = None;
+        for node in self.shares.nodes_for(&person) {
+            let msg = ControlMessage::Share(ShareControl::Revoke {
+                grant_id: grant_id.clone(),
+            });
+            if let Err(e) = self.send_control(node.as_str(), &msg).await {
+                last_err = Some(e);
+            }
+        }
+        last_err.map_or(Ok(()), Err)
+    }
+
+    /// Stop sharing with a person entirely — drop the whole durable record and
+    /// revoke each outbound grant on their devices (captured before the drop).
+    pub async fn share_stop(&self, person: PersonId) -> Result<(), String> {
+        let nodes = self.shares.nodes_for(&person);
+        let grant_ids: Vec<String> = self
+            .shares
+            .out_grants_for(&person)
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        self.shares.stop_sharing(&person);
+        self.emit_snapshot();
+        for node in &nodes {
+            for grant_id in &grant_ids {
+                let msg = ControlMessage::Share(ShareControl::Revoke {
+                    grant_id: grant_id.clone(),
+                });
+                let _ = self.send_control(node.as_str(), &msg).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// This machine's owner-or-self as a graph [`Person`] — the identity an
+    /// outbound [`ShareControl::Invite`] carries. Keyed `person:<pubkey>` to
+    /// mirror the GUI's `person:<owner ?? self>`, so both ends agree on "me".
+    fn local_person(&self) -> Person {
+        let me = self.local_node_id().unwrap_or_default();
+        let owner = self.ownership.owner().unwrap_or_else(|| me.clone());
+        Person {
+            id: format!("person:{}", pubkey_part(&owner)).into(),
+            name: self
+                .profile_label()
+                .unwrap_or_else(|| me.chars().take(10).collect()),
+        }
+    }
+
+    /// The [`Person`] we attribute an inbound share to — keyed by the
+    /// **authenticated** sender's pubkey, *never* the self-asserted body id.
+    /// This is the load-bearing trust rule: an inbound offer can only ever bind
+    /// the sender's own node into the sender's own share, so a peer can't slip
+    /// its node into someone else's person (which later outbound enforcement
+    /// would otherwise trust). The body supplies only a display name.
+    fn peer_person(&self, from: &NodeId, name: Option<&str>) -> Person {
+        let display = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.peer_label(from));
+        Person {
+            id: format!("person:{}", pubkey_part(from.as_str())).into(),
+            name: display,
+        }
+    }
+
+    /// Apply an inbound share-control message. Unlike app-control or a
+    /// privileged offer, this is **not** gated on `sender_may_control`: a share
+    /// is person-to-person, so the sharer is never the recipient's owner/fleet.
+    /// The mesh's ed25519 handshake already authenticates `from`; recording
+    /// what they offer is safe because an *inbound* grant only ever widens what
+    /// *I* may pull from *them*, never what they may do to me (that direction is
+    /// my own outbound grant, minted only by my explicit action).
+    async fn handle_share(&self, from: NodeId, message: ShareControl) {
+        match message {
+            ShareControl::Invite { from: body, grants } => {
+                let person = self.peer_person(&from, Some(&body.name));
+                self.shares.record_inbound(&person, &from, grants);
+                self.emit_snapshot();
+                self.sink.emit(
+                    "allmystuff://share",
+                    json!({ "from": from.to_string(), "kind": "invite", "person": person.name }),
+                );
+                // Acknowledge, carrying any grants I already extend back — so
+                // sharing can be mutual in one round trip (empty if I've granted
+                // them nothing; the ack never *mints* an outbound grant).
+                let back = self.shares.out_grants_for(&person.id);
+                let reply = ControlMessage::Share(ShareControl::Accept { grants: back });
+                if let Err(e) = self.send_control(from.as_str(), &reply).await {
+                    tracing::warn!("couldn't ack share from {}: {e}", short_id(from.as_str()));
+                }
+            }
+            ShareControl::Accept { grants } => {
+                let person = self.peer_person(&from, None);
+                self.shares.record_inbound(&person, &from, grants);
+                self.emit_snapshot();
+                self.sink.emit(
+                    "allmystuff://share",
+                    json!({ "from": from.to_string(), "kind": "accept", "person": person.name }),
+                );
+            }
+            ShareControl::Decline => {
+                tracing::info!("share declined by {}", short_id(from.as_str()));
+                self.sink.emit(
+                    "allmystuff://share",
+                    json!({ "from": from.to_string(), "kind": "decline" }),
+                );
+            }
+            ShareControl::Revoke { grant_id } => {
+                let person = self.peer_person(&from, None);
+                self.shares.revoke(&person.id, &grant_id);
+                self.emit_snapshot();
+                self.sink.emit(
+                    "allmystuff://share",
+                    json!({ "from": from.to_string(), "kind": "revoke" }),
+                );
+            }
+            // A share-control kind a newer build introduced — nothing to do.
+            ShareControl::Unknown => {}
+        }
     }
 
     async fn process_effects(self: &Arc<Self>, effects: Vec<Effect>) {
@@ -1783,6 +1960,14 @@ impl Mesh {
                         fps,
                     },
                 ),
+                Effect::VideoFeedback {
+                    route_id,
+                    recv_fps,
+                    decode_fails,
+                    queue_depth,
+                } => self
+                    .video
+                    .note_feedback(&route_id, recv_fps, decode_fails, queue_depth),
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
                     self.video.stop(&id);
@@ -1810,12 +1995,7 @@ impl Mesh {
                     self.sites.stop_route(&id);
                     self.drop_downloads(&id);
                 }
-                Effect::Share { from, message } => {
-                    self.sink.emit(
-                        "allmystuff://share",
-                        json!({ "from": from.to_string(), "message": message }),
-                    );
-                }
+                Effect::Share { from, message } => self.handle_share(from, message).await,
                 Effect::Ownership { from, message } => self.handle_ownership(from, message).await,
                 Effect::App { from, message } => self.handle_app_control(from, message).await,
             }
@@ -4624,6 +4804,30 @@ impl Mesh {
                 max_edge,
                 bitrate,
                 fps,
+            }),
+        )
+        .await
+    }
+
+    /// Report this viewer's decode health for an inbound route back to its
+    /// streamer (receiver → sender), so the streamer can adapt the stream.
+    /// Best-effort and unacknowledged: an old streamer drops the message and
+    /// never adapts, exactly as today.
+    pub async fn send_video_feedback(
+        self: &Arc<Self>,
+        route_id: String,
+        recv_fps: u32,
+        decode_fails: u32,
+        queue_depth: u32,
+    ) -> Result<(), String> {
+        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        self.send_control(
+            &peer,
+            &ControlMessage::Route(RouteControl::VideoFeedback {
+                route_id,
+                recv_fps,
+                decode_fails,
+                queue_depth,
             }),
         )
         .await

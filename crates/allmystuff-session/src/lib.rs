@@ -125,6 +125,15 @@ pub enum Effect {
         bitrate: Option<u32>,
         fps: Option<u32>,
     },
+    /// The viewer of a route this machine streams reported its decode health
+    /// (receiver → sender). The backend records it per route to adapt the
+    /// stream — recovery cadence now, auto-scaling later.
+    VideoFeedback {
+        route_id: String,
+        recv_fps: u32,
+        decode_fails: u32,
+        queue_depth: u32,
+    },
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
     /// An ownership/claim message arrived; the backend applies it against
@@ -418,6 +427,28 @@ impl Session {
                         max_edge,
                         bitrate,
                         fps,
+                    }];
+                }
+                Vec::new()
+            }
+            RouteControl::VideoFeedback {
+                route_id,
+                recv_fps,
+                decode_fails,
+                queue_depth,
+            } => {
+                // Only the route's own viewer reports on it, and only while
+                // it's live — same gate as a refresh/tune ask.
+                if self
+                    .routes
+                    .get(&route_id)
+                    .is_some_and(|r| r.is_active() && r.peer == from)
+                {
+                    return vec![Effect::VideoFeedback {
+                        route_id,
+                        recv_fps,
+                        decode_fails,
+                        queue_depth,
                     }];
                 }
                 Vec::new()
@@ -747,6 +778,21 @@ mod tests {
         assert!(matches!(
             fx.as_slice(),
             [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60) }]
+                if route_id == "r1"
+        ));
+        // …and report its decode health back (receiver → sender).
+        let fx = s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::VideoFeedback {
+                route_id: "r1".into(),
+                recv_fps: 28,
+                decode_fails: 3,
+                queue_depth: 1,
+            }),
+        );
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::VideoFeedback { route_id, recv_fps: 28, decode_fails: 3, queue_depth: 1 }]
                 if route_id == "r1"
         ));
         // A bystander may not.

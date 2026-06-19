@@ -12,6 +12,7 @@ import {
   proposeRoomRoute,
   proposeRoute,
   requiredGrants,
+  scopedGrantId,
   type GrantRequest,
 } from "./catalog";
 import { demoCatalog } from "./mock";
@@ -36,6 +37,9 @@ import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
   claimNode,
+  shareGrant,
+  shareRevoke,
+  shareStop,
   clientLog,
   closeThisWindow,
   connectRoute,
@@ -77,6 +81,7 @@ import {
   onRoom,
   onRoomLocal,
   onSession,
+  onShare,
   onSubscription,
   onVideoLocal,
   openConsoleWindow,
@@ -160,6 +165,7 @@ import {
   type RoomWireMessage,
   type RosterPeer,
   type Route,
+  type Share,
   type SharedEntry,
   type SharedFileMeta,
   type TerminalSessionInfo,
@@ -221,7 +227,6 @@ function sameMachine(a: string, b: string): boolean {
 }
 
 let seq = 0;
-const newId = (p: string) => `${p}:${Date.now().toString(36)}:${seq++}`;
 
 /** localStorage key for this device's rooms list. */
 const ROOMS_STORE_KEY = "allmystuff.rooms.v1";
@@ -329,6 +334,17 @@ function emptyCatalog(): Catalog {
   return { nodes: [], capabilities: [], routes: [] };
 }
 
+/** The console quality surface a previous window left selected (slider or
+ *  pills), shared across windows via localStorage. Defaults to the simpler
+ *  slider; falls back to it where storage isn't available. */
+function loadConsoleControlMode(): "slider" | "pills" {
+  try {
+    return localStorage.getItem("ams.consoleControlMode") === "pills" ? "pills" : "slider";
+  } catch {
+    return "slider";
+  }
+}
+
 class AppStore {
   // Under the real app the graph is built entirely from the live scan + mesh
   // presence, so it starts empty and fills with *your* stuff. The demo
@@ -379,13 +395,29 @@ class AppStore {
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
   consoleVideoLive = $state<string | null>(null);
-  /** The console's codec pill: which transport to *offer* for its video
-   *  route. "auto" and "h264" both offer H.264 (auto lets the decode
-   *  ladder pick where it's decoded); "mjpeg" forces the fallback. */
-  consoleCodec = $state<"auto" | "h264" | "mjpeg">("auto");
-  /** The console's quality pills — absent fields are Automatic. Sent to
-   *  the streaming side, which restarts its capture with them. */
-  consoleTune = $state<StreamTune>({});
+  /** Per-source video controls, keyed by the source capability id (screen,
+   *  an extra monitor, a camera). Each source keeps its own codec + quality,
+   *  so switching sources restores that source's picks rather than carrying
+   *  one shared setting across all of them. The node already tunes per
+   *  route-id; this is the GUI remembering which pick belongs to which. */
+  private consoleCodecBySource = $state<Record<string, "auto" | "h264" | "mjpeg">>({});
+  private consoleTuneBySource = $state<Record<string, StreamTune>>({});
+  /** The selected source's codec (which transport to *offer*). "auto" and
+   *  "h264" both offer H.264; "mjpeg" forces the fallback. */
+  get consoleCodec(): "auto" | "h264" | "mjpeg" {
+    const s = this.consoleInput;
+    return (s ? this.consoleCodecBySource[s] : undefined) ?? "auto";
+  }
+  /** The selected source's quality picks — absent fields are Automatic. */
+  get consoleTune(): StreamTune {
+    const s = this.consoleInput;
+    return (s ? this.consoleTuneBySource[s] : undefined) ?? {};
+  }
+  /** Which quality surface the console shows — the single Speed↔Quality
+   *  slider or the four granular pills. The "…" button flips it, and it's
+   *  remembered across windows, so a freshly opened console opens the way
+   *  you last left it. */
+  consoleControlMode = $state<"slider" | "pills">(loadConsoleControlMode());
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
   /** The live outbound clipboard route a paste pushes our clipboard down. */
@@ -842,6 +874,18 @@ class AppStore {
       else if (o.message.kind === "declined")
         this.toast("warn", `Couldn't claim ${who}: ${o.message.reason ?? "not claimable"}`);
     });
+    // Share negotiation: the session snapshot (above) already merges the
+    // resulting grants into the graph — this only surfaces the human nudge.
+    await onShare((s) => {
+      const who =
+        s.person?.trim() ||
+        this.catalog.nodes.find((n) => sameMachine(n.id, s.from))?.label ||
+        "Someone";
+      if (s.kind === "invite") this.toast("info", `${who} shared with you`);
+      else if (s.kind === "accept") this.toast("ok", `${who} accepted your share`);
+      else if (s.kind === "decline") this.toast("info", `${who} declined your share`);
+      else if (s.kind === "revoke") this.toast("info", `${who} changed what they share`);
+    });
   }
 
   /** Fetch the live session state (peers' presence + routes) and merge it
@@ -1259,6 +1303,7 @@ class AppStore {
       this.startConsoleAutoLegs();
     }
 
+    this.applyDurableShares(snap.shares ?? []);
     this.reconcileFleetRelationships();
     this.reconcileShares();
   }
@@ -1519,8 +1564,8 @@ class AppStore {
     this.consoleControlLive = null;
     this.consoleClipboardLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
-    this.consoleCodec = "auto";
-    this.consoleTune = {};
+    this.consoleCodecBySource = {};
+    this.consoleTuneBySource = {};
     if (isTauri()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
@@ -1710,17 +1755,36 @@ class AppStore {
     return t.maxEdge != null || t.bitrate != null || t.fps != null;
   }
 
-  /** One pill changed: remember it and re-tune the live stream. */
+  /** A quality pick changed (a pill or the slider): remember it against the
+   *  current source and re-tune the live stream. */
   setConsoleTune(patch: StreamTune) {
-    this.consoleTune = { ...this.consoleTune, ...patch };
+    const s = this.consoleInput;
+    if (!s) return;
+    this.consoleTuneBySource = {
+      ...this.consoleTuneBySource,
+      [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...patch },
+    };
     if (this.consoleVideoLive) void tuneRoute(this.consoleVideoLive, this.consoleTune);
   }
 
-  /** The codec pill changed: re-offer the video route on that transport. */
+  /** The codec pick changed: remember it against the current source and
+   *  re-offer the video route on that transport. */
   setConsoleCodec(codec: "auto" | "h264" | "mjpeg") {
-    if (this.consoleCodec === codec) return;
-    this.consoleCodec = codec;
+    const s = this.consoleInput;
+    if (!s || this.consoleCodec === codec) return;
+    this.consoleCodecBySource = { ...this.consoleCodecBySource, [s]: codec };
     void this.applyConsoleVideo();
+  }
+
+  /** Flip the quality surface (slider ⇄ pills) and remember it across
+   *  windows, so the next console opens the same way. */
+  toggleConsoleControlMode() {
+    this.consoleControlMode = this.consoleControlMode === "slider" ? "pills" : "slider";
+    try {
+      localStorage.setItem("ams.consoleControlMode", this.consoleControlMode);
+    } catch {
+      // No storage (private mode / web preview) — in-memory for this session.
+    }
   }
 
   /** Audio passthrough: play what the remote machine is playing — its
@@ -4860,6 +4924,24 @@ class AppStore {
     }
   }
 
+  /** Re-hydrate the durable shares the node persisted: any peer whose owner
+   *  is a share partner on disk is reclassified *shared* with that person's
+   *  grants, so a restart remembers what you shared instead of forgetting it
+   *  and defaulting the peer to unclaimed. The node is the source of truth;
+   *  this never overrides a device you own. */
+  private applyDurableShares(shares: Share[]) {
+    if (!shares.length) return;
+    const byPerson = new Map(shares.map((s) => [s.person.id, s]));
+    for (const n of this.catalog.nodes) {
+      if (n.kind === "this" || this.isMe(n.id)) continue;
+      if (n.relationship.kind === "mine") continue;
+      const share = byPerson.get(this.personFor(n).id);
+      if (share) {
+        n.relationship = { kind: "shared", person: share.person, grants: [...share.grants] };
+      }
+    }
+  }
+
   /** Everyone you're sharing with, one entry per person/fleet: their
    *  nodes and every grant you've given them (with the node each grant is
    *  recorded on). Drives the Sharing settings pane. */
@@ -4887,6 +4969,7 @@ class AppStore {
         n.relationship = { kind: "unclaimed" };
       }
     }
+    void shareStop(personId).catch(() => {});
     this.reauthorize();
     if (name) this.toast("info", `Stopped sharing with ${name}`);
   }
@@ -4894,25 +4977,32 @@ class AppStore {
   grant(nodeId: string, grant: Grant) {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
-    const pid = n.relationship.person.id;
+    const person = n.relationship.person;
     // De-dupe by (media, role, capability) across the *person* — a grant
     // authorizes them wherever it happens to be recorded.
     const exists = this.catalog.nodes.some(
       (x) =>
         x.relationship.kind === "shared" &&
-        x.relationship.person.id === pid &&
+        x.relationship.person.id === person.id &&
         x.relationship.grants.some(
           (g) =>
             g.media === grant.media && g.role === grant.role && g.capability === grant.capability,
         ),
     );
-    if (!exists) n.relationship.grants.push(grant);
+    if (!exists) {
+      n.relationship.grants.push(grant);
+      // Persist to the node — the durable source of truth, so the grant
+      // survives a restart (no-op in web mode).
+      void shareGrant(person, nodeId, grant).catch(() => {});
+    }
   }
 
   revokeGrant(nodeId: string, grantId: string) {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
+    const personId = n.relationship.person.id;
     n.relationship.grants = n.relationship.grants.filter((g) => g.id !== grantId);
+    void shareRevoke(personId, grantId).catch(() => {});
     this.reauthorize();
     this.toast("info", "Permission removed");
   }
@@ -4946,7 +5036,9 @@ class AppStore {
 
 function requestToGrant(req: GrantRequest): Grant {
   return {
-    id: newId("grant"),
+    // Content-derived, stable id (mirrors Grant::scoped on the Rust side) so
+    // the grant persists, de-dupes, and revokes by the same id on both ends.
+    id: scopedGrantId(req.person, req.media, req.role, req.capability),
     media: req.media,
     role: req.role,
     capability: req.capability,

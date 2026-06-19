@@ -604,6 +604,28 @@ pub enum RouteControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fps: Option<u32>,
     },
+    /// "Here's how your stream is actually arriving" — the viewer reports its
+    /// decode health back to the streamer, periodically, so the streamer can
+    /// adapt (recovery cadence today; bitrate/resolution auto-scaling next).
+    /// All counters are *since the last report*. The reverse of every other
+    /// route message: it flows receiver → sender. Unknown to v0.2.x peers (it
+    /// decodes as [`RouteControl::Unknown`] and is dropped), so an older
+    /// streamer simply never adapts — exactly today's behaviour.
+    VideoFeedback {
+        route_id: String,
+        /// Frames the viewer actually rendered per second over the window —
+        /// compare to the stream's target to spot a struggling link.
+        #[serde(default)]
+        recv_fps: u32,
+        /// Decode failures since the last report (lost/!corrupt access units,
+        /// rebuilt decoders) — the headline "this link is lossy" signal.
+        #[serde(default)]
+        decode_fails: u32,
+        /// How deep the viewer's decode queue is backed up (0 = keeping up;
+        /// large = the viewer can't drain as fast as frames arrive).
+        #[serde(default)]
+        queue_depth: u32,
+    },
     /// "List your open terminal sessions" — a viewer asking a host (its
     /// owner/fleet, enforced host-side exactly like a terminal offer) which
     /// shells it already has running, so the picker can offer to *attach* to
