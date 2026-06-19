@@ -190,11 +190,17 @@ impl StreamStats {
     }
 }
 
-/// MJPEG ceiling on the longest frame edge. 1280 keeps a 1080p/4K
-/// desktop readable while a frame stays ~60-150 KB at [`JPEG_QUALITY`] —
-/// comfortably inside a LAN data channel at the target rate. (MJPEG is
-/// the compatibility floor; the H.264 path carries the full picture.)
-const MAX_EDGE: u32 = 1280;
+/// MJPEG ceiling on the longest frame edge. Defaults to **1920** so a 1080p
+/// desktop streams at native HD — at 1280 a 1080p screen was downscaled to
+/// 720p, too soft to read text. JPEG frames are chunked under the 64 KiB
+/// data-channel ceiling, so a higher edge costs bandwidth, not correctness.
+/// (MJPEG is the compatibility floor; the H.264 path carries the full
+/// picture.) Override: `ALLMYSTUFF_MJPEG_MAX_EDGE`.
+fn mjpeg_max_edge() -> u32 {
+    static EDGE: std::sync::LazyLock<u32> =
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_MJPEG_MAX_EDGE", 1920).clamp(320, 3840));
+    *EDGE
+}
 /// Mid-range JPEG quality — piKVM's default neighbourhood; text stays
 /// legible, photos stay cheap.
 const JPEG_QUALITY: u8 = 60;
@@ -299,10 +305,37 @@ impl Tune {
     fn h264_edge(&self) -> u32 {
         self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
     }
-    /// MJPEG can only be tuned *down*: its ceiling is about channel
-    /// safety (chunked JPEGs over the 64 KiB data channel), not taste.
+    /// MJPEG honours the Res control the same way H.264 does — up to a 4K
+    /// hard cap (chunked under the 64 KiB data channel) — so the pill moves
+    /// both encodings. Untuned it defaults to HD ([`mjpeg_max_edge`], 1920)
+    /// rather than 4K, since a JPEG frame is far heavier than an H.264 one.
     fn mjpeg_edge(&self) -> u32 {
-        self.max_edge.map_or(MAX_EDGE, |e| e.min(MAX_EDGE)).max(320)
+        self.max_edge
+            .unwrap_or_else(mjpeg_max_edge)
+            .clamp(320, 3840)
+    }
+    /// MJPEG has no bitrate, so the Rate control maps to JPEG quality — the
+    /// same pill means something on both encodings. `None` (auto) keeps the
+    /// neutral [`JPEG_QUALITY`] default.
+    fn jpeg_quality(&self) -> u8 {
+        self.bitrate.map_or(JPEG_QUALITY, mjpeg_quality_for)
+    }
+}
+
+/// Map a target bitrate (the console's Rate pill: 4–40 Mbps) to a JPEG
+/// quality. Higher rate → crisper frames; the curve spans the pill range so
+/// "Speed" reads softer and "Quality" reads sharp.
+fn mjpeg_quality_for(bps: u32) -> u8 {
+    if bps <= 5_000_000 {
+        45
+    } else if bps <= 10_000_000 {
+        55
+    } else if bps <= 18_000_000 {
+        65
+    } else if bps <= 30_000_000 {
+        78
+    } else {
+        88
     }
 }
 
@@ -1069,6 +1102,9 @@ struct FrameEncoder {
     prev_size: (u32, u32),
     last_sent: Option<Instant>,
     max_edge: u32,
+    /// JPEG quality this stream encodes at — the Rate pill, mapped through
+    /// [`Tune::jpeg_quality`] (MJPEG's stand-in for a bitrate).
+    quality: u8,
     /// The route's one-shot "resend now" flag (a viewer asked).
     refresh: Arc<AtomicBool>,
 }
@@ -1082,6 +1118,7 @@ impl FrameEncoder {
             prev_size: (0, 0),
             last_sent: None,
             max_edge: tune.mjpeg_edge(),
+            quality: tune.jpeg_quality(),
             refresh,
         }
     }
@@ -1111,7 +1148,7 @@ impl FrameEncoder {
             return Ok(None);
         }
         let t1 = Instant::now();
-        let jpeg = encode_jpeg(&scaled, dw, dh)?;
+        let jpeg = encode_jpeg(&scaled, dw, dh, self.quality)?;
         stats.encode += t1.elapsed();
         stats.bytes += jpeg.len() as u64;
         stats.keyframes += 1; // every MJPEG frame is standalone
@@ -1363,9 +1400,9 @@ fn fit_within_even(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     ((w & !1).max(2), (h & !1).max(2))
 }
 
-fn encode_jpeg(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+fn encode_jpeg(rgba: &[u8], w: u32, h: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(64 * 1024);
-    let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
+    let encoder = jpeg_encoder::Encoder::new(&mut out, quality);
     encoder
         .encode(
             rgba,
@@ -1413,7 +1450,7 @@ mod tests {
     #[test]
     fn jpeg_encoder_produces_a_jpeg() {
         let rgba = vec![128u8; 8 * 8 * 4];
-        let jpeg = encode_jpeg(&rgba, 8, 8).expect("encode");
+        let jpeg = encode_jpeg(&rgba, 8, 8, JPEG_QUALITY).expect("encode");
         // SOI marker.
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
     }
@@ -1488,18 +1525,35 @@ mod tests {
         };
         assert_eq!(t.fps(), 60);
         assert_eq!(t.h264_edge(), 800);
+        // Both encodings honour the Res pick now (parity), each to the 4K
+        // hard cap.
         assert_eq!(t.mjpeg_edge(), 800);
-        // MJPEG only tunes *down*; H.264 honours up to its hard limit.
+        // The Rate pick maps to a JPEG quality for MJPEG.
+        assert_eq!(t.jpeg_quality(), mjpeg_quality_for(12_000_000));
         let big = Tune {
             max_edge: Some(9999),
             ..Tune::default()
         };
         assert_eq!(big.h264_edge(), 3840);
-        assert_eq!(big.mjpeg_edge(), MAX_EDGE);
+        assert_eq!(big.mjpeg_edge(), 3840);
         let auto = Tune::default();
         assert_eq!(auto.fps(), target_fps());
         assert_eq!(auto.h264_edge(), h264_max_edge());
-        assert_eq!(auto.mjpeg_edge(), MAX_EDGE);
+        // Untuned MJPEG defaults to HD, and untuned quality is neutral.
+        assert_eq!(auto.mjpeg_edge(), mjpeg_max_edge());
+        assert_eq!(auto.jpeg_quality(), JPEG_QUALITY);
+    }
+
+    #[test]
+    fn rate_pill_maps_to_a_monotonic_jpeg_quality() {
+        // The console's Rate pills, softest → sharpest, never decreasing.
+        let q: Vec<u8> = [4, 8, 15, 25, 40]
+            .iter()
+            .map(|m| mjpeg_quality_for(m * 1_000_000))
+            .collect();
+        assert!(q.windows(2).all(|w| w[0] <= w[1]), "monotonic: {q:?}");
+        assert!(*q.first().unwrap() < JPEG_QUALITY); // "Speed" softer than neutral
+        assert!(*q.last().unwrap() > JPEG_QUALITY); // "Quality" sharper
     }
 
     #[test]

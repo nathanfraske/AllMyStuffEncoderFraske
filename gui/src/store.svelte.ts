@@ -334,6 +334,17 @@ function emptyCatalog(): Catalog {
   return { nodes: [], capabilities: [], routes: [] };
 }
 
+/** The console quality surface a previous window left selected (slider or
+ *  pills), shared across windows via localStorage. Defaults to the simpler
+ *  slider; falls back to it where storage isn't available. */
+function loadConsoleControlMode(): "slider" | "pills" {
+  try {
+    return localStorage.getItem("ams.consoleControlMode") === "pills" ? "pills" : "slider";
+  } catch {
+    return "slider";
+  }
+}
+
 class AppStore {
   // Under the real app the graph is built entirely from the live scan + mesh
   // presence, so it starts empty and fills with *your* stuff. The demo
@@ -384,13 +395,29 @@ class AppStore {
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
   consoleVideoLive = $state<string | null>(null);
-  /** The console's codec pill: which transport to *offer* for its video
-   *  route. "auto" and "h264" both offer H.264 (auto lets the decode
-   *  ladder pick where it's decoded); "mjpeg" forces the fallback. */
-  consoleCodec = $state<"auto" | "h264" | "mjpeg">("auto");
-  /** The console's quality pills — absent fields are Automatic. Sent to
-   *  the streaming side, which restarts its capture with them. */
-  consoleTune = $state<StreamTune>({});
+  /** Per-source video controls, keyed by the source capability id (screen,
+   *  an extra monitor, a camera). Each source keeps its own codec + quality,
+   *  so switching sources restores that source's picks rather than carrying
+   *  one shared setting across all of them. The node already tunes per
+   *  route-id; this is the GUI remembering which pick belongs to which. */
+  private consoleCodecBySource = $state<Record<string, "auto" | "h264" | "mjpeg">>({});
+  private consoleTuneBySource = $state<Record<string, StreamTune>>({});
+  /** The selected source's codec (which transport to *offer*). "auto" and
+   *  "h264" both offer H.264; "mjpeg" forces the fallback. */
+  get consoleCodec(): "auto" | "h264" | "mjpeg" {
+    const s = this.consoleInput;
+    return (s ? this.consoleCodecBySource[s] : undefined) ?? "auto";
+  }
+  /** The selected source's quality picks — absent fields are Automatic. */
+  get consoleTune(): StreamTune {
+    const s = this.consoleInput;
+    return (s ? this.consoleTuneBySource[s] : undefined) ?? {};
+  }
+  /** Which quality surface the console shows — the single Speed↔Quality
+   *  slider or the four granular pills. The "…" button flips it, and it's
+   *  remembered across windows, so a freshly opened console opens the way
+   *  you last left it. */
+  consoleControlMode = $state<"slider" | "pills">(loadConsoleControlMode());
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
   /** The live outbound clipboard route a paste pushes our clipboard down. */
@@ -1537,8 +1564,8 @@ class AppStore {
     this.consoleControlLive = null;
     this.consoleClipboardLive = null;
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
-    this.consoleCodec = "auto";
-    this.consoleTune = {};
+    this.consoleCodecBySource = {};
+    this.consoleTuneBySource = {};
     if (isTauri()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
@@ -1728,17 +1755,36 @@ class AppStore {
     return t.maxEdge != null || t.bitrate != null || t.fps != null;
   }
 
-  /** One pill changed: remember it and re-tune the live stream. */
+  /** A quality pick changed (a pill or the slider): remember it against the
+   *  current source and re-tune the live stream. */
   setConsoleTune(patch: StreamTune) {
-    this.consoleTune = { ...this.consoleTune, ...patch };
+    const s = this.consoleInput;
+    if (!s) return;
+    this.consoleTuneBySource = {
+      ...this.consoleTuneBySource,
+      [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...patch },
+    };
     if (this.consoleVideoLive) void tuneRoute(this.consoleVideoLive, this.consoleTune);
   }
 
-  /** The codec pill changed: re-offer the video route on that transport. */
+  /** The codec pick changed: remember it against the current source and
+   *  re-offer the video route on that transport. */
   setConsoleCodec(codec: "auto" | "h264" | "mjpeg") {
-    if (this.consoleCodec === codec) return;
-    this.consoleCodec = codec;
+    const s = this.consoleInput;
+    if (!s || this.consoleCodec === codec) return;
+    this.consoleCodecBySource = { ...this.consoleCodecBySource, [s]: codec };
     void this.applyConsoleVideo();
+  }
+
+  /** Flip the quality surface (slider ⇄ pills) and remember it across
+   *  windows, so the next console opens the same way. */
+  toggleConsoleControlMode() {
+    this.consoleControlMode = this.consoleControlMode === "slider" ? "pills" : "slider";
+    try {
+      localStorage.setItem("ams.consoleControlMode", this.consoleControlMode);
+    } catch {
+      // No storage (private mode / web preview) — in-memory for this session.
+    }
   }
 
   /** Audio passthrough: play what the remote machine is playing — its
