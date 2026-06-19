@@ -30,6 +30,7 @@
     if (tab === "always_on") {
       void app.loadServiceStatus();
       void app.loadWindowBehavior();
+      void app.loadAutostart();
     }
   }
 </script>

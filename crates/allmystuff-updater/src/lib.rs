@@ -16,6 +16,15 @@
 //!     (`node`'s `CARGO_PKG_VERSION`), so leaving it behind is what makes an
 //!     "update" look like it did nothing.
 //!
+//! Those three **binaries** are the only artifacts — every **library** crate
+//! (`allmystuff-service`, `allmystuff-graph`, …) is statically linked into
+//! them, so swapping the binaries carries every library change with it; a new
+//! lib never needs its own updater wiring. The desktop app additionally bundles
+//! a copy of `allmystuff-serve` as a Tauri sidecar; the updater finds it next
+//! to the app (its `installed_path` sibling lookup) and refreshes it as the
+//! `allmystuff-serve` artifact like any other, so the bundled node stays
+//! current too.
+//!
 //! The flow is **stage now, apply on next launch**:
 //!
 //!   1. [`check_now`] / [`update_now`] fetch the release feed, compare

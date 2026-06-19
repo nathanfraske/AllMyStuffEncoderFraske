@@ -14,25 +14,36 @@
   const wb = $derived(app.windowBehavior);
   const busy = $derived(app.serviceBusy);
 
+  const loaded = $derived(svc != null);
+  // All three desktop OSes have a service layer, so `supported` reflects the
+  // platform. The GUI manages the service in-process (no separate CLI), so
+  // there's no "can't reach the tool" state — it's just supported or not.
   const supported = $derived(svc?.supported === true);
+  const unsupported = $derived(loaded && svc?.supported !== true);
+  const reachable = $derived(supported);
   const installed = $derived(svc?.installed === true);
   const running = $derived(svc?.running === true);
   const enabled = $derived(svc?.enabled === true);
 
-  // Platform-aware wording so the copy reads right on each OS.
+  // Platform-aware wording so the copy reads right on each OS — derived from
+  // the CLI's reported manager when we have it, else from the platform.
   const isMac = $derived(svc?.platform === "macos");
   const trayWord = $derived(isMac ? "menu bar" : "system tray");
   const startsWhen = $derived(svc?.scope === "system" ? "boot" : "login");
   const serviceKind = $derived(
-    svc?.manager === "windows-service"
+    svc?.manager === "windows-service" || svc?.platform === "windows"
       ? "Windows"
-      : svc?.manager === "launchd"
+      : svc?.manager === "launchd" || svc?.platform === "macos"
         ? "launchd"
-        : svc?.manager === "systemd"
+        : svc?.manager === "systemd" || svc?.platform === "linux"
           ? "systemd"
           : "background",
   );
-  const statusWord = $derived(!installed ? "Off" : running ? "Running" : "Stopped");
+  const statusWord = $derived(
+    !reachable ? "—" : !installed ? "Off" : running ? "Running" : "Stopped",
+  );
+
+  const autostartOn = $derived(app.autostartEnabled === true);
 
   let armedUninstall = $state(false);
   function uninstall() {
@@ -52,6 +63,7 @@
   onMount(() => {
     void app.loadServiceStatus();
     void app.loadWindowBehavior();
+    void app.loadAutostart();
   });
 </script>
 
@@ -69,51 +81,35 @@
       </p>
     </section>
   {:else}
-    <!-- Background service -->
+    <!-- Startup -->
     <section class="block">
-      <div class="row">
-        <div class="grow">
-          <div class="title">Run in the background</div>
-          <div class="hint">
-            Install AllMyStuff as a {serviceKind} service so it serves this machine — its screen,
-            files, terminal and more — across logout and reboot, no window needed. The service keeps
-            itself (and the mesh daemon) up to date on its own.
-          </div>
-        </div>
-        <span class="pill" class:on={running} class:idle={installed && !running}>{statusWord}</span>
-      </div>
-
-      {#if !supported}
-        <p class="notice">
-          A background service isn't available on {platformLabel(svc?.platform)} here yet — you can
-          still run <code>allmystuff serve</code> by hand.
-        </p>
-      {:else if !installed}
-        <div class="actions">
-          <button class="btn primary" disabled={busy} onclick={() => app.installService()}>
-            {busy ? "Installing…" : "Install as a service"}
-          </button>
-        </div>
-        {#if svc?.needs_privilege}
-          <p class="fineprint">Windows will ask for administrator approval to install it.</p>
-        {/if}
-      {:else}
-        <div class="actions">
-          {#if running}
-            <button class="btn" disabled={busy} onclick={() => app.stopService()}>Stop</button>
-            <button class="btn" disabled={busy} onclick={() => app.restartService()}>Restart</button>
-          {:else}
-            <button class="btn primary" disabled={busy} onclick={() => app.startService()}>Start</button>
-          {/if}
-          <button class="btn danger" class:armed={armedUninstall} disabled={busy} onclick={uninstall}>
-            {armedUninstall ? "Click to confirm" : "Uninstall"}
-          </button>
-        </div>
-        <div class="meta">
-          <span>Starts at {startsWhen}: <b>{enabled ? "yes" : "no"}</b></span>
-          <span>Status: <b>{running ? "running" : "stopped"}</b></span>
-        </div>
-      {/if}
+      <div class="title">Startup</div>
+      <label class="toggle">
+        <input
+          type="checkbox"
+          checked={autostartOn}
+          onchange={(e) => app.setAutostart(e.currentTarget.checked)}
+        />
+        <span>
+          <b>Start with computer</b>
+          <span class="hint">Launch AllMyStuff automatically when you log in.</span>
+        </span>
+      </label>
+      <label class="toggle" class:disabled={!autostartOn}>
+        <input
+          type="checkbox"
+          checked={wb?.start_minimized ?? false}
+          disabled={!autostartOn}
+          onchange={(e) => app.setWindowBehavior({ start_minimized: e.currentTarget.checked })}
+        />
+        <span>
+          <b>Start minimized</b>
+          <span class="hint">
+            When it starts with your computer, open straight to the {trayWord} instead of showing
+            the window.
+          </span>
+        </span>
+      </label>
     </section>
 
     <!-- Window behaviour -->
@@ -144,6 +140,55 @@
           <span class="hint">Minimizing hides the window to the {trayWord} instead of the taskbar.</span>
         </span>
       </label>
+    </section>
+
+    <!-- Background service (the headless, advanced option) -->
+    <section class="block">
+      <div class="row">
+        <div class="grow">
+          <div class="title">Run as a background service</div>
+          <div class="hint">
+            Beyond starting with your computer, install a {serviceKind} service so this machine stays
+            on the mesh even when you're logged out — serving its screen, files and terminal to peers,
+            and keeping itself (and the mesh daemon) up to date on its own.
+          </div>
+        </div>
+        <span class="pill" class:on={running} class:idle={installed && !running}>{statusWord}</span>
+      </div>
+
+      {#if !loaded}
+        <p class="fineprint">Reading service status…</p>
+      {:else if unsupported}
+        <p class="fineprint">
+          A background service isn't available on {platformLabel(svc?.platform)} — you can still run
+          <code>allmystuff serve</code> by hand.
+        </p>
+      {:else if !installed}
+        <div class="actions">
+          <button class="btn primary" disabled={busy} onclick={() => app.installService()}>
+            {busy ? "Installing…" : "Install as a service"}
+          </button>
+        </div>
+        {#if svc?.needs_privilege}
+          <p class="fineprint">Windows will ask for administrator approval to install it.</p>
+        {/if}
+      {:else}
+        <div class="actions">
+          {#if running}
+            <button class="btn" disabled={busy} onclick={() => app.stopService()}>Stop</button>
+            <button class="btn" disabled={busy} onclick={() => app.restartService()}>Restart</button>
+          {:else}
+            <button class="btn primary" disabled={busy} onclick={() => app.startService()}>Start</button>
+          {/if}
+          <button class="btn danger" class:armed={armedUninstall} disabled={busy} onclick={uninstall}>
+            {armedUninstall ? "Click to confirm" : "Uninstall"}
+          </button>
+        </div>
+        <div class="meta">
+          <span>Starts at {startsWhen}: <b>{enabled ? "yes" : "no"}</b></span>
+          <span>Status: <b>{running ? "running" : "stopped"}</b></span>
+        </div>
+      {/if}
     </section>
   {/if}
 </div>
@@ -264,5 +309,9 @@
   }
   .toggle input {
     margin-top: 0.2rem;
+  }
+  .toggle.disabled {
+    opacity: 0.55;
+    cursor: default;
   }
 </style>

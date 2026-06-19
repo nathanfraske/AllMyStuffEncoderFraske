@@ -1,0 +1,23 @@
+[package]
+name = "allmystuff-service"
+description = "Install/manage AllMyStuff as an OS background service (systemd / launchd / Windows SCM). Shared by the `allmystuff` CLI and the desktop app so both manage the service the same way — the GUI in-process, with no separate CLI to find."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lib]
+name = "allmystuff_service"
+path = "src/lib.rs"
+
+[dependencies]
+# Rich error context for the install/manage flow, and the user's home for the
+# unit/plist location + locating the node binary the service runs.
+anyhow = "1"
+dirs = { workspace = true }
+serde_json = { workspace = true }

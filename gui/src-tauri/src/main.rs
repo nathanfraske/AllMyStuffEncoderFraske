@@ -29,6 +29,7 @@ use allmystuff_node::{daemon_spawn, networks_store, video, UiSink};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
+use tauri_plugin_autostart::ManagerExt;
 
 mod window_behavior;
 
@@ -1058,142 +1059,100 @@ fn workaround_pi_webkit_rendering() {
     }
 }
 
-// ---- "Always On" tab: background service + window behaviour ------------
+// ---- "Always On" tab: background service (in-process) ------------------
 //
-// The service work is delegated to the `allmystuff` CLI (`allmystuff service
-// …`), the one place the systemd/launchd/SCM backends live — the GUI just
-// finds that binary and runs it. Status needs no privilege on any platform;
-// mutations need root/admin, so on Windows they're relaunched through a UAC
-// prompt, and on unix the GUI manages the per-user service (no privilege).
-
-/// Locate the `allmystuff` CLI binary, mirroring how the node binary is found:
-/// env override → beside this exe (the installer's layout) → `PATH` → the dev
-/// workspace target dir.
-fn find_cli_binary() -> Option<std::path::PathBuf> {
-    let exe = if cfg!(windows) {
-        "allmystuff.exe"
-    } else {
-        "allmystuff"
-    };
-    if let Some(p) = std::env::var_os("ALLMYSTUFF_CLI_BIN") {
-        let p = std::path::PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(cur) = std::env::current_exe() {
-        if let Some(c) = cur.parent().map(|d| d.join(exe)) {
-            if c.exists() {
-                return Some(c);
-            }
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let c = dir.join(exe);
-            if c.exists() {
-                return Some(c);
-            }
-        }
-    }
-    // Dev fallback: repo-root target/{release,debug}/allmystuff.
-    for profile in ["release", "debug"] {
-        if let Some(p) = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|root| root.join("target").join(profile).join(exe))
-        {
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
+// Service management lives in the shared `allmystuff_service` crate, so the GUI
+// drives it directly — there is no separate `allmystuff` binary to find, and
+// nothing degrades when one isn't around. Status and the unix (per-user)
+// mutations run in-process, needing no privilege. Windows services need admin,
+// so the GUI re-launches *its own* binary elevated (`--service-do <verb>`,
+// handled in `main`) — still no external CLI.
 
 /// The OS background-service status as JSON (`installed` / `running` /
-/// `enabled` / `supported` / …), from `allmystuff service status --json`.
-/// Querying needs no elevation, so this works without admin/sudo. Async +
-/// `spawn_blocking` so the subprocess never blocks the UI thread.
+/// `enabled` / `supported` / `manager` / …). Computed in-process by the shared
+/// crate; `spawn_blocking` because probing the live state shells out to
+/// systemctl/launchctl/sc. Whether the platform *has* a service layer is a
+/// static fact — true on all three desktop OSes — so `supported` is only false
+/// on a platform the crate doesn't manage at all.
 #[tauri::command]
 async fn service_status() -> Result<Value, String> {
-    tokio::task::spawn_blocking(service_status_blocking)
-        .await
-        .map_err(|e| format!("service status task failed: {e}"))?
+    tokio::task::spawn_blocking(|| {
+        allmystuff_service::status_value(false)
+            .unwrap_or_else(|_| json!({ "platform": std::env::consts::OS, "supported": false }))
+    })
+    .await
+    .map_err(|e| format!("service status task failed: {e}"))
 }
 
-fn service_status_blocking() -> Result<Value, String> {
-    let cli =
-        find_cli_binary().ok_or_else(|| "couldn't find the allmystuff CLI binary".to_string())?;
-    let out = std::process::Command::new(&cli)
-        .args(["service", "status", "--json"])
-        .output()
-        .map_err(|e| format!("running allmystuff: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stdout = stdout.trim();
-    serde_json::from_str::<Value>(stdout)
-        .map_err(|e| format!("parsing service status: {e} (got: {stdout})"))
+/// Map a UI verb to the shared crate's command (user scope; Windows ignores it).
+fn service_cmd(verb: &str) -> Option<allmystuff_service::ServiceCmd> {
+    use allmystuff_service::ServiceCmd;
+    Some(match verb {
+        "install" => ServiceCmd::Install { log: None },
+        "start" => ServiceCmd::Start,
+        "stop" => ServiceCmd::Stop,
+        "restart" => ServiceCmd::Restart,
+        "uninstall" => ServiceCmd::Uninstall,
+        _ => return None,
+    })
 }
 
-/// Run an `allmystuff service <verb>` that *changes* the service. Returns
-/// `{ ok, output }`. On Windows this needs elevation, so it's relaunched
-/// through a UAC prompt (the elevated child runs in its own console, so we
-/// report by exit code and let the UI re-read status); elsewhere the per-user
-/// service needs no privilege, so it runs directly with its output captured.
-fn run_service_mutation(verb: &str) -> Result<Value, String> {
-    let cli =
-        find_cli_binary().ok_or_else(|| "couldn't find the allmystuff CLI binary".to_string())?;
-    #[cfg(windows)]
-    {
-        let exe = cli.to_string_lossy().replace('\'', "''");
-        let ps = format!(
-            "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList 'service','{verb}' \
-             -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
-             catch {{ exit 1223 }}"
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .output()
-            .map_err(|e| format!("launching elevated allmystuff: {e}"))?;
-        let code = out.status.code().unwrap_or(-1);
-        if code == 1223 {
-            // ERROR_CANCELLED — the user declined the UAC prompt.
-            return Err("Administrator approval was declined.".to_string());
-        }
-        Ok(json!({
-            "ok": code == 0,
-            "output": if code == 0 {
-                format!("service {verb}: done")
-            } else {
-                format!("service {verb} failed (exit {code})")
-            },
-        }))
-    }
-    #[cfg(not(windows))]
-    {
-        let out = std::process::Command::new(&cli)
-            .args(["service", verb])
-            .output()
-            .map_err(|e| format!("running allmystuff: {e}"))?;
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.trim().is_empty() {
-            if !text.trim().is_empty() {
-                text.push('\n');
-            }
-            text.push_str(err.trim());
-        }
-        Ok(json!({ "ok": out.status.success(), "output": text.trim() }))
-    }
+/// The verb after a `--service-do` flag in this process's argv, if any (the
+/// elevated Windows self-invocation; see `main`).
+fn service_do_verb() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--service-do")?;
+    args.get(i + 1).cloned()
 }
 
-/// Run a service mutation off the UI thread. The blocking subprocess (and, on
-/// Windows, the elevated UAC wait) can take seconds, so it must not run inline
-/// on the main thread.
+/// Run a service mutation off the UI thread (it shells out to the init system,
+/// and on Windows waits on an elevated child). Returns `{ ok, output }`.
 async fn service_mutate(verb: &'static str) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || run_service_mutation(verb))
+    tokio::task::spawn_blocking(move || service_mutate_blocking(verb))
         .await
         .map_err(|e| format!("service {verb} task failed: {e}"))?
+}
+
+/// Unix: install/manage the per-user service in-process — no privilege, no CLI.
+#[cfg(not(windows))]
+fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
+    let cmd = service_cmd(verb).ok_or_else(|| format!("unknown service action: {verb}"))?;
+    match allmystuff_service::run(false, cmd) {
+        Ok(()) => Ok(json!({ "ok": true, "output": format!("service {verb}: done") })),
+        Err(e) => Ok(json!({ "ok": false, "output": format!("{e:#}") })),
+    }
+}
+
+/// Windows: a service needs admin, so re-launch our own binary elevated to do
+/// the work (`--service-do <verb>`, handled in `main`). Still no external CLI;
+/// the elevated child runs in its own console, so we report by exit code and
+/// let the UI re-read status.
+#[cfg(windows)]
+fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
+    let exe = exe.to_string_lossy().replace('\'', "''");
+    let ps = format!(
+        "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '--service-do','{verb}' \
+         -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
+         catch {{ exit 1223 }}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .output()
+        .map_err(|e| format!("launching elevated AllMyStuff: {e}"))?;
+    let code = out.status.code().unwrap_or(-1);
+    if code == 1223 {
+        // ERROR_CANCELLED — the user declined the UAC prompt.
+        return Err("Administrator approval was declined.".to_string());
+    }
+    Ok(json!({
+        "ok": code == 0,
+        "output": if code == 0 {
+            format!("service {verb}: done")
+        } else {
+            format!("service {verb} failed (exit {code})")
+        },
+    }))
 }
 
 #[tauri::command]
@@ -1217,11 +1176,11 @@ async fn service_uninstall() -> Result<Value, String> {
     service_mutate("uninstall").await
 }
 
-/// The persisted "Always On" window behaviour (close/minimize to tray).
+/// The persisted "Always On" window/startup behaviour (close/minimize to tray,
+/// start minimized).
 #[tauri::command]
 fn window_behavior_get(wb: State<'_, window_behavior::WindowBehavior>) -> Value {
-    let b = wb.get();
-    json!({ "close_to_tray": b.close_to_tray, "minimize_to_tray": b.minimize_to_tray })
+    behavior_json(wb.get())
 }
 
 #[tauri::command]
@@ -1229,12 +1188,42 @@ fn window_behavior_set(
     wb: State<'_, window_behavior::WindowBehavior>,
     close_to_tray: bool,
     minimize_to_tray: bool,
+    start_minimized: bool,
 ) -> Value {
-    let b = wb.set(window_behavior::Behavior {
+    // Preserve the internal autostart-default marker — it isn't a user field.
+    let autostart_defaulted = wb.get().autostart_defaulted;
+    behavior_json(wb.set(window_behavior::Behavior {
         close_to_tray,
         minimize_to_tray,
-    });
-    json!({ "close_to_tray": b.close_to_tray, "minimize_to_tray": b.minimize_to_tray })
+        start_minimized,
+        autostart_defaulted,
+    }))
+}
+
+fn behavior_json(b: window_behavior::Behavior) -> Value {
+    json!({
+        "close_to_tray": b.close_to_tray,
+        "minimize_to_tray": b.minimize_to_tray,
+        "start_minimized": b.start_minimized,
+    })
+}
+
+/// Whether "Start with computer" (the OS login item) is currently registered.
+#[tauri::command]
+fn autostart_get(app: tauri::AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Register / unregister the login item, returning the resulting state.
+#[tauri::command]
+fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
+    }
+    Ok(mgr.is_enabled().unwrap_or(enabled))
 }
 
 /// Build the system-tray / menu-bar icon — the home AllMyStuff keeps while
@@ -1284,6 +1273,35 @@ fn reveal_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Apply the persisted startup preferences once the app is built: reveal the
+/// main window unless this is a login-item launch the user asked to start
+/// minimized, and — on a fresh install — default "Start with computer" on.
+fn apply_startup_behavior(app: &tauri::AppHandle) {
+    let wb = app.state::<window_behavior::WindowBehavior>();
+
+    // The main window is created hidden (tauri.conf `visible: false`) so a
+    // start-minimized launch never flashes. Show it now unless we should stay
+    // hidden: a `--minimized` autostart launch with the pref on.
+    let launched_minimized = std::env::args().any(|a| a == "--minimized");
+    let start_hidden = launched_minimized && wb.start_minimized();
+    if start_hidden {
+        tracing::info!("starting minimized to the tray (login item)");
+    } else if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+
+    // First launch on this install: default "Start with computer" on, once, so
+    // a later user opt-out is never undone.
+    if wb.needs_autostart_default() {
+        match app.autolaunch().enable() {
+            Ok(()) => tracing::info!("enabled Start with computer (install default)"),
+            Err(e) => tracing::warn!("couldn't enable Start with computer by default: {e}"),
+        }
+        wb.mark_autostart_defaulted();
+    }
+}
+
 /// Native close/minimize handling for the **main** window only (secondary
 /// console / terminal / room windows always close normally): honour the
 /// persisted "Always On" preference by hiding to the tray instead of closing
@@ -1318,6 +1336,27 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 fn main() {
+    // Elevated service action: `<gui-exe> --service-do <verb>`. On Windows the
+    // "Always On" tab re-launches this binary elevated to install/manage the
+    // service; here we just run the verb in-process and exit, no webview. (The
+    // unix path calls the crate directly and never reaches this.)
+    if let Some(verb) = service_do_verb() {
+        let code = match service_cmd(&verb) {
+            Some(cmd) => match allmystuff_service::run(false, cmd) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("allmystuff service {verb}: {e:#}");
+                    1
+                }
+            },
+            None => {
+                eprintln!("allmystuff: unknown service action `{verb}`");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_rendering();
 
@@ -1339,6 +1378,14 @@ fn main() {
         // Terminal copy/paste: the async clipboard API is unreliable in
         // WebKitGTK, so the terminal windows use the plugin instead.
         .plugin(tauri_plugin_clipboard_manager::init())
+        // "Start with computer". The login item launches us with `--minimized`;
+        // whether that actually starts hidden is gated on the user's
+        // start-minimized preference at startup (see `setup`), so the arg can
+        // ride along unconditionally.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
@@ -1428,6 +1475,8 @@ fn main() {
             service_uninstall,
             window_behavior_get,
             window_behavior_set,
+            autostart_get,
+            autostart_set,
         ])
         .setup(move |app| {
             // The tray icon is what keeps AllMyStuff reachable once "Always On"
@@ -1435,6 +1484,7 @@ fn main() {
             if let Err(e) = build_tray(app.handle()) {
                 tracing::warn!("couldn't create the tray icon: {e}");
             }
+            apply_startup_behavior(app.handle());
             let handle = app.handle().clone();
             let mesh = Mesh::new(
                 client.clone(),
@@ -1506,5 +1556,20 @@ mod tests {
     fn window_slug_flattens_to_label_charset() {
         assert_eq!(window_slug("cap:desk:cam/0"), "cap_desk_cam_0");
         assert_eq!(window_slug("plain-id_9"), "plain-id_9");
+    }
+
+    #[test]
+    fn service_cmd_maps_known_verbs() {
+        use allmystuff_service::ServiceCmd;
+        assert!(matches!(
+            service_cmd("install"),
+            Some(ServiceCmd::Install { .. })
+        ));
+        assert!(matches!(service_cmd("restart"), Some(ServiceCmd::Restart)));
+        assert!(matches!(
+            service_cmd("uninstall"),
+            Some(ServiceCmd::Uninstall)
+        ));
+        assert!(service_cmd("frobnicate").is_none());
     }
 }

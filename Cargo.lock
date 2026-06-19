@@ -24,9 +24,8 @@ dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-service",
  "allmystuff-updater",
- "anyhow",
- "dirs",
  "serde_json",
  "tokio",
 ]
@@ -55,6 +54,15 @@ version = "0.1.15"
 dependencies = [
  "allmystuff-graph",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "allmystuff-service"
+version = "0.1.15"
+dependencies = [
+ "anyhow",
+ "dirs",
  "serde_json",
 ]
 

@@ -107,6 +107,8 @@ import {
   onTerminalSessions,
   filesWindowTarget,
   scanSelf,
+  autostartGet,
+  autostartSet,
   clipboardPaste,
   sendInput,
   serviceInstall,
@@ -669,6 +671,9 @@ class AppStore {
   /** Whether closing / minimizing keeps the app in the tray. Null until read
    *  from the backend (the source of truth). */
   windowBehavior = $state<WindowBehavior | null>(null);
+  /** Whether "Start with computer" (the OS login item) is registered. Null
+   *  until read from the backend. */
+  autostartEnabled = $state<boolean | null>(null);
 
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
@@ -4528,6 +4533,7 @@ class AppStore {
     if (tab === "always_on") {
       void this.loadServiceStatus();
       void this.loadWindowBehavior();
+      void this.loadAutostart();
     }
   }
 
@@ -4782,7 +4788,11 @@ class AppStore {
   /** Update one window-behaviour toggle and persist it via the backend. */
   async setWindowBehavior(patch: Partial<WindowBehavior>) {
     if (!isTauri()) return;
-    const base = this.windowBehavior ?? { close_to_tray: true, minimize_to_tray: false };
+    const base = this.windowBehavior ?? {
+      close_to_tray: true,
+      minimize_to_tray: false,
+      start_minimized: false,
+    };
     const next = { ...base, ...patch };
     // Optimistic: reflect immediately, reconcile with the stored value.
     this.windowBehavior = next;
@@ -4792,6 +4802,31 @@ class AppStore {
     } catch (e) {
       this.toast("warn", `Couldn't save window settings: ${errMsg(e)}`);
       void this.loadWindowBehavior();
+    }
+  }
+
+  // ---- "Always On": start with computer -----------------------------
+
+  /** Read whether the OS login item ("Start with computer") is registered. */
+  async loadAutostart() {
+    if (!isTauri()) return;
+    try {
+      this.autostartEnabled = await autostartGet();
+    } catch (e) {
+      this.toast("warn", `Couldn't read startup setting: ${errMsg(e)}`);
+    }
+  }
+
+  /** Register / unregister the login item and reflect the resulting state. */
+  async setAutostart(enabled: boolean) {
+    if (!isTauri()) return;
+    const prev = this.autostartEnabled;
+    this.autostartEnabled = enabled; // optimistic
+    try {
+      this.autostartEnabled = await autostartSet(enabled);
+    } catch (e) {
+      this.autostartEnabled = prev;
+      this.toast("warn", `Couldn't ${enabled ? "enable" : "disable"} Start with computer: ${errMsg(e)}`);
     }
   }
 
