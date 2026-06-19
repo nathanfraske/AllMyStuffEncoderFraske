@@ -389,9 +389,22 @@ impl Drop for RouteVideo {
     }
 }
 
+/// The latest decode health a viewer reported for one of our outbound
+/// streams (receiver → sender). Observability today; the signal the stream
+/// adaptation — recovery cadence, then bitrate/res auto-scaling — reads next.
+#[derive(Debug, Clone, Copy)]
+pub struct RecvFeedback {
+    pub recv_fps: u32,
+    pub decode_fails: u32,
+    pub queue_depth: u32,
+    pub at: Instant,
+}
+
 #[derive(Default)]
 pub struct VideoBridge {
     routes: Mutex<HashMap<String, RouteVideo>>,
+    /// Per-route receiver health, keyed by route id (see [`RecvFeedback`]).
+    feedback: Mutex<HashMap<String, RecvFeedback>>,
 }
 
 impl VideoBridge {
@@ -484,6 +497,44 @@ impl VideoBridge {
         }
     }
 
+    /// Record the decode health a viewer reported for one of our streams
+    /// (receiver → sender). Logged at info when the link looks unhealthy
+    /// (decode failures, or the queue backing up) so a struggling stream is
+    /// visible from the *sender's* logs, and stored for the stream
+    /// adaptation to read.
+    pub fn note_feedback(
+        &self,
+        route_id: &str,
+        recv_fps: u32,
+        decode_fails: u32,
+        queue_depth: u32,
+    ) {
+        self.feedback.lock().insert(
+            route_id.to_string(),
+            RecvFeedback {
+                recv_fps,
+                decode_fails,
+                queue_depth,
+                at: Instant::now(),
+            },
+        );
+        if decode_fails > 0 || queue_depth > 8 {
+            tracing::info!(
+                "video feedback {route_id}: viewer {recv_fps} fps · {decode_fails} decode-fail · queue {queue_depth}"
+            );
+        } else {
+            tracing::debug!(
+                "video feedback {route_id}: viewer {recv_fps} fps · queue {queue_depth}"
+            );
+        }
+    }
+
+    /// The most recent feedback a viewer reported for `route_id`, if any —
+    /// the hook the stream adaptation (recovery cadence, auto-scale) reads.
+    pub fn latest_feedback(&self, route_id: &str) -> Option<RecvFeedback> {
+        self.feedback.lock().get(route_id).copied()
+    }
+
     /// Restart `route_id`'s capture with the viewer's quality picks.
     pub fn retune(&self, route_id: &str, tune: Tune) {
         let Some(old) = self.routes.lock().remove(route_id) else {
@@ -515,6 +566,7 @@ impl VideoBridge {
 
     pub fn stop(&self, route_id: &str) {
         self.routes.lock().remove(route_id);
+        self.feedback.lock().remove(route_id);
     }
 }
 
@@ -1554,6 +1606,21 @@ mod tests {
         assert!(q.windows(2).all(|w| w[0] <= w[1]), "monotonic: {q:?}");
         assert!(*q.first().unwrap() < JPEG_QUALITY); // "Speed" softer than neutral
         assert!(*q.last().unwrap() > JPEG_QUALITY); // "Quality" sharper
+    }
+
+    #[test]
+    fn receiver_feedback_is_recorded_latest_wins_and_clears_with_the_route() {
+        let vb = VideoBridge::new();
+        assert!(vb.latest_feedback("r1").is_none());
+        vb.note_feedback("r1", 28, 3, 1);
+        let fb = vb.latest_feedback("r1").expect("recorded");
+        assert_eq!((fb.recv_fps, fb.decode_fails, fb.queue_depth), (28, 3, 1));
+        // A fresher report replaces the old one.
+        vb.note_feedback("r1", 30, 0, 0);
+        assert_eq!(vb.latest_feedback("r1").map(|f| f.decode_fails), Some(0));
+        // Tearing the route down drops its feedback (no unbounded growth).
+        vb.stop("r1");
+        assert!(vb.latest_feedback("r1").is_none());
     }
 
     #[test]

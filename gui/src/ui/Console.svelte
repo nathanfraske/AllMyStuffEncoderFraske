@@ -26,6 +26,7 @@
     isTauri,
     onThisWindowClose,
     refreshRoute,
+    sendVideoFeedback,
     toggleWindowFullscreen,
     watchVideo,
     watchVideoStatus,
@@ -256,6 +257,8 @@
         nativeDecode = true;
       }
     }
+    let fbTick = 0;
+    let fbFailsSent = 0;
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       const inRate = inCount;
@@ -271,6 +274,14 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // Every other tick, report our decode health back to the streamer so
+      // it can adapt (receiver → sender). decode_fails is the delta since the
+      // last report; recv_fps is what we actually painted.
+      const fbRoute = app.consoleVideoLive;
+      if (fbRoute && ++fbTick % 2 === 0) {
+        void sendVideoFeedback(fbRoute, fps, decodeFails - fbFailsSent, queuePeek());
+        fbFailsSent = decodeFails;
+      }
     }, 1000);
     if (windowed) {
       // The OS chrome's ✕ must tear the session's routes down too — the

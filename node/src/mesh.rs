@@ -1960,6 +1960,14 @@ impl Mesh {
                         fps,
                     },
                 ),
+                Effect::VideoFeedback {
+                    route_id,
+                    recv_fps,
+                    decode_fails,
+                    queue_depth,
+                } => self
+                    .video
+                    .note_feedback(&route_id, recv_fps, decode_fails, queue_depth),
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
                     self.video.stop(&id);
@@ -4796,6 +4804,30 @@ impl Mesh {
                 max_edge,
                 bitrate,
                 fps,
+            }),
+        )
+        .await
+    }
+
+    /// Report this viewer's decode health for an inbound route back to its
+    /// streamer (receiver → sender), so the streamer can adapt the stream.
+    /// Best-effort and unacknowledged: an old streamer drops the message and
+    /// never adapts, exactly as today.
+    pub async fn send_video_feedback(
+        self: &Arc<Self>,
+        route_id: String,
+        recv_fps: u32,
+        decode_fails: u32,
+        queue_depth: u32,
+    ) -> Result<(), String> {
+        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        self.send_control(
+            &peer,
+            &ControlMessage::Route(RouteControl::VideoFeedback {
+                route_id,
+                recv_fps,
+                decode_fails,
+                queue_depth,
             }),
         )
         .await

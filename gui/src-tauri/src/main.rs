@@ -249,6 +249,22 @@ async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(
     mesh.inner().request_refresh(route_id).await
 }
 
+/// Report the console's decode health for an inbound display route back to its
+/// streamer (receiver → sender), so the streamer can adapt the stream. Sent
+/// periodically by the console; best-effort, an old streamer drops it.
+#[tauri::command]
+async fn video_feedback(
+    mesh: State<'_, Arc<Mesh>>,
+    route_id: String,
+    recv_fps: u32,
+    decode_fails: u32,
+    queue_depth: u32,
+) -> Result<(), String> {
+    mesh.inner()
+        .send_video_feedback(route_id, recv_fps, decode_fails, queue_depth)
+        .await
+}
+
 /// Ask the sender of an inbound display route to stream with these
 /// quality picks; absent values mean "automatic". The console's pills.
 #[tauri::command]
@@ -1348,6 +1364,7 @@ fn main() {
             video_poll,
             video_unwatch,
             video_refresh,
+            video_feedback,
             tune_route,
             open_console_window,
             open_video_window,

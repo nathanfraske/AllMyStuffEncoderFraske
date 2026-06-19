@@ -197,6 +197,18 @@ export function refreshRoute(routeId: string): Promise<null> {
   return tryInvoke("video_refresh", { routeId });
 }
 
+/** Report this console's decode health for `routeId` back to its streamer
+ *  (receiver → sender), so the streamer can adapt. Sent periodically;
+ *  best-effort (an old streamer drops it). */
+export function sendVideoFeedback(
+  routeId: string,
+  recvFps: number,
+  decodeFails: number,
+  queueDepth: number,
+): Promise<null> {
+  return tryInvoke("video_feedback", { routeId, recvFps, decodeFails, queueDepth });
+}
+
 export function disconnectRoute(routeId: string): Promise<null> {
   return tryInvoke("disconnect_route", { routeId });
 }
