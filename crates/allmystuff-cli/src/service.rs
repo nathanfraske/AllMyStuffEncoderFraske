@@ -17,26 +17,32 @@
 //! - **system** (`--system`) — a root-owned service that starts at boot and
 //!   runs with its own state under a system directory. Requires root.
 //!
-//! Two backends, picked by target OS in [`current_manager`]:
+//! Three backends, picked by target OS:
 //!
 //! - **Linux → systemd.** An `allmystuff.service` unit under
 //!   `~/.config/systemd/user/` (user) or `/etc/systemd/system/` (system).
 //! - **macOS → launchd.** A `com.allmystuff.daemon.plist` under
 //!   `~/Library/LaunchAgents/` (user) or `/Library/LaunchDaemons/` (system).
-//!
-//! Windows and other targets aren't wired to a service manager; the command
-//! returns an actionable pointer to the manual setup instead of pretending
-//! to succeed.
+//! - **Windows → the Service Control Manager.** An `AllMyStuff` service
+//!   driven through `sc.exe`, running the node binary in service mode
+//!   (`allmystuff-serve --service`, which speaks the SCM control protocol).
+//!   Windows services are inherently system-wide (LocalSystem, start at
+//!   boot), so the `--system`/user split collapses to one service there;
+//!   managing it needs an elevated (Administrator) prompt.
 //!
 //! Almost everything here is a pure function — the unit/plist text, the
-//! `systemctl`/`launchctl` argv vectors, the status parsers — so both
-//! backends are unit-tested on every CI runner regardless of host OS.
+//! `sc.exe` argv vectors, the `systemctl`/`launchctl`/`sc` status parsers —
+//! so all three backends are unit-tested on every CI runner regardless of
+//! host OS. The unix path picks its init system in [`current_manager`]; the
+//! Windows path is dispatched up front in [`run`].
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
 
 /// systemd unit / launchd job names. Stable identifiers — changing them
 /// orphans previously-installed services, so they're constants.
@@ -149,6 +155,13 @@ impl Lifecycle {
 // ---------------------------------------------------------------------------
 
 pub fn run(system: bool, cmd: ServiceCmd) -> Result<()> {
+    // Windows doesn't have an init system we drive with unit files; it has the
+    // Service Control Manager, reached through `sc.exe`. Handle it up front so
+    // the rest of this function stays the unix (systemd/launchd) story.
+    if cfg!(windows) {
+        return win_run(cmd);
+    }
+
     let manager = current_manager()?;
     let scope = Scope::from_flag(system);
 
@@ -177,7 +190,9 @@ pub fn run(system: bool, cmd: ServiceCmd) -> Result<()> {
     }
 }
 
-/// Pick the backend for the host OS.
+/// Pick the unix init system for the host OS. Windows is handled before this
+/// is ever called (see [`run`]), so it only has to choose between systemd and
+/// launchd — and refuse the rare third unix that's neither.
 fn current_manager() -> Result<Manager> {
     #[cfg(target_os = "linux")]
     {
@@ -189,18 +204,11 @@ fn current_manager() -> Result<Manager> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let msg = if cfg!(windows) {
-            "`allmystuff service` isn't supported on Windows yet.\n\n\
-             To run the node in the background on Windows, register `allmystuff serve`\n\
-             as a startup task (Task Scheduler -> Create Task -> Triggers: \"At startup\"\n\
-             or \"At log on\"), or wrap it with a service shim such as NSSM\n\
-             (https://nssm.cc) or WinSW. Track native support upstream:\n\
-             https://github.com/mrjeeves/AllMyStuff/issues"
-        } else {
-            "`allmystuff service` supports Linux (systemd) and macOS (launchd) only.\n\
-             Run the node under your platform's init system, pointing it at: allmystuff serve"
-        };
-        Err(anyhow!(msg))
+        Err(anyhow!(
+            "`allmystuff service` supports Linux (systemd), macOS (launchd), and \
+             Windows (Service Control Manager).\nOn this platform, run the node \
+             under your own init system, pointing it at: allmystuff serve"
+        ))
     }
 }
 
@@ -949,6 +957,444 @@ fn on_path(exe: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Windows backend — the Service Control Manager, driven through `sc.exe`
+// ---------------------------------------------------------------------------
+//
+// Unlike systemd/launchd there's no unit file: the service *is* an SCM record,
+// created/queried/deleted with `sc.exe`. The node binary carries its own SCM
+// dispatcher (`allmystuff-serve --service`), so the only thing baked into the
+// service is its command line. Windows services run as LocalSystem and start
+// at boot, so the user/system scope split doesn't apply — there's one service.
+//
+// As elsewhere, the argv builders and the `sc` output parsers are pure and
+// tested on every runner; only the orchestration shells out (and only ever
+// runs on Windows).
+
+/// The SCM service name. **Must** match what the node binary passes to the
+/// service dispatcher and control handler (`allmystuff-node`'s `serve` bin),
+/// or the service can't report its status to the SCM. Stable identifier.
+const WINDOWS_SERVICE_NAME: &str = "AllMyStuff";
+const WINDOWS_DISPLAY_NAME: &str = "AllMyStuff Mesh Node";
+const WINDOWS_DESCRIPTION: &str =
+    "Runs this machine on the MyOwnMesh network (presence, plus screen / camera \
+     / audio / input / terminal / files routes), spawning and supervising the \
+     myownmesh daemon itself.";
+
+/// Entry point for the Windows path (mirrors the unix [`run`] match). Windows
+/// services are system-wide, so there's no scope argument.
+fn win_run(cmd: ServiceCmd) -> Result<()> {
+    match cmd {
+        ServiceCmd::Install { log } => win_install(log),
+        ServiceCmd::Start => win_lifecycle(Lifecycle::Start),
+        ServiceCmd::Stop => win_lifecycle(Lifecycle::Stop),
+        ServiceCmd::Restart => win_lifecycle(Lifecycle::Restart),
+        ServiceCmd::Status => win_status(),
+        ServiceCmd::Uninstall => win_uninstall(),
+    }
+}
+
+fn win_install(log: Option<String>) -> Result<()> {
+    // The service runs the node binary in service mode — resolve it the same
+    // way `allmystuff serve` does, and run it *in place*. Leaving it where the
+    // installer dropped it (beside `allmystuff` and `allmystuff-gui`) is what
+    // lets the node's background self-updater refresh all three halves in
+    // lockstep — a copied-aside binary could only ever update itself.
+    let exec = crate::serve::find_serve_binary().ok_or_else(|| {
+        anyhow!(
+            "couldn't find the `allmystuff-serve` node binary to run.\n\n\
+             Re-run the installer (it installs the node), set ALLMYSTUFF_SERVE_BIN,\n\
+             or build it from a source checkout:\n  \
+             cargo build --release --manifest-path node/Cargo.toml"
+        )
+    })?;
+    // Make it absolute, but *don't* canonicalize: Windows canonicalization adds
+    // the `\\?\` extended-length prefix, which would poison the service's
+    // ImagePath. find_serve_binary already returns absolute paths in practice.
+    let exec = win_absolute(&exec)?;
+
+    // `sc create` refuses to clobber an existing service; replace cleanly so a
+    // reinstall picks up the new binary/args.
+    let replacing = win_installed();
+    if replacing {
+        let _ = capture(&sc_stop());
+        win_wait_stopped(Duration::from_secs(10));
+        win_run_checked(&sc_delete())?;
+        win_wait_absent(Duration::from_secs(5));
+    }
+
+    let binpath = win_binpath(&exec, log.as_deref());
+    win_run_checked(&sc_create(&binpath))?;
+    // Description + automatic restart-on-failure are nice-to-haves: best-effort
+    // so a quirky `sc` build can't fail the install over cosmetics. The
+    // restart-on-failure also doubles as the node's self-update relaunch hook —
+    // an updated node exits and the SCM brings the new one straight back.
+    let _ = capture(&sc_description());
+    let _ = capture(&sc_failure());
+    win_run_checked(&sc_start())?;
+
+    println!(
+        "{} AllMyStuff as a Windows service (LocalSystem, starts at boot).",
+        if replacing {
+            "Reinstalled"
+        } else {
+            "Installed"
+        }
+    );
+    println!("  binary:  {}", exec.display());
+    println!("  service: {WINDOWS_SERVICE_NAME}  (Service Control Manager)");
+    println!("  daemon:  the node spawns `myownmesh serve` itself — one service runs both");
+    println!("  manage:  services.msc, or `sc query {WINDOWS_SERVICE_NAME}`");
+    win_print_state();
+    Ok(())
+}
+
+fn win_lifecycle(life: Lifecycle) -> Result<()> {
+    if !win_installed() {
+        bail!(
+            "the Windows service isn't installed.\nRun `allmystuff service install` first \
+             (from an elevated/Administrator prompt)."
+        );
+    }
+    match life {
+        // `sc start` on an already-running service exits 1056; `sc stop` on an
+        // already-stopped one exits 1062. Treat those as success.
+        Lifecycle::Start => win_run_tolerant(&sc_start(), &[1056])?,
+        Lifecycle::Stop => win_run_tolerant(&sc_stop(), &[1062])?,
+        Lifecycle::Restart => {
+            let _ = capture(&sc_stop());
+            win_wait_stopped(Duration::from_secs(10));
+            win_run_tolerant(&sc_start(), &[1056])?;
+        }
+    }
+    println!("{} the Windows service.", life.past());
+    win_print_state();
+    Ok(())
+}
+
+fn win_status() -> Result<()> {
+    println!("AllMyStuff (Windows service)");
+    if !win_installed() {
+        println!("  status:  not installed");
+        println!("  install: allmystuff service install  (run as Administrator)");
+        return Ok(());
+    }
+    println!("  service: {WINDOWS_SERVICE_NAME}");
+    win_print_state();
+    Ok(())
+}
+
+fn win_uninstall() -> Result<()> {
+    if !win_installed() {
+        println!("No Windows service installed — nothing to remove.");
+        return Ok(());
+    }
+    let _ = capture(&sc_stop());
+    win_wait_stopped(Duration::from_secs(10));
+    win_run_checked(&sc_delete())?;
+    // The binary runs in place (the installer owns it), so there's nothing of
+    // ours to delete — uninstall just removes the SCM record.
+    println!("Uninstalled the Windows service.");
+    Ok(())
+}
+
+/// Print the live enabled (auto-start) + running words for the SCM service.
+fn win_print_state() {
+    let (_, q_out, _) = capture(&sc_query());
+    if let Some(state) = parse_sc_state(&q_out) {
+        println!("  active:  {}", state.to_lowercase());
+    }
+    let (_, c_out, _) = capture(&sc_qc());
+    if let Some(start) = parse_sc_start_type(&c_out) {
+        let on = sc_autostart(&c_out);
+        println!(
+            "  enabled: {} ({})",
+            if on { "enabled" } else { "disabled" },
+            start.to_lowercase()
+        );
+    }
+    println!("  logs:    Event Viewer, or run in a console: allmystuff serve");
+}
+
+/// Resolve `exe` to an absolute path *without* canonicalizing (which on
+/// Windows would prepend the `\\?\` extended-length prefix that `sc`/CreateProcess
+/// mishandle). Relative inputs are joined onto the current directory.
+fn win_absolute(exe: &Path) -> Result<PathBuf> {
+    if exe.is_absolute() {
+        return Ok(exe.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("resolve current directory")?;
+    Ok(cwd.join(exe))
+}
+
+/// The command line baked into the service. The exe is quoted so a spaced path
+/// still parses, and `--service` flips the node into SCM-dispatcher mode; a
+/// `--log` filter rides along when the installer was given one.
+fn win_binpath(exec: &Path, log: Option<&str>) -> String {
+    let mut s = format!("\"{}\" --service", exec.display());
+    if let Some(filter) = log {
+        s.push_str(" --log ");
+        s.push_str(filter);
+    }
+    s
+}
+
+// ---- `sc.exe` argv builders (pure) ----------------------------------------
+
+fn sc(args: &[&str]) -> Vec<String> {
+    let mut cmd = vec!["sc".to_string()];
+    cmd.extend(args.iter().map(|a| a.to_string()));
+    cmd
+}
+
+/// `sc create <name> binPath= "<...>" start= auto DisplayName= "<...>"`. Note
+/// the SCM-mandated space after each `key=` — the value is its own token.
+fn sc_create(binpath: &str) -> Vec<String> {
+    sc(&[
+        "create",
+        WINDOWS_SERVICE_NAME,
+        "binPath=",
+        binpath,
+        "start=",
+        "auto",
+        "DisplayName=",
+        WINDOWS_DISPLAY_NAME,
+    ])
+}
+
+fn sc_description() -> Vec<String> {
+    sc(&["description", WINDOWS_SERVICE_NAME, WINDOWS_DESCRIPTION])
+}
+
+/// Restart the service on crash (mirrors systemd `Restart=on-failure`): three
+/// 5 s-delayed restarts, counter reset after a day up.
+fn sc_failure() -> Vec<String> {
+    sc(&[
+        "failure",
+        WINDOWS_SERVICE_NAME,
+        "reset=",
+        "86400",
+        "actions=",
+        "restart/5000/restart/5000/restart/5000",
+    ])
+}
+
+fn sc_start() -> Vec<String> {
+    sc(&["start", WINDOWS_SERVICE_NAME])
+}
+
+fn sc_stop() -> Vec<String> {
+    sc(&["stop", WINDOWS_SERVICE_NAME])
+}
+
+fn sc_delete() -> Vec<String> {
+    sc(&["delete", WINDOWS_SERVICE_NAME])
+}
+
+fn sc_query() -> Vec<String> {
+    sc(&["query", WINDOWS_SERVICE_NAME])
+}
+
+fn sc_qc() -> Vec<String> {
+    sc(&["qc", WINDOWS_SERVICE_NAME])
+}
+
+// ---- `sc.exe` output parsers (pure) ---------------------------------------
+
+/// The `STATE` word from `sc query` output (`RUNNING`, `STOPPED`,
+/// `STOP_PENDING`, …). The state line reads `STATE : 4  RUNNING`, so the
+/// trailing token is the word.
+fn parse_sc_state(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("STATE"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(str::to_string)
+}
+
+/// Whether `sc query` output reports the service as running.
+fn sc_running(stdout: &str) -> bool {
+    parse_sc_state(stdout).as_deref() == Some("RUNNING")
+}
+
+/// The `START_TYPE` word from `sc qc` output (`AUTO_START`, `DEMAND_START`, …).
+fn parse_sc_start_type(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("START_TYPE"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(str::to_string)
+}
+
+/// Whether `sc qc` output reports the service as starting automatically (at
+/// boot).
+fn sc_autostart(stdout: &str) -> bool {
+    parse_sc_start_type(stdout)
+        .map(|s| s.contains("AUTO_START"))
+        .unwrap_or(false)
+}
+
+// ---- Windows process helpers ----------------------------------------------
+
+/// `sc query <name>` exits 0 when the service exists (even stopped) and 1060
+/// (`ERROR_SERVICE_DOES_NOT_EXIST`) when it doesn't. Querying status needs no
+/// elevation, so the GUI and a plain shell can both read it.
+fn win_installed() -> bool {
+    capture(&sc_query()).0 == 0
+}
+
+/// Run an `sc` command, mapping the access-denied exit (5) to an actionable
+/// "run elevated" message and surfacing any other failure with `sc`'s text.
+fn win_run_checked(argv: &[String]) -> Result<()> {
+    win_run_tolerant(argv, &[])
+}
+
+/// Like [`win_run_checked`] but treats the given extra exit codes as success
+/// (e.g. "already running"/"already stopped").
+fn win_run_tolerant(argv: &[String], tolerate: &[i32]) -> Result<()> {
+    let (code, _out, err) = capture(argv);
+    if code == 0 || tolerate.contains(&code) {
+        return Ok(());
+    }
+    if code == 5 {
+        bail!(
+            "access denied running `{}`.\n\n\
+             Managing a Windows service needs an elevated prompt. Right-click \
+             Command Prompt or PowerShell and choose \"Run as administrator\", \
+             then run the command again.",
+            argv.join(" ")
+        );
+    }
+    let detail = err.trim();
+    if detail.is_empty() {
+        bail!("`{}` failed (exit {code})", argv.join(" "));
+    }
+    bail!("`{}` failed (exit {code}): {detail}", argv.join(" "));
+}
+
+/// Poll `sc query` until the service reports `STOPPED` (or the deadline).
+fn win_wait_stopped(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let (_, out, _) = capture(&sc_query());
+        if parse_sc_state(&out).as_deref() == Some("STOPPED") {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Poll `sc query` until the service is gone (exit 1060) or the deadline.
+fn win_wait_absent(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !win_installed() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable status (the GUI's "Always On" tab reads this JSON)
+// ---------------------------------------------------------------------------
+
+/// Print the service status as a single JSON line (for `service status
+/// --json`). Shape is stable and additive — see [`status_value`].
+pub fn print_status_json(system: bool) -> Result<()> {
+    let v = status_value(system)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+    );
+    Ok(())
+}
+
+/// Structured service status: `{ platform, supported, manager, scope,
+/// installed, enabled, running, needs_privilege, … }`. `enabled`/`running` are
+/// booleans (null when not installed / indeterminate). On a platform we don't
+/// support, `supported` is false and the rest is omitted.
+pub fn status_value(system: bool) -> Result<Value> {
+    if cfg!(windows) {
+        return Ok(win_status_value());
+    }
+    let scope = Scope::from_flag(system);
+    let manager = match current_manager() {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(json!({
+                "platform": std::env::consts::OS,
+                "supported": false,
+            }))
+        }
+    };
+    let home = home_dir()?;
+    let installed = manager.unit_path(scope, &home).exists();
+    let state = if installed {
+        manager.probe_state(scope)
+    } else {
+        ServiceState {
+            enabled: None,
+            active: None,
+        }
+    };
+    Ok(json!({
+        "platform": std::env::consts::OS,
+        "supported": true,
+        "manager": manager.init_name(),
+        "scope": scope.label(),
+        "installed": installed,
+        "enabled": state.enabled.as_deref().map(enabled_is_on),
+        "running": state.active.as_deref().map(active_is_running),
+        "enabled_detail": state.enabled,
+        "running_detail": state.active,
+        "needs_privilege": scope == Scope::System,
+    }))
+}
+
+fn win_status_value() -> Value {
+    let installed = win_installed();
+    let running = installed && {
+        let (_, out, _) = capture(&sc_query());
+        sc_running(&out)
+    };
+    let enabled = if installed {
+        let (_, out, _) = capture(&sc_qc());
+        Some(sc_autostart(&out))
+    } else {
+        None
+    };
+    json!({
+        "platform": "windows",
+        "supported": true,
+        "manager": "windows-service",
+        "scope": "system",
+        "installed": installed,
+        "enabled": enabled,
+        "running": running,
+        "needs_privilege": true,
+    })
+}
+
+/// systemd reports `active`; launchd, `running`. Either means "up".
+fn active_is_running(word: &str) -> bool {
+    matches!(word, "active" | "running")
+}
+
+/// "Starts on its own" — systemd's enabled-ish states, or launchd's `loaded`.
+fn enabled_is_on(word: &str) -> bool {
+    matches!(
+        word,
+        "enabled" | "enabled-runtime" | "static" | "alias" | "indirect" | "loaded"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -1295,5 +1741,109 @@ mod tests {
         if let Some(v) = saved.1 {
             std::env::set_var("ALLMYSTUFF_HOME", v);
         }
+    }
+
+    // ---- windows: binPath + sc argv builders ----
+
+    #[test]
+    fn win_binpath_quotes_exe_and_flags_service() {
+        assert_eq!(
+            win_binpath(
+                Path::new("C:\\ProgramData\\AllMyStuff\\bin\\allmystuff-serve.exe"),
+                None
+            ),
+            "\"C:\\ProgramData\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service"
+        );
+    }
+
+    #[test]
+    fn win_binpath_appends_log_filter() {
+        assert_eq!(
+            win_binpath(
+                Path::new("C:\\PD\\AllMyStuff\\bin\\allmystuff-serve.exe"),
+                Some("info,allmystuff_node=debug")
+            ),
+            "\"C:\\PD\\AllMyStuff\\bin\\allmystuff-serve.exe\" --service \
+             --log info,allmystuff_node=debug"
+        );
+    }
+
+    #[test]
+    fn sc_create_argv_has_spaced_keys_and_autostart() {
+        let argv = sc_create("\"C:\\x\\allmystuff-serve.exe\" --service");
+        assert_eq!(
+            argv,
+            vec![
+                "sc",
+                "create",
+                "AllMyStuff",
+                "binPath=",
+                "\"C:\\x\\allmystuff-serve.exe\" --service",
+                "start=",
+                "auto",
+                "DisplayName=",
+                "AllMyStuff Mesh Node",
+            ]
+        );
+    }
+
+    #[test]
+    fn sc_lifecycle_argv() {
+        assert_eq!(sc_start(), vec!["sc", "start", "AllMyStuff"]);
+        assert_eq!(sc_stop(), vec!["sc", "stop", "AllMyStuff"]);
+        assert_eq!(sc_delete(), vec!["sc", "delete", "AllMyStuff"]);
+        assert_eq!(sc_query(), vec!["sc", "query", "AllMyStuff"]);
+        assert_eq!(sc_qc(), vec!["sc", "qc", "AllMyStuff"]);
+    }
+
+    // ---- windows: sc output parsers ----
+
+    #[test]
+    fn parse_sc_state_reads_running_word() {
+        let out = "SERVICE_NAME: AllMyStuff\n        \
+                   TYPE               : 10  WIN32_OWN_PROCESS\n        \
+                   STATE              : 4  RUNNING\n        \
+                   WIN32_EXIT_CODE    : 0  (0x0)\n";
+        assert_eq!(parse_sc_state(out).as_deref(), Some("RUNNING"));
+        assert!(sc_running(out));
+    }
+
+    #[test]
+    fn parse_sc_state_reads_stopped_and_pending() {
+        let stopped = "        STATE              : 1  STOPPED\n";
+        assert_eq!(parse_sc_state(stopped).as_deref(), Some("STOPPED"));
+        assert!(!sc_running(stopped));
+
+        let pending = "        STATE              : 3  STOP_PENDING\n";
+        assert_eq!(parse_sc_state(pending).as_deref(), Some("STOP_PENDING"));
+    }
+
+    #[test]
+    fn parse_sc_start_type_reads_autostart() {
+        let qc = "[SC] QueryServiceConfig SUCCESS\n\nSERVICE_NAME: AllMyStuff\n        \
+                  TYPE               : 10  WIN32_OWN_PROCESS\n        \
+                  START_TYPE         : 2   AUTO_START\n        \
+                  ERROR_CONTROL      : 1   NORMAL\n";
+        assert_eq!(parse_sc_start_type(qc).as_deref(), Some("AUTO_START"));
+        assert!(sc_autostart(qc));
+
+        let demand = "        START_TYPE         : 3   DEMAND_START\n";
+        assert!(!sc_autostart(demand));
+    }
+
+    // ---- status word truthiness (drives the GUI's JSON) ----
+
+    #[test]
+    fn status_word_truthiness() {
+        assert!(active_is_running("active")); // systemd
+        assert!(active_is_running("running")); // launchd
+        assert!(!active_is_running("inactive"));
+        assert!(!active_is_running("stopped"));
+
+        assert!(enabled_is_on("enabled")); // systemd
+        assert!(enabled_is_on("loaded")); // launchd
+        assert!(enabled_is_on("static"));
+        assert!(!enabled_is_on("disabled"));
+        assert!(!enabled_is_on("not loaded"));
     }
 }

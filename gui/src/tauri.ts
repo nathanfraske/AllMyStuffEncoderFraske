@@ -1041,6 +1041,82 @@ export function updateLatestVersion(): Promise<string | null> {
   return tryInvoke<string>("update_latest_version");
 }
 
+// ---- "Always On": background service + window behaviour ----------------
+//
+// The service half drives the OS background service (systemd / launchd /
+// Windows SCM) through the `allmystuff` CLI; the window half persists whether
+// closing / minimizing keeps AllMyStuff alive in the tray. Both degrade to
+// null in web mode so the settings tab can render a "desktop only" note.
+
+/** Status of the OS background ("Always On") service. `supported` is false on
+ *  a platform we don't manage; otherwise `installed`/`running`/`enabled`
+ *  drive the buttons (`enabled`/`running` are null when not installed). */
+export interface ServiceStatus {
+  platform: string;
+  supported: boolean;
+  manager?: string;
+  scope?: string;
+  installed?: boolean;
+  running?: boolean | null;
+  enabled?: boolean | null;
+  needs_privilege?: boolean;
+}
+
+/** Result of a service mutation (install/start/stop/restart/uninstall). */
+export interface ServiceActionResult {
+  ok: boolean;
+  output: string;
+}
+
+/** Read the background service's status. Null in web mode. Needs no privilege
+ *  on any platform (a plain status query), so it never prompts. */
+export function serviceStatus(): Promise<ServiceStatus | null> {
+  return tryInvoke<ServiceStatus>("service_status");
+}
+
+/** Run a service mutation. Unlike the graceful-degradation helpers, these use
+ *  a raw invoke so a backend failure (a missing CLI, a declined UAC prompt, an
+ *  `sc`/systemctl error) *throws* with its message instead of being swallowed
+ *  to null — the caller surfaces it. No-op stub in web mode. */
+async function serviceAction(cmd: string): Promise<ServiceActionResult> {
+  if (!isTauri()) return { ok: false, output: "The background service needs the desktop app" };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke(cmd)) as ServiceActionResult;
+}
+
+export function serviceInstall(): Promise<ServiceActionResult> {
+  return serviceAction("service_install");
+}
+export function serviceStart(): Promise<ServiceActionResult> {
+  return serviceAction("service_start");
+}
+export function serviceStop(): Promise<ServiceActionResult> {
+  return serviceAction("service_stop");
+}
+export function serviceRestart(): Promise<ServiceActionResult> {
+  return serviceAction("service_restart");
+}
+export function serviceUninstall(): Promise<ServiceActionResult> {
+  return serviceAction("service_uninstall");
+}
+
+/** Whether closing / minimizing the window keeps AllMyStuff in the tray. */
+export interface WindowBehavior {
+  close_to_tray: boolean;
+  minimize_to_tray: boolean;
+}
+
+export function windowBehaviorGet(): Promise<WindowBehavior | null> {
+  return tryInvoke<WindowBehavior>("window_behavior_get");
+}
+
+export function windowBehaviorSet(b: WindowBehavior): Promise<WindowBehavior | null> {
+  return tryInvoke<WindowBehavior>("window_behavior_set", {
+    closeToTray: b.close_to_tray,
+    minimizeToTray: b.minimize_to_tray,
+  });
+}
+
 /** Subscribe to live session snapshots. Returns an unlisten fn (or a no-op
  *  in web mode). */
 export async function onSession(cb: (snap: SessionSnapshot) => void): Promise<() => void> {

@@ -226,7 +226,8 @@ It's self-contained: AllMyStuff rides on a `myownmesh serve` daemon, and
 process brings up both.
 
 To keep it running across logout and reboot, install it as an OS service
-(systemd on Linux, launchd on macOS), mirroring `myownmesh service`:
+(systemd on Linux, launchd on macOS, the **Service Control Manager** on
+Windows), mirroring `myownmesh service`:
 
 ```sh
 allmystuff service install            # install + start; runs at login
@@ -236,8 +237,19 @@ allmystuff service stop | restart | uninstall
 ```
 
 Because the node supervises the daemon, **one service runs both** — there's
-no second unit to install. (Windows has no service backend yet; register
-`allmystuff serve` as a Task Scheduler task instead.)
+no second unit to install. On Windows the service runs the node in SCM mode
+(`allmystuff-serve --service`) as a LocalSystem service that starts at boot;
+installing or controlling it needs an **elevated (Administrator)** prompt —
+the desktop app's **Settings → Always On** does the elevation for you. And
+because a service box may run for months without a restart, the headless node
+**self-updates unattended**: it applies a permitted release and relaunches
+straight onto it (re-exec under systemd/launchd; an SCM restart under Windows),
+keeping every half — CLI, GUI and node — current on its own.
+
+The desktop app exposes all of this under **Settings → Always On**: a one-click
+**Install as a service** (with the service's start/stop/restart/uninstall once
+it's in), plus the **close-to-tray / minimize-to-tray** toggles that keep the
+window a click away in the notification area (the menu bar on macOS).
 
 ## What a scan sees
 

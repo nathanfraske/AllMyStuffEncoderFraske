@@ -19,8 +19,23 @@
 //! allmystuff serve                       # run this machine on the mesh, headless
 //! ALLMYSTUFF_CLAIMABLE=1 allmystuff serve # …and let one of your machines adopt it
 //! ALLMYSTUFF_LOG=debug allmystuff serve   # …with verbose logs
+//! allmystuff serve --log debug            # …same, as a flag
 //! ```
+//!
+//! **Windows service mode.** `allmystuff service install` registers this binary
+//! with the Service Control Manager as `<exe> --service`. That flag flips it
+//! into [`winsvc`] mode: it answers the SCM's control protocol (a plain console
+//! binary would be killed for not doing so) and logs to a file (no console to
+//! print to). systemd and launchd need no such mode — they run the binary as
+//! an ordinary foreground process and signal it with SIGTERM.
+//!
+//! **Unattended self-update.** Headless and as a service the node is meant to
+//! be "always on, always current": its background updater doesn't just stage a
+//! release for the next launch (a service box might not restart for months) —
+//! it applies the update and relaunches onto it, on all three OSes. See
+//! [`allmystuff_updater::tick_forever_unattended`].
 
+use std::future::Future;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -77,20 +92,65 @@ fn reexec_self() -> ! {
     std::process::exit(0);
 }
 
+/// Relaunch hook for the **Windows service** path. A service can't re-exec
+/// itself the way a console process can — the SCM only tracks the original
+/// process, so a spawned child would orphan and the SCM would think the
+/// service died. Instead we exit non-zero: with the install's configured
+/// restart-on-failure action, the SCM brings the service straight back up,
+/// running the freshly-applied binary at the same ImagePath. The supervised
+/// daemon dies with us (its kill-on-close job object) and the new process
+/// respawns it.
+#[cfg(windows)]
+fn service_relaunch() -> ! {
+    tracing::info!(
+        "self-update applied; exiting so the Service Control Manager restarts the updated node"
+    );
+    std::process::exit(1);
+}
+
+/// Pick the relaunch the background updater uses when it applies a release.
+fn pick_relaunch(as_service: bool) -> fn() -> ! {
+    #[cfg(windows)]
+    {
+        if as_service {
+            return service_relaunch;
+        }
+    }
+    let _ = as_service; // unix services re-exec (execve keeps the PID)
+    reexec_self
+}
+
 fn main() -> ExitCode {
+    // Windows registers this binary as `<exe> --service`; that flag is what
+    // tells us to speak the SCM control protocol instead of running in the
+    // foreground. Off Windows there's no such mode.
+    #[cfg(windows)]
+    let as_service = std::env::args().skip(1).any(|a| a == "--service");
+    #[cfg(not(windows))]
+    let as_service = false;
+
     // Apply any update staged on a previous run before binding anything —
     // same "stage now, apply on next launch" model as the GUI and the daemon.
     allmystuff_updater::apply_pending_if_any();
 
-    // Default log filter: our crates at info, the rest quiet. Override with
-    // `ALLMYSTUFF_LOG` (e.g. `debug`, or `info,allmystuff_node=debug`).
-    let log_level = std::env::var("ALLMYSTUFF_LOG")
-        .unwrap_or_else(|_| "info,allmystuff_node=info,allmystuff_serve=info".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
-        .with_target(false)
-        .init();
+    init_logging(as_service);
 
+    // As a Windows service, hand off to the SCM dispatcher: it runs the node on
+    // its own thread (see `winsvc::run_service`) and blocks until stopped.
+    #[cfg(windows)]
+    if as_service {
+        return winsvc::dispatch();
+    }
+
+    // Foreground (a console, or a systemd/launchd-supervised process): run
+    // until a stop signal arrives.
+    run_blocking(as_service, wait_for_shutdown_signal())
+}
+
+/// Build the async runtime and run the node to completion, stopping when
+/// `shutdown` resolves. Shared by the foreground path (a signal future) and
+/// the Windows service path (an SCM-stop future).
+fn run_blocking<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -101,11 +161,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    runtime.block_on(run())
+    runtime.block_on(run(as_service, shutdown))
 }
 
-async fn run() -> ExitCode {
+async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "allmystuff node starting"
@@ -140,10 +199,14 @@ async fn run() -> ExitCode {
     mesh.clone().start().await;
 
     // Self-update ticker: a headless node checks the release feed on its own
-    // and stages whatever its policy permits for the next launch — the same
-    // "set and forget" the desktop app gets. No-ops when auto-update is off or
-    // this is a package-managed install.
-    tokio::spawn(allmystuff_updater::tick_forever());
+    // and, unlike the desktop app's "stage + offer relaunch", *applies* what
+    // its policy permits and relaunches onto it — so an always-on box that
+    // never gets manually restarted still keeps every half (CLI/GUI/node)
+    // current. No-ops when auto-update is off or this is a package-managed
+    // install. Under a Windows service the relaunch hands back to the SCM.
+    tokio::spawn(allmystuff_updater::tick_forever_unattended(pick_relaunch(
+        as_service,
+    )));
 
     match mesh.resolve_local_id().await {
         Some(id) => tracing::info!(device_id = %id, "serving this machine on the mesh"),
@@ -161,7 +224,7 @@ async fn run() -> ExitCode {
 
     // Run until asked to stop. Holding `mesh` and `_daemon` in scope keeps the
     // pump alive and the supervised daemon running for the node's whole life.
-    wait_for_shutdown_signal().await;
+    shutdown.await;
     tracing::info!("shutdown requested — stopping");
 
     // `_daemon` drops here, killing the daemon we spawned (if any).
@@ -196,5 +259,174 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+/// Initialise tracing. A console build logs to stderr; a Windows service has no
+/// console, so it logs to a file under `%ProgramData%\AllMyStuff\logs\`.
+fn init_logging(as_service: bool) {
+    let filter = tracing_subscriber::EnvFilter::new(resolve_log_filter());
+
+    #[cfg(windows)]
+    if as_service {
+        if let Some(make) = winsvc::log_writer() {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(make)
+                .init();
+            return;
+        }
+    }
+
+    #[cfg(not(windows))]
+    let _ = as_service;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
+/// The log filter: `--log <filter>` wins, then `ALLMYSTUFF_LOG`, then a quiet
+/// default (our crates at info, everything else off).
+fn resolve_log_filter() -> String {
+    if let Some(f) = arg_value("--log") {
+        return f;
+    }
+    std::env::var("ALLMYSTUFF_LOG")
+        .unwrap_or_else(|_| "info,allmystuff_node=info,allmystuff_serve=info".to_string())
+}
+
+/// The value following `flag` in this process's argv, if present.
+fn arg_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with('-'))
+        .cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Windows Service Control Manager glue
+// ---------------------------------------------------------------------------
+
+/// Speaks the SCM control protocol so `allmystuff-serve --service` runs as a
+/// real Windows service. `allmystuff service install` registers the binary
+/// with `sc.exe`; the SCM then launches it, and [`dispatch`] connects it to
+/// the service control dispatcher. The node itself is unchanged — it just runs
+/// under an SCM-stop future instead of a signal one.
+#[cfg(windows)]
+mod winsvc {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::time::Duration;
+
+    use windows_service::define_windows_service;
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::service_dispatcher;
+
+    /// Must match the SCM service name `allmystuff service install` creates
+    /// (`WINDOWS_SERVICE_NAME` in the CLI's `service.rs`); the control handler
+    /// can't bind otherwise.
+    const SERVICE_NAME: &str = "AllMyStuff";
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    /// Hand this process to the SCM. The dispatcher runs the service on its own
+    /// thread (calling [`service_main`]) and blocks until the service stops.
+    pub fn dispatch() -> ExitCode {
+        match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("service dispatcher failed to start: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    fn service_main(_args: Vec<OsString>) {
+        if let Err(e) = run_service() {
+            tracing::error!("windows service stopped with error: {e}");
+        }
+    }
+
+    fn run_service() -> windows_service::Result<()> {
+        // The SCM control handler runs on its own thread. Bridge a Stop into
+        // the node's async shutdown with a tokio channel: an unbounded sender
+        // can fire from sync code with no runtime in scope, so the handler is
+        // free to call it directly.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let handler = move |control| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    let _ = tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
+
+        // Report running straight away (the node starts asynchronously), then
+        // run it until the SCM asks us to stop.
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        // `as_service = true`: the self-updater relaunches by exiting for the
+        // SCM to restart, not by re-execing.
+        super::run_blocking(true, async move {
+            let _ = rx.recv().await;
+        });
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+        Ok(())
+    }
+
+    /// A `MakeWriter` over `%ProgramData%\AllMyStuff\logs\service.log` (append),
+    /// so a service with no console still leaves a log. `None` if the file
+    /// can't be opened, in which case logging falls back to stderr.
+    pub fn log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static> {
+        let dir = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
+            .join("AllMyStuff")
+            .join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("service.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(move || file.try_clone().expect("clone service log file handle"))
     }
 }
