@@ -458,19 +458,22 @@ impl DropWarns {
 /// as a `SPA_TYPE_OBJECT_ParamBuffers` pod for
 /// [`pipewire::stream::Stream::update_params`].
 ///
-/// `dataType` is pinned to **mappable** memory (MemFd/MemPtr) with no DMA-BUF:
-/// Mutter prefers DMA-BUF, which the consumer can't allocate or read without a
-/// GPU context, so without this the buffer negotiation finds no common type
-/// and the server never allocates (the negotiate-then-frameless stall). Pinning
-/// to SHM forces the compositor onto its CPU-readable path. `size`/`stride` are
-/// the geometry hints; the real per-frame stride is still read from the chunk.
+/// `dataType` accepts every memory type — MemFd/MemPtr **and** DMA-BUF.
+/// GNOME 50's Mutter is DMA-BUF-first for screencast: a mappable-only request
+/// it can't satisfy dead-ends the buffer negotiation and it allocates nothing
+/// (the negotiate-then-frameless stall we traced). Accept its native buffers
+/// so allocation completes; `MAP_BUFFERS` maps what it can and `add_buffer`
+/// reports what we actually got. `size`/`stride` are geometry hints; the real
+/// per-frame stride is still read from the buffer chunk.
 fn shm_buffers_pod(width: u32, height: u32, bpp: u32) -> Result<Vec<u8>, String> {
     use pipewire::spa::sys;
     use pipewire::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
     let stride = (width * bpp) as i32;
     let size = stride * height as i32;
-    let shm = (1i32 << sys::SPA_DATA_MemFd) | (1i32 << sys::SPA_DATA_MemPtr);
+    let shm = (1i32 << sys::SPA_DATA_MemFd)
+        | (1i32 << sys::SPA_DATA_MemPtr)
+        | (1i32 << sys::SPA_DATA_DmaBuf);
     let obj = pod::Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
