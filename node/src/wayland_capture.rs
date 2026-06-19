@@ -534,30 +534,47 @@ fn pipewire_consume(
         .connect_fd_rc(pw_fd, None)
         .map_err(|e| e.to_string())?;
 
-    // The portal's node propagates onto this fresh connection asynchronously.
-    // Binding the stream before the remote's initial registry has landed races
-    // the node into existence — the connect intermittently dies with "no
-    // target node available" (whoever wins the race decides). A sync roundtrip
-    // first drains that initial registry, so the node is reliably present
-    // before we touch the stream.
+    // The portal's node propagates onto this fresh connection asynchronously,
+    // at a variable time. Binding the stream before it lands races it and
+    // dies "no target node available" (or the negotiation stalls). A single
+    // sync roundtrip isn't enough — the node can register a beat late. So
+    // watch the registry and wait for *this* node id to actually appear before
+    // touching the stream, re-syncing a bounded number of times. If it never
+    // shows, bind anyway rather than hang.
     {
-        let synced = Rc::new(Cell::new(false));
-        let pending = core.sync(0).map_err(|e| e.to_string())?;
-        let _sync = core
+        let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
+        let found = Rc::new(Cell::new(false));
+        let _reg = registry
             .add_listener_local()
-            .done({
-                let synced = synced.clone();
+            .global({
+                let found = found.clone();
                 let main_loop = main_loop.clone();
-                move |id, seq| {
-                    if id == pipewire::core::PW_ID_CORE && seq == pending {
-                        synced.set(true);
+                move |g| {
+                    if g.id == node_id {
+                        found.set(true);
                         main_loop.quit();
                     }
                 }
             })
             .register();
-        while !synced.get() {
+        let _core = core
+            .add_listener_local()
+            .done({
+                let main_loop = main_loop.clone();
+                move |_, _| main_loop.quit()
+            })
+            .register();
+        for _ in 0..40 {
+            if found.get() {
+                break;
+            }
+            let _ = core.sync(0);
             main_loop.run();
+        }
+        if !found.get() {
+            tracing::warn!(
+                "wayland screencast node {node_id} never appeared in the registry; binding anyway"
+            );
         }
     }
 
