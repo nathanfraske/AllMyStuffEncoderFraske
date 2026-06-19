@@ -99,6 +99,15 @@ pub fn has_restore_token(monitor_id: Option<u32>) -> bool {
     load_token(&monitor_key(monitor_id)).is_some()
 }
 
+/// Drop the stored restore token for this monitor key, so the next
+/// [`open`] re-prompts for fresh consent instead of replaying the saved
+/// grant. Called when a restored session opened but never delivered a
+/// frame: the token is pointing at an output the compositor no longer
+/// paints, and replaying it would only strand the route again.
+pub fn forget_token(monitor_id: Option<u32>) {
+    save_token(&monitor_key(monitor_id), None);
+}
+
 /// Open a portal ScreenCast session (restoring a prior grant when a
 /// token is stored) and start pulling frames from its PipeWire node.
 pub fn open(monitor_id: Option<u32>) -> Result<(WaylandSession, Receiver<RawFrame>), String> {

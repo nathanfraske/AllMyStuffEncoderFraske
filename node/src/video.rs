@@ -779,7 +779,8 @@ fn run_capture(
     // forever with "display asleep" as a wrong diagnosis.
     #[cfg(target_os = "linux")]
     if wayland_session() {
-        if !crate::wayland_capture::has_restore_token(monitor_id) {
+        let had_token = crate::wayland_capture::has_restore_token(monitor_id);
+        if !had_token {
             reporter.report(VideoStatusState::WaitingConsent, None);
         }
         match crate::wayland_capture::open(monitor_id) {
@@ -798,27 +799,43 @@ fn run_capture(
                     Some(WAYLAND_FIRST_FRAME_DEADLINE),
                 );
                 drop(session);
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
                 match result {
                     Ok(()) => return Ok(()),
                     Err(e) => {
-                        if stop.load(Ordering::SeqCst) {
-                            return Ok(());
+                        // A frameless restored session means the saved token
+                        // points at an output the compositor no longer paints:
+                        // forget it so the next connect re-prompts for fresh
+                        // consent (the real recovery) instead of replaying a
+                        // dead grant into another frameless wait.
+                        if had_token && e.contains("no frame") {
+                            crate::wayland_capture::forget_token(monitor_id);
+                            tracing::warn!(
+                                "wayland screencast for {route_id} delivered no frames; \
+                                 dropped its restore token — reconnect to re-consent"
+                            );
+                        } else {
+                            tracing::warn!("wayland screencast for {route_id} ended: {e}");
                         }
-                        tracing::warn!(
-                            "wayland screencast for {route_id} ended ({e}); \
-                             falling back to per-frame screenshots"
-                        );
+                        reporter.report(VideoStatusState::GrabFailed, Some(e));
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "wayland screencast for {route_id} unavailable ({e}); \
-                     falling back to per-frame screenshots"
-                );
+                tracing::warn!("wayland screencast for {route_id} unavailable: {e}");
                 reporter.report(VideoStatusState::GrabFailed, Some(e));
             }
         }
+        // On Wayland the per-frame Screenshot fallback is *not* an acceptable
+        // degrade: xcap's grab there routes through the xdg-desktop-portal
+        // Screenshot API, and most compositors (GNOME especially) play their
+        // screenshot-flash animation on every single grab — the whole panel
+        // strobes white at the capture rate, useless and alarming. The
+        // ScreenCast portal is the only sane capture path on Wayland, so when
+        // it can't run we surface that and stop rather than flash the screen.
+        return Ok(());
     }
 
     // macOS: xcap's AVFoundation session. Two attempts, each with a
