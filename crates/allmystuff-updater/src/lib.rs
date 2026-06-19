@@ -37,6 +37,7 @@
 pub mod policy;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -713,6 +714,38 @@ fn wanted_artifacts(current: &str, latest: &str) -> Vec<ArtifactKind> {
             _ => artifact_needs_update(kind, latest),
         })
         .collect()
+}
+
+/// Background auto-update ticker — the half of self-update that makes it
+/// "set and forget". Runs forever: a first check fires shortly after the
+/// process starts, then again every `check_interval_hours` (re-read each
+/// loop so a settings change takes effect without a restart). Each tick is a
+/// non-forced [`check_now`], internally gated on the enabled flag, the
+/// package-manager guard, the apply policy, and the interval cooldown — so
+/// spawning it in a disabled or package-managed install simply no-ops.
+/// Whatever it stages applies on the next launch (see [`apply_pending_if_any`]).
+///
+/// Every long-lived process that links the updater spawns this: the desktop
+/// app's Tauri shell and the headless `allmystuff-serve` node. Without it the
+/// release feed is only ever hit by the on-demand `check_now(true)` behind the
+/// UI's "Check now" / `allmystuff update check` — i.e. auto-update never fires
+/// on its own. The short-lived CLI subcommands don't spawn it: they act once
+/// and exit.
+pub async fn tick_forever() {
+    // Let a freshly launched app/node settle (bind sockets, bring the session
+    // online) before the first network hit.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    loop {
+        match check_now(false).await {
+            Ok(CheckOutcome::Staged { version }) => {
+                tracing::info!("self-update staged {version}; applies on next launch");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("self-update check failed: {e}"),
+        }
+        let hours = load_auto_update().check_interval_hours.max(1);
+        tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+    }
 }
 
 /// User-driven "update everything now" — the surface behind a bare

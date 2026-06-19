@@ -98,16 +98,31 @@
         </label>
       </section>
 
-      <!-- Staged update -->
-      {#if s.staged_version}
+      <!-- Staged / applied update -->
+      {#if app.updateApplied}
+        <section class="block staged">
+          <div>
+            <div class="ver"><b>{app.updateApplied}</b> is ready</div>
+            <div class="hint">Relaunch AllMyStuff to start running the new version.</div>
+          </div>
+          <button class="btn small primary" disabled={app.updateBusy} onclick={() => app.relaunchUpdate()}>
+            {app.updateBusy ? "Relaunching…" : "Relaunch now"}
+          </button>
+        </section>
+      {:else if s.staged_version}
         <section class="block staged">
           <div>
             <div class="ver"><b>{s.staged_version}</b> is downloaded</div>
-            <div class="hint">It applies automatically on the next launch — or apply it now.</div>
+            <div class="hint">Relaunch to update now, or it applies on its own next launch.</div>
           </div>
-          <button class="btn small primary" disabled={app.updateBusy} onclick={() => app.applyUpdate()}>
-            Apply now
-          </button>
+          <div class="staged-actions">
+            <button class="btn small" disabled={app.updateBusy} onclick={() => app.applyUpdate()}>
+              Apply only
+            </button>
+            <button class="btn small primary" disabled={app.updateBusy} onclick={() => app.relaunchUpdate()}>
+              {app.updateBusy ? "Relaunching…" : "Relaunch & update"}
+            </button>
+          </div>
         </section>
       {/if}
 
@@ -223,6 +238,11 @@
     border-top: none;
     padding: 0.7rem 0.8rem;
     margin-top: 0.3rem;
+  }
+  .staged-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
   .info {
     display: flex;
