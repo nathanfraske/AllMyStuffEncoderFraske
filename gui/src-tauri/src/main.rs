@@ -2,13 +2,15 @@
 //!
 //! The window is a Svelte app; this Rust side:
 //!
-//!  1. **Scans the machine** (`scan_self`) so "this device" on the graph is
-//!     real hardware.
-//!  2. **Runs the live mesh** ([`mesh::Mesh`]) — a client of a `myownmesh
-//!     serve` daemon over the control socket. Presence makes peers appear;
-//!     the route handshake + `cpal` audio bridge make a connection actually
-//!     stream. The front-end drives it via `connect_route` /
-//!     `disconnect_route` and reads `allmystuff://session` snapshots.
+//!  1. **Brings up the per-machine node** ([`ensure_node_running`]) — one
+//!     `allmystuff-serve` node per machine, reused if the Always-On service
+//!     already runs one, else spawned and tied to this app's lifetime. The node
+//!     owns the live [`Mesh`](allmystuff_node::mesh::Mesh) and supervises the
+//!     `myownmesh` daemon; the GUI no longer runs either in-process.
+//!  2. **Drives that node over its control socket**
+//!     ([`NodeClient`]) — every node-backed Tauri command is one short request,
+//!     and the node's event stream is re-emitted onto Tauri's bus so the
+//!     front-end sees exactly what it used to when the engine ran in-process.
 //!  3. **Self-updates** via `allmystuff-updater` (its own release feed —
 //!     not the daemon's).
 
@@ -19,13 +21,11 @@
 
 use std::sync::Arc;
 
-// The node engine used to be these modules right here; it now lives in the
-// `allmystuff-node` crate so `allmystuff serve` can run it headless. This
-// shell links the same code and supplies a Tauri-backed `UiSink`.
+// The node engine lives in the `allmystuff-node` crate; this shell is a thin
+// client of the per-machine node's control socket (see
+// `allmystuff_node::node_control`), driving it rather than linking it in.
 use allmystuff_graph::{Grant, Person};
-use allmystuff_node::control_client::{ControlClient, Request, Response};
-use allmystuff_node::mesh::Mesh;
-use allmystuff_node::{daemon_spawn, networks_store, video, UiSink};
+use allmystuff_node::node_control::{ensure_node_running, NodeChild, NodeClient, NodeEvent};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, RunEvent, State};
@@ -33,47 +33,12 @@ use tauri_plugin_autostart::ManagerExt;
 
 mod window_behavior;
 
-/// The GUI's [`UiSink`]: forwards engine events onto Tauri's event bus so the
-/// Svelte front-end can react, and restarts the webview app when a fleet
-/// "upgrade this machine" lands a new build. (The `allmystuff-serve` binary
-/// swaps in a logging sink instead — same engine, no webview.)
-struct TauriSink {
-    app: tauri::AppHandle,
-}
-
-impl UiSink for TauriSink {
-    fn emit(&self, event: &str, payload: Value) {
-        let _ = self.app.emit(event, payload);
-    }
-
-    fn restart(&self) -> ! {
-        self.app.restart()
-    }
-}
-
 struct AppState {
-    client: Arc<ControlClient>,
-    daemon_child: Mutex<Option<daemon_spawn::DaemonChild>>,
-    /// Full configs of networks the user switched off — parked here so
-    /// re-enabling re-joins with everything (servers, label, roster path)
-    /// intact. See `network_set_enabled`.
-    disabled_networks: networks_store::DisabledNetworks,
-    /// This machine's single-node lock, held for as long as the app runs.
-    /// One node per machine: while the desktop app is up it *is* the node, so
-    /// the Always-On service must not also run one (two nodes advertise the
-    /// same identity and fight, and then nothing connects). Released on exit so
-    /// the service can take back over.
-    node_lock: Mutex<Option<allmystuff_node::instance::NodeInstanceLock>>,
-    /// Set when we stopped a running Always-On service to take the machine, so
-    /// we restart it on exit and headless always-on resumes.
-    resume_service_on_exit: std::sync::atomic::AtomicBool,
-}
-
-fn unwrap_response(resp: Response) -> Result<Value, String> {
-    if !resp.ok {
-        return Err(resp.error.unwrap_or_else(|| "(no error message)".into()));
-    }
-    Ok(resp.data.unwrap_or(Value::Null))
+    node: Arc<NodeClient>,
+    /// The node we spawned, if Always-On wasn't already running one. Held so
+    /// it's killed when the app exits (Always-On off => node lives only with
+    /// the app); a reused service node has no child here and keeps running.
+    node_child: Mutex<Option<NodeChild>>,
 }
 
 // ---- this machine -----------------------------------------------------
@@ -83,25 +48,12 @@ fn unwrap_response(resp: Response) -> Result<Value, String> {
 /// peers see), else `"this"` for the offline/demo graph; `label` is the
 /// hostname shown on the local node.
 #[tauri::command]
-async fn scan_self(mesh: State<'_, Arc<Mesh>>) -> Result<Value, String> {
-    let me = mesh
-        .resolve_local_id()
+async fn scan_self(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("scan_self", json!({}))
         .await
-        .unwrap_or_else(|| "this".to_string());
-    let node = allmystuff_graph::NodeId::from(me.as_str());
-    let inv = allmystuff_inventory::scan();
-    serde_json::to_value(json!({
-        "node_id": me,
-        "label": inv.host.hostname,
-        "hostname": inv.host.hostname,
-        "summary": allmystuff_bridge::node_summary(&inv),
-        "capabilities": allmystuff_bridge::capabilities_with_screens(
-            &inv,
-            &node,
-            &video::extra_screens(),
-        ),
-    }))
-    .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -117,21 +69,32 @@ fn scan_full() -> Result<Value, String> {
 /// `None` (and every non-terminal route) mints a fresh one.
 #[tauri::command]
 async fn connect_route(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     from: String,
     to: String,
     media: String,
     video: Option<Vec<String>>,
     session: Option<String>,
 ) -> Result<String, String> {
-    mesh.inner()
-        .connect_term(from, to, media, video.unwrap_or_default(), session)
+    let v = state
+        .node
+        .request(
+            "connect_route",
+            json!({ "from": from, "to": to, "media": media, "video": video, "session": session }),
+        )
         .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn disconnect_route(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
-    mesh.inner().disconnect(route_id).await
+async fn disconnect_route(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+    state
+        .node
+        .request("disconnect_route", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Mirror one frontend diagnostic line into the GUI's `tracing` log. The
@@ -149,23 +112,38 @@ fn client_log(line: String) {
 /// Claim a device as one of yours. Only takes if the target is in claim
 /// mode; the target's next presence advert (owner = us) confirms it.
 #[tauri::command]
-async fn claim_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
-    mesh.inner().claim(node).await
+async fn claim_node(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("claim_node", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Ask one of your fleet machines to update its AllMyStuff to the channel's
 /// latest release and restart. The target enforces owner/fleet before acting;
 /// its next presence advert (the new version) confirms it landed.
 #[tauri::command]
-async fn upgrade_node(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
-    mesh.inner().request_upgrade(node).await
+async fn upgrade_node(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("upgrade_node", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Put this device into / out of claim mode so another of your machines can
 /// adopt it. Returns whether it's now claimable.
 #[tauri::command]
-async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bool, String> {
-    mesh.inner().set_claimable(claimable).await
+async fn set_claimable(state: State<'_, AppState>, claimable: bool) -> Result<bool, String> {
+    let v = state
+        .node
+        .request("set_claimable", json!({ "claimable": claimable }))
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Persist an outbound grant to a person — what they may do with my stuff —
@@ -174,43 +152,70 @@ async fn set_claimable(mesh: State<'_, Arc<Mesh>>, claimable: bool) -> Result<bo
 /// next snapshot reflects it.
 #[tauri::command]
 async fn share_grant(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     person: Person,
     node: String,
     grant: Grant,
 ) -> Result<(), String> {
-    mesh.inner().share_grant(person, node.into(), grant).await
+    state
+        .node
+        .request(
+            "share_grant",
+            json!({ "person": person, "node": node, "grant": grant }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Revoke a grant by its (content-derived) id from a person's durable share,
 /// and tell their devices to drop it too.
 #[tauri::command]
 async fn share_revoke(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     person: String,
     grant_id: String,
 ) -> Result<(), String> {
-    mesh.inner().share_revoke(person.into(), grant_id).await
+    state
+        .node
+        .request(
+            "share_revoke",
+            json!({ "person": person, "grant_id": grant_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Stop sharing with a person entirely — drop the whole durable record and
 /// revoke each grant on their devices.
 #[tauri::command]
-async fn share_stop(mesh: State<'_, Arc<Mesh>>, person: String) -> Result<(), String> {
-    mesh.inner().share_stop(person.into()).await
+async fn share_stop(state: State<'_, AppState>, person: String) -> Result<(), String> {
+    state
+        .node
+        .request("share_stop", json!({ "person": person }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Forward one keyboard/mouse event down an active outbound input route —
 /// the console window's control stream.
 #[tauri::command]
 async fn send_input(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     route_id: String,
     action: serde_json::Value,
 ) -> Result<(), String> {
-    let action: allmystuff_session::InputAction =
-        serde_json::from_value(action).map_err(|e| e.to_string())?;
-    mesh.inner().send_input(route_id, action).await
+    state
+        .node
+        .request(
+            "send_input",
+            json!({ "route_id": route_id, "action": action }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Read this machine's clipboard and push it down an active outbound
@@ -218,8 +223,13 @@ async fn send_input(
 /// The backend does the read (the only place that can see file references on
 /// the OS clipboard) and streams text, an image, or files.
 #[tauri::command]
-async fn clipboard_paste(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
-    mesh.inner().clipboard_paste(route_id).await
+async fn clipboard_paste(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+    state
+        .node
+        .request("clipboard_paste", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Register the calling window's interest in a route's inbound video.
@@ -231,15 +241,36 @@ async fn clipboard_paste(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result
 /// frames — for webviews without WebCodecs, and the bottom rung of the
 /// console's decode ladder.
 #[tauri::command]
-fn video_watch(mesh: State<'_, Arc<Mesh>>, route_id: String, decode: Option<bool>) -> u64 {
-    mesh.video_watch(route_id, decode.unwrap_or(false))
+async fn video_watch(app: tauri::AppHandle, route_id: String, decode: Option<bool>) -> u64 {
+    let state = app.state::<AppState>();
+    match state
+        .node
+        .request(
+            "video_watch",
+            json!({ "route_id": route_id, "decode": decode }),
+        )
+        .await
+    {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("video_watch failed: {e:#}");
+            0
+        }
+    }
 }
 
 /// Drain the queued packets for a route as one raw batch:
 /// `[u32 len][28-byte header + payload]…`, empty when nothing arrived.
 #[tauri::command]
-fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(mesh.video_poll(&route_id))
+async fn video_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
+    let state = app.state::<AppState>();
+    tauri::ipc::Response::new(
+        state
+            .node
+            .request_bytes("video_poll", json!({ "route_id": route_id }))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Stop streaming a route's frames to the front-end (console closed or
@@ -247,16 +278,31 @@ fn video_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Respo
 /// it, so a late unwatch can't tear down a newer watcher of the same
 /// route. Idempotent.
 #[tauri::command]
-fn video_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
-    mesh.video_unwatch(&route_id, token);
+async fn video_unwatch(app: tauri::AppHandle, route_id: String, token: u64) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state
+        .node
+        .request(
+            "video_unwatch",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await
+    {
+        tracing::warn!("video_unwatch failed: {e:#}");
+    }
 }
 
 /// Ask the sender of an inbound display route for a clean decode entry
 /// (IDR) now — the console's decoder hit an error. Rate-limited backend-
 /// side; safe to call from a decode-error handler.
 #[tauri::command]
-async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(), String> {
-    mesh.inner().request_refresh(route_id).await
+async fn video_refresh(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+    state
+        .node
+        .request("video_refresh", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Report the console's decode health for an inbound display route back to its
@@ -264,30 +310,47 @@ async fn video_refresh(mesh: State<'_, Arc<Mesh>>, route_id: String) -> Result<(
 /// periodically by the console; best-effort, an old streamer drops it.
 #[tauri::command]
 async fn video_feedback(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     route_id: String,
     recv_fps: u32,
     decode_fails: u32,
     queue_depth: u32,
 ) -> Result<(), String> {
-    mesh.inner()
-        .send_video_feedback(route_id, recv_fps, decode_fails, queue_depth)
+    state
+        .node
+        .request(
+            "video_feedback",
+            json!({
+                "route_id": route_id,
+                "recv_fps": recv_fps,
+                "decode_fails": decode_fails,
+                "queue_depth": queue_depth,
+            }),
+        )
         .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Ask the sender of an inbound display route to stream with these
 /// quality picks; absent values mean "automatic". The console's pills.
 #[tauri::command]
 async fn tune_route(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     route_id: String,
     max_edge: Option<u32>,
     bitrate: Option<u32>,
     fps: Option<u32>,
 ) -> Result<(), String> {
-    mesh.inner()
-        .request_tune(route_id, max_edge, bitrate, fps)
+    state
+        .node
+        .request(
+            "tune_route",
+            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps }),
+        )
         .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---- terminal (the mesh-native shell) ----------------------------------
@@ -296,13 +359,16 @@ async fn tune_route(
 /// terminal route (the viewer side of a mesh-native shell).
 #[tauri::command]
 async fn term_send(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     route_id: String,
     event: serde_json::Value,
 ) -> Result<(), String> {
-    let event: allmystuff_session::TermEvent =
-        serde_json::from_value(event).map_err(|e| e.to_string())?;
-    mesh.inner().term_send(route_id, event).await
+    state
+        .node
+        .request("term_send", json!({ "route_id": route_id, "event": event }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Register the calling terminal window's interest in a route's output.
@@ -310,22 +376,50 @@ async fn term_send(
 /// prompt is never lost); the window drains them with `term_poll` on each
 /// `allmystuff://term-ready` poke. Same pull-not-push shape as video.
 #[tauri::command]
-fn term_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
-    mesh.term_watch(&route_id)
+async fn term_watch(app: tauri::AppHandle, route_id: String) -> u64 {
+    let state = app.state::<AppState>();
+    match state
+        .node
+        .request("term_watch", json!({ "route_id": route_id }))
+        .await
+    {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("term_watch failed: {e:#}");
+            0
+        }
+    }
 }
 
 /// Drain the queued output for a terminal route as one raw batch:
 /// `[u32 le len][bytes]…`, empty when nothing arrived.
 #[tauri::command]
-fn term_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(mesh.term_poll(&route_id))
+async fn term_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
+    let state = app.state::<AppState>();
+    tauri::ipc::Response::new(
+        state
+            .node
+            .request_bytes("term_poll", json!({ "route_id": route_id }))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Release a terminal window's claim on a route's output (tab closed).
 /// Token-scoped and idempotent, like `video_unwatch`.
 #[tauri::command]
-fn term_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
-    mesh.term_unwatch(&route_id, token);
+async fn term_unwatch(app: tauri::AppHandle, route_id: String, token: u64) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state
+        .node
+        .request(
+            "term_unwatch",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await
+    {
+        tracing::warn!("term_unwatch failed: {e:#}");
+    }
 }
 
 /// Ask `node` for its open terminal sessions (the picker's "attach to an
@@ -335,10 +429,15 @@ fn term_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
 /// `allmystuff://terminal-sessions` event. Owner/fleet gated both ends.
 #[tauri::command]
 async fn terminal_sessions(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     node: String,
 ) -> Result<Option<Vec<allmystuff_protocol::TerminalSessionInfo>>, String> {
-    mesh.inner().request_terminal_sessions(node).await
+    let v = state
+        .node
+        .request("terminal_sessions", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Open (or focus) the dedicated terminal window for `node` — one OS
@@ -370,13 +469,16 @@ async fn open_terminal_window(app: tauri::AppHandle, node: String) -> Result<(),
 /// route (the viewer side of a mesh-native file session).
 #[tauri::command]
 async fn file_send(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     route_id: String,
     event: serde_json::Value,
 ) -> Result<(), String> {
-    let event: allmystuff_session::FileEvent =
-        serde_json::from_value(event).map_err(|e| e.to_string())?;
-    mesh.inner().file_send(route_id, event).await
+    state
+        .node
+        .request("file_send", json!({ "route_id": route_id, "event": event }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Register the calling files window's interest in a route's responses.
@@ -384,22 +486,50 @@ async fn file_send(
 /// them with `file_poll` on each `allmystuff://file-ready` poke. Same
 /// pull-not-push shape as the terminal and video planes.
 #[tauri::command]
-fn file_watch(mesh: State<'_, Arc<Mesh>>, route_id: String) -> u64 {
-    mesh.file_watch(&route_id)
+async fn file_watch(app: tauri::AppHandle, route_id: String) -> u64 {
+    let state = app.state::<AppState>();
+    match state
+        .node
+        .request("file_watch", json!({ "route_id": route_id }))
+        .await
+    {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("file_watch failed: {e:#}");
+            0
+        }
+    }
 }
 
 /// Drain the queued responses for a files route as one raw batch:
 /// `[u32 le len][frame json]…`, empty when nothing arrived.
 #[tauri::command]
-fn file_poll(mesh: State<'_, Arc<Mesh>>, route_id: String) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(mesh.file_poll(&route_id))
+async fn file_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
+    let state = app.state::<AppState>();
+    tauri::ipc::Response::new(
+        state
+            .node
+            .request_bytes("file_poll", json!({ "route_id": route_id }))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Release a files window's claim on a route's responses (window closed).
 /// Token-scoped and idempotent, like `term_unwatch`.
 #[tauri::command]
-fn file_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
-    mesh.file_unwatch(&route_id, token);
+async fn file_unwatch(app: tauri::AppHandle, route_id: String, token: u64) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state
+        .node
+        .request(
+            "file_unwatch",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await
+    {
+        tracing::warn!("file_unwatch failed: {e:#}");
+    }
 }
 
 /// Route the coming `Read` request's chunks straight into this machine's
@@ -407,13 +537,21 @@ fn file_unwatch(mesh: State<'_, Arc<Mesh>>, route_id: String, token: u64) {
 /// completion lands as `allmystuff://file-saved`. Call *before* sending
 /// the request so the first chunk can't race the registration.
 #[tauri::command]
-fn file_download(
-    mesh: State<'_, Arc<Mesh>>,
+async fn file_download(
+    state: State<'_, AppState>,
     route_id: String,
     req: u64,
     name: String,
 ) -> Result<String, String> {
-    mesh.file_download(route_id, req, &name)
+    let v = state
+        .node
+        .request(
+            "file_download",
+            json!({ "route_id": route_id, "req": req, "name": name }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Open (or focus) the dedicated files window for `node` — one OS window
@@ -446,69 +584,108 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
 /// blocking socket I/O, so it runs off the command executor.
 #[tauri::command]
 async fn site_scan(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<allmystuff_inventory::ListeningService>, String> {
-    let mesh = mesh.inner().clone();
-    tokio::task::spawn_blocking(move || mesh.site_scan())
+    let v = state
+        .node
+        .request("site_scan", json!({}))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// The services this machine currently advertises, as id → display name
 /// (empty name = the classified default).
 #[tauri::command]
-fn site_exposed(mesh: State<'_, Arc<Mesh>>) -> std::collections::BTreeMap<String, String> {
-    mesh.site_exposed()
+async fn site_exposed(app: tauri::AppHandle) -> std::collections::BTreeMap<String, String> {
+    let state = app.state::<AppState>();
+    match state.node.request("site_exposed", json!({})).await {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("site_exposed failed: {e:#}");
+            Default::default()
+        }
+    }
 }
 
 /// Set which listening services this machine advertises (id → display name).
 /// Re-broadcasts presence so peers' Sites tabs update; returns the new set.
 #[tauri::command]
 async fn site_set_exposed(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     exposed: std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    Ok(mesh.inner().site_set_exposed(exposed).await)
+    let v = state
+        .node
+        .request("site_set_exposed", json!({ "exposed": exposed }))
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Map a peer's site to a local port — set up the reverse-proxy route and
 /// bind a local listener. Returns `{ localPort }`.
 #[tauri::command]
-async fn site_map(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<Value, String> {
-    let local_port = mesh.inner().site_map(node, port).await?;
-    Ok(json!({ "localPort": local_port }))
+async fn site_map(state: State<'_, AppState>, node: String, port: u16) -> Result<Value, String> {
+    state
+        .node
+        .request("site_map", json!({ "node": node, "port": port }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Tear a site mapping down (unbind the local listener, drop the route).
 #[tauri::command]
-async fn site_unmap(mesh: State<'_, Arc<Mesh>>, node: String, port: u16) -> Result<(), String> {
-    mesh.inner().site_unmap(node, port).await
+async fn site_unmap(state: State<'_, AppState>, node: String, port: u16) -> Result<(), String> {
+    state
+        .node
+        .request("site_unmap", json!({ "node": node, "port": port }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Every site this machine currently has mapped: `{ node, port, localPort }`.
 #[tauri::command]
-fn site_mappings(mesh: State<'_, Arc<Mesh>>) -> Vec<Value> {
-    mesh.site_mappings()
-        .into_iter()
-        .map(|(node, port, local_port)| json!({ "node": node, "port": port, "localPort": local_port }))
-        .collect()
+async fn site_mappings(app: tauri::AppHandle) -> Vec<Value> {
+    let state = app.state::<AppState>();
+    match state.node.request("site_mappings", json!({})).await {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("site_mappings failed: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Ask a co-owned fleet machine for its full site list, to manage its
 /// exposure from its drawer. The reply arrives as `allmystuff://node-sites`.
 #[tauri::command]
-async fn site_remote_list(mesh: State<'_, Arc<Mesh>>, node: String) -> Result<(), String> {
-    mesh.inner().site_remote_list(node).await
+async fn site_remote_list(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("site_remote_list", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Tell a co-owned fleet machine to advertise exactly `exposed` (id → name).
 #[tauri::command]
 async fn site_remote_set_exposed(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     node: String,
     exposed: std::collections::BTreeMap<String, String>,
 ) -> Result<(), String> {
-    mesh.inner().site_remote_set_exposed(node, exposed).await
+    state
+        .node
+        .request(
+            "site_remote_set_exposed",
+            json!({ "node": node, "exposed": exposed }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Open (or focus) a dedicated console window for `node` — its own OS
@@ -622,37 +799,66 @@ fn query_encode(s: &str) -> String {
 
 /// Current peers + live route states.
 #[tauri::command]
-fn session_snapshot(mesh: State<'_, Arc<Mesh>>) -> Value {
-    mesh.snapshot()
+async fn session_snapshot(app: tauri::AppHandle) -> Value {
+    let state = app.state::<AppState>();
+    match state.node.request("session_snapshot", json!({})).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("session_snapshot failed: {e:#}");
+            Value::Null
+        }
+    }
 }
 
 /// The owned-fleet roster: the shared key and the devices this owner has
 /// claimed (and that have converged via gossip). Drives the Fleet settings
 /// view; updated live by the `allmystuff://owned` event.
 #[tauri::command]
-fn owned_roster(mesh: State<'_, Arc<Mesh>>) -> Value {
-    mesh.owned_roster_value()
+async fn owned_roster(app: tauri::AppHandle) -> Value {
+    let state = app.state::<AppState>();
+    match state.node.request("owned_roster", json!({})).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("owned_roster failed: {e:#}");
+            Value::Null
+        }
+    }
 }
 
 /// Leave the fleet this device belongs to (and release its owner) — the
 /// remaining members converge on the bumped roster without us.
 #[tauri::command]
-async fn fleet_leave(mesh: State<'_, Arc<Mesh>>) -> Result<(), String> {
-    mesh.inner().fleet_leave().await
+async fn fleet_leave(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .node
+        .request("fleet_leave", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Kick a device out of the fleet. Only a member may kick (the backend
 /// enforces it), and never itself — that's `fleet_leave`.
 #[tauri::command]
-async fn fleet_kick(mesh: State<'_, Arc<Mesh>>, device: String) -> Result<(), String> {
-    mesh.inner().fleet_kick(device).await
+async fn fleet_kick(state: State<'_, AppState>, device: String) -> Result<(), String> {
+    state
+        .node
+        .request("fleet_kick", json!({ "device": device }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Name (or rename) the fleet this device belongs to. Members only; the
 /// renamed roster gossips out and converges like any membership change.
 #[tauri::command]
-async fn fleet_set_name(mesh: State<'_, Arc<Mesh>>, name: String) -> Result<(), String> {
-    mesh.inner().fleet_set_name(name).await
+async fn fleet_set_name(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    state
+        .node
+        .request("fleet_set_name", json!({ "name": name }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Fan one room-plane message (invite / join / leave / chat) out to the
@@ -660,13 +866,19 @@ async fn fleet_set_name(mesh: State<'_, Arc<Mesh>>, name: String) -> Result<(), 
 /// actually dispatched to, so the UI can say when a line reached nobody.
 #[tauri::command]
 async fn room_send(
-    mesh: State<'_, Arc<Mesh>>,
+    state: State<'_, AppState>,
     members: Vec<String>,
     message: serde_json::Value,
 ) -> Result<u32, String> {
-    let message: allmystuff_protocol::RoomMessage =
-        serde_json::from_value(message).map_err(|e| e.to_string())?;
-    mesh.inner().room_send(members, message).await
+    let v = state
+        .node
+        .request(
+            "room_send",
+            json!({ "members": members, "message": message }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 // ---- Shared Files (the call's shared-download area) ---------------------
@@ -676,90 +888,103 @@ async fn room_send(
 /// the GUI hands to the room's host for its shared list. The bytes never
 /// leave this machine until a member fetches them by token.
 #[tauri::command]
-fn room_share_files(
-    mesh: State<'_, Arc<Mesh>>,
+async fn room_share_files(
+    app: tauri::AppHandle,
     members: Vec<String>,
     paths: Vec<String>,
 ) -> Vec<allmystuff_protocol::SharedFileMeta> {
-    mesh.room_share_files(members, paths)
+    let state = app.state::<AppState>();
+    match state
+        .node
+        .request(
+            "room_share_files",
+            json!({ "members": members, "paths": paths }),
+        )
+        .await
+    {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("room_share_files failed: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Refresh the members allowed to fetch a set of shared tokens (the room's
 /// roster changed while the files were on offer).
 #[tauri::command]
-fn room_set_share_peers(mesh: State<'_, Arc<Mesh>>, tokens: Vec<String>, members: Vec<String>) {
-    mesh.room_set_share_peers(tokens, members);
+async fn room_set_share_peers(app: tauri::AppHandle, tokens: Vec<String>, members: Vec<String>) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state
+        .node
+        .request(
+            "room_set_share_peers",
+            json!({ "tokens": tokens, "members": members }),
+        )
+        .await
+    {
+        tracing::warn!("room_set_share_peers failed: {e:#}");
+    }
 }
 
 /// Stop offering a set of shared files (the uploader removed them or left).
 #[tauri::command]
-fn room_unshare(mesh: State<'_, Arc<Mesh>>, tokens: Vec<String>) {
-    mesh.room_unshare(tokens);
+async fn room_unshare(app: tauri::AppHandle, tokens: Vec<String>) {
+    let state = app.state::<AppState>();
+    if let Err(e) = state
+        .node
+        .request("room_unshare", json!({ "tokens": tokens }))
+        .await
+    {
+        tracing::warn!("room_unshare failed: {e:#}");
+    }
 }
 
 // ---- mesh control passthroughs ----------------------------------------
 
 #[tauri::command]
 async fn mesh_status(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::Status)
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn mesh_identity(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::IdentityShow)
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_identity", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn mesh_networks(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::NetworksList)
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_networks", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn mesh_peers(state: State<'_, AppState>, network: String) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::PeersList { network })
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_peers", json!({ "network": network }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn mesh_network_add(
-    state: State<'_, AppState>,
-    mesh: State<'_, Arc<Mesh>>,
-    config: Value,
-) -> Result<Value, String> {
-    let data = unwrap_response(
-        state
-            .client
-            .request(&Request::NetworkAdd { config })
-            .await
-            .map_err(|e| e.to_string())?,
-    )?;
-    // Subscribe + advertise on the freshly-joined network now, not just at
-    // next launch — so a network joined mid-session lights up immediately.
-    mesh.inner().sync_networks().await;
-    Ok(data)
+async fn mesh_network_add(state: State<'_, AppState>, config: Value) -> Result<Value, String> {
+    state
+        .node
+        .request("mesh_network_add", json!({ "config": config }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The whole daemon config — every network with its full signaling / STUN /
@@ -767,33 +992,24 @@ async fn mesh_network_add(
 /// (`NetworksList` only carries summaries).
 #[tauri::command]
 async fn mesh_config_show(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::ConfigShow)
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_config_show", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Replace one network's config (its signaling / STUN / TURN servers, label,
 /// etc.). The daemon hot-applies cosmetic changes and restarts the transport
-/// for server changes; we re-subscribe afterwards so the session reconnects.
+/// for server changes; the node re-subscribes afterwards so the session
+/// reconnects.
 #[tauri::command]
-async fn mesh_network_update(
-    state: State<'_, AppState>,
-    mesh: State<'_, Arc<Mesh>>,
-    config: Value,
-) -> Result<Value, String> {
-    let data = unwrap_response(
-        state
-            .client
-            .request(&Request::NetworkUpdate { config })
-            .await
-            .map_err(|e| e.to_string())?,
-    )?;
-    mesh.inner().sync_networks().await;
-    Ok(data)
+async fn mesh_network_update(state: State<'_, AppState>, config: Value) -> Result<Value, String> {
+    state
+        .node
+        .request("mesh_network_update", json!({ "config": config }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -803,17 +1019,14 @@ async fn mesh_roster_approve(
     device_id: String,
     label: Option<String>,
 ) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::RosterApprove {
-                network,
-                device_id,
-                label,
-            })
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request(
+            "mesh_roster_approve",
+            json!({ "network": network, "device_id": device_id, "label": label }),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -822,61 +1035,57 @@ async fn mesh_roster_remove(
     network: String,
     device_id: String,
 ) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::RosterRemove { network, device_id })
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request(
+            "mesh_roster_remove",
+            json!({ "network": network, "device_id": device_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn mesh_roster_list(state: State<'_, AppState>, network: String) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::RosterList { network })
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_roster_list", json!({ "network": network }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Ask the daemon for a fresh, valid network id (the shareable handle peers
 /// join with). Used by the "create network" flow.
 #[tauri::command]
 async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<Value, String> {
-    unwrap_response(
-        state
-            .client
-            .request(&Request::NetworkIdGenerate)
-            .await
-            .map_err(|e| e.to_string())?,
-    )
+    state
+        .node
+        .request("mesh_network_id_generate", json!({}))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn mesh_network_remove(
-    state: State<'_, AppState>,
-    mesh: State<'_, Arc<Mesh>>,
-    network: String,
-) -> Result<Value, String> {
-    let data = unwrap_response(
-        state
-            .client
-            .request(&Request::NetworkRemove { network })
-            .await
-            .map_err(|e| e.to_string())?,
-    )?;
-    mesh.inner().sync_networks().await;
-    Ok(data)
+async fn mesh_network_remove(state: State<'_, AppState>, network: String) -> Result<Value, String> {
+    state
+        .node
+        .request("mesh_network_remove", json!({ "network": network }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The networks currently switched off (their full parked configs), for
 /// the pill menu's disabled rows.
 #[tauri::command]
-fn disabled_networks(state: State<'_, AppState>) -> Vec<Value> {
-    state.disabled_networks.list()
+async fn disabled_networks(app: tauri::AppHandle) -> Vec<Value> {
+    let state = app.state::<AppState>();
+    match state.node.request("disabled_networks", json!({})).await {
+        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("disabled_networks failed: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Switch a network off or back on without deleting it. Off = leave the
@@ -887,84 +1096,17 @@ fn disabled_networks(state: State<'_, AppState>) -> Vec<Value> {
 #[tauri::command]
 async fn network_set_enabled(
     state: State<'_, AppState>,
-    mesh: State<'_, Arc<Mesh>>,
     network: String,
     enabled: bool,
 ) -> Result<Value, String> {
-    if enabled {
-        let config = state
-            .disabled_networks
-            .take(&network)
-            .ok_or_else(|| format!("'{network}' isn't a disabled network here"))?;
-        let rejoin = state
-            .client
-            .request(&Request::NetworkAdd {
-                config: config.clone(),
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(unwrap_response);
-        match rejoin {
-            Ok(data) => {
-                mesh.inner().sync_networks().await;
-                Ok(data)
-            }
-            Err(e) => {
-                // Park it back so a failed re-join (daemon down, say) never
-                // loses the config.
-                state.disabled_networks.park(config);
-                Err(e)
-            }
-        }
-    } else {
-        // Snapshot the full config *before* leaving — `config_show` is the
-        // only place the daemon hands the whole thing back.
-        let shown = unwrap_response(
-            state
-                .client
-                .request(&Request::ConfigShow)
-                .await
-                .map_err(|e| e.to_string())?,
-        )?;
-        let config = shown
-            .pointer("/config/networks")
-            .and_then(|v| v.as_array())
-            .and_then(|nets| {
-                nets.iter()
-                    .find(|n| {
-                        let id = n.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                        let nid = n
-                            .get("network_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        id == network || nid == network
-                    })
-                    .cloned()
-            })
-            .ok_or_else(|| format!("unknown network: {network}"))?;
-        if !state.disabled_networks.park(config) {
-            return Err("couldn't save the network for later — not disabling it".into());
-        }
-        let left = state
-            .client
-            .request(&Request::NetworkRemove {
-                network: network.clone(),
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(unwrap_response);
-        match left {
-            Ok(data) => {
-                mesh.inner().sync_networks().await;
-                Ok(data)
-            }
-            Err(e) => {
-                // Still joined — un-park so the books match reality.
-                let _ = state.disabled_networks.take(&network);
-                Err(e)
-            }
-        }
-    }
+    state
+        .node
+        .request(
+            "network_set_enabled",
+            json!({ "network": network, "enabled": enabled }),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Write a network-settings envelope (the GUI's flat, shareable JSON for a
@@ -984,20 +1126,13 @@ async fn mesh_network_export_file(path: String, config: Value) -> Result<(), Str
 #[tauri::command]
 async fn mesh_identity_set_label(
     state: State<'_, AppState>,
-    mesh: State<'_, Arc<Mesh>>,
     label: String,
 ) -> Result<Value, String> {
-    let data = unwrap_response(
-        state
-            .client
-            .request(&Request::IdentitySetLabel {
-                label: label.clone(),
-            })
-            .await
-            .map_err(|e| e.to_string())?,
-    )?;
-    mesh.inner().set_label(label).await;
-    Ok(data)
+    state
+        .node
+        .request("mesh_identity_set_label", json!({ "label": label }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---- self-update (AllMyStuff's own updater, not the daemon's) ----------
@@ -1091,63 +1226,6 @@ async fn service_status() -> Result<Value, String> {
     })
     .await
     .map_err(|e| format!("service status task failed: {e}"))
-}
-
-/// Make this machine's node be *us* (the desktop app) — the single node per
-/// machine. Returns `true` once we hold the machine lock (start the mesh) and
-/// `false` if we yielded to the Always-On service (don't start a second mesh).
-///
-/// If the Always-On service is already running its node, we take the machine
-/// from it where that costs no privilege — Linux user-systemd and a macOS
-/// LaunchAgent both stop without elevation — and restart it on exit so headless
-/// always-on resumes. On Windows the service needs admin to stop (`sc stop`), so
-/// rather than throw a UAC prompt on every launch we leave the service as the
-/// node and yield; the machine stays connected, and turning Always On off (the
-/// existing, intentional flow) hands control back to the window.
-async fn claim_machine(handle: &tauri::AppHandle) -> bool {
-    if let Some(lock) = allmystuff_node::instance::acquire() {
-        handle.state::<AppState>().node_lock.lock().replace(lock);
-        return true;
-    }
-
-    #[cfg(not(windows))]
-    {
-        tracing::info!(
-            "Always-On service holds this machine; stopping it so the desktop app is the single node"
-        );
-        let stopped = tokio::task::spawn_blocking(|| service_mutate_blocking("stop"))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
-        if stopped {
-            handle
-                .state::<AppState>()
-                .resume_service_on_exit
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        // The service's `serve` process exits and frees the machine; the stop
-        // returns before that settles, so retry briefly.
-        for _ in 0..50 {
-            if let Some(lock) = allmystuff_node::instance::acquire() {
-                handle.state::<AppState>().node_lock.lock().replace(lock);
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        tracing::warn!("couldn't claim the node lock after stopping the service — yielding");
-        false
-    }
-
-    #[cfg(windows)]
-    {
-        tracing::info!(
-            "Always-On service owns this machine's node — yielding (turn Always On off to drive it from here)"
-        );
-        let _ = handle.emit("allmystuff://always-on-active", json!({}));
-        false
-    }
 }
 
 /// Map a UI verb to the shared crate's command (user scope; Windows ignores it).
@@ -1368,6 +1446,31 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
     }
 }
 
+/// Subscribe to the node's event stream and re-emit each event on Tauri's bus,
+/// so the Svelte front-end sees exactly what it used to when the engine ran
+/// in-process. Reconnects if the node restarts.
+async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
+    use tokio::sync::mpsc;
+    loop {
+        let (tx, mut rx) = mpsc::channel::<NodeEvent>(256);
+        if let Err(e) = node.subscribe_events(tx).await {
+            tracing::warn!("node event subscribe failed: {e:#}; retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                NodeEvent::Emit { event, payload } => {
+                    let _ = app.emit(&event, payload);
+                }
+                NodeEvent::Restart => app.restart(), // never returns
+            }
+        }
+        tracing::info!("node event stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 /// Native close/minimize handling for the **main** window only (secondary
 /// console / terminal / room windows always close normally): honour the
 /// persisted "Always On" preference by hiding to the tray instead of closing
@@ -1436,8 +1539,6 @@ fn main() {
         .with_target(false)
         .init();
 
-    let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1452,13 +1553,6 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .manage(AppState {
-            client: client.clone(),
-            daemon_child: Mutex::new(None),
-            disabled_networks: networks_store::DisabledNetworks::load(),
-            node_lock: Mutex::new(None),
-            resume_service_on_exit: std::sync::atomic::AtomicBool::new(false),
-        })
         .manage(window_behavior::WindowBehavior::load())
         .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
@@ -1554,44 +1648,31 @@ fn main() {
             }
             apply_startup_behavior(app.handle());
             let handle = app.handle().clone();
-            let mesh = Mesh::new(
-                client.clone(),
-                Arc::new(TauriSink {
-                    app: handle.clone(),
-                }),
-            );
-            app.manage(mesh.clone());
-            let client = client.clone();
-            tauri::async_runtime::spawn(async move {
-                // One node per machine. While the desktop app is open it is the
-                // node, so claim the machine before bringing up the daemon/mesh.
-                // If the Always-On service already runs this machine's node,
-                // `claim_machine` takes it over where it can (and restarts the
-                // service on exit) or yields — either way we never bring up a
-                // second mesh against the same identity.
-                if !claim_machine(&handle).await {
-                    tracing::info!(
-                        "desktop app is yielding its node to the Always-On service; \
-                         turn Always On off to drive this machine from the app"
-                    );
-                    return;
+            let node = match NodeClient::new() {
+                Ok(n) => Arc::new(n),
+                Err(e) => {
+                    tracing::error!("couldn't resolve the node socket: {e:#}");
+                    return Err(e.into());
                 }
-
-                match daemon_spawn::ensure_daemon_running(&client).await {
+            };
+            app.manage(AppState {
+                node: node.clone(),
+                node_child: Mutex::new(None),
+            });
+            tauri::async_runtime::spawn(async move {
+                // One node per machine: reuse the Always-On service's node if
+                // it's up, else spawn a transient one tied to this app's
+                // lifetime. The node owns the Mesh and supervises the myownmesh
+                // daemon itself — the GUI no longer runs either.
+                match ensure_node_running().await {
                     Ok(child) => {
-                        if let Some(child) = child {
-                            handle
-                                .state::<AppState>()
-                                .daemon_child
-                                .lock()
-                                .replace(child);
+                        if let Some(c) = child {
+                            handle.state::<AppState>().node_child.lock().replace(c);
                         }
                     }
-                    Err(e) => tracing::warn!("daemon auto-spawn skipped: {e:#}"),
+                    Err(e) => tracing::error!("couldn't bring up the allmystuff node: {e:#}"),
                 }
-                // Bring the live session online (subscribes, advertises
-                // presence, starts the event pump).
-                mesh.start().await;
+                run_event_pump(handle, node).await;
             });
             // Self-update ticker — the first check fires shortly after launch,
             // then at the configured interval. Spawned unconditionally:
@@ -1605,21 +1686,10 @@ fn main() {
         .expect("error while building the AllMyStuff GUI")
         .run(|app, event| {
             if let RunEvent::Exit = event {
-                let state = app.state::<AppState>();
-                // Free the machine first so the Always-On service can re-take it.
-                state.node_lock.lock().take();
-                let child = state.daemon_child.lock().take();
-                if let Some(c) = child {
-                    drop(c);
-                }
-                // Resume the Always-On service we stopped on the way in, so
-                // headless always-on comes back once the window is gone.
-                if state
-                    .resume_service_on_exit
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    let _ = service_mutate_blocking("start");
-                }
+                // Kill the node we spawned (if any). A reused Always-On service
+                // node has no child here and keeps running, so the machine
+                // stays reachable.
+                app.state::<AppState>().node_child.lock().take();
             }
         });
 }

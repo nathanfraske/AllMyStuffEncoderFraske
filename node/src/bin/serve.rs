@@ -42,6 +42,8 @@ use std::sync::Arc;
 use allmystuff_node::control_client::ControlClient;
 use allmystuff_node::daemon_spawn::{self, DaemonChild};
 use allmystuff_node::mesh::Mesh;
+use allmystuff_node::networks_store::DisabledNetworks;
+use allmystuff_node::node_control::{self, SocketSink};
 use allmystuff_node::UiSink;
 
 /// Headless event sink. The engine's events (`allmystuff://session`,
@@ -170,33 +172,19 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         "allmystuff node starting"
     );
 
-    // One node per machine. If the desktop app (or another serve) already holds
-    // the machine, *wait* here rather than start a second mesh — two nodes
-    // advertise the same identity and fight, and then nothing connects. Staying
-    // supervised (not exiting) means we take the machine the instant the holder
-    // frees it, e.g. when the desktop app closes. We honor shutdown while
-    // waiting so `systemctl stop` (etc.) stays prompt.
-    let mut shutdown = std::pin::pin!(shutdown);
-    let _node_lock = {
-        let mut held = allmystuff_node::instance::acquire();
-        if held.is_none() {
-            tracing::info!(
-                "another AllMyStuff node owns this machine (the desktop app) — \
-                 waiting to take over when it frees up"
-            );
-        }
-        loop {
-            if let Some(lock) = held {
-                break lock;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-                _ = &mut shutdown => {
-                    tracing::info!("shutdown requested while waiting for the machine — stopping");
-                    return ExitCode::SUCCESS;
-                }
-            }
-            held = allmystuff_node::instance::acquire();
+    // One node per machine. The node control socket is the guard: bind it
+    // before bringing up any mesh. A *live* node already holding it means this
+    // machine is already served (a running Always-On service, or the desktop
+    // app's spawned node) — starting a second mesh would put two nodes under
+    // one identity and then nothing connects, so step aside cleanly. Binding
+    // before the mesh starts is also what makes two simultaneously-starting
+    // nodes safe (see `bind_control_socket`).
+    let shutdown = std::pin::pin!(shutdown);
+    let control_listener = match node_control::bind_control_socket().await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::info!("not starting a second node ({e:#})");
+            return ExitCode::SUCCESS;
         }
     };
 
@@ -223,10 +211,39 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         }
     };
 
-    // Wire the engine to a headless sink and bring the session online
-    // (subscribe, advertise presence + capabilities, start the event pump).
-    let mesh = Mesh::new(client.clone(), Arc::new(LogSink));
+    // Wire the engine to a sink that both logs (the headless `LogSink`) and
+    // broadcasts every event to clients of the node control socket — the seam
+    // a thin GUI drives the node over (Phase A). The broadcaster is shared
+    // with the control server spawned below, and `DisabledNetworks` is the
+    // park store the server's `network_set_enabled` command needs.
+    let broadcaster = node_control::new_broadcaster();
+    let (event_tx, event_rx) = node_control::event_channel();
+    let disabled = Arc::new(DisabledNetworks::load());
+    let sink = SocketSink::new(Arc::new(LogSink), event_tx);
+    let mesh = Mesh::new(client.clone(), Arc::new(sink));
     mesh.clone().start().await;
+
+    // Serve the node control + event socket (on the listener bound up front) so
+    // the desktop app drives this node over it instead of running its own mesh.
+    tokio::spawn({
+        let mesh = mesh.clone();
+        let client = client.clone();
+        let disabled = disabled.clone();
+        async move {
+            if let Err(e) = node_control::serve(
+                control_listener,
+                mesh,
+                client,
+                disabled,
+                broadcaster,
+                event_rx,
+            )
+            .await
+            {
+                tracing::warn!("node control socket stopped: {e:#}");
+            }
+        }
+    });
 
     // Self-update ticker: a headless node checks the release feed on its own
     // and, unlike the desktop app's "stage + offer relaunch", *applies* what

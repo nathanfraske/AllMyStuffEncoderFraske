@@ -15,11 +15,11 @@ and the **mesh is a sidecar**, never an embedded dependency.
                   └───────────────┬───────────────────┘
                                   ▼
                     ┌──────────────────────────────┐
-                    │   allmystuff-node engine      │   one engine, two
-                    │   presence · routes · every   │   front ends: the GUI
-                    │   media plane (screen/camera/ │   and the headless
-                    │   audio/input/terminal/files) │   serve binary both
-                    └───────┬───────────────┬───────┘   link it.
+                    │   allmystuff-node engine      │   one node per
+                    │   presence · routes · every   │   machine, run by
+                    │   media plane (screen/camera/ │   allmystuff-serve;
+                    │   audio/input/terminal/files) │   the GUI drives it
+                    └───────┬───────────────┬───────┘   as a thin client.
           scan_self()       │               │  control socket
       (inventory+bridge)    │               │  (line-delimited JSON)
                             ▼               ▼
@@ -32,14 +32,21 @@ and the **mesh is a sidecar**, never an embedded dependency.
               the library workspace         the mesh, sidecarred
 ```
 
-The seam between the two front ends is the `UiSink` trait
-(`allmystuff-node`): `Mesh::new` takes one, the GUI hands it a Tauri-backed
-implementation (`app.emit`), and `allmystuff-serve` hands it a logging one.
-Nothing else in the engine knows whether a webview is attached — which is the
-whole reason the same code can stream a screen with or without a GUI. The
-headless binary also spawns and supervises the `myownmesh serve` daemon
-itself (the same `daemon_spawn` logic the GUI uses), so `allmystuff service`
-needs only one unit to bring the whole node up. See
+There is **one node per machine**, and it runs in the `allmystuff-serve`
+binary — never in the GUI. That binary owns the `Mesh`, spawns and supervises
+the `myownmesh serve` daemon itself (so `allmystuff service` needs only one
+unit to bring the whole node up), and exposes its own **node control socket**
+(`allmystuff_node::node_control`): length-prefixed frames carrying one request
+per command and a stream of engine events. The desktop GUI is a *thin client*
+of that socket — it issues commands with `NodeClient` and re-emits the event
+stream onto Tauri's bus, rather than linking the engine. Events reach that
+stream through the engine's `UiSink` seam: `allmystuff-serve` wires in a
+`SocketSink` that logs each event and fans it out to every connected client.
+
+This is why running both the Always-On service and the desktop app no longer
+collides: there is exactly one `Mesh` advertising one identity. (The GUI used
+to build its own `Mesh` with a Tauri-backed `UiSink`; two nodes under one
+identity is precisely what stopped machines connecting.) See
 [the README's Headless section](README.md#headless-serve--service).
 
 The library workspace (`crates/`) compiles and tests with nothing but

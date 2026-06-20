@@ -1,0 +1,18 @@
+# Workspace-wide build-script environment (applies to every cargo invocation
+# at or below the repo root — cargo merges .cargo/config.toml from the cwd up).
+#
+# CMAKE_POLICY_VERSION_MINIMUM: audiopus_sys (the opus crate's libopus build)
+# vendors a CMakeLists whose `cmake_minimum_required` predates 3.5, which
+# CMake 4.x refuses outright ("Compatibility with CMake < 3.5 has been
+# removed"; macOS/Homebrew and recent Windows cmakes hit this — CMake 3.x only
+# warns, and ignores this var). It's CMake's own documented escape hatch, read
+# from the environment since 4.0.
+#
+# This lives at the repo root (not just in gui/src-tauri) because the node
+# engine is now built on its own — `just dev` builds `allmystuff-serve`, and
+# `just serve` runs it — via `cargo --manifest-path node/Cargo.toml` from the
+# repo root, where a `node/.cargo/config.toml` would never be found (cargo
+# searches from the *cwd* up, not from the manifest). Drop this when
+# audiopus_sys ships a fixed CMakeLists.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
