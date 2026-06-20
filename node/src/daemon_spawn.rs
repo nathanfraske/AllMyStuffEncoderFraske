@@ -17,26 +17,170 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::control_client::{ControlClient, Request};
 
+/// Stop a supervised child gracefully: on unix send `SIGTERM` and give it
+/// up to ~2s to exit on its own — a clean shutdown that lets the daemon
+/// cascade its own teardown — then `SIGKILL` whatever's left. On Windows
+/// there's no graceful signal in std, but the job-object tie
+/// ([`tie_daemon_lifetime`]) already cascades a kill-on-close, so a plain
+/// `Child::kill` is the right (and only) move.
+///
+/// Marked `pub(crate)` so [`crate::node_control::NodeChild`] can reuse the
+/// exact same teardown for the `allmystuff-serve` child it supervises.
+pub(crate) fn graceful_kill(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` with a pid we own; an ESRCH (already-reaped)
+        // just no-ops. We never reuse a pid we haven't `wait`ed.
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // The unix branch falls through here for the still-alive case (SIGKILL);
+    // Windows takes this path directly.
+    let _ = child.kill();
+}
+
+/// Ask the orphaned daemon at `pid` to shut down. On unix that's a plain
+/// `SIGTERM` (the daemon's clean-shutdown signal); on Windows std has no
+/// signal, so we go through sysinfo's `Process::kill` (which is also how we
+/// verified the pid is myownmesh, so the lookup is cheap and the gate the
+/// same). Only ever called for a pid we've already confirmed is *our*
+/// myownmesh orphan.
+fn stop_orphan(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)`; an ESRCH (already gone) just no-ops.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let spid = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[spid]),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+        if let Some(proc) = sys.process(spid) {
+            proc.kill();
+        }
+    }
+}
+
 /// Owned wrapper around a spawned `myownmesh serve` child. Dropping it
-/// kills the child.
+/// stops the child ([`graceful_kill`]) and, if the daemon pidfile still
+/// points at *this* child, removes it — so the next run's self-heal sees a
+/// clean slate rather than a stale pid.
 pub struct DaemonChild {
     child: Option<Child>,
+    /// The pid we recorded in [`daemon_pidfile`] when we spawned, so `drop`
+    /// can clear the file — but only while it still names *us* (a daemon
+    /// that replaced ours since then owns the file now).
+    pid: u32,
 }
 
 impl DaemonChild {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+        }
     }
 }
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
+            graceful_kill(&mut c);
             let _ = c.wait();
+            // Only clear the pidfile if it still points at us — a fresh
+            // daemon (ours or a foreign one) that took the file over since
+            // we wrote it must keep its own record.
+            if let Some(path) = daemon_pidfile() {
+                if read_pidfile(&path) == Some(self.pid) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             tracing::info!("myownmesh daemon child terminated");
         }
     }
+}
+
+/// `<MYOWNMESH_HOME or ~>/.myownmesh/allmystuff-daemon.pid` — the record of
+/// which `myownmesh` daemon *we* spawned, honouring `MYOWNMESH_HOME` exactly
+/// like [`crate::ownership`]'s store and the control socket. `None` when no
+/// home dir resolves (an ephemeral/test environment with neither set).
+fn daemon_pidfile() -> Option<PathBuf> {
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    Some(home.join(".myownmesh").join("allmystuff-daemon.pid"))
+}
+
+/// Write `pid` to the daemon pidfile, creating `~/.myownmesh` first. Best
+/// effort — a failed write just means the *next* run can't recognise this
+/// daemon as ours and will reuse it like a foreign one (never the wrong,
+/// destructive direction).
+fn write_pidfile(pid: u32) {
+    let Some(path) = daemon_pidfile() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+        tracing::warn!("couldn't record the daemon pid at {}: {e}", path.display());
+    }
+}
+
+/// Read the pid recorded in the daemon pidfile. `None` for a missing file
+/// or any unparseable/garbage content — both mean "we have no daemon of our
+/// own on record", the safe default.
+fn read_pidfile(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// True when `pid` is alive *and* really a `myownmesh` process — the gate
+/// that lets us reclaim our orphan without ever risking a process that
+/// merely inherited its pid after it died (pid reuse). Checks the live
+/// process's exe basename (falling back to its name) for a `myownmesh`
+/// prefix, refreshing only that one pid.
+fn pid_is_myownmesh(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let spid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let Some(proc) = sys.process(spid) else {
+        return false;
+    };
+    // Prefer the exe basename (stable, full); fall back to the process name
+    // (truncated to 15 chars on Linux, but "myownmesh" fits).
+    let exe_base = proc
+        .exe()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned());
+    let name = proc.name().to_string_lossy().into_owned();
+    let basename = exe_base.unwrap_or(name);
+    basename.starts_with("myownmesh")
 }
 
 /// Tie the spawned daemon's lifetime to this process at the OS level —
@@ -413,25 +557,87 @@ fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
     )
 }
 
+/// How long we wait for an orphan we just SIGTERM-ed to stop answering the
+/// control socket before we give up replacing it. A clean `myownmesh`
+/// shutdown is near-instant; this is slack for a wedged one mid-teardown.
+const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reuse the daemon already answering the socket *as today*: log its version
+/// against the pin and, when it's stale and ours-to-keep-current, refresh the
+/// binary on disk for the next start. Always returns `Ok(None)` — "a daemon is
+/// already running; step aside". Factored out so both reuse paths (foreign
+/// daemon, and an orphan we couldn't cleanly replace) share one body.
+async fn reuse_running_daemon(client: &ControlClient) -> Result<Option<DaemonChild>> {
+    if log_daemon_version(client).await {
+        // The running daemon is stale, but it isn't ours to restart (an
+        // externally-started daemon, or one we couldn't replace). Refresh the
+        // binary on disk so the *next* daemon start runs the pinned features.
+        if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
+            if run_daemon_update(&bin).await {
+                tracing::warn!(
+                    "updated myownmesh on disk, but the running daemon keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch the app"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Spawn `myownmesh serve` and wait briefly for its socket. Returns
 /// `Ok(None)` when a daemon is already running (we reuse it).
+///
+/// **Self-heal**: when a daemon is already answering, we normally reuse it —
+/// *except* when it's an orphan we started in a previous run (the GUI
+/// SIGKILLs the node on exit, so on macOS the node never gets to cascade its
+/// own shutdown and the daemon is left behind). A pidfile records which
+/// daemon was ours; if the answering daemon is that orphan we SIGTERM it and
+/// spawn a fresh one, so a wedged transport from the dead run can't be
+/// inherited. A daemon we *didn't* start (a user's own, the MyOwnMesh app's,
+/// a `MYOWNMESH_BIN`-pinned one) is never touched.
 pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<DaemonChild>> {
     if probe(client).await {
         tracing::info!("existing myownmesh daemon found on the control socket");
-        if log_daemon_version(client).await {
-            // The running daemon is stale, but it isn't ours to restart
-            // (an externally-started daemon, or a macOS orphan from a
-            // crashed run). Refresh the binary on disk so the *next*
-            // daemon start runs the pinned features.
-            if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
-                if run_daemon_update(&bin).await {
-                    tracing::warn!(
-                        "updated myownmesh on disk, but the running daemon keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch the app"
-                    );
-                }
-            }
+
+        // A user-pinned/managed binary (`MYOWNMESH_BIN`) is deliberately out
+        // of our hands — never restart whatever it points at.
+        if std::env::var_os("MYOWNMESH_BIN").is_some() {
+            return reuse_running_daemon(client).await;
         }
-        return Ok(None);
+
+        // Is the answering daemon the orphan we started earlier? Only if the
+        // pidfile names a live pid that is *actually* a myownmesh process
+        // (the sysinfo check guards pid reuse). Anything else — no pidfile, a
+        // dead pid, or a live pid that isn't myownmesh — is a daemon we
+        // didn't start, so we reuse it untouched.
+        let our_orphan = daemon_pidfile()
+            .as_deref()
+            .and_then(read_pidfile)
+            .filter(|&pid| pid_is_myownmesh(pid));
+        let Some(pid) = our_orphan else {
+            return reuse_running_daemon(client).await;
+        };
+
+        tracing::warn!(
+            "found a stale mesh daemon we started earlier (now orphaned) — restarting it for a clean transport"
+        );
+        stop_orphan(pid);
+        // Wait for it to stop answering, then fall through to spawn a fresh
+        // one. If it's *still* answering, we couldn't replace it cleanly —
+        // reuse it rather than spawn a conflicting second daemon.
+        let deadline = std::time::Instant::now() + ORPHAN_STOP_TIMEOUT;
+        loop {
+            if !probe(client).await {
+                break; // gone — fall through to the spawn path below
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "the orphaned daemon is still answering after {}s — couldn't replace it cleanly; reusing it",
+                    ORPHAN_STOP_TIMEOUT.as_secs()
+                );
+                return reuse_running_daemon(client).await;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     let (bin, source) = find_daemon_binary().context("locate myownmesh binary")?;
@@ -469,6 +675,11 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
+    // Record this daemon as ours, so a future run's self-heal can recognise
+    // it as our orphan (and `DaemonChild::drop` can clear the record on a
+    // clean exit). Write before the tie/probe so even an early failure leaves
+    // a recoverable pid on disk.
+    write_pidfile(child.id());
     tie_daemon_lifetime(&child);
     let handle = DaemonChild::new(child);
 
@@ -536,5 +747,54 @@ mod tests {
         assert!((0, 10, 0) > (0, 2, 4));
         assert!((1, 0, 0) > (0, 10, 0));
         assert!((0, 2, 4) >= (0, 2, 4));
+    }
+
+    // The pidfile env reads/writes a process-global (`MYOWNMESH_HOME`), so
+    // these tests share one guarded section to stay hermetic under the test
+    // runner's threads.
+    use std::sync::Mutex;
+    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pidfile_resolves_under_myownmesh_home() {
+        let _g = HOME_ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("ams-pidtest-{}", std::process::id()));
+        std::env::set_var("MYOWNMESH_HOME", &tmp);
+        let path = daemon_pidfile().expect("a home resolves");
+        assert_eq!(
+            path,
+            tmp.join(".myownmesh").join("allmystuff-daemon.pid"),
+            "the pidfile lives under <MYOWNMESH_HOME>/.myownmesh"
+        );
+        std::env::remove_var("MYOWNMESH_HOME");
+    }
+
+    #[test]
+    fn pidfile_round_trips_and_rejects_garbage() {
+        let _g = HOME_ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("ams-pidrt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("MYOWNMESH_HOME", &tmp);
+        let path = daemon_pidfile().expect("a home resolves");
+
+        // Missing file → None.
+        assert_eq!(read_pidfile(&path), None, "no file yet");
+
+        // Write-then-read round-trips the pid exactly.
+        write_pidfile(4242);
+        assert_eq!(
+            read_pidfile(&path),
+            Some(4242),
+            "the written pid reads back"
+        );
+
+        // Garbage / non-numeric content → None, never a panic.
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        assert_eq!(read_pidfile(&path), None, "garbage parses to no pid");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_pidfile(&path), None, "empty file is no pid");
+
+        std::env::remove_var("MYOWNMESH_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

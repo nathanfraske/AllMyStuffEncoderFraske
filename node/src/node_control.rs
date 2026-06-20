@@ -1159,7 +1159,11 @@ pub struct NodeChild {
 impl Drop for NodeChild {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
+            // SIGTERM-then-SIGKILL on unix so a clean parent exit lets the node
+            // run its own shutdown — which drops its `DaemonChild` and cascades
+            // the kill to the mesh daemon, instead of orphaning it. Windows
+            // keeps the job-object kill-on-close (see `graceful_kill`).
+            crate::daemon_spawn::graceful_kill(&mut c);
             let _ = c.wait();
             tracing::info!("allmystuff node child terminated");
         }
