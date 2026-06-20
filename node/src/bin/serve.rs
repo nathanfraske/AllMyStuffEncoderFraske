@@ -170,6 +170,36 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         "allmystuff node starting"
     );
 
+    // One node per machine. If the desktop app (or another serve) already holds
+    // the machine, *wait* here rather than start a second mesh — two nodes
+    // advertise the same identity and fight, and then nothing connects. Staying
+    // supervised (not exiting) means we take the machine the instant the holder
+    // frees it, e.g. when the desktop app closes. We honor shutdown while
+    // waiting so `systemctl stop` (etc.) stays prompt.
+    let mut shutdown = std::pin::pin!(shutdown);
+    let _node_lock = {
+        let mut held = allmystuff_node::instance::acquire();
+        if held.is_none() {
+            tracing::info!(
+                "another AllMyStuff node owns this machine (the desktop app) — \
+                 waiting to take over when it frees up"
+            );
+        }
+        loop {
+            if let Some(lock) = held {
+                break lock;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested while waiting for the machine — stopping");
+                    return ExitCode::SUCCESS;
+                }
+            }
+            held = allmystuff_node::instance::acquire();
+        }
+    };
+
     let client = match ControlClient::new() {
         Ok(c) => Arc::new(c),
         Err(e) => {

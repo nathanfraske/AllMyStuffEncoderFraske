@@ -32,6 +32,7 @@ pub mod control_client;
 pub mod daemon_spawn;
 pub mod files;
 pub mod input_inject;
+pub mod instance;
 pub mod mesh;
 pub mod networks_store;
 pub mod ownership;
