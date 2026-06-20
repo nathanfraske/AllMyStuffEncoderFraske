@@ -1105,7 +1105,6 @@ async fn service_status() -> Result<Value, String> {
 /// node and yield; the machine stays connected, and turning Always On off (the
 /// existing, intentional flow) hands control back to the window.
 async fn claim_machine(handle: &tauri::AppHandle) -> bool {
-    use std::sync::atomic::Ordering;
     if let Some(lock) = allmystuff_node::instance::acquire() {
         handle.state::<AppState>().node_lock.lock().replace(lock);
         return true;
@@ -1126,7 +1125,7 @@ async fn claim_machine(handle: &tauri::AppHandle) -> bool {
             handle
                 .state::<AppState>()
                 .resume_service_on_exit
-                .store(true, Ordering::SeqCst);
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         // The service's `serve` process exits and frees the machine; the stop
         // returns before that settles, so retry briefly.
