@@ -58,6 +58,15 @@ struct AppState {
     /// re-enabling re-joins with everything (servers, label, roster path)
     /// intact. See `network_set_enabled`.
     disabled_networks: networks_store::DisabledNetworks,
+    /// This machine's single-node lock, held for as long as the app runs.
+    /// One node per machine: while the desktop app is up it *is* the node, so
+    /// the Always-On service must not also run one (two nodes advertise the
+    /// same identity and fight, and then nothing connects). Released on exit so
+    /// the service can take back over.
+    node_lock: Mutex<Option<allmystuff_node::instance::NodeInstanceLock>>,
+    /// Set when we stopped a running Always-On service to take the machine, so
+    /// we restart it on exit and headless always-on resumes.
+    resume_service_on_exit: std::sync::atomic::AtomicBool,
 }
 
 fn unwrap_response(resp: Response) -> Result<Value, String> {
@@ -1084,6 +1093,64 @@ async fn service_status() -> Result<Value, String> {
     .map_err(|e| format!("service status task failed: {e}"))
 }
 
+/// Make this machine's node be *us* (the desktop app) — the single node per
+/// machine. Returns `true` once we hold the machine lock (start the mesh) and
+/// `false` if we yielded to the Always-On service (don't start a second mesh).
+///
+/// If the Always-On service is already running its node, we take the machine
+/// from it where that costs no privilege — Linux user-systemd and a macOS
+/// LaunchAgent both stop without elevation — and restart it on exit so headless
+/// always-on resumes. On Windows the service needs admin to stop (`sc stop`), so
+/// rather than throw a UAC prompt on every launch we leave the service as the
+/// node and yield; the machine stays connected, and turning Always On off (the
+/// existing, intentional flow) hands control back to the window.
+async fn claim_machine(handle: &tauri::AppHandle) -> bool {
+    use std::sync::atomic::Ordering;
+    if let Some(lock) = allmystuff_node::instance::acquire() {
+        handle.state::<AppState>().node_lock.lock().replace(lock);
+        return true;
+    }
+
+    #[cfg(not(windows))]
+    {
+        tracing::info!(
+            "Always-On service holds this machine; stopping it so the desktop app is the single node"
+        );
+        let stopped = tokio::task::spawn_blocking(|| service_mutate_blocking("stop"))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        if stopped {
+            handle
+                .state::<AppState>()
+                .resume_service_on_exit
+                .store(true, Ordering::SeqCst);
+        }
+        // The service's `serve` process exits and frees the machine; the stop
+        // returns before that settles, so retry briefly.
+        for _ in 0..50 {
+            if let Some(lock) = allmystuff_node::instance::acquire() {
+                handle.state::<AppState>().node_lock.lock().replace(lock);
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tracing::warn!("couldn't claim the node lock after stopping the service — yielding");
+        false
+    }
+
+    #[cfg(windows)]
+    {
+        tracing::info!(
+            "Always-On service owns this machine's node — yielding (turn Always On off to drive it from here)"
+        );
+        let _ = handle.emit("allmystuff://always-on-active", json!({}));
+        false
+    }
+}
+
 /// Map a UI verb to the shared crate's command (user scope; Windows ignores it).
 fn service_cmd(verb: &str) -> Option<allmystuff_service::ServiceCmd> {
     use allmystuff_service::ServiceCmd;
@@ -1390,6 +1457,8 @@ fn main() {
             client: client.clone(),
             daemon_child: Mutex::new(None),
             disabled_networks: networks_store::DisabledNetworks::load(),
+            node_lock: Mutex::new(None),
+            resume_service_on_exit: std::sync::atomic::AtomicBool::new(false),
         })
         .manage(window_behavior::WindowBehavior::load())
         .on_window_event(handle_window_event)
@@ -1495,6 +1564,20 @@ fn main() {
             app.manage(mesh.clone());
             let client = client.clone();
             tauri::async_runtime::spawn(async move {
+                // One node per machine. While the desktop app is open it is the
+                // node, so claim the machine before bringing up the daemon/mesh.
+                // If the Always-On service already runs this machine's node,
+                // `claim_machine` takes it over where it can (and restarts the
+                // service on exit) or yields — either way we never bring up a
+                // second mesh against the same identity.
+                if !claim_machine(&handle).await {
+                    tracing::info!(
+                        "desktop app is yielding its node to the Always-On service; \
+                         turn Always On off to drive this machine from the app"
+                    );
+                    return;
+                }
+
                 match daemon_spawn::ensure_daemon_running(&client).await {
                     Ok(child) => {
                         if let Some(child) = child {
@@ -1524,9 +1607,19 @@ fn main() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 let state = app.state::<AppState>();
+                // Free the machine first so the Always-On service can re-take it.
+                state.node_lock.lock().take();
                 let child = state.daemon_child.lock().take();
                 if let Some(c) = child {
                     drop(c);
+                }
+                // Resume the Always-On service we stopped on the way in, so
+                // headless always-on comes back once the window is gone.
+                if state
+                    .resume_service_on_exit
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = service_mutate_blocking("start");
                 }
             }
         });
