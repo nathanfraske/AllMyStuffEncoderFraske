@@ -1,0 +1,13 @@
+# Build-script environment for the node workspace.
+#
+# CMAKE_POLICY_VERSION_MINIMUM: audiopus_sys (the opus crate's libopus build)
+# vendors a CMakeLists whose `cmake_minimum_required` predates 3.5, which
+# CMake 4.x refuses outright (macOS/Homebrew and recent Windows cmakes hit
+# this; CMake 3.x only warns). This is CMake's own documented escape hatch,
+# read from the environment since 4.0 — older cmakes ignore it. The GUI
+# workspace (`gui/src-tauri/.cargo/config.toml`) carries the same setting; the
+# node workspace needs its own because it builds independently (`just dev`
+# builds `allmystuff-serve` here, `just serve`/`just node-check` build it too).
+# Drop this when audiopus_sys ships a fixed CMakeLists.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
