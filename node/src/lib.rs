@@ -35,6 +35,7 @@ pub mod input_inject;
 pub mod instance;
 pub mod mesh;
 pub mod networks_store;
+pub mod node_control;
 pub mod ownership;
 pub mod shares;
 pub mod sites;

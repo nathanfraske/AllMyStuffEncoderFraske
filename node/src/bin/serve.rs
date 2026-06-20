@@ -42,6 +42,8 @@ use std::sync::Arc;
 use allmystuff_node::control_client::ControlClient;
 use allmystuff_node::daemon_spawn::{self, DaemonChild};
 use allmystuff_node::mesh::Mesh;
+use allmystuff_node::networks_store::DisabledNetworks;
+use allmystuff_node::node_control::{self, SocketSink};
 use allmystuff_node::UiSink;
 
 /// Headless event sink. The engine's events (`allmystuff://session`,
@@ -223,10 +225,30 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         }
     };
 
-    // Wire the engine to a headless sink and bring the session online
-    // (subscribe, advertise presence + capabilities, start the event pump).
-    let mesh = Mesh::new(client.clone(), Arc::new(LogSink));
+    // Wire the engine to a sink that both logs (the headless `LogSink`) and
+    // broadcasts every event to clients of the node control socket — the seam
+    // a thin GUI drives the node over (Phase A). The broadcaster is shared
+    // with the control server spawned below, and `DisabledNetworks` is the
+    // park store the server's `network_set_enabled` command needs.
+    let broadcaster = node_control::new_broadcaster();
+    let disabled = Arc::new(DisabledNetworks::load());
+    let sink = SocketSink::new(Arc::new(LogSink), broadcaster.clone());
+    let mesh = Mesh::new(client.clone(), Arc::new(sink));
     mesh.clone().start().await;
+
+    // Serve the node control + event socket so a future thin GUI can drive
+    // this node over it instead of running its own in-process mesh. Additive:
+    // the existing single-instance lock/wait above is unchanged for now.
+    tokio::spawn({
+        let mesh = mesh.clone();
+        let client = client.clone();
+        let disabled = disabled.clone();
+        async move {
+            if let Err(e) = node_control::serve(mesh, client, disabled, broadcaster).await {
+                tracing::warn!("node control socket stopped: {e:#}");
+            }
+        }
+    });
 
     // Self-update ticker: a headless node checks the release feed on its own
     // and, unlike the desktop app's "stage + offer relaunch", *applies* what
