@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::tokio::Listener;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
@@ -417,8 +418,9 @@ impl WireResponse {
 // SocketSink — the node's UiSink, fanning events to every event connection
 // ---------------------------------------------------------------------------
 
-/// The set of subscribed event connections' senders. The server registers a
-/// sender per event connection; [`SocketSink`] pushes to all of them.
+/// The subscribed event connections' senders — the fan-out task's registry,
+/// shared with [`serve`]'s accept loop (each event connection pushes its
+/// sender here, [`fan_out`] writes to them).
 pub type Broadcaster = Arc<Mutex<Vec<mpsc::Sender<NodeEvent>>>>;
 
 /// Build a fresh, empty broadcaster.
@@ -426,60 +428,78 @@ pub fn new_broadcaster() -> Broadcaster {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// Create the ordered event hand-off: the sender a [`SocketSink`] pushes every
+/// engine event into, and the receiver [`serve`]'s [`fan_out`] task drains.
+/// Unbounded so `emit` (the [`UiSink`] contract is non-blocking) never stalls
+/// the engine; FIFO so events reach subscribers in the order they happened.
+pub fn event_channel() -> (
+    mpsc::UnboundedSender<NodeEvent>,
+    mpsc::UnboundedReceiver<NodeEvent>,
+) {
+    mpsc::unbounded_channel()
+}
+
 /// The node's [`UiSink`]: every engine event is both logged (via the wrapped
-/// `inner` sink — the binary's `LogSink`) **and** broadcast to every connected
-/// event subscriber, so a thin GUI sees exactly what the headless node logs.
+/// `inner` sink — the binary's `LogSink`) **and** handed to the fan-out task,
+/// which streams it to every connected event subscriber, so a thin GUI sees
+/// exactly what the headless node logs.
 ///
 /// `restart` is delegated: the node binary owns re-exec, so [`SocketSink`]
-/// broadcasts a [`NodeEvent::Restart`] to subscribers (so a GUI can relaunch
-/// its window) and then hands off to `inner.restart()`, which never returns.
+/// signals a [`NodeEvent::Restart`] to subscribers (so a GUI can relaunch its
+/// window) and then hands off to `inner.restart()`, which never returns.
 pub struct SocketSink {
     /// The wrapped sink — the binary's `LogSink`, which owns re-exec.
-    pub inner: Arc<dyn UiSink>,
-    /// The subscribed event connections.
-    pub broadcaster: Broadcaster,
+    inner: Arc<dyn UiSink>,
+    /// Ordered hand-off to the fan-out task. `emit` is called from many engine
+    /// tasks at once; funnelling every event through one FIFO queue (rather
+    /// than spawning a task per event, which the runtime may then reorder) is
+    /// what keeps them in order on the wire — a stale session snapshot
+    /// arriving *after* a newer one would mis-paint the GUI.
+    tx: mpsc::UnboundedSender<NodeEvent>,
 }
 
 impl SocketSink {
-    /// Wrap `inner` (the node binary's `LogSink`) and share `broadcaster` with
-    /// the [`serve`] accept loop.
-    pub fn new(inner: Arc<dyn UiSink>, broadcaster: Broadcaster) -> Self {
-        Self { inner, broadcaster }
-    }
-
-    /// Push one event to every subscriber, dropping any whose receiver is
-    /// gone. `try_send` (not `send`) so the sink never blocks the engine — a
-    /// subscriber that can't keep up loses the event rather than stalling the
-    /// node, exactly as a fire-and-forget `app.emit` would.
-    fn broadcast(&self, ev: NodeEvent) {
-        let broadcaster = self.broadcaster.clone();
-        // The UiSink contract is non-blocking; hop the async lock + sends onto
-        // the runtime so `emit` returns immediately.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let mut subs = broadcaster.lock().await;
-                subs.retain(|tx| tx.try_send(ev.clone()).is_ok() || !tx.is_closed());
-            });
-        }
+    /// Wrap `inner` (the node binary's `LogSink`); events flow through `tx` to
+    /// the fan-out task [`serve`] runs. Build the pair with [`event_channel`].
+    pub fn new(inner: Arc<dyn UiSink>, tx: mpsc::UnboundedSender<NodeEvent>) -> Self {
+        Self { inner, tx }
     }
 }
 
 impl UiSink for SocketSink {
     fn emit(&self, event: &str, payload: Value) {
         self.inner.emit(event, payload.clone());
-        self.broadcast(NodeEvent::Emit {
+        // Non-blocking + ordered: a dropped receiver (no fan-out running) just
+        // discards, exactly like a UI with no listener.
+        let _ = self.tx.send(NodeEvent::Emit {
             event: event.to_string(),
             payload,
         });
     }
 
     fn restart(&self) -> ! {
-        // Best-effort: tell subscribers to relaunch before we re-exec. The
-        // broadcast hops onto the runtime, so give it a beat to flush, then
-        // delegate to the inner sink (which re-execs and never returns).
-        self.broadcast(NodeEvent::Restart);
+        // Tell subscribers to relaunch before we re-exec, give the fan-out a
+        // beat to flush it, then delegate to the inner sink (re-execs, never
+        // returns).
+        let _ = self.tx.send(NodeEvent::Restart);
         std::thread::sleep(Duration::from_millis(100));
         self.inner.restart()
+    }
+}
+
+/// Drain the ordered event queue and fan each event out to every subscribed
+/// connection, in order. One task, one queue — so all subscribers observe
+/// events in the same order the engine produced them. A subscriber whose buffer
+/// is full loses the event (`try_send`, never block the fan-out) rather than
+/// stalling every other subscriber; a disconnected one is reaped.
+async fn fan_out(mut rx: mpsc::UnboundedReceiver<NodeEvent>, broadcaster: Broadcaster) {
+    while let Some(ev) = rx.recv().await {
+        let mut subs = broadcaster.lock().await;
+        subs.retain(|tx| match tx.try_send(ev.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true, // alive, just behind
+            Err(mpsc::error::TrySendError::Closed(_)) => false, // gone — reap it
+        });
     }
 }
 
@@ -487,28 +507,54 @@ impl UiSink for SocketSink {
 // The server
 // ---------------------------------------------------------------------------
 
-/// Bind the node control socket and accept connections forever, each on its
-/// own task. The first frame of every connection is a [`NodeRequest`]: the
+/// Bind the node control socket, enforcing **one node per machine**: the bind
+/// itself is the guard (there is no separate lock). If a *live* node already
+/// answers the socket, this machine is already served — the bind fails with an
+/// error the caller treats as "step aside, don't start a second mesh". A
+/// *stale* socket file (a crashed node) is cleared and the bind retried.
+///
+/// This is race-safe: two nodes starting at once both try to create the name;
+/// the first wins and the second's create fails, probes the now-live winner,
+/// and steps aside.
+pub async fn bind_control_socket() -> Result<Listener> {
+    let addr = node_socket_addr()?;
+    match ListenerOptions::new().name(addr.to_name()?).create_tokio() {
+        Ok(listener) => Ok(listener),
+        Err(_) => {
+            // The name is taken. A node that answers owns the machine; a name
+            // taken by nothing live is a corpse from a crash — clear it and
+            // bind once more.
+            if NodeClient::probe().await {
+                bail!("another allmystuff node already owns this machine's control socket");
+            }
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(addr.path());
+            }
+            ListenerOptions::new()
+                .name(addr.to_name()?)
+                .create_tokio()
+                .context("bind the node control socket")
+        }
+    }
+}
+
+/// Accept connections on an already-bound `listener` forever, each on its own
+/// task, and run the [`fan_out`] task that streams engine events to
+/// subscribers. The first frame of every connection is a [`NodeRequest`]: the
 /// [`SUBSCRIBE_EVENTS`] sentinel turns it into a long-lived event stream;
-/// anything else is dispatched as a one-shot command and the connection
-/// closes after its response.
+/// anything else is dispatched as a one-shot command and the connection closes
+/// after its response.
 pub async fn serve(
+    listener: Listener,
     mesh: Arc<Mesh>,
     client: Arc<ControlClient>,
     disabled: Arc<DisabledNetworks>,
     broadcaster: Broadcaster,
+    event_rx: mpsc::UnboundedReceiver<NodeEvent>,
 ) -> Result<()> {
-    let addr = node_socket_addr()?;
-    // A stale socket file from a crashed run blocks the bind; clear it first,
-    // exactly like the daemons do (the path is ours — the per-machine node).
-    #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file(addr.path());
-    }
-    let listener = ListenerOptions::new()
-        .name(addr.to_name()?)
-        .create_tokio()
-        .context("bind the node control socket")?;
+    // Drain the engine's ordered event queue out to every subscribed client.
+    tokio::spawn(fan_out(event_rx, broadcaster.clone()));
     tracing::info!("node control socket listening");
 
     loop {
