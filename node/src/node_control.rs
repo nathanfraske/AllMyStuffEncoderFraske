@@ -1212,28 +1212,85 @@ fn tie_node_lifetime(_child: &Child) {
     // kernel-level equivalent.
 }
 
-/// Locate the `allmystuff-serve` node binary: next to the current executable
-/// first (`allmystuff-serve{.exe}`), else on `$PATH`. Simpler than
-/// [`crate::daemon_spawn::find_daemon_binary`] — the node ships beside us, not
-/// as a bundled sidecar.
+/// A real, non-empty binary — not the zero-byte sidecar stub the GUI's
+/// `build.rs` writes when `allmystuff-serve` wasn't built (spawning that stub is
+/// exactly the "node never came up" failure).
+fn usable(p: &std::path::Path) -> bool {
+    p.metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Locate the `allmystuff-serve` node binary. It ships the same way the
+/// `myownmesh` daemon does — a Tauri sidecar beside the app — so this mirrors
+/// [`crate::daemon_spawn::find_daemon_binary`], with one twist: unlike the
+/// fetched daemon, the node is built *locally*, so a dev run's freshest copy is
+/// in the sibling `node/target`, which we prefer over a possibly-stale sidecar:
+///
+///  1. `ALLMYSTUFF_SERVE_BIN` override.
+///  2. **Sibling node build** — `node/target/{release,debug}/allmystuff-serve`
+///     (what `just dev` builds; the build-time manifest dir is `<repo>/node`,
+///     so this path only exists on a dev machine).
+///  3. **Bundled sidecar** beside the running exe — `allmystuff-serve-<triple>`
+///     (dev staging) or plain `allmystuff-serve{.exe}` (production bundle).
+///  4. **Dev source slot** — `gui/src-tauri/binaries/allmystuff-serve-<triple>`.
+///  5. `allmystuff-serve` on `$PATH` (an installed copy).
+///
+/// Every candidate is checked with [`usable`] so a stub is skipped.
 fn find_node_binary() -> Option<PathBuf> {
-    let exe = if cfg!(windows) {
-        "allmystuff-serve.exe"
-    } else {
-        "allmystuff-serve"
-    };
+    let exe = format!("allmystuff-serve{}", std::env::consts::EXE_SUFFIX);
+    let exe_triple = format!(
+        "allmystuff-serve-{}{}",
+        env!("DAEMON_SIDECAR_TRIPLE"),
+        std::env::consts::EXE_SUFFIX
+    );
+
+    // 1. Override.
+    if let Some(p) = std::env::var_os("ALLMYSTUFF_SERVE_BIN") {
+        let p = PathBuf::from(p);
+        if usable(&p) {
+            return Some(p);
+        }
+    }
+
+    // 2. Sibling node build (freshest in dev; `CARGO_MANIFEST_DIR` is `<repo>/node`).
+    let node_target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    for profile in ["release", "debug"] {
+        let p = node_target.join(profile).join(&exe);
+        if usable(&p) {
+            return Some(p);
+        }
+    }
+
+    // 3. Bundled sidecar beside the running app binary (dev triple, then plain).
     if let Ok(cur) = std::env::current_exe() {
         if let Some(dir) = cur.parent() {
-            let p = dir.join(exe);
-            if p.is_file() {
-                return Some(p);
+            for name in [exe_triple.as_str(), exe.as_str()] {
+                let p = dir.join(name);
+                if usable(&p) {
+                    return Some(p);
+                }
             }
         }
     }
+
+    // 4. Dev source slot the GUI's build.rs stages into.
+    if let Some(root) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
+        let p = root
+            .join("gui")
+            .join("src-tauri")
+            .join("binaries")
+            .join(&exe_triple);
+        if usable(&p) {
+            return Some(p);
+        }
+    }
+
+    // 5. PATH.
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(exe);
-            if candidate.exists() {
+            let candidate = dir.join(&exe);
+            if usable(&candidate) {
                 return Some(candidate);
             }
         }

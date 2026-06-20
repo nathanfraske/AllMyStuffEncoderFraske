@@ -28,18 +28,23 @@ setup:
 setup:
     @& .\scripts\bootstrap.ps1
 
-# Run the desktop app (Tauri + Svelte) with hot reload. The mesh daemon is
-# bundled automatically (build.rs fetches the rev pinned in .myownmesh-rev
-# the first time — slowest part of the first run), and the GUI auto-spawns
-# it. So `just dev` gives you the full app with live mesh, no extra steps.
+# Run the desktop app (Tauri + Svelte) with hot reload. We build the
+# `allmystuff-serve` node binary first: the GUI is a thin client that spawns it
+# (one node per machine), and the GUI's build.rs bundles whatever's in
+# `node/target` as a sidecar — so without this the app would ship a stub and
+# spawn nothing. The mesh daemon underneath is still bundled automatically
+# (build.rs fetches the rev pinned in .myownmesh-rev the first time), and the
+# node spawns it. So `just dev` gives you the full app with live mesh.
 [unix]
-[doc("Run the app with hot reload (mesh daemon bundled automatically).")]
+[doc("Run the app with hot reload (node + mesh daemon bundled automatically).")]
 dev *ARGS:
+    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve
     @cd gui && pnpm install --silent && pnpm tauri dev {{ARGS}}
 
 [windows]
-[doc("Run the app with hot reload (mesh daemon bundled automatically).")]
+[doc("Run the app with hot reload (node + mesh daemon bundled automatically).")]
 dev *ARGS:
+    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve
     @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
 
 # Build the library workspace (no webview / Tauri compile).
