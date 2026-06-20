@@ -78,6 +78,29 @@ caps:
 serve *ARGS:
     @cargo run --manifest-path node/Cargo.toml --bin allmystuff-serve -- {{ARGS}}
 
+# Stop this machine's whole mesh stack: the AllMyStuff node (`allmystuff-serve`)
+# and the `myownmesh` daemon it spawns. Use it for a clean slate between `just
+# dev` runs, or to clear an *orphaned* daemon — on macOS a hard Ctrl-C out of
+# `just dev` can leave the daemon running (no kernel parent-death signal there),
+# and the next run silently reuses it. The node is SIGTERM'd first so it shuts
+# down cleanly (which kills its own daemon child); then any leftover daemon is
+# swept. Killing the daemon alone is pointless in dev — the node doesn't respawn
+# it — so this always takes down both; restart with `just dev`.
+[unix]
+[doc("Kill this machine's mesh stack (node + myownmesh daemon).")]
+kill:
+    @pkill -TERM -f '[a]llmystuff-serve' 2>/dev/null; pkill -f '[m]yownmesh.* serve' 2>/dev/null; echo 'stopped the node + mesh daemon (whatever was running)'
+
+[windows]
+[doc("Kill this machine's mesh stack (node + myownmesh daemon).")]
+kill:
+    @Get-Process allmystuff-serve,myownmesh,myownmesh-* -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output "mesh stack stopped (allmystuff-serve + myownmesh)"; exit 0
+
+# Clean restart: kill the mesh stack, then start the app fresh.
+[doc("Kill the mesh stack, then `just dev`.")]
+restart *ARGS: kill
+    @just dev {{ARGS}}
+
 fmt:
     @cargo fmt --all
 
