@@ -50,11 +50,58 @@ $guiAsset = "allmystuff-gui-windows-$arch.zip"
 $serveAsset = "allmystuff-serve-windows-$arch.zip"
 $meshAsset = "myownmesh-windows-$arch.zip"
 
+# Extract a release zip over $Prefix, retrying briefly. Windows can keep a file
+# lock for a moment after a process exits, so a just-stopped .exe may not have
+# released yet; a few retries beat a spurious "Access ... denied".
+function Expand-Over([string]$zipPath) {
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            Expand-Archive -Path $zipPath -DestinationPath $Prefix -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($i -eq 4) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+# Stop a running AllMyStuff before overwriting its binaries. Windows locks a
+# running .exe, so extracting over allmystuff-gui.exe / allmystuff-serve.exe /
+# myownmesh.exe while the app, node, or daemon is up fails with "Access ...
+# denied" — exactly what an in-place reinstall/update hits. Stop the Always-On
+# service first (so it can't respawn the node mid-install), then the app, node,
+# and daemon. Returns $true if the Always-On service was running, so the caller
+# can bring it back on the new binary afterward.
+function Stop-AllMyStuff {
+    $serviceWasRunning = $false
+    $svc = Get-Service -Name "AllMyStuff" -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        Log "Stopping the Always-On service so its binaries can be replaced"
+        $serviceWasRunning = $true
+        try { Stop-Service -Name "AllMyStuff" -Force -ErrorAction Stop }
+        catch { & sc.exe stop AllMyStuff *> $null }
+    }
+    # The desktop app, the node, and the mesh daemon (release name + the dev
+    # `myownmesh-<triple>` name). Leave the short-lived `allmystuff` CLI alone —
+    # it installs fine and may be the very process running this installer
+    # (e.g. `allmystuff update`).
+    $names = @("allmystuff-gui", "allmystuff-serve", "myownmesh", "myownmesh-*")
+    $procs = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+    if ($procs.Count -gt 0) {
+        $which = ($procs | Select-Object -ExpandProperty ProcessName -Unique) -join ', '
+        Log "Stopping running processes so their .exe files unlock: $which"
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Give Windows a moment to release the file handles before we overwrite.
+        Start-Sleep -Milliseconds 800
+    }
+    return $serviceWasRunning
+}
+
 function Install-FromZip([string]$zipPath) {
     if (-not (Test-Path $Prefix)) {
         New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
     }
-    Expand-Archive -Path $zipPath -DestinationPath $Prefix -Force
+    Expand-Over $zipPath
     $exe = Join-Path $Prefix "allmystuff.exe"
     if (-not (Test-Path $exe)) {
         throw "allmystuff.exe not found in $zipPath after extraction"
@@ -74,7 +121,7 @@ function Install-GuiFromZip([string]$zipPath) {
     if (-not (Test-Path $Prefix)) {
         New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
     }
-    Expand-Archive -Path $zipPath -DestinationPath $Prefix -Force
+    Expand-Over $zipPath
     $exe = Join-Path $Prefix "allmystuff-gui.exe"
     if (-not (Test-Path $exe)) {
         throw "allmystuff-gui.exe not found in $zipPath after extraction"
@@ -86,7 +133,7 @@ function Install-ServeFromZip([string]$zipPath) {
     if (-not (Test-Path $Prefix)) {
         New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
     }
-    Expand-Archive -Path $zipPath -DestinationPath $Prefix -Force
+    Expand-Over $zipPath
     $exe = Join-Path $Prefix "allmystuff-serve.exe"
     if (-not (Test-Path $exe)) {
         throw "allmystuff-serve.exe not found in $zipPath after extraction"
@@ -338,7 +385,7 @@ function Try-ReleaseMesh {
             }
             Log "SHA256 OK"
         }
-        Expand-Archive -Path $zip -DestinationPath $Prefix -Force
+        Expand-Over $zip
         $exe = Join-Path $Prefix "myownmesh.exe"
         if (-not (Test-Path $exe)) {
             Warn "myownmesh.exe not found in $meshAsset after extraction."
@@ -457,6 +504,13 @@ function Build-FromSource {
     }
 }
 
+# Stop a running app/node/daemon (and the Always-On service) first, so we never
+# try to overwrite a locked, in-use .exe. Skipped on a dry run.
+$serviceWasRunning = $false
+if (-not $DryRun) {
+    $serviceWasRunning = Stop-AllMyStuff
+}
+
 $installedFromRelease = $false
 if ($FromSource -or -not (Try-Release)) {
     Build-FromSource
@@ -512,6 +566,14 @@ if ($NoMesh) {
 } else {
     Log "Mesh: skipped — neither the desktop app nor the node binary was"
     Log "installed (only they use the daemon; scan/capabilities don't)."
+}
+
+# If we stopped the Always-On service to replace its binaries, bring it back on
+# the new build so headless always-on resumes.
+if ($serviceWasRunning -and -not $DryRun) {
+    Log "Restarting the Always-On service on the updated binary"
+    try { Start-Service -Name "AllMyStuff" -ErrorAction Stop }
+    catch { & sc.exe start AllMyStuff *> $null }
 }
 
 if (-not $NoGui) {
