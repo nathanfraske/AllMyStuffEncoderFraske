@@ -316,16 +316,23 @@ async fn wait_for_shutdown_signal() {
 /// Initialise tracing. A console build logs to stderr; a Windows service has no
 /// console, so it logs to a file under `%ProgramData%\AllMyStuff\logs\`.
 fn init_logging(as_service: bool) {
+    use tracing_subscriber::prelude::*;
+
     let filter = tracing_subscriber::EnvFilter::new(resolve_log_filter());
 
+    // Windows service: no console, so keep logging to the dedicated service
+    // file (system-wide under %ProgramData%) exactly as before.
     #[cfg(windows)]
     if as_service {
         if let Some(make) = winsvc::log_writer() {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_ansi(false)
-                .with_writer(make)
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(false)
+                        .with_ansi(false)
+                        .with_writer(make),
+                )
                 .init();
             return;
         }
@@ -334,10 +341,48 @@ fn init_logging(as_service: bool) {
     #[cfg(not(windows))]
     let _ = as_service;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    // Foreground or — crucially — spawned by the desktop app as a console-less
+    // child (CREATE_NO_WINDOW): log to stdout (visible when there *is* a
+    // console, e.g. `allmystuff serve` in a terminal or `just dev`) AND always
+    // to a file under ~/.myownmesh/logs/, so the node leaves a findable log
+    // even when nothing's watching its stdout. That file is the fix for the
+    // long-standing "I can't see the node's logs on Windows when it doesn't
+    // work" gap — the node now runs out-of-process, so its log has to land
+    // somewhere on disk. If the home dir can't be resolved we just use stdout.
+    let file_layer = node_log_writer().map(|make| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(make)
+    });
+    let stdout_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
+}
+
+/// A `MakeWriter` over `~/.myownmesh/logs/node.log` (honoring `MYOWNMESH_HOME`,
+/// beside the node socket and the ownership/shares stores), truncated once per
+/// start so each node run leaves a clean, bounded log. `None` — logging falls
+/// back to stdout only — if the home dir can't be resolved or the file opened.
+fn node_log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static> {
+    let dir = std::env::var_os("MYOWNMESH_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)?
+        .join(".myownmesh")
+        .join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("node.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .ok()?;
+    Some(move || file.try_clone().expect("clone node log file handle"))
 }
 
 /// The log filter: `--log <filter>` wins, then `ALLMYSTUFF_LOG`, then a quiet

@@ -1080,6 +1080,16 @@ impl Mesh {
                     // is owner/fleet-only, the same rule as input injection,
                     // enforced before any reply exists.
                     if let ControlMessage::Route(RouteControl::Offer { route, .. }) = &msg {
+                        // Log every inbound offer at the point it's received, so
+                        // a host's node log shows whether an offer even arrived
+                        // (vs. an offerer stuck "awaiting accept" because nothing
+                        // here ever processed it). The accept itself is silent
+                        // otherwise; a refusal logs the warn below.
+                        tracing::info!(
+                            route = %route.id,
+                            from = %short_id(&from),
+                            "route offer received"
+                        );
                         let hosts_here = self
                             .local_node_id()
                             .is_some_and(|me| node_of(route.from.as_str()) == me);
