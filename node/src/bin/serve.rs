@@ -230,9 +230,15 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         let client = client.clone();
         let disabled = disabled.clone();
         async move {
-            if let Err(e) =
-                node_control::serve(control_listener, mesh, client, disabled, broadcaster, event_rx)
-                    .await
+            if let Err(e) = node_control::serve(
+                control_listener,
+                mesh,
+                client,
+                disabled,
+                broadcaster,
+                event_rx,
+            )
+            .await
             {
                 tracing::warn!("node control socket stopped: {e:#}");
             }

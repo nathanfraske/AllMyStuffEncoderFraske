@@ -93,9 +93,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// clean EOF *before any byte of a frame* — a peer that hung up between frames,
 /// not a truncated one (a partial frame is an error). Rejects a length past
 /// [`MAX_FRAME_LEN`] before allocating.
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>> {
     let mut len_buf = [0u8; 4];
     // A clean hangup right at a frame boundary is a normal end of stream.
     match r.read_exact(&mut len_buf).await {
@@ -269,8 +267,7 @@ impl NodeClient {
         if tag != TAG_JSON {
             bail!("node sent a {tag} frame where a JSON response was expected");
         }
-        let resp: WireResponse =
-            serde_json::from_slice(&payload).context("parse node response")?;
+        let resp: WireResponse = serde_json::from_slice(&payload).context("parse node response")?;
         if resp.ok {
             Ok(resp.result)
         } else {
@@ -288,9 +285,9 @@ impl NodeClient {
             TAG_JSON => {
                 let resp: WireResponse =
                     serde_json::from_slice(&payload).context("parse node response")?;
-                Err(anyhow!(resp
-                    .error
-                    .unwrap_or_else(|| "node returned JSON where bytes were expected".into())))
+                Err(anyhow!(resp.error.unwrap_or_else(|| {
+                    "node returned JSON where bytes were expected".into()
+                })))
             }
             other => bail!("node sent a {other} frame where raw bytes were expected"),
         }
@@ -335,8 +332,7 @@ impl NodeClient {
         if tag != TAG_JSON {
             bail!("subscribe ack wasn't a JSON frame");
         }
-        let ack: WireResponse =
-            serde_json::from_slice(&payload).context("parse subscribe ack")?;
+        let ack: WireResponse = serde_json::from_slice(&payload).context("parse subscribe ack")?;
         if !ack.ok {
             return Err(anyhow!(
                 "subscribe rejected: {}",
@@ -883,12 +879,11 @@ pub async fn dispatch(
                 Err(e) => DispatchOut::Err(e.to_string()),
             }
         }
-        "site_exposed" => json_result::<std::collections::BTreeMap<String, String>>(Ok(
-            mesh.site_exposed(),
-        )),
+        "site_exposed" => {
+            json_result::<std::collections::BTreeMap<String, String>>(Ok(mesh.site_exposed()))
+        }
         "site_set_exposed" => {
-            let exposed: std::collections::BTreeMap<String, String> =
-                try_arg!(arg(a, "exposed"));
+            let exposed: std::collections::BTreeMap<String, String> = try_arg!(arg(a, "exposed"));
             json_result::<std::collections::BTreeMap<String, String>>(Ok(mesh
                 .site_set_exposed(exposed)
                 .await))
@@ -922,8 +917,7 @@ pub async fn dispatch(
         }
         "site_remote_set_exposed" => {
             let node: String = try_arg!(arg(a, "node"));
-            let exposed: std::collections::BTreeMap<String, String> =
-                try_arg!(arg(a, "exposed"));
+            let exposed: std::collections::BTreeMap<String, String> = try_arg!(arg(a, "exposed"));
             json_result(mesh.site_remote_set_exposed(node, exposed).await)
         }
 
@@ -993,12 +987,14 @@ pub async fn dispatch(
             let network: String = try_arg!(arg(a, "network"));
             daemon_request(client, Request::RosterList { network }).await
         }
-        "mesh_network_id_generate" => {
-            daemon_request(client, Request::NetworkIdGenerate).await
-        }
+        "mesh_network_id_generate" => daemon_request(client, Request::NetworkIdGenerate).await,
         "mesh_network_add" => {
             let config: Value = try_arg!(arg(a, "config"));
-            sync_after(mesh, daemon_request(client, Request::NetworkAdd { config }).await).await
+            sync_after(
+                mesh,
+                daemon_request(client, Request::NetworkAdd { config }).await,
+            )
+            .await
         }
         "mesh_network_update" => {
             let config: Value = try_arg!(arg(a, "config"));
@@ -1081,9 +1077,12 @@ async fn network_set_enabled(
         let Some(config) = disabled.take(&network) else {
             return DispatchOut::Err(format!("'{network}' isn't a disabled network here"));
         };
-        let rejoin = daemon_request(client, Request::NetworkAdd {
-            config: config.clone(),
-        })
+        let rejoin = daemon_request(
+            client,
+            Request::NetworkAdd {
+                config: config.clone(),
+            },
+        )
         .await;
         match rejoin {
             DispatchOut::Json(data) => {
@@ -1126,9 +1125,12 @@ async fn network_set_enabled(
                 "couldn't save the network for later — not disabling it".into(),
             );
         }
-        let left = daemon_request(client, Request::NetworkRemove {
-            network: network.clone(),
-        })
+        let left = daemon_request(
+            client,
+            Request::NetworkRemove {
+                network: network.clone(),
+            },
+        )
         .await;
         match left {
             DispatchOut::Json(data) => {
