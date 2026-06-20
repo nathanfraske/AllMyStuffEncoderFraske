@@ -15,14 +15,19 @@
 //!    ([`clipboard`]), and exposed-service tunnels ([`sites`]);
 //!  * **ownership + the owned fleet** ([`ownership`]).
 //!
-//! The one thing it does *not* own is where node events surface. The GUI
-//! wants them on Tauri's event bus so the Svelte front-end can react; a
-//! headless `allmystuff serve` has no front-end and just logs the handful it
-//! cares about. That seam is the [`UiSink`] trait: [`mesh::Mesh::new`] takes
-//! one, the GUI hands it a Tauri-backed implementation, and the
-//! `allmystuff-serve` binary hands it a logging one. Nothing else in the
-//! engine knows or cares which is wired in — which is exactly why the same
-//! code can run with or without a webview.
+//! The one thing it does *not* own is where node events surface. That seam is
+//! the [`UiSink`] trait: [`mesh::Mesh::new`] takes one and the engine emits
+//! through it, knowing nothing about who (if anyone) listens.
+//!
+//! There is **one node per machine**, and it runs in the `allmystuff-serve`
+//! binary. That binary wires in a [`node_control::SocketSink`], which logs each
+//! event *and* fans it out to every client connected to the node's own control
+//! socket ([`node_control`]). The desktop GUI is a thin client of that socket
+//! ([`node_control::NodeClient`]): it drives the node with one request per
+//! command and re-emits the streamed events onto Tauri's bus, rather than
+//! linking the engine and running a second `Mesh` itself. (It used to do the
+//! latter, with a Tauri-backed sink — but that put two nodes under one identity
+//! on an Always-On machine, and then nothing could connect.)
 
 pub mod audio;
 pub mod byte_queues;
