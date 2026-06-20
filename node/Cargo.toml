@@ -88,6 +88,10 @@ openh264 = "0.9"
 opus = "0.3"
 # Access units ride the daemon control socket as base64.
 base64 = "0.22"
+# Verifying a recorded PID is actually a `myownmesh` process before we
+# signal it — the self-heal gate that lets us replace *our* orphaned
+# daemon without ever touching one we didn't start (and guards PID reuse).
+sysinfo = "0.38"
 # Cross-platform *rich* clipboard — text, image, and file lists — for the
 # clipboard plane. The clipboard-manager bits the GUI used are a webview
 # concern and stay in the GUI; this is the OS-clipboard side the node owns.
@@ -96,13 +100,18 @@ clipboard-rs = "0.2"
 # optimize them — see the crate's manifest.
 allmystuff-pixels = { path = "pixels" }
 
+# `libc::kill` for graceful daemon/node teardown (SIGTERM-then-SIGKILL) and
+# for SIGTERM-ing an orphaned daemon we're replacing — needed on every unix,
+# macOS included (it has no PR_SET_PDEATHSIG, so this is its only lever).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # PR_SET_PDEATHSIG for the daemon lifetime tie (daemon_spawn). libloading
 # dlopens libpulse-simple at runtime for system-audio capture; zbus drives
 # the ScreenCast portal (wayland_capture) and the keep-awake inhibitor
 # (wake); pipewire consumes the portal's stream; xcb makes the DPMS
 # "light the panel" call.
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 libloading = "0.8"
 zbus = "5"
 pipewire = "0.9"
