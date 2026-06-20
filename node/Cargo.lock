@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
