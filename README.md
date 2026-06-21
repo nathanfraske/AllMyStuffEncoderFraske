@@ -11,7 +11,7 @@ Remote desktop, shell, and files for every computer you own — over a private m
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-informational.svg)](#installation)
 [![Built on MyOwnMesh](https://img.shields.io/badge/mesh-MyOwnMesh-6c5ce7.svg)](https://github.com/mrjeeves/MyOwnMesh)
 
-<img src="docs/design/allmystuff-graph.png" width="780" alt="The AllMyStuff graph: each machine is a node; click one to see its hardware and open a session" />
+<img src="docs/design/allmystuff-app.svg" width="720" alt="The AllMyStuff window: each machine is a node on a graph, with live routes between them — a screen stream from den-tower and a file transfer from nas-01" />
 
 </div>
 
