@@ -242,6 +242,44 @@ impl Ownership {
         })
     }
 
+    /// The closed MyOwnMesh network that backs this fleet, derived
+    /// deterministically from the fleet key so every co-owned device computes
+    /// the **same** id without being told it — that is what makes the move to
+    /// closed-network governance self-migrating. `None` when not in a fleet.
+    ///
+    /// This network's signed roster — not the gossiped [`Ownership::fleet`]
+    /// roster — is the authority for who may control this device (see
+    /// `Mesh::sender_may_control`). The gossiped fleet roster is now advisory
+    /// (display / convergence) only.
+    pub fn fleet_network_id(&self) -> Option<String> {
+        let i = self.inner.lock();
+        i.fleet_key.as_deref().map(derive_fleet_network_id)
+    }
+
+    /// The fleet display name, if any (for naming the closed network).
+    pub fn fleet_name(&self) -> String {
+        self.inner.lock().fleet_name.clone()
+    }
+
+    /// Whether this device is the fleet's **owner** — it minted the key and is
+    /// owned by no-one — i.e. the device responsible for founding the fleet's
+    /// closed network and admitting members into its signed roster.
+    pub fn is_fleet_owner(&self) -> bool {
+        let i = self.inner.lock();
+        i.owner.is_none() && i.fleet_key.is_some()
+    }
+
+    /// Canonical member device-ids of the fleet — for the owner to admit into
+    /// the closed-network roster. Empty when not in a fleet.
+    pub fn fleet_member_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .fleet_members
+            .iter()
+            .map(|m| m.device.as_str().to_string())
+            .collect()
+    }
+
     /// Make sure this device has a fleet key, minting a fresh one the first
     /// time (e.g. when it claims its first device). Returns the key.
     pub fn ensure_fleet_key(&self) -> String {
@@ -554,6 +592,21 @@ fn new_fleet_key() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Derive the fleet's closed-network id from its key. Deterministic so every
+/// co-owned device computes the identical id (self-converging migration), and
+/// an *identifier* not a secret (it travels in signaling), so it must not echo
+/// the key — an FNV-1a digest gives a stable, low-collision, dependency-free
+/// 16-char lowercase-hex id that is a valid MyOwnMesh network id charset.
+fn derive_fleet_network_id(key: &str) -> String {
+    // FNV-1a, 64-bit.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing

@@ -127,6 +127,14 @@ pub struct Mesh {
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
+    /// Canonical pubkeys authorised to control this device — the fleet's
+    /// **closed-network signed roster**, cached from the daemon (`RosterList`
+    /// for `ownership.fleet_network_id()`). [`Mesh::sender_may_control`] trusts
+    /// THIS, not the gossiped `ownership.fleet()`, so unauthenticated
+    /// `CHANNEL_OWNED` gossip can no longer grant control — closing the
+    /// fleet-conscription takeover (AMS-01). Refreshed on ownership changes and
+    /// on a periodic tick.
+    fleet_authorized: Mutex<std::collections::HashSet<String>>,
     /// Durable share relationships — who I share with and the grants in each
     /// direction. Node-owned (enforcement lives here), persisted beside the
     /// ownership record, and projected into [`Mesh::snapshot`] so the GUI
@@ -360,6 +368,7 @@ impl Mesh {
                 profile: None,
             }),
             ownership: Arc::new(Ownership::load()),
+            fleet_authorized: Mutex::new(std::collections::HashSet::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
             video_out,
@@ -2399,6 +2408,76 @@ impl Mesh {
         }
         self.emit_owned();
         self.emit_snapshot();
+
+        // Keep the closed-network fleet and its signed-roster cache in step
+        // with this ownership change. Founding (owner-side `NetworkAdd` +
+        // member admits) runs on the broadcast/startup/claim path only; the
+        // authorised-controller cache refresh runs on every check.
+        if peer.is_none() {
+            self.ensure_fleet_network().await;
+        }
+        self.refresh_fleet_authorization().await;
+    }
+
+    /// Make sure the fleet's closed network exists and its signed roster
+    /// reflects the fleet. The **owner** founds it closed and admits each
+    /// member; a **member** just joins (the owner's signed governance converges
+    /// it to closed and admits this device). Idempotent — a duplicate add or
+    /// re-approve is a daemon no-op. Best-effort: failures are logged by the
+    /// daemon and leave control failing closed until the roster is in place.
+    async fn ensure_fleet_network(self: &Arc<Self>) {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return;
+        };
+        let owner = self.ownership.is_fleet_owner();
+        let kind = if owner { "closed" } else { "open" };
+        let config = json!({
+            "id": network.as_str(),
+            "network_id": network.as_str(),
+            "label": self.ownership.fleet_name(),
+            "kind": kind,
+        });
+        // A duplicate `NetworkAdd` (already joined) returns an error we ignore.
+        let _ = self.client.request(&Request::NetworkAdd { config }).await;
+        if owner {
+            // Admit every fleet member into the closed roster — the
+            // authenticated membership `sender_may_control` will trust.
+            for member in self.ownership.fleet_member_ids() {
+                let _ = self
+                    .client
+                    .request(&Request::RosterApprove {
+                        network: network.clone(),
+                        device_id: pubkey_part(&member).to_string(),
+                        label: None,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
+    /// from the fleet's closed-network **signed roster** (`RosterList`). No
+    /// fleet → clear it (only the owner, via the direct check in
+    /// `sender_may_control`, may control). Daemon unreachable → keep the prior
+    /// cache rather than briefly denying a legitimate controller.
+    async fn refresh_fleet_authorization(self: &Arc<Self>) {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            self.fleet_authorized.lock().clear();
+            return;
+        };
+        let data = match self.client.request(&Request::RosterList { network }).await {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return,
+        };
+        let mut set = std::collections::HashSet::new();
+        if let Some(arr) = data.get("roster").and_then(|v| v.as_array()) {
+            for e in arr {
+                if let Some(id) = e.get("device_id").and_then(|v| v.as_str()) {
+                    set.insert(pubkey_part(id).to_string());
+                }
+            }
+        }
+        *self.fleet_authorized.lock() = set;
     }
 
     /// Send this node's presence profile straight to one peer — the
@@ -4751,16 +4830,22 @@ impl Mesh {
     /// Whether `sender` may drive this machine's keyboard and mouse: it is
     /// the recorded owner, or a member of the owned fleet this device
     /// belongs to. Nobody else — not even a peer a route auto-accepted for.
+    /// Whether `sender` may drive this device's privileged planes (terminal,
+    /// files, input, sites, console). Trust comes from **authenticated**
+    /// sources only: the recorded owner, or membership in the fleet's
+    /// closed-network **signed roster** (cached in [`Mesh::fleet_authorized`]
+    /// from the daemon).
+    ///
+    /// The gossiped `ownership.fleet()` roster is deliberately NOT consulted:
+    /// it is adopted from unauthenticated `CHANNEL_OWNED` gossip, which is
+    /// exactly the conscription vector this closes (AMS-01). Fails closed — an
+    /// empty or stale cache denies control rather than guessing.
     fn sender_may_control(&self, sender: &str) -> bool {
         let canon = pubkey_part(sender);
         if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
             return true;
         }
-        self.ownership.fleet().is_some_and(|r| {
-            r.members
-                .iter()
-                .any(|m| pubkey_part(m.device.as_str()) == canon)
-        })
+        self.fleet_authorized.lock().contains(canon)
     }
 
     /// Ask the far end of an inbound display/camera route for a clean
