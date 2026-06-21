@@ -1,49 +1,66 @@
 <div align="center">
 
+<img src="docs/design/logo.png" width="116" alt="AllMyStuff logo" />
+
 # AllMyStuff
 
-### Map everything you own. Wire it together. Share a piece with a friend — and nothing else.
+### All my stuff. Works. — _yours can too._
 
-A friendly desktop app that finds every device on your machines — screens,
-mics (even 4-mic arrays), speakers, cameras, keyboards, drives — lays them
-out as one graph across a private mesh you own, and lets you connect them
-with a tap. Your mic to the studio PC. The living-room TV showing your
-laptop. A **virtual room** holding the kitchen, the office and the garage
-in one call — screens, sound and files shared only when you switch them on.
+One app turns the gear you already own into one quiet system: **see any
+screen, open any shell, reach any file**, from whichever device is in your
+hand. Peer-to-peer between machines you own. Encrypted end to end. And when
+something is truly stuck, a real human is one tap away.
 
-Built on [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh). Pure-Rust core,
-Tauri + Svelte app, auto-updating — the same family as
-[MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM).
-
-[The idea](#the-idea) · [Install](#install) · [The graph](#the-graph) · [Yours vs shared](#yours-vs-shared--authorization-not-authentication) · [Architecture](#architecture) · [Run it](#build--run) · [Releases](https://github.com/mrjeeves/AllMyStuff/releases)
+<br/>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Built on MyOwnMesh](https://img.shields.io/badge/mesh-MyOwnMesh-6c5ce7.svg)](https://github.com/mrjeeves/MyOwnMesh)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-informational.svg)](#install)
+[![Built with](https://img.shields.io/badge/built%20with-Rust%20·%20Tauri%20·%20Svelte-orange.svg)](#architecture)
+[![Price](https://img.shields.io/badge/price-%240%20forever-F11EA1.svg)](#the-bigger-picture)
+[![Releases](https://img.shields.io/github/v/release/mrjeeves/AllMyStuff?label=release&color=success)](https://github.com/mrjeeves/AllMyStuff/releases)
+
+**[The idea](#the-idea)** · **[Install](#install)** · **[See it. Drive it. Share it. Own it.](#see-it-drive-it-share-it-own-it)** · **[Yours vs shared](#yours-vs-shared)** · **[Headless](#headless-serve--service)** · **[Architecture](#architecture)** · **[Status](#status)** · **[Build](#build--run)**
+
+<br/>
+
+<img src="docs/design/allmystuff-graph.png" width="760" alt="The AllMyStuff graph: your machines as nodes, devices wired between them" />
+
+<sub><b>Home is a graph.</b> Every machine is a node; tap a device's dot, tap where it should go, and the wire exists.</sub>
 
 </div>
 
+---
+
 ## The idea
 
-Most "connect your devices" tools are built for network engineers. AllMyStuff
-is built for everyone else. It does three things:
+Most "connect your devices" tools are built for network engineers.
+AllMyStuff is built for everyone else. It does three things:
 
 1. **Finds your stuff.** It scans each machine for *everything plugged in* —
    CPU, GPU, RAM, storage, networks, and the things you actually care about:
    displays, microphones (including beam-forming arrays), speakers, cameras,
    keyboards, mice, and the rest of the USB bus.
 
-2. **Draws it as a graph.** Every machine is a node. Click one and you see
-   its stats and its devices, each with a little **connect dot** you drag to
-   wire it somewhere else on the mesh.
+2. **Draws it as a graph.** Every machine is a node. Click one and you see its
+   stats and its devices, each with a little **connect dot** you drag to wire
+   it somewhere else on the mesh.
 
 3. **Keeps it safe without keys or jargon.** The mesh underneath proves *who*
    each device is, cryptographically — you never see a key. AllMyStuff only
    asks the question a human actually has: **is this mine, or am I sharing
    with someone?**
 
+> **Is this a VPN? A Tailscale?** Same itch, different animal. A VPN answers
+> *"how do my machines reach each other?"* by building a network — a subnet
+> with IPs, ports, and rules to manage. AllMyStuff answers it with **routes**:
+> your devices carry capabilities (a screen, a shell, a folder), and the graph
+> connects exactly the pairs you've granted, for exactly as long as a route is
+> live.
+
 ## Install
 
-One command — detects platform, fetches the binaries from
+One command — detects your platform, fetches the binaries from
 [GitHub Releases](https://github.com/mrjeeves/AllMyStuff/releases),
 verifies SHA-256, drops `allmystuff` **and** the `allmystuff-gui`
 desktop app on your PATH (so a bare `allmystuff` opens the app), and
@@ -51,136 +68,174 @@ brings the mesh along with it.
 
 ```sh
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.sh | sh
+curl -fsSL https://allmystuff.works/install.sh | sh
 ```
 
 ```powershell
 # Windows
-irm https://raw.githubusercontent.com/mrjeeves/AllMyStuff/main/scripts/install.ps1 | iex
+irm https://allmystuff.works/install.ps1 | iex
 ```
 
-**The mesh comes along.** Live machines run on a
-[MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh) daemon, and the
-installer sorts that out too — there is no second install command:
+No account. No card. Not even at install. The app opens straight into a
+populated **demo graph** even with no mesh at all — so you can click around the
+whole experience offline before anything touches your real machines.
 
-- a `myownmesh` that's already installed and recent enough (at or
-  above the version pinned in [`.myownmesh-rev`](.myownmesh-rev)) is
-  **used as-is**;
+<details>
+<summary><b>What the installer actually does</b> (the mesh comes along, no second command)</summary>
+
+<br/>
+
+Live machines run on a [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh)
+daemon, and the installer sorts that out too — there is no second install
+command:
+
+- a `myownmesh` that's already installed and recent enough (at or above the
+  version pinned in [`.myownmesh-rev`](.myownmesh-rev)) is **used as-is**;
 - an older one is **asked to update itself** (`myownmesh update`);
-- none at all → the daemon is **installed next to the app**,
-  downloaded and SHA-256-verified from MyOwnMesh's releases.
+- none at all → the daemon is **installed next to the app**, downloaded and
+  SHA-256-verified from MyOwnMesh's releases.
 
-The app starts and manages the daemon by itself — and from then on
-keeps it current: an installed daemon that's fallen behind the app's
-pin is asked to update itself at launch, before it's started, so a
-stale mesh never quietly costs you features (a too-old daemon lacks
-the media lanes that screens and audio ride). The app opens into a
-populated demo graph even with no mesh at all, so a failed or skipped
-daemon never blocks you from exploring. Pass `--no-mesh` (Unix) /
-`-NoMesh` (Windows) to leave the daemon alone.
+The app starts and manages the daemon by itself, and keeps it current at
+launch, so a stale mesh never quietly costs you features. Pass `--no-mesh`
+(Unix) / `-NoMesh` (Windows) to leave the daemon alone.
 
-The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
-writable) on Unix and `%LOCALAPPDATA%\Programs\AllMyStuff` on
-Windows, and adds the directory to PATH if it isn't already there.
-Every install also drops `allmystuff-serve` — the **headless node**
-that `allmystuff serve` runs (see [Headless](#headless-serve--service)
-below) — and, since both it and the app run on the mesh, the daemon.
-The desktop app goes in by default; pass `--no-gui` (Unix) or `-NoGui`
-(Windows) for a headless box — that skips only the webview app, keeping
-the node and the daemon so `allmystuff serve` works out of the box. The
-GUI binary relies on the system webview (libwebkit2gtk / WebView2 /
-WKWebView); for full OS integration (menu entry, icon, the mesh daemon
-bundled inside the package) grab the `.deb` / `.AppImage` / `.dmg` /
-`.msi` bundle from Releases instead.
-
-Prefer a tarball directly? The portable binaries
-(`allmystuff-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
-[Releases](https://github.com/mrjeeves/AllMyStuff/releases) for the
+The installer writes to `/usr/local/bin` (or `~/.local/bin` if not writable)
+on Unix and `%LOCALAPPDATA%\Programs\AllMyStuff` on Windows, adding the
+directory to PATH if needed. Every install also drops `allmystuff-serve` —
+the **headless node** that `allmystuff serve` runs (see
+[Headless](#headless-serve--service)). Pass `--no-gui` (Unix) / `-NoGui`
+(Windows) for a headless box — that skips only the webview app. For full OS
+integration (menu entry, icon, the daemon bundled inside the package) grab the
+`.deb` / `.AppImage` / `.dmg` / `.msi` bundle from
+[Releases](https://github.com/mrjeeves/AllMyStuff/releases) instead. Prefer a
+tarball? Portable binaries (`allmystuff-<platform>.{tar.gz,zip}` + `.sha256`)
+are on Releases for the
 [same five platforms as MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh#platforms).
 
-## The graph
+</details>
 
-The whole app is one canvas, with two ways to read it: the radial view
-(your machines orbit *this device*, fleets seated together) and a **grouped
-grid** — one labelled band per fleet (yours, each person's, and an
-"unknown fleet" for devices that advertise no owner) — switched from the
-zoom controls.
+## See it. Drive it. Share it. Own it.
 
-- **Click a node** → a drawer with its hardware, the session buttons
-  (**Remote Control · Open Files · Open Terminal**), the live connections
-  running through it, and its devices folded under a count.
-- **Connect a device** → tap its dot, then tap where it should go. AllMyStuff
-  picks the matching endpoint (your mic → that PC's audio-in; that PC's
-  screen → your monitor), draws a glowing wire — and pops the console that
-  manages that kind of session on the far machine.
-- **Make a room** → a zoom-like call between machines you pick — or just
-  this one, inviting others later: **you host the rooms you make** (their
-  identity, roster and name are yours; closing one ends it for everyone),
-  named after your fleet's owner by default, **open or invite-only** —
-  an open room's id *is* the invite (copy it from the panel; pasting one
-  under "Join with an id" knocks, and an invite-only host admits or
-  denies from the People panel). Rooms you made, were invited to, or
-  were *ever* invited to stay on your list like roster slots until the
-  host says otherwise. On the desktop each room opens in **its own
-  window** — full-screenable, like every console — and it reads like the
-  calls you know: a tile per person (owner names first — "Casey", with
-  the machine alongside), red-slashed mic when muted, a green *you're
-  sharing* banner with the stop button on it, chat and people on the
-  right, Leave in red. Joining wires *nothing*: your
-  **mic** (the call — your voice), camera and screen share all start off,
-  and the panel adds **share sound** (what the machine is *playing* —
-  deliberately never your mic), **share control** (let members drive this
-  machine), chat, and file sending. Members' screen shares show up as live
-  letterboxed tiles — and it's a *real* room: sharing there is scoped to the
-  room, stream-only (nothing is stored), and never hands its members standing
-  permissions. Be in as many rooms at once as you like; each room's
-  toggles are its own.
+The whole app is one canvas. Tap a node for a drawer of its hardware, its live
+connections, and its devices. Tap a device's dot, then tap where it should go,
+and AllMyStuff picks the matching endpoint, draws a glowing wire, and pops the
+console that manages that session. Edges are colour-coded by what flows through
+them — <b>audio</b>, <b>video</b>, <b>screen</b>, <b>controls</b>, <b>files</b> —
+so the graph reads at a glance.
 
-Edges are colour-coded by what flows through them — <b>audio</b>,
-<b>video</b>, <b>screen</b>, <b>controls</b>, <b>files</b> — so the graph
-reads at a glance.
+Four moves cover everything:
 
-> A rendered mock of the main screen lives at
-> [`docs/design/allmystuff-graph.svg`](docs/design/allmystuff-graph.svg).
+### 👁️ Console — _you can always see it._
 
-## Yours vs shared — authorization, not authentication
+Every machine gets a console — its screens, its cameras, its audio, in tabs.
+**H.264 at native resolution up to 4K** when the path is fast, a stubborn MJPEG
+floor when it isn't. Turn on control and your keyboard and mouse *are* its
+keyboard and mouse. One tab per screen; multi-monitor machines get a tab each,
+and every tab pops out into its own OS window or goes fullscreen. Smooth enough
+to drive your tower from a thin laptop. Only the recorded **owner** can type.
 
-This is the heart of it. When you add a connection, you pick one of two
-things:
+### ⌨️ Shell & Files — _you can always act._
 
-- **🧦 A device that's mine** — something you own or manage. It joins your
-  fleet and connects freely with everything else you own. No ceremony.
-- **🧑‍🤝‍🧑 Someone I'm sharing with** — a friend or family member. *Nothing*
-  flows until you allow it, and every grant is scoped: a direction (they send
-  / they receive), a kind (just audio, just your screen…), and optionally a
-  single device.
+A real shell and a real file browser for every machine you own — **no sshd to
+configure, no port forwarding, no cloud drive in the middle.** Open a terminal
+tab and the far side spawns your actual shell in a real PTY (`openpty` on
+Linux/macOS, ConPTY on Windows). Browse, preview, rename, fetch — downloads
+stream straight to disk, never through a server. Flow control end-to-end,
+exactly like ssh — because it behaves like ssh. Gated to the device's owner; a
+guest can't even ask.
 
-Try to wire your screen to a friend before you've allowed it and you don't
-get an error — you get a friendly sheet: *"Let Alex receive your screen?"*
-Approve it and **only that** becomes reachable. Revoke it later and any
-connection that depended on it stops immediately.
+### 🤝 Sharing — _you choose who else can._
 
-A share is with the **person, not one machine**: what you allow Alex works
-to whichever of Alex's devices is handy (their fleet shares one owner), and
-a device of theirs that appears later joins the same connection. Everything
-you're sharing — every person, every grant — lives under **Settings →
-Sharing**, where any single grant, or the whole connection, can be taken
+Sharing is a grant to a **person, not a password to a machine.** *"Alex can
+receive my screen"* — that's the whole grant. It follows Alex to whichever of
+their devices is handy, it covers exactly one thing, and it revokes with one
+tap. A blocked connection tells you the **one grant** that would unblock it. New
+devices verify with a code both sides can read aloud. **Nothing is shareable by
+default. Nothing.**
+
+### 🧦 Fleet — _it stays yours._
+
+Claim a device and it joins your **fleet** — a set of machines that trust each
+other under one key you mint, hold, and can walk away with. A box can't be
+taken: claiming only works when the device itself was put in claim mode. Your
+data lives on your devices — **there is no server-side "your stuff."** Internet
+down? Everything inside the walls keeps working. MIT-licensed, self-hostable
+end to end — even the relay servers.
+
+> **Rooms.** Want a zoom-like call between machines you pick? Make a **room** —
+> you host the ones you make, open or invite-only, each opening in its own
+> full-screenable window. Joining wires *nothing*: mic, camera and screen share
+> all start off, sharing is scoped to the room and stream-only (nothing is
+> stored), and it never hands members standing permissions. Be in as many at
+> once as you like.
+
+## Yours vs shared
+
+This is the heart of it — **authorization, not authentication.** When you add a
+connection, you pick one of two things:
+
+| | |
+|---|---|
+| 🧦 **A device that's mine** | Something you own or manage. It joins your fleet and connects freely with everything else you own. No ceremony. |
+| 🧑‍🤝‍🧑 **Someone I'm sharing with** | A friend or family member. *Nothing* flows until you allow it, and every grant is scoped: a direction (they send / they receive), a kind (just audio, just your screen…), and optionally a single device. |
+
+Try to wire your screen to a friend before you've allowed it and you don't get
+an error — you get a friendly sheet: *"Let Alex receive your screen?"* Approve
+it and **only that** becomes reachable. Revoke it later and any connection that
+depended on it stops immediately.
+
+A share is with the **person, not one machine**: what you allow Alex works to
+whichever of Alex's devices is handy, and a device of theirs that appears later
+joins the same connection. Everything you're sharing lives under **Settings →
+Sharing**, where any single grant — or the whole connection — can be taken
 back.
 
-The mesh handles identity. You handle permission. That split is the whole
-product.
+> The mesh handles identity. You handle permission. **That split is the whole
+> product.**
+
+## Headless: serve & service
+
+A box with no screen is still worth putting on the mesh — a home server whose
+disk you want to reach, a desktop you'll remote into, a machine that just hosts
+a room's screen share. `allmystuff serve` runs the node with **no GUI**: it
+shows up on the graph, advertises this machine's capabilities, and serves them
+to peers. Same engine the desktop app links; the only thing missing is the
+window.
+
+```sh
+allmystuff serve                         # run this machine on the mesh, headless
+ALLMYSTUFF_CLAIMABLE=1 allmystuff serve  # …and let one of your machines adopt it
+```
+
+To keep it running across logout and reboot, install it as an OS service
+(systemd / launchd / Windows SCM):
+
+```sh
+allmystuff service install                  # install + start; runs at login
+sudo allmystuff service --system install    # …or at boot, system-wide
+allmystuff service status                   # installed / enabled / running
+allmystuff service stop | restart | uninstall
+```
+
+Because the node supervises the daemon, **one service runs both** — no second
+unit to install. A service box may run for months without a restart, so the
+headless node **self-updates unattended**: it applies a permitted release and
+relaunches straight onto it. The desktop app exposes all of this under
+**Settings → Always On** (start-with-computer, start-minimized, one-click
+install-as-service, close/minimize-to-tray), handling the Windows
+administrator elevation for you.
 
 ## Architecture
 
-A Cargo workspace of small, focused crates plus a Tauri + Svelte app — the
-same shape as MyOwnMesh and MyOwnLLM, and a **client of the `myownmesh`
-daemon** rather than an embedder of the engine.
+A Cargo workspace of small, focused crates plus a Tauri + Svelte app — the same
+shape as MyOwnMesh and MyOwnLLM, and a **client of the `myownmesh` daemon**
+rather than an embedder of the engine.
 
 ```
-allmystuff-inventory   # lib — cross-platform device scan (Linux live; macOS/Windows scaffolded)
+allmystuff-inventory   # lib — cross-platform device scan (Linux/macOS/Windows)
 allmystuff-graph       # lib — capabilities, routes, and the own-vs-share authorization model
 allmystuff-protocol    # lib — mirror of the myownmesh control socket + AllMyStuff's peer messages
-allmystuff-bridge      # lib — turns an Inventory into routable graph capabilities (+ presence summary)
+allmystuff-bridge      # lib — turns an Inventory into routable graph capabilities (+ presence)
 allmystuff-session     # lib — live presence + the route offer/accept handshake + media frame types
 allmystuff-updater     # lib — self-update: release feed, SHA-256 verify, stage-then-apply
 allmystuff-cli         # bin — `allmystuff` scan / capabilities / update / serve / service, headless
@@ -193,73 +248,69 @@ gui/                   # app — Tauri 2 backend + Svelte 5 front-end (the graph
   pure and heavily tested.
 - **One engine, two front ends.** The whole node — presence, the route
   handshake, and every media plane (screen / camera / audio / input / terminal
-  / files / clipboard) — lives in `node/` (`allmystuff-node`). The GUI links it
-  and feeds events to its webview; `allmystuff-serve` links the same code and
-  runs it headless. Either way it's a **sidecar client** of a running
-  `myownmesh serve`, talked to over the daemon's line-delimited JSON control
-  socket. The mesh version it targets is pinned in
-  [`.myownmesh-rev`](.myownmesh-rev).
+  / files / clipboard) — lives in `node/`. The GUI links it and feeds events to
+  its webview; `allmystuff-serve` links the same code and runs it headless.
+  Either way it's a **sidecar client** of a running `myownmesh serve`, talked
+  to over the daemon's line-delimited JSON control socket.
 - **Two sources of truth, one set of rules.** The routing/authorization logic
   is ported to TypeScript so the graph is fully interactive on its own; the
   Rust `Catalog` enforces the identical rules before anything hits the wire.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full tour.
+See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for the full tour.
 
-## Headless: serve & service
+## Status
 
-A box with no screen is still worth putting on the mesh — a home server
-whose disk you want to reach, a desktop you'll remote into, a machine
-that just hosts a room's screen share. `allmystuff serve` runs the node
-with **no GUI**: it shows up on the graph, advertises this machine's
-capabilities, and serves them to peers — a console watching its screen
-(**monitor out**, where a display is attached), a fleet member opening a
-terminal, a room pulling its system audio. It links the same engine the
-desktop app does; the only thing missing is the window.
+This repository is a **working foundation**, honest about what's real. The
+deep per-platform detail behind each row lives in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+| Piece | State | |
+|---|---|---|
+| **Device scanner** | ✅ Working | Linux (`/proc`+`/sys`), macOS (`system_profiler`), Windows (CIM) — fixture-tested decoders, compiled + tested on all three in CI; flags each category's current default |
+| **Graph model + authorization** | ✅ Working | Pure Rust, fully unit-tested; mirrored in TS for the UI |
+| **Device ownership** | ✅ Working | Every device advertises its owner and whether it's *claimable*; you can only adopt a box started in claim mode |
+| **Desktop graph UI** | ✅ Working | Builds, typechecks, interactive on demo *and* live data |
+| **Remote console** | ✅ Working | A pikvm-style session in its own OS window per machine: live screen, video-inputs tab bar, audio passthrough, keyboard/mouse — every tab pops out, hover fullscreen |
+| **Remote terminal** | ✅ Working | A real shell on any of your machines, **no sshd anywhere** — tabbed xterm.js, one mesh route per tab to a PTY the far side spawns |
+| **Remote files** | ✅ Working | A finder-like manager, **no smb/sftp anywhere** — browse, preview, upload, download to Downloads, rename, delete, new folder |
+| **Presence + route handshake** | ✅ Working | Peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
+| **Live audio streaming** | ✅ Working | Opus over MyOwnMesh's RTP audio lane (48 kHz, ~96 kbps), PCM fallback for older peers; system-audio loopback or mic capture |
+| **Live screen + input** | ✅ Working | openh264 screen-content encode → RTP up to 4K/30 fps, MJPEG fallback; persistent capture per OS; hosting forces a sleeping display awake; chords resolve by physical key so modifiers never stick |
+| **Live camera streaming** | ✅ Working | Same negotiated pipe as screens (H.264 + MJPEG fallback) via nokhwa; wires from the graph, tiles a room call |
+| **Storage streaming** | 🚧 Next | The routes wire and show the session; the one scanned media still needing its transport over the proven pipe |
+
+## Build & run
+
+The desktop app opens straight into a populated **demo graph** even with no
+mesh, so you can explore the whole experience — clicking nodes, drawing
+connections, the share sheet, rooms — offline. A bare `allmystuff` opens it;
+the subcommands (`scan`, `capabilities`, `update`, `serve`, `service`) are for
+headless boxes and scripts.
+
+From a source checkout it's two commands:
 
 ```sh
-allmystuff serve                        # run this machine on the mesh, headless
-ALLMYSTUFF_CLAIMABLE=1 allmystuff serve  # …and let one of your machines adopt it
+just setup    # one-time: build deps, Rust, Node, pnpm, GUI deps
+just dev      # run the app with hot reload
 ```
 
-It's self-contained: AllMyStuff rides on a `myownmesh serve` daemon, and
-`allmystuff serve` **spawns and supervises that daemon itself** — one
-process brings up both.
-
-To keep it running across logout and reboot, install it as an OS service
-(systemd on Linux, launchd on macOS, the **Service Control Manager** on
-Windows), mirroring `myownmesh service`:
+The headless node is its own workspace under `node/`:
 
 ```sh
-allmystuff service install            # install + start; runs at login
-sudo allmystuff service --system install   # …or at boot, system-wide
-allmystuff service status             # installed / enabled / running
-allmystuff service stop | restart | uninstall
+cargo build --release --manifest-path node/Cargo.toml   # builds allmystuff-serve
 ```
 
-Because the node supervises the daemon, **one service runs both** — there's
-no second unit to install. On Windows the service runs the node in SCM mode
-(`allmystuff-serve --service`) as a LocalSystem service that starts at boot;
-installing or controlling it needs an **elevated (Administrator)** prompt —
-the desktop app's **Settings → Always On** does the elevation for you. And
-because a service box may run for months without a restart, the headless node
-**self-updates unattended**: it applies a permitted release and relaunches
-straight onto it (re-exec under systemd/launchd; an SCM restart under Windows),
-keeping every half — CLI, GUI and node — current on its own.
+The full CLI reference, the desktop-app dependencies, the live-mesh setup, and
+**how to help test on macOS / Windows / Pi** all live in
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
-The desktop app exposes all of this under **Settings → Always On**: **Start
-with computer** (on by default) and **Start minimized**, a one-click **Install
-as a service** (with start/stop/restart/uninstall once it's in), and the
-**close-to-tray / minimize-to-tray** toggles that keep the window a click away
-in the notification area (the menu bar on macOS). The app manages the service
-**in-process** — there's no separate `allmystuff` command for it to hunt down —
-so on Linux/macOS it just installs the per-user service, and on Windows it
-prompts once for administrator approval.
+<details>
+<summary><b>What a scan sees</b> (every probe degrades gracefully)</summary>
 
-## What a scan sees
+<br/>
 
-Every probe degrades gracefully, so a bare container shows compute +
-storage + network while a loaded laptop shows the lot — displays, mic
-arrays, cameras, the works. On the box this was built on:
+A bare container shows compute + storage + network; a loaded laptop shows the
+lot — displays, mic arrays, cameras, the works.
 
 ```text
 ┌──────┐
@@ -290,60 +341,43 @@ The graph in action (on this machine's real devices):
       your friend isn't allowed to receive your display yet
 ```
 
-## Build & run
+</details>
 
-The desktop app opens straight into a populated demo graph even with no
-mesh, so you can explore the whole experience — clicking nodes, drawing
-connections, the share sheet, rooms — offline. A bare `allmystuff` opens
-it; the subcommands (`scan`, `capabilities`, `update`, and the headless
-`serve` / `service`) are for headless boxes and scripts.
+## The bigger picture
 
-From a source checkout it's two commands:
+AllMyStuff sits on **three pillars** — only one of them is this repo, and the
+app never needs the other two.
 
-```sh
-just setup    # one-time: build deps, Rust, Node, pnpm, GUI deps
-just dev      # run the app with hot reload
-```
+| | | |
+|---|---|---|
+| **01 · The software** | **Free, and missing nothing.** | $0 forever — open source, every feature, peer-to-peer, encrypted end to end. *(You are here.)* |
+| **02 · The hardware** | **When the OS is dead, software can't save it. Hardware can.** | The [Access line](https://allmystuff.works/hardware/) — an out-of-band witness that watches a machine's video and presses its buttons, so it stays on your graph even with its OS gone. |
+| **03 · The service** | **A human on call. A network of your own.** | Strictly optional. A real technician one tap away (your yes first, logged, revocable), or a private relay venue of your own. |
 
-The headless node is its own workspace under `node/`; build it directly with:
+The free app is **complete on day one — not a trial, not a tier.** Where the
+software ends, the other pillars start. Read the whole story at
+**[allmystuff.works](https://allmystuff.works)**.
 
-```sh
-cargo build --release --manifest-path node/Cargo.toml   # builds allmystuff-serve
-```
+## Family
 
-The full CLI reference, the desktop-app dependencies, the live-mesh setup,
-and **how to help test on macOS / Windows / Pi** all live in
-**[CONTRIBUTING.md](CONTRIBUTING.md)**.
-
-## Status
-
-This repository is a **working foundation**, honest about what's real:
-
-| Piece | State |
-|---|---|
-| Device scanner | **Working** on Linux (`/proc` + `/sys`), macOS (`system_profiler`), and Windows (CIM) — fixture-tested decoders, compiled + tested on all three in CI. Flags each category's **current default** (the mic it captures from, the screen it drives first) |
-| Graph model + authorization | **Working** — pure Rust, fully unit-tested; mirrored in TS for the UI. Routing prefers a node's default device when auto-picking an endpoint |
-| Device ownership | **Working** — every device advertises its owner and whether it's *claimable*; you can only adopt a box that was started in claim mode, never flat-take one that's already owned |
-| Desktop graph UI | **Working** — builds, typechecks, interactive on demo data and live data. Devices on the mesh that aren't running AllMyStuff are shown but quieted and un-targetable |
-| Remote console | **Working** — a pikvm-style session in its **own OS window per machine** (open as many as you like): live screen, a video-inputs tab bar, audio passthrough and keyboard/mouse control — both up from the moment the console opens, with the toggles as off-switches — wiring the real routes underneath. Every tab pops out (hover ⧉) into **its own OS window** with its own quality controls, and the stage has a hover **fullscreen** in the player corner; a popped tab holds a big **Return video here** so streams parked on other monitors are one click from home |
-| Remote terminal | **Working** — a real shell on any of your machines, **no sshd anywhere**: the node drawer's **Open Terminal** opens a tabbed xterm.js window per machine; each tab is its own mesh route to a PTY the far side spawns (`portable-pty`: openpty on Linux/macOS, ConPTY on Windows — same behavior on every OS). Gated to the device's **owner/fleet** exactly like keyboard injection, enforced host-side; advertised via presence `features`, so older peers simply never see the button |
-| Remote files | **Working** — a finder-like file manager on any of your machines, **no smb/sftp anywhere**: the node drawer's **Open Files** (between Remote Control and Open Terminal) opens a window per machine — browse, preview text/images in place, upload, download straight into this machine's Downloads, rename, delete, new folder. One mesh route per window, request/response frames over the same media channel; gated to the device's **owner/fleet** exactly like the terminal, enforced host-side, advertised via presence `features` |
-| Presence + route handshake | **Working** — peers appear via presence; routes negotiate offer/accept/teardown over the mesh |
-| Live audio streaming | **Working** — an audio route streams what its source capability names: **system audio** captures the machine's own playback (WASAPI loopback on Windows, the pulse server's monitor source on Linux — PulseAudio or PipeWire; macOS degrades to the default input until a virtual-device path lands), a mic capability captures the default input. The transport is negotiated per route like video's: **Opus over MyOwnMesh's RTP audio track lane** (48 kHz, 20 ms frames, ~96 kbps) when both daemons speak it, with the v1 PCM-frames-over-channel stream as the automatic fallback for older peers. The console's audio passthrough is **listen-only by design**: the remote's system audio plays on your speakers and nothing flows back — injected audio would ride the remote's loopback straight back as an echo (echo cancellation is the follow-up; wiring a mic stays a deliberate act on the graph). Default devices, mono in v1 |
-| Live screen + input streaming | **Working** — a display route streams the remote's screen (the routed monitor: every screen is its own console tab) over MyOwnMesh's **H.264 video track lane** (openh264 screen-content encode at native resolution up to 4K (3840 edge) → RTP, ~30 fps) negotiated per route, with the v1 MJPEG-over-channel stream as the automatic fallback for older peers. Decode is covered on every platform: WebCodecs where the webview has it, the backend's **native openh264 decoder** (ready-to-paint RGBA over IPC) where it doesn't or when WebCodecs stalls. Capture is a persistent session (in-house DXGI on Windows, the **ScreenCast portal with restore tokens** on Wayland — consent is a once-per-machine dialog, every start after it is silent and unattended — AVFoundation on macOS, paced grabs on X11), unchanged frames skipped, drop-on-backpressure. **Hosting a stream forces a sleeping display back on and holds it awake** for the session — the documented per-OS force-on calls (`SC_MONITORPOWER` + one-shot `ES_DISPLAY_REQUIRED` on Windows, `IOPMAssertionDeclareUserActivity` on macOS, DPMS `ForceLevel(On)` + screensaver `SimulateUserActivity` on Linux) pulsed for as long as the stream is dark, a synthetic F15 tap that survives the input filtering a mouse wiggle doesn't, and the keep-awake inhibitors for the session's lifetime; the viewer clicking at a dark console fires the same wake, so driving it works like a remote login. The host's capture state reaches the viewer **in-band** — "waiting for consent", "display asleep", "no monitor" — so a black stage explains itself. (A *locked* Windows console can't be relit from a user-session app — that takes a system service, a planned follow-up.) Device changes under a running app (a monitor waking, detaching, plugging in) re-broadcast presence within ~10 s. A control route forwards normalized keyboard/mouse events (sourced from the synthetic per-machine **keyboard & mouse**, so any platform can drive any other) injected with `enigo`, gated to the device's owner/fleet — and it's **assumed on**: opening a console brings keyboard & mouse (and audio passthrough) up with the picture, like sitting down at the machine; the toggles are the off-switches. Key **combinations are the norm, not the exception**: every key event carries the physical key next to the layout-resolved one, chords resolve through it (Ctrl+C lands on the C key whatever the held modifiers composed), each end remembers what's pressed so keyups release exactly what went down and a dropped route or blurred window can never leave the remote with a stuck modifier. Default audio devices in v1 |
-| Live camera streaming | **Working** — a video route streams the scanned camera its source capability names, over the same negotiated pipe as screens (H.264 track lane with the MJPEG fallback, quality pills, in-band capture status — "no camera", "camera failed" when another app holds it or the OS permission is off). Capture rides **nokhwa** (V4L2 on Linux, AVFoundation on macOS, Media Foundation on Windows), asking each camera for its smoothest rate and the largest picture at it; MJPG and YUYV sensors both decode. Cameras land on every machine's synthetic **video in** sink, so they wire from the graph, stream in the console's camera tabs, and tile a room call via the **Camera** toggle — and every room tile pops out into its own window or goes fullscreen from the hover corner, with the tile's **Return video here** as the reset. Hosts advertise the `camera` feature tag — a console pointed at an older build's camera says "update that machine" instead of waiting on pixels |
-| Storage streaming | **Next** — the routes wire and show the session; the one scanned media still needing its transport over the proven pipe |
-
-## Lineage
-
-AllMyStuff is the third app in the family:
+AllMyStuff is the third app in the family — it borrows their patterns and points
+them at *every* device, not just the GPU.
 
 - **[MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh)** — the pure-Rust
   peer-to-peer mesh. AllMyStuff sidecars it for identity, discovery, and
   transport.
 - **[MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM)** — detect hardware, run
   the best local model. AllMyStuff borrows its hardware-detection and
-  sidecar-the-daemon patterns and points them at *every* device, not just the
-  GPU.
+  sidecar-the-daemon patterns.
 
-[LICENSE](LICENSE) — MIT.
+---
+
+<div align="center">
+
+**[allmystuff.works](https://allmystuff.works)** · [Releases](https://github.com/mrjeeves/AllMyStuff/releases) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md)
+
+Tech that works when you turn it on. **Yours, with or without us.**
+
+[LICENSE](LICENSE) — MIT · A [Critical Error Computing](https://allmystuff.works) product
+
+</div>
