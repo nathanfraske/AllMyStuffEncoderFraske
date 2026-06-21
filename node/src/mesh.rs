@@ -2158,6 +2158,13 @@ impl Mesh {
                 self.send_owned_to(from.as_str()).await;
                 self.broadcast_owned().await;
                 self.emit_owned();
+                // Adoption is a fleet-roster change: found the fleet's closed
+                // network (if new) and admit the freshly-claimed device into
+                // its signed roster, then refresh our authorised-controller
+                // cache. This is what makes the new member authenticated for
+                // control — the gossip above is now only advisory.
+                self.ensure_fleet_network().await;
+                self.refresh_fleet_authorization().await;
                 // Surface the claim feedback for the claimer's toast, too.
                 self.sink.emit(
                     "allmystuff://ownership",
