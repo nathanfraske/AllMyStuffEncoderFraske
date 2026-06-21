@@ -1,6 +1,6 @@
 # Architecture
 
-AllMyStuff is a consumer-facing app for wiring your devices together over a
+AllMyStuff is a desktop app for connecting the computers you own over a
 private mesh. It's deliberately split so the **model is pure and testable**
 and the **mesh is a sidecar**, never an embedded dependency.
 
@@ -43,11 +43,11 @@ stream onto Tauri's bus, rather than linking the engine. Events reach that
 stream through the engine's `UiSink` seam: `allmystuff-serve` wires in a
 `SocketSink` that logs each event and fans it out to every connected client.
 
-This is why running both the Always-On service and the desktop app no longer
+This is why running both the headless service and the desktop app no longer
 collides: there is exactly one `Mesh` advertising one identity. (The GUI used
 to build its own `Mesh` with a Tauri-backed `UiSink`; two nodes under one
 identity is precisely what stopped machines connecting.) See
-[the README's Headless section](README.md#headless-serve--service).
+[The headless node](CONTRIBUTING.md#the-headless-node).
 
 The library workspace (`crates/`) compiles and tests with nothing but
 `cargo` — no webview, no daemon, no network. The GUI is its own Cargo
@@ -64,6 +64,7 @@ crates/
 ├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
 ├── allmystuff-session     # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
 ├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
+├── allmystuff-service     # install/manage the OS background service (systemd / launchd / Windows SCM)
 └── allmystuff-cli         # `allmystuff` — opens the GUI, or scan / capabilities / update / serve / service
 
 node/                      # the headless node engine (its own workspace, heavy media deps)
@@ -91,8 +92,7 @@ device ids.
   desktop — just with fewer devices.
 - **The fiddly decoders are pure functions with fixture tests** — EDID timing
   descriptors, ALSA capture channels, input-device classification — so
-  correctness doesn't depend on the hardware being present. (The MyOwnLLM
-  pattern, generalised.)
+  correctness doesn't depend on the hardware being present.
 - macOS / Windows reuse the `sysinfo` host basics and scaffold the device
   classes (`system_profiler`, CIM).
 
@@ -297,7 +297,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
   opens a unified **Settings panel** (`SettingsPanel.svelte`) with Networks,
   Fleet (the owned roster's shared key + members), and Updates (the
   `allmystuff-updater` controls). The **Networks** tab is itself split into
-  sub-tabs (MyOwnLLM-style): **Status** (identity, create/join, approvals,
+  sub-tabs: **Status** (identity, create/join, approvals,
   add-a-device), **Servers** (per-network signaling / STUN / TURN, defaulting
   to MyOwnMesh's reference servers), and **Devices** (every machine and which
   network(s) it's on). Multiple networks are first-class — you're joined to
@@ -424,7 +424,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
    speak the lane (myownmesh ≥ 0.2.4 — the actually-bundled daemon pin is
-   v0.2.8, see `.myownmesh-rev`), as PCM `AudioFrame`s over
+   v0.2.9, see `.myownmesh-rev`), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step
@@ -475,7 +475,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    daemon's job: myownmesh ≥ 0.2.2 reassembles access units
    sequence-aware, so packet loss or a late NACK retransmit costs one
    frame, never a corrupt unit in a decoder. (These are floor thresholds;
-   the actually-bundled daemon pin is v0.2.8 — see `.myownmesh-rev`.)
+   the actually-bundled daemon pin is v0.2.9 — see `.myownmesh-rev`.)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;
