@@ -1027,6 +1027,119 @@ pub async fn dispatch(
             out
         }
 
+        // ---- closed-network governance + custody MFA (daemon passthroughs) ----
+        "mesh_governance_state" => {
+            let network: String = try_arg!(arg(a, "network"));
+            daemon_request(client, Request::GovernanceState { network }).await
+        }
+        "mesh_governance_propose_kind" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let to: String = try_arg!(arg(a, "to"));
+            let mfa_code: Option<String> = try_arg!(opt(a, "mfa_code"));
+            daemon_request(
+                client,
+                Request::GovernanceProposeKindChange {
+                    network,
+                    to,
+                    mfa_code,
+                },
+            )
+            .await
+        }
+        "mesh_governance_grant_role" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let target: String = try_arg!(arg(a, "target"));
+            let role: String = try_arg!(arg(a, "role"));
+            let mfa_code: Option<String> = try_arg!(opt(a, "mfa_code"));
+            daemon_request(
+                client,
+                Request::GovernanceProposeRoleGrant {
+                    network,
+                    target,
+                    role,
+                    mfa_code,
+                },
+            )
+            .await
+        }
+        "mesh_governance_revoke_role" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let target: String = try_arg!(arg(a, "target"));
+            let mfa_code: Option<String> = try_arg!(opt(a, "mfa_code"));
+            daemon_request(
+                client,
+                Request::GovernanceProposeRoleRevoke {
+                    network,
+                    target,
+                    mfa_code,
+                },
+            )
+            .await
+        }
+        "mesh_governance_sign" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let proposal_id: String = try_arg!(arg(a, "proposal_id"));
+            let mfa_code: Option<String> = try_arg!(opt(a, "mfa_code"));
+            daemon_request(
+                client,
+                Request::GovernanceSign {
+                    network,
+                    proposal_id,
+                    mfa_code,
+                },
+            )
+            .await
+        }
+        "mesh_governance_deny" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let proposal_id: String = try_arg!(arg(a, "proposal_id"));
+            daemon_request(
+                client,
+                Request::GovernanceDeny {
+                    network,
+                    proposal_id,
+                },
+            )
+            .await
+        }
+        "mesh_governance_withdraw" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let proposal_id: String = try_arg!(arg(a, "proposal_id"));
+            daemon_request(
+                client,
+                Request::GovernanceWithdraw {
+                    network,
+                    proposal_id,
+                },
+            )
+            .await
+        }
+        "mesh_governance_spawn_split" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let proposal_id: String = try_arg!(arg(a, "proposal_id"));
+            daemon_request(
+                client,
+                Request::GovernanceSpawnSplit {
+                    network,
+                    proposal_id,
+                },
+            )
+            .await
+        }
+        "mesh_governance_mfa_enroll" => {
+            let network: String = try_arg!(arg(a, "network"));
+            daemon_request(client, Request::GovernanceMfaEnroll { network }).await
+        }
+        "mesh_governance_mfa_status" => {
+            let network: String = try_arg!(arg(a, "network"));
+            daemon_request(client, Request::GovernanceMfaStatus { network }).await
+        }
+        "mesh_governance_mfa_disable" => {
+            let network: String = try_arg!(arg(a, "network"));
+            let code: String = try_arg!(arg(a, "code"));
+            daemon_request(client, Request::GovernanceMfaDisable { network, code }).await
+        }
+
         // ---- park store --------------------------------------------------
         "disabled_networks" => DispatchOut::Json(Value::Array(disabled.list())),
         "network_set_enabled" => {
