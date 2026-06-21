@@ -115,14 +115,10 @@ everything and every machine keeps running the app.
 
 ## Wait, how is it free?
 
-Because it runs on **your** hardware, not ours. The app, the mesh, and a small
-always-on relay cost us almost nothing per person — so we don't bill for them.
-We make money selling [hardware](https://allmystuff.works/hardware/) and a
-[concierge service](https://allmystuff.works/service/) to the people who want
-them; both are strictly optional and the app never needs either.
-
-It's **complete on day one — not a trial, not a tier.** MIT-licensed, and you
-can point it at your own servers and self-host the whole thing.
+Because it runs on **your** hardware, not ours — the app, the mesh, and a small
+always-on relay cost us next to nothing per person, so there's nothing to bill
+you for. It's **complete on day one — not a trial, not a tier** — MIT-licensed,
+and you can point every piece at your own servers and self-host the lot.
 
 ## How it works
 
@@ -168,19 +164,6 @@ just dev      # run with hot reload
 
 The full CLI reference and how to help test on macOS / Windows / Pi are in
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
-
-## The bigger picture
-
-AllMyStuff stands on **three pillars** — only one is this repo, and the app
-never needs the other two.
-
-| | | |
-|---|---|---|
-| **01 · Software** | _Free, and missing nothing._ | $0 forever, open source, every feature. **You are here.** |
-| **02 · Hardware** | _When the OS is dead, hardware can still answer._ | The [Access line](https://allmystuff.works/hardware/) — an out-of-band witness that keeps a crashed machine on your graph. |
-| **03 · Service** | _A human on call. A network of your own._ | Optional: a real technician one tap away, or a private relay of your own. |
-
-The whole story is at **[allmystuff.works](https://allmystuff.works)**.
 
 ## Family
 
