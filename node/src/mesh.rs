@@ -916,6 +916,15 @@ impl Mesh {
             // whose presence frame was missed still gets its stats — otherwise
             // it shows the control buttons (from these tags) with no summary.
             "summary": profile.as_ref().map(|p| &p.summary),
+            // Same reasoning for the wireable endpoints — the control / audio /
+            // video / display sinks & sources that rooms and remote-control
+            // wire to. They used to ride *only* the bespoke presence advert, so
+            // a peer whose presence frame was missed showed its buttons but
+            // advertised no endpoint, and rooms/remote-control reported "no
+            // audio/control/video path to that machine". Carry them on the
+            // reliable peer list too so a path resolves regardless of whether
+            // presence lands.
+            "endpoints": profile.as_ref().map(|p| &p.capabilities),
         });
         for network in networks {
             let _ = self
