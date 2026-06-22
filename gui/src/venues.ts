@@ -147,3 +147,30 @@ export function saveNetworkVenues(map: Record<string, string[]>): void {
     /* ignore */
   }
 }
+
+const INACTIVE_VENUES_KEY = "ams.inactive-venues.v1";
+
+/** Load the set of venues the user has explicitly switched **off** (by venue
+ *  id). The off-list, not an on-list, so every venue is on by default and
+ *  driving a mesh can only ever *remove* one from here — never add — matching
+ *  "driving meshes turns venues on if needed, but only the user turns one off". */
+export function loadInactiveVenues(): string[] {
+  try {
+    const raw = localStorage.getItem(INACTIVE_VENUES_KEY);
+    if (raw) {
+      const a = JSON.parse(raw) as unknown;
+      if (Array.isArray(a)) return a.filter((x): x is string => typeof x === "string");
+    }
+  } catch {
+    /* ignore corrupt storage */
+  }
+  return [];
+}
+
+export function saveInactiveVenues(ids: string[]): void {
+  try {
+    localStorage.setItem(INACTIVE_VENUES_KEY, JSON.stringify(ids));
+  } catch {
+    /* ignore */
+  }
+}

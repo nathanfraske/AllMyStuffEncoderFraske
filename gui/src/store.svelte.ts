@@ -23,10 +23,12 @@ import {
   venuesFromEnvelope,
 } from "./network-settings";
 import {
+  loadInactiveVenues,
   loadNetworkVenues,
   loadVenues,
   newVenueId,
   PUBLIC_VENUE_ID,
+  saveInactiveVenues,
   saveNetworkVenues,
   saveVenues,
   unionServers,
@@ -603,6 +605,16 @@ class AppStore {
   disabledNets = $state<NetworkConfigFull[]>([]);
   /** The network pill's dropdown (enable/disable without deleting). */
   netMenuOpen = $state(false);
+  /** The venues pill's dropdown — the master on/off for each venue, the sibling
+   *  of the meshes pill. */
+  venueMenuOpen = $state(false);
+  /** Venues the user has switched **off** (by id). An off-list, so venues are
+   *  on by default; only the user adds to it, while driving a mesh can only
+   *  remove from it. */
+  inactiveVenues = $state<string[]>(loadInactiveVenues());
+  /** Briefly true right after driving a mesh turned a venue back on, so the
+   *  venues pill can shimmer to say "something here changed". */
+  venuePillShimmer = $state(false);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -4454,6 +4466,16 @@ class AppStore {
       );
       await this.refreshNetworks();
       await this.loadDisabledNetworks();
+      // Driving a mesh on turns its venues back on if any were off, and shimmers
+      // the venues pill so the change is seen. Disabling never touches a venue —
+      // other meshes may still ride it, and turning one off is the user's call.
+      if (on) {
+        const net = this.networks.find((n) => n.config_id === key || n.network_id === key);
+        if (net && this.reactivateVenuesFor(net.network_id)) {
+          await this.applyNetworkVenuesByWireId(net.network_id);
+          this.shimmerVenuePill();
+        }
+      }
       await this.syncMeshGraph();
     } catch (e) {
       this.toast("warn", `Couldn't ${on ? "enable" : "disable"} the network: ${errMsg(e)}`);
@@ -4621,6 +4643,79 @@ class AppStore {
     return ids.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
   }
 
+  /** Whether a venue is currently on. On by default; only an explicit user
+   *  switch-off (the off-list) turns it off. */
+  isVenueActive(id: string): boolean {
+    return !this.inactiveVenues.includes(id);
+  }
+
+  /** The merger of every live mesh's venues — the list the venues pill shows.
+   *  Deduped by id, Public first (so the built-in anchors the list), the rest
+   *  by label. This is "the venues across all your meshes" in one place. */
+  meshVenues(): Venue[] {
+    const seen = new Set<string>();
+    const out: Venue[] = [];
+    for (const n of Array.isArray(this.networks) ? this.networks : []) {
+      for (const v of this.venuesForNetwork(n.network_id)) {
+        if (!seen.has(v.id)) {
+          seen.add(v.id);
+          out.push(v);
+        }
+      }
+    }
+    return out.sort((a, b) => {
+      if (a.id === PUBLIC_VENUE_ID) return -1;
+      if (b.id === PUBLIC_VENUE_ID) return 1;
+      return a.label.localeCompare(b.label);
+    });
+  }
+
+  /** The on/off counts for the venues pill label. */
+  venueCounts = $derived.by(() => {
+    const all = this.meshVenues();
+    const on = all.filter((v) => this.isVenueActive(v.id)).length;
+    return { on, total: all.length };
+  });
+
+  /** Flip a venue on or off across every mesh that uses it. Turning one off is
+   *  the user's call (driving a mesh never does it); turning one on re-applies
+   *  its servers. Re-deriving each affected mesh skips the fleet mesh unless
+   *  you own it — its venue is owner-defined. */
+  async toggleVenue(id: string, on: boolean) {
+    if (on) this.inactiveVenues = this.inactiveVenues.filter((x) => x !== id);
+    else if (!this.inactiveVenues.includes(id)) this.inactiveVenues = [...this.inactiveVenues, id];
+    saveInactiveVenues(this.inactiveVenues);
+    // Re-apply to every live mesh that references this venue.
+    for (const n of Array.isArray(this.networks) ? this.networks : []) {
+      if (this.venuesForNetwork(n.network_id).some((v) => v.id === id)) {
+        if (this.isFleetMesh(n) && !this.isFleetOwner) continue;
+        await this.applyNetworkVenuesByWireId(n.network_id);
+      }
+    }
+  }
+
+  /** Driving a mesh on turns its venues back on if any were off (the user's
+   *  off-switch is the only thing that turns one off). Returns whether anything
+   *  was re-activated, so the caller can shimmer the venues pill. */
+  private reactivateVenuesFor(networkId: string): boolean {
+    let changed = false;
+    for (const v of this.venuesForNetwork(networkId)) {
+      if (this.inactiveVenues.includes(v.id)) {
+        this.inactiveVenues = this.inactiveVenues.filter((x) => x !== v.id);
+        changed = true;
+      }
+    }
+    if (changed) saveInactiveVenues(this.inactiveVenues);
+    return changed;
+  }
+
+  /** Shimmer the venues pill briefly — used when driving a mesh re-activated a
+   *  venue, so the change is visible without a toast. */
+  private shimmerVenuePill() {
+    this.venuePillShimmer = true;
+    setTimeout(() => (this.venuePillShimmer = false), 1100);
+  }
+
   private persistVenues() {
     saveVenues(this.venues);
   }
@@ -4692,11 +4787,16 @@ class AppStore {
     }
   }
 
-  /** Recompute + write a mesh's union, found by wire id. */
+  /** Recompute + write a mesh's union, found by wire id. Only the **active**
+   *  venues contribute — a venue the user switched off drops out of the union —
+   *  but if that would leave the mesh with no servers at all, fall back to its
+   *  full venue set rather than strand it offline. */
   private async applyNetworkVenuesByWireId(networkId: string) {
     const cfg = this.networkConfigs.find((c) => c.network_id === networkId);
     if (!cfg) return;
-    await this.updateNetworkServers(cfg.id, unionServers(this.venuesForNetwork(networkId)));
+    const all = this.venuesForNetwork(networkId);
+    const active = all.filter((v) => this.isVenueActive(v.id));
+    await this.updateNetworkServers(cfg.id, unionServers(active.length ? active : all));
   }
 
   /** Save a mesh's current inline servers as a new named venue and switch the
