@@ -159,6 +159,7 @@ import {
   type SiteAdvert,
   type SiteMapping,
   type InputAction,
+  type InventorySummary,
   type MediaKind,
   type MeshNode,
   type Standing,
@@ -1149,7 +1150,14 @@ class AppStore {
     // same id presence + capabilities use, so they merge into one node.
     const live = new Map<
       string,
-      { label: string; online: boolean; app: boolean; features: string[]; version?: string }
+      {
+        label: string;
+        online: boolean;
+        app: boolean;
+        features: string[];
+        version?: string;
+        summary?: InventorySummary;
+      }
     >();
     const rosterAll: RosterPeer[] = [];
     const joins: PendingJoin[] = [];
@@ -1202,6 +1210,9 @@ class AppStore {
           e.app = true;
           e.features = tags.filter((t) => t !== CAP_TAG_ALLMYSTUFF);
           if (p.capabilities?.app_version) e.version = p.capabilities.app_version;
+          // The device stats ride the peer list too — so a connected peer whose
+          // presence advert was missed still gets its OS/CPU/RAM summary.
+          if (p.capabilities?.summary) e.summary = p.capabilities.summary;
         }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
@@ -1277,6 +1288,7 @@ class AppStore {
           app: info.app,
           features: info.features,
           version: info.version,
+          summary: info.summary,
           networks: nodeNets,
         });
       } else {
@@ -1285,11 +1297,15 @@ class AppStore {
         if (!node.hostname && info.label) node.label = info.label;
         // The mesh marker can flip a node *on* (app node), but it never
         // downgrades one: presence may have already enriched it with richer
-        // detail (summary, owner, sites), so only fill what's still missing.
+        // detail (owner, sites), so only fill what's still missing.
         if (info.app) {
           node.app = true;
           if (!node.features?.length) node.features = info.features;
           if (!node.version && info.version) node.version = info.version;
+          // The stats now ride the peer list, so keep them fresh from there —
+          // this is the reliable source the missed-presence case fell back to
+          // nothing on. Only overwrite with a real summary, never blank it.
+          if (info.summary) node.summary = info.summary;
         }
       }
     }

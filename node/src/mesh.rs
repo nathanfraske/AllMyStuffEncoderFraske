@@ -712,6 +712,10 @@ impl Mesh {
                 if changed {
                     tracing::info!("device picture changed on rescan — re-broadcasting presence");
                     mesh.broadcast_presence().await;
+                    // Keep the peer-list copy of the summary fresh too, so peers
+                    // that read it from the capability matrix (not the presence
+                    // advert) see the new stats.
+                    mesh.advertise_capabilities().await;
                     mesh.emit_snapshot();
                 }
             }
@@ -906,6 +910,12 @@ impl Mesh {
         let capabilities = json!({
             "tags": tags,
             "app_version": env!("CARGO_PKG_VERSION"),
+            // Ride the device summary (OS / CPU / RAM / device count) on the
+            // capability matrix too, not just the bespoke presence advert. The
+            // peer list is polled and reliable, so a peer that connected but
+            // whose presence frame was missed still gets its stats — otherwise
+            // it shows the control buttons (from these tags) with no summary.
+            "summary": profile.as_ref().map(|p| &p.summary),
         });
         for network in networks {
             let _ = self
