@@ -33,7 +33,11 @@
   } from "../tauri";
   import { displayName, type TerminalSessionInfo } from "../types";
 
-  let { host, windowed = false }: { host: string; windowed?: boolean } = $props();
+  let {
+    host,
+    windowed = false,
+    initialAttach = null,
+  }: { host: string; windowed?: boolean; initialAttach?: string | null } = $props();
 
   const node = $derived(app.node(host));
 
@@ -487,6 +491,23 @@
     focusActiveSoon();
   }
 
+  /** Pop this tab out into its own terminal window — the terminal twin of a
+   *  video feed's ⧉ pop-out. The shell is shared (tmux-style), so the new
+   *  window re-attaches to the same session while we detach this one by closing
+   *  the tab; the shell and its scrollback carry straight on. Only meaningful
+   *  once the host has resolved the session id (so the new window can name it). */
+  function popOutTab(tabId: number) {
+    const t = tabs.find((x) => x.id === tabId);
+    if (!t || !t.routeId) return;
+    const session = app.routeSessions[t.routeId];
+    if (!session) {
+      app.toast("warn", "This shell isn't ready to pop out yet — give it a moment.");
+      return;
+    }
+    app.popOutTerminal(host, session);
+    void closeTab(tabId);
+  }
+
   /** After a tab becomes visible its pane has real dimensions again — re-report
    *  capacity (the host may grow the shared size back) and focus, next frame.
    *  The render size stays the host's authoritative one, never a local refit. */
@@ -538,7 +559,9 @@
   }
 
   onMount(() => {
-    newTab();
+    // A popped-out window joins the shared shell it was opened for; an ordinary
+    // window mints a fresh one.
+    newTab(initialAttach ?? undefined);
     // Tab statuses hang off route negotiation states from session
     // snapshots. Snapshot *events* are the latency win but can be lost
     // (this codebase's video plane moved to pull for exactly that
@@ -638,6 +661,15 @@
                   >
                 {/if}
               </button>
+              {#if windowed && t.routeId && app.routeSessions[t.routeId]}
+                <button
+                  class="tab-pop"
+                  title="Pop this shell out into its own window"
+                  onclick={() => popOutTab(t.id)}
+                >
+                  ⧉
+                </button>
+              {/if}
               <button class="tab-x" title="Close this shell" onclick={() => void closeTab(t.id)}>
                 ✕
               </button>
@@ -912,6 +944,20 @@
     margin-right: 0.15rem;
   }
   .tab-x:hover {
+    background: #463e6e;
+    color: #f1eefb;
+  }
+  .tab-pop {
+    border: none;
+    background: none;
+    color: #7d76a0;
+    font-size: 0.72rem;
+    width: 1.3rem;
+    height: 1.3rem;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .tab-pop:hover {
     background: #463e6e;
     color: #f1eefb;
   }

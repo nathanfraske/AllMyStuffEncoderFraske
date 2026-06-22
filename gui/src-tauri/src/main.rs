@@ -458,22 +458,35 @@ async fn terminal_sessions(
 /// window per machine, holding that machine's terminal tabs. The window
 /// loads the same app with `?terminal=<node>`.
 #[tauri::command]
-async fn open_terminal_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
-    let label = format!("terminal-{}", window_slug(&node));
+async fn open_terminal_window(
+    app: tauri::AppHandle,
+    node: String,
+    attach: Option<String>,
+) -> Result<(), String> {
+    // A plain terminal window is one-per-machine (`terminal-<node>`); a
+    // *popped-out* tab attaches to a specific shared session and gets its own
+    // window keyed by that session (`terminal-<node>-<session>`), so two
+    // pop-outs never collide and re-popping the same shell just refocuses it.
+    let (label, url) = match &attach {
+        Some(session) => (
+            format!("terminal-{}-{}", window_slug(&node), window_slug(session)),
+            format!("index.html?terminal={node}&attach={}", query_encode(session)),
+        ),
+        None => (
+            format!("terminal-{}", window_slug(&node)),
+            format!("index.html?terminal={node}"),
+        ),
+    };
     if let Some(existing) = app.get_webview_window(&label) {
         let _ = existing.set_focus();
         return Ok(());
     }
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(format!("index.html?terminal={node}").into()),
-    )
-    .title("AllMyStuff terminal")
-    .inner_size(940.0, 600.0)
-    .min_inner_size(480.0, 320.0)
-    .build()
-    .map_err(|e| e.to_string())?;
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+        .title("AllMyStuff terminal")
+        .inner_size(940.0, 600.0)
+        .min_inner_size(480.0, 320.0)
+        .build()
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -455,12 +455,14 @@ export async function watchVideoStatus(
 // ---- terminal (the mesh-native shell) ----------------------------------
 
 /** Open (or focus) the dedicated terminal window for `node` — one window
- *  per machine, holding its terminal tabs. Desktop only; the web preview
- *  keeps its in-page terminal. */
-export async function openTerminalWindow(node: string): Promise<void> {
+ *  per machine, holding its terminal tabs. With `attach` set, opens a
+ *  *popped-out* window whose first tab joins that shared session (its own
+ *  window, keyed by the session). Desktop only; the web preview keeps its
+ *  in-page terminal. */
+export async function openTerminalWindow(node: string, attach?: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_terminal_window", { node });
+  await invoke("open_terminal_window", { node, attach: attach ?? null });
 }
 
 /** Which machine this window is a terminal for, when the window was opened
@@ -468,6 +470,14 @@ export async function openTerminalWindow(node: string): Promise<void> {
 export function terminalWindowTarget(): string | null {
   if (typeof window === "undefined") return null;
   return new URLSearchParams(window.location.search).get("terminal");
+}
+
+/** The shared session this terminal window should attach its first tab to,
+ *  when it was opened as a popped-out tab (`?attach=<session id>`). Null for an
+ *  ordinary terminal window (its first tab mints a fresh shell). */
+export function terminalAttachTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("attach");
 }
 
 /** Send keystrokes or a resize down an active terminal route (this window
