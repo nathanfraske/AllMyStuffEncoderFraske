@@ -159,6 +159,7 @@ import {
   type InputAction,
   type MediaKind,
   type MeshNode,
+  type Standing,
   type NetworkConfigFull,
   type NetworkSummary,
   type OwnedRoster,
@@ -648,6 +649,49 @@ class AppStore {
     if (m.role === "owner") return "owner";
     if (m.role === "controller") return "manager";
     return "member";
+  }
+
+  /** The single, derived **standing** of a node relative to you — what the
+   *  graph, the drawer and every claim/fleet button read so they always agree.
+   *  Computed live from the authoritative reactive state (your fleet roster,
+   *  the device's advertised owner + claimable flag, its share). Nothing here
+   *  is stored: change the fleet or a device's advert and this recomputes, so
+   *  the UI can't drift into a contradictory "unclaimed but in your fleet"
+   *  state the way the old stored `relationship.kind` did. */
+  standing(node: MeshNode): Standing {
+    const self = node.kind === "this" || this.isMe(node.id);
+    const app = isAppNode(node);
+    const shared = node.relationship.kind === "shared" ? node.relationship.person : null;
+    const inFleet = this.isFleetMember(node.id);
+    const role = this.fleetRoleOf(node.id);
+    const ownedByMe = !!node.owner && this.isMe(node.owner);
+    const ownedByOther = !!node.owner && !this.isMe(node.owner);
+    const offering = node.claimable === true;
+    const mine = inFleet || ownedByMe;
+    const claimable = !self && app && offering && !mine && !ownedByOther;
+    let kind: Standing["kind"];
+    if (self) kind = "self";
+    else if (!app) kind = "mesh";
+    else if (shared) kind = "shared";
+    else if (inFleet) kind = "fleet";
+    else if (ownedByMe) kind = "mine";
+    else if (claimable) kind = "claimable";
+    else if (ownedByOther) kind = "theirs";
+    else kind = "free";
+    return {
+      self,
+      app,
+      mine,
+      inFleet,
+      role,
+      iAmFleetOwner: this.isFleetOwner,
+      ownedByMe,
+      ownedByOther,
+      claimable,
+      offering,
+      shared,
+      kind,
+    };
   }
 
   /** Whether this device has a fleet custody authenticator enrolled. When it
@@ -1342,9 +1386,9 @@ class AppStore {
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
-      if (p.owner && sameMachine(p.owner, this.localId) && node.relationship.kind === "unclaimed") {
-        node.relationship = { kind: "mine" };
-      }
+      // (Relationship is no longer set here — `reconcileFleetRelationships`
+      // at the end of this method is the single owner of mine/unclaimed,
+      // projecting it from the node's live standing.)
       // Collapse any other view of this same machine into the one node we just
       // settled on (id `p.node`) — heals an already-split graph. Match by id,
       // not reference: a freshly-pushed node is proxied by `$state`, so
@@ -1410,24 +1454,19 @@ class AppStore {
     this.reconcileShares();
   }
 
-  /** Fleet membership implies the relationship. Ownership is *directional*
-   *  — your owner machine advertises no owner of its own — so on a claimed
-   *  device its owner would read "unclaimed" forever even while wearing the
-   *  fleet badge (mutually exclusive states on screen). Any co-member of
-   *  your fleet is *yours*; one that left (or kicked you) and doesn't claim
-   *  us as owner reverts to unclaimed. A relationship the user set to
-   *  `shared` is never touched. */
+  /** Project each node's **standing** onto the stored `relationship.kind`, the
+   *  single owner of mine/unclaimed. `standing()` is the live truth the UI
+   *  reads; this keeps the stored field — used by the older list/count/group
+   *  consumers — a faithful projection of it, so nothing can drift into the
+   *  contradictory "unclaimed but in your fleet" states the racing writers
+   *  used to produce. An explicit `shared` relationship (user intent + grants)
+   *  is never touched. Idempotent — safe to run after every state change. */
   private reconcileFleetRelationships() {
-    const meInFleet = this.isFleetMember(this.localId);
     for (const n of this.catalog.nodes) {
       if (n.kind === "this" || this.isMe(n.id)) continue;
-      const inFleet = meInFleet && this.isFleetMember(n.id);
-      const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
-      if (n.relationship.kind === "unclaimed" && inFleet) {
-        n.relationship = { kind: "mine" };
-      } else if (n.relationship.kind === "mine" && !inFleet && !ownedByMe) {
-        n.relationship = { kind: "unclaimed" };
-      }
+      if (n.relationship.kind === "shared") continue;
+      const want = this.standing(n).mine ? "mine" : "unclaimed";
+      if (n.relationship.kind !== want) n.relationship = { kind: want };
     }
   }
 

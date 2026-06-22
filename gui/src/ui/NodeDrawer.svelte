@@ -17,27 +17,19 @@
 
   const node = $derived(app.selectedNode);
   const caps = $derived(node ? app.capsOf(node.id) : []);
-  const shared = $derived(node?.relationship.kind === "shared");
+  // The single derived standing — every section and button below reads it, so
+  // the drawer can't contradict the graph (or itself).
+  const st = $derived(node ? app.standing(node) : null);
+  const shared = $derived(st?.kind === "shared");
   // A device on the mesh that isn't running AllMyStuff: nothing to wire.
-  const meshonly = $derived(!!node && !isAppNode(node));
-  // This device declares an owner that isn't us — it can't be adopted.
-  // Compare by canonical pubkey (`isMe`): presence carries the owner as a
-  // bare pubkey while our local id is the display form.
-  const ownedByOther = $derived(!!node?.owner && !app.isMe(node.owner));
+  const meshonly = $derived(!!st && !st.app);
   // A remote machine you can open a console session on.
-  const isRemoteApp = $derived(!!node && node.kind !== "this" && !meshonly);
+  const isRemoteApp = $derived(!!st && !st.self && st.app);
 
-  // Whether this device is part of *your* fleet — your own machine, one you
-  // own, or a co-member sharing your fleet key. Its raw capabilities ("Its
-  // stuff") are only shown for these: a guest's or a stranger's machine on
-  // the mesh isn't yours to wire up from here.
-  const inMyFleet = $derived(
-    !!node &&
-      (node.kind === "this" ||
-        node.relationship.kind === "mine" ||
-        app.isFleetMember(node.id) ||
-        (!!node.owner && app.isMe(node.owner))),
-  );
+  // Whether this device is part of *your* stuff — your own machine, or one in
+  // your fleet (claimed/owned). Its raw capabilities ("Its stuff") are only
+  // shown for these: a guest's or a stranger's machine isn't yours to wire up.
+  const inMyFleet = $derived(!!st && (st.self || st.mine));
 
   // Capabilities grouped by media for tidy sections.
   const grouped = $derived.by(() => {
@@ -265,28 +257,27 @@
       ></div>
       <div class="drawer-body">
         <header class="head">
-      <span class="avatar">{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span>
+      <span class="avatar">{!st || !st.app ? "📡" : st.shared ? "🧑" : st.self ? "💻" : "🖥"}</span>
       <div class="title">
         <div class="name">{displayName(node)}</div>
         <div class="kindline">
-          {#if node.kind === "this"}this device · {/if}
-          {#if meshonly}
-            <span class="pill soft">not on AllMyStuff</span>
-          {:else if shared && node.relationship.kind === "shared"}
-            <span class="pill guest">shared with {node.relationship.person.name}</span>
-          {:else if node.relationship.kind === "unclaimed"}
-            <!-- A device that declares an owner that isn't us was claimed
-                 by someone else — that's a fact, not a blank slate, so the
-                 chip says so instead of "unclaimed". -->
-            {#if ownedByOther}
+          {#if st}
+            {#if st.self}this device · {/if}
+            {#if !st.app}
+              <span class="pill soft">not on AllMyStuff</span>
+            {:else if st.shared}
+              <span class="pill guest">shared with {st.shared.name}</span>
+            {:else if st.inFleet || (st.mine && !st.self)}
+              <span class="pill mine">yours</span>
+            {:else if st.kind === "claimable"}
+              <span class="pill claimable">＋ claimable</span>
+            {:else if st.kind === "theirs"}
               <span class="pill theirs">someone else's</span>
-            {:else}
-              <span class="pill soft">{node.claimable ? "claimable" : "unclaimed"}</span>
+            {:else if !st.self}
+              <span class="pill soft">unclaimed</span>
             {/if}
-          {:else}
-            <span class="pill mine">yours</span>
+            {#if st.inFleet}<span class="pill fleet" title="In your fleet · {st.role}">🔗 {st.role}</span>{/if}
           {/if}
-          {#if app.isFleetMember(node.id)}<span class="pill fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
           <span class="state" class:on={node.online}>{node.online ? "online" : "offline"}</span>
         </div>
         {#if node.networks && node.networks.length}
@@ -334,7 +325,7 @@
          sharing is one-directional: when you share your stuff *with* someone,
          their machine isn't yours to drive, so it never offers a remote
          control (the far side would refuse it anyway). -->
-    {#if isRemoteApp && node.relationship.kind === "mine"}
+    {#if isRemoteApp && st?.mine}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
       </button>
@@ -373,26 +364,25 @@
          fleet is the closed mesh of devices you own; this is where you offer a
          device for adoption, leave the fleet, and (as owner) hand out manager
          / owner authority. -->
-    {#if !meshonly && (node.kind === "this" || app.isFleetMember(node.id))}
-      {@const role = app.fleetRoleOf(node.id)}
+    {#if st && st.app && (st.self || st.inFleet)}
       <section class="block fleet-ctl">
         <div class="block-head">
           <h4>🔗 Fleet</h4>
-          {#if role}<span class="role-pill {role}" title="Authority in your fleet">{role}</span>{/if}
+          {#if st.role}<span class="role-pill {st.role}" title="Authority in your fleet">{st.role}</span>{/if}
         </div>
 
-        {#if node.kind === "this"}
-          {#if app.isFleetMember(node.id)}
+        {#if st.self}
+          {#if st.inFleet}
             <p class="hint">
               This device is in {app.fleetName ? `${app.fleetName}'s` : "your"} fleet.
             </p>
             <label class="adopt">
               <input
                 type="checkbox"
-                checked={node.claimable ?? false}
+                checked={st.offering}
                 onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
               />
-              <span>{node.claimable ? "Offering this device for adoption" : "Re-offer this device for adoption"}</span>
+              <span>{st.offering ? "Offering this device for adoption" : "Re-offer this device for adoption"}</span>
             </label>
             <button class="btn small danger leave" onclick={() => app.leaveFleet()}>Leave the fleet</button>
           {:else}
@@ -402,26 +392,26 @@
             </p>
             <button
               class="btn small claim-toggle"
-              class:on={node.claimable}
+              class:on={st.offering}
               title="Offer this device so another of mine can adopt it"
-              onclick={() => app.setLocalClaimable(!(node.claimable ?? false))}
+              onclick={() => app.setLocalClaimable(!st.offering)}
             >
-              {node.claimable ? "🔓 Stop offering" : "🔒 Make claimable"}
+              {st.offering ? "🔓 Stop offering" : "🔒 Make claimable"}
             </button>
           {/if}
-        {:else if app.isFleetOwner}
+        {:else if st.iAmFleetOwner}
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
           <div class="fleet-actions">
-            {#if role === "member"}
+            {#if st.role === "member"}
               <button class="btn small" title="A manager can admit devices to the fleet" onclick={() => app.grantFleetRole(node.id, "manager")}>Make manager</button>
             {/if}
-            {#if role !== "owner"}
+            {#if st.role !== "owner"}
               <button class="btn small" title="An owner has full fleet authority and co-signs governance" onclick={() => app.grantFleetRole(node.id, "owner")}>Make owner</button>
             {/if}
-            {#if role === "manager"}
+            {#if st.role === "manager"}
               <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw manager</button>
             {/if}
-            {#if role === "owner"}
+            {#if st.role === "owner"}
               <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw owner</button>
             {/if}
             <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
@@ -432,7 +422,7 @@
           </p>
         {:else}
           <p class="hint">
-            In your fleet{#if role && role !== "member"} as <b>{role}</b>{/if}. Only the fleet owner can change roles.
+            In your fleet{#if st.role && st.role !== "member"} as <b>{st.role}</b>{/if}. Only the fleet owner can change roles.
           </p>
         {/if}
       </section>
@@ -440,52 +430,16 @@
 
     <!-- Relationship / sharing -->
     <section class="block">
-      {#if meshonly}
+      {#if !st || !st.app}
         <p class="muted">
           This device is on your mesh, but it isn't running AllMyStuff — so it
           has no screens, mics or other things to wire up, and it can't be a
           connection target. Install AllMyStuff on it and it'll fill in here.
         </p>
         {#if node.id}<div class="devid" title={node.id}>mesh id {node.id.slice(0, 16)}…</div>{/if}
-      {:else if node.relationship.kind === "unclaimed"}
-        {#if ownedByOther}
-          <p class="muted">
-            This device already has an owner, so you can't adopt it. If they
-            want to share it with you, you'll get exactly what they allow.
-          </p>
-          <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
-        {:else if node.claimable}
-          <!-- The forefront claim affordance — an accent call-to-action, not a
-               buried button. Claiming is authorization, so the copy is the same
-               shape the sharing flow uses; the big button makes "make it mine"
-               the obvious next move. -->
-          <div class="claim-card">
-            <div class="claim-card-head">
-              <span class="claim-glyph" aria-hidden="true">＋</span>
-              <div>
-                <div class="claim-card-title">Make {displayName(node)} yours</div>
-                <div class="claim-card-sub">It's in claim mode — offering itself for adoption.</div>
-              </div>
-            </div>
-            <p class="claim-card-what">
-              Claiming links it into your fleet under a shared key, so your
-              devices trust each other for screen, files and control. It's the
-              same kind of authorization you'll use to share with people.
-            </p>
-            <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
-            <button class="linklike" onclick={makeShared}>It's someone else's — I'm just sharing with them →</button>
-          </div>
-        {:else}
-          <p class="muted">
-            This device hasn't been put up for adoption. You can't just take
-            ownership — start AllMyStuff on it in claim mode (or toggle
-            “allow adoption” there), then claim it from here.
-          </p>
-          <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
-        {/if}
-      {:else if shared && node.relationship.kind === "shared"}
+      {:else if st.shared}
         <div class="block-head">
-          <h4>What {node.relationship.person.name} can do</h4>
+          <h4>What {st.shared.name} can do</h4>
           <button class="btn small" onclick={() => (addingGrant = !addingGrant)}>
             {addingGrant ? "Done" : "Allow more"}
           </button>
@@ -494,7 +448,7 @@
           <p class="muted">Nothing yet — they can't reach any of your stuff until you allow it.</p>
         {:else if (partner?.nodes.length ?? 0) > 1}
           <p class="muted">
-            You're sharing with {node.relationship.person.name}, not one machine — these work to
+            You're sharing with {st.shared.name}, not one machine — these work to
             any of their {partner?.nodes.length} devices.
           </p>
         {/if}
@@ -520,17 +474,51 @@
             {/if}
           </div>
         {/if}
-        {#if node.claimable || (node.owner && app.isMe(node.owner))}
+        {#if st.offering || st.ownedByMe}
           <button class="linklike" onclick={claimThis}>This is actually my own device →</button>
         {/if}
+      {:else if st.kind === "claimable"}
+        <!-- The forefront claim affordance — an accent call-to-action, not a
+             buried button. Claiming is authorization, so the copy is the same
+             shape the sharing flow uses; the big button makes "make it mine"
+             the obvious next move. -->
+        <div class="claim-card">
+          <div class="claim-card-head">
+            <span class="claim-glyph" aria-hidden="true">＋</span>
+            <div>
+              <div class="claim-card-title">Make {displayName(node)} yours</div>
+              <div class="claim-card-sub">It's in claim mode — offering itself for adoption.</div>
+            </div>
+          </div>
+          <p class="claim-card-what">
+            Claiming links it into your fleet under a shared key, so your
+            devices trust each other for screen, files and control. It's the
+            same kind of authorization you'll use to share with people.
+          </p>
+          <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
+          <button class="linklike" onclick={makeShared}>It's someone else's — I'm just sharing with them →</button>
+        </div>
+      {:else if st.kind === "theirs"}
+        <p class="muted">
+          This device already has an owner, so you can't adopt it. If they
+          want to share it with you, you'll get exactly what they allow.
+        </p>
+        <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
+      {:else if st.kind === "free"}
+        <p class="muted">
+          This device hasn't been put up for adoption. You can't just take
+          ownership — start AllMyStuff on it in claim mode (or toggle
+          “allow adoption” there), then claim it from here.
+        </p>
+        <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
       {:else}
         <p class="muted own-note">
-          {node.kind === "this" ? "This is you." : "Yours — it connects freely with everything else you own."}
+          {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
-        {#if app.isFleetMember(node.id)}
+        {#if st.inFleet}
           <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 See the fleet's shared key →</button>
         {/if}
-        {#if node.kind !== "this"}
+        {#if !st.self}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
         {/if}
       {/if}
@@ -900,6 +888,11 @@
   .pill.fleet {
     background: var(--accent-soft);
     color: var(--accent-ink);
+  }
+  .pill.claimable {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-weight: 700;
   }
   .netline {
     display: flex;

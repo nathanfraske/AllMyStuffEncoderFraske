@@ -57,6 +57,39 @@ export type Relationship =
   | { kind: "unclaimed" }
   | ({ kind: "shared" } & Share);
 
+/** A node's **standing** relative to you — the single, derived answer to
+ *  "what is this device to me, right now?". Computed live from the
+ *  authoritative reactive state (your fleet roster, the device's advertised
+ *  owner + claimable flag, and any explicit share) so the graph, the drawer
+ *  and every button read *one* coherent status instead of racing stored
+ *  flags. Always recomputed from source — never stored. */
+export interface Standing {
+  /** This very device. */
+  self: boolean;
+  /** Running AllMyStuff (vs a bare mesh device with nothing to wire). */
+  app: boolean;
+  /** It's *yours* — a member of your fleet, or a device you own. */
+  mine: boolean;
+  /** A member of your fleet's signed roster. */
+  inFleet: boolean;
+  /** Its role in your fleet when in it: "owner" | "manager" | "member". */
+  role: "owner" | "manager" | "member" | null;
+  /** Whether *you* are the fleet owner — gates the role / evict controls. */
+  iAmFleetOwner: boolean;
+  /** It advertises *you* as its owner (claimed; roster may still be settling). */
+  ownedByMe: boolean;
+  /** It advertises someone else as its owner. */
+  ownedByOther: boolean;
+  /** It's offering itself for adoption *and* you can take it. */
+  claimable: boolean;
+  /** Raw "offering itself for adoption" flag (e.g. your own un-fleeted device). */
+  offering: boolean;
+  /** The person it's explicitly shared with, else null. */
+  shared: Person | null;
+  /** The single primary status, for the headline label / visual treatment. */
+  kind: "self" | "mesh" | "shared" | "fleet" | "mine" | "claimable" | "theirs" | "free";
+}
+
 export interface InventorySummary {
   os: string;
   cpu: string;

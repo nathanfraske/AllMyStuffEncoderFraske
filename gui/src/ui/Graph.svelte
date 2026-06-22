@@ -326,16 +326,11 @@
     return isAppNode(n) && n.relationship.kind !== "unclaimed";
   }
 
-  /** A device offering itself for adoption that you can actually take: an
-   *  AllMyStuff node, unclaimed, in claim mode, and not owned by someone else.
-   *  Mirrors the `adoptable` flag computed per-node in the template. */
+  /** A device offering itself for adoption that you can actually take — the
+   *  same `standing().claimable` the node's visual reads, so the tap target
+   *  and the look never disagree. */
   function isAdoptable(n: MeshNode): boolean {
-    return (
-      isAppNode(n) &&
-      n.relationship.kind === "unclaimed" &&
-      n.claimable === true &&
-      !(!!n.owner && !app.isMe(n.owner))
-    );
+    return app.standing(n).claimable;
   }
 
   /** The claimable node whose inline "Claim" button is currently dropped out
@@ -425,20 +420,20 @@
     {/each}
     {#each layout as p (p.node.id)}
       {@const n = p.node}
-      {@const shared = n.relationship.kind === "shared"}
-      {@const unclaimed = n.relationship.kind === "unclaimed"}
-      {@const meshonly = !isAppNode(n)}
-      <!-- Offering itself for adoption *and* actually takeable (unowned): the
-           node gets an accent halo so "claim me" is obvious on the graph. -->
-      {@const adoptable = unclaimed && n.claimable === true && !(n.owner && !app.isMe(n.owner))}
+      <!-- One derived standing drives every visual + affordance, so the node
+           never shows contradictory state (e.g. "unclaimed" while wearing a
+           fleet badge). It recomputes live from the fleet roster + the device's
+           advert, so claiming or fleet changes reflect immediately. -->
+      {@const st = app.standing(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
-        class:self={n.kind === "this"}
-        class:shared
-        class:unclaimed
-        class:claimable={adoptable}
-        class:meshonly
+        class:self={st.self}
+        class:shared={st.kind === "shared"}
+        class:mine={st.mine && !st.self}
+        class:unclaimed={st.kind === "free" || st.kind === "theirs"}
+        class:claimable={st.claimable}
+        class:meshonly={!st.app}
         class:selected={app.selectedNodeId === n.id}
         class:armed={armed && targetable(n)}
         class:offline={!n.online}
@@ -462,9 +457,9 @@
           <div class="node-id">
             <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
             <div class="node-sub">
-              {#if shared && n.relationship.kind === "shared"}
-                shared with {n.relationship.person.name}
-              {:else if meshonly}
+              {#if st.shared}
+                shared with {st.shared.name}
+              {:else if !st.app}
                 on the mesh · not running AllMyStuff
               {:else if n.summary}
                 {n.summary.cpu}
@@ -476,22 +471,14 @@
           <span class="dot" class:on={n.online} title={n.online ? "online" : "offline"}></span>
         </div>
         <div class="node-meta">
-          {#if n.kind === "this"}<span class="tag you">this device</span>{/if}
-          {#if meshonly}<span class="tag meshonly">not on AllMyStuff</span>
-          {:else if shared}<span class="tag guest">guest</span>
-          {:else if unclaimed}
-            <!-- A device whose advert names an owner that isn't us is
-                 claimed by someone else — say that, not "unclaimed". One
-                 that's offering itself gets the accent "claim" tag. -->
-            {#if n.owner && !app.isMe(n.owner)}
-              <span class="tag theirs">someone else's</span>
-            {:else if adoptable}
-              <span class="tag claimable">＋ claim</span>
-            {:else}
-              <span class="tag unclaimed">unclaimed</span>
-            {/if}
-          {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
-          {#if app.isFleetMember(n.id)}<span class="tag fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
+          {#if st.self}<span class="tag you">this device</span>{/if}
+          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+          {:else if st.shared}<span class="tag guest">guest</span>
+          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" title="In your fleet · {st.role}">🔗 {st.role === "member" ? "fleet" : st.role}</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
@@ -502,14 +489,14 @@
         {/if}
         <!-- Claimable affordances drop out from *under* the node, floating
              below it so they never disturb the graph's layout. -->
-        {#if n.kind === "this" && !meshonly && !app.isFleetMember(n.id) && !n.claimable}
+        {#if st.self && st.app && !st.inFleet && !st.offering}
           <!-- Your own device, not in a fleet: offer it for adoption. -->
           <button
             class="node-drawer make-claimable"
             title="Offer this device so another of your machines can adopt it into a fleet"
             onclick={(e) => { e.stopPropagation(); void app.setLocalClaimable(true); }}
           >🔒 Make claimable</button>
-        {:else if adoptable && claimRevealed === n.id}
+        {:else if st.claimable && claimRevealed === n.id}
           <!-- A claimable device you tapped: the Claim button slides in. -->
           <button
             class="node-drawer claim-go"
