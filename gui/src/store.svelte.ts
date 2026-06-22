@@ -1066,12 +1066,7 @@ class AppStore {
       // pass at mount can run before the session is ready.
       if (live) {
         void this.hydrateFromBackend();
-        void this.loadIdentity();
-        void this.refreshNetworks().then(() => this.syncMeshGraph());
-        void this.pullSessionSnapshot();
-        void this.loadOwnedFleet();
-        void this.loadSites();
-        void this.loadDisabledNetworks();
+        this.pullLiveState();
       }
       this.backendConnected = live;
     });
@@ -1136,7 +1131,36 @@ class AppStore {
    *  don't all arrive as session snapshots). Mirrors the MyOwnMesh client. */
   private startMeshPolling() {
     if (!isTauri() || this.meshPoll) return;
-    this.meshPoll = setInterval(() => void this.syncMeshGraph(), 3000);
+    this.meshPoll = setInterval(() => {
+      void this.syncMeshGraph();
+      // Safety net for a missed `live` event. The node emits it exactly once,
+      // fire-and-forget — so a GUI that subscribed *after* the node went live
+      // (a cold first launch, common on Windows where the node cold-spawns
+      // slowly) never receives it and stays stuck in "demo mode" with dead
+      // header pills even though the mesh is up. Re-hydrate from the node until
+      // it takes; the call no-ops while the socket is still unreachable.
+      if (!this.backendConnected) void this.recoverBackendConnection();
+    }, 3000);
+  }
+
+  /** Re-pull everything that depends on a live mesh. Shared by the `live`
+   *  subscription event and the poll-based recovery so the two can't drift. */
+  private pullLiveState() {
+    void this.loadIdentity();
+    void this.refreshNetworks().then(() => this.syncMeshGraph());
+    void this.pullSessionSnapshot();
+    void this.loadOwnedFleet();
+    void this.loadSites();
+    void this.loadDisabledNetworks();
+  }
+
+  /** Poll-driven recovery when the one-shot `live` event was missed: bring the
+   *  connected flag (and the live state behind it) current. Idempotent — bails
+   *  until the node socket answers (hydrateFromBackend no-ops on a null scan),
+   *  then flips the flag and pulls the live state once. */
+  private async recoverBackendConnection() {
+    await this.hydrateFromBackend();
+    if (this.backendConnected) this.pullLiveState();
   }
 
   /** Build the graph's machine nodes from the daemon's *actual* mesh
@@ -1157,6 +1181,7 @@ class AppStore {
         features: string[];
         version?: string;
         summary?: InventorySummary;
+        endpoints?: Capability[];
       }
     >();
     const rosterAll: RosterPeer[] = [];
@@ -1213,6 +1238,9 @@ class AppStore {
           // The device stats ride the peer list too — so a connected peer whose
           // presence advert was missed still gets its OS/CPU/RAM summary.
           if (p.capabilities?.summary) e.summary = p.capabilities.summary;
+          // …and so do the wireable endpoints, so rooms/remote-control resolve
+          // a path without waiting on the bespoke presence advert to land.
+          if (p.capabilities?.endpoints?.length) e.endpoints = p.capabilities.endpoints;
         }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
@@ -1307,6 +1335,25 @@ class AppStore {
           // nothing on. Only overwrite with a real summary, never blank it.
           if (info.summary) node.summary = info.summary;
         }
+      }
+      // Carry the wireable endpoints from the reliable peer list onto the
+      // catalog, re-keyed to the resolved node so `matchEndpoint` (which
+      // filters capabilities by node) finds them. This is the missed-presence
+      // case that left rooms/remote-control with "no audio/control/video path":
+      // the endpoints used to ride only the bespoke presence advert. The
+      // endpoint id is `<node>:<slot>`, so re-prefix it with the node id we
+      // settled on, mirroring how `setLocalId` re-keys.
+      const endpointNode = node?.id ?? id;
+      if (info.app && info.endpoints?.length) {
+        const reKeyed = info.endpoints.map((c) => ({
+          ...c,
+          node: endpointNode,
+          id: endpointNode + c.id.slice(c.node.length),
+        }));
+        this.catalog.capabilities = [
+          ...this.catalog.capabilities.filter((c) => c.node !== endpointNode),
+          ...reKeyed,
+        ];
       }
     }
     // The local machine is on every network we've joined.

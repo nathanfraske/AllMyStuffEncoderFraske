@@ -360,6 +360,11 @@ export interface PeerInfo {
      *  it arrives reliably with the peer list even when the presence advert is
      *  missed. */
     summary?: InventorySummary | null;
+    /** The wireable endpoints (control / audio / video / display sinks &
+     *  sources), carried here too so rooms and remote-control can resolve a
+     *  path even when the bespoke presence advert — which used to be their
+     *  only source — was missed. */
+    endpoints?: Capability[] | null;
   } | null;
 }
 
