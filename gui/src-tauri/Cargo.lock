@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-gui"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-graph",
@@ -110,6 +110,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "sysinfo",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -127,7 +128,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "allmystuff-graph",
  "serde",
@@ -136,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-service"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -145,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -156,11 +157,12 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
  "hex",
+ "minisign-verify",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3066,6 +3068,12 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"
