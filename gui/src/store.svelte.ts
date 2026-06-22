@@ -4677,14 +4677,33 @@ class AppStore {
     return { on, total: all.length };
   });
 
+  /** Turn venues **on** — the single place the off-list shrinks. The pill, the
+   *  venues library and assigning a venue to a mesh all route through it, so
+   *  they're one system. Returns whether anything changed. */
+  private activateVenues(ids: string[]): boolean {
+    const set = new Set(ids);
+    const next = this.inactiveVenues.filter((x) => !set.has(x));
+    if (next.length === this.inactiveVenues.length) return false;
+    this.inactiveVenues = next;
+    saveInactiveVenues(this.inactiveVenues);
+    return true;
+  }
+
+  /** Turn a venue **off** (add to the off-list) — only ever the user's action,
+   *  never a side effect of driving a mesh. */
+  private deactivateVenue(id: string) {
+    if (this.inactiveVenues.includes(id)) return;
+    this.inactiveVenues = [...this.inactiveVenues, id];
+    saveInactiveVenues(this.inactiveVenues);
+  }
+
   /** Flip a venue on or off across every mesh that uses it. Turning one off is
    *  the user's call (driving a mesh never does it); turning one on re-applies
    *  its servers. Re-deriving each affected mesh skips the fleet mesh unless
    *  you own it — its venue is owner-defined. */
   async toggleVenue(id: string, on: boolean) {
-    if (on) this.inactiveVenues = this.inactiveVenues.filter((x) => x !== id);
-    else if (!this.inactiveVenues.includes(id)) this.inactiveVenues = [...this.inactiveVenues, id];
-    saveInactiveVenues(this.inactiveVenues);
+    if (on) this.activateVenues([id]);
+    else this.deactivateVenue(id);
     // Re-apply to every live mesh that references this venue.
     for (const n of Array.isArray(this.networks) ? this.networks : []) {
       if (this.venuesForNetwork(n.network_id).some((v) => v.id === id)) {
@@ -4698,15 +4717,7 @@ class AppStore {
    *  off-switch is the only thing that turns one off). Returns whether anything
    *  was re-activated, so the caller can shimmer the venues pill. */
   private reactivateVenuesFor(networkId: string): boolean {
-    let changed = false;
-    for (const v of this.venuesForNetwork(networkId)) {
-      if (this.inactiveVenues.includes(v.id)) {
-        this.inactiveVenues = this.inactiveVenues.filter((x) => x !== v.id);
-        changed = true;
-      }
-    }
-    if (changed) saveInactiveVenues(this.inactiveVenues);
-    return changed;
+    return this.activateVenues(this.venuesForNetwork(networkId).map((v) => v.id));
   }
 
   /** Shimmer the venues pill briefly — used when driving a mesh re-activated a
@@ -4777,7 +4788,11 @@ class AppStore {
     const venues = venueIds.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
     this.networkVenues[cfg.network_id] = venues.map((v) => v.id);
     this.persistNetworkVenues();
-    await this.updateNetworkServers(configId, unionServers(venues));
+    // Assigning a venue to a mesh turns it on — the same off-list the pill
+    // drives, so settings and the pill are one system — then apply through the
+    // single active-filtered path (not a separate raw write) so both agree.
+    this.activateVenues(venues.map((v) => v.id));
+    await this.applyNetworkVenuesByWireId(cfg.network_id);
   }
 
   /** Re-apply a venue to every live mesh that uses it (after an edit). */
