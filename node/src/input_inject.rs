@@ -53,9 +53,15 @@ enum Cmd {
     ReleaseRoute(String),
 }
 
+/// AMS-06: the most input events queued for injection before excess is dropped.
+/// Legitimate remote control is consumed far faster than it's produced, so the
+/// queue normally holds a handful; this only ever bites a flood from an
+/// abusive controller, capping memory instead of growing it unbounded.
+const INPUT_QUEUE_CAP: usize = 4096;
+
 #[derive(Default)]
 pub struct Injector {
-    tx: Mutex<Option<mpsc::Sender<Cmd>>>,
+    tx: Mutex<Option<mpsc::SyncSender<Cmd>>>,
 }
 
 impl Injector {
@@ -91,15 +97,22 @@ impl Injector {
             if !spawn {
                 return;
             }
-            let (sender, rx) = mpsc::channel::<Cmd>();
+            // A *bounded* queue: a flood from an abusive controller drops excess
+            // (below) rather than growing memory without limit (AMS-06).
+            let (sender, rx) = mpsc::sync_channel::<Cmd>(INPUT_QUEUE_CAP);
             std::thread::spawn(move || run_injector(rx));
             *tx = Some(sender);
         }
         if let Some(t) = tx.as_ref() {
-            if t.send(cmd).is_err() {
-                // The thread ended (platform refused); allow a retry on the
-                // next event rather than wedging forever.
-                *tx = None;
+            match t.try_send(cmd) {
+                Ok(()) => {}
+                // Queue full — the injector can't keep up with the inbound rate.
+                // Drop the event; legitimate control never fills a queue this
+                // deep, and a teardown's `release_route` lifts any held keys.
+                Err(mpsc::TrySendError::Full(_)) => {}
+                // The thread ended (platform refused); allow a retry on the next
+                // event rather than wedging forever.
+                Err(mpsc::TrySendError::Disconnected(_)) => *tx = None,
             }
         }
     }
