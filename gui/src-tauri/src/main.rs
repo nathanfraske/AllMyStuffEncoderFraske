@@ -470,7 +470,10 @@ async fn open_terminal_window(
     let (label, url) = match &attach {
         Some(session) => (
             format!("terminal-{}-{}", window_slug(&node), window_slug(session)),
-            format!("index.html?terminal={node}&attach={}", query_encode(session)),
+            format!(
+                "index.html?terminal={node}&attach={}",
+                query_encode(session)
+            ),
         ),
         None => (
             format!("terminal-{}", window_slug(&node)),
@@ -487,6 +490,9 @@ async fn open_terminal_window(
         .min_inner_size(480.0, 320.0)
         .build()
         .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(&label) {
+        set_taskbar_identity(&w, AUMID_TERMINAL);
+    }
     Ok(())
 }
 
@@ -601,6 +607,9 @@ async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), St
     .min_inner_size(480.0, 320.0)
     .build()
     .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(&label) {
+        set_taskbar_identity(&w, AUMID_FILES);
+    }
     Ok(())
 }
 
@@ -736,6 +745,9 @@ async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), 
     .min_inner_size(560.0, 380.0)
     .build()
     .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(&label) {
+        set_taskbar_identity(&w, AUMID_CONSOLE);
+    }
     Ok(())
 }
 
@@ -760,6 +772,9 @@ async fn open_room_window(app: tauri::AppHandle, room: String) -> Result<(), Str
     .min_inner_size(640.0, 440.0)
     .build()
     .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(&label) {
+        set_taskbar_identity(&w, AUMID_ROOM);
+    }
     Ok(())
 }
 
@@ -793,6 +808,9 @@ async fn open_video_window(
     .min_inner_size(380.0, 260.0)
     .build()
     .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(&label) {
+        set_taskbar_identity(&w, AUMID_VIDEO);
+    }
     Ok(())
 }
 
@@ -822,6 +840,98 @@ fn query_encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+// AppUserModelIDs for the secondary windows, so each *kind* groups under its own
+// taskbar button rather than stacking under the main app — terminals together,
+// files together, and so on, each separately pinnable. The main window keeps the
+// process default. The strings are stable identities (Windows keys pins and
+// grouping off them); they are not the bundle identifier on purpose. Referenced
+// on every platform (the call sites pass them), used only on Windows.
+const AUMID_TERMINAL: &str = "works.allmystuff.terminal";
+const AUMID_CONSOLE: &str = "works.allmystuff.console";
+const AUMID_FILES: &str = "works.allmystuff.files";
+const AUMID_ROOM: &str = "works.allmystuff.room";
+const AUMID_VIDEO: &str = "works.allmystuff.video";
+
+/// Give a secondary window its own taskbar identity (an explicit per-window
+/// AppUserModelID) so it groups separately from the main AllMyStuff app and is
+/// separately pinnable. Windows only — a no-op everywhere else. Best-effort: a
+/// failure just leaves the window on the default grouping, never an error.
+///
+/// Per-window (not per-process) is the point: every Tauri window lives in one
+/// process, so `SetCurrentProcessExplicitAppUserModelID` can't separate them —
+/// only the window's shell property store (`PKEY_AppUserModel_ID`) can. The HWND
+/// is bridged through its raw pointer because Tauri links an older `windows`
+/// crate than this GUI does, so their `HWND` types differ.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn set_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
+    #[cfg(windows)]
+    {
+        use windows::core::{GUID, PWSTR};
+        use windows::Win32::Foundation::{HWND, PROPERTYKEY};
+        use windows::Win32::System::Com::StructuredStorage::{
+            PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+        };
+        use windows::Win32::System::Variant::VT_LPWSTR;
+        use windows::Win32::UI::Shell::PropertiesSystem::{
+            IPropertyStore, SHGetPropertyStoreForWindow,
+        };
+
+        // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5.
+        const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
+            fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+            pid: 5,
+        };
+
+        // Tauri links an older `windows` crate than this GUI, so its `HWND` is a
+        // different type — bridge through the raw pointer.
+        let raw = match window.hwnd() {
+            Ok(h) => h.0 as *mut core::ffi::c_void,
+            Err(e) => {
+                tracing::warn!("taskbar identity: no window handle ({e})");
+                return;
+            }
+        };
+
+        // A null-terminated wide copy of the id; it must outlive `SetValue`,
+        // which copies the string into the store (see the `drop` at the end).
+        let mut wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+        // A VT_LPWSTR PROPVARIANT pointing at `wide`. windows 0.61 has no string
+        // constructor for the structured-storage PROPVARIANT, so build it by
+        // hand. `ManuallyDrop` (and *not* calling `PropVariantClear`) is
+        // deliberate: the buffer is ours (a `Vec`), not COM-allocated.
+        let value = PROPVARIANT {
+            Anonymous: PROPVARIANT_0 {
+                Anonymous: core::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
+                    vt: VT_LPWSTR,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: PROPVARIANT_0_0_0 {
+                        pwszVal: PWSTR(wide.as_mut_ptr()),
+                    },
+                }),
+            },
+        };
+
+        unsafe {
+            let store: IPropertyStore = match SHGetPropertyStoreForWindow(HWND(raw)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("taskbar identity: property store unavailable ({e})");
+                    return;
+                }
+            };
+            if store.SetValue(&PKEY_APPUSERMODEL_ID, &value).is_ok() {
+                let _ = store.Commit();
+            }
+        }
+        // Keep `wide` alive past `SetValue` (its raw pointer rode inside
+        // `value`); a raw pointer creates no borrow, so without this the buffer
+        // could be freed before the store reads it.
+        drop(wide);
+    }
 }
 
 /// Current peers + live route states.
@@ -922,7 +1032,10 @@ async fn fleet_revoke_role(
 ) -> Result<(), String> {
     state
         .node
-        .request("fleet_revoke_role", json!({ "device": device, "code": code }))
+        .request(
+            "fleet_revoke_role",
+            json!({ "device": device, "code": code }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
