@@ -368,22 +368,74 @@
       </button>
     {/if}
 
-    <!-- The local device's claim-mode toggle, given pride of place as a
-         button (in the same slot + style the remote machines' buttons use)
-         while this machine isn't yet in a fleet: an unowned device's most
-         useful action, filling the space it would otherwise leave empty. The
-         hover spells out what it does; the colour flips on when active. Once
-         it's in a fleet, re-offering it for adoption is a rare "reclaim", so
-         it drops to the quieter checkbox down in the relationship block. -->
-    {#if node.kind === "this" && !app.isFleetMember(node.id)}
-      <button
-        class="btn console-open claim-toggle"
-        class:on={node.claimable}
-        title="Offer this device so another of mine can adopt it"
-        onclick={() => app.setLocalClaimable(!(node.claimable ?? false))}
-      >
-        {node.claimable ? "🔓 Disallow Claiming" : "🔒 Allow Claiming"}
-      </button>
+    <!-- Fleet controls — always present for your own machines and fleet
+         members, and deliberately *separate* from the sharing block below. A
+         fleet is the closed mesh of devices you own; this is where you offer a
+         device for adoption, leave the fleet, and (as owner) hand out manager
+         / owner authority. -->
+    {#if !meshonly && (node.kind === "this" || app.isFleetMember(node.id))}
+      {@const role = app.fleetRoleOf(node.id)}
+      <section class="block fleet-ctl">
+        <div class="block-head">
+          <h4>🔗 Fleet</h4>
+          {#if role}<span class="role-pill {role}" title="Authority in your fleet">{role}</span>{/if}
+        </div>
+
+        {#if node.kind === "this"}
+          {#if app.isFleetMember(node.id)}
+            <p class="hint">
+              This device is in {app.fleetName ? `${app.fleetName}'s` : "your"} fleet.
+            </p>
+            <label class="adopt">
+              <input
+                type="checkbox"
+                checked={node.claimable ?? false}
+                onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
+              />
+              <span>{node.claimable ? "Offering this device for adoption" : "Re-offer this device for adoption"}</span>
+            </label>
+            <button class="btn small danger leave" onclick={() => app.leaveFleet()}>Leave the fleet</button>
+          {:else}
+            <p class="hint">
+              Not in a fleet yet. Offer this device for adoption, then claim it
+              from another of your machines to link them under one fleet.
+            </p>
+            <button
+              class="btn small claim-toggle"
+              class:on={node.claimable}
+              title="Offer this device so another of mine can adopt it"
+              onclick={() => app.setLocalClaimable(!(node.claimable ?? false))}
+            >
+              {node.claimable ? "🔓 Stop offering" : "🔒 Make claimable"}
+            </button>
+          {/if}
+        {:else if app.isFleetOwner}
+          <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
+          <div class="fleet-actions">
+            {#if role === "member"}
+              <button class="btn small" title="A manager can admit devices to the fleet" onclick={() => app.grantFleetRole(node.id, "manager")}>Make manager</button>
+            {/if}
+            {#if role !== "owner"}
+              <button class="btn small" title="An owner has full fleet authority and co-signs governance" onclick={() => app.grantFleetRole(node.id, "owner")}>Make owner</button>
+            {/if}
+            {#if role === "manager"}
+              <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw manager</button>
+            {/if}
+            {#if role === "owner"}
+              <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw owner</button>
+            {/if}
+            <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
+          </div>
+          <p class="hint tiny">
+            A <b>manager</b> can admit devices; an <b>owner</b> has full
+            authority. Withdrawing returns them to a plain member.
+          </p>
+        {:else}
+          <p class="hint">
+            In your fleet{#if role && role !== "member"} as <b>{role}</b>{/if}. Only the fleet owner can change roles.
+          </p>
+        {/if}
+      </section>
     {/if}
 
     <!-- Relationship / sharing -->
@@ -476,38 +528,9 @@
           {node.kind === "this" ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
         {#if app.isFleetMember(node.id)}
-          <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 Part of your fleet — see the shared key →</button>
+          <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 See the fleet's shared key →</button>
         {/if}
-        {#if node.kind === "this"}
-          <!-- The other side of claiming: this device offering *itself*. When
-               it's on, a prominent banner makes the hand-off obvious — you
-               finish the claim from a machine that already owns your stuff. -->
-          {#if node.claimable}
-            <div class="offer-banner">
-              <span class="offer-glyph" aria-hidden="true">📡</span>
-              <div>
-                <div class="offer-title">This device is offering itself for adoption</div>
-                <div class="offer-sub">
-                  On a machine you already own, open this device on the graph and
-                  choose <b>Claim</b> — they'll link under one shared key.
-                </div>
-              </div>
-            </div>
-          {/if}
-          <!-- In a fleet, the claim toggle is the quieter checkbox (re-offering
-               an already-owned machine is a rare "reclaim"); outside a fleet it
-               lives as the prominent button up in the actions slot. -->
-          {#if app.isFleetMember(node.id)}
-            <label class="adopt">
-              <input
-                type="checkbox"
-                checked={node.claimable ?? false}
-                onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
-              />
-              <span>{node.claimable ? "Offering this device for adoption" : "Offer this device so another of mine can adopt it"}</span>
-            </label>
-          {/if}
-        {:else}
+        {#if node.kind !== "this"}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
         {/if}
       {/if}
@@ -952,32 +975,40 @@
     text-align: center;
     color: var(--ink-soft);
   }
-  /* This device offering itself — a calm status banner (it's a state, not a
-     call to act here), so the in-progress hand-off is impossible to miss. */
-  .offer-banner {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.55rem;
-    border: 1px solid var(--accent);
-    background: var(--accent-soft);
-    border-radius: var(--r-md);
-    padding: 0.65rem 0.75rem;
-    margin: 0.2rem 0 0.5rem;
+  /* Fleet controls — its own block, distinct from the sharing block. */
+  .fleet-ctl .hint.tiny {
+    font-size: 0.72rem;
+    margin-top: 0.5rem;
   }
-  .offer-glyph {
-    font-size: 1.2rem;
-    line-height: 1.2;
-    flex-shrink: 0;
-  }
-  .offer-title {
+  .role-pill {
+    font-size: 0.62rem;
     font-weight: 700;
-    font-size: 0.86rem;
-  }
-  .offer-sub {
-    font-size: 0.76rem;
-    line-height: 1.45;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-radius: var(--r-pill);
+    padding: 0.08rem 0.45rem;
     color: var(--ink-soft);
-    margin-top: 0.15rem;
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+  }
+  .role-pill.owner {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .role-pill.manager {
+    color: var(--ok);
+    background: var(--ok-soft);
+    border-color: var(--ok);
+  }
+  .fleet-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.3rem;
+  }
+  .fleet-ctl .leave {
+    margin-top: 0.5rem;
   }
   .state {
     font-size: 0.7rem;

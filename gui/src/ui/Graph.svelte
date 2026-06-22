@@ -326,6 +326,22 @@
     return isAppNode(n) && n.relationship.kind !== "unclaimed";
   }
 
+  /** A device offering itself for adoption that you can actually take: an
+   *  AllMyStuff node, unclaimed, in claim mode, and not owned by someone else.
+   *  Mirrors the `adoptable` flag computed per-node in the template. */
+  function isAdoptable(n: MeshNode): boolean {
+    return (
+      isAppNode(n) &&
+      n.relationship.kind === "unclaimed" &&
+      n.claimable === true &&
+      !(!!n.owner && !app.isMe(n.owner))
+    );
+  }
+
+  /** The claimable node whose inline "Claim" button is currently dropped out
+   *  (revealed by tapping it). Null = none showing. */
+  let claimRevealed = $state<string | null>(null);
+
   function onNodeClick(n: MeshNode) {
     if (app.dragFrom) {
       // Mesh-only and not-yet-claimed nodes aren't connection targets.
@@ -338,7 +354,14 @@
         return;
       }
       app.dropConnectOnNode(n.id);
+    } else if (isAdoptable(n)) {
+      // Tapping a claimable node drops an inline "Claim" button out from
+      // under it (shimmer + slide) — the fast path to adopt, right on the
+      // graph — and opens the drawer for the full story.
+      claimRevealed = claimRevealed === n.id ? null : n.id;
+      app.selectNode(n.id);
     } else {
+      claimRevealed = null;
       app.selectNode(app.selectedNodeId === n.id ? null : n.id);
     }
   }
@@ -476,6 +499,22 @@
           <div class="node-nets" title="On {n.networks.join(', ')}">
             {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
           </div>
+        {/if}
+        <!-- Claimable affordances drop out from *under* the node, floating
+             below it so they never disturb the graph's layout. -->
+        {#if n.kind === "this" && !meshonly && !app.isFleetMember(n.id) && !n.claimable}
+          <!-- Your own device, not in a fleet: offer it for adoption. -->
+          <button
+            class="node-drawer make-claimable"
+            title="Offer this device so another of your machines can adopt it into a fleet"
+            onclick={(e) => { e.stopPropagation(); void app.setLocalClaimable(true); }}
+          >🔒 Make claimable</button>
+        {:else if adoptable && claimRevealed === n.id}
+          <!-- A claimable device you tapped: the Claim button slides in. -->
+          <button
+            class="node-drawer claim-go"
+            onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
+          >＋ Claim this device</button>
         {/if}
       </div>
     {/each}
@@ -646,6 +685,60 @@
     }
     100% {
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0), var(--shadow-md);
+    }
+  }
+  /* The claim affordances drop out from *under* the node — floated below it so
+     they never push siblings around — with a slide-in, and a shimmer on the
+     accent Claim button to pull the eye to the new action. */
+  .node-drawer {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    z-index: 6;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.4rem 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 650;
+    font-family: inherit;
+    cursor: pointer;
+    background: var(--surface);
+    color: var(--ink-soft);
+    box-shadow: var(--shadow-md);
+    animation: drawer-drop 0.22s ease-out both;
+  }
+  .node-drawer:hover {
+    border-color: var(--accent);
+  }
+  .claim-go {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: linear-gradient(
+      110deg,
+      var(--accent-soft) 30%,
+      oklch(0.7 0.16 350 / 0.5) 50%,
+      var(--accent-soft) 70%
+    );
+    background-size: 220% 100%;
+    animation: drawer-drop 0.22s ease-out both, shimmer 1.6s linear 0.22s infinite;
+  }
+  @keyframes drawer-drop {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes shimmer {
+    from {
+      background-position: 220% 0;
+    }
+    to {
+      background-position: -20% 0;
     }
   }
   /* A device that isn't running AllMyStuff: quiet, washed-out, and not a

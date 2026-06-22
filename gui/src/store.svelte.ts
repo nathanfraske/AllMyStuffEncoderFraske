@@ -57,6 +57,8 @@ import {
   fleetKick,
   fleetLeave,
   fleetSetName,
+  fleetGrantRole,
+  fleetRevokeRole,
   isTauri,
   onFileProgress,
   onFileSaved,
@@ -620,9 +622,52 @@ class AppStore {
   fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
 
   /** Whether this device is the fleet owner (founder / key-holder). Only the
-   *  owner can rename the fleet or evict a device — the backend enforces it;
-   *  the UI gates to match so members aren't shown actions that would fail. */
+   *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
+   *  backend enforces it; the UI gates to match so members aren't shown
+   *  actions that would fail. */
   isFleetOwner = $derived.by(() => this.ownedFleet?.is_owner ?? false);
+
+  /** The fleet's closed-network id (the word-salad mesh name), if any. The
+   *  meshes list uses it to lock the fleet mesh. */
+  fleetNetworkId = $derived.by(() => this.ownedFleet?.network_id?.trim() || null);
+
+  /** Whether a mesh in the list is *the fleet mesh* — the closed network that
+   *  backs your fleet. It's joined and left via the fleet, not as a mesh. */
+  isFleetMesh(net: { network_id?: string } | null | undefined): boolean {
+    const id = this.fleetNetworkId;
+    return !!id && !!net?.network_id && net.network_id === id;
+  }
+
+  /** A fleet member's governance role ("member" | "manager" | "owner"), for
+   *  the drawer's grant/withdraw controls. "controller" is surfaced as the
+   *  friendlier "manager". Null when the device isn't a fleet member. */
+  fleetRoleOf(deviceId: string): "member" | "manager" | "owner" | null {
+    const m = this.ownedFleet?.members.find((x) => sameMachine(x.device, deviceId));
+    if (!m) return null;
+    if (m.role === "owner") return "owner";
+    if (m.role === "controller") return "manager";
+    return "member";
+  }
+
+  /** Grant a fleet member a role (owner-only; backend enforces). */
+  async grantFleetRole(device: string, role: "manager" | "owner") {
+    try {
+      await fleetGrantRole(device, role);
+      this.toast("ok", role === "owner" ? "Granted owner" : "Granted manager");
+    } catch (e) {
+      this.toast("warn", `Couldn't grant the role: ${String(e)}`);
+    }
+  }
+
+  /** Withdraw a fleet member's role, back to a plain member (owner-only). */
+  async withdrawFleetRole(device: string) {
+    try {
+      await fleetRevokeRole(device);
+      this.toast("ok", "Role withdrawn");
+    } catch (e) {
+      this.toast("warn", `Couldn't withdraw the role: ${String(e)}`);
+    }
+  }
 
   /** Name (or rename) the fleet — members only (the backend enforces it;
    *  the demo mirrors the rule). The renamed roster gossips out and every

@@ -828,6 +828,23 @@ export async function fleetSetName(name: string): Promise<void> {
   await invoke("fleet_set_name", { name });
 }
 
+/** Grant a fleet member a role: "manager" (a controller — can admit members)
+ *  or "owner" (full authority). Owner-only; the daemon enforces the quorum and
+ *  throws with the reason when refused. */
+export async function fleetGrantRole(device: string, role: "manager" | "owner"): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_grant_role", { device, role });
+}
+
+/** Withdraw a fleet member's role — back to a plain member. Owner-only; throws
+ *  with the reason when refused. */
+export async function fleetRevokeRole(device: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_revoke_role", { device });
+}
+
 /** Whether this device has enrolled a custody authenticator for the fleet's
  *  closed network. `no_fleet` is true when there's no fleet to enroll yet. */
 export interface FleetMfaStatus {

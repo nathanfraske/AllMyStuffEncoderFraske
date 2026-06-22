@@ -331,6 +331,9 @@ export interface PeerInfo {
 export interface OwnedMember {
   device: string;
   label: string;
+  /** Governance role in the fleet's closed network: "member" | "controller"
+   *  (a "manager") | "owner". Drives the drawer's grant/withdraw controls. */
+  role?: "member" | "controller" | "owner";
 }
 
 /** The fleet roster (from `owned_roster` / the `allmystuff://owned` event):
@@ -345,8 +348,11 @@ export interface OwnedRoster {
   version: number;
   members: OwnedMember[];
   /** Whether *this* device is the fleet owner (founder / key-holder). Only the
-   *  owner can rename the fleet or remove (evict) a device. */
+   *  owner can rename the fleet, grant/withdraw roles, or evict a device. */
   is_owner?: boolean;
+  /** The fleet's closed-network id (the word-salad name). Lets the meshes list
+   *  spot — and lock — the fleet mesh: you leave it by leaving the fleet. */
+  network_id?: string;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------
