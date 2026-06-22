@@ -169,3 +169,7 @@ release VERSION:
     @git push
     @git tag v{{VERSION}}
     @git push origin v{{VERSION}}
+    @echo ""
+    @echo "✓ pushed tag v{{VERSION}} — the release workflow is building."
+    @echo "  watch it:   gh run watch"
+    @echo "  list runs:  gh run list --workflow=release.yml"
