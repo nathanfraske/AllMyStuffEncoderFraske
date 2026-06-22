@@ -514,7 +514,7 @@ async fn fan_out(mut rx: mpsc::UnboundedReceiver<NodeEvent>, broadcaster: Broadc
 /// and steps aside.
 pub async fn bind_control_socket() -> Result<Listener> {
     let addr = node_socket_addr()?;
-    match ListenerOptions::new().name(addr.to_name()?).create_tokio() {
+    match bind_owner_only(&addr) {
         Ok(listener) => Ok(listener),
         Err(_) => {
             // The name is taken. A node that answers owns the machine; a name
@@ -527,12 +527,41 @@ pub async fn bind_control_socket() -> Result<Listener> {
             {
                 let _ = std::fs::remove_file(addr.path());
             }
-            ListenerOptions::new()
-                .name(addr.to_name()?)
-                .create_tokio()
-                .context("bind the node control socket")
+            bind_owner_only(&addr).context("bind the node control socket")
         }
     }
+}
+
+/// Bind the node control socket and, on Unix, restrict it to the owner. The
+/// socket drives privileged operations (scan, route setup, terminal/files/
+/// input), so only this user's processes may reach it.
+///
+/// We `chmod` the **bound socket file** to 0600 rather than use interprocess's
+/// `mode()` option: that one `fchmod`s the socket *fd* before bind, which
+/// macOS/BSD reject with `ENOTSUP` — failing the bind outright (no node starts).
+/// A path `chmod` after bind works on every Unix; the window between bind and
+/// chmod is a negligible startup-time TOCTOU. Without this the socket inherits
+/// the umask — the audit's AMS-04 exposure (a same-host process reaching the
+/// control API). On Windows the namespaced pipe uses interprocess's default
+/// security descriptor; an owner-only DACL via `security_descriptor()` is a
+/// documented follow-up.
+fn bind_owner_only(addr: &SocketAddr) -> Result<Listener> {
+    let listener = ListenerOptions::new()
+        .name(addr.to_name()?)
+        .create_tokio()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(addr.path(), std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(
+                "couldn't restrict the node control socket to 0600 ({e}); \
+                 it may be reachable by other local users"
+            );
+        }
+    }
+    Ok(listener)
 }
 
 /// Accept connections on an already-bound `listener` forever, each on its own
@@ -1526,6 +1555,24 @@ pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// AMS-04: the Unix control socket must be bound owner-only (0600) so no
+    /// other local user/process can reach the privileged control API. Binds a
+    /// real socket and checks the mode `bind_owner_only` chmod'd it to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Keep the path short — macOS caps Unix socket paths at ~104 bytes.
+        let path = std::env::temp_dir().join(format!("ams-node-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let addr = SocketAddr::Path(path.clone());
+        let listener = bind_owner_only(&addr).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "node control socket must be owner-only");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Round-trip a frame through an in-memory duplex pipe and assert the tag
     /// and payload survive intact.

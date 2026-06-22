@@ -75,6 +75,12 @@ const SCROLLBACK_CAP: usize = 256 * 1024;
 /// from another machine never loses a working shell. One hour.
 const SESSION_IDLE_REAP_MS: u64 = 60 * 60 * 1000;
 
+/// AMS-06: the most concurrent PTYs this host will spawn. A generous ceiling,
+/// far above any legitimate multi-viewer use, that stops an authorised-but-
+/// abusive controller from spawning unbounded shells (a local fork-bomb of
+/// `bash` processes). Attaching to an existing session is never capped.
+const MAX_LOCAL_SESSIONS: usize = 32;
+
 /// A bounded byte ring of recent PTY output. Cheap to append, snapshots to a
 /// contiguous `Vec<u8>` for replay; the `parking_lot::Mutex` around it is the
 /// one guard the reader appends-and-broadcasts under, so an attacher that
@@ -290,6 +296,17 @@ impl TerminalHost {
         }
 
         // CREATE: mint an id if none was given.
+        // AMS-06: refuse to spawn past the concurrent-PTY ceiling, so an
+        // authorised-but-abusive controller can't fork-bomb this host with
+        // shells. Counted here (creation), never on attach.
+        {
+            let open = self.sessions.lock().len();
+            if open >= MAX_LOCAL_SESSIONS {
+                return Err(format!(
+                    "too many terminal sessions open here ({open}); close one before opening another"
+                ));
+            }
+        }
         let sid = match session_id {
             Some(s) => s.to_string(),
             None => {

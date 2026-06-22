@@ -17,7 +17,7 @@
 //!    `ALLMYSTUFF_CLAIMABLE` flag, so a box never sits silently adoptable
 //!    across reboots after you toggled it on once.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use allmystuff_graph::NodeId;
 use allmystuff_protocol::OwnedMember;
@@ -551,8 +551,39 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
         fleet_members: inner.fleet_members.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
-        Ok(json) => std::fs::write(path, json).is_ok(),
+        Ok(json) => write_private(path, json.as_bytes()),
         Err(_) => false,
+    }
+}
+
+/// Write `bytes` to `path`, owner-only on Unix (mode 0600). This file holds the
+/// plaintext fleet key, so a secret at rest mustn't be left world-readable
+/// under the umask — the audit's AMS-08. The mode is tightened *before* the
+/// bytes are written (and an existing, looser file is tightened too, since a
+/// create-time mode doesn't apply to a file that already exists), so the key
+/// never lands in a file other local users can read. (A full at-rest fix wraps
+/// the key in the OS keychain; this is the cheap, always-on floor.)
+fn write_private(path: &Path, bytes: &[u8]) -> bool {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        f.write_all(bytes).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).is_ok()
     }
 }
 
@@ -588,6 +619,24 @@ mod tests {
             path: None,
             inner: Mutex::new(Inner::default()),
         }
+    }
+
+    /// AMS-08: the ownership file holds the plaintext fleet key, so `persist`
+    /// must leave it owner-only (0600) — even when an older build left it
+    /// world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn ownership_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ams-own-{}.json", std::process::id()));
+        // Pre-create it world-readable to prove we tighten an existing file.
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(persist(&Some(path.clone()), &Inner::default()));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the fleet key at rest must be owner-only");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
