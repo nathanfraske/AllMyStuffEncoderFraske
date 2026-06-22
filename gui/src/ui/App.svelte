@@ -10,7 +10,6 @@
     terminalWindowTarget,
     videoWindowTarget,
   } from "../tauri";
-  import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
   import NetworkMenu from "./NetworkMenu.svelte";
@@ -137,7 +136,7 @@
             : app.networks.length > 1
               ? `${app.networks.length} meshes`
               : app.activeNetwork
-                ? networkDisplayName(app.activeNetwork)
+                ? app.meshLabel(app.activeNetwork)
                 : app.disabledNets.length > 0
                   ? "meshes off"
                   : "no mesh"}

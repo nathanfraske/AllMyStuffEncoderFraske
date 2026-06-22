@@ -649,6 +649,29 @@ class AppStore {
     return !!id && !!net?.network_id && net.network_id === id;
   }
 
+  /** The fleet owner's display name, read from the signed roster (the member
+   *  whose role is "owner"). Lets every device — member, manager, owner — label
+   *  the fleet mesh by its owner even without an explicit fleet name. Empty when
+   *  the owner isn't in the roster yet. */
+  fleetOwnerName(): string {
+    const owner = this.ownedFleet?.members.find((m) => this.fleetRoleOf(m.device) === "owner");
+    return owner?.label?.trim() ?? "";
+  }
+
+  /** The display name for a mesh. The fleet mesh reads "<owner>'s Fleet" — the
+   *  explicit fleet name if set, else the owner's name from the roster — so
+   *  members and managers show the same label the owner does, sourced from the
+   *  roster that always converges, not a backend network label that may not have
+   *  reached them. Every other mesh is just its own label/id. */
+  meshLabel(net: { network_id?: string; label?: string | null; config_id?: string } | null | undefined): string {
+    if (!net) return "";
+    if (this.isFleetMesh(net)) {
+      const name = this.fleetName || this.fleetOwnerName();
+      if (name) return `${name}'s Fleet`;
+    }
+    return networkDisplayName(net);
+  }
+
   /** A fleet member's governance role ("member" | "manager" | "owner"), for
    *  the drawer's grant/withdraw controls. "controller" is surfaced as the
    *  friendlier "manager". Null when the device isn't a fleet member. */
@@ -1128,7 +1151,7 @@ class AppStore {
     };
     const nets = Array.isArray(this.networks) ? this.networks : [];
     for (const net of nets) {
-      const netName = networkDisplayName(net);
+      const netName = this.meshLabel(net);
       let peers: PeerInfo[] = [];
       let roster: RosterPeer[] = [];
       try {
@@ -1260,7 +1283,7 @@ class AppStore {
     }
     // The local machine is on every network we've joined.
     const me = this.node(this.localId) ?? this.catalog.nodes.find((n) => n.kind === "this");
-    if (me) me.networks = nets.map((n) => networkDisplayName(n)).sort();
+    if (me) me.networks = nets.map((n) => this.meshLabel(n)).sort();
     // A machine that's no longer in any roster/peer set has dropped offline.
     // Compare by canonical pubkey so a presence node (display id) isn't wrongly
     // marked offline just because the daemon lists it under the bare pubkey.
@@ -4504,7 +4527,7 @@ class AppStore {
     }
     // A device only reachable over disabled networks reads offline, and
     // this machine's own chips track what's actually joined.
-    const enabledNames = new Set(this.networks.map((n) => networkDisplayName(n)));
+    const enabledNames = new Set(this.networks.map((n) => this.meshLabel(n)));
     for (const n of this.catalog.nodes) {
       if (n.kind === "this") {
         n.networks = [...enabledNames].sort();

@@ -40,7 +40,7 @@
     <div class="row" class:fleet={fleetMesh}>
       <span class="row-dot live"></span>
       <div class="row-main">
-        <div class="row-name">{networkDisplayName(n)}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
+        <div class="row-name">{app.meshLabel(n)}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
         <div class="row-sub">{n.network_id}</div>
       </div>
       {#if fleetMesh}

@@ -154,7 +154,7 @@
           {@const fleetMesh = app.isFleetMesh(n)}
           <li class:on={app.rosterNetwork === n.config_id} class:fleet={fleetMesh}>
             <button class="net-main" onclick={() => app.refreshRoster(n.config_id)}>
-              <span class="net-name">{networkDisplayName(n)}{#if fleetMesh}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{/if}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
+              <span class="net-name">{app.meshLabel(n)}{#if fleetMesh}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{/if}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
             <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
@@ -215,7 +215,7 @@
     <!-- Approvals / roster -->
     {#if rosterNet}
       <section class="block">
-        <h4>Devices on “{networkDisplayName(rosterNet)}”</h4>
+        <h4>Devices on “{app.meshLabel(rosterNet)}”</h4>
 
         {#if pending.length > 0}
           <div class="subhead">Waiting for you</div>
