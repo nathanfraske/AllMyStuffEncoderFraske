@@ -2595,6 +2595,25 @@ impl Mesh {
         // A duplicate `NetworkAdd` (already joined) returns an error we ignore.
         let _ = self.client.request(&Request::NetworkAdd { config }).await;
 
+        // Keep the fleet-mesh **label** converged. `NetworkAdd` is a no-op once
+        // joined, so it never refreshes the label — but a rename handed down to a
+        // member arrives as a fresh key+name and re-runs this. Without an explicit
+        // update the member's fleet-mesh pill (and anywhere the mesh label titles
+        // things) would keep the old name even though its graph fleet-name pill,
+        // fed by the roster, already updated. NetworkUpdate makes the owner's
+        // rename actually spread to every member's mesh label too.
+        let label = fleet_label(&self.ownership.fleet_name());
+        let _ = self
+            .client
+            .request(&Request::NetworkUpdate {
+                config: json!({
+                    "id": network.as_str(),
+                    "network_id": network.as_str(),
+                    "label": label,
+                }),
+            })
+            .await;
+
         // The set of joined networks just changed — pick the fleet network up
         // everywhere: refresh `st.networks`, (re)subscribe its channels, and
         // re-advertise the `allmystuff` capability + presence on it. Without
