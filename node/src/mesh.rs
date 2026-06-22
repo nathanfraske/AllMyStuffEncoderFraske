@@ -2146,11 +2146,7 @@ impl Mesh {
                 // derive the same closed network), join it, and converge our
                 // signed roster from the owner's governance. Only honoured from
                 // our recorded owner — a stray key from anyone else is ignored.
-                let from_is_owner = self
-                    .ownership
-                    .owner()
-                    .as_deref()
-                    .map(pubkey_part)
+                let from_is_owner = self.ownership.owner().as_deref().map(pubkey_part)
                     == Some(pubkey_part(from.as_str()));
                 if !from_is_owner {
                     tracing::warn!(
@@ -2261,9 +2257,10 @@ impl Mesh {
     /// key/members when there's no fleet yet, so the front-end always gets a
     /// well-formed shape.
     pub async fn fleet_roster_value(&self) -> Value {
-        let (Some(key), Some(network)) =
-            (self.ownership.fleet_key(), self.ownership.fleet_network_id())
-        else {
+        let (Some(key), Some(network)) = (
+            self.ownership.fleet_key(),
+            self.ownership.fleet_network_id(),
+        ) else {
             return empty_owned();
         };
         let mut members: Vec<OwnedMember> = Vec::new();
@@ -2577,7 +2574,10 @@ impl Mesh {
         }
         let network = self.ownership.kick_member(&device)?;
         let target = pubkey_part(&device).to_string();
-        tracing::info!("evicting {} from fleet network {network}", short_id(&device));
+        tracing::info!(
+            "evicting {} from fleet network {network}",
+            short_id(&device)
+        );
         let resp = self
             .client
             .request(&Request::GovernanceProposeEvict {
@@ -2588,7 +2588,11 @@ impl Mesh {
             .await;
         match resp {
             Ok(r) if r.ok => {}
-            Ok(r) => return Err(r.error.unwrap_or_else(|| "couldn't evict the device".into())),
+            Ok(r) => {
+                return Err(r
+                    .error
+                    .unwrap_or_else(|| "couldn't evict the device".into()))
+            }
             Err(e) => return Err(e.to_string()),
         }
         // Tell the device directly too, so a cooperative one ejects at once.
@@ -2616,7 +2620,10 @@ impl Mesh {
                 "network_id": network.as_str(),
                 "label": self.ownership.fleet_name(),
             });
-            let _ = self.client.request(&Request::NetworkUpdate { config }).await;
+            let _ = self
+                .client
+                .request(&Request::NetworkUpdate { config })
+                .await;
         }
         self.emit_owned().await;
         Ok(())
