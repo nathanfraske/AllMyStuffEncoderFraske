@@ -335,14 +335,18 @@ export interface OwnedMember {
 
 /** The fleet roster (from `owned_roster` / the `allmystuff://owned` event):
  *  the shared key that links your co-owned devices and the members it links.
- *  An empty `key` means you haven't claimed anything yet. */
+ *  The members are projected from the fleet's closed-network **signed
+ *  roster** — authenticated membership, not gossip. An empty `key` means you
+ *  haven't claimed anything yet. */
 export interface OwnedRoster {
   key: string;
-  /** The fleet's display name ("Casey") — cosmetic, gossiped with the
-   *  roster. Absent/empty = unnamed (an older peer never sends it). */
+  /** The fleet's display name ("Casey") — cosmetic. Absent/empty = unnamed. */
   name?: string;
   version: number;
   members: OwnedMember[];
+  /** Whether *this* device is the fleet owner (founder / key-holder). Only the
+   *  owner can rename the fleet or remove (evict) a device. */
+  is_owner?: boolean;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------

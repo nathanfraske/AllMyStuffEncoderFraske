@@ -160,7 +160,7 @@
           id="fleet-owner-name"
           class="name-input"
           placeholder="Unnamed — whose fleet is this?"
-          disabled={!selfIsMember}
+          disabled={!app.isFleetOwner}
           bind:value={nameDraft}
           oninput={() => (nameDirty = true)}
           onkeydown={(e) => e.key === "Enter" && saveName()}
@@ -169,8 +169,8 @@
       </div>
       <p class="hint">
         The fleet answers to this name everywhere — the graph's “{app.fleetName ||
-          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it. It
-        gossips with the roster, so every member sees the same name.
+          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it.
+        {#if !app.isFleetOwner}Only the fleet owner can change it.{/if}
       </p>
     </section>
 
@@ -186,23 +186,23 @@
               <div class="m-name">{m.label || live || m.device.slice(0, 12)}{#if isSelf} <span class="self-tag">this device</span>{/if}</div>
               <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
             </div>
-            {#if selfIsMember && !isSelf}
+            {#if app.isFleetOwner && !isSelf}
               <button
                 class="kick"
                 class:armed={armed === m.device}
-                title="Remove this device from the fleet (it's also released from your ownership)"
+                title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
                 onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
               >
-                {armed === m.device ? "Kick — sure?" : "Kick"}
+                {armed === m.device ? "Evict — sure?" : "Evict"}
               </button>
             {/if}
           </li>
         {/each}
       </ul>
-      {#if !selfIsMember}
+      {#if !app.isFleetOwner}
         <p class="hint">
-          This device isn't in the fleet, so it can only watch the roster —
-          you can't kick devices from a fleet you aren't in.
+          Only the fleet owner (the device that founded the fleet) can evict a
+          device. This device can leave on its own below.
         </p>
       {/if}
     </section>

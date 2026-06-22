@@ -611,12 +611,18 @@ class AppStore {
    *  it can still be approved later; it just stops nagging from the nudge. */
   dismissedJoins = $state<string[]>([]);
 
-  // ---- owned fleet (the gossiped "Owned" roster) ------------------
-  /** The shared key + members linking the devices you've claimed. */
+  // ---- owned fleet (the closed network's signed roster) -----------
+  /** The shared key + members linking the devices you've claimed. Members are
+   *  the fleet's closed-network signed roster — authenticated, not gossip. */
   ownedFleet = $state<OwnedRoster | null>(null);
 
   /** The fleet's display name ("Casey"), empty when unnamed. */
   fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
+
+  /** Whether this device is the fleet owner (founder / key-holder). Only the
+   *  owner can rename the fleet or evict a device — the backend enforces it;
+   *  the UI gates to match so members aren't shown actions that would fail. */
+  isFleetOwner = $derived.by(() => this.ownedFleet?.is_owner ?? false);
 
   /** Name (or rename) the fleet — members only (the backend enforces it;
    *  the demo mirrors the rule). The renamed roster gossips out and every
