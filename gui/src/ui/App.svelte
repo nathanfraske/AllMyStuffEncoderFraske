@@ -10,10 +10,10 @@
     terminalWindowTarget,
     videoWindowTarget,
   } from "../tauri";
-  import { networkDisplayName } from "../types";
   import Graph from "./Graph.svelte";
   import NodeDrawer from "./NodeDrawer.svelte";
   import NetworkMenu from "./NetworkMenu.svelte";
+  import VenueMenu from "./VenueMenu.svelte";
   import Sidebar from "./Sidebar.svelte";
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
@@ -137,7 +137,7 @@
             : app.networks.length > 1
               ? `${app.networks.length} meshes`
               : app.activeNetwork
-                ? networkDisplayName(app.activeNetwork)
+                ? app.meshLabel(app.activeNetwork)
                 : app.disabledNets.length > 0
                   ? "meshes off"
                   : "no mesh"}
@@ -146,6 +146,34 @@
         </button>
         {#if app.netMenuOpen}
           <NetworkMenu />
+        {/if}
+      </span>
+      <!-- The venues pill: the sibling of the meshes pill, for the venues your
+           meshes call out at. Same dropdown-with-switches shape; it shimmers
+           when driving a mesh just turned a venue back on. -->
+      <span class="net-anchor">
+        <button
+          class="chip venue"
+          class:live={app.backendConnected && app.venueCounts.on > 0}
+          class:shimmer={app.venuePillShimmer}
+          onclick={(e) => {
+            e.stopPropagation();
+            app.venueMenuOpen = !app.venueMenuOpen;
+          }}
+          title="Your venues — the signaling/relay sets your meshes call out at"
+          aria-haspopup="menu"
+          aria-expanded={app.venueMenuOpen}
+        >
+          <span class="net-dot"></span>
+          {app.venueCounts.total === 0
+            ? "no venues"
+            : app.venueCounts.on === app.venueCounts.total
+              ? `${app.venueCounts.total} ${app.venueCounts.total === 1 ? "venue" : "venues"}`
+              : `${app.venueCounts.on}/${app.venueCounts.total} venues`}
+          <span class="net-chevron" class:open={app.venueMenuOpen} aria-hidden="true">▾</span>
+        </button>
+        {#if app.venueMenuOpen}
+          <VenueMenu />
         {/if}
       </span>
     </div>
@@ -333,6 +361,36 @@
   }
   .net-chevron.open {
     transform: rotate(180deg);
+  }
+  /* The venues pill is the calmer sibling of the meshes pill — neutral when
+     idle, accent-lit when venues are on, so it doesn't compete with the
+     red/green mesh status. */
+  .chip.venue {
+    background: var(--surface);
+    color: var(--ink-soft);
+    border-color: var(--line-strong);
+  }
+  .chip.venue.live {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    border-color: var(--accent-soft);
+  }
+  /* A brief glow when driving a mesh just turned a venue back on. */
+  .chip.venue.shimmer {
+    animation: venue-shimmer 1.1s ease;
+  }
+  @keyframes venue-shimmer {
+    0% {
+      box-shadow: 0 0 0 0 var(--accent-soft);
+    }
+    35% {
+      box-shadow: 0 0 0 6px var(--accent-soft);
+      background: var(--accent-soft);
+      color: var(--accent-ink);
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
   }
   .actions {
     display: flex;

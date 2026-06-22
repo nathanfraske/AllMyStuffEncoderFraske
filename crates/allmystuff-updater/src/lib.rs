@@ -6,7 +6,8 @@
 //!
 //! **Three** binaries move in lockstep, the same trio the installer drops
 //! side by side, each shipped as `<stem>-<platform>.{tar.gz,zip}` with a
-//! `.sha256` sidecar:
+//! mandatory `.sha256` sidecar (and, once release signing is configured, a
+//! `.minisig` detached signature):
 //!
 //!   * `allmystuff`        — the CLI launcher (the running binary here);
 //!   * `allmystuff-gui`     — the desktop app a bare `allmystuff` opens;
@@ -28,8 +29,12 @@
 //! The flow is **stage now, apply on next launch**:
 //!
 //!   1. [`check_now`] / [`update_now`] fetch the release feed, compare
-//!      versions, download + SHA-256-verify the platform assets, and
-//!      extract them into `~/.allmystuff/updates/<version>/`.
+//!      versions, download and **verify** the platform assets — a published
+//!      SHA-256 is mandatory (a missing one fails closed; nothing unverified is
+//!      ever staged), and when this build was compiled with a release public
+//!      key baked in (`ALLMYSTUFF_RELEASE_PUBKEY`) a valid detached minisign
+//!      signature is required too — then extract them into
+//!      `~/.allmystuff/updates/<version>/`.
 //!   2. [`apply_pending_if_any`] (called first thing in `main`) atomically
 //!      renames the staged binaries over the installed ones.
 //!
@@ -68,6 +73,14 @@ pub fn default_release_api_beta() -> &'static str {
 }
 
 const USER_AGENT: &str = concat!("allmystuff-self-update/", env!("CARGO_PKG_VERSION"));
+
+/// The minisign public key releases are signed with, baked in at build time.
+/// `None` until release signing is configured (set `ALLMYSTUFF_RELEASE_PUBKEY`
+/// to the base64 public key in the release build env — see `RELEASE-SIGNING.md`).
+/// When `Some`, the updater refuses any artifact lacking a valid signature; when
+/// `None` it still requires the mandatory SHA-256, so a missing signature on an
+/// unconfigured build degrades to integrity-only, never to "unverified".
+const RELEASE_PUBKEY: Option<&str> = option_env!("ALLMYSTUFF_RELEASE_PUBKEY");
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -1049,8 +1062,7 @@ async fn stage_release(
                 .as_str()
                 .ok_or_else(|| Error::msg("asset missing download url"))?;
             let dest = dir.join(&asset_name);
-            let expected = find_sha256(assets, &asset_name, &client).await;
-            download_and_verify(&client, url, &dest, expected.as_deref(), &asset_name).await?;
+            download_verify_stage(&client, assets, url, &dest, &asset_name).await?;
             Ok::<PathBuf, Error>(dest)
         }
         .await;
@@ -1085,8 +1097,8 @@ async fn stage_release(
 }
 
 /// Find the expected SHA-256 for `asset_name`: a `<asset>.sha256` sidecar
-/// asset, else a `SHA256SUMS` line. `None` if neither is published (we then
-/// stage without verification, logging a warning).
+/// asset, else a `SHA256SUMS` line. `None` if neither is published — the
+/// caller treats that as fail-closed and refuses to stage (never "unverified").
 async fn find_sha256(
     assets: &[serde_json::Value],
     asset_name: &str,
@@ -1129,11 +1141,17 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
         .await?)
 }
 
-async fn download_and_verify(
+/// Download `url`, **verify** it, and write it to `dest`. Fails closed: a
+/// published SHA-256 is mandatory (a missing one refuses to stage rather than
+/// the old behaviour of warning and staging unverified), and when this build
+/// has a release public key baked in, a valid detached minisign signature over
+/// the artifact is required too. SHA-256 proves only integrity against the same
+/// release; the signature is what makes a swapped release asset detectable.
+async fn download_verify_stage(
     client: &reqwest::Client,
+    assets: &[serde_json::Value],
     url: &str,
     dest: &Path,
-    expected_sha256: Option<&str>,
     asset_name: &str,
 ) -> Result<()> {
     let bytes = client
@@ -1143,20 +1161,66 @@ async fn download_and_verify(
         .error_for_status()?
         .bytes()
         .await?;
-    if let Some(expected) = expected_sha256 {
-        let actual = hex::encode(Sha256::digest(&bytes));
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(Error::ChecksumMismatch {
-                asset: asset_name.to_string(),
-                expected: expected.to_string(),
-                actual,
-            });
-        }
-    } else {
-        tracing::warn!("no SHA-256 published for {asset_name}; staging unverified");
+
+    // Integrity: a published checksum is mandatory. A missing sidecar used to
+    // fall through to a warning, which let anyone able to omit it serve any
+    // payload — now it refuses to stage.
+    let expected = find_sha256(assets, asset_name, client)
+        .await
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "no checksum sidecar for {asset_name}; refusing to stage unverified"
+            ))
+        })?;
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(Error::ChecksumMismatch {
+            asset: asset_name.to_string(),
+            expected,
+            actual,
+        });
     }
+
+    // Authenticity: when a release signing key is baked in, a valid detached
+    // minisign signature over the artifact is required before staging.
+    match RELEASE_PUBKEY {
+        Some(pubkey) => {
+            let sig_name = format!("{asset_name}.minisig");
+            let sig_asset = assets
+                .iter()
+                .find(|a| a["name"].as_str() == Some(sig_name.as_str()))
+                .ok_or_else(|| {
+                    Error::msg(format!("no signature for {asset_name}; refusing to stage"))
+                })?;
+            let sig_url = sig_asset["browser_download_url"]
+                .as_str()
+                .ok_or_else(|| Error::msg("signature asset missing url"))?;
+            let sig_text = fetch_text(client, sig_url).await?;
+            verify_signature(pubkey, &bytes, &sig_text)
+                .map_err(|e| Error::msg(format!("signature check failed for {asset_name}: {e}")))?;
+        }
+        None => tracing::warn!(
+            "release signing not configured in this build; {asset_name} verified by SHA-256 only"
+        ),
+    }
+
     std::fs::write(dest, &bytes)?;
     Ok(())
+}
+
+/// Verify a detached minisign signature over `data` against the baked-in
+/// release public key. Pure verification (no signing); fails closed on any
+/// malformed input.
+fn verify_signature(
+    pubkey_b64: &str,
+    data: &[u8],
+    minisig_text: &str,
+) -> std::result::Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
+        .map_err(|e| format!("bad release public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(minisig_text)
+        .map_err(|e| format!("bad signature file: {e}"))?;
+    pk.verify(data, &sig, false).map_err(|e| e.to_string())
 }
 
 // ---- platform asset naming + archive extraction ----------------------
@@ -1274,6 +1338,17 @@ mod tests {
             detect_install_kind_from_path("/home/me/.local/bin/allmystuff"),
             InstallKind::Raw
         );
+    }
+
+    #[test]
+    fn signature_verification_fails_closed_on_garbage() {
+        // A real minisign public key (base64, line 2 of a minisign.pub). Any
+        // malformed key/signature, or a good key over a non-signature, must
+        // return Err — the updater treats every Err here as "refuse to stage".
+        let pubkey = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        assert!(verify_signature(pubkey, b"some artifact bytes", "not a signature").is_err());
+        assert!(verify_signature("not-a-key", b"data", "also not a signature").is_err());
+        assert!(verify_signature("", b"", "").is_err());
     }
 
     #[test]

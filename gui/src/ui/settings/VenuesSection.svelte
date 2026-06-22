@@ -12,6 +12,10 @@
 
   const venues = $derived(app.venues);
   const draft = $derived(app.venueDraft);
+  // Which venues are actually used by a live mesh — the same merger the venues
+  // pill shows. The on/off switch (shared with the pill) is offered only for
+  // these, since toggling a venue no mesh rides has nothing to act on.
+  const usedIds = $derived(new Set(app.meshVenues().map((v) => v.id)));
 
   // The inline editor's working copy — local state so typing isn't written back
   // (and reconnected) on every keystroke; the store only hears about it on Save.
@@ -196,9 +200,26 @@
           <div class="v-name">
             {v.label}
             {#if v.builtin}<span class="chip built-chip">built-in</span>{/if}
+            {#if usedIds.has(v.id) && !app.isVenueActive(v.id)}<span class="chip off-chip">off</span>{/if}
           </div>
           <div class="v-sub">{summarise(v)}</div>
         </div>
+        {#if usedIds.has(v.id)}
+          {@const on = app.isVenueActive(v.id)}
+          <button
+            class="vswitch"
+            class:on
+            role="switch"
+            aria-checked={on}
+            aria-label="{on ? 'Switch off' : 'Switch on'} {v.label}"
+            title={on
+              ? "On — this venue's servers are folded into every mesh that uses it. The same switch as the venues pill."
+              : "Off — switch on to fold this venue's servers back in"}
+            onclick={() => void app.toggleVenue(v.id, !on)}
+          >
+            <span class="vknob"></span>
+          </button>
+        {/if}
         {#if v.builtin}
           <button class="btn small" onclick={() => edit(v)}>View</button>
         {:else}
@@ -364,6 +385,42 @@
     color: var(--accent-ink);
     background: var(--accent-soft);
     border-color: var(--accent);
+  }
+  .off-chip {
+    color: var(--ink-faint);
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+  }
+  /* The shared on/off switch — the same control as the venues pill, so the
+     library and the pill drive one off-list. */
+  .vswitch {
+    position: relative;
+    width: 2.1rem;
+    height: 1.15rem;
+    border-radius: var(--r-pill);
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    padding: 0;
+    flex-shrink: 0;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .vswitch .vknob {
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: 0.95rem;
+    height: 0.95rem;
+    border-radius: 50%;
+    background: var(--ink-faint);
+    transition: transform 0.12s ease, background 0.12s ease;
+  }
+  .vswitch.on {
+    background: var(--ok-soft);
+    border-color: var(--ok);
+  }
+  .vswitch.on .vknob {
+    transform: translateX(0.92rem);
+    background: var(--ok);
   }
   .editor {
     margin-top: 1rem;

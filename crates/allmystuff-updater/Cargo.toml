@@ -1,6 +1,6 @@
 [package]
 name = "allmystuff-updater"
-description = "Self-update for AllMyStuff: configurable release feed, SHA-256 verification, stage-then-apply — modelled on myownmesh-updater, self-contained."
+description = "Self-update for AllMyStuff: configurable release feed, fail-closed SHA-256 + minisign verification, stage-then-apply — modelled on myownmesh-updater, self-contained."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,10 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Detached Ed25519 (minisign) verification of release artifacts. Pure-Rust,
+# verification-only — no signing in the client, which only checks. Matches
+# myownmesh-updater so both halves share one release-signing scheme.
+minisign-verify = "0.2"
 flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }

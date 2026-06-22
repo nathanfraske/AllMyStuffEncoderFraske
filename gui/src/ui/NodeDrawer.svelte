@@ -430,6 +430,14 @@
             In your fleet{#if st.role && st.role !== "member"} as <b>{st.role}</b>{/if}. Only the fleet owner can change roles.
           </p>
         {/if}
+
+        {#if st.inFleet}
+          <!-- The full fleet view — name, members, key, MFA — lives in Settings;
+               this is the jump there from the device you're looking at. -->
+          <button class="linklike fleet-settings" onclick={() => app.openSettings("fleet")}>
+            ⚙ Manage fleet in Settings →
+          </button>
+        {/if}
       </section>
     {/if}
 
@@ -520,9 +528,6 @@
         <p class="muted own-note">
           {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
-        {#if st.inFleet}
-          <button class="linklike" onclick={() => app.openSettings("fleet")}>🔗 See the fleet's shared key →</button>
-        {/if}
         {#if !st.self}
           <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
         {/if}
@@ -1154,6 +1159,10 @@
   }
   .linklike:hover {
     text-decoration: underline;
+  }
+  .fleet-ctl .fleet-settings {
+    display: block;
+    margin-top: 0.5rem;
   }
   /* The "Its stuff" fold: a full-width header row that reads as a count
      until expanded. */

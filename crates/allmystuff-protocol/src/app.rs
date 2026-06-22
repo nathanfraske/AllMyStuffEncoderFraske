@@ -704,7 +704,20 @@ pub enum OwnershipControl {
     /// claim is confirmed — it replaces the old gossiped `OwnedRoster`. The
     /// device adopts the key, joins the fleet's closed network, and converges
     /// its signed roster from the owner's governance.
-    FleetKey { key: String, name: String },
+    ///
+    /// `venue` carries the owner's fleet-network **transport config** (its
+    /// signaling / STUN / TURN servers) as a JSON object string, so a joining
+    /// member calls out where the rest of the fleet does instead of at its own
+    /// default. The venue is owner-defined: only the fleet owner sets it, and a
+    /// change re-hands the key to broadcast it. Carried as a string (not a typed
+    /// value) so the message stays `Eq` and preserves every config field
+    /// verbatim. `None` from an older owner, or before any venue is configured.
+    FleetKey {
+        key: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue: Option<String>,
+    },
     /// A member tells its owner it's leaving the fleet, so the owner removes
     /// it from the signed roster (a propagating evict) instead of believing
     /// it's still a member. Sent by the leaver to its owner just before it

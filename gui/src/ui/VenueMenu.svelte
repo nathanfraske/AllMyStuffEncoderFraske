@@ -1,22 +1,19 @@
 <script lang="ts">
-  // The network pill's dropdown: every network this device knows — the
-  // ones it's joined (live) and the ones switched off (parked) — each
-  // with an on/off switch, so a network can be quieted **without
-  // deleting it**. Off = the daemon leaves the network (peers there stop
-  // seeing this device) but the full config is kept; on = re-join with
-  // everything (servers, label, roster) intact.
+  // The venues pill's dropdown — the sibling of the meshes menu, but for
+  // venues. It lists the merger of every live mesh's venues, each with an
+  // on/off switch. A venue is on by default; turning one **off** is the user's
+  // call (driving a mesh never does it), while enabling a mesh turns its venues
+  // back on (and shimmers the pill). Off = its servers drop out of every mesh
+  // that rides it; on = they're folded back in.
   import { app } from "../store.svelte";
-  import { networkDisplayName } from "../types";
 
   function close() {
-    app.netMenuOpen = false;
+    app.venueMenuOpen = false;
   }
 
-  // Close on a click anywhere outside the menu (the pill itself stops
-  // propagation so it can toggle).
   function onWindowPointerDown(e: PointerEvent) {
     const t = e.target as Element | null;
-    if (!t?.closest?.(".net-menu, .chip.net")) close();
+    if (!t?.closest?.(".venue-menu, .chip.venue")) close();
   }
 
   $effect(() => {
@@ -25,61 +22,34 @@
   });
 </script>
 
-<div class="net-menu" role="menu" aria-label="Your meshes">
-  <div class="menu-head">Your meshes</div>
+<div class="venue-menu" role="menu" aria-label="Your venues">
+  <div class="menu-head">Your venues</div>
 
-  {#if app.networks.length === 0 && app.disabledNets.length === 0}
+  {#if app.meshVenues().length === 0}
     <p class="menu-empty">
-      No meshes yet — join or import one from
-      <button class="linkish" onclick={() => (close(), app.openSettings("networks"))}>Settings</button>.
+      No venues yet — your meshes call out at
+      <button class="linkish" onclick={() => (close(), app.openSettings("venues"))}>their venues</button>.
     </p>
   {/if}
 
-  {#each app.networks as n (n.config_id)}
-    {@const fleetMesh = app.isFleetMesh(n)}
-    <div class="row" class:fleet={fleetMesh}>
-      <span class="row-dot live"></span>
+  {#each app.meshVenues() as v (v.id)}
+    {@const on = app.isVenueActive(v.id)}
+    <div class="row" class:off={!on}>
+      <span class="row-dot" class:live={on}></span>
       <div class="row-main">
-        <div class="row-name">{app.meshLabel(n)}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
-        <div class="row-sub">{n.network_id}</div>
-      </div>
-      {#if fleetMesh}
-        <!-- The fleet mesh can't be switched off here — it's the closed
-             network your fleet rides on. Leave the fleet to leave this mesh. -->
-        <span
-          class="lock"
-          title="This is your fleet mesh — it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
-          aria-label="Fleet mesh — locked"
-        >🔒</span>
-      {:else}
-        <button
-          class="switch on"
-          role="switch"
-          aria-checked="true"
-          aria-label="Disable {networkDisplayName(n)}"
-          title="Disable — leave this mesh but keep it for later"
-          onclick={() => app.toggleNetworkEnabled(n.config_id, false)}
-        >
-          <span class="knob"></span>
-        </button>
-      {/if}
-    </div>
-  {/each}
-
-  {#each app.disabledNets as c (c.id)}
-    <div class="row off">
-      <span class="row-dot"></span>
-      <div class="row-main">
-        <div class="row-name">{networkDisplayName(c)}</div>
-        <div class="row-sub">disabled — kept for later</div>
+        <div class="row-name">{v.label}</div>
+        <div class="row-sub">{v.signaling[0] ?? v.url ?? "no servers"}</div>
       </div>
       <button
         class="switch"
+        class:on
         role="switch"
-        aria-checked="false"
-        aria-label="Enable {networkDisplayName(c)}"
-        title="Enable — re-join this mesh"
-        onclick={() => app.toggleNetworkEnabled(c.id, true)}
+        aria-checked={on}
+        aria-label="{on ? 'Switch off' : 'Switch on'} {v.label}"
+        title={on
+          ? "Switch off — drop this venue's servers from every mesh that uses it"
+          : "Switch on — fold this venue's servers back in"}
+        onclick={() => void app.toggleVenue(v.id, !on)}
       >
         <span class="knob"></span>
       </button>
@@ -91,14 +61,14 @@
       class="btn small wide"
       onclick={() => {
         close();
-        app.openSettings("networks");
-      }}>⚙ Manage meshes…</button
+        app.openSettings("venues");
+      }}>⚙ Manage venues…</button
     >
   </div>
 </div>
 
 <style>
-  .net-menu {
+  .venue-menu {
     position: absolute;
     top: calc(100% + 0.45rem);
     right: 0;
@@ -210,26 +180,6 @@
   .switch.on .knob {
     transform: translateX(0.92rem);
     background: var(--ok);
-  }
-  .lock {
-    flex-shrink: 0;
-    font-size: 0.95rem;
-    opacity: 0.75;
-    cursor: not-allowed;
-    padding: 0 0.2rem;
-  }
-  .fleet-tag {
-    margin-left: 0.35rem;
-    font-size: 0.6rem;
-    font-weight: 700;
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-    border-radius: var(--r-pill);
-    padding: 0.05rem 0.35rem;
-    vertical-align: middle;
-  }
-  .row.fleet {
-    box-shadow: inset 0 0 0 1px var(--accent-soft);
   }
   .menu-foot {
     margin-top: 0.35rem;

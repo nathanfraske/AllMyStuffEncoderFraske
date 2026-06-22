@@ -353,7 +353,14 @@ export interface PeerInfo {
    *  carried in the peer list (reliable, unlike the bespoke presence advert).
    *  The `allmystuff` tag (CAP_TAG_ALLMYSTUFF) marks it as an app node; the
    *  remaining tags are its advertised features. `app_version` is its build. */
-  capabilities?: { tags?: string[]; app_version?: string | null } | null;
+  capabilities?: {
+    tags?: string[];
+    app_version?: string | null;
+    /** The device summary (OS / CPU / RAM / device count), carried here too so
+     *  it arrives reliably with the peer list even when the presence advert is
+     *  missed. */
+    summary?: InventorySummary | null;
+  } | null;
 }
 
 // ---- owned fleet (the gossiped "Owned" roster) ------------------------

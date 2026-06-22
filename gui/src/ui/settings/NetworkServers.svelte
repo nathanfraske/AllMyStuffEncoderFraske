@@ -5,7 +5,7 @@
   // kept as an "Edit servers directly" escape hatch (still writing through
   // `updateNetworkServers`, exactly as before).
   import { app } from "../../store.svelte";
-  import { networkDisplayName, type TurnEntry } from "../../types";
+  import { type TurnEntry } from "../../types";
   import {
     MYOWNMESH_SIGNALING,
     MYOWNMESH_STUN,
@@ -97,14 +97,14 @@
     <div class="picker">
       {#each configs as c (c.id)}
         <button class="pick" class:active={selectedId === c.id} onclick={() => (app.serversNetwork = c.id)}>
-          {networkDisplayName(c)}
+          {app.meshLabel(c)}
         </button>
       {/each}
     </div>
 
     {#if selected}
       <p class="lead">
-        <b>{networkDisplayName(selected)}</b> calls out at <b>{currentLabel}</b>. A
+        <b>{app.meshLabel(selected)}</b> calls out at <b>{currentLabel}</b>. A
         venue is a named set of signaling / STUN / TURN servers — picking one
         reconnects the mesh through it.
       </p>

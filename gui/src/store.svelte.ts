@@ -23,10 +23,12 @@ import {
   venuesFromEnvelope,
 } from "./network-settings";
 import {
+  loadInactiveVenues,
   loadNetworkVenues,
   loadVenues,
   newVenueId,
   PUBLIC_VENUE_ID,
+  saveInactiveVenues,
   saveNetworkVenues,
   saveVenues,
   unionServers,
@@ -157,6 +159,7 @@ import {
   type SiteAdvert,
   type SiteMapping,
   type InputAction,
+  type InventorySummary,
   type MediaKind,
   type MeshNode,
   type Standing,
@@ -603,6 +606,16 @@ class AppStore {
   disabledNets = $state<NetworkConfigFull[]>([]);
   /** The network pill's dropdown (enable/disable without deleting). */
   netMenuOpen = $state(false);
+  /** The venues pill's dropdown — the master on/off for each venue, the sibling
+   *  of the meshes pill. */
+  venueMenuOpen = $state(false);
+  /** Venues the user has switched **off** (by id). An off-list, so venues are
+   *  on by default; only the user adds to it, while driving a mesh can only
+   *  remove from it. */
+  inactiveVenues = $state<string[]>(loadInactiveVenues());
+  /** Briefly true right after driving a mesh turned a venue back on, so the
+   *  venues pill can shimmer to say "something here changed". */
+  venuePillShimmer = $state(false);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -647,6 +660,29 @@ class AppStore {
   isFleetMesh(net: { network_id?: string } | null | undefined): boolean {
     const id = this.fleetNetworkId;
     return !!id && !!net?.network_id && net.network_id === id;
+  }
+
+  /** The fleet owner's display name, read from the signed roster (the member
+   *  whose role is "owner"). Lets every device — member, manager, owner — label
+   *  the fleet mesh by its owner even without an explicit fleet name. Empty when
+   *  the owner isn't in the roster yet. */
+  fleetOwnerName(): string {
+    const owner = this.ownedFleet?.members.find((m) => this.fleetRoleOf(m.device) === "owner");
+    return owner?.label?.trim() ?? "";
+  }
+
+  /** The display name for a mesh. The fleet mesh reads "<owner>'s Fleet" — the
+   *  explicit fleet name if set, else the owner's name from the roster — so
+   *  members and managers show the same label the owner does, sourced from the
+   *  roster that always converges, not a backend network label that may not have
+   *  reached them. Every other mesh is just its own label/id. */
+  meshLabel(net: { network_id?: string; label?: string | null; config_id?: string } | null | undefined): string {
+    if (!net) return "";
+    if (this.isFleetMesh(net)) {
+      const name = this.fleetName || this.fleetOwnerName();
+      if (name) return `${name}'s Fleet`;
+    }
+    return networkDisplayName(net);
   }
 
   /** A fleet member's governance role ("member" | "manager" | "owner"), for
@@ -1049,8 +1085,15 @@ class AppStore {
     // The fleet roster converges live — a claim, or gossip catching up, pushes
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
+      const renamed = (this.ownedFleet?.name ?? "") !== (r.name ?? "");
       this.ownedFleet = r;
       this.reconcileFleetRelationships();
+      // A rename changes the fleet *mesh* label, which the graph's network
+      // chips (and the meshes list) read from the network config — not the
+      // roster. The 3 s mesh poll never re-reads network labels, so pull them
+      // now and re-derive the graph, so a fleet rename actually shows up on the
+      // mesh pills, not just the "<name>'s fleet" grouping.
+      if (renamed) void this.refreshNetworks().then(() => this.syncMeshGraph());
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
@@ -1107,7 +1150,14 @@ class AppStore {
     // same id presence + capabilities use, so they merge into one node.
     const live = new Map<
       string,
-      { label: string; online: boolean; app: boolean; features: string[]; version?: string }
+      {
+        label: string;
+        online: boolean;
+        app: boolean;
+        features: string[];
+        version?: string;
+        summary?: InventorySummary;
+      }
     >();
     const rosterAll: RosterPeer[] = [];
     const joins: PendingJoin[] = [];
@@ -1121,7 +1171,7 @@ class AppStore {
     };
     const nets = Array.isArray(this.networks) ? this.networks : [];
     for (const net of nets) {
-      const netName = networkDisplayName(net);
+      const netName = this.meshLabel(net);
       let peers: PeerInfo[] = [];
       let roster: RosterPeer[] = [];
       try {
@@ -1160,6 +1210,9 @@ class AppStore {
           e.app = true;
           e.features = tags.filter((t) => t !== CAP_TAG_ALLMYSTUFF);
           if (p.capabilities?.app_version) e.version = p.capabilities.app_version;
+          // The device stats ride the peer list too — so a connected peer whose
+          // presence advert was missed still gets its OS/CPU/RAM summary.
+          if (p.capabilities?.summary) e.summary = p.capabilities.summary;
         }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
@@ -1235,6 +1288,7 @@ class AppStore {
           app: info.app,
           features: info.features,
           version: info.version,
+          summary: info.summary,
           networks: nodeNets,
         });
       } else {
@@ -1243,17 +1297,21 @@ class AppStore {
         if (!node.hostname && info.label) node.label = info.label;
         // The mesh marker can flip a node *on* (app node), but it never
         // downgrades one: presence may have already enriched it with richer
-        // detail (summary, owner, sites), so only fill what's still missing.
+        // detail (owner, sites), so only fill what's still missing.
         if (info.app) {
           node.app = true;
           if (!node.features?.length) node.features = info.features;
           if (!node.version && info.version) node.version = info.version;
+          // The stats now ride the peer list, so keep them fresh from there —
+          // this is the reliable source the missed-presence case fell back to
+          // nothing on. Only overwrite with a real summary, never blank it.
+          if (info.summary) node.summary = info.summary;
         }
       }
     }
     // The local machine is on every network we've joined.
     const me = this.node(this.localId) ?? this.catalog.nodes.find((n) => n.kind === "this");
-    if (me) me.networks = nets.map((n) => networkDisplayName(n)).sort();
+    if (me) me.networks = nets.map((n) => this.meshLabel(n)).sort();
     // A machine that's no longer in any roster/peer set has dropped offline.
     // Compare by canonical pubkey so a presence node (display id) isn't wrongly
     // marked offline just because the daemon lists it under the bare pubkey.
@@ -4424,6 +4482,16 @@ class AppStore {
       );
       await this.refreshNetworks();
       await this.loadDisabledNetworks();
+      // Driving a mesh on turns its venues back on if any were off, and shimmers
+      // the venues pill so the change is seen. Disabling never touches a venue —
+      // other meshes may still ride it, and turning one off is the user's call.
+      if (on) {
+        const net = this.networks.find((n) => n.config_id === key || n.network_id === key);
+        if (net && this.reactivateVenuesFor(net.network_id)) {
+          await this.applyNetworkVenuesByWireId(net.network_id);
+          this.shimmerVenuePill();
+        }
+      }
       await this.syncMeshGraph();
     } catch (e) {
       this.toast("warn", `Couldn't ${on ? "enable" : "disable"} the network: ${errMsg(e)}`);
@@ -4497,7 +4565,7 @@ class AppStore {
     }
     // A device only reachable over disabled networks reads offline, and
     // this machine's own chips track what's actually joined.
-    const enabledNames = new Set(this.networks.map((n) => networkDisplayName(n)));
+    const enabledNames = new Set(this.networks.map((n) => this.meshLabel(n)));
     for (const n of this.catalog.nodes) {
       if (n.kind === "this") {
         n.networks = [...enabledNames].sort();
@@ -4541,6 +4609,14 @@ class AppStore {
       this.toast("warn", "That network isn't loaded — reopen Settings");
       return;
     }
+    // The fleet's venue is owner-defined and owner-broadcast: members and
+    // managers ride the owner's choice. Refuse here too, so no UI path (the
+    // venues editor included) lets a non-owner change the fleet mesh's servers
+    // — the owner's next broadcast would just overwrite it anyway.
+    if (this.isFleetMesh(cfg) && !this.isFleetOwner) {
+      this.toast("warn", "The fleet's venue is set by the fleet owner — you ride the owner's choice.");
+      return;
+    }
     const next: NetworkConfigFull = {
       ...cfg,
       signaling: {
@@ -4581,6 +4657,90 @@ class AppStore {
       return pub ? [pub] : [];
     }
     return ids.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
+  }
+
+  /** Whether a venue is currently on. On by default; only an explicit user
+   *  switch-off (the off-list) turns it off. */
+  isVenueActive(id: string): boolean {
+    return !this.inactiveVenues.includes(id);
+  }
+
+  /** The merger of every live mesh's venues — the list the venues pill shows.
+   *  Deduped by id, Public first (so the built-in anchors the list), the rest
+   *  by label. This is "the venues across all your meshes" in one place. */
+  meshVenues(): Venue[] {
+    const seen = new Set<string>();
+    const out: Venue[] = [];
+    for (const n of Array.isArray(this.networks) ? this.networks : []) {
+      for (const v of this.venuesForNetwork(n.network_id)) {
+        if (!seen.has(v.id)) {
+          seen.add(v.id);
+          out.push(v);
+        }
+      }
+    }
+    return out.sort((a, b) => {
+      if (a.id === PUBLIC_VENUE_ID) return -1;
+      if (b.id === PUBLIC_VENUE_ID) return 1;
+      return a.label.localeCompare(b.label);
+    });
+  }
+
+  /** The on/off counts for the venues pill label. */
+  venueCounts = $derived.by(() => {
+    const all = this.meshVenues();
+    const on = all.filter((v) => this.isVenueActive(v.id)).length;
+    return { on, total: all.length };
+  });
+
+  /** Turn venues **on** — the single place the off-list shrinks. The pill, the
+   *  venues library and assigning a venue to a mesh all route through it, so
+   *  they're one system. Returns whether anything changed. */
+  private activateVenues(ids: string[]): boolean {
+    const set = new Set(ids);
+    const next = this.inactiveVenues.filter((x) => !set.has(x));
+    if (next.length === this.inactiveVenues.length) return false;
+    this.inactiveVenues = next;
+    saveInactiveVenues(this.inactiveVenues);
+    return true;
+  }
+
+  /** Turn a venue **off** (add to the off-list) — only ever the user's action,
+   *  never a side effect of driving a mesh. */
+  private deactivateVenue(id: string) {
+    if (this.inactiveVenues.includes(id)) return;
+    this.inactiveVenues = [...this.inactiveVenues, id];
+    saveInactiveVenues(this.inactiveVenues);
+  }
+
+  /** Flip a venue on or off across every mesh that uses it. Turning one off is
+   *  the user's call (driving a mesh never does it); turning one on re-applies
+   *  its servers. Re-deriving each affected mesh skips the fleet mesh unless
+   *  you own it — its venue is owner-defined. */
+  async toggleVenue(id: string, on: boolean) {
+    if (on) this.activateVenues([id]);
+    else this.deactivateVenue(id);
+    // Re-apply to every live mesh that references this venue.
+    for (const n of Array.isArray(this.networks) ? this.networks : []) {
+      if (this.venuesForNetwork(n.network_id).some((v) => v.id === id)) {
+        if (this.isFleetMesh(n) && !this.isFleetOwner) continue;
+        await this.applyNetworkVenuesByWireId(n.network_id);
+      }
+    }
+  }
+
+  /** Driving a mesh on turns its venues back on if any were off (the user's
+   *  off-switch is the only thing that turns one off). Returns whether anything
+   *  was re-activated, so the caller can shimmer the venues pill. */
+  private reactivateVenuesFor(networkId: string): boolean {
+    return this.activateVenues(this.venuesForNetwork(networkId).map((v) => v.id));
+  }
+
+  /** Shimmer the venues pill briefly — used when driving a mesh re-activated a
+   *  venue, so the change is visible without a toast. */
+  private shimmerVenuePill() {
+    this.venuePillShimmer = true;
+    setTimeout(() => (this.venuePillShimmer = false), 1100);
   }
 
   private persistVenues() {
@@ -4644,7 +4804,11 @@ class AppStore {
     const venues = venueIds.map((id) => this.venueById(id)).filter((v): v is Venue => !!v);
     this.networkVenues[cfg.network_id] = venues.map((v) => v.id);
     this.persistNetworkVenues();
-    await this.updateNetworkServers(configId, unionServers(venues));
+    // Assigning a venue to a mesh turns it on — the same off-list the pill
+    // drives, so settings and the pill are one system — then apply through the
+    // single active-filtered path (not a separate raw write) so both agree.
+    this.activateVenues(venues.map((v) => v.id));
+    await this.applyNetworkVenuesByWireId(cfg.network_id);
   }
 
   /** Re-apply a venue to every live mesh that uses it (after an edit). */
@@ -4654,11 +4818,16 @@ class AppStore {
     }
   }
 
-  /** Recompute + write a mesh's union, found by wire id. */
+  /** Recompute + write a mesh's union, found by wire id. Only the **active**
+   *  venues contribute — a venue the user switched off drops out of the union —
+   *  but if that would leave the mesh with no servers at all, fall back to its
+   *  full venue set rather than strand it offline. */
   private async applyNetworkVenuesByWireId(networkId: string) {
     const cfg = this.networkConfigs.find((c) => c.network_id === networkId);
     if (!cfg) return;
-    await this.updateNetworkServers(cfg.id, unionServers(this.venuesForNetwork(networkId)));
+    const all = this.venuesForNetwork(networkId);
+    const active = all.filter((v) => this.isVenueActive(v.id));
+    await this.updateNetworkServers(cfg.id, unionServers(active.length ? active : all));
   }
 
   /** Save a mesh's current inline servers as a new named venue and switch the

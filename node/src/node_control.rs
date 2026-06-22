@@ -1010,11 +1010,27 @@ pub async fn dispatch(
         }
         "mesh_network_update" => {
             let config: Value = try_arg!(arg(a, "config"));
-            sync_after(
+            let target = config
+                .get("network_id")
+                .or_else(|| config.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let out = sync_after(
                 mesh,
                 daemon_request(client, Request::NetworkUpdate { config }).await,
             )
-            .await
+            .await;
+            // If the owner just changed the fleet mesh's transport (its venue),
+            // push it to every member — the venue is owner-defined and
+            // owner-broadcast (a no-op for a non-owner). The internal label
+            // update in ensure_fleet_network goes straight to the daemon, not
+            // through here, so this fires only on a deliberate config edit.
+            if let (DispatchOut::Json(_), Some(nid)) = (&out, target) {
+                if mesh.is_fleet_network(&nid) {
+                    mesh.fleet_broadcast_config().await;
+                }
+            }
+            out
         }
         "mesh_network_remove" => {
             let network: String = try_arg!(arg(a, "network"));
