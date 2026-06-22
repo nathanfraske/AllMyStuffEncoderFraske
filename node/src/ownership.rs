@@ -300,18 +300,38 @@ impl Ownership {
         changed
     }
 
-    /// Leave the fleet this device belongs to. Drops the local credential
-    /// and returns the derived closed-network id that was left, so the caller
-    /// can tear the device out of that network (a `NetworkRemove`). `None`
-    /// when this device wasn't in a fleet.
-    pub fn leave_fleet(&self) -> Option<String> {
+    /// Whether this device is in a fleet **at all** — the single membership
+    /// predicate every other check derives from. True when it holds a fleet key
+    /// (a founder, or an adopted member) *or* it's been claimed (has an owner).
+    /// The `owner` arm is what makes an owned-but-keyless device — claimed, but
+    /// still awaiting its owner's key handoff — count as in a fleet, so the
+    /// drawer, the settings pane and `leave` all agree instead of one saying
+    /// "in a fleet" while another insists it isn't.
+    pub fn in_fleet(&self) -> bool {
+        let i = self.inner.lock();
+        i.owner.is_some() || i.fleet_key.is_some()
+    }
+
+    /// Leave the fleet this device belongs to, clearing **all** local
+    /// fleet/ownership state — owner, key, name, members — in one atomic step.
+    /// Returns the derived closed-network id to tear out of (`Some`) when this
+    /// device held a key, or `None` when it didn't (an owned-but-keyless member
+    /// that never joined the network — there's nothing to `NetworkRemove`, but
+    /// it has still left). `Err` only when there was nothing to leave: no owner
+    /// and no key. Clearing the owner here is deliberate — membership follows
+    /// ownership, so leaving releases this device to re-advertise unowned.
+    pub fn leave_fleet(&self) -> Result<Option<String>, ()> {
         let mut i = self.inner.lock();
-        let key = i.fleet_key.take()?;
+        if i.owner.is_none() && i.fleet_key.is_none() {
+            return Err(());
+        }
+        let network = i.fleet_key.take().map(|k| derive_fleet_network_id(&k));
+        i.owner = None;
         i.fleet_name.clear();
         i.fleet_version = 0;
         i.fleet_members.clear();
         persist(&self.path, &i);
-        Some(derive_fleet_network_id(&key))
+        Ok(network)
     }
 
     /// Forget `device` from the owner's local member record (the re-admit
@@ -669,12 +689,34 @@ mod tests {
         let dev = memory();
         let key = dev.ensure_fleet_key();
         let net = derive_fleet_network_id(&key);
+        assert!(dev.in_fleet());
 
         let left = dev.leave_fleet().expect("was in a fleet");
-        assert_eq!(left, net, "returns the network to tear down");
+        assert_eq!(
+            left.as_deref(),
+            Some(net.as_str()),
+            "returns the network to tear down"
+        );
         assert!(dev.fleet_key().is_none());
-        // Not in a fleet any more → leaving again is a no-op.
-        assert!(dev.leave_fleet().is_none());
+        assert!(!dev.in_fleet());
+        // Not in a fleet any more → leaving again errors (nothing to leave).
+        assert!(dev.leave_fleet().is_err());
+    }
+
+    #[test]
+    fn an_owned_but_keyless_device_is_in_a_fleet_and_can_leave() {
+        // A device claimed by an owner whose fleet-key handoff never landed:
+        // it has an owner but no key. It's still in a fleet, and leaving must
+        // succeed (clearing the owner) rather than insisting it isn't.
+        let dev = memory();
+        assert!(dev.set_owner(Some("desktop-AAAAA".into())));
+        assert!(dev.fleet_key().is_none());
+        assert!(dev.in_fleet(), "claimed without a key is still in a fleet");
+
+        let left = dev.leave_fleet().expect("a claimed device can leave");
+        assert!(left.is_none(), "no closed network was ever joined");
+        assert!(dev.owner().is_none(), "leaving releases the owner");
+        assert!(!dev.in_fleet());
     }
 
     #[test]

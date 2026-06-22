@@ -14,10 +14,15 @@
 
   const fleet = $derived(app.ownedFleet);
   const members = $derived(fleet?.members ?? []);
-  const hasFleet = $derived(!!fleet && !!fleet.key && members.length > 0);
-  // Membership is the permission: you can leave, and kick others, only
-  // while this device is in the fleet itself.
-  const selfIsMember = $derived(members.some((m) => app.isMe(m.device)));
+  // One membership truth, shared with the graph and the drawer: the backend's
+  // `in_fleet`. So the settings pane can't say "no fleet" while the drawer says
+  // you're in one. A keyless member (claimed, awaiting its key) is in a fleet
+  // too — it just has no key block to show.
+  const hasFleet = $derived(app.inFleet);
+  const hasKey = $derived(!!fleet?.key);
+  // Membership is the permission: you can leave, and kick others, while this
+  // device is in the fleet — the same single flag.
+  const selfIsMember = $derived(app.inFleet);
 
   let revealed = $state(false);
   let copied = $state(false);
@@ -142,18 +147,31 @@
   </p>
 
   {#if hasFleet}
-    <section class="block key-block">
-      <div class="key-head">
-        <span class="key-title">🔑 Fleet key</span>
-        <span class="muted">v{fleet?.version}</span>
-      </div>
-      <div class="key-row">
-        <code class:revealed>{keyShown}</code>
-        <button class="btn small" onclick={() => (revealed = !revealed)}>{revealed ? "Hide" : "Reveal"}</button>
-        <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
-      </div>
-      <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+    {#if hasKey}
+      <section class="block key-block">
+        <div class="key-head">
+          <span class="key-title">🔑 Fleet key</span>
+          <span class="muted">v{fleet?.version}</span>
+        </div>
+        <div class="key-row">
+          <code class:revealed>{keyShown}</code>
+          <button class="btn small" onclick={() => (revealed = !revealed)}>{revealed ? "Hide" : "Reveal"}</button>
+          <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
+        </div>
+        <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+      </section>
+    {:else}
+      <section class="block">
+        <p class="hint">
+          This device has been claimed into a fleet but is still waiting on its
+          owner to hand over the shared key. It'll join the rest of the fleet
+          once the owner is reachable; you can leave below in the meantime.
+        </p>
+      </section>
+    {/if}
 
+    {#if hasKey}
+      <section class="block name-block">
       <div class="name-row">
         <label class="name-label" for="fleet-owner-name">🪪 Fleet owner name</label>
         <input
@@ -172,7 +190,8 @@
           "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it.
         {#if !app.isFleetOwner}Only the fleet owner can change it.{/if}
       </p>
-    </section>
+      </section>
+    {/if}
 
     <section class="block">
       <h4>{members.length} device{members.length === 1 ? "" : "s"} in your fleet</h4>

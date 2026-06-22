@@ -40,7 +40,7 @@
   const mineLabel = (): string =>
     app.fleetName
       ? `${app.fleetName}'s fleet`
-      : app.hasFleet
+      : app.inFleet
         ? "Your fleet"
         : "Your devices";
 

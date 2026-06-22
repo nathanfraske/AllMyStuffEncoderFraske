@@ -623,11 +623,14 @@ class AppStore {
   /** The fleet's display name ("Casey"), empty when unnamed. */
   fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
 
-  /** Whether this device holds a fleet credential at all — the one true test
-   *  of "are you in a fleet." A fleet of one counts: starting or being left
-   *  alone in a fleet is valid, so this keys on holding the key, not on having
-   *  company on the roster. */
-  hasFleet = $derived.by(() => !!this.ownedFleet?.key);
+  /** Whether **this** device is in a fleet at all — the single self-membership
+   *  truth the whole UI reads, taken straight from the backend's one `in_fleet`
+   *  flag (true when you hold the key *or* have been claimed). A fleet of one
+   *  counts; an owned-but-keyless device (claimed, awaiting its key) counts.
+   *  The drawer, the settings Fleet pane, the graph label and the leave control
+   *  all read this, so none of them can claim you're in a fleet while another
+   *  insists you're not. */
+  inFleet = $derived.by(() => this.ownedFleet?.in_fleet === true);
 
   /** Whether this device is the fleet owner (founder / key-holder). Only the
    *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
@@ -675,9 +678,7 @@ class AppStore {
     // to "Leave the fleet", matching the backend's no-claiming-while-owned rule
     // so the UI can't say "not in a fleet" while the backend refuses adoption.
     // For a remote device, whether it's a member of your fleet roster.
-    const inFleet = self
-      ? !!this.ownedFleet?.key || this.ownedFleet?.claimed === true
-      : this.isFleetMember(node.id);
+    const inFleet = self ? this.inFleet : this.isFleetMember(node.id);
     const role = this.fleetRoleOf(node.id);
     // Roster-authoritative ownership. The signed fleet roster — what the
     // settings Fleet pane and the graph's fleet grouping both read — is the
@@ -690,7 +691,7 @@ class AppStore {
     // contradict it).
     const advertisedMine = !!node.owner && this.isMe(node.owner);
     const ownedByOther = !!node.owner && !this.isMe(node.owner);
-    const ownedByMe = inFleet || (advertisedMine && !this.hasFleet);
+    const ownedByMe = inFleet || (advertisedMine && !this.inFleet);
     const offering = node.claimable === true;
     const mine = ownedByMe;
     const claimable = !self && app && offering && !mine && !ownedByOther;

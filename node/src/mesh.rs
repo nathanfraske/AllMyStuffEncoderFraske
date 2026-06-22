@@ -2324,61 +2324,69 @@ impl Mesh {
     /// key/members when there's no fleet yet, so the front-end always gets a
     /// well-formed shape.
     pub async fn fleet_roster_value(&self) -> Value {
-        // A device is "in a fleet" the moment it's claimed — it belongs to its
-        // owner's fleet even before the owner's `FleetKey` handoff lands (which
-        // can lag or fail if the owner is briefly offline). The GUI never sees
-        // the *local* node's own `owner`, so it leans on this roster as the only
-        // signal; report `claimed` so a just-claimed-but-keyless device reads as
-        // in-a-fleet (and not free to make claimable) instead of contradicting
-        // the backend's no-claiming-while-owned rule.
-        let claimed = self.ownership.owner().is_some();
-        let (Some(key), Some(network)) = (
-            self.ownership.fleet_key(),
-            self.ownership.fleet_network_id(),
-        ) else {
+        // The single membership truth the whole GUI reads: `in_fleet`. A device
+        // is in a fleet the moment it's claimed — it belongs to its owner's
+        // fleet even before the owner's `FleetKey` handoff lands (which can lag
+        // or fail if the owner is briefly offline) — or whenever it holds a key.
+        // The GUI never sees the *local* node's own `owner`, so it leans on this
+        // one flag; every place that asks "am I in a fleet" (the drawer, the
+        // settings pane, the leave button) reads it, so they can't disagree.
+        let in_fleet = self.ownership.in_fleet();
+        // Not in a fleet at all → the empty, well-formed shape. Everything below
+        // assumes membership, and the GUI keys solely on `in_fleet`.
+        if !in_fleet {
             let mut v = empty_owned();
             if let Some(o) = v.as_object_mut() {
-                o.insert("claimed".into(), Value::Bool(claimed));
+                o.insert("in_fleet".into(), Value::Bool(false));
             }
             return v;
-        };
+        }
+        // In a fleet. The key/network may be absent — an owned-but-keyless
+        // member that's been claimed but hasn't received its owner's key
+        // handoff is in a fleet with no closed network of its own yet. In that
+        // case there's no signed roster to read; the membership the user sees is
+        // still real (self, plus the owner's local list when we're the owner).
+        let key = self.ownership.fleet_key().unwrap_or_default();
+        let network = self.ownership.fleet_network_id();
         let mut members: Vec<OwnedMember> = Vec::new();
         let mut member_roles: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        if let Ok(r) = self
-            .client
-            .request(&Request::RosterList {
-                network: network.clone(),
-            })
-            .await
-        {
-            if r.ok {
-                if let Some(arr) = r
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.get("roster"))
-                    .and_then(|v| v.as_array())
-                {
-                    for e in arr {
-                        if let Some(id) = e.get("device_id").and_then(|v| v.as_str()) {
-                            let label = e
-                                .get("label")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            // The governance role projection ("member" /
-                            // "controller" / "owner"), so the GUI can label the
-                            // grant/withdraw controls per member.
-                            let role = e
-                                .get("role")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("member")
-                                .to_string();
-                            member_roles.insert(pubkey_part(id).to_string(), role);
-                            members.push(OwnedMember {
-                                device: NodeId::from(pubkey_part(id)),
-                                label,
-                            });
+        if let Some(network) = network.as_deref() {
+            if let Ok(r) = self
+                .client
+                .request(&Request::RosterList {
+                    network: network.to_string(),
+                })
+                .await
+            {
+                if r.ok {
+                    if let Some(arr) = r
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("roster"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for e in arr {
+                            if let Some(id) = e.get("device_id").and_then(|v| v.as_str()) {
+                                let label = e
+                                    .get("label")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                // The governance role projection ("member" /
+                                // "controller" / "owner"), so the GUI can label
+                                // the grant/withdraw controls per member.
+                                let role = e
+                                    .get("role")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("member")
+                                    .to_string();
+                                member_roles.insert(pubkey_part(id).to_string(), role);
+                                members.push(OwnedMember {
+                                    device: NodeId::from(pubkey_part(id)),
+                                    label,
+                                });
+                            }
                         }
                     }
                 }
@@ -2451,12 +2459,16 @@ impl Mesh {
             );
             // The fleet's closed-network id, so the GUI can spot which mesh in
             // the list is the fleet mesh and lock it (you leave it by leaving
-            // the fleet, not by removing the mesh).
-            obj.insert("network_id".into(), Value::String(network));
-            // Whether this device is claimed (owned) at all — true for any
-            // fleet member, mirrored from the no-key path so the GUI's
-            // "am I in a fleet" check is the same in both branches.
-            obj.insert("claimed".into(), Value::Bool(claimed));
+            // the fleet, not by removing the mesh). Empty for a keyless member
+            // that hasn't joined a closed network yet.
+            obj.insert(
+                "network_id".into(),
+                Value::String(network.unwrap_or_default()),
+            );
+            // The single membership flag — always true here (we returned early
+            // when not in a fleet), so the GUI's "am I in a fleet" check is the
+            // same regardless of whether we hold a key yet.
+            obj.insert("in_fleet".into(), Value::Bool(in_fleet));
             // Stamp each member with its governance role for the drawer's
             // grant/withdraw controls.
             if let Some(arr) = obj.get_mut("members").and_then(|v| v.as_array_mut()) {
@@ -2746,17 +2758,25 @@ impl Mesh {
                 )
                 .await;
         }
+        // Leaving clears all local fleet/ownership state atomically (owner
+        // included). It returns the closed network to tear out of, or `None`
+        // when there was no key to derive one (an owned-but-keyless member that
+        // never joined a network — it has still left); `Err` only when there
+        // was genuinely nothing to leave.
         let network = self
             .ownership
             .leave_fleet()
-            .ok_or("this device isn't in a fleet")?;
-        tracing::info!("leaving the fleet — forgetting closed network {network}");
-        let _ = self
-            .client
-            .request(&Request::NetworkRemove { network })
-            .await;
-        if self.ownership.owner().is_some() {
-            self.ownership.set_owner(None);
+            .map_err(|_| "this device isn't in a fleet".to_string())?;
+        if let Some(network) = network {
+            tracing::info!("leaving the fleet — forgetting closed network {network}");
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove { network })
+                .await;
+        } else {
+            tracing::info!(
+                "left the fleet (was claimed but keyless — no closed network to forget)"
+            );
         }
         self.refresh_fleet_authorization().await;
         self.refresh_profile_ownership().await;
