@@ -705,6 +705,11 @@ pub enum OwnershipControl {
     /// device adopts the key, joins the fleet's closed network, and converges
     /// its signed roster from the owner's governance.
     FleetKey { key: String, name: String },
+    /// A member tells its owner it's leaving the fleet, so the owner removes
+    /// it from the signed roster (a propagating evict) instead of believing
+    /// it's still a member. Sent by the leaver to its owner just before it
+    /// drops the fleet network; the owner reconciles its roster on receipt.
+    FleetDeparted,
     /// An ownership kind a newer build introduced. Ignored here rather than
     /// failing the enclosing [`ControlMessage`].
     #[serde(other)]

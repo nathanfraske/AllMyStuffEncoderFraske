@@ -1052,6 +1052,13 @@ impl Mesh {
                     // reply self-heals on their next frame instead of waiting
                     // for a manual network refresh.
                     let node_id = profile.node.clone();
+                    // What this device says about its own ownership, captured
+                    // before the advert is folded in (moved): used to self-heal
+                    // our fleet roster below.
+                    let advertised_owner = profile
+                        .owner
+                        .as_ref()
+                        .map(|o| pubkey_part(o.as_str()).to_string());
                     let known = {
                         let st = self.state.lock();
                         st.session
@@ -1065,6 +1072,30 @@ impl Mesh {
                             .map(|s| s.apply_presence(profile))
                             .unwrap_or(false)
                     };
+                    // Self-heal the fleet: if a device we still list as a fleet
+                    // member now advertises a *different* owner (or none — it
+                    // went unclaimed), it has left us or been re-claimed. Evict
+                    // it so the roster reflects reality even when the explicit
+                    // leave notification never arrived (it was offline, crashed,
+                    // or was claimed straight out from under us).
+                    if !is_self && self.ownership.is_fleet_owner() {
+                        let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
+                        let peer = pubkey_part(node_id.as_str()).to_string();
+                        let in_my_fleet = self
+                            .ownership
+                            .fleet_member_ids()
+                            .iter()
+                            .any(|d| pubkey_part(d) == peer)
+                            || self.fleet_authorized.lock().contains(&peer);
+                        let still_ours = advertised_owner.as_deref() == me.as_deref();
+                        if in_my_fleet && !still_ours {
+                            tracing::info!(
+                                "fleet member {} now answers to a different owner — evicting",
+                                short_id(node_id.as_str())
+                            );
+                            let _ = self.fleet_kick(node_id.to_string()).await;
+                        }
+                    }
                     if new_boot || (!is_self && !known) {
                         tracing::info!(
                             "peer {} {} — answering with our presence + roster",
@@ -2166,6 +2197,18 @@ impl Mesh {
                     self.emit_owned().await;
                 }
             }
+            OwnershipControl::FleetDeparted => {
+                // A member is telling us it left the fleet. Evict it from the
+                // signed roster so our view (and every other member's) reflects
+                // reality. Only the fleet owner acts on this.
+                if self.ownership.is_fleet_owner() {
+                    tracing::info!(
+                        "{} left the fleet — evicting from the roster",
+                        short_id(from.as_str())
+                    );
+                    let _ = self.fleet_kick(from.to_string()).await;
+                }
+            }
             other => {
                 // Declined — feedback for the claimer's UI.
                 tracing::info!(
@@ -2624,13 +2667,23 @@ impl Mesh {
         }
     }
 
-    /// Front-end command: leave the fleet this device belongs to. Drop the
-    /// local credential, tear out of the fleet's closed network, and — since
-    /// membership follows ownership — let any recorded owner go and
-    /// re-advertise unowned. The owner's signed roster may still list this
-    /// device until it's evicted, but leaving the network makes that moot:
-    /// it's gone from the wire.
+    /// Front-end command: leave the fleet this device belongs to. Tell the
+    /// owner first (so it evicts us from the signed roster instead of believing
+    /// we're still a member — the leave-side mirror of the owner's kick), then
+    /// drop the local credential, tear out of the fleet's closed network, and —
+    /// since membership follows ownership — let any recorded owner go and
+    /// re-advertise unowned.
     pub async fn fleet_leave(self: &Arc<Self>) -> Result<(), String> {
+        // Notify the owner *before* we leave the network, while we can still
+        // route a control frame to it on the fleet mesh.
+        if let Some(owner) = self.ownership.owner() {
+            let _ = self
+                .send_control(
+                    &owner,
+                    &ControlMessage::Ownership(OwnershipControl::FleetDeparted),
+                )
+                .await;
+        }
         let network = self
             .ownership
             .leave_fleet()

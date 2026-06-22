@@ -1132,13 +1132,31 @@ class AppStore {
     // Recently-connected machines get the same grace as a transient status:
     // a daemon restarting mid-poll reports *nobody* for a few seconds, and
     // without the grace that blanks the whole graph offline and back.
+    // Refresh the fleet roster every poll so fleet status — a new member, a
+    // role change, a device that left, one re-claimed out from under us —
+    // converges on the graph within a poll, not only when the backend happens
+    // to emit an `allmystuff://owned` event.
+    await this.loadOwnedFleet();
+
     const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
-    for (const n of this.catalog.nodes) {
+    // Devices no longer on any active mesh fall off the graph. We used to only
+    // flip them offline and never remove them, so a node from a mesh you've
+    // since disabled or left lingered (and "randomly reappeared"). Now: keep
+    // your own machine, your fleet, and anything you've claimed or share;
+    // anything else that isn't on an active mesh this poll (past its presence
+    // grace) is pruned.
+    this.catalog.nodes = this.catalog.nodes.filter((n) => {
       const canon = canonicalNodeId(n.id);
-      if (n.kind !== "this" && !this.isLocalMachine(n.id) && !knownCanon.has(canon)) {
-        n.online = this.withinPresenceGrace(canon);
-      }
-    }
+      if (n.kind === "this" || this.isLocalMachine(n.id)) return true;
+      if (knownCanon.has(canon)) return true; // seen this poll; online already set
+      const keep =
+        n.relationship.kind === "mine" ||
+        n.relationship.kind === "shared" ||
+        this.isFleetMember(n.id) ||
+        this.withinPresenceGrace(canon);
+      if (keep) n.online = this.withinPresenceGrace(canon);
+      return keep;
+    });
     // A freshly-discovered device may belong to someone we already share
     // with — fold it into that share.
     this.reconcileShares();
