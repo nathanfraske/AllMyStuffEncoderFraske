@@ -54,6 +54,21 @@
     }
   }
 
+  // The fleet mesh has no plain "leave" — leaving it *is* leaving the fleet. So
+  // the button warns first (a toast + an armed second click), then routes to the
+  // real exit, `leaveFleet`, which releases this device and tears down the mesh.
+  let armedFleetLeave = $state(false);
+  function fleetMeshLeave() {
+    if (!armedFleetLeave) {
+      armedFleetLeave = true;
+      app.toast("warn", "This is your fleet mesh — leaving it leaves the fleet. Click again to confirm.");
+      setTimeout(() => (armedFleetLeave = false), 4000);
+      return;
+    }
+    armedFleetLeave = false;
+    void app.leaveFleet();
+  }
+
   // Import = the no-typing way onto a network: pick a settings file the other
   // device exported and the network (handle + servers) is recreated here.
   let importInput = $state<HTMLInputElement | null>(null);
@@ -143,18 +158,26 @@
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
             <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+            <!-- Export, Venue and Copy id work the same for every mesh — even
+                 the fleet's. The fleet mesh differs in just two ways: it can't be
+                 *disabled* (it's the closed network your fleet rides on), and
+                 leaving it leaves the fleet, so its Leave warns and routes to the
+                 real exit instead of a plain `leaveNetwork`. -->
+            <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
+            <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
             {#if fleetMesh}
-              <!-- The fleet mesh isn't joined or left like an ordinary mesh:
-                   it's the closed network your fleet rides on. Lock the off
-                   controls and point at the real exit (leaving the fleet). -->
               <button
                 class="btn small locked"
                 disabled
-                title="This is your fleet mesh — it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
-              >🔒 Fleet mesh</button>
+                title="This is your fleet mesh — it can't be disabled. Leave the fleet to leave this mesh."
+              >🔒 Can't disable</button>
+              <button
+                class="btn small danger"
+                class:armed={armedFleetLeave}
+                title="Leaving this mesh leaves your fleet — this device is released back to unclaimed."
+                onclick={fleetMeshLeave}
+              >{armedFleetLeave ? "Leaves the fleet — sure?" : "Leave"}</button>
             {:else}
-              <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
-              <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
               <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
               <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
             {/if}

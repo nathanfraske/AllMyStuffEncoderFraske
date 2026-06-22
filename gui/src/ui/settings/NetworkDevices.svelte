@@ -15,6 +15,10 @@
     }),
   );
 
+  // The device's mesh id (pubkey), trimmed to a glanceable hash with the full
+  // value on hover — shown grey under the display name.
+  const shortHash = (id: string) => (id.length > 20 ? `${id.slice(0, 10)}…${id.slice(-6)}` : id);
+
   function relLabel(n: MeshNode): { text: string; cls: string } {
     if (!isAppNode(n)) return { text: "not on AllMyStuff", cls: "soft" };
     if (n.relationship.kind === "shared") return { text: "shared", cls: "guest" };
@@ -36,6 +40,7 @@
         <span class="avatar">{n.kind === "this" ? "💻" : isAppNode(n) ? "🖥" : "📡"}</span>
         <div class="id">
           <div class="name">{displayName(n)}</div>
+          <div class="devid" title={n.id}>{shortHash(n.id)}</div>
           <div class="meta">
             <span class="pill {rel.cls}">{rel.text}</span>
             <span class="state" class:on={n.online}>{n.online ? "online" : "offline"}</span>
@@ -96,6 +101,15 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .devid {
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 0.05rem;
   }
   .meta {
     display: flex;
