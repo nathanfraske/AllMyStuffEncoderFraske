@@ -36,22 +36,33 @@
   {/if}
 
   {#each app.networks as n (n.config_id)}
-    <div class="row">
+    {@const fleetMesh = app.isFleetMesh(n)}
+    <div class="row" class:fleet={fleetMesh}>
       <span class="row-dot live"></span>
       <div class="row-main">
-        <div class="row-name">{networkDisplayName(n)}</div>
+        <div class="row-name">{networkDisplayName(n)}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
         <div class="row-sub">{n.network_id}</div>
       </div>
-      <button
-        class="switch on"
-        role="switch"
-        aria-checked="true"
-        aria-label="Disable {networkDisplayName(n)}"
-        title="Disable — leave this mesh but keep it for later"
-        onclick={() => app.toggleNetworkEnabled(n.config_id, false)}
-      >
-        <span class="knob"></span>
-      </button>
+      {#if fleetMesh}
+        <!-- The fleet mesh can't be switched off here — it's the closed
+             network your fleet rides on. Leave the fleet to leave this mesh. -->
+        <span
+          class="lock"
+          title="This is your fleet mesh — it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
+          aria-label="Fleet mesh — locked"
+        >🔒</span>
+      {:else}
+        <button
+          class="switch on"
+          role="switch"
+          aria-checked="true"
+          aria-label="Disable {networkDisplayName(n)}"
+          title="Disable — leave this mesh but keep it for later"
+          onclick={() => app.toggleNetworkEnabled(n.config_id, false)}
+        >
+          <span class="knob"></span>
+        </button>
+      {/if}
     </div>
   {/each}
 
@@ -199,6 +210,26 @@
   .switch.on .knob {
     transform: translateX(0.92rem);
     background: var(--ok);
+  }
+  .lock {
+    flex-shrink: 0;
+    font-size: 0.95rem;
+    opacity: 0.75;
+    cursor: not-allowed;
+    padding: 0 0.2rem;
+  }
+  .fleet-tag {
+    margin-left: 0.35rem;
+    font-size: 0.6rem;
+    font-weight: 700;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.35rem;
+    vertical-align: middle;
+  }
+  .row.fleet {
+    box-shadow: inset 0 0 0 1px var(--accent-soft);
   }
   .menu-foot {
     margin-top: 0.35rem;

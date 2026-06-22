@@ -57,6 +57,39 @@ export type Relationship =
   | { kind: "unclaimed" }
   | ({ kind: "shared" } & Share);
 
+/** A node's **standing** relative to you — the single, derived answer to
+ *  "what is this device to me, right now?". Computed live from the
+ *  authoritative reactive state (your fleet roster, the device's advertised
+ *  owner + claimable flag, and any explicit share) so the graph, the drawer
+ *  and every button read *one* coherent status instead of racing stored
+ *  flags. Always recomputed from source — never stored. */
+export interface Standing {
+  /** This very device. */
+  self: boolean;
+  /** Running AllMyStuff (vs a bare mesh device with nothing to wire). */
+  app: boolean;
+  /** It's *yours* — a member of your fleet, or a device you own. */
+  mine: boolean;
+  /** A member of your fleet's signed roster. */
+  inFleet: boolean;
+  /** Its role in your fleet when in it: "owner" | "manager" | "member". */
+  role: "owner" | "manager" | "member" | null;
+  /** Whether *you* are the fleet owner — gates the role / evict controls. */
+  iAmFleetOwner: boolean;
+  /** It advertises *you* as its owner (claimed; roster may still be settling). */
+  ownedByMe: boolean;
+  /** It advertises someone else as its owner. */
+  ownedByOther: boolean;
+  /** It's offering itself for adoption *and* you can take it. */
+  claimable: boolean;
+  /** Raw "offering itself for adoption" flag (e.g. your own un-fleeted device). */
+  offering: boolean;
+  /** The person it's explicitly shared with, else null. */
+  shared: Person | null;
+  /** The single primary status, for the headline label / visual treatment. */
+  kind: "self" | "mesh" | "shared" | "fleet" | "mine" | "claimable" | "theirs" | "free";
+}
+
 export interface InventorySummary {
   os: string;
   cpu: string;
@@ -331,18 +364,35 @@ export interface PeerInfo {
 export interface OwnedMember {
   device: string;
   label: string;
+  /** Governance role in the fleet's closed network: "member" | "controller"
+   *  (a "manager") | "owner". Drives the drawer's grant/withdraw controls. */
+  role?: "member" | "controller" | "owner";
 }
 
 /** The fleet roster (from `owned_roster` / the `allmystuff://owned` event):
  *  the shared key that links your co-owned devices and the members it links.
- *  An empty `key` means you haven't claimed anything yet. */
+ *  The members are projected from the fleet's closed-network **signed
+ *  roster** — authenticated membership, not gossip. An empty `key` means you
+ *  haven't claimed anything yet. */
 export interface OwnedRoster {
   key: string;
-  /** The fleet's display name ("Casey") — cosmetic, gossiped with the
-   *  roster. Absent/empty = unnamed (an older peer never sends it). */
+  /** The fleet's display name ("Casey") — cosmetic. Absent/empty = unnamed. */
   name?: string;
   version: number;
   members: OwnedMember[];
+  /** Whether *this* device is the fleet owner (founder / key-holder). Only the
+   *  owner can rename the fleet, grant/withdraw roles, or evict a device. */
+  is_owner?: boolean;
+  /** The fleet's closed-network id (the word-salad name). Lets the meshes list
+   *  spot — and lock — the fleet mesh: you leave it by leaving the fleet. */
+  network_id?: string;
+  /** The single membership truth, computed by the backend: whether *this*
+   *  device is in a fleet at all. True when it holds the key (founder or
+   *  adopted member) **or** has been claimed (owned) — so an owned-but-keyless
+   *  device, claimed but still awaiting its owner's key handoff, reads as in a
+   *  fleet. Everything that asks "am I in a fleet" (the drawer, the settings
+   *  pane, the leave control) reads this one flag so they can't disagree. */
+  in_fleet?: boolean;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------

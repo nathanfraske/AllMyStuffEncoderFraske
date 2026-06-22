@@ -136,16 +136,28 @@
 
       <ul class="nets">
         {#each app.networks as n (n.config_id)}
-          <li class:on={app.rosterNetwork === n.config_id}>
+          {@const fleetMesh = app.isFleetMesh(n)}
+          <li class:on={app.rosterNetwork === n.config_id} class:fleet={fleetMesh}>
             <button class="net-main" onclick={() => app.refreshRoster(n.config_id)}>
-              <span class="net-name">{networkDisplayName(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
+              <span class="net-name">{networkDisplayName(n)}{#if fleetMesh}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{/if}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
             <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
-            <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
-            <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
-            <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
-            <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
+            {#if fleetMesh}
+              <!-- The fleet mesh isn't joined or left like an ordinary mesh:
+                   it's the closed network your fleet rides on. Lock the off
+                   controls and point at the real exit (leaving the fleet). -->
+              <button
+                class="btn small locked"
+                disabled
+                title="This is your fleet mesh — it can't be turned off here. Leave the fleet (Settings → Fleet) to leave this mesh."
+              >🔒 Fleet mesh</button>
+            {:else}
+              <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
+              <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+              <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
+              <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
+            {/if}
           </li>
         {/each}
         {#each app.disabledNets as c (c.id)}
@@ -416,5 +428,17 @@
   }
   .btn.danger {
     color: var(--danger);
+  }
+  .nets li.fleet {
+    box-shadow: inset 0 0 0 1.5px var(--accent-soft);
+  }
+  .badge.fleet-badge {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  .btn.locked {
+    opacity: 0.8;
+    cursor: not-allowed;
+    color: var(--ink-faint);
   }
 </style>

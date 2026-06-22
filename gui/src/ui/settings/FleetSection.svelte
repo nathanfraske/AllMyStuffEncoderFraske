@@ -5,13 +5,24 @@
   // things.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import {
+    fleetMfaStatus,
+    fleetMfaEnroll,
+    fleetMfaDisable,
+    type FleetMfaEnrolled,
+  } from "../../tauri";
 
   const fleet = $derived(app.ownedFleet);
   const members = $derived(fleet?.members ?? []);
-  const hasFleet = $derived(!!fleet && !!fleet.key && members.length > 0);
-  // Membership is the permission: you can leave, and kick others, only
-  // while this device is in the fleet itself.
-  const selfIsMember = $derived(members.some((m) => app.isMe(m.device)));
+  // One membership truth, shared with the graph and the drawer: the backend's
+  // `in_fleet`. So the settings pane can't say "no fleet" while the drawer says
+  // you're in one. A keyless member (claimed, awaiting its key) is in a fleet
+  // too — it just has no key block to show.
+  const hasFleet = $derived(app.inFleet);
+  const hasKey = $derived(!!fleet?.key);
+  // Membership is the permission: you can leave, and kick others, while this
+  // device is in the fleet — the same single flag.
+  const selfIsMember = $derived(app.inFleet);
 
   let revealed = $state(false);
   let copied = $state(false);
@@ -34,7 +45,10 @@
   // armed id is the member's device (or "leave" for the leave button).
   let armed = $state<string | null>(null);
 
-  onMount(() => void app.loadOwnedFleet());
+  onMount(() => {
+    void app.loadOwnedFleet();
+    void loadMfaStatus();
+  });
 
   function confirmThen(id: string, act: () => void) {
     if (armed === id) {
@@ -71,6 +85,57 @@
     const n = app.catalog.nodes.find((x) => x.id === device) ?? null;
     return n?.label ?? "";
   }
+
+  // ---- fleet custody (TOTP / MFA) ----
+  // The fleet is a closed network underneath; enrolling an authenticator on
+  // this device tells the daemon to refuse a fleet governance change (kind
+  // flip, owner grant/revoke) without a fresh code. It guards *this device's*
+  // signing key for the fleet — it doesn't replace the shared fleet key.
+  let mfaEnrolled = $state(false);
+  let mfaBusy = $state(false);
+  let mfaError = $state<string | null>(null);
+  let mfaEnrollResult = $state<FleetMfaEnrolled | null>(null);
+  let mfaDisableCode = $state("");
+  let mfaDisableOpen = $state(false);
+
+  async function loadMfaStatus() {
+    try {
+      const s = await fleetMfaStatus();
+      mfaEnrolled = s.enrolled;
+    } catch {
+      // status is best-effort; a missing fleet just reads as not-enrolled.
+      mfaEnrolled = false;
+    }
+  }
+
+  async function enrollMfa() {
+    mfaBusy = true;
+    mfaError = null;
+    try {
+      mfaEnrollResult = await fleetMfaEnroll();
+      mfaEnrolled = true;
+    } catch (e) {
+      mfaError = e instanceof Error ? e.message : String(e);
+    }
+    mfaBusy = false;
+  }
+
+  async function disableMfa() {
+    const code = mfaDisableCode.trim();
+    if (!code) return;
+    mfaBusy = true;
+    mfaError = null;
+    try {
+      await fleetMfaDisable(code);
+      mfaEnrolled = false;
+      mfaEnrollResult = null;
+      mfaDisableCode = "";
+      mfaDisableOpen = false;
+    } catch (e) {
+      mfaError = e instanceof Error ? e.message : String(e);
+    }
+    mfaBusy = false;
+  }
 </script>
 
 <div class="section">
@@ -82,25 +147,38 @@
   </p>
 
   {#if hasFleet}
-    <section class="block key-block">
-      <div class="key-head">
-        <span class="key-title">🔑 Fleet key</span>
-        <span class="muted">v{fleet?.version}</span>
-      </div>
-      <div class="key-row">
-        <code class:revealed>{keyShown}</code>
-        <button class="btn small" onclick={() => (revealed = !revealed)}>{revealed ? "Hide" : "Reveal"}</button>
-        <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
-      </div>
-      <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+    {#if hasKey}
+      <section class="block key-block">
+        <div class="key-head">
+          <span class="key-title">🔑 Fleet key</span>
+          <span class="muted">v{fleet?.version}</span>
+        </div>
+        <div class="key-row">
+          <code class:revealed>{keyShown}</code>
+          <button class="btn small" onclick={() => (revealed = !revealed)}>{revealed ? "Hide" : "Reveal"}</button>
+          <button class="btn small" onclick={copyKey}>{copied ? "Copied ✓" : "Copy"}</button>
+        </div>
+        <p class="hint">Every device below holds this same key. It's an internal grouping secret — keep it private.</p>
+      </section>
+    {:else}
+      <section class="block">
+        <p class="hint">
+          This device has been claimed into a fleet but is still waiting on its
+          owner to hand over the shared key. It'll join the rest of the fleet
+          once the owner is reachable; you can leave below in the meantime.
+        </p>
+      </section>
+    {/if}
 
+    {#if hasKey}
+      <section class="block name-block">
       <div class="name-row">
         <label class="name-label" for="fleet-owner-name">🪪 Fleet owner name</label>
         <input
           id="fleet-owner-name"
           class="name-input"
           placeholder="Unnamed — whose fleet is this?"
-          disabled={!selfIsMember}
+          disabled={!app.isFleetOwner}
           bind:value={nameDraft}
           oninput={() => (nameDirty = true)}
           onkeydown={(e) => e.key === "Enter" && saveName()}
@@ -109,10 +187,11 @@
       </div>
       <p class="hint">
         The fleet answers to this name everywhere — the graph's “{app.fleetName ||
-          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it. It
-        gossips with the roster, so every member sees the same name.
+          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it.
+        {#if !app.isFleetOwner}Only the fleet owner can change it.{/if}
       </p>
-    </section>
+      </section>
+    {/if}
 
     <section class="block">
       <h4>{members.length} device{members.length === 1 ? "" : "s"} in your fleet</h4>
@@ -126,28 +205,101 @@
               <div class="m-name">{m.label || live || m.device.slice(0, 12)}{#if isSelf} <span class="self-tag">this device</span>{/if}</div>
               <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
             </div>
-            {#if selfIsMember && !isSelf}
+            {#if app.isFleetOwner && !isSelf}
               <button
                 class="kick"
                 class:armed={armed === m.device}
-                title="Remove this device from the fleet (it's also released from your ownership)"
+                title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
                 onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
               >
-                {armed === m.device ? "Kick — sure?" : "Kick"}
+                {armed === m.device ? "Evict — sure?" : "Evict"}
               </button>
             {/if}
           </li>
         {/each}
       </ul>
-      {#if !selfIsMember}
+      {#if !app.isFleetOwner}
         <p class="hint">
-          This device isn't in the fleet, so it can only watch the roster —
-          you can't kick devices from a fleet you aren't in.
+          Only the fleet owner (the device that founded the fleet) can evict a
+          device. This device can leave on its own below.
         </p>
       {/if}
     </section>
 
     {#if selfIsMember}
+      <section class="block mfa-block">
+        <h4>🛡️ Fleet security · authenticator</h4>
+        <p class="hint">
+          A per-device second factor. When enrolled, this device won't author
+          or co-sign a fleet governance change without a fresh code from your
+          authenticator app. It guards <b>this device's</b> signing key for the
+          fleet — it doesn't replace the shared fleet key above.
+        </p>
+
+        {#if mfaEnrolled}
+          <div class="mfa-status on">✓ An authenticator is enrolled on this device for the fleet.</div>
+
+          <div class="mfa-disable">
+            <button
+              class="btn small"
+              onclick={() => (mfaDisableOpen = !mfaDisableOpen)}
+            >
+              {mfaDisableOpen ? "Cancel" : "Remove authenticator"}
+            </button>
+            {#if mfaDisableOpen}
+              <div class="mfa-disable-row">
+                <input
+                  class="mfa-input"
+                  type="text"
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  placeholder="Current 6-digit or recovery code"
+                  bind:value={mfaDisableCode}
+                  onkeydown={(e) => e.key === "Enter" && disableMfa()}
+                />
+                <button
+                  class="btn small danger"
+                  disabled={mfaBusy || !mfaDisableCode.trim()}
+                  onclick={disableMfa}
+                >
+                  Disable
+                </button>
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <button class="btn small primary" disabled={mfaBusy} onclick={enrollMfa}>
+            Enroll an authenticator
+          </button>
+        {/if}
+
+        {#if mfaEnrollResult}
+          <div class="mfa-enroll">
+            <p class="mfa-enroll-lead">
+              <b>Add this to your authenticator app now, and save the recovery
+              codes</b> — they won't be shown again.
+            </p>
+            <div class="mfa-kv"><span>Secret</span><code>{mfaEnrollResult.secret}</code></div>
+            <div class="mfa-kv"><span>otpauth URI</span><code class="wrap">{mfaEnrollResult.otpauth_uri}</code></div>
+            <div class="mfa-kv">
+              <span>Recovery codes</span>
+              <ul class="mfa-recovery">
+                {#each mfaEnrollResult.recovery_codes as rc (rc)}
+                  <li><code>{rc}</code></li>
+                {/each}
+              </ul>
+            </div>
+            <button class="btn small" onclick={() => (mfaEnrollResult = null)}>
+              I've saved these
+            </button>
+          </div>
+        {/if}
+
+        {#if mfaError}
+          <div class="mfa-status err" role="alert">⚠ {mfaError}</div>
+        {/if}
+      </section>
+
       <!-- The exit lives at the very bottom, away from the everyday stuff. -->
       <section class="block">
         <div class="leave-row">
@@ -371,5 +523,102 @@
   .empty-title {
     font-weight: 700;
     font-size: 1rem;
+  }
+
+  /* ---- fleet custody (MFA) ---- */
+  .mfa-status {
+    font-size: 0.8rem;
+    border-radius: var(--r-sm);
+    padding: 0.45rem 0.6rem;
+    margin: 0.5rem 0;
+  }
+  .mfa-status.on {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  .mfa-status.err {
+    color: var(--danger);
+    background: var(--danger-soft);
+  }
+  .btn.primary {
+    background: var(--accent-soft);
+    border-color: var(--line-strong);
+    color: var(--accent-ink);
+    font-weight: 650;
+  }
+  .btn.danger {
+    color: var(--danger);
+    border-color: oklch(0.7 0.19 14 / 0.5);
+    background: var(--danger-soft);
+  }
+  .mfa-disable {
+    margin-top: 0.5rem;
+  }
+  .mfa-disable-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+  }
+  .mfa-input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.4rem 0.6rem;
+    font-size: 0.84rem;
+    font-family: var(--mono);
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .mfa-enroll {
+    margin-top: 0.7rem;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+  }
+  .mfa-enroll-lead {
+    margin: 0 0 0.5rem;
+    font-size: 0.8rem;
+    color: var(--ink-soft);
+    line-height: 1.45;
+  }
+  .mfa-kv {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    margin: 0.35rem 0;
+    font-size: 0.78rem;
+  }
+  .mfa-kv > span {
+    min-width: 6.5rem;
+    flex-shrink: 0;
+    color: var(--ink-faint);
+  }
+  .mfa-kv code {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 0.15rem 0.4rem;
+    font-size: 0.76rem;
+    font-family: var(--mono);
+  }
+  .mfa-kv code.wrap {
+    word-break: break-all;
+  }
+  .mfa-recovery {
+    margin: 0;
+    padding-left: 1rem;
+    columns: 2;
+    list-style: none;
+  }
+  .mfa-recovery code {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 0.1rem 0.3rem;
+    font-size: 0.74rem;
+    font-family: var(--mono);
   }
 </style>

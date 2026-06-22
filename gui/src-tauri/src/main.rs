@@ -837,13 +837,17 @@ async fn fleet_leave(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Kick a device out of the fleet. Only a member may kick (the backend
-/// enforces it), and never itself — that's `fleet_leave`.
+/// Evict a device from the fleet (owner-only; the daemon enforces it). `code`
+/// is the owner's custody second factor when fleet MFA is enrolled.
 #[tauri::command]
-async fn fleet_kick(state: State<'_, AppState>, device: String) -> Result<(), String> {
+async fn fleet_kick(
+    state: State<'_, AppState>,
+    device: String,
+    code: Option<String>,
+) -> Result<(), String> {
     state
         .node
-        .request("fleet_kick", json!({ "device": device }))
+        .request("fleet_kick", json!({ "device": device, "code": code }))
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -859,6 +863,74 @@ async fn fleet_set_name(state: State<'_, AppState>, name: String) -> Result<(), 
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Grant a fleet member a role: "manager" (controller) or "owner". Owner-only;
+/// the daemon enforces the closed network's quorum.
+#[tauri::command]
+async fn fleet_grant_role(
+    state: State<'_, AppState>,
+    device: String,
+    role: String,
+    code: Option<String>,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "fleet_grant_role",
+            json!({ "device": device, "role": role, "code": code }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Withdraw a fleet member's role, back to a plain member. Owner-only. `code`
+/// is the custody second factor when fleet MFA is enrolled.
+#[tauri::command]
+async fn fleet_revoke_role(
+    state: State<'_, AppState>,
+    device: String,
+    code: Option<String>,
+) -> Result<(), String> {
+    state
+        .node
+        .request("fleet_revoke_role", json!({ "device": device, "code": code }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether this device has enrolled a custody authenticator for the fleet's
+/// closed network: `{ "enrolled": bool, "no_fleet"?: true }`.
+#[tauri::command]
+async fn fleet_mfa_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Enroll a custody authenticator for the fleet. Returns the secret,
+/// `otpauth://` URI, and one-time recovery codes (shown once).
+#[tauri::command]
+async fn fleet_mfa_enroll(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_enroll", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove the fleet's custody authenticator (requires a valid code).
+#[tauri::command]
+async fn fleet_mfa_disable(state: State<'_, AppState>, code: String) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_disable", json!({ "code": code }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Fan one room-plane message (invite / join / leave / chat) out to the
@@ -1607,6 +1679,11 @@ fn main() {
             fleet_leave,
             fleet_kick,
             fleet_set_name,
+            fleet_grant_role,
+            fleet_revoke_role,
+            fleet_mfa_status,
+            fleet_mfa_enroll,
+            fleet_mfa_disable,
             mesh_status,
             mesh_identity,
             mesh_networks,

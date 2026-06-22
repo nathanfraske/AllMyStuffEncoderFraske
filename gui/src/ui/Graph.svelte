@@ -40,7 +40,7 @@
   const mineLabel = (): string =>
     app.fleetName
       ? `${app.fleetName}'s fleet`
-      : app.fleetMemberIds.size > 1
+      : app.inFleet
         ? "Your fleet"
         : "Your devices";
 
@@ -326,6 +326,17 @@
     return isAppNode(n) && n.relationship.kind !== "unclaimed";
   }
 
+  /** A device offering itself for adoption that you can actually take — the
+   *  same `standing().claimable` the node's visual reads, so the tap target
+   *  and the look never disagree. */
+  function isAdoptable(n: MeshNode): boolean {
+    return app.standingOf(n).claimable;
+  }
+
+  /** The claimable node whose inline "Claim" button is currently dropped out
+   *  (revealed by tapping it). Null = none showing. */
+  let claimRevealed = $state<string | null>(null);
+
   function onNodeClick(n: MeshNode) {
     if (app.dragFrom) {
       // Mesh-only and not-yet-claimed nodes aren't connection targets.
@@ -338,7 +349,14 @@
         return;
       }
       app.dropConnectOnNode(n.id);
+    } else if (isAdoptable(n)) {
+      // Tapping a claimable node drops an inline "Claim" button out from
+      // under it (shimmer + slide) — the fast path to adopt, right on the
+      // graph — and opens the drawer for the full story.
+      claimRevealed = claimRevealed === n.id ? null : n.id;
+      app.selectNode(n.id);
     } else {
+      claimRevealed = null;
       app.selectNode(app.selectedNodeId === n.id ? null : n.id);
     }
   }
@@ -402,20 +420,20 @@
     {/each}
     {#each layout as p (p.node.id)}
       {@const n = p.node}
-      {@const shared = n.relationship.kind === "shared"}
-      {@const unclaimed = n.relationship.kind === "unclaimed"}
-      {@const meshonly = !isAppNode(n)}
-      <!-- Offering itself for adoption *and* actually takeable (unowned): the
-           node gets an accent halo so "claim me" is obvious on the graph. -->
-      {@const adoptable = unclaimed && n.claimable === true && !(n.owner && !app.isMe(n.owner))}
+      <!-- One derived standing drives every visual + affordance, so the node
+           never shows contradictory state (e.g. "unclaimed" while wearing a
+           fleet badge). It recomputes live from the fleet roster + the device's
+           advert, so claiming or fleet changes reflect immediately. -->
+      {@const st = app.standingOf(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
-        class:self={n.kind === "this"}
-        class:shared
-        class:unclaimed
-        class:claimable={adoptable}
-        class:meshonly
+        class:self={st.self}
+        class:shared={st.kind === "shared"}
+        class:mine={st.mine && !st.self}
+        class:unclaimed={st.kind === "free" || st.kind === "theirs"}
+        class:claimable={st.claimable}
+        class:meshonly={!st.app}
         class:selected={app.selectedNodeId === n.id}
         class:armed={armed && targetable(n)}
         class:offline={!n.online}
@@ -439,9 +457,9 @@
           <div class="node-id">
             <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
             <div class="node-sub">
-              {#if shared && n.relationship.kind === "shared"}
-                shared with {n.relationship.person.name}
-              {:else if meshonly}
+              {#if st.shared}
+                shared with {st.shared.name}
+              {:else if !st.app}
                 on the mesh · not running AllMyStuff
               {:else if n.summary}
                 {n.summary.cpu}
@@ -453,22 +471,14 @@
           <span class="dot" class:on={n.online} title={n.online ? "online" : "offline"}></span>
         </div>
         <div class="node-meta">
-          {#if n.kind === "this"}<span class="tag you">this device</span>{/if}
-          {#if meshonly}<span class="tag meshonly">not on AllMyStuff</span>
-          {:else if shared}<span class="tag guest">guest</span>
-          {:else if unclaimed}
-            <!-- A device whose advert names an owner that isn't us is
-                 claimed by someone else — say that, not "unclaimed". One
-                 that's offering itself gets the accent "claim" tag. -->
-            {#if n.owner && !app.isMe(n.owner)}
-              <span class="tag theirs">someone else's</span>
-            {:else if adoptable}
-              <span class="tag claimable">＋ claim</span>
-            {:else}
-              <span class="tag unclaimed">unclaimed</span>
-            {/if}
-          {:else if n.kind !== "this"}<span class="tag mine">yours</span>{/if}
-          {#if app.isFleetMember(n.id)}<span class="tag fleet" title="In your owned fleet (shared key)">🔗 fleet</span>{/if}
+          {#if st.self}<span class="tag you">this device</span>{/if}
+          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+          {:else if st.shared}<span class="tag guest">guest</span>
+          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" title="In your fleet · {st.role}">🔗 {st.role === "member" ? "fleet" : st.role}</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
@@ -476,6 +486,22 @@
           <div class="node-nets" title="On {n.networks.join(', ')}">
             {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
           </div>
+        {/if}
+        <!-- Claimable affordances drop out from *under* the node, floating
+             below it so they never disturb the graph's layout. -->
+        {#if st.self && st.app && !st.inFleet && !st.offering}
+          <!-- Your own device, not in a fleet: offer it for adoption. -->
+          <button
+            class="node-drawer make-claimable"
+            title="Offer this device so another of your machines can adopt it into a fleet"
+            onclick={(e) => { e.stopPropagation(); void app.setLocalClaimable(true); }}
+          >🔒 Make claimable</button>
+        {:else if st.claimable && claimRevealed === n.id}
+          <!-- A claimable device you tapped: the Claim button slides in. -->
+          <button
+            class="node-drawer claim-go"
+            onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
+          >＋ Claim this device</button>
         {/if}
       </div>
     {/each}
@@ -646,6 +672,77 @@
     }
     100% {
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0), var(--shadow-md);
+    }
+  }
+  /* The claim affordances drop out from *under* the node — floated below it so
+     they never push siblings around — with a slide-in, and a shimmer on the
+     accent Claim button to pull the eye to the new action. */
+  /* A drawer that reads as part of *this* node: it tucks just under the card,
+     inset and sharing the bottom edge (no top border, bottom-rounded), with a
+     short stem down from the node's centre so it's unmistakably attached to
+     the device above it — not floating loose between cards. */
+  .node-drawer {
+    position: absolute;
+    top: calc(100% - 1px);
+    left: 14px;
+    right: 14px;
+    z-index: 6;
+    border: 1.5px solid var(--accent);
+    border-top: none;
+    border-radius: 0 0 var(--r-sm) var(--r-sm);
+    padding: 0.42rem 0.5rem 0.4rem;
+    font-size: 0.78rem;
+    font-weight: 650;
+    font-family: inherit;
+    cursor: pointer;
+    background: var(--surface);
+    color: var(--accent-ink);
+    box-shadow: 0 8px 16px oklch(0 0 0 / 0.18);
+    transform-origin: top center;
+    animation: drawer-drop 0.2s ease-out both;
+  }
+  /* The stem joining the drawer to the node's bottom edge. */
+  .node-drawer::before {
+    content: "";
+    position: absolute;
+    top: -8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 2px;
+    height: 8px;
+    background: var(--accent);
+  }
+  .node-drawer:hover {
+    background: var(--accent-soft);
+  }
+  .claim-go {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: linear-gradient(
+      110deg,
+      var(--accent-soft) 30%,
+      oklch(0.7 0.16 350 / 0.5) 50%,
+      var(--accent-soft) 70%
+    );
+    background-size: 220% 100%;
+    animation: drawer-drop 0.22s ease-out both, shimmer 1.6s linear 0.22s infinite;
+  }
+  @keyframes drawer-drop {
+    from {
+      opacity: 0;
+      transform: scaleY(0.4);
+    }
+    to {
+      opacity: 1;
+      transform: scaleY(1);
+    }
+  }
+  @keyframes shimmer {
+    from {
+      background-position: 220% 0;
+    }
+    to {
+      background-position: -20% 0;
     }
   }
   /* A device that isn't running AllMyStuff: quiet, washed-out, and not a

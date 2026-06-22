@@ -234,30 +234,32 @@ pub struct OwnedMember {
     pub label: String,
 }
 
-/// The gossiped roster of an owner's fleet: a shared key that links every
-/// co-owned device, a monotonically-increasing version for last-writer-wins
-/// convergence, and the members themselves.
+/// A snapshot of an owner's fleet for the front-end: the shared key, the
+/// fleet name, a change counter, and the members. This is now a **node →
+/// GUI** shape only (the `owned_roster` command and the `allmystuff://owned`
+/// event) — it is no longer gossiped between peers. The node builds it from
+/// local credential state plus the fleet's closed-network **signed roster**,
+/// which is the real source of membership truth.
 ///
-/// The key is, for now, an **internal grouping secret** — every device in the
-/// fleet holds the same one, minted by the first owner to claim a device and
-/// handed down on each adoption. A later edition lets the user link that key
-/// to other things; today it exists only to group co-owned devices. It is
-/// gossiped on [`CHANNEL_OWNED`].
+/// The key is an **internal grouping secret** — every device in the fleet
+/// holds the same one, minted by the first owner to claim a device and handed
+/// down on each adoption ([`OwnershipControl::FleetKey`]). Both sides derive
+/// the fleet's closed-network id from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OwnedRoster {
     /// Shared fleet key. Empty means "no fleet yet".
     #[serde(default)]
     pub key: String,
     /// The fleet's display name — whatever its owner answers to ("Casey").
-    /// Cosmetic and gossiped with the roster, converging by the same
-    /// version. Empty = unnamed, and an empty name is skipped on the wire
-    /// so an older peer sees exactly the roster shape it always did.
+    /// Cosmetic. Empty = unnamed, and an empty name is skipped on the wire so
+    /// an older peer sees exactly the roster shape it always did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Bumped on every membership change so peers converge on the newest copy.
+    /// A local change counter (bumped on claim/kick/rename), surfaced so newer
+    /// GUI renders win. No longer a gossip convergence clock.
     #[serde(default)]
     pub version: u64,
-    /// Every device the owner has claimed (and the owner itself).
+    /// The fleet's members, projected from the closed network's signed roster.
     #[serde(default)]
     pub members: Vec<OwnedMember>,
 }
@@ -696,6 +698,18 @@ pub enum OwnershipControl {
     /// The owner relinquishes the device, returning it to unowned. Only the
     /// current owner's release is honoured.
     Release,
+    /// The owner hands the freshly-claimed device its fleet credential: the
+    /// shared fleet key (from which both sides derive the same closed-network
+    /// id) and the fleet's display name. Sent point-to-point right after the
+    /// claim is confirmed — it replaces the old gossiped `OwnedRoster`. The
+    /// device adopts the key, joins the fleet's closed network, and converges
+    /// its signed roster from the owner's governance.
+    FleetKey { key: String, name: String },
+    /// A member tells its owner it's leaving the fleet, so the owner removes
+    /// it from the signed roster (a propagating evict) instead of believing
+    /// it's still a member. Sent by the leaver to its owner just before it
+    /// drops the fleet network; the owner reconciles its roster on receipt.
+    FleetDeparted,
     /// An ownership kind a newer build introduced. Ignored here rather than
     /// failing the enclosing [`ControlMessage`].
     #[serde(other)]

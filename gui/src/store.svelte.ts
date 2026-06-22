@@ -57,6 +57,9 @@ import {
   fleetKick,
   fleetLeave,
   fleetSetName,
+  fleetGrantRole,
+  fleetRevokeRole,
+  fleetMfaStatus,
   isTauri,
   onFileProgress,
   onFileSaved,
@@ -156,6 +159,7 @@ import {
   type InputAction,
   type MediaKind,
   type MeshNode,
+  type Standing,
   type NetworkConfigFull,
   type NetworkSummary,
   type OwnedRoster,
@@ -611,12 +615,173 @@ class AppStore {
    *  it can still be approved later; it just stops nagging from the nudge. */
   dismissedJoins = $state<string[]>([]);
 
-  // ---- owned fleet (the gossiped "Owned" roster) ------------------
-  /** The shared key + members linking the devices you've claimed. */
+  // ---- owned fleet (the closed network's signed roster) -----------
+  /** The shared key + members linking the devices you've claimed. Members are
+   *  the fleet's closed-network signed roster — authenticated, not gossip. */
   ownedFleet = $state<OwnedRoster | null>(null);
 
   /** The fleet's display name ("Casey"), empty when unnamed. */
   fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
+
+  /** Whether **this** device is in a fleet at all — the single self-membership
+   *  truth the whole UI reads, taken straight from the backend's one `in_fleet`
+   *  flag (true when you hold the key *or* have been claimed). A fleet of one
+   *  counts; an owned-but-keyless device (claimed, awaiting its key) counts.
+   *  The drawer, the settings Fleet pane, the graph label and the leave control
+   *  all read this, so none of them can claim you're in a fleet while another
+   *  insists you're not. */
+  inFleet = $derived.by(() => this.ownedFleet?.in_fleet === true);
+
+  /** Whether this device is the fleet owner (founder / key-holder). Only the
+   *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
+   *  backend enforces it; the UI gates to match so members aren't shown
+   *  actions that would fail. */
+  isFleetOwner = $derived.by(() => this.ownedFleet?.is_owner ?? false);
+
+  /** The fleet's closed-network id (the word-salad mesh name), if any. The
+   *  meshes list uses it to lock the fleet mesh. */
+  fleetNetworkId = $derived.by(() => this.ownedFleet?.network_id?.trim() || null);
+
+  /** Whether a mesh in the list is *the fleet mesh* — the closed network that
+   *  backs your fleet. It's joined and left via the fleet, not as a mesh. */
+  isFleetMesh(net: { network_id?: string } | null | undefined): boolean {
+    const id = this.fleetNetworkId;
+    return !!id && !!net?.network_id && net.network_id === id;
+  }
+
+  /** A fleet member's governance role ("member" | "manager" | "owner"), for
+   *  the drawer's grant/withdraw controls. "controller" is surfaced as the
+   *  friendlier "manager". Null when the device isn't a fleet member. */
+  fleetRoleOf(deviceId: string): "member" | "manager" | "owner" | null {
+    const m = this.ownedFleet?.members.find((x) => sameMachine(x.device, deviceId));
+    if (!m) return null;
+    if (m.role === "owner") return "owner";
+    if (m.role === "controller") return "manager";
+    return "member";
+  }
+
+  /** The single, derived **standing** of a node relative to you — what the
+   *  graph, the drawer and every claim/fleet button read so they always agree.
+   *  Computed live from the authoritative reactive state (your fleet roster,
+   *  the device's advertised owner + claimable flag, its share). Nothing here
+   *  is stored: change the fleet or a device's advert and this recomputes, so
+   *  the UI can't drift into a contradictory "unclaimed but in your fleet"
+   *  state the way the old stored `relationship.kind` did. */
+  standing(node: MeshNode): Standing {
+    const self = node.kind === "this" || this.isMe(node.id);
+    const app = isAppNode(node);
+    const shared = node.relationship.kind === "shared" ? node.relationship.person : null;
+    // "In a fleet": for *this* device, whether it's claimed at all — either it
+    // holds a fleet credential (a solo fleet you founded still counts) *or* it's
+    // been claimed by an owner whose fleet-key handoff hasn't landed yet (owned
+    // but keyless). Both mean it isn't free: the make-claimable button gives way
+    // to "Leave the fleet", matching the backend's no-claiming-while-owned rule
+    // so the UI can't say "not in a fleet" while the backend refuses adoption.
+    // For a remote device, whether it's a member of your fleet roster.
+    const inFleet = self ? this.inFleet : this.isFleetMember(node.id);
+    const role = this.fleetRoleOf(node.id);
+    // Roster-authoritative ownership. The signed fleet roster — what the
+    // settings Fleet pane and the graph's fleet grouping both read — is the
+    // authority for "is this device in my fleet". A device's *own* presence
+    // advert of "owner = you" is a weaker, staler hint: it lingers after the
+    // device leaves or is evicted (it may be offline, or have missed the
+    // Release), so it must not keep a device marked mine once the roster has
+    // dropped it — that's the graph-vs-settings divergence. Fall back to the
+    // advert only when you hold no fleet at all (nothing authoritative to
+    // contradict it).
+    const advertisedMine = !!node.owner && this.isMe(node.owner);
+    const ownedByOther = !!node.owner && !this.isMe(node.owner);
+    const ownedByMe = inFleet || (advertisedMine && !this.inFleet);
+    const offering = node.claimable === true;
+    const mine = ownedByMe;
+    const claimable = !self && app && offering && !mine && !ownedByOther;
+    let kind: Standing["kind"];
+    if (self) kind = "self";
+    else if (!app) kind = "mesh";
+    else if (shared) kind = "shared";
+    else if (inFleet) kind = "fleet";
+    else if (ownedByMe) kind = "mine";
+    else if (claimable) kind = "claimable";
+    else if (ownedByOther) kind = "theirs";
+    else kind = "free";
+    return {
+      self,
+      app,
+      mine,
+      inFleet,
+      role,
+      iAmFleetOwner: this.isFleetOwner,
+      ownedByMe,
+      ownedByOther,
+      claimable,
+      offering,
+      shared,
+      kind,
+    };
+  }
+
+  /** Every node's standing, as a **derived** map keyed by node id — so the
+   *  graph and drawer read a reactive value (which Svelte re-tracks the moment
+   *  the fleet roster or any device's advert changes) rather than calling a
+   *  method per render and hoping the dependency is tracked. This is the single
+   *  reactive source the whole claim/fleet UI consumes. */
+  standings = $derived.by(() => {
+    const m = new Map<string, Standing>();
+    for (const n of this.catalog.nodes) m.set(n.id, this.standing(n));
+    return m;
+  });
+
+  /** The standing for one node — the reactive map entry, with a live fallback
+   *  for a node that isn't in the catalog yet. */
+  standingOf(node: MeshNode): Standing {
+    return this.standings.get(node.id) ?? this.standing(node);
+  }
+
+  /** Whether this device has a fleet custody authenticator enrolled. When it
+   *  is, owner governance acts (evict, grant/withdraw role) need a fresh code,
+   *  so the UI prompts for one. Refreshed on the mesh poll. */
+  fleetMfaEnrolled = $state(false);
+
+  /** A pending owner-governance action waiting on a custody code. When set, a
+   *  small modal collects the code and calls `run(code)`. Null = no prompt. */
+  fleetCodePrompt = $state<{ title: string; run: (code: string) => Promise<void> } | null>(null);
+
+  async loadFleetMfa() {
+    if (!isTauri()) return;
+    try {
+      this.fleetMfaEnrolled = (await fleetMfaStatus()).enrolled;
+    } catch {
+      this.fleetMfaEnrolled = false;
+    }
+  }
+
+  /** Run an owner-authority governance action. When fleet MFA is enrolled the
+   *  daemon needs a fresh custody code, so open the prompt (the modal calls
+   *  the action with the entered code); otherwise run it straight. */
+  private async runFleetGov(title: string, action: (code?: string) => Promise<void>) {
+    if (this.fleetMfaEnrolled) {
+      this.fleetCodePrompt = { title, run: (code: string) => action(code) };
+      return;
+    }
+    try {
+      await action(undefined);
+      this.toast("ok", `${title} ✓`);
+    } catch (e) {
+      this.toast("warn", `${title} failed: ${String(e)}`);
+    }
+  }
+
+  /** Grant a fleet member a role (owner-only; backend enforces + may need MFA). */
+  async grantFleetRole(device: string, role: "manager" | "owner") {
+    await this.runFleetGov(role === "owner" ? "Make owner" : "Make manager", (code) =>
+      fleetGrantRole(device, role, code),
+    );
+  }
+
+  /** Withdraw a fleet member's role, back to a plain member (owner-only). */
+  async withdrawFleetRole(device: string) {
+    await this.runFleetGov("Withdraw role", (code) => fleetRevokeRole(device, code));
+  }
 
   /** Name (or rename) the fleet — members only (the backend enforces it;
    *  the demo mirrors the rule). The renamed roster gossips out and every
@@ -690,6 +855,16 @@ class AppStore {
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
   );
 
+  /** This machine's own node — the "this device" the drawer falls back to when
+   *  nothing is selected, so the panel always has something to show rather than
+   *  vanishing. Matched by the definitive `kind === "this"` marker, with the
+   *  local-id match as a backstop before the first scan re-homes it. */
+  localNode = $derived(
+    this.catalog.nodes.find((n) => n.kind === "this") ??
+      this.catalog.nodes.find((n) => this.isLocalMachine(n.id)) ??
+      null,
+  );
+
   /** The machine a console session is currently open on, if any. */
   consoleNode = $derived(
     this.consoleNodeId ? this.catalog.nodes.find((n) => n.id === this.consoleNodeId) ?? null : null,
@@ -754,9 +929,13 @@ class AppStore {
     return set;
   });
 
-  /** Whether a node is part of your owned fleet (linked by the shared key). */
+  /** Whether a node is part of your owned fleet (linked by the shared key).
+   *  A fleet of one is a real fleet: when you hold a fleet credential the
+   *  roster always lists at least yourself, and when you don't it's empty —
+   *  so membership is just "is this device on the roster," with no size floor
+   *  that would otherwise read a solo fleet as no fleet at all. */
   isFleetMember(nodeId: string): boolean {
-    return this.fleetMemberIds.has(canonicalNodeId(nodeId)) && this.fleetMemberIds.size > 1;
+    return this.fleetMemberIds.has(canonicalNodeId(nodeId));
   }
 
   /** Whether an id refers to this very machine (any suffix form). */
@@ -1081,13 +1260,32 @@ class AppStore {
     // Recently-connected machines get the same grace as a transient status:
     // a daemon restarting mid-poll reports *nobody* for a few seconds, and
     // without the grace that blanks the whole graph offline and back.
+    // Refresh the fleet roster every poll so fleet status — a new member, a
+    // role change, a device that left, one re-claimed out from under us —
+    // converges on the graph within a poll, not only when the backend happens
+    // to emit an `allmystuff://owned` event.
+    await this.loadOwnedFleet();
+    void this.loadFleetMfa();
+
     const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
-    for (const n of this.catalog.nodes) {
+    // Devices no longer on any active mesh fall off the graph. We used to only
+    // flip them offline and never remove them, so a node from a mesh you've
+    // since disabled or left lingered (and "randomly reappeared"). Now: keep
+    // your own machine, your fleet, and anything you've claimed or share;
+    // anything else that isn't on an active mesh this poll (past its presence
+    // grace) is pruned.
+    this.catalog.nodes = this.catalog.nodes.filter((n) => {
       const canon = canonicalNodeId(n.id);
-      if (n.kind !== "this" && !this.isLocalMachine(n.id) && !knownCanon.has(canon)) {
-        n.online = this.withinPresenceGrace(canon);
-      }
-    }
+      if (n.kind === "this" || this.isLocalMachine(n.id)) return true;
+      if (knownCanon.has(canon)) return true; // seen this poll; online already set
+      const keep =
+        n.relationship.kind === "mine" ||
+        n.relationship.kind === "shared" ||
+        this.isFleetMember(n.id) ||
+        this.withinPresenceGrace(canon);
+      if (keep) n.online = this.withinPresenceGrace(canon);
+      return keep;
+    });
     // A freshly-discovered device may belong to someone we already share
     // with — fold it into that share.
     this.reconcileShares();
@@ -1245,9 +1443,9 @@ class AppStore {
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
-      if (p.owner && sameMachine(p.owner, this.localId) && node.relationship.kind === "unclaimed") {
-        node.relationship = { kind: "mine" };
-      }
+      // (Relationship is no longer set here — `reconcileFleetRelationships`
+      // at the end of this method is the single owner of mine/unclaimed,
+      // projecting it from the node's live standing.)
       // Collapse any other view of this same machine into the one node we just
       // settled on (id `p.node`) — heals an already-split graph. Match by id,
       // not reference: a freshly-pushed node is proxied by `$state`, so
@@ -1313,24 +1511,19 @@ class AppStore {
     this.reconcileShares();
   }
 
-  /** Fleet membership implies the relationship. Ownership is *directional*
-   *  — your owner machine advertises no owner of its own — so on a claimed
-   *  device its owner would read "unclaimed" forever even while wearing the
-   *  fleet badge (mutually exclusive states on screen). Any co-member of
-   *  your fleet is *yours*; one that left (or kicked you) and doesn't claim
-   *  us as owner reverts to unclaimed. A relationship the user set to
-   *  `shared` is never touched. */
+  /** Project each node's **standing** onto the stored `relationship.kind`, the
+   *  single owner of mine/unclaimed. `standing()` is the live truth the UI
+   *  reads; this keeps the stored field — used by the older list/count/group
+   *  consumers — a faithful projection of it, so nothing can drift into the
+   *  contradictory "unclaimed but in your fleet" states the racing writers
+   *  used to produce. An explicit `shared` relationship (user intent + grants)
+   *  is never touched. Idempotent — safe to run after every state change. */
   private reconcileFleetRelationships() {
-    const meInFleet = this.isFleetMember(this.localId);
     for (const n of this.catalog.nodes) {
       if (n.kind === "this" || this.isMe(n.id)) continue;
-      const inFleet = meInFleet && this.isFleetMember(n.id);
-      const ownedByMe = !!n.owner && sameMachine(n.owner, this.localId);
-      if (n.relationship.kind === "unclaimed" && inFleet) {
-        n.relationship = { kind: "mine" };
-      } else if (n.relationship.kind === "mine" && !inFleet && !ownedByMe) {
-        n.relationship = { kind: "unclaimed" };
-      }
+      if (n.relationship.kind === "shared") continue;
+      const want = this.standing(n).mine ? "mine" : "unclaimed";
+      if (n.relationship.kind !== want) n.relationship = { kind: want };
     }
   }
 
@@ -2691,15 +2884,26 @@ class AppStore {
   /** Put *this* device into (or out of) claim mode so another of your
    *  machines can adopt it. */
   async setLocalClaimable(on: boolean) {
-    const me = this.node(this.localId);
+    // Resolve the *actual* local node (by its definitive marker, not just an id
+    // match) so the optimistic flip lands on the node the graph is showing.
+    const me =
+      this.catalog.nodes.find((n) => n.kind === "this") ??
+      this.catalog.nodes.find((n) => this.isLocalMachine(n.id));
     if (this.backendConnected) {
       try {
-        const now = await setClaimable(on);
-        if (me) me.claimable = now ?? on;
-        this.toast(
-          on ? "info" : "ok",
-          on ? "This device can now be adopted by another of your machines" : "Adoption turned off",
-        );
+        // The backend is the authority: it refuses claim mode for a device
+        // already in a fleet, so `now` is what actually took — report *that*,
+        // not what was asked, so the toast can't claim something untrue.
+        const now = (await setClaimable(on)) ?? on;
+        if (me) me.claimable = now;
+        if (on && !now) {
+          this.toast("warn", "This device is in a fleet — leave it first to offer it for adoption.");
+        } else {
+          this.toast(
+            now ? "info" : "ok",
+            now ? "This device can now be adopted by another of your machines" : "Adoption turned off",
+          );
+        }
       } catch (e) {
         this.toast("warn", `Couldn't change claim mode: ${errMsg(e)}`);
       }
@@ -4590,6 +4794,12 @@ class AppStore {
     if (this.backendConnected) {
       try {
         await fleetLeave();
+        // Reflect it now — clear the local fleet so the graph + drawer update
+        // this instant, not on the next poll. The backend's empty roster lands
+        // right after and confirms it. A freshly fleet-less device also stops
+        // being claimable-blocked, so the make-claimable affordance returns.
+        this.ownedFleet = null;
+        this.reconcileFleetRelationships();
         this.toast("ok", "Left the fleet");
       } catch (e) {
         this.toast("warn", `Couldn't leave the fleet: ${String(e)}`);
@@ -4609,8 +4819,8 @@ class AppStore {
     this.toast("ok", "Left the fleet");
   }
 
-  /** Kick a member out of the fleet — allowed only while we're a member
-   *  ourselves (the backend enforces it; the demo mirrors the rule). */
+  /** Evict a member from the fleet (owner-only). Routes through the governance
+   *  helper, so it prompts for the custody code when fleet MFA is enrolled. */
   async kickFleetMember(device: string) {
     if (this.isMe(device)) {
       void this.leaveFleet();
@@ -4619,12 +4829,7 @@ class AppStore {
     const label =
       this.ownedFleet?.members.find((m) => sameMachine(m.device, device))?.label || "that device";
     if (this.backendConnected) {
-      try {
-        await fleetKick(device);
-        this.toast("ok", `Kicked ${label} from the fleet`);
-      } catch (e) {
-        this.toast("warn", `Couldn't kick ${label}: ${String(e)}`);
-      }
+      await this.runFleetGov(`Evict ${label}`, (code) => fleetKick(device, code));
       return;
     }
     // Demo/web: mirror the membership rule, then drop them.

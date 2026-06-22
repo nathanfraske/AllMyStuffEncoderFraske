@@ -217,6 +217,86 @@ pub enum Request {
     UpdateSetPrefs {
         prefs: Value,
     },
+
+    // ---- closed-network governance (forwarded to the myownmesh daemon) ----
+    //
+    // AllMyStuff drives the daemon's closed-network governance + the
+    // per-device custody MFA that gates owner/kind changes. These mirror the
+    // daemon's `op`/snake_case wire shapes (stringly-typed `to`/`role`, which
+    // the daemon's NetworkKind/Role deserialise from snake_case) so the bytes
+    // match without depending on `myownmesh-core` here.
+    /// Snapshot the signed governance state (kind, roles, transition log,
+    /// pending proposals, splits) for a network.
+    GovernanceState {
+        network: String,
+    },
+    /// Propose a kind change. `to` is `"open"` or `"closed"`.
+    GovernanceProposeKindChange {
+        network: String,
+        to: String,
+        /// Per-device custody second factor, when this device enrolled one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Propose granting `target` a role: `"member"` | `"controller"` | `"owner"`.
+    GovernanceProposeRoleGrant {
+        network: String,
+        target: String,
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Propose revoking `target`'s role (back to member).
+    GovernanceProposeRoleRevoke {
+        network: String,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Propose evicting `target` from the closed network's roster entirely
+    /// — the propagating removal a fleet uses to kick a lost/stolen device.
+    GovernanceProposeEvict {
+        network: String,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Sign a pending proposal.
+    GovernanceSign {
+        network: String,
+        proposal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Deny a pending proposal (single-shot kill switch).
+    GovernanceDeny {
+        network: String,
+        proposal_id: String,
+    },
+    /// Withdraw a proposal this device floated.
+    GovernanceWithdraw {
+        network: String,
+        proposal_id: String,
+    },
+    /// Spawn a proposer-initiated split. Returns the derived network id.
+    GovernanceSpawnSplit {
+        network: String,
+        proposal_id: String,
+    },
+    /// Enroll a per-device TOTP custody lock for `network`. Returns the
+    /// secret (base32 + `otpauth://` URI) and one-time recovery codes.
+    GovernanceMfaEnroll {
+        network: String,
+    },
+    /// Whether this device holds a custody enrollment for `network`.
+    GovernanceMfaStatus {
+        network: String,
+    },
+    /// Remove the custody lock for `network` (requires a valid code).
+    GovernanceMfaDisable {
+        network: String,
+        code: String,
+    },
 }
 
 /// Daemon → client reply to a one-shot [`Request`].
