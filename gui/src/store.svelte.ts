@@ -623,6 +623,12 @@ class AppStore {
   /** The fleet's display name ("Casey"), empty when unnamed. */
   fleetName = $derived.by(() => this.ownedFleet?.name?.trim() ?? "");
 
+  /** Whether this device holds a fleet credential at all — the one true test
+   *  of "are you in a fleet." A fleet of one counts: starting or being left
+   *  alone in a fleet is valid, so this keys on holding the key, not on having
+   *  company on the roster. */
+  hasFleet = $derived.by(() => !!this.ownedFleet?.key);
+
   /** Whether this device is the fleet owner (founder / key-holder). Only the
    *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
    *  backend enforces it; the UI gates to match so members aren't shown
@@ -898,9 +904,13 @@ class AppStore {
     return set;
   });
 
-  /** Whether a node is part of your owned fleet (linked by the shared key). */
+  /** Whether a node is part of your owned fleet (linked by the shared key).
+   *  A fleet of one is a real fleet: when you hold a fleet credential the
+   *  roster always lists at least yourself, and when you don't it's empty —
+   *  so membership is just "is this device on the roster," with no size floor
+   *  that would otherwise read a solo fleet as no fleet at all. */
   isFleetMember(nodeId: string): boolean {
-    return this.fleetMemberIds.has(canonicalNodeId(nodeId)) && this.fleetMemberIds.size > 1;
+    return this.fleetMemberIds.has(canonicalNodeId(nodeId));
   }
 
   /** Whether an id refers to this very machine (any suffix form). */

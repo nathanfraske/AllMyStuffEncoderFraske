@@ -40,7 +40,7 @@
   const mineLabel = (): string =>
     app.fleetName
       ? `${app.fleetName}'s fleet`
-      : app.fleetMemberIds.size > 1
+      : app.hasFleet
         ? "Your fleet"
         : "Your devices";
 
