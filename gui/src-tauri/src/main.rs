@@ -861,6 +861,38 @@ async fn fleet_set_name(state: State<'_, AppState>, name: String) -> Result<(), 
     Ok(())
 }
 
+/// Whether this device has enrolled a custody authenticator for the fleet's
+/// closed network: `{ "enrolled": bool, "no_fleet"?: true }`.
+#[tauri::command]
+async fn fleet_mfa_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Enroll a custody authenticator for the fleet. Returns the secret,
+/// `otpauth://` URI, and one-time recovery codes (shown once).
+#[tauri::command]
+async fn fleet_mfa_enroll(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_enroll", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove the fleet's custody authenticator (requires a valid code).
+#[tauri::command]
+async fn fleet_mfa_disable(state: State<'_, AppState>, code: String) -> Result<Value, String> {
+    state
+        .node
+        .request("fleet_mfa_disable", json!({ "code": code }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Fan one room-plane message (invite / join / leave / chat) out to the
 /// given members. Best-effort per member; returns how many the daemon
 /// actually dispatched to, so the UI can say when a line reached nobody.
@@ -1607,6 +1639,9 @@ fn main() {
             fleet_leave,
             fleet_kick,
             fleet_set_name,
+            fleet_mfa_status,
+            fleet_mfa_enroll,
+            fleet_mfa_disable,
             mesh_status,
             mesh_identity,
             mesh_networks,

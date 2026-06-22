@@ -828,6 +828,39 @@ export async function fleetSetName(name: string): Promise<void> {
   await invoke("fleet_set_name", { name });
 }
 
+/** Whether this device has enrolled a custody authenticator for the fleet's
+ *  closed network. `no_fleet` is true when there's no fleet to enroll yet. */
+export interface FleetMfaStatus {
+  enrolled: boolean;
+  no_fleet?: boolean;
+}
+export async function fleetMfaStatus(): Promise<FleetMfaStatus> {
+  if (!isTauri()) return { enrolled: false, no_fleet: true };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("fleet_mfa_status")) as FleetMfaStatus;
+}
+
+/** Enroll a custody authenticator for the fleet — guards owner/role/kind
+ *  changes on the fleet's closed network. Returns the secret, an `otpauth://`
+ *  URI (for a QR), and one-time recovery codes; shown to the user once. */
+export interface FleetMfaEnrolled {
+  secret: string;
+  otpauth_uri: string;
+  recovery_codes: string[];
+}
+export async function fleetMfaEnroll(): Promise<FleetMfaEnrolled> {
+  if (!isTauri()) throw new Error("desktop app only");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("fleet_mfa_enroll")) as FleetMfaEnrolled;
+}
+
+/** Remove the fleet's custody authenticator. Requires a valid current code. */
+export async function fleetMfaDisable(code: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_mfa_disable", { code });
+}
+
 // ---- virtual rooms (the rooms plane) ------------------------------------
 
 /** Fan one room-plane message out to `members` (canonical or display node
