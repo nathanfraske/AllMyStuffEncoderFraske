@@ -2090,6 +2090,13 @@ impl Mesh {
                         short_id(from.as_str())
                     );
                     self.ownership_check(None).await;
+                    // Push our own owned roster now so this device's GUI knows
+                    // it's claimed (in a fleet) immediately — before the owner's
+                    // `FleetKey` handoff lands. Without this, an owned-but-keyless
+                    // window would read as "not in a fleet" while we'd already
+                    // refuse to be made claimable, the very contradiction the
+                    // roster's `claimed` flag exists to resolve.
+                    self.emit_owned().await;
                     OwnershipControl::Claimed { owner }
                 } else {
                     tracing::info!(
@@ -2300,11 +2307,23 @@ impl Mesh {
     /// key/members when there's no fleet yet, so the front-end always gets a
     /// well-formed shape.
     pub async fn fleet_roster_value(&self) -> Value {
+        // A device is "in a fleet" the moment it's claimed — it belongs to its
+        // owner's fleet even before the owner's `FleetKey` handoff lands (which
+        // can lag or fail if the owner is briefly offline). The GUI never sees
+        // the *local* node's own `owner`, so it leans on this roster as the only
+        // signal; report `claimed` so a just-claimed-but-keyless device reads as
+        // in-a-fleet (and not free to make claimable) instead of contradicting
+        // the backend's no-claiming-while-owned rule.
+        let claimed = self.ownership.owner().is_some();
         let (Some(key), Some(network)) = (
             self.ownership.fleet_key(),
             self.ownership.fleet_network_id(),
         ) else {
-            return empty_owned();
+            let mut v = empty_owned();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("claimed".into(), Value::Bool(claimed));
+            }
+            return v;
         };
         let mut members: Vec<OwnedMember> = Vec::new();
         let mut member_roles: std::collections::HashMap<String, String> =
@@ -2395,6 +2414,10 @@ impl Mesh {
             // the list is the fleet mesh and lock it (you leave it by leaving
             // the fleet, not by removing the mesh).
             obj.insert("network_id".into(), Value::String(network));
+            // Whether this device is claimed (owned) at all — true for any
+            // fleet member, mirrored from the no-key path so the GUI's
+            // "am I in a fleet" check is the same in both branches.
+            obj.insert("claimed".into(), Value::Bool(claimed));
             // Stamp each member with its governance role for the drawer's
             // grant/withdraw controls.
             if let Some(arr) = obj.get_mut("members").and_then(|v| v.as_array_mut()) {

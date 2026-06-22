@@ -668,12 +668,16 @@ class AppStore {
     const self = node.kind === "this" || this.isMe(node.id);
     const app = isAppNode(node);
     const shared = node.relationship.kind === "shared" ? node.relationship.person : null;
-    // "In a fleet": for *this* device, whether you hold a fleet credential at
-    // all — a solo fleet (you founded it, no members yet) still counts, so the
-    // make-claimable button correctly gives way to "Leave the fleet" and the
-    // backend's no-claiming-while-in-a-fleet rule. For a remote device, whether
-    // it's a member of your fleet roster.
-    const inFleet = self ? !!this.ownedFleet?.key : this.isFleetMember(node.id);
+    // "In a fleet": for *this* device, whether it's claimed at all — either it
+    // holds a fleet credential (a solo fleet you founded still counts) *or* it's
+    // been claimed by an owner whose fleet-key handoff hasn't landed yet (owned
+    // but keyless). Both mean it isn't free: the make-claimable button gives way
+    // to "Leave the fleet", matching the backend's no-claiming-while-owned rule
+    // so the UI can't say "not in a fleet" while the backend refuses adoption.
+    // For a remote device, whether it's a member of your fleet roster.
+    const inFleet = self
+      ? !!this.ownedFleet?.key || this.ownedFleet?.claimed === true
+      : this.isFleetMember(node.id);
     const role = this.fleetRoleOf(node.id);
     const ownedByMe = !!node.owner && this.isMe(node.owner);
     const ownedByOther = !!node.owner && !this.isMe(node.owner);

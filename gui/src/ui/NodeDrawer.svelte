@@ -375,15 +375,10 @@
           {#if st.inFleet}
             <p class="hint">
               This device is in {app.fleetName ? `${app.fleetName}'s` : "your"} fleet.
+              {app.isFleetOwner
+                ? "Leave to dissolve it and free this device for adoption."
+                : "Leave to release this device and offer it for adoption again."}
             </p>
-            <label class="adopt">
-              <input
-                type="checkbox"
-                checked={st.offering}
-                onchange={(e) => app.setLocalClaimable(e.currentTarget.checked)}
-              />
-              <span>{st.offering ? "Offering this device for adoption" : "Re-offer this device for adoption"}</span>
-            </label>
             <button class="btn small danger leave" onclick={() => app.leaveFleet()}>Leave the fleet</button>
           {:else}
             <p class="hint">
@@ -1308,19 +1303,6 @@
   }
   .claim-toggle.on:hover {
     background: var(--accent-ink);
-  }
-  .adopt {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-    font-size: 0.8rem;
-    color: var(--ink-soft);
-    line-height: 1.4;
-    cursor: pointer;
-  }
-  .adopt input {
-    margin-top: 0.15rem;
   }
   .devid {
     font-size: 0.72rem;

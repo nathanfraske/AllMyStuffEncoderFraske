@@ -386,6 +386,12 @@ export interface OwnedRoster {
   /** The fleet's closed-network id (the word-salad name). Lets the meshes list
    *  spot — and lock — the fleet mesh: you leave it by leaving the fleet. */
   network_id?: string;
+  /** Whether *this* device is claimed (owned) at all — true for any fleet
+   *  member, including a just-claimed device that hasn't received the owner's
+   *  fleet-key handoff yet (so it has no `key` but is still in a fleet). The
+   *  graph/drawer use it so an owned-but-keyless device reads as in-a-fleet
+   *  instead of offering a make-claimable button the backend would refuse. */
+  claimed?: boolean;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------
