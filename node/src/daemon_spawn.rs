@@ -112,7 +112,7 @@ impl Drop for DaemonChild {
             // daemon (ours or a foreign one) that took the file over since
             // we wrote it must keep its own record.
             if let Some(path) = daemon_pidfile() {
-                if read_pidfile(&path) == Some(self.pid) {
+                if read_pidfile(&path).map(|(pid, _)| pid) == Some(self.pid) {
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -136,31 +136,43 @@ fn daemon_pidfile() -> Option<PathBuf> {
 /// effort — a failed write just means the *next* run can't recognise this
 /// daemon as ours and will reuse it like a foreign one (never the wrong,
 /// destructive direction).
-fn write_pidfile(pid: u32) {
+fn write_pidfile(pid: u32, start_time: Option<u64>) {
     let Some(path) = daemon_pidfile() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+    // `<pid> <start_time>` — the start time is what defeats pid reuse on the
+    // self-heal sweep (a process that inherited the pid after ours died has a
+    // different start time). Best-effort: if we couldn't read it, write the pid
+    // alone, and the sweep falls back to the myownmesh name check.
+    let body = match start_time {
+        Some(t) => format!("{pid} {t}"),
+        None => pid.to_string(),
+    };
+    if let Err(e) = std::fs::write(&path, body) {
         tracing::warn!("couldn't record the daemon pid at {}: {e}", path.display());
     }
 }
 
-/// Read the pid recorded in the daemon pidfile. `None` for a missing file
-/// or any unparseable/garbage content — both mean "we have no daemon of our
-/// own on record", the safe default.
-fn read_pidfile(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Read the recorded daemon pid and its process start time from the pidfile.
+/// The start time is `None` for an older single-pid file (still honoured, with
+/// the name check alone). `None` overall for a missing or garbage file — both
+/// mean "we have no daemon of our own on record", the safe default.
+fn read_pidfile(path: &Path) -> Option<(u32, Option<u64>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let start = parts.next().and_then(|s| s.parse().ok());
+    Some((pid, start))
 }
 
-/// True when `pid` is alive *and* really a `myownmesh` process — the gate
-/// that lets us reclaim our orphan without ever risking a process that
-/// merely inherited its pid after it died (pid reuse). Checks the live
-/// process's exe basename (falling back to its name) for a `myownmesh`
-/// prefix, refreshing only that one pid.
-fn pid_is_myownmesh(pid: u32) -> bool {
+/// `(is-myownmesh, start-time-secs)` for the live process at `pid`, or `None`
+/// if no such process. One refresh of the single pid. The exe basename (falling
+/// back to the name) decides `myownmesh`-ness; the start time is the epoch-second
+/// process birth time the sweep matches against the pidfile.
+fn daemon_identity(pid: u32) -> Option<(bool, u64)> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let spid = Pid::from_u32(pid);
     let mut sys = System::new();
@@ -169,9 +181,7 @@ fn pid_is_myownmesh(pid: u32) -> bool {
         true,
         ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
     );
-    let Some(proc) = sys.process(spid) else {
-        return false;
-    };
+    let proc = sys.process(spid)?;
     // Prefer the exe basename (stable, full); fall back to the process name
     // (truncated to 15 chars on Linux, but "myownmesh" fits).
     let exe_base = proc
@@ -179,8 +189,27 @@ fn pid_is_myownmesh(pid: u32) -> bool {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned());
     let name = proc.name().to_string_lossy().into_owned();
-    let basename = exe_base.unwrap_or(name);
-    basename.starts_with("myownmesh")
+    let is_myownmesh = exe_base.unwrap_or(name).starts_with("myownmesh");
+    Some((is_myownmesh, proc.start_time()))
+}
+
+/// True when `pid` is alive, really a `myownmesh` process, **and** its start
+/// time matches what we recorded — the gate that lets us reclaim our orphan
+/// without ever signalling a process that merely inherited its pid after our
+/// daemon died (pid reuse). The start-time match is what closes that window: a
+/// reused pid belongs to a process born at a different time. An older pidfile
+/// with no recorded start time falls back to the name check alone, as before.
+fn pid_is_our_daemon(pid: u32, want_start: Option<u64>) -> bool {
+    let Some((is_myownmesh, start)) = daemon_identity(pid) else {
+        return false;
+    };
+    if !is_myownmesh {
+        return false;
+    }
+    match want_start {
+        Some(want) => want == start,
+        None => true,
+    }
 }
 
 /// Tie the spawned daemon's lifetime to this process at the OS level —
@@ -612,7 +641,8 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         let our_orphan = daemon_pidfile()
             .as_deref()
             .and_then(read_pidfile)
-            .filter(|&pid| pid_is_myownmesh(pid));
+            .filter(|&(pid, want_start)| pid_is_our_daemon(pid, want_start))
+            .map(|(pid, _)| pid);
         let Some(pid) = our_orphan else {
             return reuse_running_daemon(client).await;
         };
@@ -677,9 +707,11 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         .with_context(|| format!("spawn {}", bin.display()))?;
     // Record this daemon as ours, so a future run's self-heal can recognise
     // it as our orphan (and `DaemonChild::drop` can clear the record on a
-    // clean exit). Write before the tie/probe so even an early failure leaves
-    // a recoverable pid on disk.
-    write_pidfile(child.id());
+    // clean exit). Pair the pid with its start time so the recogniser can't be
+    // fooled by pid reuse. Write before the tie/probe so even an early failure
+    // leaves a recoverable pid on disk.
+    let start_time = daemon_identity(child.id()).map(|(_, t)| t);
+    write_pidfile(child.id(), start_time);
     tie_daemon_lifetime(&child);
     let handle = DaemonChild::new(child);
 
@@ -780,12 +812,21 @@ mod tests {
         // Missing file → None.
         assert_eq!(read_pidfile(&path), None, "no file yet");
 
-        // Write-then-read round-trips the pid exactly.
-        write_pidfile(4242);
+        // Write-then-read round-trips the pid *and* its start time.
+        write_pidfile(4242, Some(99_887_766));
         assert_eq!(
             read_pidfile(&path),
-            Some(4242),
-            "the written pid reads back"
+            Some((4242, Some(99_887_766))),
+            "the written pid + start time read back"
+        );
+
+        // An older single-pid file still parses, with no start time — the sweep
+        // falls back to the name check for it.
+        std::fs::write(&path, "4242").unwrap();
+        assert_eq!(
+            read_pidfile(&path),
+            Some((4242, None)),
+            "a legacy pid-only file reads back with no start time"
         );
 
         // Garbage / non-numeric content → None, never a panic.
