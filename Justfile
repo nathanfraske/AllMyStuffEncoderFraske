@@ -142,14 +142,24 @@ gui-check:
 # engine), then the GUI typecheck/build.
 check: fmt-check lint test node-check gui-check
 
-# Cut a release: bump every crate's version (+ the GUI sub-workspace),
-# commit, push, trigger the workflow. Mirrors MyOwnMesh / MyOwnLLM — the
-# user runs `just release 0.2.0` and the release.yml workflow verifies the
-# manifests, builds the per-platform bundles + portable binaries, and
-# publishes the GitHub release. Bash script — the release flow runs from a
-# Linux/macOS box.
+# Cut a release: bump every crate's version (+ the GUI/node sub-workspaces),
+# commit, push, then push the `v{{VERSION}}` tag to trigger the workflow.
+# Mirrors MyOwnMesh / MyOwnLLM — the user runs `just release 0.2.0` and the
+# release.yml workflow verifies the manifests, builds the per-platform bundles
+# + portable binaries, and publishes the GitHub release. Bash script — the
+# release flow runs from a Linux/macOS box.
+#
+# We trigger by pushing the tag (not `gh workflow run`) so the build is
+# deterministic. The tag is an immutable ref pinned to the bump commit, so the
+# workflow's `actions/checkout` lands exactly on the version we just committed.
+# The old `gh workflow run release.yml` used workflow_dispatch, which resolves
+# `main` at dispatch time and raced the preceding `git push`: GitHub could
+# still see the pre-bump HEAD, check that out, build the old version, and fail
+# the "Verify tag matches manifest versions" gate (this is what sank v0.1.21 —
+# the run built the 0.1.20 commit). release.yml keeps its workflow_dispatch
+# trigger as a manual escape hatch for re-running an existing tag.
 [unix]
-[doc("Cut a release: bump versions, commit, push, trigger the workflow.")]
+[doc("Cut a release: bump versions, commit, push, tag to trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
     @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock; then \
@@ -157,4 +167,5 @@ release VERSION:
         git commit -m "chore(release): {{VERSION}}"; \
     fi
     @git push
-    @gh workflow run release.yml -f tag=v{{VERSION}}
+    @git tag v{{VERSION}}
+    @git push origin v{{VERSION}}
