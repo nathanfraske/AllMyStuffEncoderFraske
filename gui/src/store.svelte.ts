@@ -1066,12 +1066,7 @@ class AppStore {
       // pass at mount can run before the session is ready.
       if (live) {
         void this.hydrateFromBackend();
-        void this.loadIdentity();
-        void this.refreshNetworks().then(() => this.syncMeshGraph());
-        void this.pullSessionSnapshot();
-        void this.loadOwnedFleet();
-        void this.loadSites();
-        void this.loadDisabledNetworks();
+        this.pullLiveState();
       }
       this.backendConnected = live;
     });
@@ -1136,7 +1131,36 @@ class AppStore {
    *  don't all arrive as session snapshots). Mirrors the MyOwnMesh client. */
   private startMeshPolling() {
     if (!isTauri() || this.meshPoll) return;
-    this.meshPoll = setInterval(() => void this.syncMeshGraph(), 3000);
+    this.meshPoll = setInterval(() => {
+      void this.syncMeshGraph();
+      // Safety net for a missed `live` event. The node emits it exactly once,
+      // fire-and-forget — so a GUI that subscribed *after* the node went live
+      // (a cold first launch, common on Windows where the node cold-spawns
+      // slowly) never receives it and stays stuck in "demo mode" with dead
+      // header pills even though the mesh is up. Re-hydrate from the node until
+      // it takes; the call no-ops while the socket is still unreachable.
+      if (!this.backendConnected) void this.recoverBackendConnection();
+    }, 3000);
+  }
+
+  /** Re-pull everything that depends on a live mesh. Shared by the `live`
+   *  subscription event and the poll-based recovery so the two can't drift. */
+  private pullLiveState() {
+    void this.loadIdentity();
+    void this.refreshNetworks().then(() => this.syncMeshGraph());
+    void this.pullSessionSnapshot();
+    void this.loadOwnedFleet();
+    void this.loadSites();
+    void this.loadDisabledNetworks();
+  }
+
+  /** Poll-driven recovery when the one-shot `live` event was missed: bring the
+   *  connected flag (and the live state behind it) current. Idempotent — bails
+   *  until the node socket answers (hydrateFromBackend no-ops on a null scan),
+   *  then flips the flag and pulls the live state once. */
+  private async recoverBackendConnection() {
+    await this.hydrateFromBackend();
+    if (this.backendConnected) this.pullLiveState();
   }
 
   /** Build the graph's machine nodes from the daemon's *actual* mesh
