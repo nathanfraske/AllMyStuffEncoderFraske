@@ -1049,8 +1049,15 @@ class AppStore {
     // The fleet roster converges live — a claim, or gossip catching up, pushes
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
+      const renamed = (this.ownedFleet?.name ?? "") !== (r.name ?? "");
       this.ownedFleet = r;
       this.reconcileFleetRelationships();
+      // A rename changes the fleet *mesh* label, which the graph's network
+      // chips (and the meshes list) read from the network config — not the
+      // roster. The 3 s mesh poll never re-reads network labels, so pull them
+      // now and re-derive the graph, so a fleet rename actually shows up on the
+      // mesh pills, not just the "<name>'s fleet" grouping.
+      if (renamed) void this.refreshNetworks().then(() => this.syncMeshGraph());
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
