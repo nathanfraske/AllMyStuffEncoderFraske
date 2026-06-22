@@ -2288,6 +2288,25 @@ impl Mesh {
                 }
             }
         }
+        // The signed roster a node holds never lists *itself* — each device is
+        // locally authoritative and isn't re-added from a peer's roster gossip
+        // (MyOwnMesh `on_roster_entries` skips the self entry). But the fleet
+        // the user sees includes this device: it holds the key. Add self so the
+        // GUI's "am I in my fleet" check (and the relationship reconcile that
+        // depends on it) is true for members, not just the owner.
+        if let Some(me) = self.local_node_id() {
+            let canon = pubkey_part(&me).to_string();
+            if !members
+                .iter()
+                .any(|m| pubkey_part(m.device.as_str()) == canon)
+            {
+                let label = self.profile_label().unwrap_or_else(|| me.clone());
+                members.push(OwnedMember {
+                    device: NodeId::from(canon.as_str()),
+                    label,
+                });
+            }
+        }
         let roster = OwnedRoster {
             key,
             name: self.ownership.fleet_name(),
@@ -2411,6 +2430,25 @@ impl Mesh {
         let _ = self.client.request(&Request::NetworkAdd { config }).await;
 
         if !self.ownership.is_fleet_owner() {
+            // A member pre-rosters its **owner**. Fleet membership is mutual
+            // trust established by the claim, but MyOwnMesh only auto-approves a
+            // connection from a peer that's already in your roster — so without
+            // this the member would be prompted to "let in" its own owner (and
+            // approving it would admit the owner via the handshake). The owner
+            // already pre-rosters the member at claim time; this is the
+            // symmetric half. We trust our owner inherently (it owns us), so
+            // there's no authority gap — and this never propagates (a member
+            // isn't a roster-grant authority, so peers refuse its roster gossip).
+            if let Some(owner) = self.ownership.owner() {
+                let _ = self
+                    .client
+                    .request(&Request::RosterApprove {
+                        network: network.clone(),
+                        device_id: pubkey_part(&owner).to_string(),
+                        label: None,
+                    })
+                    .await;
+            }
             return;
         }
 
