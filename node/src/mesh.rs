@@ -2595,6 +2595,15 @@ impl Mesh {
         // A duplicate `NetworkAdd` (already joined) returns an error we ignore.
         let _ = self.client.request(&Request::NetworkAdd { config }).await;
 
+        // The set of joined networks just changed — pick the fleet network up
+        // everywhere: refresh `st.networks`, (re)subscribe its channels, and
+        // re-advertise the `allmystuff` capability + presence on it. Without
+        // this the joiner is on the fleet mesh but never advertises the app tag
+        // there, so peers (e.g. the owner whose graph centres on this network)
+        // see it connected-but-mesh-only — "online, not on AllMyStuff" — until
+        // some unrelated network change happens to trigger a sync.
+        self.sync_networks().await;
+
         if !self.ownership.is_fleet_owner() {
             // A member pre-rosters its **owner**. Fleet membership is mutual
             // trust established by the claim, but MyOwnMesh only auto-approves a
