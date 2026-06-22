@@ -320,10 +320,10 @@ impl Ownership {
     /// it has still left). `Err` only when there was nothing to leave: no owner
     /// and no key. Clearing the owner here is deliberate — membership follows
     /// ownership, so leaving releases this device to re-advertise unowned.
-    pub fn leave_fleet(&self) -> Result<Option<String>, ()> {
+    pub fn leave_fleet(&self) -> Result<Option<String>, &'static str> {
         let mut i = self.inner.lock();
         if i.owner.is_none() && i.fleet_key.is_none() {
-            return Err(());
+            return Err("this device isn't in a fleet");
         }
         let network = i.fleet_key.take().map(|k| derive_fleet_network_id(&k));
         i.owner = None;

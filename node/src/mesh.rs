@@ -2763,10 +2763,7 @@ impl Mesh {
         // when there was no key to derive one (an owned-but-keyless member that
         // never joined a network — it has still left); `Err` only when there
         // was genuinely nothing to leave.
-        let network = self
-            .ownership
-            .leave_fleet()
-            .map_err(|_| "this device isn't in a fleet".to_string())?;
+        let network = self.ownership.leave_fleet()?;
         if let Some(network) = network {
             tracing::info!("leaving the fleet — forgetting closed network {network}");
             let _ = self
