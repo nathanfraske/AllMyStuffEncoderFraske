@@ -1094,6 +1094,23 @@ impl Mesh {
                                 short_id(node_id.as_str())
                             );
                             self.fleet_drop_member(node_id.to_string()).await;
+                        } else if in_my_fleet && still_ours && (new_boot || !known) {
+                            // A member that's still ours just (re)appeared. If the
+                            // original fleet-key handoff was lost — we were offline
+                            // when it accepted the claim, or the frame dropped — it's
+                            // claimed-but-keyless and stuck outside the closed
+                            // network. Re-hand the key now; the member's
+                            // `adopt_fleet_key` is a no-op when it already holds it,
+                            // so this is safe to repeat on every (re)appearance and
+                            // self-heals the handoff without a manual nudge. Gated on
+                            // the member still being in *our* roster so it never
+                            // undoes an eviction (an evicted device we dropped is no
+                            // longer `in_my_fleet`, so it isn't re-keyed).
+                            tracing::info!(
+                                "fleet member {} (re)appeared — re-handing the fleet key in case it was missed",
+                                short_id(node_id.as_str())
+                            );
+                            self.send_fleet_key(node_id.as_str()).await;
                         }
                     }
                     if new_boot || (!is_self && !known) {
