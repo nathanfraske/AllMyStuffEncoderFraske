@@ -837,13 +837,17 @@ async fn fleet_leave(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Kick a device out of the fleet. Only a member may kick (the backend
-/// enforces it), and never itself — that's `fleet_leave`.
+/// Evict a device from the fleet (owner-only; the daemon enforces it). `code`
+/// is the owner's custody second factor when fleet MFA is enrolled.
 #[tauri::command]
-async fn fleet_kick(state: State<'_, AppState>, device: String) -> Result<(), String> {
+async fn fleet_kick(
+    state: State<'_, AppState>,
+    device: String,
+    code: Option<String>,
+) -> Result<(), String> {
     state
         .node
-        .request("fleet_kick", json!({ "device": device }))
+        .request("fleet_kick", json!({ "device": device, "code": code }))
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -868,21 +872,30 @@ async fn fleet_grant_role(
     state: State<'_, AppState>,
     device: String,
     role: String,
+    code: Option<String>,
 ) -> Result<(), String> {
     state
         .node
-        .request("fleet_grant_role", json!({ "device": device, "role": role }))
+        .request(
+            "fleet_grant_role",
+            json!({ "device": device, "role": role, "code": code }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Withdraw a fleet member's role, back to a plain member. Owner-only.
+/// Withdraw a fleet member's role, back to a plain member. Owner-only. `code`
+/// is the custody second factor when fleet MFA is enrolled.
 #[tauri::command]
-async fn fleet_revoke_role(state: State<'_, AppState>, device: String) -> Result<(), String> {
+async fn fleet_revoke_role(
+    state: State<'_, AppState>,
+    device: String,
+    code: Option<String>,
+) -> Result<(), String> {
     state
         .node
-        .request("fleet_revoke_role", json!({ "device": device }))
+        .request("fleet_revoke_role", json!({ "device": device, "code": code }))
         .await
         .map_err(|e| e.to_string())?;
     Ok(())

@@ -1090,10 +1090,10 @@ impl Mesh {
                         let still_ours = advertised_owner.as_deref() == me.as_deref();
                         if in_my_fleet && !still_ours {
                             tracing::info!(
-                                "fleet member {} now answers to a different owner — evicting",
+                                "fleet member {} now answers to a different owner — dropping",
                                 short_id(node_id.as_str())
                             );
-                            let _ = self.fleet_kick(node_id.to_string()).await;
+                            self.fleet_drop_member(node_id.to_string()).await;
                         }
                     }
                     if new_boot || (!is_self && !known) {
@@ -2203,10 +2203,10 @@ impl Mesh {
                 // reality. Only the fleet owner acts on this.
                 if self.ownership.is_fleet_owner() {
                     tracing::info!(
-                        "{} left the fleet — evicting from the roster",
+                        "{} left the fleet — dropping from the roster",
                         short_id(from.as_str())
                     );
-                    let _ = self.fleet_kick(from.to_string()).await;
+                    self.fleet_drop_member(from.to_string()).await;
                 }
             }
             other => {
@@ -2707,8 +2707,14 @@ impl Mesh {
     /// closed network. The signed `Evict` propagates the removal to every
     /// member (so the device loses control authorisation everywhere, even if
     /// it's lost/stolen), and a best-effort `Release` tells a cooperative
-    /// device to eject itself immediately.
-    pub async fn fleet_kick(self: &Arc<Self>, device: String) -> Result<(), String> {
+    /// device to eject itself immediately. `code` is the owner's custody
+    /// second factor when fleet MFA is enrolled (the GUI prompts for it);
+    /// otherwise it's `None`.
+    pub async fn fleet_kick(
+        self: &Arc<Self>,
+        device: String,
+        code: Option<String>,
+    ) -> Result<(), String> {
         if !self.ownership.is_fleet_owner() {
             return Err("only the fleet owner can remove a device".into());
         }
@@ -2723,7 +2729,7 @@ impl Mesh {
             .request(&Request::GovernanceProposeEvict {
                 network,
                 target,
-                mfa_code: None,
+                mfa_code: code,
             })
             .await;
         match resp {
@@ -2745,6 +2751,32 @@ impl Mesh {
         self.refresh_fleet_authorization().await;
         self.emit_owned().await;
         Ok(())
+    }
+
+    /// Internal: drop `device` from the fleet *locally* — a plain roster
+    /// remove, not the propagating governance `Evict`. Used for automatic
+    /// roster cleanup (a member told us it left, or a device reappeared under
+    /// a new owner) where there's no user to supply an MFA code and the device
+    /// is already gone anyway, so a local removal that keeps the owner's view
+    /// honest is the right, friction-free tool. Best-effort.
+    async fn fleet_drop_member(self: &Arc<Self>, device: String) {
+        let Ok(network) = self.ownership.kick_member(&device) else {
+            return;
+        };
+        let target = pubkey_part(&device).to_string();
+        tracing::info!(
+            "dropping {} from the fleet roster (local)",
+            short_id(&device)
+        );
+        let _ = self
+            .client
+            .request(&Request::RosterRemove {
+                network,
+                device_id: target,
+            })
+            .await;
+        self.refresh_fleet_authorization().await;
+        self.emit_owned().await;
     }
 
     /// Front-end command: name (or rename) the fleet. Owner-authoritative:
@@ -2794,6 +2826,7 @@ impl Mesh {
         self: &Arc<Self>,
         device: String,
         role: String,
+        code: Option<String>,
     ) -> Result<(), String> {
         let network = self
             .ownership
@@ -2813,7 +2846,7 @@ impl Mesh {
                 network,
                 target,
                 role: role.to_string(),
-                mfa_code: None,
+                mfa_code: code,
             })
             .await;
         match resp {
@@ -2830,7 +2863,11 @@ impl Mesh {
     /// plain member. Used for "withdraw as manager / owner". Like a grant, the
     /// daemon enforces who may revoke (authority over the target's current
     /// role); we float the proposal and surface any refusal.
-    pub async fn fleet_revoke_role(self: &Arc<Self>, device: String) -> Result<(), String> {
+    pub async fn fleet_revoke_role(
+        self: &Arc<Self>,
+        device: String,
+        code: Option<String>,
+    ) -> Result<(), String> {
         let network = self
             .ownership
             .fleet_network_id()
@@ -2842,7 +2879,7 @@ impl Mesh {
             .request(&Request::GovernanceProposeRoleRevoke {
                 network,
                 target,
-                mfa_code: None,
+                mfa_code: code,
             })
             .await;
         match resp {

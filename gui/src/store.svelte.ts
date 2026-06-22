@@ -59,6 +59,7 @@ import {
   fleetSetName,
   fleetGrantRole,
   fleetRevokeRole,
+  fleetMfaStatus,
   isTauri,
   onFileProgress,
   onFileSaved,
@@ -649,24 +650,50 @@ class AppStore {
     return "member";
   }
 
-  /** Grant a fleet member a role (owner-only; backend enforces). */
-  async grantFleetRole(device: string, role: "manager" | "owner") {
+  /** Whether this device has a fleet custody authenticator enrolled. When it
+   *  is, owner governance acts (evict, grant/withdraw role) need a fresh code,
+   *  so the UI prompts for one. Refreshed on the mesh poll. */
+  fleetMfaEnrolled = $state(false);
+
+  /** A pending owner-governance action waiting on a custody code. When set, a
+   *  small modal collects the code and calls `run(code)`. Null = no prompt. */
+  fleetCodePrompt = $state<{ title: string; run: (code: string) => Promise<void> } | null>(null);
+
+  async loadFleetMfa() {
+    if (!isTauri()) return;
     try {
-      await fleetGrantRole(device, role);
-      this.toast("ok", role === "owner" ? "Granted owner" : "Granted manager");
-    } catch (e) {
-      this.toast("warn", `Couldn't grant the role: ${String(e)}`);
+      this.fleetMfaEnrolled = (await fleetMfaStatus()).enrolled;
+    } catch {
+      this.fleetMfaEnrolled = false;
     }
+  }
+
+  /** Run an owner-authority governance action. When fleet MFA is enrolled the
+   *  daemon needs a fresh custody code, so open the prompt (the modal calls
+   *  the action with the entered code); otherwise run it straight. */
+  private async runFleetGov(title: string, action: (code?: string) => Promise<void>) {
+    if (this.fleetMfaEnrolled) {
+      this.fleetCodePrompt = { title, run: (code: string) => action(code) };
+      return;
+    }
+    try {
+      await action(undefined);
+      this.toast("ok", `${title} ✓`);
+    } catch (e) {
+      this.toast("warn", `${title} failed: ${String(e)}`);
+    }
+  }
+
+  /** Grant a fleet member a role (owner-only; backend enforces + may need MFA). */
+  async grantFleetRole(device: string, role: "manager" | "owner") {
+    await this.runFleetGov(role === "owner" ? "Make owner" : "Make manager", (code) =>
+      fleetGrantRole(device, role, code),
+    );
   }
 
   /** Withdraw a fleet member's role, back to a plain member (owner-only). */
   async withdrawFleetRole(device: string) {
-    try {
-      await fleetRevokeRole(device);
-      this.toast("ok", "Role withdrawn");
-    } catch (e) {
-      this.toast("warn", `Couldn't withdraw the role: ${String(e)}`);
-    }
+    await this.runFleetGov("Withdraw role", (code) => fleetRevokeRole(device, code));
   }
 
   /** Name (or rename) the fleet — members only (the backend enforces it;
@@ -1137,6 +1164,7 @@ class AppStore {
     // converges on the graph within a poll, not only when the backend happens
     // to emit an `allmystuff://owned` event.
     await this.loadOwnedFleet();
+    void this.loadFleetMfa();
 
     const knownCanon = new Set([...known.keys()].map(canonicalNodeId));
     // Devices no longer on any active mesh fall off the graph. We used to only
@@ -4678,8 +4706,8 @@ class AppStore {
     this.toast("ok", "Left the fleet");
   }
 
-  /** Kick a member out of the fleet — allowed only while we're a member
-   *  ourselves (the backend enforces it; the demo mirrors the rule). */
+  /** Evict a member from the fleet (owner-only). Routes through the governance
+   *  helper, so it prompts for the custody code when fleet MFA is enrolled. */
   async kickFleetMember(device: string) {
     if (this.isMe(device)) {
       void this.leaveFleet();
@@ -4688,12 +4716,7 @@ class AppStore {
     const label =
       this.ownedFleet?.members.find((m) => sameMachine(m.device, device))?.label || "that device";
     if (this.backendConnected) {
-      try {
-        await fleetKick(device);
-        this.toast("ok", `Kicked ${label} from the fleet`);
-      } catch (e) {
-        this.toast("warn", `Couldn't kick ${label}: ${String(e)}`);
-      }
+      await this.runFleetGov(`Evict ${label}`, (code) => fleetKick(device, code));
       return;
     }
     // Demo/web: mirror the membership rule, then drop them.

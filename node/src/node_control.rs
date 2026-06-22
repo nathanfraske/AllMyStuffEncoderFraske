@@ -948,7 +948,8 @@ pub async fn dispatch(
         "fleet_leave" => json_result(mesh.fleet_leave().await),
         "fleet_kick" => {
             let device: String = try_arg!(arg(a, "device"));
-            json_result(mesh.fleet_kick(device).await)
+            let code: Option<String> = try_arg!(opt(a, "code"));
+            json_result(mesh.fleet_kick(device, code).await)
         }
         "fleet_set_name" => {
             let name: String = try_arg!(arg(a, "name"));
@@ -957,11 +958,13 @@ pub async fn dispatch(
         "fleet_grant_role" => {
             let device: String = try_arg!(arg(a, "device"));
             let role: String = try_arg!(arg(a, "role"));
-            json_result(mesh.fleet_grant_role(device, role).await)
+            let code: Option<String> = try_arg!(opt(a, "code"));
+            json_result(mesh.fleet_grant_role(device, role, code).await)
         }
         "fleet_revoke_role" => {
             let device: String = try_arg!(arg(a, "device"));
-            json_result(mesh.fleet_revoke_role(device).await)
+            let code: Option<String> = try_arg!(opt(a, "code"));
+            json_result(mesh.fleet_revoke_role(device, code).await)
         }
 
         // ---- daemon passthroughs ----------------------------------------

@@ -20,6 +20,7 @@
   import SettingsPanel from "./SettingsPanel.svelte";
   import ApprovalsPopup from "./ApprovalsPopup.svelte";
   import ClaimSheet from "./ClaimSheet.svelte";
+  import FleetCodePrompt from "./FleetCodePrompt.svelte";
   import ShareSheet from "./ShareSheet.svelte";
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
@@ -197,6 +198,9 @@
   {/if}
   {#if app.claimOpen}
     <ClaimSheet />
+  {/if}
+  {#if app.fleetCodePrompt}
+    <FleetCodePrompt />
   {/if}
   {#if infoOpen}
     <LayersSheet onclose={() => (infoOpen = false)} />
