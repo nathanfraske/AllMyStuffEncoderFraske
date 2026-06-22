@@ -158,13 +158,17 @@
               <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
             </button>
             <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
-            <!-- Export, Venue and Copy id work the same for every mesh — even
-                 the fleet's. The fleet mesh differs in just two ways: it can't be
-                 *disabled* (it's the closed network your fleet rides on), and
-                 leaving it leaves the fleet, so its Leave warns and routes to the
-                 real exit instead of a plain `leaveNetwork`. -->
+            <!-- Export and Copy id work the same for every mesh — even the
+                 fleet's. The fleet mesh differs in three ways: it can't be
+                 *disabled*; its venue is owner-only (members and managers ride
+                 the owner's choice, broadcast to them); and leaving it leaves
+                 the fleet, so its Leave warns and routes to the real exit. -->
             <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
-            <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+            {#if fleetMesh && !app.isFleetOwner}
+              <button class="btn small locked" disabled title="The fleet's venue is set by the fleet owner — every device rides the owner's choice. Managers manage members, not core settings.">🔒 Venue</button>
+            {:else}
+              <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+            {/if}
             {#if fleetMesh}
               <button
                 class="btn small locked"

@@ -2196,7 +2196,7 @@ impl Mesh {
                     }),
                 );
             }
-            OwnershipControl::FleetKey { key, name } => {
+            OwnershipControl::FleetKey { key, name, venue } => {
                 // Our owner handed us the fleet credential. Adopt the key (so we
                 // derive the same closed network), join it, and converge our
                 // signed roster from the owner's governance. Only honoured from
@@ -2219,6 +2219,12 @@ impl Mesh {
                     self.ensure_fleet_network().await;
                     self.refresh_fleet_authorization().await;
                     self.emit_owned().await;
+                }
+                // Apply the owner's venue regardless of whether the key changed —
+                // the owner may have re-handed it *only* to update the venue (a
+                // venue change re-broadcasts with the same key+name).
+                if let Some(venue) = venue {
+                    self.apply_fleet_venue(&venue).await;
                 }
             }
             OwnershipControl::FleetDeparted => {
@@ -2302,10 +2308,94 @@ impl Mesh {
             return;
         };
         let name = self.ownership.fleet_name();
-        let msg = ControlMessage::Ownership(OwnershipControl::FleetKey { key, name });
+        // Hand the fleet's venue (transport servers) down with the key, so the
+        // member rides the same calling-out point as the rest of the fleet.
+        let venue = self.fleet_venue_json().await;
+        let msg = ControlMessage::Ownership(OwnershipControl::FleetKey { key, name, venue });
         match self.send_control(peer, &msg).await {
             Ok(()) => tracing::info!("handed the fleet key to {}", short_id(peer)),
             Err(e) => tracing::warn!("couldn't hand the fleet key to {}: {e}", short_id(peer)),
+        }
+    }
+
+    /// The owner's fleet-network **venue** — its transport servers (signaling /
+    /// STUN / TURN) — as a JSON object string, read from the live daemon config,
+    /// to hand a member so it calls out where the fleet does. Just the transport
+    /// fields; the member owns its own id/label/kind. `None` when the fleet
+    /// network isn't configured yet or carries no servers (defaults are fine).
+    async fn fleet_venue_json(&self) -> Option<String> {
+        let network = self.ownership.fleet_network_id()?;
+        let resp = self.client.request(&Request::ConfigShow).await.ok()?;
+        if !resp.ok {
+            return None;
+        }
+        let data = resp.data?;
+        let nets = data.pointer("/config/networks")?.as_array()?;
+        let cfg = nets.iter().find(|n| {
+            let id = n.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let nid = n
+                .get("network_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            id == network || nid == network
+        })?;
+        let mut venue = serde_json::Map::new();
+        for k in ["signaling", "stun_servers", "turn_servers"] {
+            if let Some(v) = cfg.get(k) {
+                venue.insert(k.to_string(), v.clone());
+            }
+        }
+        if venue.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&Value::Object(venue)).ok()
+    }
+
+    /// Apply the owner's handed-down fleet **venue** to this device's fleet
+    /// network, so it calls out where the rest of the fleet does. Members mirror
+    /// the owner's venue; they don't define it. A best-effort `NetworkUpdate`
+    /// over just the transport fields, keyed to our own fleet network id.
+    async fn apply_fleet_venue(self: &Arc<Self>, venue_json: &str) {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return;
+        };
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(venue_json) else {
+            return;
+        };
+        let mut config = serde_json::Map::new();
+        config.insert("id".into(), Value::String(network.clone()));
+        config.insert("network_id".into(), Value::String(network.clone()));
+        for (k, v) in obj {
+            config.insert(k, v);
+        }
+        let _ = self
+            .client
+            .request(&Request::NetworkUpdate {
+                config: Value::Object(config),
+            })
+            .await;
+        self.sync_networks().await;
+    }
+
+    /// Whether `network` is this device's fleet mesh.
+    pub fn is_fleet_network(&self, network: &str) -> bool {
+        self.ownership.fleet_network_id().as_deref() == Some(network)
+    }
+
+    /// Owner-only: re-hand the fleet key — which now carries the fleet-network
+    /// venue — to every member, so a venue the owner just changed propagates to
+    /// the whole fleet. A no-op for a non-owner: members don't define the venue,
+    /// only the owner broadcasts it (managers manage members, not core settings).
+    pub async fn fleet_broadcast_config(self: &Arc<Self>) {
+        if !self.ownership.is_fleet_owner() {
+            return;
+        }
+        let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
+        for member in self.ownership.fleet_member_ids() {
+            if Some(pubkey_part(&member).to_string()) == me {
+                continue;
+            }
+            self.send_fleet_key(&member).await;
         }
     }
 

@@ -4548,6 +4548,14 @@ class AppStore {
       this.toast("warn", "That network isn't loaded — reopen Settings");
       return;
     }
+    // The fleet's venue is owner-defined and owner-broadcast: members and
+    // managers ride the owner's choice. Refuse here too, so no UI path (the
+    // venues editor included) lets a non-owner change the fleet mesh's servers
+    // — the owner's next broadcast would just overwrite it anyway.
+    if (this.isFleetMesh(cfg) && !this.isFleetOwner) {
+      this.toast("warn", "The fleet's venue is set by the fleet owner — you ride the owner's choice.");
+      return;
+    }
     const next: NetworkConfigFull = {
       ...cfg,
       signaling: {
