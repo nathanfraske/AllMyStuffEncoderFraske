@@ -101,6 +101,15 @@ kill:
 restart *ARGS: kill
     @just dev {{ARGS}}
 
+# Discard local changes and pull the latest — a pristine tree so `just dev`
+# starts clean each time (clears stray lockfile / build-artifact edits a dev
+# run leaves behind). git commands are identical on bash and PowerShell, so no
+# [windows] variant is needed.
+[doc("Discard local changes + git pull — a clean slate before `just dev`.")]
+pull:
+    @git reset --hard HEAD
+    @git pull
+
 fmt:
     @cargo fmt --all
 
