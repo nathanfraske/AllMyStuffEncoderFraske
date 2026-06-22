@@ -954,6 +954,15 @@ pub async fn dispatch(
             let name: String = try_arg!(arg(a, "name"));
             json_result(mesh.fleet_set_name(name).await)
         }
+        "fleet_grant_role" => {
+            let device: String = try_arg!(arg(a, "device"));
+            let role: String = try_arg!(arg(a, "role"));
+            json_result(mesh.fleet_grant_role(device, role).await)
+        }
+        "fleet_revoke_role" => {
+            let device: String = try_arg!(arg(a, "device"));
+            json_result(mesh.fleet_revoke_role(device).await)
+        }
 
         // ---- daemon passthroughs ----------------------------------------
         "mesh_status" => daemon_request(client, Request::Status).await,

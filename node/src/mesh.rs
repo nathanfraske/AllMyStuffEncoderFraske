@@ -2264,7 +2264,15 @@ impl Mesh {
             return empty_owned();
         };
         let mut members: Vec<OwnedMember> = Vec::new();
-        if let Ok(r) = self.client.request(&Request::RosterList { network }).await {
+        let mut member_roles: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(r) = self
+            .client
+            .request(&Request::RosterList {
+                network: network.clone(),
+            })
+            .await
+        {
             if r.ok {
                 if let Some(arr) = r
                     .data
@@ -2279,6 +2287,15 @@ impl Mesh {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            // The governance role projection ("member" /
+                            // "controller" / "owner"), so the GUI can label the
+                            // grant/withdraw controls per member.
+                            let role = e
+                                .get("role")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("member")
+                                .to_string();
+                            member_roles.insert(pubkey_part(id).to_string(), role);
                             members.push(OwnedMember {
                                 device: NodeId::from(pubkey_part(id)),
                                 label,
@@ -2306,6 +2323,16 @@ impl Mesh {
                     label,
                 });
             }
+            // Best-effort role for this device (it isn't in its own roster):
+            // the founder is the owner, everyone else defaults to member.
+            member_roles.entry(canon).or_insert_with(|| {
+                if self.ownership.is_fleet_owner() {
+                    "owner"
+                } else {
+                    "member"
+                }
+                .to_string()
+            });
         }
         let roster = OwnedRoster {
             key,
@@ -2314,13 +2341,35 @@ impl Mesh {
             members,
         };
         let mut value = serde_json::to_value(roster).unwrap_or_else(|_| empty_owned());
-        // Tag whether *this* device is the fleet owner (the founder/key-holder),
-        // so the GUI can gate owner-only actions (rename, kick/evict).
         if let Some(obj) = value.as_object_mut() {
+            // Tag whether *this* device is the fleet owner (the founder /
+            // key-holder), so the GUI can gate owner-only actions.
             obj.insert(
                 "is_owner".into(),
                 Value::Bool(self.ownership.is_fleet_owner()),
             );
+            // The fleet's closed-network id, so the GUI can spot which mesh in
+            // the list is the fleet mesh and lock it (you leave it by leaving
+            // the fleet, not by removing the mesh).
+            obj.insert("network_id".into(), Value::String(network));
+            // Stamp each member with its governance role for the drawer's
+            // grant/withdraw controls.
+            if let Some(arr) = obj.get_mut("members").and_then(|v| v.as_array_mut()) {
+                for m in arr {
+                    let canon = m
+                        .get("device")
+                        .and_then(|v| v.as_str())
+                        .map(|d| pubkey_part(d).to_string())
+                        .unwrap_or_default();
+                    let role = member_roles
+                        .get(&canon)
+                        .cloned()
+                        .unwrap_or_else(|| "member".to_string());
+                    if let Some(mo) = m.as_object_mut() {
+                        mo.insert("role".into(), Value::String(role));
+                    }
+                }
+            }
         }
         value
     }
@@ -2423,7 +2472,7 @@ impl Mesh {
         let config = json!({
             "id": network.as_str(),
             "network_id": network.as_str(),
-            "label": self.ownership.fleet_name(),
+            "label": fleet_label(&self.ownership.fleet_name()),
             "kind": "open",
         });
         // A duplicate `NetworkAdd` (already joined) returns an error we ignore.
@@ -2656,13 +2705,89 @@ impl Mesh {
             let config = json!({
                 "id": network.as_str(),
                 "network_id": network.as_str(),
-                "label": self.ownership.fleet_name(),
+                "label": fleet_label(&self.ownership.fleet_name()),
             });
             let _ = self
                 .client
                 .request(&Request::NetworkUpdate { config })
                 .await;
         }
+        self.emit_owned().await;
+        Ok(())
+    }
+
+    /// Front-end command: grant `device` a fleet role. `role` is the UI term
+    /// — "manager" (a controller: can admit members) or "owner" (full
+    /// authority, co-signs governance). Authoring a role grant is an owner
+    /// authority act on the closed network; the daemon enforces the quorum and
+    /// rejects the proposal if this device lacks the authority, so we just
+    /// float it and surface any refusal. The roster's role projection updates
+    /// once it ratifies, and the GUI refreshes from `allmystuff://owned`.
+    pub async fn fleet_grant_role(
+        self: &Arc<Self>,
+        device: String,
+        role: String,
+    ) -> Result<(), String> {
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("this device isn't in a fleet")?;
+        // Map the UI's "manager" onto MyOwnMesh's "controller".
+        let role = match role.as_str() {
+            "manager" | "controller" => "controller",
+            "owner" => "owner",
+            other => return Err(format!("unknown fleet role: {other}")),
+        };
+        let target = pubkey_part(&device).to_string();
+        tracing::info!("granting {role} to {} on {network}", short_id(&device));
+        let resp = self
+            .client
+            .request(&Request::GovernanceProposeRoleGrant {
+                network,
+                target,
+                role: role.to_string(),
+                mfa_code: None,
+            })
+            .await;
+        match resp {
+            Ok(r) if r.ok => {}
+            Ok(r) => return Err(r.error.unwrap_or_else(|| "couldn't grant the role".into())),
+            Err(e) => return Err(e.to_string()),
+        }
+        self.refresh_fleet_authorization().await;
+        self.emit_owned().await;
+        Ok(())
+    }
+
+    /// Front-end command: withdraw `device`'s fleet role — revoke it back to a
+    /// plain member. Used for "withdraw as manager / owner". Like a grant, the
+    /// daemon enforces who may revoke (authority over the target's current
+    /// role); we float the proposal and surface any refusal.
+    pub async fn fleet_revoke_role(self: &Arc<Self>, device: String) -> Result<(), String> {
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("this device isn't in a fleet")?;
+        let target = pubkey_part(&device).to_string();
+        tracing::info!("revoking role from {} on {network}", short_id(&device));
+        let resp = self
+            .client
+            .request(&Request::GovernanceProposeRoleRevoke {
+                network,
+                target,
+                mfa_code: None,
+            })
+            .await;
+        match resp {
+            Ok(r) if r.ok => {}
+            Ok(r) => {
+                return Err(r
+                    .error
+                    .unwrap_or_else(|| "couldn't withdraw the role".into()))
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        self.refresh_fleet_authorization().await;
         self.emit_owned().await;
         Ok(())
     }
@@ -5386,7 +5511,20 @@ impl Mesh {
 
 /// A well-formed but empty owned roster (no fleet yet).
 fn empty_owned() -> Value {
-    json!({ "key": "", "version": 0, "members": [], "is_owner": false })
+    json!({ "key": "", "version": 0, "members": [], "is_owner": false, "network_id": "" })
+}
+
+/// The fleet network's display label. A fleet is a closed network owned by the
+/// originating node, so when it carries an owner name it reads "<name>'s
+/// Fleet"; unnamed, the label is empty and MyOwnMesh falls back to the
+/// word-salad network id (the human-communicable name derived from the key).
+fn fleet_label(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!("{name}'s Fleet")
+    }
 }
 
 // The shape video takes on a console window's IPC channel: a fixed

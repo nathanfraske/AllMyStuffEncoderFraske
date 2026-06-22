@@ -106,10 +106,14 @@ impl Ownership {
 
     /// Whether this device is currently offering itself for adoption: no
     /// owner yet **and** claim mode is on. This is the *only* condition under
-    /// which a claim is accepted.
+    /// which a claim is accepted. A device already **in a fleet** — claimed
+    /// (it has an owner) *or* the founder of one (it holds a fleet key) — is
+    /// never claimable: a claimed device can't be re-adopted, and a fleet
+    /// owner offering itself for adoption would be conscripted into another
+    /// fleet while still owning its own.
     pub fn claimable(&self) -> bool {
         let i = self.inner.lock();
-        i.owner.is_none() && i.claim_mode
+        i.owner.is_none() && i.claim_mode && i.fleet_key.is_none()
     }
 
     /// Record (or clear) the owner. Recording one ends claim mode — an owned
@@ -133,10 +137,12 @@ impl Ownership {
         persist(&self.path, &i)
     }
 
-    /// Turn claim mode on or off at runtime (only meaningful while unowned).
+    /// Turn claim mode on or off at runtime. Only meaningful for a device
+    /// that's free to be adopted — not owned, and not already the founder of
+    /// its own fleet (see [`Ownership::claimable`]).
     pub fn set_claim_mode(&self, on: bool) {
         let mut i = self.inner.lock();
-        i.claim_mode = on && i.owner.is_none();
+        i.claim_mode = on && i.owner.is_none() && i.fleet_key.is_none();
     }
 
     /// Accept a claim from `claimer` — but only if the device is currently
@@ -703,6 +709,27 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         assert_ne!(a, derive_fleet_network_id(&new_fleet_key()));
+    }
+
+    #[test]
+    fn a_device_in_a_fleet_is_not_claimable() {
+        // Fresh + claim mode on → claimable.
+        let dev = memory();
+        dev.set_claim_mode(true);
+        assert!(dev.claimable());
+
+        // Founding a fleet (minting a key on first claim) disables it: an
+        // owner can't be conscripted into someone else's fleet.
+        dev.ensure_fleet_key();
+        assert!(!dev.claimable(), "a fleet owner isn't claimable");
+        dev.set_claim_mode(true);
+        assert!(!dev.claimable(), "and can't be toggled back on");
+
+        // A claimed device (has an owner) isn't claimable either.
+        let member = memory();
+        member.inner.lock().claim_mode = true;
+        assert!(member.try_accept_claim("owner"));
+        assert!(!member.claimable());
     }
 
     #[test]
