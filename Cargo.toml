@@ -9,6 +9,7 @@ members = [
     "crates/allmystuff-updater",
     "crates/allmystuff-service",
     "crates/allmystuff-cli",
+    "crates/allmystuff-term",
 ]
 # The Tauri desktop app (`gui/src-tauri`) and the headless mesh node
 # (`node/` — the `allmystuff-node` engine + the `allmystuff-serve` binary)
@@ -37,6 +38,7 @@ allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.2.1" }
 allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.1" }
 allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.1" }
 allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.1" }
+allmystuff-term = { path = "crates/allmystuff-term", version = "0.2.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -60,6 +62,12 @@ dirs = "5"
 
 # Compact transport encoding for audio frames over the mesh channel.
 base64 = "0.22"
+
+# Terminal client (`amst`): the local-socket transport to the node control
+# socket (same crate + version the node binds it with) and cross-platform raw
+# mode / terminal size for driving the user's own terminal.
+interprocess = { version = "2", features = ["tokio"] }
+crossterm = "0.28"
 
 # Test-only.
 tempfile = "3"

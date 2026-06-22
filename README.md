@@ -29,7 +29,10 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   one tab per monitor. Keyboard and mouse pass through, so a remote machine
   works as if you were sitting at it.
 - **Remote shell.** Open a real terminal on any of your machines. No SSH daemon,
-  keys, or port forwarding to set up — it runs over the mesh.
+  keys, or port forwarding to set up — it runs over the mesh. Also from the
+  command line: `amst <machine>` (or `allmystuff term`) drops you into a shell on
+  any machine you own, right from your own terminal — and a bare `amst` opens one
+  on this machine.
 - **File access.** Browse, preview, and transfer files between machines.
   Downloads land straight on your disk; nothing routes through a third party.
 - **Automatic discovery.** Each machine reports its hardware and attached

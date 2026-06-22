@@ -24,5 +24,9 @@ allmystuff-updater = { workspace = true }
 # node binary (`serve` execs it). The same crate the desktop app links, so both
 # manage the service identically.
 allmystuff-service = { workspace = true }
+# `allmystuff term` / `allmystuff amst` — the mesh terminal client. The same
+# library backs the standalone `amst` binary, so the subcommand and the command
+# are one feature.
+allmystuff-term = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

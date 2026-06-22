@@ -1,0 +1,42 @@
+[package]
+name = "allmystuff-term"
+description = "AllMyStuff terminal (amst) — open a real shell on any machine you own, over the mesh, from your own terminal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# The standalone `amst` command. The same library also backs `allmystuff term`
+# (the CLI links this crate and calls `run`), so the two are one feature.
+[[bin]]
+name = "amst"
+path = "src/main.rs"
+
+[lib]
+name = "allmystuff_term"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Wire types (NodeProfile, the terminal feature tag) and the terminal event
+# enum — the lightweight library crates, no media stack.
+allmystuff-protocol = { workspace = true }
+allmystuff-session = { workspace = true }
+# Locating the `allmystuff-serve` node binary to auto-start one (the same
+# discovery the CLI's `serve` uses).
+allmystuff-service = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Async runtime + the local-socket transport to the node control socket. "net"
+# backs interprocess's tokio integration; the rest matches the workspace base.
+tokio = { workspace = true, features = ["net"] }
+# Local IPC: the same crate (and version) the node uses for the control socket,
+# so address resolution stays identical across both ends of the wire.
+interprocess = { workspace = true }
+# Cross-platform raw mode + terminal size — macOS / Linux / Windows in one API.
+crossterm = { workspace = true }
+dirs = { workspace = true }
