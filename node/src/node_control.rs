@@ -944,7 +944,7 @@ pub async fn dispatch(
             mesh.room_unshare(tokens);
             DispatchOut::Json(Value::Null)
         }
-        "owned_roster" => DispatchOut::Json(mesh.owned_roster_value()),
+        "owned_roster" => DispatchOut::Json(mesh.fleet_roster_value().await),
         "fleet_leave" => json_result(mesh.fleet_leave().await),
         "fleet_kick" => {
             let device: String = try_arg!(arg(a, "device"));

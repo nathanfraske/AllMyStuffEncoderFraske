@@ -27,10 +27,10 @@ use crate::UiSink;
 
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
-    AppControl, ClientId, ControlMessage, NodeProfile, OwnedRoster, OwnershipControl, Request,
-    RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
-    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, PROTOCOL_VERSION,
+    AppControl, ClientId, ControlMessage, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
+    Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -130,10 +130,11 @@ pub struct Mesh {
     /// Canonical pubkeys authorised to control this device — the fleet's
     /// **closed-network signed roster**, cached from the daemon (`RosterList`
     /// for `ownership.fleet_network_id()`). [`Mesh::sender_may_control`] trusts
-    /// THIS, not the gossiped `ownership.fleet()`, so unauthenticated
-    /// `CHANNEL_OWNED` gossip can no longer grant control — closing the
-    /// fleet-conscription takeover (AMS-01). Refreshed on ownership changes and
-    /// on a periodic tick.
+    /// THIS alone: membership is established by the owner founding a genuinely
+    /// closed network (founder self-election) and admitting members into the
+    /// signed roster, so no unauthenticated gossip can grant control — closing
+    /// the fleet-conscription takeover (AMS-01). Refreshed on ownership changes
+    /// and on a periodic tick.
     fleet_authorized: Mutex<std::collections::HashSet<String>>,
     /// Durable share relationships — who I share with and the grants in each
     /// direction. Node-owned (enforcement lives here), persisted beside the
@@ -1245,46 +1246,6 @@ impl Mesh {
                     MediaPayload::Site(frame) => self.handle_site_frame(&from, frame),
                 }
             }
-            CHANNEL_OWNED => {
-                // A peer gossiped its fleet roster. Merge it; if our copy
-                // changed (a new member, or we adopted the key as a freshly
-                // adopted device), re-broadcast so the fleet converges and
-                // tell the front-end.
-                if let Ok(roster) = serde_json::from_value::<OwnedRoster>(payload) {
-                    let Some(me) = self.local_node_id() else {
-                        return;
-                    };
-                    let structural = self.ownership.merge_fleet(&me, &roster);
-                    // Gossip echoes after every presence answer and
-                    // re-broadcast; only a roster that *changed* something
-                    // is worth a line at the default level.
-                    if structural {
-                        tracing::info!(
-                            "owned roster from {}: key …{} v{} ({} members) → merged",
-                            short_id(&from),
-                            key_tail(&roster.key),
-                            roster.version,
-                            roster.members.len(),
-                        );
-                        self.broadcast_owned().await;
-                        self.emit_owned();
-                    } else {
-                        let outcome = if self.ownership.fleet().is_some_and(|f| f.key == roster.key)
-                        {
-                            "in sync"
-                        } else {
-                            "ignored (not our fleet)"
-                        };
-                        tracing::debug!(
-                            "owned roster from {}: key …{} v{} ({} members) → {outcome}",
-                            short_id(&from),
-                            key_tail(&roster.key),
-                            roster.version,
-                            roster.members.len(),
-                        );
-                    }
-                }
-            }
             CHANNEL_ROOMS => {
                 // The rooms plane is deliberately thin backend-side: rooms
                 // live in the GUI (like relationships do), so a decoded
@@ -2121,50 +2082,56 @@ impl Mesh {
             OwnershipControl::Release => {
                 // The recorded owner is letting this device go (compare by
                 // pubkey — same display-vs-bare id reconciliation as Claim).
-                // A claim change → run the full status check (the release
-                // also cleared our fleet membership, so the empty roster
-                // reaches the UI).
+                // This also covers a kick: the owner sends Release alongside
+                // the closed-network Evict so the device ejects itself even if
+                // it missed (or won't honour) the signed removal.
                 let owner = self.ownership.owner();
                 if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
                     tracing::info!("released by {} — unowned again", short_id(from.as_str()));
+                    // Tear out of the fleet's closed network before clearing the
+                    // credential (set_owner(None) drops the key it derives from).
+                    let fleet_net = self.ownership.fleet_network_id();
                     self.ownership.set_owner(None);
+                    if let Some(network) = fleet_net {
+                        let _ = self
+                            .client
+                            .request(&Request::NetworkRemove { network })
+                            .await;
+                    }
+                    self.refresh_fleet_authorization().await;
                     self.ownership_check(None).await;
                 }
             }
             OwnershipControl::Claimed { owner } => {
                 // The device we claimed (`from`) accepted us as its owner.
-                // Make the claim *do* something durable: establish or extend
-                // the owned fleet — mint our key on the first adoption, add
-                // ourselves and the new device, hand the full roster straight
-                // to it, and gossip so every co-owned device converges on the
-                // same key + membership. This is the "Owned roster" linking the
-                // fleet under a shared key.
-                self.ownership.ensure_fleet_key();
+                // Make the claim *do* something durable: mint our fleet key on
+                // the first adoption, record ourselves and the new device in
+                // the owner's re-admit list, found the fleet's closed network
+                // (electing us Owner) and admit the new device into its signed
+                // roster, then hand the fleet key down to it so it derives and
+                // joins the same network. The signed roster — not gossip — is
+                // now the authority for membership and control.
+                let key = self.ownership.ensure_fleet_key();
                 if let Some(me) = self.local_node_id() {
                     let my_label = self.profile_label().unwrap_or_else(|| me.clone());
                     self.ownership.upsert_member(&me, &my_label);
                 }
                 let label = self.peer_label(&from);
                 self.ownership.upsert_member(from.as_str(), &label);
-                if let Some(r) = self.ownership.fleet() {
-                    tracing::info!(
-                        "claim confirmed by {}; fleet key …{} now {} members (v{})",
-                        short_id(from.as_str()),
-                        key_tail(&r.key),
-                        r.members.len(),
-                        r.version
-                    );
-                }
-                self.send_owned_to(from.as_str()).await;
-                self.broadcast_owned().await;
-                self.emit_owned();
-                // Adoption is a fleet-roster change: found the fleet's closed
-                // network (if new) and admit the freshly-claimed device into
-                // its signed roster, then refresh our authorised-controller
-                // cache. This is what makes the new member authenticated for
-                // control — the gossip above is now only advisory.
+                tracing::info!(
+                    "claim confirmed by {}; fleet key …{} now {} member(s)",
+                    short_id(from.as_str()),
+                    key_tail(&key),
+                    self.ownership.fleet_member_ids().len(),
+                );
+                // Found the closed network (if new) and admit every member —
+                // including the one just claimed — into its signed roster.
                 self.ensure_fleet_network().await;
                 self.refresh_fleet_authorization().await;
+                // Hand the new device its fleet credential point-to-point so it
+                // joins the same closed network and converges its roster.
+                self.send_fleet_key(from.as_str()).await;
+                self.emit_owned().await;
                 // Surface the claim feedback for the claimer's toast, too.
                 self.sink.emit(
                     "allmystuff://ownership",
@@ -2173,6 +2140,35 @@ impl Mesh {
                         "message": OwnershipControl::Claimed { owner },
                     }),
                 );
+            }
+            OwnershipControl::FleetKey { key, name } => {
+                // Our owner handed us the fleet credential. Adopt the key (so we
+                // derive the same closed network), join it, and converge our
+                // signed roster from the owner's governance. Only honoured from
+                // our recorded owner — a stray key from anyone else is ignored.
+                let from_is_owner = self
+                    .ownership
+                    .owner()
+                    .as_deref()
+                    .map(pubkey_part)
+                    == Some(pubkey_part(from.as_str()));
+                if !from_is_owner {
+                    tracing::warn!(
+                        "ignoring fleet key from {} — not our owner",
+                        short_id(from.as_str())
+                    );
+                    return;
+                }
+                if self.ownership.adopt_fleet_key(&key, &name) {
+                    tracing::info!(
+                        "adopted fleet key …{} from {} — joining its closed network",
+                        key_tail(&key),
+                        short_id(from.as_str())
+                    );
+                    self.ensure_fleet_network().await;
+                    self.refresh_fleet_authorization().await;
+                    self.emit_owned().await;
+                }
             }
             other => {
                 // Declined — feedback for the claimer's UI.
@@ -2233,109 +2229,84 @@ impl Mesh {
         }
     }
 
-    /// Broadcast this device's fleet roster (if any) on the owned channel to
-    /// every network, so co-owned devices converge on one key + membership.
-    async fn broadcast_owned(&self) {
-        let Some(roster) = self.ownership.fleet() else {
+    /// Hand a freshly-claimed device its fleet credential point-to-point: the
+    /// shared key (so it derives the same closed-network id and joins it) and
+    /// the fleet name. This replaces the old gossiped `OwnedRoster` — the
+    /// device's signed-roster membership converges from the owner's governance
+    /// once it's in the network.
+    async fn send_fleet_key(&self, peer: &str) {
+        let Some(key) = self.ownership.fleet_key() else {
             return;
         };
-        self.broadcast_roster(&roster).await;
-    }
-
-    /// Broadcast one explicit roster on every network — used for the final
-    /// minus-self roster of a leave (our own store is already cleared) and
-    /// the bumped roster of a kick. Logs how many peers each network's
-    /// broadcast actually reached, so "the roster never arrived" is
-    /// diagnosable from this side's log.
-    async fn broadcast_roster(&self, roster: &OwnedRoster) {
-        let networks = { self.state.lock().networks.clone() };
-        let Ok(payload) = serde_json::to_value(roster) else {
-            return;
-        };
-        for network in networks {
-            let resp = self
-                .client
-                .request(&Request::ChannelSendAll {
-                    network: network.clone(),
-                    channel: CHANNEL_OWNED.to_string(),
-                    payload: payload.clone(),
-                })
-                .await;
-            match resp {
-                Ok(r) if r.ok => {
-                    let n = r
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("dispatched_to"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    tracing::debug!("owned roster broadcast on {network} reached {n} peer(s)");
-                }
-                Ok(r) => tracing::warn!(
-                    "owned roster broadcast on {network} refused: {}",
-                    r.error.unwrap_or_else(|| "(no error)".into())
-                ),
-                Err(e) => tracing::warn!("owned roster broadcast on {network} failed: {e}"),
-            }
+        let name = self.ownership.fleet_name();
+        let msg = ControlMessage::Ownership(OwnershipControl::FleetKey { key, name });
+        match self.send_control(peer, &msg).await {
+            Ok(()) => tracing::info!("handed the fleet key to {}", short_id(peer)),
+            Err(e) => tracing::warn!("couldn't hand the fleet key to {}: {e}", short_id(peer)),
         }
     }
 
-    /// Send this device's fleet roster straight to one peer — used right
-    /// after a claim (and on the targeted ownership check) so the device
-    /// gets the key + membership the moment it matters.
-    async fn send_owned_to(&self, peer: &str) {
-        let Some(roster) = self.ownership.fleet() else {
-            return;
-        };
-        self.send_roster_to(peer, &roster).await;
-    }
-
-    /// Send one explicit roster straight to a peer — a kick hands the
-    /// kicked device the roster it's no longer in, so it drops out
-    /// immediately.
-    async fn send_roster_to(&self, peer: &str, roster: &OwnedRoster) {
-        let Some(network) = self.network_for_peer(peer) else {
-            tracing::warn!("no network to hand the fleet roster to {}", short_id(peer));
-            return;
-        };
-        if let Ok(payload) = serde_json::to_value(roster) {
-            let resp = self
-                .client
-                .request(&Request::ChannelSendTo {
-                    network: network.clone(),
-                    channel: CHANNEL_OWNED.to_string(),
-                    peer: pubkey_part(peer).to_string(),
-                    payload,
-                })
-                .await;
-            match resp {
-                Ok(r) if r.ok => {
-                    tracing::info!("fleet roster handed to {} on {network}", short_id(peer));
-                }
-                Ok(r) => tracing::warn!(
-                    "fleet roster to {} refused by daemon: {}",
-                    short_id(peer),
-                    r.error.unwrap_or_else(|| "(no error)".into())
-                ),
-                Err(e) => tracing::warn!("fleet roster to {} failed: {e}", short_id(peer)),
-            }
-        }
-    }
-
-    /// Push the current fleet roster to the front-end.
-    fn emit_owned(&self) {
-        self.sink
-            .emit("allmystuff://owned", self.owned_roster_value());
+    /// Push the current fleet roster to the front-end. Sourced from the
+    /// closed network's **signed roster**, so the GUI shows authenticated
+    /// membership, not a gossiped guess.
+    async fn emit_owned(&self) {
+        let value = self.fleet_roster_value().await;
+        self.sink.emit("allmystuff://owned", value);
     }
 
     /// The current fleet roster as JSON — for the `owned_roster` command and
-    /// the `allmystuff://owned` event. An empty key/members when there's no
-    /// fleet yet, so the front-end always gets a well-formed shape.
-    pub fn owned_roster_value(&self) -> Value {
-        match self.ownership.fleet() {
-            Some(r) => serde_json::to_value(r).unwrap_or_else(|_| empty_owned()),
-            None => empty_owned(),
+    /// the `allmystuff://owned` event, in the `OwnedRoster` shape the GUI
+    /// expects: the shared key + name from local state, members from the
+    /// fleet's closed-network **signed roster** (`RosterList`). An empty
+    /// key/members when there's no fleet yet, so the front-end always gets a
+    /// well-formed shape.
+    pub async fn fleet_roster_value(&self) -> Value {
+        let (Some(key), Some(network)) =
+            (self.ownership.fleet_key(), self.ownership.fleet_network_id())
+        else {
+            return empty_owned();
+        };
+        let mut members: Vec<OwnedMember> = Vec::new();
+        if let Ok(r) = self.client.request(&Request::RosterList { network }).await {
+            if r.ok {
+                if let Some(arr) = r
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("roster"))
+                    .and_then(|v| v.as_array())
+                {
+                    for e in arr {
+                        if let Some(id) = e.get("device_id").and_then(|v| v.as_str()) {
+                            let label = e
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            members.push(OwnedMember {
+                                device: NodeId::from(pubkey_part(id)),
+                                label,
+                            });
+                        }
+                    }
+                }
+            }
         }
+        let roster = OwnedRoster {
+            key,
+            name: self.ownership.fleet_name(),
+            version: self.ownership.fleet_version(),
+            members,
+        };
+        let mut value = serde_json::to_value(roster).unwrap_or_else(|_| empty_owned());
+        // Tag whether *this* device is the fleet owner (the founder/key-holder),
+        // so the GUI can gate owner-only actions (rename, kick/evict).
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "is_owner".into(),
+                Value::Bool(self.ownership.is_fleet_owner()),
+            );
+        }
+        value
     }
 
     /// Front-end command: claim `node` as owned by this device. Only the
@@ -2377,19 +2348,15 @@ impl Mesh {
     }
 
     /// The claim-status check — "is what we believe about ownership still
-    /// true, and does everyone else know it?" Drops incoherent fleet
-    /// residue, re-stamps the live profile from the ownership store, then
-    /// re-asserts presence + roster. Runs **targeted** at one peer right
-    /// after its connection establishes or its app (re)starts — so the two
-    /// sides converge on the event itself; there is no heartbeat — and
+    /// true, and does everyone else know it?" Re-stamps the live profile from
+    /// the ownership store, then re-asserts presence. Runs **targeted** at one
+    /// peer right after its connection establishes or its app (re)starts — so
+    /// the two sides converge on the event itself; there is no heartbeat — and
     /// **broadcast** on the local triggers: session start, a claim/release,
     /// and fleet membership changes.
     pub async fn ownership_check(self: &Arc<Self>, peer: Option<&str>) {
-        let Some(me) = self.local_node_id() else {
+        if self.local_node_id().is_none() {
             return;
-        };
-        if self.ownership.sanitize_fleet(&me) {
-            tracing::info!("ownership check dropped a stale fleet roster");
         }
         {
             let mut st = self.state.lock();
@@ -2402,70 +2369,128 @@ impl Mesh {
             Some(peer) => {
                 tracing::debug!("ownership check → {}", short_id(peer));
                 self.send_presence_to(peer).await;
-                // The roster (it carries the fleet's grouping key) goes only
-                // to peers that are actually in the fleet — presence is for
-                // everyone, the key is not.
-                let member = self.ownership.fleet().is_some_and(|f| {
-                    f.members
-                        .iter()
-                        .any(|m| pubkey_part(m.device.as_str()) == pubkey_part(peer))
-                });
-                if member {
-                    self.send_owned_to(peer).await;
-                }
             }
             None => {
                 self.broadcast_presence().await;
-                self.broadcast_owned().await;
             }
         }
-        self.emit_owned();
+        self.emit_owned().await;
         self.emit_snapshot();
 
         // Keep the closed-network fleet and its signed-roster cache in step
         // with this ownership change. Founding (owner-side `NetworkAdd` +
-        // member admits) runs on the broadcast/startup/claim path only; the
-        // authorised-controller cache refresh runs on every check.
+        // founder self-election + member admits) runs on the
+        // broadcast/startup/claim path only; the authorised-controller cache
+        // refresh runs on every check.
         if peer.is_none() {
             self.ensure_fleet_network().await;
         }
         self.refresh_fleet_authorization().await;
     }
 
-    /// Make sure the fleet's closed network exists and its signed roster
-    /// reflects the fleet. The **owner** founds it closed and admits each
-    /// member; a **member** just joins (the owner's signed governance converges
-    /// it to closed and admits this device). Idempotent — a duplicate add or
-    /// re-approve is a daemon no-op. Best-effort: failures are logged by the
-    /// daemon and leave control failing closed until the roster is in place.
+    /// Make sure the fleet's closed network exists, is genuinely closed, and
+    /// its signed roster reflects the fleet.
+    ///
+    /// Both sides `NetworkAdd` the network as **open** first — seeding it
+    /// closed would block the founder self-election, which is only valid
+    /// `open → closed`. The **owner** then proposes the `KindChange → closed`
+    /// (a single-signer founder self-election that auto-ratifies, electing it
+    /// Owner and making governance genuinely closed — without which the roles
+    /// map stays empty and fleet-MFA guards nothing), and admits every member
+    /// into the signed roster. A **member** just joins open and converges to
+    /// closed from the owner's broadcast governance. All steps are idempotent;
+    /// best-effort, with failures logged by the daemon.
     async fn ensure_fleet_network(self: &Arc<Self>) {
         let Some(network) = self.ownership.fleet_network_id() else {
             return;
         };
-        let owner = self.ownership.is_fleet_owner();
-        let kind = if owner { "closed" } else { "open" };
         let config = json!({
             "id": network.as_str(),
             "network_id": network.as_str(),
             "label": self.ownership.fleet_name(),
-            "kind": kind,
+            "kind": "open",
         });
         // A duplicate `NetworkAdd` (already joined) returns an error we ignore.
         let _ = self.client.request(&Request::NetworkAdd { config }).await;
-        if owner {
-            // Admit every fleet member into the closed roster — the
-            // authenticated membership `sender_may_control` will trust.
-            for member in self.ownership.fleet_member_ids() {
-                let _ = self
-                    .client
-                    .request(&Request::RosterApprove {
-                        network: network.clone(),
-                        device_id: pubkey_part(&member).to_string(),
-                        label: None,
-                    })
-                    .await;
+
+        if !self.ownership.is_fleet_owner() {
+            return;
+        }
+
+        // Found the closed governance if it isn't already ours. Only propose
+        // when the network is still open — a redundant propose on an
+        // already-closed network would sit in pending forever (propose doesn't
+        // pre-validate). `is_fleet_founded` reads the signed state.
+        if !self.is_fleet_founded(&network).await {
+            match self
+                .client
+                .request(&Request::GovernanceProposeKindChange {
+                    network: network.clone(),
+                    to: "closed".into(),
+                    mfa_code: None,
+                })
+                .await
+            {
+                Ok(r) if r.ok => {
+                    tracing::info!("founded fleet closed network {network} (self-elected owner)")
+                }
+                Ok(r) => tracing::warn!(
+                    "founding fleet network {network} refused: {}",
+                    r.error.unwrap_or_else(|| "(no error)".into())
+                ),
+                Err(e) => tracing::warn!("founding fleet network {network} failed: {e}"),
             }
         }
+
+        // Admit every fleet member into the signed roster — the authenticated
+        // membership `sender_may_control` trusts. Idempotent re-approve keeps
+        // the roster (and its gossip to members) converged across restarts.
+        for member in self.ownership.fleet_member_ids() {
+            let _ = self
+                .client
+                .request(&Request::RosterApprove {
+                    network: network.clone(),
+                    device_id: pubkey_part(&member).to_string(),
+                    label: None,
+                })
+                .await;
+        }
+    }
+
+    /// Whether this device already holds the founder-Owner role on the fleet's
+    /// closed network — i.e. the `KindChange → closed` self-election has
+    /// ratified. Reads the signed governance state; on any error assumes
+    /// not-yet-founded (a redundant propose is cheaper to avoid than a missed
+    /// one is to recover). `me` is matched in bare-pubkey form, as the roles
+    /// map keys it.
+    async fn is_fleet_founded(self: &Arc<Self>, network: &str) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let me = pubkey_part(&me).to_string();
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return false,
+        };
+        let state = data.get("state").unwrap_or(&Value::Null);
+        let closed = state.get("kind").and_then(|v| v.as_str()) == Some("closed");
+        let i_am_owner = state
+            .get("roles")
+            .and_then(|v| v.as_object())
+            .and_then(|roles| {
+                roles
+                    .iter()
+                    .find(|(k, _)| pubkey_part(k) == me)
+                    .map(|(_, v)| v.as_str() == Some("owner"))
+            })
+            .unwrap_or(false);
+        closed && i_am_owner
     }
 
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])
@@ -2515,70 +2540,85 @@ impl Mesh {
         }
     }
 
-    /// Front-end command: leave the fleet this device belongs to. The
-    /// remaining members get the bumped minus-us roster (replacement
-    /// semantics drop us everywhere), our own fleet state clears, and —
-    /// since membership follows ownership — any recorded owner is let go
-    /// and presence re-advertises unowned.
+    /// Front-end command: leave the fleet this device belongs to. Drop the
+    /// local credential, tear out of the fleet's closed network, and — since
+    /// membership follows ownership — let any recorded owner go and
+    /// re-advertise unowned. The owner's signed roster may still list this
+    /// device until it's evicted, but leaving the network makes that moot:
+    /// it's gone from the wire.
     pub async fn fleet_leave(self: &Arc<Self>) -> Result<(), String> {
-        let me = self.local_node_id().ok_or("mesh not ready")?;
-        let roster = self
+        let network = self
             .ownership
-            .leave_fleet(&me)
+            .leave_fleet()
             .ok_or("this device isn't in a fleet")?;
-        tracing::info!(
-            "leaving the fleet — broadcasting roster v{} ({} members remain)",
-            roster.version,
-            roster.members.len()
-        );
-        self.broadcast_roster(&roster).await;
+        tracing::info!("leaving the fleet — forgetting closed network {network}");
+        let _ = self
+            .client
+            .request(&Request::NetworkRemove { network })
+            .await;
         if self.ownership.owner().is_some() {
             self.ownership.set_owner(None);
         }
+        self.refresh_fleet_authorization().await;
         self.refresh_profile_ownership().await;
-        self.emit_owned();
+        self.emit_owned().await;
         Ok(())
     }
 
-    /// Front-end command: kick `device` out of the fleet. The store
-    /// enforces the rule — only a member may kick, and never itself — and
-    /// the kicked device learns immediately: it gets a best-effort
-    /// ownership release (honoured when we're its recorded owner) plus the
-    /// new roster it's absent from, which its merge treats as "kicked".
+    /// Front-end command: kick `device` out of the fleet. Only the fleet
+    /// **owner** can — eviction is an owner-authority governance act on the
+    /// closed network. The signed `Evict` propagates the removal to every
+    /// member (so the device loses control authorisation everywhere, even if
+    /// it's lost/stolen), and a best-effort `Release` tells a cooperative
+    /// device to eject itself immediately.
     pub async fn fleet_kick(self: &Arc<Self>, device: String) -> Result<(), String> {
-        let me = self.local_node_id().ok_or("mesh not ready")?;
-        let roster = self.ownership.kick_member(&me, &device)?;
-        tracing::info!(
-            "kicked {} from the fleet (roster now v{}, {} members)",
-            short_id(&device),
-            roster.version,
-            roster.members.len()
-        );
-        self.broadcast_roster(&roster).await;
+        if !self.ownership.is_fleet_owner() {
+            return Err("only the fleet owner can remove a device".into());
+        }
+        let network = self.ownership.kick_member(&device)?;
+        let target = pubkey_part(&device).to_string();
+        tracing::info!("evicting {} from fleet network {network}", short_id(&device));
+        let resp = self
+            .client
+            .request(&Request::GovernanceProposeEvict {
+                network,
+                target,
+                mfa_code: None,
+            })
+            .await;
+        match resp {
+            Ok(r) if r.ok => {}
+            Ok(r) => return Err(r.error.unwrap_or_else(|| "couldn't evict the device".into())),
+            Err(e) => return Err(e.to_string()),
+        }
+        // Tell the device directly too, so a cooperative one ejects at once.
         let _ = self
             .send_control(
                 &device,
                 &ControlMessage::Ownership(OwnershipControl::Release),
             )
             .await;
-        self.send_roster_to(&device, &roster).await;
-        self.emit_owned();
+        self.refresh_fleet_authorization().await;
+        self.emit_owned().await;
         Ok(())
     }
 
-    /// Front-end command: name (or rename) the fleet. The bumped roster
-    /// replaces everywhere it gossips — same convergence as a kick — and
-    /// the UI refreshes from the `allmystuff://owned` event.
+    /// Front-end command: name (or rename) the fleet. Owner-authoritative:
+    /// the name is set locally and pushed onto the closed network's label.
+    /// (The label is local per MyOwnMesh, so members keep the name they got
+    /// at claim time — cosmetic.) The UI refreshes from `allmystuff://owned`.
     pub async fn fleet_set_name(self: &Arc<Self>, name: String) -> Result<(), String> {
-        let me = self.local_node_id().ok_or("mesh not ready")?;
-        let roster = self.ownership.set_fleet_name(&me, &name)?;
-        tracing::info!(
-            "fleet named {:?} (roster now v{})",
-            roster.name,
-            roster.version
-        );
-        self.broadcast_roster(&roster).await;
-        self.emit_owned();
+        self.ownership.set_fleet_name(&name)?;
+        tracing::info!("fleet named {:?}", self.ownership.fleet_name());
+        if let Some(network) = self.ownership.fleet_network_id() {
+            let config = json!({
+                "id": network.as_str(),
+                "network_id": network.as_str(),
+                "label": self.ownership.fleet_name(),
+            });
+            let _ = self.client.request(&Request::NetworkUpdate { config }).await;
+        }
+        self.emit_owned().await;
         Ok(())
     }
 
@@ -2601,19 +2641,18 @@ impl Mesh {
         self.subscribe_channels(client_id, &networks).await;
         self.advertise_capabilities().await;
         self.broadcast_presence().await;
-        self.broadcast_owned().await;
         self.emit_snapshot();
     }
 
-    /// Subscribe presence, owned, control, media, and rooms on each given
-    /// network. All of them ride every network: broadcasts (presence/owned)
-    /// so peers are found wherever they are, and point-to-point
-    /// (control/media/rooms) so a frame addressed to whichever network the
-    /// *sender* last saw us on always has a subscriber here.
+    /// Subscribe presence, control, media, and rooms on each given network.
+    /// All of them ride every network: presence broadcasts so peers are found
+    /// wherever they are, and point-to-point (control/media/rooms) so a frame
+    /// addressed to whichever network the *sender* last saw us on always has a
+    /// subscriber here. (The fleet's `OwnedRoster` gossip channel is gone —
+    /// membership is the closed network's signed roster now.)
     async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
         let channels = [
             CHANNEL_PRESENCE,
-            CHANNEL_OWNED,
             CHANNEL_CONTROL,
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
@@ -4840,19 +4879,18 @@ impl Mesh {
         }
     }
 
-    /// Whether `sender` may drive this machine's keyboard and mouse: it is
-    /// the recorded owner, or a member of the owned fleet this device
-    /// belongs to. Nobody else — not even a peer a route auto-accepted for.
     /// Whether `sender` may drive this device's privileged planes (terminal,
     /// files, input, sites, console). Trust comes from **authenticated**
     /// sources only: the recorded owner, or membership in the fleet's
     /// closed-network **signed roster** (cached in [`Mesh::fleet_authorized`]
-    /// from the daemon).
+    /// from the daemon). Nobody else — not even a peer a route auto-accepted
+    /// for.
     ///
-    /// The gossiped `ownership.fleet()` roster is deliberately NOT consulted:
-    /// it is adopted from unauthenticated `CHANNEL_OWNED` gossip, which is
-    /// exactly the conscription vector this closes (AMS-01). Fails closed — an
-    /// empty or stale cache denies control rather than guessing.
+    /// No gossiped roster is consulted — the fleet has none any more. The old
+    /// `CHANNEL_OWNED` `OwnedRoster` gossip was exactly the conscription vector
+    /// this closes (AMS-01); membership is now the signed roster a peer can
+    /// only enter via the owner's governance. Fails closed — an empty or stale
+    /// cache denies control rather than guessing.
     fn sender_may_control(&self, sender: &str) -> bool {
         let canon = pubkey_part(sender);
         if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
@@ -5303,7 +5341,7 @@ impl Mesh {
 
 /// A well-formed but empty owned roster (no fleet yet).
 fn empty_owned() -> Value {
-    json!({ "key": "", "version": 0, "members": [] })
+    json!({ "key": "", "version": 0, "members": [], "is_owner": false })
 }
 
 // The shape video takes on a console window's IPC channel: a fixed

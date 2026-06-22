@@ -253,6 +253,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
+    /// Propose evicting `target` from the closed network's roster entirely
+    /// — the propagating removal a fleet uses to kick a lost/stolen device.
+    GovernanceProposeEvict {
+        network: String,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
     /// Sign a pending proposal.
     GovernanceSign {
         network: String,
