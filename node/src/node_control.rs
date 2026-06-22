@@ -1140,6 +1140,27 @@ pub async fn dispatch(
             daemon_request(client, Request::GovernanceMfaDisable { network, code }).await
         }
 
+        // ---- fleet custody MFA (targets the fleet's closed network) -------
+        "fleet_mfa_status" => match mesh.fleet_network_id() {
+            Some(network) => daemon_request(client, Request::GovernanceMfaStatus { network }).await,
+            None => DispatchOut::Json(json!({ "enrolled": false, "no_fleet": true })),
+        },
+        "fleet_mfa_enroll" => match mesh.fleet_network_id() {
+            Some(network) => daemon_request(client, Request::GovernanceMfaEnroll { network }).await,
+            None => DispatchOut::Err(
+                "not in a fleet yet — adopt a device to found one before enrolling".into(),
+            ),
+        },
+        "fleet_mfa_disable" => {
+            let code: String = try_arg!(arg(a, "code"));
+            match mesh.fleet_network_id() {
+                Some(network) => {
+                    daemon_request(client, Request::GovernanceMfaDisable { network, code }).await
+                }
+                None => DispatchOut::Err("not in a fleet".into()),
+            }
+        }
+
         // ---- park store --------------------------------------------------
         "disabled_networks" => DispatchOut::Json(Value::Array(disabled.list())),
         "network_set_enabled" => {

@@ -2370,6 +2370,12 @@ impl Mesh {
         Ok(self.ownership.claimable())
     }
 
+    /// The closed network backing this device's fleet (derived from the fleet
+    /// key). The GUI targets the fleet's custody-MFA enroll/status at this id.
+    pub fn fleet_network_id(&self) -> Option<String> {
+        self.ownership.fleet_network_id()
+    }
+
     /// The claim-status check — "is what we believe about ownership still
     /// true, and does everyone else know it?" Drops incoherent fleet
     /// residue, re-stamps the live profile from the ownership store, then
