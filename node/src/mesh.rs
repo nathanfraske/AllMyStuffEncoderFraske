@@ -2695,9 +2695,11 @@ impl Mesh {
     }
 
     /// Front-end command: name (or rename) the fleet. Owner-authoritative:
-    /// the name is set locally and pushed onto the closed network's label.
-    /// (The label is local per MyOwnMesh, so members keep the name they got
-    /// at claim time — cosmetic.) The UI refreshes from `allmystuff://owned`.
+    /// the name is set locally, pushed onto the closed network's label, and —
+    /// since the owner is the source of truth for the fleet name — re-handed
+    /// to every member so it propagates instead of having to be set on each
+    /// device. (Members got the name with their fleet key at claim time; a
+    /// rename re-sends it.) The UI refreshes from `allmystuff://owned`.
     pub async fn fleet_set_name(self: &Arc<Self>, name: String) -> Result<(), String> {
         self.ownership.set_fleet_name(&name)?;
         tracing::info!("fleet named {:?}", self.ownership.fleet_name());
@@ -2711,6 +2713,18 @@ impl Mesh {
                 .client
                 .request(&Request::NetworkUpdate { config })
                 .await;
+        }
+        // Re-hand the (now-renamed) fleet key to every member so the name
+        // converges across the fleet. Owner-only — a member has no members to
+        // notify, and the name is the owner's to set.
+        if self.ownership.is_fleet_owner() {
+            let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
+            for member in self.ownership.fleet_member_ids() {
+                if Some(pubkey_part(&member).to_string()) == me {
+                    continue;
+                }
+                self.send_fleet_key(&member).await;
+            }
         }
         self.emit_owned().await;
         Ok(())
