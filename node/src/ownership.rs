@@ -382,19 +382,111 @@ fn new_fleet_key() -> String {
     s
 }
 
+/// Adjective + name word-lists for a fleet's deterministic network name.
+///
+/// FROZEN once shipped: changing either list (or the derivation below) changes
+/// the id a given key derives, which would strand existing fleets on the id
+/// they already converged on. Add to the *end* only if ever extended.
+const FLEET_ADJECTIVES: &[&str] = &[
+    "amber", "ancient", "autumn", "bold", "brave", "bright", "brisk", "calm", "clever", "cobalt",
+    "cosmic", "crimson", "daring", "dawn", "dusky", "eager", "elder", "ember", "fabled", "fancy",
+    "fleet", "frosty", "gentle", "gilded", "golden", "hardy", "hidden", "humble", "ivory", "jolly",
+    "keen", "lively", "lucky", "mellow", "merry", "mighty", "nimble", "noble", "polar", "quiet",
+    "rapid", "royal", "rugged", "silent", "solar", "spry", "stout", "sunny", "swift", "tidal",
+    "vivid", "wily",
+];
+
+const FLEET_NAMES: &[&str] = &[
+    "ampere",
+    "archimedes",
+    "babbage",
+    "bardeen",
+    "bell",
+    "bohr",
+    "boyle",
+    "carson",
+    "curie",
+    "dalton",
+    "darwin",
+    "dijkstra",
+    "edison",
+    "einstein",
+    "euclid",
+    "euler",
+    "faraday",
+    "fermi",
+    "feynman",
+    "franklin",
+    "galileo",
+    "gauss",
+    "hawking",
+    "heisenberg",
+    "hertz",
+    "hopper",
+    "hubble",
+    "joule",
+    "kepler",
+    "knuth",
+    "lamarr",
+    "lovelace",
+    "maxwell",
+    "meitner",
+    "mendel",
+    "morse",
+    "newton",
+    "noether",
+    "nobel",
+    "pascal",
+    "pasteur",
+    "planck",
+    "ramanujan",
+    "sagan",
+    "tesla",
+    "turing",
+    "volta",
+    "watt",
+];
+
 /// Derive the fleet's closed-network id from its key. Deterministic so every
-/// co-owned device computes the identical id (self-converging migration), and
-/// an *identifier* not a secret (it travels in signaling), so it must not echo
-/// the key — an FNV-1a digest gives a stable, low-collision, dependency-free
-/// 16-char lowercase-hex id that is a valid MyOwnMesh network id charset.
+/// co-owned device computes the identical id (self-converging migration). The
+/// id is an *identifier*, not a secret (it rides in signaling), and the design
+/// wants it **human-communicable** — sayable, memorable, reusable — so it reads
+/// as a git-branch-style word salad (`adjective-name-suffix`, e.g.
+/// `swift-mendel-q4z7a`) rather than a hash. The two words make it speakable;
+/// the 5-char base36 suffix carries the entropy that keeps distinct fleets
+/// apart. Lowercase alphanumerics + `-`, a valid MyOwnMesh network id.
 fn derive_fleet_network_id(key: &str) -> String {
-    // FNV-1a, 64-bit.
+    let h1 = fnv1a64(key.as_bytes());
+    // A second digest over the reversed key gives independent bits for the
+    // suffix, so it doesn't track the word choice.
+    let reversed: Vec<u8> = key.bytes().rev().collect();
+    let h2 = fnv1a64(&reversed);
+    let adjective = FLEET_ADJECTIVES[(h1 % FLEET_ADJECTIVES.len() as u64) as usize];
+    // Shift before the modulo so the name doesn't correlate with the adjective.
+    let name = FLEET_NAMES[((h1 >> 21) % FLEET_NAMES.len() as u64) as usize];
+    format!("{adjective}-{name}-{}", base36(h2, 5))
+}
+
+/// FNV-1a, 64-bit. Stable, dependency-free, good enough for a non-secret id.
+fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in key.as_bytes() {
+    for b in bytes {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{hash:016x}")
+    hash
+}
+
+/// `n` rendered as `width` lowercase base36 chars (low digit first) — the
+/// readable suffix that disambiguates a derived fleet name.
+fn base36(mut n: u64, width: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(width);
+    for _ in 0..width {
+        out.push(DIGITS[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    out
 }
 
 /// The stable pubkey portion of a mesh device id — strip MyOwnMesh's trailing
@@ -589,6 +681,28 @@ mod tests {
         // Kicking when not in a fleet is an error.
         let stray = memory();
         assert!(stray.kick_member("whoever").is_err());
+    }
+
+    #[test]
+    fn fleet_network_id_is_a_deterministic_word_salad() {
+        let key = new_fleet_key();
+        let a = derive_fleet_network_id(&key);
+        // Deterministic: the same key always derives the same name — this is
+        // what makes every co-owned device converge on one network.
+        assert_eq!(a, derive_fleet_network_id(&key));
+
+        // adjective-name-suffix shape, drawn from the frozen word-lists.
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.len(), 3, "{a} should be adjective-name-suffix");
+        assert!(FLEET_ADJECTIVES.contains(&parts[0]), "{a}");
+        assert!(FLEET_NAMES.contains(&parts[1]), "{a}");
+        assert_eq!(parts[2].len(), 5, "5-char suffix in {a}");
+
+        // A valid (lowercase) MyOwnMesh network id, and distinct keys differ.
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert_ne!(a, derive_fleet_network_id(&new_fleet_key()));
     }
 
     #[test]
