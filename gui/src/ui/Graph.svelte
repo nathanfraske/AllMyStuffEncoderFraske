@@ -330,7 +330,7 @@
    *  same `standing().claimable` the node's visual reads, so the tap target
    *  and the look never disagree. */
   function isAdoptable(n: MeshNode): boolean {
-    return app.standing(n).claimable;
+    return app.standingOf(n).claimable;
   }
 
   /** The claimable node whose inline "Claim" button is currently dropped out
@@ -424,7 +424,7 @@
            never shows contradictory state (e.g. "unclaimed" while wearing a
            fleet badge). It recomputes live from the fleet roster + the device's
            advert, so claiming or fleet changes reflect immediately. -->
-      {@const st = app.standing(n)}
+      {@const st = app.standingOf(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
@@ -677,26 +677,43 @@
   /* The claim affordances drop out from *under* the node — floated below it so
      they never push siblings around — with a slide-in, and a shimmer on the
      accent Claim button to pull the eye to the new action. */
+  /* A drawer that reads as part of *this* node: it tucks just under the card,
+     inset and sharing the bottom edge (no top border, bottom-rounded), with a
+     short stem down from the node's centre so it's unmistakably attached to
+     the device above it — not floating loose between cards. */
   .node-drawer {
     position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    right: 0;
+    top: calc(100% - 1px);
+    left: 14px;
+    right: 14px;
     z-index: 6;
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    padding: 0.4rem 0.5rem;
+    border: 1.5px solid var(--accent);
+    border-top: none;
+    border-radius: 0 0 var(--r-sm) var(--r-sm);
+    padding: 0.42rem 0.5rem 0.4rem;
     font-size: 0.78rem;
     font-weight: 650;
     font-family: inherit;
     cursor: pointer;
     background: var(--surface);
-    color: var(--ink-soft);
-    box-shadow: var(--shadow-md);
-    animation: drawer-drop 0.22s ease-out both;
+    color: var(--accent-ink);
+    box-shadow: 0 8px 16px oklch(0 0 0 / 0.18);
+    transform-origin: top center;
+    animation: drawer-drop 0.2s ease-out both;
+  }
+  /* The stem joining the drawer to the node's bottom edge. */
+  .node-drawer::before {
+    content: "";
+    position: absolute;
+    top: -8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 2px;
+    height: 8px;
+    background: var(--accent);
   }
   .node-drawer:hover {
-    border-color: var(--accent);
+    background: var(--accent-soft);
   }
   .claim-go {
     border-color: var(--accent);
@@ -713,11 +730,11 @@
   @keyframes drawer-drop {
     from {
       opacity: 0;
-      transform: translateY(-8px);
+      transform: scaleY(0.4);
     }
     to {
       opacity: 1;
-      transform: translateY(0);
+      transform: scaleY(1);
     }
   }
   @keyframes shimmer {

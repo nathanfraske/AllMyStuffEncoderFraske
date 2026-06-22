@@ -662,7 +662,12 @@ class AppStore {
     const self = node.kind === "this" || this.isMe(node.id);
     const app = isAppNode(node);
     const shared = node.relationship.kind === "shared" ? node.relationship.person : null;
-    const inFleet = this.isFleetMember(node.id);
+    // "In a fleet": for *this* device, whether you hold a fleet credential at
+    // all — a solo fleet (you founded it, no members yet) still counts, so the
+    // make-claimable button correctly gives way to "Leave the fleet" and the
+    // backend's no-claiming-while-in-a-fleet rule. For a remote device, whether
+    // it's a member of your fleet roster.
+    const inFleet = self ? !!this.ownedFleet?.key : this.isFleetMember(node.id);
     const role = this.fleetRoleOf(node.id);
     const ownedByMe = !!node.owner && this.isMe(node.owner);
     const ownedByOther = !!node.owner && !this.isMe(node.owner);
@@ -692,6 +697,23 @@ class AppStore {
       shared,
       kind,
     };
+  }
+
+  /** Every node's standing, as a **derived** map keyed by node id — so the
+   *  graph and drawer read a reactive value (which Svelte re-tracks the moment
+   *  the fleet roster or any device's advert changes) rather than calling a
+   *  method per render and hoping the dependency is tracked. This is the single
+   *  reactive source the whole claim/fleet UI consumes. */
+  standings = $derived.by(() => {
+    const m = new Map<string, Standing>();
+    for (const n of this.catalog.nodes) m.set(n.id, this.standing(n));
+    return m;
+  });
+
+  /** The standing for one node — the reactive map entry, with a live fallback
+   *  for a node that isn't in the catalog yet. */
+  standingOf(node: MeshNode): Standing {
+    return this.standings.get(node.id) ?? this.standing(node);
   }
 
   /** Whether this device has a fleet custody authenticator enrolled. When it
@@ -2827,15 +2849,26 @@ class AppStore {
   /** Put *this* device into (or out of) claim mode so another of your
    *  machines can adopt it. */
   async setLocalClaimable(on: boolean) {
-    const me = this.node(this.localId);
+    // Resolve the *actual* local node (by its definitive marker, not just an id
+    // match) so the optimistic flip lands on the node the graph is showing.
+    const me =
+      this.catalog.nodes.find((n) => n.kind === "this") ??
+      this.catalog.nodes.find((n) => this.isLocalMachine(n.id));
     if (this.backendConnected) {
       try {
-        const now = await setClaimable(on);
-        if (me) me.claimable = now ?? on;
-        this.toast(
-          on ? "info" : "ok",
-          on ? "This device can now be adopted by another of your machines" : "Adoption turned off",
-        );
+        // The backend is the authority: it refuses claim mode for a device
+        // already in a fleet, so `now` is what actually took — report *that*,
+        // not what was asked, so the toast can't claim something untrue.
+        const now = (await setClaimable(on)) ?? on;
+        if (me) me.claimable = now;
+        if (on && !now) {
+          this.toast("warn", "This device is in a fleet — leave it first to offer it for adoption.");
+        } else {
+          this.toast(
+            now ? "info" : "ok",
+            now ? "This device can now be adopted by another of your machines" : "Adoption turned off",
+          );
+        }
       } catch (e) {
         this.toast("warn", `Couldn't change claim mode: ${errMsg(e)}`);
       }
@@ -4726,6 +4759,12 @@ class AppStore {
     if (this.backendConnected) {
       try {
         await fleetLeave();
+        // Reflect it now — clear the local fleet so the graph + drawer update
+        // this instant, not on the next poll. The backend's empty roster lands
+        // right after and confirms it. A freshly fleet-less device also stops
+        // being claimable-blocked, so the make-claimable affordance returns.
+        this.ownedFleet = null;
+        this.reconcileFleetRelationships();
         this.toast("ok", "Left the fleet");
       } catch (e) {
         this.toast("warn", `Couldn't leave the fleet: ${String(e)}`);

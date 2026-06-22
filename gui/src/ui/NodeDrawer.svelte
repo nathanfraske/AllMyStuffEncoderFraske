@@ -19,7 +19,7 @@
   const caps = $derived(node ? app.capsOf(node.id) : []);
   // The single derived standing — every section and button below reads it, so
   // the drawer can't contradict the graph (or itself).
-  const st = $derived(node ? app.standing(node) : null);
+  const st = $derived(node ? app.standingOf(node) : null);
   const shared = $derived(st?.kind === "shared");
   // A device on the mesh that isn't running AllMyStuff: nothing to wire.
   const meshonly = $derived(!!st && !st.app);
