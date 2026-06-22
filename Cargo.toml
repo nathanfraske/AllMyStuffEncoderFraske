@@ -38,7 +38,6 @@ allmystuff-bridge = { path = "crates/allmystuff-bridge", version = "0.2.1" }
 allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.1" }
 allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.1" }
 allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.1" }
-allmystuff-term = { path = "crates/allmystuff-term", version = "0.2.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

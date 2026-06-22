@@ -25,7 +25,6 @@ dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-service",
- "allmystuff-term",
  "allmystuff-updater",
  "serde_json",
  "tokio",

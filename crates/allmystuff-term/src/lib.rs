@@ -169,9 +169,40 @@ async fn go(opts: Opts) -> Result<i32, String> {
         return Err(e);
     }
 
-    let code = attach::run(client.clone(), route_id, ev_rx).await?;
+    // `--cwd` (the "open a terminal here" launch) starts you in that folder by
+    // injecting a `cd` once the prompt is up. It's a local path, so it only
+    // makes sense for a terminal on *this* machine; ignored (with a note) for a
+    // remote one.
+    let initial_input = match &opts.cwd {
+        Some(dir) if host.is_me => Some(cd_command(dir)),
+        Some(_) => {
+            eprintln!("amst: --cwd is ignored for a remote machine (it's a local path).");
+            None
+        }
+        None => None,
+    };
+
+    let code = attach::run(client.clone(), route_id, ev_rx, initial_input).await?;
     eprintln!("\r\namst: terminal closed.");
     Ok(code)
+}
+
+/// The `cd <dir>` keystrokes to drop the shell into `dir`, as the "open a
+/// terminal here" integration wants. POSIX single-quoting on unix (every shell
+/// from `sh` to `fish` honours it); a double-quoted `cd` on Windows (PowerShell
+/// always, `cmd` for the same drive). Best-effort — a path the shell rejects
+/// just leaves you at the prompt, nothing breaks.
+fn cd_command(dir: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        format!("cd \"{}\"\r\n", dir.replace('"', "")).into_bytes()
+    }
+    #[cfg(not(windows))]
+    {
+        // Single-quote and escape embedded single quotes ('\'' closes, escapes,
+        // reopens) so any path is passed literally.
+        format!("cd '{}'\n", dir.replace('\'', "'\\''")).into_bytes()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +675,10 @@ fn now_millis() -> u128 {
 struct Opts {
     target: Option<String>,
     attach: Option<String>,
+    /// Start the shell in this directory (a local path; only meaningful for a
+    /// terminal on this machine) — what the "open a terminal here" shell
+    /// integration passes.
+    cwd: Option<String>,
     list: bool,
     sessions: bool,
     help: bool,
@@ -669,6 +704,16 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
             }
             s if s.starts_with("--attach=") => {
                 o.attach = Some(s["--attach=".len()..].to_string());
+            }
+            "-C" | "--cwd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.cwd = Some(v.clone()),
+                    None => return Err("--cwd needs a directory".into()),
+                }
+            }
+            s if s.starts_with("--cwd=") => {
+                o.cwd = Some(s["--cwd=".len()..].to_string());
             }
             s if s.starts_with('-') && s != "-" => {
                 return Err(format!("unknown option `{s}`"));
@@ -702,6 +747,8 @@ OPTIONS:
     -s, --sessions       List the open shell sessions on MACHINE (to --attach).
     -a, --attach <ID>    Attach to an existing shell session (shared, tmux-style)
                          instead of opening a new one.
+    -C, --cwd <DIR>      Start the shell in DIR (a terminal on this machine) —
+                         what the 'open a terminal here' shell integration uses.
     -h, --help           Show this help.
     -V, --version        Print the version.
 
@@ -764,6 +811,33 @@ mod tests {
                 attach: Some("t9".into()),
                 ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn parse_cwd_flag_forms() {
+        let a: Vec<String> = ["--cwd", "/home/u/proj"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_args(&a).unwrap().cwd.as_deref(), Some("/home/u/proj"));
+        let a: Vec<String> = ["-C", "/tmp"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_args(&a).unwrap().cwd.as_deref(), Some("/tmp"));
+        let a: Vec<String> = ["--cwd=/x/y"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_args(&a).unwrap().cwd.as_deref(), Some("/x/y"));
+        let a: Vec<String> = ["--cwd"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&a).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cd_command_single_quotes_and_escapes() {
+        assert_eq!(cd_command("/home/u"), b"cd '/home/u'\n".to_vec());
+        // An embedded single quote is closed/escaped/reopened so the path is
+        // passed literally.
+        assert_eq!(
+            cd_command("/a/it's here"),
+            b"cd '/a/it'\\''s here'\n".to_vec()
         );
     }
 

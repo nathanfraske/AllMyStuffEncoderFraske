@@ -108,14 +108,6 @@ function Install-FromZip([string]$zipPath) {
     }
     Log "Installed: $exe"
 
-    # `amst.exe` is the same binary in terminal mode (it detects argv[0]) — a
-    # copy gives the standalone `amst` command (open a shell on any machine you
-    # own, over the mesh) without a second download. A copy, not a symlink, so
-    # it works without Developer Mode / elevation.
-    $amst = Join-Path $Prefix "amst.exe"
-    Copy-Item -Path $exe -Destination $amst -Force
-    Log "Installed: $amst (amst → allmystuff)"
-
     # Add prefix to user PATH if it isn't already there.
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if (-not ($userPath -split ";" | Where-Object { $_ -ieq $Prefix })) {
@@ -501,9 +493,6 @@ function Build-FromSource {
         }
         Copy-Item -Force $built (Join-Path $Prefix "allmystuff.exe")
         Log "Installed: $(Join-Path $Prefix 'allmystuff.exe')"
-        # `amst.exe` is the same binary in terminal mode (it detects argv[0]).
-        Copy-Item -Force (Join-Path $Prefix "allmystuff.exe") (Join-Path $Prefix "amst.exe")
-        Log "Installed: $(Join-Path $Prefix 'amst.exe') (amst → allmystuff)"
 
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         if (-not ($userPath -split ";" | Where-Object { $_ -ieq $Prefix })) {

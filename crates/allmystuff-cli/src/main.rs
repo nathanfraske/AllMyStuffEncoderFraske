@@ -7,7 +7,6 @@
 //! ```text
 //! allmystuff                 # open the desktop app
 //! allmystuff serve           # run this machine on the mesh, headless (no GUI)
-//! allmystuff term [machine]  # open a shell on a machine you own, over the mesh (also `amst`)
 //! allmystuff service install # keep the node running across reboots (systemd/launchd)
 //! allmystuff scan            # pretty inventory of this machine
 //! allmystuff scan --json     # the same, as JSON
@@ -28,15 +27,6 @@ fn main() -> ExitCode {
     allmystuff_updater::apply_pending_if_any();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Invoked as `amst` (the terminal command — a symlink/copy the installer
-    // drops next to this binary): every argument is the terminal's, there's no
-    // subcommand to strip. This is what makes `amst` and `allmystuff term` the
-    // same binary in an install.
-    if invoked_as_amst() {
-        return allmystuff_term::run(&args);
-    }
-
     let Some(cmd) = args.first().map(String::as_str) else {
         // No subcommand → open the desktop app.
         return gui_launch::launch();
@@ -52,10 +42,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "serve" => serve::run(&args[1..]),
-        // `allmystuff term [machine]` (alias `amst`) — open a real shell on a
-        // machine you own, over the mesh. With no machine it's a terminal on
-        // this machine. The standalone `amst` binary is the same code.
-        "term" | "amst" | "terminal" => allmystuff_term::run(&args[1..]),
         "service" => run_service(&args[1..]),
         "scan" => {
             let json = args.iter().any(|a| a == "--json");
@@ -69,19 +55,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Whether this process was launched under the name `amst` — argv[0]'s
-/// basename, case-insensitive, ignoring any `.exe`. The installer drops an
-/// `amst` (a symlink on unix, a copy on Windows) that points at this binary, so
-/// the mesh terminal is reachable as its own command without a second build.
-fn invoked_as_amst() -> bool {
-    if let Some(arg0) = std::env::args_os().next() {
-        if let Some(stem) = std::path::Path::new(&arg0).file_stem() {
-            return stem.eq_ignore_ascii_case("amst");
-        }
-    }
-    false
 }
 
 /// `allmystuff update [check|apply|status|enable|disable] [--json]` —
@@ -393,9 +366,6 @@ COMMANDS:
     serve           Run this machine on the mesh, headless (no GUI). Serves its
                     screen/camera/audio/terminal/files to peers, and spawns the
                     myownmesh daemon itself.
-    term [MACHINE]  Open a real shell on a machine you own, over the mesh (no
-                    SSH). With no MACHINE, a terminal on this machine. Also the
-                    standalone `amst` command. `term --list` shows your machines.
     service         Install/manage serve as a background OS service so it
                     survives reboots — systemd / launchd / Windows SCM (install |
                     start | stop | restart | status | uninstall; --system for a

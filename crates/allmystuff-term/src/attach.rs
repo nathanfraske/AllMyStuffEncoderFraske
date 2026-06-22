@@ -46,10 +46,13 @@ fn local_size() -> (u16, u16) {
 /// Drive `route_id` interactively until it ends. Returns the far shell's exit
 /// code (0 when it ended without one, e.g. killed). `events` is the node's
 /// already-subscribed event stream; we filter it for this route's pokes.
+/// `initial_input` (if any) is sent once the screen is first painted — the
+/// `cd <dir>` an "open a terminal here" launch injects.
 pub async fn run(
     client: Arc<NodeClient>,
     route_id: String,
     mut events: mpsc::Receiver<NodeEvent>,
+    initial_input: Option<Vec<u8>>,
 ) -> Result<i32, String> {
     // Claim this route's buffered output.
     let token = client
@@ -78,6 +81,14 @@ pub async fn run(
     // Paint whatever was buffered before we subscribed (the prompt/scrollback).
     drain(&client, &route_id, &mut stdout).await;
 
+    // Inject the launch's `cd` (or whatever) as if typed, now that the prompt
+    // is up. A failure here is non-fatal — the session is still usable.
+    if let Some(bytes) = initial_input {
+        if !bytes.is_empty() {
+            let _ = send_keys(&client, &route_id, bytes).await;
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -97,11 +108,9 @@ pub async fn run(
             // Keystrokes → the far PTY.
             bytes = key_rx.recv(), if stdin_open => match bytes {
                 Some(b) if !b.is_empty() => {
-                    let event = TermEvent::Data { bytes: b };
-                    let payload = serde_json::to_value(&event).map_err(|e| e.to_string())?;
                     // A send failure means the route is gone (host left, torn
                     // down) — stop rather than spin.
-                    if client.request("term_send", json!({ "route_id": route_id, "event": payload })).await.is_err() {
+                    if send_keys(&client, &route_id, b).await.is_err() {
                         break;
                     }
                 }
@@ -211,6 +220,20 @@ fn split_batch(batch: &[u8]) -> Vec<&[u8]> {
         i += len;
     }
     chunks
+}
+
+/// Send keystroke bytes to the far PTY (one `term_send` Data). `Err` means the
+/// route is gone.
+async fn send_keys(client: &Arc<NodeClient>, route_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let event = TermEvent::Data { bytes };
+    let payload = serde_json::to_value(&event).map_err(|e| e.to_string())?;
+    client
+        .request(
+            "term_send",
+            json!({ "route_id": route_id, "event": payload }),
+        )
+        .await
+        .map(|_| ())
 }
 
 /// Tell the host our emulator size so the shell relays out to fit.

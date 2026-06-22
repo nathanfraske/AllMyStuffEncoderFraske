@@ -156,6 +156,13 @@ jobs:
       - name: Build CLI
         run: cargo build --release --bin allmystuff --target ${{ matrix.platform.target }}
 
+      # Build `amst` (AMSTerm) — the standalone mesh terminal. A separate,
+      # self-contained program in the same root workspace (no webview, no media
+      # stack), shipped as its own portable asset and installed by its own
+      # `install-amst` script.
+      - name: Build amst (AMSTerm)
+        run: cargo build --release --bin amst --target ${{ matrix.platform.target }}
+
       # Build the headless node binary (`allmystuff-serve`, what `allmystuff
       # serve` runs). It carries the whole media/mesh engine, so it links the
       # same native stack as the GUI (minus the webview). Shipped alongside
@@ -205,6 +212,30 @@ jobs:
           else
             cp "$BIN" "dist-bin/allmystuff"
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin allmystuff
+            (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+          fi
+
+      # Package the portable `amst` (AMSTerm) binary so `install-amst` can fetch
+      # `amst-<platform>.<ext>` directly. The raw binary is left in dist-bin
+      # (the upload glob only matches the archives + .sha256, like the CLI step).
+      - name: Package portable amst binary
+        shell: bash
+        run: |
+          set -e
+          BIN=target/${{ matrix.platform.target }}/release/amst
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          if [[ ! -f "$BIN" ]]; then
+            echo "amst binary not found at $BIN"; exit 1
+          fi
+          mkdir -p dist-bin
+          NAME="amst-${{ matrix.platform.name }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$BIN" "dist-bin/amst.exe"
+            (cd dist-bin && 7z a "${NAME}.zip" amst.exe)
+            (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+          else
+            cp "$BIN" "dist-bin/amst"
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin amst
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
@@ -268,6 +299,7 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist-bin/allmystuff-*
+            dist-bin/amst-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

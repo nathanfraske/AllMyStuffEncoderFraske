@@ -85,17 +85,12 @@ fi
 install_binary() {
   src="$1"
   mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
-  # `amst` is the same binary in terminal mode (it detects argv[0]), so a
-  # relative symlink next to the CLI gives the standalone `amst` command — open
-  # a shell on any machine you own, over the mesh — without a second download.
   if [ -w "$PREFIX_DIR" ]; then
     install -m 0755 "$src" "$PREFIX_DIR/allmystuff"
-    ln -sf allmystuff "$PREFIX_DIR/amst"
   else
     sudo install -m 0755 "$src" "$PREFIX_DIR/allmystuff"
-    sudo ln -sf allmystuff "$PREFIX_DIR/amst"
   fi
-  log "Installed: $PREFIX_DIR/allmystuff (and amst → allmystuff)"
+  log "Installed: $PREFIX_DIR/allmystuff"
 }
 
 install_gui_binary() {
