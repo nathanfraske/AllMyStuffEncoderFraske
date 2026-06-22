@@ -15,7 +15,13 @@
     type MediaKind,
   } from "../types";
 
-  const node = $derived(app.selectedNode);
+  // The drawer never closes: with no selection it falls back to this device, so
+  // the panel always shows *something* (your own node) instead of vanishing.
+  const node = $derived(app.selectedNode ?? app.localNode);
+  // Whether we're showing the fallback (this device) rather than a real
+  // selection — used to drop the "close" affordance, since there's nothing to
+  // deselect back to.
+  const isLocalFallback = $derived(!app.selectedNode || node?.kind === "this");
   const caps = $derived(node ? app.capsOf(node.id) : []);
   // The single derived standing — every section and button below reads it, so
   // the drawer can't contradict the graph (or itself).
@@ -236,12 +242,14 @@
         <span class="rail-avatar" aria-hidden="true"
           >{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span
         >
-        <button
-          class="rail-btn"
-          onclick={() => app.selectNode(null)}
-          title="Close"
-          aria-label="Close">✕</button
-        >
+        {#if !isLocalFallback}
+          <button
+            class="rail-btn"
+            onclick={() => app.selectNode(null)}
+            title="Back to this device"
+            aria-label="Back to this device">✕</button
+          >
+        {/if}
       </div>
     {:else}
       <!-- Drag this edge to resize the sidebar. -->
@@ -293,7 +301,9 @@
         title="Collapse panel"
         aria-label="Collapse panel">⟩</button
       >
-      <button class="x" onclick={() => app.selectNode(null)} aria-label="Close">✕</button>
+      {#if !isLocalFallback}
+        <button class="x" onclick={() => app.selectNode(null)} title="Back to this device" aria-label="Back to this device">✕</button>
+      {/if}
     </header>
 
     {#if node.summary}

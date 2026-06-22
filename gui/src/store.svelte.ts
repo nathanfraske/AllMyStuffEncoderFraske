@@ -679,10 +679,20 @@ class AppStore {
       ? !!this.ownedFleet?.key || this.ownedFleet?.claimed === true
       : this.isFleetMember(node.id);
     const role = this.fleetRoleOf(node.id);
-    const ownedByMe = !!node.owner && this.isMe(node.owner);
+    // Roster-authoritative ownership. The signed fleet roster — what the
+    // settings Fleet pane and the graph's fleet grouping both read — is the
+    // authority for "is this device in my fleet". A device's *own* presence
+    // advert of "owner = you" is a weaker, staler hint: it lingers after the
+    // device leaves or is evicted (it may be offline, or have missed the
+    // Release), so it must not keep a device marked mine once the roster has
+    // dropped it — that's the graph-vs-settings divergence. Fall back to the
+    // advert only when you hold no fleet at all (nothing authoritative to
+    // contradict it).
+    const advertisedMine = !!node.owner && this.isMe(node.owner);
     const ownedByOther = !!node.owner && !this.isMe(node.owner);
+    const ownedByMe = inFleet || (advertisedMine && !this.hasFleet);
     const offering = node.claimable === true;
-    const mine = inFleet || ownedByMe;
+    const mine = ownedByMe;
     const claimable = !self && app && offering && !mine && !ownedByOther;
     let kind: Standing["kind"];
     if (self) kind = "self";
@@ -842,6 +852,16 @@ class AppStore {
   // ---- derived -----------------------------------------------------
   selectedNode = $derived(
     this.selectedNodeId ? this.catalog.nodes.find((n) => n.id === this.selectedNodeId) ?? null : null,
+  );
+
+  /** This machine's own node — the "this device" the drawer falls back to when
+   *  nothing is selected, so the panel always has something to show rather than
+   *  vanishing. Matched by the definitive `kind === "this"` marker, with the
+   *  local-id match as a backstop before the first scan re-homes it. */
+  localNode = $derived(
+    this.catalog.nodes.find((n) => n.kind === "this") ??
+      this.catalog.nodes.find((n) => this.isLocalMachine(n.id)) ??
+      null,
   );
 
   /** The machine a console session is currently open on, if any. */

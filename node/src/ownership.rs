@@ -266,6 +266,15 @@ impl Ownership {
             .collect()
     }
 
+    /// The owner's local member records (device + label). The owner's durable,
+    /// persisted view of who's in its fleet — kept consistent with the signed
+    /// roster (a left/evicted device is dropped from both), so it's safe to
+    /// fold into the roster shown to the GUI to cover a startup lag or a
+    /// transient signed-roster read failure. Empty for a non-owner member.
+    pub fn fleet_members(&self) -> Vec<OwnedMember> {
+        self.inner.lock().fleet_members.clone()
+    }
+
     /// Make sure this device has a fleet key, minting a fresh one the first
     /// time (e.g. when it claims its first device). Returns the key.
     pub fn ensure_fleet_key(&self) -> String {

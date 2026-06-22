@@ -2384,6 +2384,28 @@ impl Mesh {
                 }
             }
         }
+        // Fold in the owner's durable local member list so its devices show as
+        // members immediately — before the closed network's signed roster
+        // re-converges on startup, and through a transient roster-read failure —
+        // and so the roster the GUI sees matches the owner's actual membership
+        // rather than diverging from it. A left or evicted device is dropped
+        // from this list too (the removal paths clear both), so the merge never
+        // resurrects one; a non-owner member's list is empty, a no-op there.
+        for m in self.ownership.fleet_members() {
+            let canon = pubkey_part(m.device.as_str()).to_string();
+            if !members
+                .iter()
+                .any(|x| pubkey_part(x.device.as_str()) == canon)
+            {
+                members.push(OwnedMember {
+                    device: NodeId::from(canon.as_str()),
+                    label: m.label.clone(),
+                });
+            }
+            member_roles
+                .entry(canon)
+                .or_insert_with(|| "member".to_string());
+        }
         // The signed roster a node holds never lists *itself* — each device is
         // locally authoritative and isn't re-added from a peer's roster gossip
         // (MyOwnMesh `on_roster_entries` skips the self entry). But the fleet
