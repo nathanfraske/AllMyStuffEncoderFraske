@@ -992,7 +992,13 @@ class AppStore {
   }
 
   capsOf(nodeId: string): Capability[] {
-    return this.catalog.capabilities.filter((c) => c.node === nodeId);
+    // Canonical (bare-pubkey) match, not exact: the caller's id and a
+    // capability's `node` can be different display-id forms of the same machine
+    // (`pubkey-SUFFIX` vs the bare pubkey). An exact compare misses them — which
+    // left consoleVideoInputs empty, so the console opened with no screen to
+    // auto-start.
+    const want = canonicalNodeId(nodeId);
+    return this.catalog.capabilities.filter((c) => canonicalNodeId(c.node) === want);
   }
 
   node(nodeId: string): MeshNode | undefined {
@@ -1751,9 +1757,8 @@ class AppStore {
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
       this.fireBackendConnect(res.route.from, res.route.to, res.route.media, codec);
-      const f = this.capability(from)?.label ?? from;
-      const t = this.capability(to)?.label ?? to;
-      this.toast("ok", `Connected ${f} → ${t}`);
+      // No success toast — the graph route, the console pills, and the screen
+      // are the visual confirmation a connection is up.
       return true;
     }
     if (res.denied && res.denied.length) {
@@ -1900,7 +1905,6 @@ class AppStore {
     } else {
       void this.wireConsoleFirstVideo();
     }
-    this.toast("ok", `Console open on ${node!.label}`);
   }
 
   /** The console's opening video wire + the auto-legs decision — split
