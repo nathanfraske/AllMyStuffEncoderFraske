@@ -244,6 +244,11 @@ function endpointRank(c: Capability): number {
  *  canonical form instead. Mirrors store.svelte.ts's `canonicalNodeId` and
  *  myownmesh-core's `signing::pubkey_part`. */
 function canonicalNode(id: string): string {
+  // Null-safe: matchEndpoint runs during render with ids that may not be
+  // resolved yet (a console window before its target/localId lands). The old
+  // exact compare quietly no-matched on a nullish id; this must too, or the
+  // throw blanks the whole view.
+  if (!id) return id;
   const dash = id.lastIndexOf("-");
   if (dash > 0) {
     const suffix = id.slice(dash + 1);
