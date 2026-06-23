@@ -901,9 +901,14 @@ class AppStore {
       null,
   );
 
-  /** The machine a console session is currently open on, if any. */
+  /** The machine a console session is currently open on, if any. Resolved
+   *  canonically (by bare pubkey), not by exact id: the id is captured when the
+   *  console opens, but a node's display id can change form afterwards (a
+   *  presence snapshot re-homing it onto its `pubkey-SUFFIX` display id). An
+   *  exact `n.id === consoleNodeId` then misses it, leaving `<Console>`'s
+   *  `{#if node}` false and the whole remote-console window blank. */
   consoleNode = $derived(
-    this.consoleNodeId ? this.catalog.nodes.find((n) => n.id === this.consoleNodeId) ?? null : null,
+    this.consoleNodeId ? this.machineByAnyId(this.consoleNodeId) ?? null : null,
   );
 
   /** Routes running between this machine and the console's remote — the
