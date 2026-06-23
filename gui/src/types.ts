@@ -356,15 +356,17 @@ export interface PeerInfo {
   capabilities?: {
     tags?: string[];
     app_version?: string | null;
-    /** The device summary (OS / CPU / RAM / device count), carried here too so
-     *  it arrives reliably with the peer list even when the presence advert is
-     *  missed. */
-    summary?: InventorySummary | null;
-    /** The wireable endpoints (control / audio / video / display sinks &
-     *  sources), carried here too so rooms and remote-control can resolve a
-     *  path even when the bespoke presence advert — which used to be their
-     *  only source — was missed. */
-    endpoints?: Capability[] | null;
+    /** Embedder-defined data. The daemon's `CapabilityAdvert` is a typed struct
+     *  that only forwards `tags`/`app_version`/`max_connections` and this opaque
+     *  `extra` bag — anything app-specific must ride here or serde drops it.
+     *  Carried on the reliable peer list, unlike the bespoke presence advert. */
+    extra?: {
+      /** The device summary (OS / CPU / RAM / device count). */
+      summary?: InventorySummary | null;
+      /** The wireable endpoints (control / audio / video / display sinks &
+       *  sources) rooms and remote-control resolve a route through. */
+      endpoints?: Capability[] | null;
+    } | null;
   } | null;
 }
 

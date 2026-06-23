@@ -1235,12 +1235,13 @@ class AppStore {
           e.app = true;
           e.features = tags.filter((t) => t !== CAP_TAG_ALLMYSTUFF);
           if (p.capabilities?.app_version) e.version = p.capabilities.app_version;
-          // The device stats ride the peer list too — so a connected peer whose
-          // presence advert was missed still gets its OS/CPU/RAM summary.
-          if (p.capabilities?.summary) e.summary = p.capabilities.summary;
-          // …and so do the wireable endpoints, so rooms/remote-control resolve
-          // a path without waiting on the bespoke presence advert to land.
-          if (p.capabilities?.endpoints?.length) e.endpoints = p.capabilities.endpoints;
+          // The daemon's CapabilityAdvert only forwards app-specific data under
+          // `extra` (its typed struct drops unknown top-level fields), so the
+          // device stats and the wireable endpoints both ride there — reliably,
+          // unlike the bespoke presence advert that used to be their only source.
+          const extra = p.capabilities?.extra;
+          if (extra?.summary) e.summary = extra.summary;
+          if (extra?.endpoints?.length) e.endpoints = extra.endpoints;
         }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
@@ -1337,22 +1338,20 @@ class AppStore {
         }
       }
       // Carry the wireable endpoints from the reliable peer list onto the
-      // catalog, re-keyed to the resolved node so `matchEndpoint` (which
-      // filters capabilities by node) finds them. This is the missed-presence
-      // case that left rooms/remote-control with "no audio/control/video path":
-      // the endpoints used to ride only the bespoke presence advert. The
-      // endpoint id is `<node>:<slot>`, so re-prefix it with the node id we
-      // settled on, mirroring how `setLocalId` re-keys.
-      const endpointNode = node?.id ?? id;
+      // catalog so `matchEndpoint` (which filters capabilities by node) finds
+      // them — the missed-presence case that left rooms/remote-control with "no
+      // audio/control/video path". Store them AS-IS, not re-keyed: an endpoint
+      // id is the *remote's* own id (`<remote-node>:<slot>`), which is what the
+      // remote resolves a route by — re-prefixing it with a local id makes the
+      // remote reject the route ("path does not exist on the remote"). The
+      // remote's node id is the same id this peer's node carries, so a plain
+      // store still matches locally. Mirrors the presence path
+      // (`applySessionSnapshot`), which also stores caps unchanged.
       if (info.app && info.endpoints?.length) {
-        const reKeyed = info.endpoints.map((c) => ({
-          ...c,
-          node: endpointNode,
-          id: endpointNode + c.id.slice(c.node.length),
-        }));
+        const epNode = info.endpoints[0].node;
         this.catalog.capabilities = [
-          ...this.catalog.capabilities.filter((c) => c.node !== endpointNode),
-          ...reKeyed,
+          ...this.catalog.capabilities.filter((c) => c.node !== epNode),
+          ...info.endpoints,
         ];
       }
     }
@@ -1383,8 +1382,15 @@ class AppStore {
       const canon = canonicalNodeId(n.id);
       if (n.kind === "this" || this.isLocalMachine(n.id)) return true;
       if (knownCanon.has(canon)) return true; // seen this poll; online already set
+      // "mine" is roster-authoritative — a device is kept because it's an
+      // actual fleet member (isFleetMember, below), NOT because its
+      // relationship still reads "mine". A device you left/evicted keeps
+      // advertising "owner = you" for a while (it's offline, or missed the
+      // Release), which marks it "mine" via the stale-advert fallback in
+      // `standing()`; keying the prune off that pinned departed devices on the
+      // graph forever ("fails to update the graph"). Roster + live-this-poll +
+      // shares + presence grace are the real keep signals.
       const keep =
-        n.relationship.kind === "mine" ||
         n.relationship.kind === "shared" ||
         this.isFleetMember(n.id) ||
         this.withinPresenceGrace(canon);
@@ -4497,6 +4503,10 @@ class AppStore {
       }
       this.toast("info", "Left the network");
       await this.refreshNetworks();
+      // Re-derive the graph now so the left network's nodes drop immediately,
+      // rather than lingering until the next 3 s poll happens to run (matches
+      // toggleNetworkEnabled / restartNetwork, which both re-sync on change).
+      await this.syncMeshGraph();
     } catch (e) {
       this.toast("warn", `Couldn't leave: ${errMsg(e)}`);
     }
