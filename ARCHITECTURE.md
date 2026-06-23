@@ -180,7 +180,8 @@ even where the input scan finds nothing (macOS) — **system audio** =
 duplex, **video in** = video sink — the app shows inbound camera
 streams in a window, so "can receive a camera" is a property of the
 machine, exactly like control — and **clipboard** = duplex, the endpoint
-a console pushes a paste into) so whole-computer flows (screen-share,
+a console pushes a paste into and pulls a remote copy/cut back out of) so
+whole-computer flows (screen-share,
 camera feeds, room calls, remote control) have something to land on *and*
 start from. The GUI also passes its own monitor enumeration in
 (`capabilities_with_screens`): each monitor beyond the primary becomes a
@@ -520,17 +521,24 @@ Tauri 2 + Svelte 5, a client of the daemon.
    A **clipboard route** (`MediaKind::Clipboard`, the synthetic per-machine
    `clipboard` endpoint) rides the same plane as a third console toggle
    next to audio and control, default-on in a session. To keep each
-   machine's clipboard its own, it carries nothing until you *paste*: the
-   console intercepts the paste chord and the backend reads this machine's
-   clipboard and pushes it as `"clip"` frames over `CHANNEL_MEDIA`, only
-   then forwarding the paste keystroke — both ordered to the same peer, so
-   the sink writes the clipboard (gated exactly like input injection) before
-   the injected paste reads it. **Text** rides one frame; an **image** or a
-   set of **files** rides a chunked transfer (`open` manifest → base64
-   `chunk`s → `close`, split under the channel's ~64 KiB ceiling like a
-   video frame), file bytes streaming from disk and landing in a per-transfer
-   staging dir whose paths the receiver's OS clipboard is then pointed at —
-   so a paste in a file manager materializes them. The OS-clipboard side
+   machine's clipboard its own, it carries nothing until you *paste* or
+   *copy/cut from the remote*; the route is **bidirectional**, like the files
+   plane. On **paste**, the console intercepts the paste chord and the backend
+   reads this machine's clipboard and pushes it as `"clip"` frames over
+   `CHANNEL_MEDIA`, only then forwarding the paste keystroke — both ordered to
+   the same peer, so the sink writes the clipboard (gated exactly like input
+   injection) before the injected paste reads it. On **copy/cut from the
+   remote** (Ctrl/Cmd+C·X with control on), the mirror runs: the console
+   forwards the copy keystroke first so the remote copies its selection into
+   its own clipboard, then sends a `pull`; the remote waits a beat for the
+   copy to land, reads its clipboard, and streams it back on the same route,
+   where the controller writes it to its own clipboard (accepted only inside
+   the window the pull opened, so nothing lands unasked). **Text** rides one
+   frame; an **image** or a set of **files** rides a chunked transfer (`open`
+   manifest → base64 `chunk`s → `close`, split under the channel's ~64 KiB
+   ceiling like a video frame), file bytes streaming from disk and landing in
+   a per-transfer staging dir whose paths the receiver's OS clipboard is then
+   pointed at — so a paste in a file manager materializes them. The OS-clipboard side
    (reading copied file references, handing files back for paste — formats
    the bundled clipboard-manager plugin can't touch) is `clipboard-rs`,
    driven on one dedicated thread (`clipboard.rs`) that owns the single

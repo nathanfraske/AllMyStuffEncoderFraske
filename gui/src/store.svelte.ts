@@ -115,6 +115,7 @@ import {
   autostartGet,
   autostartSet,
   clipboardPaste,
+  clipboardPull,
   sendInput,
   serviceInstall,
   serviceRestart,
@@ -2201,6 +2202,24 @@ class AppStore {
     const route = this.consoleClipboardLive;
     if (!route) return;
     await clipboardPaste(route);
+  }
+
+  /** Copy/cut *from* the remote — the mirror of [`sendConsoleClipboard`].
+   *  Forwards the copy/cut chord down the control route (so the remote copies
+   *  its selection into its own clipboard), then pulls that clipboard back so
+   *  it lands here. Awaits the keystroke before the pull so the two ride the
+   *  same ordered channel to the peer in order (copy, then read); the remote
+   *  waits a beat for its app to land the copy before replying. No-op unless
+   *  both control and clipboard passthrough are live. `key`/`code` are the
+   *  physical C or X the user pressed; the held Ctrl/Cmd is already down on
+   *  the remote, so this completes the chord there. */
+  async copyConsoleClipboard(key: string, code: string | undefined): Promise<void> {
+    const control = this.consoleControlLive;
+    const clip = this.consoleClipboardLive;
+    if (!control || !clip) return;
+    await sendInput(control, { kind: "key", key, code, down: true });
+    await sendInput(control, { kind: "key", key, code, down: false });
+    await clipboardPull(clip);
   }
 
   /** Connect one session leg (a console channel, a room toggle) through

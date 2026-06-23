@@ -809,6 +809,10 @@ pub async fn dispatch(
             let route_id: String = try_arg!(arg(a, "route_id"));
             json_result(mesh.clipboard_paste(route_id).await)
         }
+        "clipboard_pull" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            json_result(mesh.clipboard_pull(route_id).await)
+        }
 
         // ---- video plane -------------------------------------------------
         "video_watch" => {

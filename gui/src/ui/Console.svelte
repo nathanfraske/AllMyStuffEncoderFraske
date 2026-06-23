@@ -674,10 +674,23 @@
     return isV && (e.metaKey || e.ctrlKey) && !e.altKey;
   }
 
-  // V keyups already accounted for: a paste is replayed as a synthesized
-  // press *after* the clipboard frame is sent (see onKey), so the matching
-  // natural keyup is a straggler to swallow — no double event, no stuck key.
-  const pasteHandled = new Set<string>();
+  // The physical copy/cut chords — Cmd+C·X (mac) / Ctrl+C·X (win·linux). The
+  // mirror of paste: with clipboard passthrough on, these copy/cut *from* the
+  // remote. `code` is layout-independent, so it fires on the C/X key whatever
+  // it composes.
+  function isCopyCutChord(e: KeyboardEvent): boolean {
+    const isCorX =
+      e.code === "KeyC" ||
+      e.code === "KeyX" ||
+      (!e.code && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "x"));
+    return isCorX && (e.metaKey || e.ctrlKey) && !e.altKey;
+  }
+
+  // Copy/cut/paste keyups already accounted for: the chord is replayed as a
+  // synthesized press (a paste *after* the clipboard frame, a copy/cut *before*
+  // pulling the remote clipboard back — see onKey), so the matching natural
+  // keyup is a straggler to swallow — no double event, no stuck key.
+  const chordHandled = new Set<string>();
 
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node) return;
@@ -707,14 +720,26 @@
       if (e.repeat) return;
       const key = e.key;
       const code = e.code || undefined;
-      pasteHandled.add(e.code || e.key);
+      chordHandled.add(e.code || e.key);
       void app.sendConsoleClipboard().finally(() => {
         app.sendConsoleInput({ kind: "key", key, code, down: true });
         app.sendConsoleInput({ kind: "key", key, code, down: false });
       });
       return;
     }
-    if (!down && pasteHandled.delete(e.code || e.key)) return; // straggler keyup
+    // Copy/cut-from-remote: forward the chord so the remote copies its
+    // selection into its own clipboard, then pull that clipboard back here.
+    // Same once-per-press guard as paste — the forwarded keystroke is what
+    // does the copying; its straggler keyup is swallowed below.
+    if (down && app.consoleClipboard && isCopyCutChord(e)) {
+      if (e.repeat) return;
+      const key = e.key;
+      const code = e.code || undefined;
+      chordHandled.add(e.code || e.key);
+      void app.copyConsoleClipboard(key, code);
+      return;
+    }
+    if (!down && chordHandled.delete(e.code || e.key)) return; // straggler keyup
     keys.onKey(e, down);
   }
 

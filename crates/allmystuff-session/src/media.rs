@@ -334,13 +334,17 @@ impl FileFrame {
     }
 }
 
-/// One clipboard transfer over a clipboard route. Sent **on paste**, never
-/// on copy: each machine keeps its own local clipboard, and content only
-/// crosses the wire at the moment the far side is about to paste it — so a
-/// copy here never clobbers the clipboard there. The receiving machine
-/// writes the payload to its OS clipboard, and the paste keystroke (riding
-/// the paired control route right behind this frame, on the same ordered
-/// channel) then lands it.
+/// One clipboard transfer over a clipboard route. Content only ever crosses
+/// the wire at an explicit moment — never on a bare copy — so each machine
+/// keeps its own clipboard and neither silently clobbers the other:
+///   * on **paste**, the controller pushes its clipboard so the far side
+///     pastes *that* (the keystroke rides the paired control route right
+///     behind this frame, on the same ordered channel, and lands it), and
+///   * on **copy/cut from the remote**, the controller first forwards the
+///     copy keystroke, then sends a [`Pull`](ClipboardEvent::Pull) and the
+///     remote replies with its freshly-copied clipboard down this same route.
+///
+/// Either way the receiving machine writes the payload to its OS clipboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardFrame {
     /// Tag for demuxing off the shared media channel. Always `"clip"`.
@@ -384,6 +388,18 @@ pub enum ClipboardEvent {
     },
     /// Every chunk delivered — assemble and write to the OS clipboard.
     Close { transfer: u64 },
+    /// Controller → controlled: read your clipboard *now* and send it back
+    /// down this same route. The mirror of the everyday paste flow, for when
+    /// someone driving the console copies or cuts **from** the remote
+    /// (Ctrl/Cmd+C·X): the keystroke rides the control route first so the
+    /// remote copies its selection into its own clipboard, then this asks for
+    /// that content so it lands on the controller's clipboard. The reply rides
+    /// this route in reverse — text in one [`Text`](ClipboardEvent::Text)
+    /// frame, an image or files as an [`Open`](ClipboardEvent::Open) /
+    /// [`Chunk`](ClipboardEvent::Chunk) / [`Close`](ClipboardEvent::Close)
+    /// transfer — exactly like a paste going the other way. Carries no fields:
+    /// it names no transfer of its own; the reply mints that.
+    Pull,
     /// A clipboard event a newer build introduced. Ignored rather than
     /// failing the whole frame.
     #[serde(other)]
@@ -1173,6 +1189,8 @@ mod tests {
                 data: vec![0xFF, 0x00, 0x10],
             },
             ClipboardEvent::Close { transfer: 7 },
+            // Copy/cut-from-remote request — a fieldless variant.
+            ClipboardEvent::Pull,
         ];
         for event in events {
             let f = ClipboardFrame::new("route:a:clipboard→b:clipboard", 3, event);
@@ -1185,6 +1203,9 @@ mod tests {
                 Some(MediaPayload::Clipboard(g)) if g.seq == 3
             ));
         }
+        // Pull is the bare `{kind: "pull"}` on the wire (no fields to carry).
+        let pull = ClipboardFrame::new("r", 0, ClipboardEvent::Pull);
+        assert_eq!(serde_json::to_value(&pull).unwrap()["kind"], "pull");
         // Chunk bytes travel as base64, never raw.
         let f = ClipboardFrame::new(
             "r",

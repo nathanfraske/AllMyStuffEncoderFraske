@@ -232,6 +232,20 @@ async fn clipboard_paste(state: State<'_, AppState>, route_id: String) -> Result
     Ok(())
 }
 
+/// Copy/cut **from** the remote: ask the far end to read its clipboard now and
+/// send it back down the route, so the selection it just copied lands on this
+/// machine. The console calls this right after forwarding the copy/cut
+/// keystroke; the backend opens the acceptance window and fires the request.
+#[tauri::command]
+async fn clipboard_pull(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+    state
+        .node
+        .request("clipboard_pull", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Register the calling window's interest in a route's inbound video.
 /// Packets queue backend-side from this moment; the window drains them
 /// with `video_poll` once per display refresh. (Pull, not push: a missed
@@ -1641,6 +1655,7 @@ fn main() {
             share_stop,
             send_input,
             clipboard_paste,
+            clipboard_pull,
             video_watch,
             video_poll,
             video_unwatch,
