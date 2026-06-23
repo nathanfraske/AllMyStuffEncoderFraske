@@ -174,6 +174,11 @@ pub struct Mesh {
     /// transfer id). Image bytes accumulate in memory; file bytes stream to
     /// a per-transfer staging dir.
     clip_inbound: Mutex<HashMap<(String, u64), ClipInbound>>,
+    /// When we last sent a clipboard [`Pull`](ClipboardEvent::Pull) per route
+    /// — the gate that lets the remote's reply land on *our* clipboard. Only a
+    /// reply that arrives within [`CLIPBOARD_PULL_WINDOW`] of our own pull is
+    /// accepted, so a misbehaving peer can't clobber our clipboard unasked.
+    clip_pull_at: Mutex<HashMap<String, std::time::Instant>>,
     /// This app run's random presence boot id — how peers detect that we
     /// (re)started and answer with their state (see `NodeProfile::boot`).
     boot_id: u64,
@@ -380,6 +385,7 @@ impl Mesh {
             clipboard_transfer: AtomicU64::new(0),
             clipboard: ClipboardService::spawn(),
             clip_inbound: Mutex::new(HashMap::new()),
+            clip_pull_at: Mutex::new(HashMap::new()),
             boot_id: fresh_boot_id(),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
@@ -5550,17 +5556,65 @@ impl Mesh {
             }
             r.peer.to_string()
         };
+        self.send_clipboard_contents(&peer, &route_id).await
+    }
+
+    /// Front-end command: copy/cut **from** the remote — ask the far end to
+    /// read its clipboard now and send it back on `route_id`, so the content
+    /// it just copied lands on *this* machine. The mirror of
+    /// [`Self::clipboard_paste`]: the console forwards the copy keystroke down
+    /// the control route first (so the remote copies its selection into its
+    /// own clipboard), then calls this. We mark the pull so the reply is let
+    /// through ([`Self::handle_clipboard_frame`]) and fire the request. This
+    /// machine must be the route's source side, exactly as for a paste.
+    pub async fn clipboard_pull(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
+        let peer = {
+            let st = self.state.lock();
+            let r = st
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .ok_or("unknown route")?;
+            if !(r.is_active()
+                && r.route.media == MediaKind::Clipboard
+                && node_of(r.route.from.as_str()) == me)
+            {
+                return Err("route isn't an active outbound clipboard link".into());
+            }
+            r.peer.to_string()
+        };
+        // Open the acceptance window *before* the request goes out, so the
+        // reply can never beat it (the remote replies on this same route).
+        self.clip_pull_at
+            .lock()
+            .insert(route_id.clone(), std::time::Instant::now());
+        self.send_clip_frame(&peer, &route_id, ClipboardEvent::Pull)
+            .await
+    }
+
+    /// Read this machine's OS clipboard and stream it to `peer` on `route_id`
+    /// — the shared body of [`Self::clipboard_paste`] (pushing our clipboard
+    /// for the far side to paste) and the [`Pull`](ClipboardEvent::Pull)
+    /// reply (sending our just-copied clipboard back to a controller). Text
+    /// rides one frame; an image or files ride a chunked transfer, the same
+    /// shape the video/term/file planes use.
+    async fn send_clipboard_contents(
+        self: &Arc<Self>,
+        peer: &str,
+        route_id: &str,
+    ) -> Result<(), String> {
         // Read the OS clipboard off its dedicated thread (a blocking call).
         let svc = self.clipboard.clone();
         let clip = tokio::task::spawn_blocking(move || svc.read())
             .await
             .map_err(|e| e.to_string())?;
         let Some(clip) = clip else {
-            return Ok(()); // empty / unreadable clipboard — nothing to paste
+            return Ok(()); // empty / unreadable clipboard — nothing to send
         };
         match clip {
             LocalClip::Text(text) => {
-                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Text { text })
+                self.send_clip_frame(peer, route_id, ClipboardEvent::Text { text })
                     .await
             }
             LocalClip::Image(png) => {
@@ -5570,8 +5624,8 @@ impl Mesh {
                     size: png.len() as u64,
                 }];
                 self.send_clip_frame(
-                    &peer,
-                    &route_id,
+                    peer,
+                    route_id,
                     ClipboardEvent::Open {
                         transfer,
                         content: ClipboardContentKind::Image,
@@ -5581,8 +5635,8 @@ impl Mesh {
                 .await?;
                 for piece in png.chunks(CLIPBOARD_CHUNK_BYTES) {
                     self.send_clip_frame(
-                        &peer,
-                        &route_id,
+                        peer,
+                        route_id,
                         ClipboardEvent::Chunk {
                             transfer,
                             item: 0,
@@ -5591,7 +5645,7 @@ impl Mesh {
                     )
                     .await?;
                 }
-                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Close { transfer })
+                self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
                     .await
             }
             LocalClip::Files(files) => {
@@ -5610,8 +5664,8 @@ impl Mesh {
                     })
                     .collect();
                 self.send_clip_frame(
-                    &peer,
-                    &route_id,
+                    peer,
+                    route_id,
                     ClipboardEvent::Open {
                         transfer,
                         content: ClipboardContentKind::Files,
@@ -5630,8 +5684,8 @@ impl Mesh {
                             break;
                         }
                         self.send_clip_frame(
-                            &peer,
-                            &route_id,
+                            peer,
+                            route_id,
                             ClipboardEvent::Chunk {
                                 transfer,
                                 item: i as u32,
@@ -5641,7 +5695,7 @@ impl Mesh {
                         .await?;
                     }
                 }
-                self.send_clip_frame(&peer, &route_id, ClipboardEvent::Close { transfer })
+                self.send_clip_frame(peer, route_id, ClipboardEvent::Close { transfer })
                     .await
             }
         }
@@ -5661,23 +5715,95 @@ impl Mesh {
         self.send_media_value(peer, payload).await
     }
 
-    /// Sink side: a peer pasted into this machine, so reassemble and write
-    /// their clipboard content to the local OS clipboard. Gated exactly like
-    /// input injection — a live clipboard route that sinks here from this
-    /// sender, *and* the sender being this device's owner or a co-owned fleet
-    /// member — since writing the clipboard is part of driving the machine.
+    /// A clipboard route carries frames both ways, like the files plane:
+    ///   * **Sink side** (we're the route's `to`) — the controlled machine.
+    ///     A paste pushes the controller's clipboard here, so we reassemble it
+    ///     and write our OS clipboard; a [`Pull`](ClipboardEvent::Pull) asks
+    ///     for *our* clipboard (a copy/cut driven from the console), so we read
+    ///     it and stream it back. Either way it's part of being driven, so it
+    ///     takes the same gate as input injection: a live route from this exact
+    ///     sender *and* that sender being our owner or a co-owned fleet member.
+    ///   * **Source side** (we're the route's `from`) — the controller. This
+    ///     is the reply to a copy/cut we pulled, so we write it to our OS
+    ///     clipboard — but only inside the window our own [`Self::clipboard_pull`]
+    ///     opened, so a peer can never push onto our clipboard unasked.
+    ///
     /// Text is one frame; an image or files arrive as a chunked transfer that
-    /// commits on `Close`. The paste keystroke rides right behind the `Close`
-    /// on the same ordered channel, so the clipboard is set before it injects.
-    fn handle_clipboard_frame(&self, from: &str, frame: ClipboardFrame) {
-        if !(self.inbound_media_ok(&frame.route, from, MediaKind::Clipboard)
-            && self.sender_may_control(from))
-        {
-            tracing::warn!("dropped clipboard from {from}: not an authorized controller");
+    /// commits on `Close`. A paste/copy keystroke rides the paired control
+    /// route on the same ordered channel, so order is honoured end to end.
+    fn handle_clipboard_frame(self: &Arc<Self>, from: &str, frame: ClipboardFrame) {
+        let Some(me) = self.local_node_id() else {
             return;
+        };
+        let (sinks_here, sources_here) = {
+            let st = self.state.lock();
+            let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
+                return;
+            };
+            if !(r.is_active()
+                && r.route.media == MediaKind::Clipboard
+                && pubkey_part(r.peer.as_str()) == pubkey_part(from))
+            {
+                return;
+            }
+            (
+                node_of(r.route.to.as_str()) == me,
+                node_of(r.route.from.as_str()) == me,
+            )
+        };
+
+        if sinks_here {
+            if !self.sender_may_control(from) {
+                tracing::warn!("dropped clipboard from {from}: not an authorized controller");
+                return;
+            }
+            if let ClipboardEvent::Pull = frame.event {
+                // Copy/cut *from* this machine: the controller forwarded the
+                // copy keystroke just ahead of this on the same ordered
+                // channel, so our clipboard is (about to be) the freshly-copied
+                // selection. Give the OS a beat to land it, then stream it back
+                // on this route — the mirror of a paste. Through `crate::spawn`
+                // (never a bare `tokio::spawn`), so it rides the engine's
+                // registered runtime handle like every other engine task.
+                let mesh = self.clone();
+                let peer = from.to_string();
+                let route = frame.route;
+                crate::spawn(async move {
+                    tokio::time::sleep(CLIPBOARD_COPY_SETTLE).await;
+                    if let Err(e) = mesh.send_clipboard_contents(&peer, &route).await {
+                        tracing::warn!("clipboard pull reply failed: {e}");
+                    }
+                });
+                return;
+            }
+            self.apply_clipboard_event(frame.route, frame.event);
+        } else if sources_here {
+            // Accept a reply only inside the window our own pull opened; a
+            // transfer's opening frame consumes that window (one reply per
+            // pull), and its later Chunk/Close ride through on the
+            // clip_inbound entry the Open registered (unknown transfers no-op).
+            let accept = match &frame.event {
+                ClipboardEvent::Text { .. } | ClipboardEvent::Open { .. } => self
+                    .clip_pull_at
+                    .lock()
+                    .remove(&frame.route)
+                    .is_some_and(|t| t.elapsed() < CLIPBOARD_PULL_WINDOW),
+                ClipboardEvent::Chunk { .. } | ClipboardEvent::Close { .. } => true,
+                ClipboardEvent::Pull | ClipboardEvent::Unknown => false,
+            };
+            if accept {
+                self.apply_clipboard_event(frame.route, frame.event);
+            }
         }
-        let route = frame.route;
-        match frame.event {
+    }
+
+    /// Write one received clipboard event to this machine's OS clipboard —
+    /// the shared body of both directions of [`Self::handle_clipboard_frame`].
+    /// Text commits at once; an image or files reassemble across a transfer
+    /// and commit on `Close`. File bytes stream to a per-transfer staging dir
+    /// the OS clipboard is then pointed at.
+    fn apply_clipboard_event(&self, route: String, event: ClipboardEvent) {
+        match event {
             ClipboardEvent::Text { text } => self.clipboard.set_text(text),
             ClipboardEvent::Open {
                 transfer,
@@ -5759,8 +5885,9 @@ impl Mesh {
                     ClipboardContentKind::Unknown => {}
                 }
             }
-            // A clipboard event a newer build introduced — ignore it.
-            ClipboardEvent::Unknown => {}
+            // Pull is handled by the caller (sink side only); a newer build's
+            // event is ignored rather than failing the frame.
+            ClipboardEvent::Pull | ClipboardEvent::Unknown => {}
         }
     }
 
@@ -6132,6 +6259,19 @@ fn key_tail(key: &str) -> &str {
 /// pathological "copy a huge folder, paste over the mesh". Generous for real
 /// copy/paste (documents, images, a handful of files).
 const MAX_CLIPBOARD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How long the controlled side waits after a copy/cut keystroke before
+/// reading its clipboard for a [`Pull`](ClipboardEvent::Pull) reply — the
+/// beat an app needs to actually land the copied selection on the OS
+/// clipboard. The keystroke arrives just ahead of the pull on the same
+/// ordered channel; this covers the asynchronous gap after injection.
+const CLIPBOARD_COPY_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// How long after sending a [`Pull`](ClipboardEvent::Pull) the controller
+/// will accept the reply onto its own clipboard. Generous for the round trip
+/// plus the settle above; outside it, a clipboard frame on a route we source
+/// is unsolicited and dropped.
+const CLIPBOARD_PULL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// An inbound clipboard transfer being reassembled (see
 /// [`Mesh::handle_clipboard_frame`]).

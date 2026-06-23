@@ -115,6 +115,7 @@ import {
   autostartGet,
   autostartSet,
   clipboardPaste,
+  clipboardPull,
   sendInput,
   serviceInstall,
   serviceRestart,
@@ -2201,6 +2202,78 @@ class AppStore {
     const route = this.consoleClipboardLive;
     if (!route) return;
     await clipboardPaste(route);
+  }
+
+  /** Copy/cut *from* the remote — the mirror of paste. Forwards the copy/cut
+   *  chord down the control route (so the remote copies its selection into
+   *  its own clipboard), then pulls that clipboard back so it lands here.
+   *  Awaits the keystroke before the pull so the two ride the same ordered
+   *  channel to the peer in order (copy, then read); the remote waits a beat
+   *  for its app to land the copy before replying. No-op unless both control
+   *  and clipboard passthrough are live. `heldMeta` is whether the user's
+   *  chord used Cmd (vs Ctrl) — see [`forwardClipboardChord`] for why. */
+  async copyConsoleClipboard(
+    key: string,
+    code: string | undefined,
+    heldMeta: boolean,
+  ): Promise<void> {
+    if (!this.consoleControlLive || !this.consoleClipboardLive) return;
+    await this.forwardClipboardChord(key, code, heldMeta);
+    await clipboardPull(this.consoleClipboardLive);
+  }
+
+  /** Paste *into* the remote: push this machine's clipboard down the live
+   *  route, then forward the paste chord so the remote pastes our content.
+   *  Clipboard first, keystroke second — the order the remote needs (write
+   *  clipboard, then inject paste), both on the same ordered channel. */
+  async pasteConsoleClipboard(
+    key: string,
+    code: string | undefined,
+    heldMeta: boolean,
+  ): Promise<void> {
+    if (!this.consoleControlLive || !this.consoleClipboardLive) return;
+    await this.sendConsoleClipboard();
+    await this.forwardClipboardChord(key, code, heldMeta);
+  }
+
+  /** Forward a copy/cut/paste chord to the remote, translating the modifier
+   *  to the *remote's* convention — copy/paste is Cmd+key on macOS but
+   *  Ctrl+key on Windows/Linux, and input injection forwards modifiers
+   *  literally, so a Ctrl+C sent to a Mac never copies. `heldMeta` is the
+   *  modifier the user actually pressed (Cmd if true, else Ctrl), already
+   *  held down on the remote. When it matches what the remote needs, we just
+   *  complete the chord with the letter; when it differs we lift the held
+   *  one on the remote, swap in the right one for the letter, then restore
+   *  the held one — so a following chord on the same modifier (Ctrl+C then
+   *  Ctrl+V) still lands. The remote OS comes from its presence advert;
+   *  absent (an older peer) we assume Ctrl, the no-op for same-OS pairs. */
+  private async forwardClipboardChord(
+    key: string,
+    code: string | undefined,
+    heldMeta: boolean,
+  ): Promise<void> {
+    const control = this.consoleControlLive;
+    if (!control) return;
+    const CONTROL = { key: "Control", code: "ControlLeft" };
+    const META = { key: "Meta", code: "MetaLeft" };
+    const remoteMeta = (this.consoleNode?.summary?.os ?? "").toLowerCase().includes("mac");
+    const mod = (m: { key: string; code: string }, down: boolean) =>
+      sendInput(control, { kind: "key", key: m.key, code: m.code, down });
+    const letter = async () => {
+      await sendInput(control, { kind: "key", key, code, down: true });
+      await sendInput(control, { kind: "key", key, code, down: false });
+    };
+    if (remoteMeta === heldMeta) {
+      await letter();
+      return;
+    }
+    const held = heldMeta ? META : CONTROL;
+    const want = remoteMeta ? META : CONTROL;
+    await mod(held, false);
+    await mod(want, true);
+    await letter();
+    await mod(want, false);
+    await mod(held, true);
   }
 
   /** Connect one session leg (a console channel, a room toggle) through

@@ -329,6 +329,16 @@ export function clipboardPaste(routeId: string): Promise<null> {
   return tryInvoke("clipboard_paste", { routeId });
 }
 
+/** Copy/cut *from* the remote: ask the far side to read its clipboard and send
+ *  it back down this route, so the selection it just copied lands on this
+ *  machine. The console calls this right after forwarding the copy/cut
+ *  keystroke (so the remote has copied into its own clipboard first). The
+ *  read happens on the remote; the backend gates the reply onto our clipboard
+ *  to the window this pull opens. */
+export function clipboardPull(routeId: string): Promise<null> {
+  return tryInvoke("clipboard_pull", { routeId });
+}
+
 /** Decode one wire packet (28-byte little-endian header + payload) out
  *  of a poll batch. Returns null for shapes we don't recognize. */
 function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoFrameMsg | null {
