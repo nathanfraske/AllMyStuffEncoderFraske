@@ -14,6 +14,14 @@ before (SHA-256-only); the signing CI job is a no-op and the client logs that
 signing isn't configured. This mirrors the scheme already used by the bundled
 `myownmesh` daemon, so both halves of an install share one signing model.
 
+> **Empty key == unconfigured.** The `bundles` job exports
+> `ALLMYSTUFF_RELEASE_PUBKEY` unconditionally, so when the repo *variable* is
+> unset the build still sees it as an empty string and `option_env!` yields
+> `Some("")`, not `None`. The updater normalises an empty baked-in key back to
+> "not configured" so an unconfigured repo really does degrade to SHA-256-only
+> rather than demanding signatures it never publishes (which fails every update
+> closed). Configuring the variable with a real key is what flips signing on.
+
 ## One-time setup
 
 1. **Generate a password-less signing key** (CI must sign non-interactively):

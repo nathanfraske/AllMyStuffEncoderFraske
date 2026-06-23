@@ -77,10 +77,30 @@ const USER_AGENT: &str = concat!("allmystuff-self-update/", env!("CARGO_PKG_VERS
 /// The minisign public key releases are signed with, baked in at build time.
 /// `None` until release signing is configured (set `ALLMYSTUFF_RELEASE_PUBKEY`
 /// to the base64 public key in the release build env — see `RELEASE-SIGNING.md`).
-/// When `Some`, the updater refuses any artifact lacking a valid signature; when
-/// `None` it still requires the mandatory SHA-256, so a missing signature on an
-/// unconfigured build degrades to integrity-only, never to "unverified".
+/// When configured, the updater refuses any artifact lacking a valid signature;
+/// otherwise it still requires the mandatory SHA-256, so a missing signature on
+/// an unconfigured build degrades to integrity-only, never to "unverified".
+///
+/// Read through [`release_pubkey`], never directly: CI exports the env var
+/// unconditionally (`ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.… }}`), so when the
+/// repo variable is unset the var is still *present but empty* at build time and
+/// `option_env!` yields `Some("")` rather than `None`. Treating that empty
+/// string as "configured" is what made an unconfigured repo demand signatures it
+/// never published — failing every update closed; [`release_pubkey`] normalises
+/// an empty key back to `None`.
 const RELEASE_PUBKEY: Option<&str> = option_env!("ALLMYSTUFF_RELEASE_PUBKEY");
+
+/// The configured release public key, or `None` when signing isn't set up.
+/// Normalises the baked-in [`RELEASE_PUBKEY`] so an empty string (an unset CI
+/// variable still exported as `""`) counts as "not configured".
+fn release_pubkey() -> Option<&'static str> {
+    normalize_pubkey(RELEASE_PUBKEY)
+}
+
+/// Treat an empty baked-in key as "not configured" — see [`RELEASE_PUBKEY`].
+fn normalize_pubkey(key: Option<&str>) -> Option<&str> {
+    key.filter(|k| !k.is_empty())
+}
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -1183,7 +1203,7 @@ async fn download_verify_stage(
 
     // Authenticity: when a release signing key is baked in, a valid detached
     // minisign signature over the artifact is required before staging.
-    match RELEASE_PUBKEY {
+    match release_pubkey() {
         Some(pubkey) => {
             let sig_name = format!("{asset_name}.minisig");
             let sig_asset = assets
@@ -1338,6 +1358,20 @@ mod tests {
             detect_install_kind_from_path("/home/me/.local/bin/allmystuff"),
             InstallKind::Raw
         );
+    }
+
+    #[test]
+    fn empty_baked_pubkey_is_treated_as_unconfigured() {
+        // CI exports ALLMYSTUFF_RELEASE_PUBKEY unconditionally, so an unset repo
+        // variable reaches the compiler as Some("") (option_env! of a
+        // present-but-empty var), not None. That empty string must degrade to
+        // SHA-256-only — never "require a signature verified against an empty
+        // key", which made download_verify_stage demand a .minisig that was
+        // never published and fail every update closed.
+        assert_eq!(normalize_pubkey(Some("")), None);
+        assert_eq!(normalize_pubkey(None), None);
+        let real = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        assert_eq!(normalize_pubkey(Some(real)), Some(real));
     }
 
     #[test]
