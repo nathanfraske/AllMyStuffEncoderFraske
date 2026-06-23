@@ -5762,11 +5762,13 @@ impl Mesh {
                 // copy keystroke just ahead of this on the same ordered
                 // channel, so our clipboard is (about to be) the freshly-copied
                 // selection. Give the OS a beat to land it, then stream it back
-                // on this route — the mirror of a paste.
+                // on this route — the mirror of a paste. Through `crate::spawn`
+                // (never a bare `tokio::spawn`), so it rides the engine's
+                // registered runtime handle like every other engine task.
                 let mesh = self.clone();
                 let peer = from.to_string();
                 let route = frame.route;
-                tokio::spawn(async move {
+                crate::spawn(async move {
                     tokio::time::sleep(CLIPBOARD_COPY_SETTLE).await;
                     if let Err(e) = mesh.send_clipboard_contents(&peer, &route).await {
                         tracing::warn!("clipboard pull reply failed: {e}");

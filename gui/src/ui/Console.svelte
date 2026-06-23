@@ -718,13 +718,8 @@
       // straggler line below swallows it), stranding the key down on the
       // remote.
       if (e.repeat) return;
-      const key = e.key;
-      const code = e.code || undefined;
       chordHandled.add(e.code || e.key);
-      void app.sendConsoleClipboard().finally(() => {
-        app.sendConsoleInput({ kind: "key", key, code, down: true });
-        app.sendConsoleInput({ kind: "key", key, code, down: false });
-      });
+      void app.pasteConsoleClipboard(e.key, e.code || undefined, e.metaKey);
       return;
     }
     // Copy/cut-from-remote: forward the chord so the remote copies its
@@ -733,10 +728,8 @@
     // does the copying; its straggler keyup is swallowed below.
     if (down && app.consoleClipboard && isCopyCutChord(e)) {
       if (e.repeat) return;
-      const key = e.key;
-      const code = e.code || undefined;
       chordHandled.add(e.code || e.key);
-      void app.copyConsoleClipboard(key, code);
+      void app.copyConsoleClipboard(e.key, e.code || undefined, e.metaKey);
       return;
     }
     if (!down && chordHandled.delete(e.code || e.key)) return; // straggler keyup
