@@ -423,9 +423,25 @@ impl Mesh {
                             (peer, r)
                         }
                         AudioOut::Lane { peer, route, data } => {
-                            let lane = mesh.audio_lane(&route, &peer, true).unwrap_or(0);
-                            let r = mesh.send_audio_track(&peer, lane, data).await;
-                            (peer, r)
+                            // Same lane discipline as video: drop rather than
+                            // ship on lane 0 when the route has no current lane
+                            // (torn down, or past the audio lane pool), which
+                            // would otherwise play one stream's audio on
+                            // another's route.
+                            match mesh.audio_lane(&route, &peer, true) {
+                                Some(lane) => {
+                                    let r = mesh.send_audio_track(&peer, lane, data).await;
+                                    (peer, r)
+                                }
+                                None => {
+                                    if mesh.diag_ok(&format!("nolane-a:{route}")) {
+                                        tracing::debug!(
+                                            "no audio lane for {route} right now; dropping Opus frame"
+                                        );
+                                    }
+                                    (peer, Ok(()))
+                                }
+                            }
                         }
                     };
                     if let Err(e) = result {
@@ -461,8 +477,28 @@ impl Mesh {
                         // An H.264 access unit rides the mesh's RTP track
                         // lane — no chunking (RTP packetizes), no ceiling.
                         VideoPacket::H264 { data, duration_us } => {
-                            let lane = mesh.video_lane(&route_id, &peer, true).unwrap_or(0);
-                            mesh.send_video_track(&peer, lane, data, duration_us).await
+                            match mesh.video_lane(&route_id, &peer, true) {
+                                Some(lane) => {
+                                    mesh.send_video_track(&peer, lane, data, duration_us).await
+                                }
+                                // No lane for this route right now — it has
+                                // just torn down, or another of this peer's
+                                // streams pushed it past the lane pool. DROP
+                                // the unit: the old `.unwrap_or(0)` shipped it
+                                // on lane 0, the receiver's *first* route, so a
+                                // second monitor's pixels surfaced in the first
+                                // monitor's window (the intermittent
+                                // wrong-window flash). The decoder re-lands the
+                                // moment the route is back on a lane (next IDR).
+                                None => {
+                                    if mesh.diag_ok(&format!("nolane:{route_id}")) {
+                                        tracing::debug!(
+                                            "no video lane for {route_id} right now; dropping H.264 unit"
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                            }
                         }
                     };
                     if let Err(e) = outcome {
@@ -3557,11 +3593,20 @@ impl Mesh {
         }
     }
 
-    /// The ids of the active-codec media routes between us and `peer` in one
-    /// direction, sorted — the shared, signalling-free basis for lane
+    /// The ids of the **active** codec media routes between us and `peer` in
+    /// one direction, sorted — the shared, signalling-free basis for lane
     /// assignment: both ends compute the identical list from their own copy of
     /// the session, so a route lands on the same lane on both. `codec` is
     /// "h264" (video) or "opus" (audio); `outbound` = we are the source.
+    ///
+    /// Only **active** routes count. A route still negotiating (Offered /
+    /// Incoming) or already torn down must not occupy a lane slot: it carries
+    /// no media, yet — being in `routes()` — it would shift every later
+    /// route's index and so its lane, decoding a live stream's frames into
+    /// the wrong window for as long as the transient lasts. Restricting the
+    /// basis to active routes keeps the two ends agreeing on a stable lane for
+    /// the whole life of each stream (both ends process Active/Teardown), so
+    /// an unrelated route coming or going no longer reshuffles a live one.
     fn sorted_media_routes(&self, peer: &str, outbound: bool, codec: &str) -> Vec<String> {
         let Some(me) = self.local_node_id() else {
             return Vec::new();
@@ -3573,7 +3618,7 @@ impl Mesh {
             return Vec::new();
         };
         let mut ids: Vec<String> = session
-            .routes()
+            .active_routes()
             .filter(|r| {
                 let codecs = if codec == "opus" { &r.audio } else { &r.video };
                 codecs.iter().any(|c| c == codec) && {

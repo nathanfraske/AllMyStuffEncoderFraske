@@ -98,6 +98,12 @@
   // component just blits. The WebCodecs decoder is created lazily on the
   // first key unit and rebuilt on the next one after any error.
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+  // The role=application stage. Control key forwarding is bound here (not to
+  // `<svelte:window>`) so it fires whenever the stage holds focus — and
+  // hover/click/toggle pin that focus, the reliable way a dedicated console
+  // window's keyboard reaches the remote (window-level setFocus alone doesn't
+  // push document focus into the webview on hover).
+  let stageEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
@@ -625,17 +631,28 @@
     return { x, y };
   }
 
+  // The KVM rule: with control live, the window under the mouse is the one
+  // your keyboard should reach — claim focus on hover, no click in between (a
+  // click would go to the *remote*). Raise the OS window AND pin keyboard
+  // focus on the stage element: setFocus() alone doesn't reliably push
+  // document focus into the webview on hover-without-click, so without the
+  // element focus the key handlers (now on the stage) never fire in a
+  // dedicated console window. Gated on the document not already holding focus
+  // so it never steals focus from an open pill menu once the window is active.
+  function claimFocus() {
+    if (document.hasFocus()) return;
+    void focusThisWindow();
+    stageEl?.focus({ preventScroll: true });
+  }
+
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
+    // Keep keyboard focus on the stage whenever control is on (even over a
+    // camera input, where pointer forwarding is off but typing still flows).
+    if (app.consoleControl) claimFocus();
     if (!stagePointerActive) return;
-    // The KVM rule: with control live, the window under the mouse is the
-    // one your keyboard should reach — claim OS focus on hover, no click
-    // in between (a click would go to the *remote*). This is what makes
-    // keys land on the machine you're pointing at when popout windows of
-    // other machines are open beside this console.
-    if (!document.hasFocus()) void focusThisWindow();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
@@ -645,6 +662,8 @@
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
+    // A click is the most reliable focus pin (whatever was last focused).
+    if (down && app.consoleControl) stageEl?.focus({ preventScroll: true });
     if (!stagePointerActive) return;
     const p = normPoint(e);
     if (!p) return;
@@ -692,20 +711,23 @@
   // keyup is a straggler to swallow — no double event, no stuck key.
   const chordHandled = new Set<string>();
 
-  function onKey(e: KeyboardEvent, down: boolean) {
-    if (!node) return;
-    if (!app.consoleControl) {
-      // Without control, Escape steps out of fullscreen first, then (the
-      // popover habit) closes the session; in a window it closes the
-      // window too.
-      if (down && e.key === "Escape") {
-        if (theater) void flipTheater();
-        else endSession();
-      }
-      return;
+  // No-control keys ride the window, so Escape works without the stage being
+  // focused: it steps out of fullscreen first, then (the popover habit)
+  // closes the session; in a window it closes the window too.
+  function onWindowKey(e: KeyboardEvent) {
+    if (!node || app.consoleControl) return;
+    if (e.key === "Escape") {
+      if (theater) void flipTheater();
+      else endSession();
     }
-    // With control on, *every* key belongs to the remote — including
-    // Escape and chords like Ctrl+W, exactly like sitting at the machine.
+  }
+
+  // Control forwarding — bound to the focusable stage, so it fires only while
+  // the stage holds keyboard focus. With control on, *every* key belongs to
+  // the remote — including Escape and chords like Ctrl+W, exactly like sitting
+  // at the machine.
+  function onKey(e: KeyboardEvent, down: boolean) {
+    if (!node || !app.consoleControl) return;
     e.preventDefault();
     // Send-on-paste: with clipboard passthrough on, a paste pushes this
     // machine's clipboard to the remote first, then replays the paste
@@ -741,6 +763,11 @@
     // can still carry the keyups.
     if (app.consoleControl) keys.releaseAll();
     app.toggleConsoleControl();
+    // Turning it on: focus the stage so keys forward immediately, without
+    // needing a click into the picture first (a `tabindex=-1` element is
+    // still focusable programmatically, so this works before the reactive
+    // tabindex flips to 0).
+    if (app.consoleControl) stageEl?.focus({ preventScroll: true });
   }
 
   function inputIcon(c: Capability): string {
@@ -748,12 +775,7 @@
   }
 </script>
 
-<svelte:window
-  onkeydown={(e) => onKey(e, true)}
-  onkeyup={(e) => onKey(e, false)}
-  onblur={() => keys.releaseAll()}
-  onclick={() => (openPill = null)}
-/>
+<svelte:window onkeydown={onWindowKey} onclick={() => (openPill = null)} />
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -819,16 +841,25 @@
 
       <!-- Video stage -->
       <!-- role=application: a remote-desktop surface — every pointer/key
-           event belongs to the far machine while control is on. -->
+           event belongs to the far machine while control is on. Focusable
+           only while control is on, so keys forward from here and nowhere
+           else. -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <div
+        bind:this={stageEl}
         class="stage"
         class:grabbing={stagePointerActive}
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
+        tabindex={app.consoleControl ? 0 : -1}
         onpointermove={onPointerMove}
         onpointerdown={(e) => onPointerButton(e, true)}
         onpointerup={(e) => onPointerButton(e, false)}
         onwheel={onWheel}
+        onkeydown={(e) => onKey(e, true)}
+        onkeyup={(e) => onKey(e, false)}
+        onblur={() => keys.releaseAll()}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
         {#if selectedPopped}
@@ -1317,6 +1348,12 @@
   }
   .stage.grabbing {
     cursor: crosshair;
+  }
+  /* The stage is focusable (so keys forward) but fills its pane — a focus
+     ring around it would just be noise. */
+  .stage:focus,
+  .stage:focus-visible {
+    outline: none;
   }
   /* Fullscreen ("theater"): chrome away, the stage is the window. */
   .console.theater > .bar,

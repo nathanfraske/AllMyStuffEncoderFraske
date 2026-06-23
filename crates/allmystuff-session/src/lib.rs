@@ -332,6 +332,30 @@ impl Session {
                 audio,
                 session,
             } => {
+                // A duplicate Offer for a route we have already accepted and
+                // started. The daemon redelivers the same Offer once per
+                // shared network (and a re-offer can arrive while the route is
+                // still live), so without this guard each duplicate re-emits
+                // `StartMedia` and re-spawns the host's capture pump for a
+                // route that is already streaming — two capture backends bound
+                // to one monitor, and (with the release profile's
+                // `panic = "abort"`) a panic on either aborts the whole host.
+                // Re-ack so a genuinely lost `Accept` still lands, but never
+                // re-insert (it would clobber a host-resolved `term_session`)
+                // and never restart media.
+                if self
+                    .routes
+                    .get(&route.id)
+                    .is_some_and(|r| r.origin == Origin::Inbound && r.is_active())
+                {
+                    return vec![Effect::Send {
+                        peer: from,
+                        message: ControlMessage::Route(RouteControl::Accept {
+                            route_id: route.id,
+                            session: None,
+                        }),
+                    }];
+                }
                 let accept = self.auto_accept;
                 let state = if accept {
                     RouteState::Active
@@ -668,6 +692,55 @@ mod tests {
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::StartMedia(r) if r.id == "r1")));
+    }
+
+    #[test]
+    fn duplicate_offer_for_an_active_route_does_not_restart_media() {
+        // The daemon redelivers the same Offer once per shared network. The
+        // first one accepts + starts media; a second identical Offer for the
+        // now-active route must NOT re-emit StartMedia (which would
+        // double-start the host's capture pump — two backends on one monitor,
+        // fatal under panic=abort). It re-acks (in case the first Accept was
+        // lost) and leaves the route untouched.
+        let mut s = Session::new("desk");
+        s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        // A host-resolved terminal session id is recorded after the first start.
+        s.set_term_session("r1", "term-7".into());
+        let effects = s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                // A re-offer might still carry the viewer's original ask;
+                // honouring it must not clobber the resolved id below.
+                session: Some("term-1".into()),
+            }),
+        );
+        // No second StartMedia…
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::StartMedia(_))),
+            "a duplicate Offer must not restart media"
+        );
+        // …only a re-ack…
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Send { message: ControlMessage::Route(RouteControl::Accept { route_id, .. }), .. } if route_id == "r1"
+        )));
+        // …and the host-resolved session id survives (not clobbered by the
+        // duplicate's re-insert).
+        assert_eq!(
+            s.route("r1").and_then(|r| r.term_session.as_deref()),
+            Some("term-7")
+        );
     }
 
     #[test]

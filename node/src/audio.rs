@@ -221,6 +221,18 @@ impl AudioBridge {
     where
         F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
     {
+        // Exactly one capture pump per route (the video bridge's discipline):
+        // a duplicate StartMedia (the daemon redelivers an Offer once per
+        // shared network) must not double-start audio capture — and with the
+        // release profile's `panic = "abort"` a panic on a stray capture
+        // thread aborts the host. Keyed on the captures map only, so a
+        // loopback route (capture + playback under one id) is unaffected.
+        if self.captures.lock().contains_key(&route_id) {
+            tracing::debug!(
+                "audio capture already running for {route_id}; ignoring duplicate start"
+            );
+            return;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let id = route_id.clone();
@@ -229,18 +241,32 @@ impl AudioBridge {
                 tracing::warn!("audio capture for {id} stopped: {e}");
             }
         });
-        self.captures.lock().insert(
-            route_id,
-            RouteAudio {
-                stop,
-                thread: Some(thread),
-                playback: None,
-            },
-        );
+        // Insert, then join any displaced thread off the lock (RouteAudio::drop
+        // joins) — never under the captures lock.
+        let displaced = {
+            let mut captures = self.captures.lock();
+            captures.insert(
+                route_id,
+                RouteAudio {
+                    stop,
+                    thread: Some(thread),
+                    playback: None,
+                },
+            )
+        };
+        drop(displaced);
     }
 
     /// Begin playing inbound audio for `route_id` on the default output.
     pub fn start_playback(&self, route_id: String) {
+        // One playback pump per route, for the same reason as `start_capture`;
+        // keyed on the playbacks map so a loopback route still runs both.
+        if self.playbacks.lock().contains_key(&route_id) {
+            tracing::debug!(
+                "audio playback already running for {route_id}; ignoring duplicate start"
+            );
+            return;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let ring = Arc::new(Mutex::new(VecDeque::<i16>::new()));
@@ -259,19 +285,24 @@ impl AudioBridge {
                 tracing::warn!("audio playback for {id} stopped: {e}");
             }
         });
-        self.playbacks.lock().insert(
-            route_id,
-            RouteAudio {
-                stop,
-                thread: Some(thread),
-                playback: Some(Playback {
-                    ring,
-                    out_rate,
-                    fed,
-                    stats: Mutex::new(LevelStats::new()),
-                }),
-            },
-        );
+        let displaced = {
+            let mut playbacks = self.playbacks.lock();
+            playbacks.insert(
+                route_id,
+                RouteAudio {
+                    stop,
+                    thread: Some(thread),
+                    playback: Some(Playback {
+                        ring,
+                        out_rate,
+                        fed,
+                        stats: Mutex::new(LevelStats::new()),
+                    }),
+                },
+            )
+        };
+        // Join any displaced playback thread off the lock (RouteAudio::drop).
+        drop(displaced);
     }
 
     /// Push an inbound frame into a playback route's ring (mono, resampled
@@ -324,9 +355,13 @@ impl AudioBridge {
     }
 
     pub fn stop(&self, route_id: &str) {
-        // Drop runs the thread join + stream teardown.
-        self.captures.lock().remove(route_id);
-        self.playbacks.lock().remove(route_id);
+        // Drop runs the thread join + stream teardown — bind the removed
+        // values so that join happens after each lock guard is released, never
+        // under it (an unbound `remove(..);` drops while the guard is held).
+        let removed_capture = self.captures.lock().remove(route_id);
+        let removed_playback = self.playbacks.lock().remove(route_id);
+        drop(removed_capture);
+        drop(removed_playback);
     }
 
     #[allow(dead_code)]

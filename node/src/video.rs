@@ -462,6 +462,19 @@ impl VideoBridge {
         F: Fn(VideoPacket) -> bool + Send + Sync + 'static,
         S: Fn(VideoStatusState, Option<String>) + Send + Sync + 'static,
     {
+        // Exactly one capture pump per route. A duplicate `StartMedia` (the
+        // daemon redelivers an Offer once per shared network) must not start a
+        // second capture for a route that already has one — two backends bound
+        // to one monitor, and with the release profile's `panic = "abort"` a
+        // panic on either aborts the host. A genuine restart (a viewer's
+        // retune) goes through `spawn_route` directly, which is allowed to
+        // replace; only this entry point dedupes.
+        if self.routes.lock().contains_key(&route_id) {
+            tracing::debug!(
+                "video capture already running for {route_id}; ignoring duplicate start"
+            );
+            return;
+        }
         self.spawn_route(
             route_id,
             mode,
@@ -512,19 +525,28 @@ impl VideoBridge {
                 tracing::warn!("{what} capture for {id} stopped: {e}");
             }
         });
-        self.routes.lock().insert(
-            route_id,
-            RouteVideo {
-                stop,
-                thread: Some(thread),
-                mode,
-                source,
-                on_packet,
-                on_status,
-                refresh,
-                idr_ms,
-            },
-        );
+        let displaced = {
+            let mut routes = self.routes.lock();
+            routes.insert(
+                route_id,
+                RouteVideo {
+                    stop,
+                    thread: Some(thread),
+                    mode,
+                    source,
+                    on_packet,
+                    on_status,
+                    refresh,
+                    idr_ms,
+                },
+            )
+        };
+        // Join any displaced capture thread (RouteVideo::drop) only after the
+        // routes lock is released — joining a thread under the lock would
+        // block every other route op, and on the async start path stall a
+        // tokio worker. `start_capture` dedupes so this is normally `None`;
+        // the explicit drop keeps the off-lock guarantee for any caller.
+        drop(displaced);
     }
 
     /// Ask `route_id`'s encoder for a clean decode entry on its next
@@ -613,8 +635,14 @@ impl VideoBridge {
     }
 
     pub fn stop(&self, route_id: &str) {
-        self.routes.lock().remove(route_id);
+        // Bind the removed route so its Drop (the capture-thread join) runs
+        // after the routes lock guard is released, never under it — an
+        // unbound `remove(..);` would drop the RouteVideo (and join) while the
+        // guard is still held (temporary drop order), blocking the lock on a
+        // thread join.
+        let removed = self.routes.lock().remove(route_id);
         self.feedback.lock().remove(route_id);
+        drop(removed);
     }
 }
 

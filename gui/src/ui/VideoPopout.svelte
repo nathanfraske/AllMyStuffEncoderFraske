@@ -67,6 +67,12 @@
   const ended = $derived(routeState === "torn_down" || routeState === "rejected");
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+  // The role=application surface. Key forwarding lives on this element (not
+  // `<svelte:window>`) so it fires whenever the element holds focus — and
+  // hovering pins that focus (below), the reliable way to make a secondary
+  // window's keyboard reach the remote where window-level setFocus alone
+  // doesn't push document focus into the webview on hover (WebKitGTK).
+  let stageEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   let frameW = $state(0);
   let frameH = $state(0);
@@ -247,16 +253,25 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
 
+  // The KVM rule: with control live, the window under the mouse is the one
+  // the keyboard should reach — claim focus on hover, no click in between (a
+  // click would go to the *remote*). Raise the OS window AND pin keyboard
+  // focus on the surface element: `setFocus()` alone doesn't reliably push
+  // document focus into the webview on a hover-without-click, so without the
+  // element focus the key handlers (now on `stageEl`) never fire and only the
+  // already-focused window — usually the main one — could drive. Gated on the
+  // document not already holding focus so it never steals focus from an open
+  // pill menu once this window is active.
+  function claimFocus() {
+    if (document.hasFocus()) return;
+    void focusThisWindow();
+    stageEl?.focus({ preventScroll: true });
+  }
+
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
-    // The KVM rule: with control live, the window under the mouse is the
-    // one the keyboard should reach — claim OS focus on hover, no click
-    // in between (a click would go to the *remote*). Keyboard events only
-    // ever reach the focused window, so this is what makes keys land on
-    // the machine you're pointing at when several control surfaces are
-    // open at once.
-    if (!document.hasFocus()) void focusThisWindow();
+    claimFocus();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = norm(e);
@@ -266,6 +281,9 @@
   }
   function onPointerButton(e: PointerEvent, down: boolean) {
     if (!controlActive) return;
+    // A click is the most reliable focus pin — land it on the stage so keys
+    // forward even if the cursor was last over a hover-bar button.
+    if (down) stageEl?.focus({ preventScroll: true });
     const p = norm(e);
     if (!p) return;
     e.preventDefault();
@@ -284,36 +302,44 @@
   // modifier.
   const keys = makeKeyForwarder(send);
 
-  function onKey(e: KeyboardEvent, down: boolean) {
-    if (controlActive) {
-      // With control granted, every key belongs to the far machine —
-      // the hover ⛶ leaves fullscreen.
-      e.preventDefault();
-      keys.onKey(e, down);
-      return;
-    }
-    if (down && e.key === "Escape" && fullscreen) void flipFullscreen();
+  // Control forwarding — bound to the focusable surface element, so it only
+  // fires while this window actually holds keyboard focus (the KVM rule). With
+  // control granted every key belongs to the far machine.
+  function onControlKey(e: KeyboardEvent, down: boolean) {
+    if (!controlActive) return;
+    e.preventDefault();
+    keys.onKey(e, down);
+  }
+
+  // No-control keys ride the window so they work without the surface being
+  // focused: Escape leaves fullscreen (the hover ⛶ does it while driving).
+  function onWindowKey(e: KeyboardEvent) {
+    if (controlActive) return;
+    if (e.key === "Escape" && fullscreen) void flipFullscreen();
   }
 </script>
 
-<svelte:window
-  onkeydown={(e) => onKey(e, true)}
-  onkeyup={(e) => onKey(e, false)}
-  onblur={() => keys.releaseAll()}
-  onclick={() => (openPill = null)}
-/>
+<svelte:window onkeydown={onWindowKey} onclick={() => (openPill = null)} />
 
 <!-- role=application: with control granted this is a remote-desktop
-     surface — every pointer/key goes to the far machine. -->
+     surface — every pointer/key goes to the far machine. It's focusable
+     only while driving, so keys forward from here and nowhere else. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
+  bind:this={stageEl}
   class="popout"
   class:driving={controlActive}
   role="application"
   aria-label="Popped-out video{sourceCap ? ` — ${sourceCap.label}` : ''}"
+  tabindex={controlActive ? 0 : -1}
   onpointermove={onPointerMove}
   onpointerdown={(e) => onPointerButton(e, true)}
   onpointerup={(e) => onPointerButton(e, false)}
   onwheel={onWheel}
+  onkeydown={(e) => onControlKey(e, true)}
+  onkeyup={(e) => onControlKey(e, false)}
+  onblur={() => keys.releaseAll()}
   oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
@@ -424,6 +450,12 @@
   }
   .popout.driving {
     cursor: crosshair;
+  }
+  /* The surface is focusable (so keys forward), but it fills the window —
+     a focus ring at the window edge would just be noise. */
+  .popout:focus,
+  .popout:focus-visible {
+    outline: none;
   }
   canvas {
     width: 100%;
