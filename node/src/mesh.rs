@@ -910,21 +910,24 @@ impl Mesh {
         let capabilities = json!({
             "tags": tags,
             "app_version": env!("CARGO_PKG_VERSION"),
-            // Ride the device summary (OS / CPU / RAM / device count) on the
-            // capability matrix too, not just the bespoke presence advert. The
-            // peer list is polled and reliable, so a peer that connected but
-            // whose presence frame was missed still gets its stats — otherwise
-            // it shows the control buttons (from these tags) with no summary.
-            "summary": profile.as_ref().map(|p| &p.summary),
-            // Same reasoning for the wireable endpoints — the control / audio /
-            // video / display sinks & sources that rooms and remote-control
-            // wire to. They used to ride *only* the bespoke presence advert, so
-            // a peer whose presence frame was missed showed its buttons but
-            // advertised no endpoint, and rooms/remote-control reported "no
-            // audio/control/video path to that machine". Carry them on the
-            // reliable peer list too so a path resolves regardless of whether
-            // presence lands.
-            "endpoints": profile.as_ref().map(|p| &p.capabilities),
+            // The daemon's `CapabilityAdvert` is a typed struct — only `tags`,
+            // `app_version`, `max_connections`, and a freeform `extra` survive
+            // its (de)serialization. Anything app-specific MUST ride `extra`,
+            // or serde drops it at the control boundary (which silently sank an
+            // earlier attempt to carry these at the top level). So nest the
+            // embedder data under `extra`:
+            //  - summary: the device stats (OS / CPU / RAM / device count), so a
+            //    peer whose bespoke presence frame was missed still shows them.
+            //  - endpoints: the wireable control / audio / video / display sinks
+            //    & sources rooms and remote-control resolve a route through.
+            //    These used to ride *only* the flaky presence advert, so a missed
+            //    frame left a peer showing its buttons but advertising no
+            //    endpoint — "no audio/control/video path to that machine". The
+            //    polled peer list is reliable, so a path resolves regardless.
+            "extra": {
+                "summary": profile.as_ref().map(|p| &p.summary),
+                "endpoints": profile.as_ref().map(|p| &p.capabilities),
+            },
         });
         for network in networks {
             let _ = self
@@ -2885,15 +2888,39 @@ impl Mesh {
     /// since membership follows ownership — let any recorded owner go and
     /// re-advertise unowned.
     pub async fn fleet_leave(self: &Arc<Self>) -> Result<(), String> {
-        // Notify the owner *before* we leave the network, while we can still
-        // route a control frame to it on the fleet mesh.
-        if let Some(owner) = self.ownership.owner() {
-            let _ = self
+        // Notify *before* we leave the network, while we can still route a
+        // control frame on the fleet mesh.
+        if self.ownership.is_fleet_owner() {
+            // We're the owner dissolving our own fleet — there's no owner to
+            // tell. Tell every member to release instead, so they stop deriving
+            // the (now-defunct) closed network and showing each other as fleet.
+            // Best-effort per member (mirrors fleet_kick's direct Release); an
+            // offline member just keeps a dead key until it next reconciles.
+            for member in self.ownership.fleet_member_ids() {
+                let _ = self
+                    .send_control(
+                        &member,
+                        &ControlMessage::Ownership(OwnershipControl::Release),
+                    )
+                    .await;
+            }
+        } else if let Some(owner) = self.ownership.owner() {
+            // We're a member: tell the owner so it evicts us from the signed
+            // roster. Best-effort — surface the failure (don't swallow it) so
+            // it's diagnosable; our re-advertised "unowned" presence below is
+            // the backstop (the owner drops a member that answers to a
+            // different owner / none).
+            if let Err(e) = self
                 .send_control(
                     &owner,
                     &ControlMessage::Ownership(OwnershipControl::FleetDeparted),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    "couldn't tell the fleet owner we left ({e}); relying on our unowned re-advert to clear us from its roster"
+                );
+            }
         }
         // Leaving clears all local fleet/ownership state atomically (owner
         // included). It returns the closed network to tear out of, or `None`

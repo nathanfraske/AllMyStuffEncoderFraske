@@ -901,9 +901,14 @@ class AppStore {
       null,
   );
 
-  /** The machine a console session is currently open on, if any. */
+  /** The machine a console session is currently open on, if any. Resolved
+   *  canonically (by bare pubkey), not by exact id: the id is captured when the
+   *  console opens, but a node's display id can change form afterwards (a
+   *  presence snapshot re-homing it onto its `pubkey-SUFFIX` display id). An
+   *  exact `n.id === consoleNodeId` then misses it, leaving `<Console>`'s
+   *  `{#if node}` false and the whole remote-console window blank. */
   consoleNode = $derived(
-    this.consoleNodeId ? this.catalog.nodes.find((n) => n.id === this.consoleNodeId) ?? null : null,
+    this.consoleNodeId ? this.machineByAnyId(this.consoleNodeId) ?? null : null,
   );
 
   /** Routes running between this machine and the console's remote — the
@@ -987,7 +992,13 @@ class AppStore {
   }
 
   capsOf(nodeId: string): Capability[] {
-    return this.catalog.capabilities.filter((c) => c.node === nodeId);
+    // Canonical (bare-pubkey) match, not exact: the caller's id and a
+    // capability's `node` can be different display-id forms of the same machine
+    // (`pubkey-SUFFIX` vs the bare pubkey). An exact compare misses them — which
+    // left consoleVideoInputs empty, so the console opened with no screen to
+    // auto-start.
+    const want = canonicalNodeId(nodeId);
+    return this.catalog.capabilities.filter((c) => canonicalNodeId(c.node) === want);
   }
 
   node(nodeId: string): MeshNode | undefined {
@@ -1235,12 +1246,13 @@ class AppStore {
           e.app = true;
           e.features = tags.filter((t) => t !== CAP_TAG_ALLMYSTUFF);
           if (p.capabilities?.app_version) e.version = p.capabilities.app_version;
-          // The device stats ride the peer list too — so a connected peer whose
-          // presence advert was missed still gets its OS/CPU/RAM summary.
-          if (p.capabilities?.summary) e.summary = p.capabilities.summary;
-          // …and so do the wireable endpoints, so rooms/remote-control resolve
-          // a path without waiting on the bespoke presence advert to land.
-          if (p.capabilities?.endpoints?.length) e.endpoints = p.capabilities.endpoints;
+          // The daemon's CapabilityAdvert only forwards app-specific data under
+          // `extra` (its typed struct drops unknown top-level fields), so the
+          // device stats and the wireable endpoints both ride there — reliably,
+          // unlike the bespoke presence advert that used to be their only source.
+          const extra = p.capabilities?.extra;
+          if (extra?.summary) e.summary = extra.summary;
+          if (extra?.endpoints?.length) e.endpoints = extra.endpoints;
         }
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
@@ -1337,22 +1349,20 @@ class AppStore {
         }
       }
       // Carry the wireable endpoints from the reliable peer list onto the
-      // catalog, re-keyed to the resolved node so `matchEndpoint` (which
-      // filters capabilities by node) finds them. This is the missed-presence
-      // case that left rooms/remote-control with "no audio/control/video path":
-      // the endpoints used to ride only the bespoke presence advert. The
-      // endpoint id is `<node>:<slot>`, so re-prefix it with the node id we
-      // settled on, mirroring how `setLocalId` re-keys.
-      const endpointNode = node?.id ?? id;
+      // catalog so `matchEndpoint` (which filters capabilities by node) finds
+      // them — the missed-presence case that left rooms/remote-control with "no
+      // audio/control/video path". Store them AS-IS, not re-keyed: an endpoint
+      // id is the *remote's* own id (`<remote-node>:<slot>`), which is what the
+      // remote resolves a route by — re-prefixing it with a local id makes the
+      // remote reject the route ("path does not exist on the remote"). The
+      // remote's node id is the same id this peer's node carries, so a plain
+      // store still matches locally. Mirrors the presence path
+      // (`applySessionSnapshot`), which also stores caps unchanged.
       if (info.app && info.endpoints?.length) {
-        const reKeyed = info.endpoints.map((c) => ({
-          ...c,
-          node: endpointNode,
-          id: endpointNode + c.id.slice(c.node.length),
-        }));
+        const epNode = info.endpoints[0].node;
         this.catalog.capabilities = [
-          ...this.catalog.capabilities.filter((c) => c.node !== endpointNode),
-          ...reKeyed,
+          ...this.catalog.capabilities.filter((c) => c.node !== epNode),
+          ...info.endpoints,
         ];
       }
     }
@@ -1383,8 +1393,15 @@ class AppStore {
       const canon = canonicalNodeId(n.id);
       if (n.kind === "this" || this.isLocalMachine(n.id)) return true;
       if (knownCanon.has(canon)) return true; // seen this poll; online already set
+      // "mine" is roster-authoritative — a device is kept because it's an
+      // actual fleet member (isFleetMember, below), NOT because its
+      // relationship still reads "mine". A device you left/evicted keeps
+      // advertising "owner = you" for a while (it's offline, or missed the
+      // Release), which marks it "mine" via the stale-advert fallback in
+      // `standing()`; keying the prune off that pinned departed devices on the
+      // graph forever ("fails to update the graph"). Roster + live-this-poll +
+      // shares + presence grace are the real keep signals.
       const keep =
-        n.relationship.kind === "mine" ||
         n.relationship.kind === "shared" ||
         this.isFleetMember(n.id) ||
         this.withinPresenceGrace(canon);
@@ -1558,11 +1575,17 @@ class AppStore {
       this.catalog.nodes = this.catalog.nodes.filter(
         (n) => n.id === p.node || !sameMachine(n.id, p.node),
       );
-      // Refresh this peer's capabilities.
-      this.catalog.capabilities = [
-        ...this.catalog.capabilities.filter((c) => c.node !== p.node),
-        ...p.capabilities,
-      ];
+      // Refresh this peer's capabilities — but only when presence actually
+      // carried some. An empty/missed presence frame must not blank the
+      // endpoints we already have from the reliable peer list (the
+      // control/audio/video sinks rooms + remote-control wire to); otherwise a
+      // session event with no caps wipes them and reads as "no path".
+      if (p.capabilities?.length) {
+        this.catalog.capabilities = [
+          ...this.catalog.capabilities.filter((c) => c.node !== p.node),
+          ...p.capabilities,
+        ];
+      }
     }
 
     // Reflect live routes (active ones become catalog routes), and keep
@@ -1734,9 +1757,8 @@ class AppStore {
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
       this.fireBackendConnect(res.route.from, res.route.to, res.route.media, codec);
-      const f = this.capability(from)?.label ?? from;
-      const t = this.capability(to)?.label ?? to;
-      this.toast("ok", `Connected ${f} → ${t}`);
+      // No success toast — the graph route, the console pills, and the screen
+      // are the visual confirmation a connection is up.
       return true;
     }
     if (res.denied && res.denied.length) {
@@ -1883,7 +1905,6 @@ class AppStore {
     } else {
       void this.wireConsoleFirstVideo();
     }
-    this.toast("ok", `Console open on ${node!.label}`);
   }
 
   /** The console's opening video wire + the auto-legs decision — split
@@ -4497,6 +4518,10 @@ class AppStore {
       }
       this.toast("info", "Left the network");
       await this.refreshNetworks();
+      // Re-derive the graph now so the left network's nodes drop immediately,
+      // rather than lingering until the next 3 s poll happens to run (matches
+      // toggleNetworkEnabled / restartNetwork, which both re-sync on change).
+      await this.syncMeshGraph();
     } catch (e) {
       this.toast("warn", `Couldn't leave: ${errMsg(e)}`);
     }
