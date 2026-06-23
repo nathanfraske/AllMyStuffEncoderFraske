@@ -1564,11 +1564,17 @@ class AppStore {
       this.catalog.nodes = this.catalog.nodes.filter(
         (n) => n.id === p.node || !sameMachine(n.id, p.node),
       );
-      // Refresh this peer's capabilities.
-      this.catalog.capabilities = [
-        ...this.catalog.capabilities.filter((c) => c.node !== p.node),
-        ...p.capabilities,
-      ];
+      // Refresh this peer's capabilities — but only when presence actually
+      // carried some. An empty/missed presence frame must not blank the
+      // endpoints we already have from the reliable peer list (the
+      // control/audio/video sinks rooms + remote-control wire to); otherwise a
+      // session event with no caps wipes them and reads as "no path".
+      if (p.capabilities?.length) {
+        this.catalog.capabilities = [
+          ...this.catalog.capabilities.filter((c) => c.node !== p.node),
+          ...p.capabilities,
+        ];
+      }
     }
 
     // Reflect live routes (active ones become catalog routes), and keep

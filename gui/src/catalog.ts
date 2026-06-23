@@ -236,14 +236,31 @@ function endpointRank(c: Capability): number {
   return 2;
 }
 
+/** Strip MyOwnMesh's 5-char display suffix (`-AB12C`) to the bare pubkey.
+ *  Capability endpoints are built with the *display id* (`pubkey-SUFFIX`), but
+ *  a machine's graph node is often keyed by the bare pubkey the roster / peer
+ *  list reports — so an exact `node` compare misses a peer's endpoints and
+ *  reads as "no audio/control/video path to that machine". Match on the
+ *  canonical form instead. Mirrors store.svelte.ts's `canonicalNodeId` and
+ *  myownmesh-core's `signing::pubkey_part`. */
+function canonicalNode(id: string): string {
+  const dash = id.lastIndexOf("-");
+  if (dash > 0) {
+    const suffix = id.slice(dash + 1);
+    if (suffix.length === 5 && /^[0-9a-zA-Z]+$/.test(suffix)) return id.slice(0, dash);
+  }
+  return id;
+}
+
 export function matchEndpoint(
   cat: Catalog,
   node: string,
   media: MediaKind,
   role: GrantRole,
 ): Capability | undefined {
+  const want = canonicalNode(node);
   return cat.capabilities
-    .filter((c) => c.node === node && mediaCompatible(c.media, media))
+    .filter((c) => canonicalNode(c.node) === want && mediaCompatible(c.media, media))
     .filter((c) => (role === "provide" ? canSource(c.flow) : canSink(c.flow)))
     .sort((a, b) => endpointRank(a) - endpointRank(b) || a.id.localeCompare(b.id))[0];
 }
