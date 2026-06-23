@@ -1513,13 +1513,22 @@ pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
     tracing::info!(?bin, "spawning allmystuff node");
 
     let mut cmd = Command::new(&bin);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    // Windowless parent: don't give the node its own console window.
+    cmd.stdin(Stdio::null());
+    // Unix: the child inherits our stdout/stderr, so its logs stream into the
+    // same terminal (`just dev` / `allmystuff serve`).
+    #[cfg(not(windows))]
+    {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    // Windows: a GUI-subsystem parent has no console for the child to inherit,
+    // so inherited stdout would vanish — the node's logs never reach the
+    // terminal (only its file). Capture them and forward to ours below so they
+    // stream inline like on Unix. CREATE_NO_WINDOW still stops a console window
+    // from flashing up.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     // Linux half of the lifetime tie: SIGKILL the node when this process dies.
@@ -1533,9 +1542,37 @@ pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
             });
         }
     }
+    #[cfg(windows)]
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", bin.display()))?;
+    #[cfg(not(windows))]
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
+    // Windows: pump the node's captured stdout/stderr into ours, line by line,
+    // so its logs show in the `just dev` terminal (detached — they end when the
+    // node exits and the pipes close).
+    #[cfg(windows)]
+    {
+        use std::io::{BufRead, BufReader, Write};
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut sink = std::io::stdout();
+                for line in BufReader::new(out).lines().map_while(Result::ok) {
+                    let _ = writeln!(sink, "{line}");
+                }
+            });
+        }
+        if let Some(err) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut sink = std::io::stderr();
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    let _ = writeln!(sink, "{line}");
+                }
+            });
+        }
+    }
     tie_node_lifetime(&child);
     let handle = NodeChild { child: Some(child) };
 
