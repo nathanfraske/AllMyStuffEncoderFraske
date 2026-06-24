@@ -3805,21 +3805,25 @@ impl Mesh {
     }
 
     /// The route whose inbound video samples arrive on `lane` from `peer`.
-    /// Prefer the binding the streamer announced ([`Self::record_video_lane`])
-    /// — it's authoritative and immune to the two ends briefly disagreeing on
-    /// the route order. Fall back to the positional sort (the lane-th active
-    /// H.264 route from the peer) for a streamer that doesn't announce (an
-    /// older build), or for the brief window before its announce lands.
+    ///
+    /// Once a peer has announced *any* lane binding ([`Self::record_video_lane`])
+    /// the announced map is **authoritative**: this lane is whatever it bound,
+    /// or — if it hasn't bound this lane yet — `None`. We deliberately do NOT
+    /// fall back to a positional guess there: the streamer pins lanes
+    /// non-positionally (lowest-free), so guessing by sorted position would put
+    /// one monitor's frames in another monitor's window (and `None` simply
+    /// leaves that window holding its last frame until the real binding lands).
+    ///
+    /// Only a peer that has announced *nothing* (an older build that doesn't
+    /// pin/announce, or the brief moment before its first announce) uses the
+    /// positional sort — exactly the pre-binding behaviour.
     fn video_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
         let canon = pubkey_part(peer);
-        if let Some(route) = self
-            .video_lane_binds
-            .lock()
-            .get(canon)
-            .and_then(|m| m.get(&lane))
-            .cloned()
         {
-            return Some(route);
+            let binds = self.video_lane_binds.lock();
+            if let Some(per_peer) = binds.get(canon) {
+                return per_peer.get(&lane).cloned();
+            }
         }
         self.sorted_media_routes(peer, false, "h264")
             .into_iter()

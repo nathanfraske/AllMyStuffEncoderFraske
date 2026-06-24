@@ -1107,13 +1107,13 @@ fn orient_to_monitor(
     rotation_deg: u32,
     logical: (u32, u32),
 ) -> (Vec<u8>, u32, u32) {
-    // Clockwise quarter-turns that *undo* the display's rotation. (If a 90°
-    // monitor ever streams rotated the wrong way — the OS's rotation sign is
-    // the one thing that can't be pinned down without the hardware — swap the
-    // `1` and `3`.)
+    // Clockwise quarter-turns that *undo* the display's rotation. xcap reports
+    // the angle the panel is rotated by, so we rotate the raw scan-out the same
+    // way to bring it upright (verified on hardware: the complement came out
+    // upside-down).
     let turns: u8 = match rotation_deg % 360 {
-        90 => 3,
-        270 => 1,
+        90 => 1,
+        270 => 3,
         _ => return (rgba, bw, bh),
     };
     let (lw, lh) = logical;
