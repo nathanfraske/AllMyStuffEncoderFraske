@@ -496,6 +496,11 @@ impl Session {
             RouteControl::TerminalSessionsRequest | RouteControl::TerminalSessions { .. } => {
                 Vec::new()
             }
+            // The streamer's lane↔route binding is consumed by the backend's
+            // media plane (it routes inbound H.264), not the state machine —
+            // handled in the mesh before it reaches here, like the terminal
+            // picker plane above. The session just ignores it.
+            RouteControl::VideoLane { .. } => Vec::new(),
             // A route-control kind a newer peer introduced that this build
             // doesn't know (decoded as `Unknown` rather than failing the
             // whole control message): no state change.

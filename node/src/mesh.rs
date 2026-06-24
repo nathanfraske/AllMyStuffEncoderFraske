@@ -219,6 +219,18 @@ pub struct Mesh {
     /// How many media lanes the local daemon provisions per peer (from
     /// Status `media_lanes`); 1 means a pre-pool daemon.
     daemon_lanes: std::sync::atomic::AtomicU8,
+    /// **Host side:** the RTP video track lane pinned to each route we
+    /// stream, by route id. Assigned once (lowest free in the peer's pool)
+    /// when the stream starts and held until teardown, so an unrelated route
+    /// coming or going never renumbers a live stream's lane. The viewer is
+    /// told the binding ([`RouteControl::VideoLane`]) and demuxes by it.
+    video_lane_pins: Mutex<HashMap<String, u8>>,
+    /// **Viewer side:** the lane→route binding a streamer told us, per peer
+    /// (canonical pubkey). Inbound H.264 on lane `L` from peer `P` belongs to
+    /// `video_lane_binds[P][L]` — authoritative over the positional guess.
+    /// Empty for a peer that doesn't announce (older build): that peer's lanes
+    /// fall back to the positional sort.
+    video_lane_binds: Mutex<HashMap<String, HashMap<u8, String>>>,
 }
 
 /// One captured-audio packet headed for the forwarder, in whichever
@@ -396,6 +408,8 @@ impl Mesh {
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
+            video_lane_pins: Mutex::new(HashMap::new()),
+            video_lane_binds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1257,6 +1271,12 @@ impl Mesh {
                                 json!({ "from": from, "sessions": sessions }),
                             );
                         }
+                        ControlMessage::Route(RouteControl::VideoLane { route_id, lane }) => {
+                            // The streamer told us which track lane this route's
+                            // H.264 rides — record it so inbound samples demux to
+                            // the right console window by binding, not by guess.
+                            self.record_video_lane(&from, &route_id, lane);
+                        }
                         msg => {
                             let effects = {
                                 let mut st = self.state.lock();
@@ -1374,14 +1394,22 @@ impl Mesh {
         }
     }
 
-    /// Drop the per-route video state a route that just ended leaves
-    /// behind — its receive-side counters, any pending re-key ask, and its
-    /// native decoder. (Lane assignment is computed on the fly now, so
-    /// there's no per-route lane mapping to free.)
+    /// Drop the per-route video state a route that just ended leaves behind —
+    /// its receive-side counters, any pending re-key ask, its native decoder,
+    /// the host-side pinned track lane (freeing it for the next stream), and
+    /// the viewer-side lane→route binding.
     fn release_video_lanes(&self, route_id: &str) {
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
+        // Host side: free the pinned lane so a later stream can reuse it.
+        self.video_lane_pins.lock().remove(route_id);
+        // Viewer side: drop any lane binding that pointed at this route.
+        let mut binds = self.video_lane_binds.lock();
+        for per_peer in binds.values_mut() {
+            per_peer.retain(|_, r| r != route_id);
+        }
+        binds.retain(|_, per_peer| !per_peer.is_empty());
     }
 
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
@@ -1683,9 +1711,16 @@ impl Mesh {
         } else {
             Vec::new()
         };
-        let peer = if from_node == me { to_node } else { from_node };
+        // Self / loopback is decided by *canonical* node id: the route's
+        // endpoints carry the suffixed display id the UI built them from,
+        // while `me` is the bare node id, so a raw `==` would miss a genuine
+        // self-route and offer it over the wire (where it never returns) —
+        // which is exactly what stopped local terminals from opening.
+        let from_is_me = same_node(&from_node, &me);
+        let to_is_me = same_node(&to_node, &me);
+        let peer = if from_is_me { to_node } else { from_node };
 
-        if peer == me {
+        if from_is_me && to_is_me {
             // Local loopback (e.g. this machine's mic to its own speakers):
             // no peer to negotiate with — record it active and stream now.
             // Offer-then-Accept drives the session to Active and yields the
@@ -3308,8 +3343,16 @@ impl Mesh {
         let Some(me) = self.local_node_id() else {
             return;
         };
-        let from_node = node_of(route.from.as_str());
-        let to_node = node_of(route.to.as_str());
+        // Compare endpoints to ourselves *canonically* — the route's ids carry
+        // the UI's display suffix while `me` is the bare node id. Without this
+        // a loopback (e.g. a local terminal) matches neither the loopback arm
+        // nor the host/viewer arms, and nothing starts. The bare ids only feed
+        // `== me` checks, log labels, and the peer arg to the capture starts
+        // (which the routing layer canonicalises again), so normalising them
+        // here is safe.
+        let me = pubkey_part(&me).to_string();
+        let from_node = pubkey_part(&node_of(route.from.as_str())).to_string();
+        let to_node = pubkey_part(&node_of(route.to.as_str())).to_string();
 
         match route.media {
             MediaKind::Audio => {
@@ -3423,6 +3466,10 @@ impl Mesh {
                         mode_label(mode),
                     );
                     self.start_video_stream(route, &to_node, mode, VideoSource::Screen(monitor));
+                    // Tell the viewer the pinned lane (best-effort, off the
+                    // sync start path; the pin is already assigned above).
+                    let (mesh, rid, peer) = (self.clone(), route.id.clone(), to_node.clone());
+                    crate::spawn(async move { mesh.announce_video_lane(&rid, &peer).await });
                 } else if to_node == me {
                     tracing::info!(
                         "route {} active — expecting screen frames from {}",
@@ -3449,6 +3496,8 @@ impl Mesh {
                         mode_label(mode),
                     );
                     self.start_video_stream(route, &to_node, mode, VideoSource::Camera(device));
+                    let (mesh, rid, peer) = (self.clone(), route.id.clone(), to_node.clone());
+                    crate::spawn(async move { mesh.announce_video_lane(&rid, &peer).await });
                 } else if to_node == me {
                     tracing::info!(
                         "route {} active — expecting camera frames from {}",
@@ -3674,10 +3723,49 @@ impl Mesh {
         })
     }
 
-    /// The lane an outbound H.264 video route to `peer` rides, or `None` for
-    /// MJPEG (no usable lane, or the route's sorted position is past the
-    /// effective pool). `outbound` = we are the source.
+    /// Pin (or look up) the RTP video track lane an outbound H.264 route to
+    /// `peer` streams on — the **lowest free** lane in the peer's pool among
+    /// that peer's already-pinned routes, held for the route's lifetime.
+    /// `None` when the pool is exhausted or the daemon has no video lane (the
+    /// route then rides MJPEG). Called once when the stream's transport is
+    /// chosen; thereafter [`Self::video_lane`] just reads the pin.
+    ///
+    /// Pinning is what makes the lane stable: a second feed opening (or a
+    /// third tearing down) no longer renumbers a live feed's lane, so the
+    /// viewer — told the binding over [`RouteControl::VideoLane`] — never
+    /// briefly maps one monitor's frames onto another's window.
+    fn assign_video_lane(&self, peer: &str, route_id: &str) -> Option<u8> {
+        let cap = self.effective_video_lanes(peer);
+        if cap == 0 {
+            return None;
+        }
+        // The peer's other H.264 routes, to see which lanes are taken.
+        // Computed before taking the pin lock (it locks session state).
+        let peer_routes = self.sorted_media_routes(peer, true, "h264");
+        let mut pins = self.video_lane_pins.lock();
+        if let Some(&lane) = pins.get(route_id) {
+            return Some(lane);
+        }
+        let used: std::collections::HashSet<u8> = peer_routes
+            .iter()
+            .filter(|id| id.as_str() != route_id)
+            .filter_map(|id| pins.get(id).copied())
+            .collect();
+        let lane = (0..cap).find(|l| !used.contains(l))?;
+        pins.insert(route_id.to_string(), lane);
+        Some(lane)
+    }
+
+    /// The video track lane an outbound H.264 route to `peer` is streaming on:
+    /// the lane [`Self::assign_video_lane`] pinned at stream start. `None` once
+    /// the route has torn down (its pin freed) — the forwarder then drops the
+    /// frame rather than guessing a lane. `outbound` is kept for symmetry with
+    /// the audio twin; the receive side resolves lanes via
+    /// [`Self::video_route_for_lane`], never here.
     fn video_lane(&self, route_id: &str, peer: &str, outbound: bool) -> Option<u8> {
+        if outbound {
+            return self.video_lane_pins.lock().get(route_id).copied();
+        }
         let cap = self.effective_video_lanes(peer);
         if cap == 0 {
             return None;
@@ -3702,11 +3790,37 @@ impl Mesh {
         (idx < cap as usize).then_some(idx as u8)
     }
 
-    /// The route whose inbound video samples arrive on `lane` from `peer` — the
-    /// inverse of [`Self::video_lane`]: the lane-th H.264 video route from the
-    /// peer to us in sorted order. Routes a `video_inbound` event to the right
-    /// console window.
+    /// Record the lane→route binding a streamer announced
+    /// ([`RouteControl::VideoLane`]) so inbound H.264 on that lane routes to
+    /// the right console window regardless of the local route order.
+    fn record_video_lane(&self, peer: &str, route_id: &str, lane: u8) {
+        let canon = pubkey_part(peer).to_string();
+        let mut binds = self.video_lane_binds.lock();
+        let per_peer = binds.entry(canon).or_default();
+        // A lane is reused only after its previous route tore down (which
+        // clears its binding), so overwriting here just records the current
+        // owner; drop any other lane that stale-pointed at this same route.
+        per_peer.retain(|l, r| *l == lane || r != route_id);
+        per_peer.insert(lane, route_id.to_string());
+    }
+
+    /// The route whose inbound video samples arrive on `lane` from `peer`.
+    /// Prefer the binding the streamer announced ([`Self::record_video_lane`])
+    /// — it's authoritative and immune to the two ends briefly disagreeing on
+    /// the route order. Fall back to the positional sort (the lane-th active
+    /// H.264 route from the peer) for a streamer that doesn't announce (an
+    /// older build), or for the brief window before its announce lands.
     fn video_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
+        let canon = pubkey_part(peer);
+        if let Some(route) = self
+            .video_lane_binds
+            .lock()
+            .get(canon)
+            .and_then(|m| m.get(&lane))
+            .cloned()
+        {
+            return Some(route);
+        }
         self.sorted_media_routes(peer, false, "h264")
             .into_iter()
             .nth(lane as usize)
@@ -3741,10 +3855,36 @@ impl Mesh {
                 route.id
             );
         }
-        if accepts_h264 && self.video_lane(&route.id, to_node, true).is_some() {
+        // Pin a track lane for this route now (lowest free in the peer's
+        // pool). A pin is what lets us tell the viewer a stable binding; no
+        // pin (pool exhausted / no daemon lane) means MJPEG, exactly as v1.
+        if accepts_h264 && self.assign_video_lane(to_node, &route.id).is_some() {
             VideoMode::H264
         } else {
             VideoMode::Mjpeg
+        }
+    }
+
+    /// Tell the viewer which video track lane this route streams on, so it
+    /// demuxes inbound H.264 by the announced binding instead of a positional
+    /// guess. No-op for an MJPEG route (no pinned lane). Best-effort: a viewer
+    /// that never hears it (older build, a dropped message) falls back to the
+    /// positional lane, exactly as before.
+    async fn announce_video_lane(&self, route_id: &str, peer: &str) {
+        let Some(lane) = self.video_lane(route_id, peer, true) else {
+            return;
+        };
+        if let Err(e) = self
+            .send_control(
+                peer,
+                &ControlMessage::Route(RouteControl::VideoLane {
+                    route_id: route_id.to_string(),
+                    lane,
+                }),
+            )
+            .await
+        {
+            tracing::debug!("announcing video lane for {route_id} failed: {e}");
         }
     }
 
@@ -6119,6 +6259,17 @@ fn node_of(cap_id: &str) -> String {
         .unwrap_or_else(|| cap_id.to_string())
 }
 
+/// Whether two node ids name the **same machine**, ignoring the display
+/// suffix ([`pubkey_part`] strips the `-<5char>` the UI appends). Routing and
+/// presence carry the bare node id, while the front-end builds a route's
+/// capability ids from the suffixed display id — so a self / loopback check
+/// (`is this route to my own machine?`) must compare canonically. A raw `==`
+/// misses a genuine self-route when the two forms differ and tries to send a
+/// local terminal out over the wire, where it never comes back.
+fn same_node(a: &str, b: &str) -> bool {
+    pubkey_part(a) == pubkey_part(b)
+}
+
 /// The device part of a capability id — everything after the node
 /// (`"<node>:cam:video0"` → `"cam:video0"`). `None` for a bare node id.
 fn device_of(cap_id: &str) -> Option<String> {
@@ -6623,6 +6774,27 @@ mod tests {
         );
         assert!(is_terminal_route(&remote));
         assert_ne!(node_of(remote.from.as_str()), node_of(remote.to.as_str()));
+    }
+
+    #[test]
+    fn loopback_is_detected_across_node_id_forms() {
+        // The regression that broke local terminals: the front-end builds the
+        // route from the *display* id (`<pubkey>-ab3d9`) while the backend's
+        // `me` is the *bare* node id (`<pubkey>`). A raw `==` sees them as
+        // different machines and tries to offer the local terminal over the
+        // wire, where it never comes back. `same_node` compares canonically.
+        let me = "k7pubkeybody";
+        let display = format!("{me}-ab3d9"); // what the UI mints ids from
+        let from = node_of(&format!("{display}:terminal"));
+        let to = node_of(&format!("{display}:term-view:1"));
+        // Raw equality misses it (the suffix differs)…
+        assert_ne!(from, me);
+        // …but the canonical self-check the loopback branches now use holds.
+        assert!(same_node(&from, me) && same_node(&to, me));
+
+        // A genuinely remote terminal stays non-loopback under the same check.
+        let host = node_of("otherpubkey-99xyz:terminal");
+        assert!(!same_node(&host, me));
     }
 
     #[test]

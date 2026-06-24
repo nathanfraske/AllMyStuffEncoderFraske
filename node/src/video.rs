@@ -743,6 +743,11 @@ fn run_capture(
         }
     };
     let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
+    // A physically-rotated monitor: most backends hand over the upright
+    // presentation image, but Windows DXGI gives the raw scan-out — the
+    // orient pass below rotates that case to match (and is a no-op for the
+    // others). `source_hint` is the monitor's reported (presentation) size.
+    let rotation_deg = monitor.rotation().map(|r| r.round() as u32).unwrap_or(0);
     let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms)?;
     let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
@@ -761,7 +766,9 @@ fn run_capture(
                         stop,
                         fps,
                         &frames,
-                        |f: crate::win_capture::RawFrame| (f.rgba, f.width, f.height),
+                        move |f: crate::win_capture::RawFrame| {
+                            orient_to_monitor(f.rgba, f.width, f.height, rotation_deg, source_hint)
+                        },
                         on_packet,
                         &mut encoder,
                         &mut stats,
@@ -818,7 +825,9 @@ fn run_capture(
                     stop,
                     fps,
                     &frames,
-                    |f: crate::wayland_capture::RawFrame| (f.rgba, f.width, f.height),
+                    move |f: crate::wayland_capture::RawFrame| {
+                        orient_to_monitor(f.rgba, f.width, f.height, rotation_deg, source_hint)
+                    },
                     on_packet,
                     &mut encoder,
                     &mut stats,
@@ -1075,6 +1084,46 @@ where
     }
 }
 
+/// Bring a captured frame upright to match a **physically-rotated** monitor.
+///
+/// Most capture backends (X11's grab, the Wayland portal, macOS
+/// AVFoundation) hand over the presentation image — already oriented the way
+/// the OS shows it and the way remote-control input is mapped against. Windows
+/// DXGI Output Duplication is the exception: it delivers the raw, *unrotated*
+/// scan-out, so a portrait monitor streamed sideways while the controls still
+/// lined up with the upright screen. We spot that case by the captured buffer
+/// being the monitor's logical size with width/height *swapped*, and rotate it
+/// upright; a backend that already presents upright has matching dimensions
+/// and passes through untouched (so applying this on every path is safe).
+///
+/// `logical` is the monitor's reported (presentation) width×height. Only the
+/// 90°/270° cases are corrected — they're the ones the dimension swap can
+/// detect unambiguously; a 180° flip can't be told from an already-upright
+/// buffer by size, and is rare enough to leave.
+fn orient_to_monitor(
+    rgba: Vec<u8>,
+    bw: u32,
+    bh: u32,
+    rotation_deg: u32,
+    logical: (u32, u32),
+) -> (Vec<u8>, u32, u32) {
+    // Clockwise quarter-turns that *undo* the display's rotation. (If a 90°
+    // monitor ever streams rotated the wrong way — the OS's rotation sign is
+    // the one thing that can't be pinned down without the hardware — swap the
+    // `1` and `3`.)
+    let turns: u8 = match rotation_deg % 360 {
+        90 => 3,
+        270 => 1,
+        _ => return (rgba, bw, bh),
+    };
+    let (lw, lh) = logical;
+    // Rotate only when the backend gave us the physical (transposed) buffer.
+    if lw == 0 || lh == 0 || bw != lh || bh != lw {
+        return (rgba, bw, bh);
+    }
+    allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns)
+}
+
 /// Stream from xcap's persistent AVFoundation capture session. Set-up
 /// happens once; frames arrive as the OS produces them — damage-driven
 /// backends send nothing while the screen is still. (Wayland rides
@@ -1094,11 +1143,13 @@ fn run_session_capture(
     let (recorder, frames) = monitor.video_recorder().map_err(|e| e.to_string())?;
     recorder.start().map_err(|e| e.to_string())?;
     tracing::info!("screen capture session started for {route_id}");
+    let rotation_deg = monitor.rotation().map(|r| r.round() as u32).unwrap_or(0);
+    let logical = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
     let result = pump_frames(
         stop,
         fps,
         &frames,
-        |f| (f.raw, f.width, f.height),
+        move |f| orient_to_monitor(f.raw, f.width, f.height, rotation_deg, logical),
         on_packet,
         encoder,
         stats,
@@ -1124,6 +1175,8 @@ fn run_oneshot_capture(
     reporter: &mut StatusReporter,
 ) -> Result<(), String> {
     let budget = Duration::from_secs(1) / fps.max(1);
+    let rotation_deg = monitor.rotation().map(|r| r.round() as u32).unwrap_or(0);
+    let logical = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
     let mut failures = 0u64;
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
@@ -1132,7 +1185,9 @@ fn run_oneshot_capture(
             .map_err(|e| e.to_string())
             .and_then(|image| {
                 let (sw, sh) = (image.width(), image.height());
-                encoder.encode(image.into_raw(), sw, sh, stats)
+                let (rgba, sw, sh) =
+                    orient_to_monitor(image.into_raw(), sw, sh, rotation_deg, logical);
+                encoder.encode(rgba, sw, sh, stats)
             });
         match outcome {
             Ok(Some(packet)) => {
