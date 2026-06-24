@@ -21,10 +21,15 @@
 //! the physical `KeyboardEvent.code` ("KeyC"). Injection assumes key
 //! *combinations* are the norm, not the exception:
 //!
-//! - Plain typing (no modifier beyond Shift held) injects the resolved
-//!   character as itself, so the *typist's* layout wins — with held
-//!   Shift, an uppercase letter injects as its base letter and the
-//!   forwarded Shift restores the case.
+//! - Plain typing with no modifier held injects the resolved character
+//!   as itself, so the *typist's* layout wins.
+//! - With Shift held the resolved character is the *shifted* one ("A",
+//!   "!", "?"), which must not be injected as itself: that would shift a
+//!   key whose unshifted face is already the symbol, and the held Shift
+//!   either doubles up or (on X11's Unicode keycode remap) lands on an
+//!   empty shift level and types nothing. Instead the unshifted keycap of
+//!   the physical key is injected and the forwarded Shift composes it —
+//!   the base letter for "A", the digit "1" for "!", just like hardware.
 //! - A chord (Ctrl/Alt/Meta held) resolves through the *physical* key:
 //!   Ctrl+C must land on the remote's C key, never on whatever character
 //!   the sender's layout composed under the held modifiers.
@@ -446,14 +451,28 @@ impl KeyTracker {
                 return Some(Key::Unicode(base));
             }
         }
-        if (combo || self.held(Key::Shift)) && c.is_uppercase() {
-            // The modifier is already held on this end — inject the base
-            // letter and let it restore the case, instead of asking the
-            // platform for a "press of 'C'" (which Windows can't express
-            // as a single virtual key).
-            let mut lower = c.to_lowercase();
-            if let (Some(l), None) = (lower.next(), lower.next()) {
-                return Some(Key::Unicode(l));
+        if combo || self.held(Key::Shift) {
+            // A modifier is already held on this end, so the character the
+            // sender's layout composed under it ("A", but also "!", "?",
+            // "@"…) must not be injected as itself: that asks the platform
+            // to *shift a key whose unshifted face is already the symbol*.
+            // On X11 the Unicode path remaps a spare keycode's unshifted
+            // level to that symbol, so with Shift held the server reads the
+            // shifted level — NoSymbol — and types nothing. That's why
+            // capitals worked (handled below) while "!" and "?" vanished.
+            // Inject the key's unshifted keycap and let the held Shift
+            // compose it, exactly as a real keyboard does.
+            if let Some(base) = code.and_then(base_char) {
+                return Some(Key::Unicode(base));
+            }
+            // No physical code (an older sender): a letter can still be
+            // de-shifted by lower-casing it; a symbol has to stand as
+            // itself and hope the modifier doesn't swallow it.
+            if c.is_uppercase() {
+                let mut lower = c.to_lowercase();
+                if let (Some(l), None) = (lower.next(), lower.next()) {
+                    return Some(Key::Unicode(l));
+                }
             }
         }
         Some(Key::Unicode(c))
@@ -597,26 +616,33 @@ mod tests {
     }
 
     #[test]
-    fn shifted_typing_injects_the_base_letter() {
+    fn shifted_typing_injects_the_unshifted_keycap() {
         let mut t = KeyTracker::default();
         assert_eq!(t.press("Shift", Some("ShiftLeft")), Some(Key::Shift));
         // The held Shift restores the case on this end.
         assert_eq!(t.resolve("A", Some("KeyA")), Some(Key::Unicode('a')));
-        // Shifted symbols keep the typist's layout (no chord here).
-        assert_eq!(t.resolve("!", Some("Digit1")), Some(Key::Unicode('!')));
+        // A shifted symbol injects its key's unshifted keycap too, so the
+        // held Shift composes the symbol — injecting "!" itself while Shift
+        // is down lands on an empty shift level on X11 and types nothing.
+        assert_eq!(t.resolve("!", Some("Digit1")), Some(Key::Unicode('1')));
+        assert_eq!(t.resolve("?", Some("Slash")), Some(Key::Unicode('/')));
+        // No physical code (older sender): a symbol can only stand as
+        // itself, but a letter is still de-shifted by lower-casing.
         assert_eq!(t.resolve("@", None), Some(Key::Unicode('@')));
+        assert_eq!(t.resolve("Z", None), Some(Key::Unicode('z')));
     }
 
     #[test]
     fn keyup_releases_what_its_keydown_pressed() {
         let mut t = KeyTracker::default();
         t.press("Shift", Some("ShiftLeft"));
-        // Shift+1 goes down as "!"…
-        assert_eq!(t.press("!", Some("Digit1")), Some(Key::Unicode('!')));
+        // Shift+1 goes down as the unshifted keycap '1' (the held Shift
+        // composes the '!' on the remote)…
+        assert_eq!(t.press("!", Some("Digit1")), Some(Key::Unicode('1')));
         assert_eq!(t.release("Shift", Some("ShiftLeft")), Some(Key::Shift));
-        // …and comes up as "1": the release must lift the '!' that went
-        // down, not a '1' that never did.
-        assert_eq!(t.release("1", Some("Digit1")), Some(Key::Unicode('!')));
+        // …and comes up as "1": the release lifts exactly the key that
+        // went down, matched by its physical code regardless of the char.
+        assert_eq!(t.release("1", Some("Digit1")), Some(Key::Unicode('1')));
         assert!(t.pressed.is_empty());
         // A keyup nothing matches (older sender) still resolves fresh.
         assert_eq!(t.release("a", Some("KeyA")), Some(Key::Unicode('a')));
