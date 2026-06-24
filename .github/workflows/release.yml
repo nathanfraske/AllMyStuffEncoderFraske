@@ -346,7 +346,8 @@ jobs:
           set -e
           mkdir -p signing
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir signing \
-            --pattern 'allmystuff-*.tar.gz' --pattern 'allmystuff-*.zip'
+            --pattern 'allmystuff-*.tar.gz' --pattern 'allmystuff-*.zip' \
+            --pattern 'amst-*.tar.gz' --pattern 'amst-*.zip'
 
       - name: Sign and upload signatures
         if: steps.gate.outputs.enabled == 'true'
@@ -361,8 +362,8 @@ jobs:
           shopt -s nullglob
           # Password-less CI key (see RELEASE-SIGNING.md): no prompt, </dev/null
           # guards against ever hanging on one.
-          for f in allmystuff-*.tar.gz allmystuff-*.zip; do
+          for f in allmystuff-*.tar.gz allmystuff-*.zip amst-*.tar.gz amst-*.zip; do
             minisign -S -s minisign.key -m "$f" -x "$f.minisig" </dev/null
           done
           rm -f minisign.key
-          gh release upload "$TAG" allmystuff-*.minisig --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" allmystuff-*.minisig amst-*.minisig --repo "$GITHUB_REPOSITORY" --clobber
