@@ -35,6 +35,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_ROTATE90,
+};
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -45,6 +48,10 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Authoritative clockwise rotation of the scan-out, normalized to
+    /// {0,90,180,270}. From `DXGI_OUTDUPL_DESC.Rotation`, read once per
+    /// duplication. The raw buffer is rotated by THIS to become upright.
+    pub rotation_deg: u32,
 }
 
 /// A running duplication session. Dropping it stops the thread — really
@@ -144,6 +151,11 @@ struct Duplication {
     dup: IDXGIOutputDuplication,
     /// CPU-readable copy target, reused across frames of the same size.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// Clockwise degrees from `DXGI_OUTDUPL_DESC.Rotation`, read at
+    /// construction; fixed for the duplication's lifetime. A mode change
+    /// kills the duplication with ACCESS_LOST and pump rebuilds it, so the
+    /// rebuilt one re-reads the (possibly new) orientation for free.
+    rotation_deg: u32,
 }
 
 impl Duplication {
@@ -186,11 +198,25 @@ impl Duplication {
                 let dup = output1
                     .DuplicateOutput(&device)
                     .map_err(|e| format!("DuplicateOutput: {e}"))?;
+                // The duplicated output's own rotation is the ground truth for
+                // how its raw scan-out is oriented — far more reliable than a
+                // separate monitor-rotation query, which can report the native
+                // (unrotated) geometry. Read it once: it's fixed for the
+                // duplication's life, and an orientation change tears the
+                // duplication down with ACCESS_LOST (pump re-acquires, re-reads
+                // it on the fresh one). GetDesc is infallible and by-value.
+                let rotation_deg = match dup.GetDesc().Rotation {
+                    DXGI_MODE_ROTATION_ROTATE90 => 90,
+                    DXGI_MODE_ROTATION_ROTATE180 => 180,
+                    DXGI_MODE_ROTATION_ROTATE270 => 270,
+                    _ => 0, // IDENTITY / UNSPECIFIED / anything else: upright.
+                };
                 return Ok(Duplication {
                     _device: device,
                     context,
                     dup,
                     staging: None,
+                    rotation_deg,
                 });
             }
         }
@@ -264,6 +290,7 @@ impl Duplication {
             rgba,
             width: w,
             height: h,
+            rotation_deg: self.rotation_deg,
         }))
     }
 

@@ -128,6 +128,28 @@ mod tests {
     }
 
     #[test]
+    fn dxgi_rotation_enum_maps_to_clockwise_turns() {
+        // DXGI_OUTDUPL_DESC.Rotation enum values: UNSPECIFIED=0, IDENTITY=1,
+        // ROTATE90=2, ROTATE180=3, ROTATE270=4. To bring the raw native
+        // scan-out upright, rotate clockwise by `max(0, enum-1)` turns — the
+        // mapping win_capture encodes as degrees (90→1, 180→2, 270→3) and the
+        // operator orient_to_monitor applies. Asserted here, in the shared
+        // crate, since the live DXGI constants are Windows-only.
+        let enum_to_turns = |e: i32| -> u8 { (e.saturating_sub(1).max(0) as u8) & 3 };
+        assert_eq!(enum_to_turns(0), 0, "UNSPECIFIED → 0");
+        assert_eq!(enum_to_turns(1), 0, "IDENTITY → 0");
+        assert_eq!(enum_to_turns(2), 1, "ROTATE90 → 1 CW");
+        assert_eq!(enum_to_turns(3), 2, "ROTATE180 → 2");
+        assert_eq!(enum_to_turns(4), 3, "ROTATE270 → 3 CW");
+
+        // And those turn counts produce the expected dim behavior on a 4×2.
+        let buf: Vec<u8> = (0..(4 * 2 * 4)).map(|i| i as u8).collect();
+        assert_eq!(rotate_rgba(&buf, 4, 2, enum_to_turns(2)).1, 2); // 90 → w becomes 2
+        assert_eq!(rotate_rgba(&buf, 4, 2, enum_to_turns(3)).1, 4); // 180 → w stays 4
+        assert_eq!(rotate_rgba(&buf, 4, 2, enum_to_turns(4)).1, 2); // 270 → w becomes 2
+    }
+
+    #[test]
     fn scale_rgba_samples_the_right_pixels() {
         // 2x1 image: red then blue. Downscale to 1x1 keeps the left pixel.
         let src = [255, 0, 0, 255, 0, 0, 255, 255];
