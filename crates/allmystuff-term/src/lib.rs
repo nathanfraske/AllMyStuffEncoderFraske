@@ -21,9 +21,6 @@
 //! this machine onto the mesh and drop you into a shell on it. Reaching another
 //! machine needs it to be online and yours (owner or same fleet) — the same
 //! rule the desktop app's terminal enforces, re-checked on the far side.
-//!
-//! The same code backs `allmystuff term` / `allmystuff amst` (see the CLI), so
-//! the standalone binary and the subcommand are one feature.
 
 mod attach;
 mod client;

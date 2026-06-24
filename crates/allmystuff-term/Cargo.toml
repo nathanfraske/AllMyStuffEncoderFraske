@@ -8,8 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-# The standalone `amst` command. The same library also backs `allmystuff term`
-# (the CLI links this crate and calls `run`), so the two are one feature.
+# The standalone `amst` command — a thin shim over the library's `run`.
 [[bin]]
 name = "amst"
 path = "src/main.rs"
