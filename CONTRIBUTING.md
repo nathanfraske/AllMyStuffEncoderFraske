@@ -62,6 +62,32 @@ allmystuff service status   # installed / enabled / running (also: start|stop|re
 allmystuff service --system install  # …as a boot service, system-wide (needs root)
 ```
 
+### AMSTerm (`amst`)
+
+`amst` is the **AllMyStuff terminal** — a separate, self-contained program
+(crate `allmystuff-term`, binary `amst`): a real shell on any machine you own,
+over the mesh, with no SSH daemon, keys, or port forwarding. It's the
+command-line twin of the desktop app's "Open Terminal", with your own terminal
+standing in for the emulator.
+
+```sh
+amst                       # open a shell on THIS machine (a session your fleet can attach to)
+amst nas-01                # open a shell on the machine called nas-01
+amst --list                # the machines you can open a terminal on
+amst nas-01 --sessions     # nas-01's open shells (to --attach)
+amst nas-01 --attach term-3  # join nas-01's existing shell `term-3` (shared, tmux-style)
+amst --cwd /path           # start the local shell in /path ("open a terminal here")
+```
+
+It's a thin client of this machine's node and starts one itself if none is
+running (`allmystuff-serve`), so a bare `amst` is enough to bring this machine
+onto the mesh and drop you into a shell on it. Reaching another machine needs it
+online and yours (owner or same fleet) — the same rule the desktop app's
+terminal enforces. It ships and installs on its own (`scripts/install-amst.sh` /
+`install-amst.ps1`), which also adds the app launcher / shortcuts / "AMSTerm
+here" context menu. From a source checkout: `cargo run -p allmystuff-term --bin
+amst -- <args>` (or `just term <args>`).
+
 `serve` / `service` run the headless node — see [The headless node](#the-headless-node)
 below. From a source checkout, `cargo run -p allmystuff-cli -- <cmd>`. A real
 inventory of the machine this was built on:

@@ -454,27 +454,72 @@ async fn terminal_sessions(
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
+/// Open a secondary app window (terminal / files / console / room / video) —
+/// or focus the existing one with this `label` — and stamp the freshly built
+/// window with its own taskbar identity. **Every** secondary window is built
+/// through here so the identity step can't be forgotten: `aumid` is a required
+/// argument (see [`set_taskbar_identity`]), applied to each new window at
+/// creation. A future window kind just calls this with its own `AUMID_*`.
+fn open_secondary_window(
+    app: &tauri::AppHandle,
+    label: &str,
+    url: String,
+    title: &str,
+    inner_size: (f64, f64),
+    min_inner_size: (f64, f64),
+    aumid: &str,
+) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(label) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(inner_size.0, inner_size.1)
+        .min_inner_size(min_inner_size.0, min_inner_size.1)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if let Some(w) = app.get_webview_window(label) {
+        set_taskbar_identity(&w, aumid);
+    }
+    Ok(())
+}
+
 /// Open (or focus) the dedicated terminal window for `node` — one OS
 /// window per machine, holding that machine's terminal tabs. The window
 /// loads the same app with `?terminal=<node>`.
 #[tauri::command]
-async fn open_terminal_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
-    let label = format!("terminal-{}", window_slug(&node));
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(
+async fn open_terminal_window(
+    app: tauri::AppHandle,
+    node: String,
+    attach: Option<String>,
+) -> Result<(), String> {
+    // A plain terminal window is one-per-machine (`terminal-<node>`); a
+    // *popped-out* tab attaches to a specific shared session and gets its own
+    // window keyed by that session (`terminal-<node>-<session>`), so two
+    // pop-outs never collide and re-popping the same shell just refocuses it.
+    let (label, url) = match &attach {
+        Some(session) => (
+            format!("terminal-{}-{}", window_slug(&node), window_slug(session)),
+            format!(
+                "index.html?terminal={node}&attach={}",
+                query_encode(session)
+            ),
+        ),
+        None => (
+            format!("terminal-{}", window_slug(&node)),
+            format!("index.html?terminal={node}"),
+        ),
+    };
+    open_secondary_window(
         &app,
         &label,
-        tauri::WebviewUrl::App(format!("index.html?terminal={node}").into()),
+        url,
+        "AllMyStuff terminal",
+        (940.0, 600.0),
+        (480.0, 320.0),
+        AUMID_TERMINAL,
     )
-    .title("AllMyStuff terminal")
-    .inner_size(940.0, 600.0)
-    .min_inner_size(480.0, 320.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 // ---- files (the mesh-native file manager) -------------------------------
@@ -573,22 +618,15 @@ async fn file_download(
 /// same app with `?files=<node>`.
 #[tauri::command]
 async fn open_files_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
-    let label = format!("files-{}", window_slug(&node));
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(
+    open_secondary_window(
         &app,
-        &label,
-        tauri::WebviewUrl::App(format!("index.html?files={node}").into()),
+        &format!("files-{}", window_slug(&node)),
+        format!("index.html?files={node}"),
+        "AllMyStuff files",
+        (940.0, 640.0),
+        (480.0, 320.0),
+        AUMID_FILES,
     )
-    .title("AllMyStuff files")
-    .inner_size(940.0, 640.0)
-    .min_inner_size(480.0, 320.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 // ---- sites (the reverse proxy) -----------------------------------------
@@ -708,22 +746,15 @@ async fn site_remote_set_exposed(
 /// console for that machine.
 #[tauri::command]
 async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), String> {
-    let label = format!("console-{}", window_slug(&node));
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(
+    open_secondary_window(
         &app,
-        &label,
-        tauri::WebviewUrl::App(format!("index.html?console={node}").into()),
+        &format!("console-{}", window_slug(&node)),
+        format!("index.html?console={node}"),
+        "AllMyStuff console",
+        (1100.0, 740.0),
+        (560.0, 380.0),
+        AUMID_CONSOLE,
     )
-    .title("AllMyStuff console")
-    .inner_size(1100.0, 740.0)
-    .min_inner_size(560.0, 380.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// Open (or focus) the dedicated window for one virtual room — the call
@@ -732,22 +763,15 @@ async fn open_console_window(app: tauri::AppHandle, node: String) -> Result<(), 
 /// loads the same app with `?room=<room id>`.
 #[tauri::command]
 async fn open_room_window(app: tauri::AppHandle, room: String) -> Result<(), String> {
-    let label = format!("room-{}", window_slug(&room));
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(
+    open_secondary_window(
         &app,
-        &label,
-        tauri::WebviewUrl::App(format!("index.html?room={room}").into()),
+        &format!("room-{}", window_slug(&room)),
+        format!("index.html?room={room}"),
+        "AllMyStuff room",
+        (1180.0, 760.0),
+        (640.0, 440.0),
+        AUMID_ROOM,
     )
-    .title("AllMyStuff room")
-    .inner_size(1180.0, 760.0)
-    .min_inner_size(640.0, 440.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// Open (or focus) the popout window for one video stream — a console
@@ -763,24 +787,17 @@ async fn open_video_window(
     key: String,
     title: String,
 ) -> Result<(), String> {
-    let label = format!("video-{}", window_slug(&key));
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(
+    open_secondary_window(
         &app,
-        &label,
+        &format!("video-{}", window_slug(&key)),
         // The key carries capability/route ids (colons, the route arrow) —
         // percent-encode so the query survives; URLSearchParams decodes.
-        tauri::WebviewUrl::App(format!("index.html?video={}", query_encode(&key)).into()),
+        format!("index.html?video={}", query_encode(&key)),
+        &title,
+        (880.0, 560.0),
+        (380.0, 260.0),
+        AUMID_VIDEO,
     )
-    .title(&title)
-    .inner_size(880.0, 560.0)
-    .min_inner_size(380.0, 260.0)
-    .build()
-    .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// A node id reduced to the characters Tauri allows in a window label —
@@ -809,6 +826,102 @@ fn query_encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+// AppUserModelIDs for the secondary windows, so each *kind* groups under its own
+// taskbar button rather than stacking under the main app — terminals together,
+// files together, and so on, each separately pinnable. The main window keeps the
+// process default. The strings are stable identities (Windows keys pins and
+// grouping off them); they are not the bundle identifier on purpose. Referenced
+// on every platform (the call sites pass them), used only on Windows.
+const AUMID_TERMINAL: &str = "works.allmystuff.terminal";
+const AUMID_CONSOLE: &str = "works.allmystuff.console";
+const AUMID_FILES: &str = "works.allmystuff.files";
+const AUMID_ROOM: &str = "works.allmystuff.room";
+const AUMID_VIDEO: &str = "works.allmystuff.video";
+
+/// Give a secondary window its own taskbar identity (an explicit per-window
+/// AppUserModelID) so it groups separately from the main AllMyStuff app and is
+/// separately pinnable. Windows only — a no-op everywhere else. Best-effort: a
+/// failure just leaves the window on the default grouping, never an error.
+///
+/// Per-window (not per-process) is the point: every Tauri window lives in one
+/// process, so `SetCurrentProcessExplicitAppUserModelID` can't separate them —
+/// only the window's shell property store (`PKEY_AppUserModel_ID`) can. The HWND
+/// is bridged through its raw pointer because Tauri links an older `windows`
+/// crate than this GUI does, so their `HWND` types differ.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn set_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
+    #[cfg(windows)]
+    {
+        use windows::core::{GUID, PWSTR};
+        use windows::Win32::Foundation::{HWND, PROPERTYKEY};
+        use windows::Win32::System::Com::StructuredStorage::{
+            PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+        };
+        use windows::Win32::System::Variant::VT_LPWSTR;
+        use windows::Win32::UI::Shell::PropertiesSystem::{
+            IPropertyStore, SHGetPropertyStoreForWindow,
+        };
+
+        // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5.
+        const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
+            fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+            pid: 5,
+        };
+
+        // Tauri links an older `windows` crate than this GUI, so its `HWND` is a
+        // different type — bridge through the raw pointer. The `as *mut c_void`
+        // is a no-op on the currently pinned crate pair (clippy would flag it),
+        // but it's kept on purpose: if Tauri's `HWND` ever reverts to an `isize`
+        // representation the cast is what keeps this compiling.
+        #[allow(clippy::unnecessary_cast)]
+        let raw = match window.hwnd() {
+            Ok(h) => h.0 as *mut core::ffi::c_void,
+            Err(e) => {
+                tracing::warn!("taskbar identity: no window handle ({e})");
+                return;
+            }
+        };
+
+        // A null-terminated wide copy of the id; it must outlive `SetValue`,
+        // which copies the string into the store (see the `drop` at the end).
+        let mut wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+        // A VT_LPWSTR PROPVARIANT pointing at `wide`. windows 0.61 has no string
+        // constructor for the structured-storage PROPVARIANT, so build it by
+        // hand. `ManuallyDrop` (and *not* calling `PropVariantClear`) is
+        // deliberate: the buffer is ours (a `Vec`), not COM-allocated.
+        let value = PROPVARIANT {
+            Anonymous: PROPVARIANT_0 {
+                Anonymous: core::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
+                    vt: VT_LPWSTR,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: PROPVARIANT_0_0_0 {
+                        pwszVal: PWSTR(wide.as_mut_ptr()),
+                    },
+                }),
+            },
+        };
+
+        unsafe {
+            let store: IPropertyStore = match SHGetPropertyStoreForWindow(HWND(raw)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("taskbar identity: property store unavailable ({e})");
+                    return;
+                }
+            };
+            if store.SetValue(&PKEY_APPUSERMODEL_ID, &value).is_ok() {
+                let _ = store.Commit();
+            }
+        }
+        // Keep `wide` alive past `SetValue` (its raw pointer rode inside
+        // `value`); a raw pointer creates no borrow, so without this the buffer
+        // could be freed before the store reads it.
+        drop(wide);
+    }
 }
 
 /// Current peers + live route states.
@@ -909,7 +1022,10 @@ async fn fleet_revoke_role(
 ) -> Result<(), String> {
     state
         .node
-        .request("fleet_revoke_role", json!({ "device": device, "code": code }))
+        .request(
+            "fleet_revoke_role",
+            json!({ "device": device, "code": code }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())

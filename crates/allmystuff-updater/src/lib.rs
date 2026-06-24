@@ -16,8 +16,11 @@
 //!     the mesh *and the one that advertises this node's version to peers*
 //!     (`node`'s `CARGO_PKG_VERSION`), so leaving it behind is what makes an
 //!     "update" look like it did nothing.
+//!   * `amst`              — the standalone mesh terminal (AMSTerm). Its asset
+//!     stem is `amst` (not `allmystuff-amst`); like the GUI/node it's a
+//!     best-effort half, refreshed only when it's actually installed here.
 //!
-//! Those three **binaries** are the only artifacts — every **library** crate
+//! Those four **binaries** are the only artifacts — every **library** crate
 //! (`allmystuff-service`, `allmystuff-graph`, …) is statically linked into
 //! them, so swapping the binaries carries every library change with it; a new
 //! lib never needs its own updater wiring. The desktop app additionally bundles
@@ -319,7 +322,7 @@ fn current_version() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Artifacts: the two binaries we ship.
+// Artifacts: the binaries we ship.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,11 +330,17 @@ enum ArtifactKind {
     Cli,
     Gui,
     Serve,
+    Amst,
 }
 
-/// Every artifact a release ships, in apply order (the required CLI first).
-const ALL_ARTIFACTS: [ArtifactKind; 3] =
-    [ArtifactKind::Cli, ArtifactKind::Gui, ArtifactKind::Serve];
+/// Every artifact a release ships, in apply order (the required CLI first,
+/// then the best-effort halves).
+const ALL_ARTIFACTS: [ArtifactKind; 4] = [
+    ArtifactKind::Cli,
+    ArtifactKind::Gui,
+    ArtifactKind::Serve,
+    ArtifactKind::Amst,
+];
 
 impl ArtifactKind {
     fn as_str(self) -> &'static str {
@@ -339,6 +348,7 @@ impl ArtifactKind {
             ArtifactKind::Cli => "cli",
             ArtifactKind::Gui => "gui",
             ArtifactKind::Serve => "serve",
+            ArtifactKind::Amst => "amst",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -346,15 +356,19 @@ impl ArtifactKind {
             "cli" => Some(ArtifactKind::Cli),
             "gui" => Some(ArtifactKind::Gui),
             "serve" => Some(ArtifactKind::Serve),
+            "amst" => Some(ArtifactKind::Amst),
             _ => None,
         }
     }
-    /// Release-asset stem — `allmystuff` / `allmystuff-gui` / `allmystuff-serve`.
+    /// Release-asset stem — `allmystuff` / `allmystuff-gui` / `allmystuff-serve`
+    /// / `amst`. Note `amst` breaks the `allmystuff-*` pattern (it ships under
+    /// its own short name), so this must stay explicit per kind.
     fn asset_stem(self) -> &'static str {
         match self {
             ArtifactKind::Cli => "allmystuff",
             ArtifactKind::Gui => "allmystuff-gui",
             ArtifactKind::Serve => "allmystuff-serve",
+            ArtifactKind::Amst => "amst",
         }
     }
     fn bin_name(self) -> &'static str {
@@ -363,6 +377,7 @@ impl ArtifactKind {
                 ArtifactKind::Cli => "allmystuff.exe",
                 ArtifactKind::Gui => "allmystuff-gui.exe",
                 ArtifactKind::Serve => "allmystuff-serve.exe",
+                ArtifactKind::Amst => "amst.exe",
             }
         } else {
             self.asset_stem()
@@ -376,6 +391,9 @@ impl ArtifactKind {
             ArtifactKind::Cli => None,
             ArtifactKind::Gui => Some("ALLMYSTUFF_GUI_BIN"),
             ArtifactKind::Serve => Some("ALLMYSTUFF_SERVE_BIN"),
+            // amst has no launcher/sidecar that pins a custom path; it's found
+            // as a sibling of the running binary or on PATH (installed_path).
+            ArtifactKind::Amst => None,
         }
     }
     /// The CLI is the half whose failure must not be swallowed — it's the
@@ -1433,9 +1451,19 @@ mod tests {
         let stems: Vec<_> = ALL_ARTIFACTS.iter().map(|k| k.asset_stem()).collect();
         assert_eq!(
             stems,
-            vec!["allmystuff", "allmystuff-gui", "allmystuff-serve"]
+            vec!["allmystuff", "allmystuff-gui", "allmystuff-serve", "amst"]
         );
         assert!(ALL_ARTIFACTS.contains(&ArtifactKind::Serve));
+        assert!(ALL_ARTIFACTS.contains(&ArtifactKind::Amst));
+
+        // amst ships under its own short stem, not `allmystuff-amst`.
+        let amst = platform_asset(ArtifactKind::Amst.asset_stem());
+        assert!(amst.starts_with("amst-"));
+        assert_eq!(
+            ArtifactKind::Amst.bin_name(),
+            if cfg!(windows) { "amst.exe" } else { "amst" }
+        );
+        assert!(!ArtifactKind::Amst.is_required());
 
         let serve = platform_asset(ArtifactKind::Serve.asset_stem());
         assert!(serve.starts_with("allmystuff-serve-"));

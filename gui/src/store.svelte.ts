@@ -2565,6 +2565,18 @@ class AppStore {
     this.terminalNodeId = null;
   }
 
+  /** Pop a terminal tab out into its own window — the terminal twin of a
+   *  video feed's pop-out. The shell lives on the host (tmux-style
+   *  multi-attach), so we just open a fresh terminal window for `hostNodeId`
+   *  whose first tab *attaches* to that same `session`; the caller closes the
+   *  originating tab, which detaches this viewer while the shell (and its
+   *  scrollback) carries straight on in the new window. Desktop only — a
+   *  popped-out window is an OS window, which the web preview can't open. */
+  popOutTerminal(hostNodeId: string, session: string) {
+    if (!isTauri()) return;
+    void openTerminalWindow(hostNodeId, session);
+  }
+
   /** Open one terminal *session* (a tab) to `hostNodeId`: a generic route
    *  from the host's `…:terminal` endpoint to a viewer endpoint minted for
    *  this tab — unique endpoint, unique route id, so tabs to one machine

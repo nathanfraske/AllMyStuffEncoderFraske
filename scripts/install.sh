@@ -5,10 +5,12 @@
 #   1. Download a pre-built release binary from GitHub for the current platform.
 #   2. Fall back to building from source via cargo.
 #
-# Installs both the `allmystuff` CLI and the `allmystuff-gui` desktop
-# app (the app is small and makes a bare `allmystuff` open it — pass
-# --no-gui for a CLI-only install on a headless box), then makes sure
-# the `myownmesh` daemon the app's live mode runs on is in place:
+# Installs the `allmystuff` CLI, the `allmystuff-gui` desktop app (the app
+# is small and makes a bare `allmystuff` open it — pass --no-gui for a
+# CLI-only install on a headless box), and the standalone `amst` mesh
+# terminal (`amst <machine>` opens a shell on any machine you own; --no-amst
+# to skip), then makes sure the `myownmesh` daemon the app's live mode runs
+# on is in place:
 #
 #   * an installed daemon that's new enough (>= the version pinned in
 #     .myownmesh-rev) is used as-is;
@@ -39,6 +41,9 @@ PREFIX_DIR="${ALLMYSTUFF_PREFIX:-}"
 FORCE_SOURCE=false
 INSTALL_GUI=true
 INSTALL_MESH=true
+INSTALL_AMST=true
+# Set by build_from_source so amst can reuse the same checkout/clone.
+REPO_DIR=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -46,6 +51,7 @@ for arg in "$@"; do
     --from-source) FORCE_SOURCE=true ;;
     --no-gui)      INSTALL_GUI=false ;;
     --no-mesh)     INSTALL_MESH=false ;;
+    --no-amst)     INSTALL_AMST=false ;;
     --prefix=*)    PREFIX_DIR="${arg#*=}" ;;
     *) ;;
   esac
@@ -70,6 +76,7 @@ esac
 ASSET="allmystuff-${OS}-${ARCH}.tar.gz"
 GUI_ASSET="allmystuff-gui-${OS}-${ARCH}.tar.gz"
 SERVE_ASSET="allmystuff-serve-${OS}-${ARCH}.tar.gz"
+AMST_ASSET="amst-${OS}-${ARCH}.tar.gz"
 MESH_ASSET="myownmesh-${OS}-${ARCH}.tar.gz"
 
 # Pick install prefix. Prefer /usr/local/bin if writable (or sudo is cached);
@@ -113,6 +120,17 @@ install_serve_binary() {
     sudo install -m 0755 "$src" "$PREFIX_DIR/allmystuff-serve"
   fi
   log "Installed: $PREFIX_DIR/allmystuff-serve"
+}
+
+install_amst_binary() {
+  src="$1"
+  mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
+  if [ -w "$PREFIX_DIR" ]; then
+    install -m 0755 "$src" "$PREFIX_DIR/amst"
+  else
+    sudo install -m 0755 "$src" "$PREFIX_DIR/amst"
+  fi
+  log "Installed: $PREFIX_DIR/amst"
 }
 
 ensure_on_path() {
@@ -308,6 +326,76 @@ try_release_serve() {
   _cleanup_try_serve
   trap - EXIT INT TERM
   return 0
+}
+
+_TRY_AMST_TMP=""
+_cleanup_try_amst() {
+  if [ -n "$_TRY_AMST_TMP" ] && [ -d "$_TRY_AMST_TMP" ]; then
+    rm -rf "$_TRY_AMST_TMP"
+  fi
+  _TRY_AMST_TMP=""
+}
+
+# Best-effort amst (AMSTerm) install: fetch the portable `amst` tarball and
+# drop it next to the CLI — the standalone mesh terminal (`amst <machine>`
+# opens a shell on a machine you own). Returns non-zero (without aborting the
+# overall install) if the asset is missing — an older release may predate it.
+# This installs only the binary; the app launcher and the "AMSTerm here"
+# right-click menu are scripts/install-amst's job.
+try_release_amst() {
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+  api="https://api.github.com/repos/${REPO}/releases/latest"
+  if ! json="$(curl -fsSL "$api" 2>/dev/null)"; then
+    warn "GitHub releases unreachable; skipping amst."
+    return 1
+  fi
+  url="$(printf '%s' "$json" | grep -Eo "https://[^\"]+/${AMST_ASSET}" | head -n1 || true)"
+  if [ -z "$url" ]; then
+    warn "No amst asset matched ${AMST_ASSET} in the latest release."
+    return 1
+  fi
+  sha_url="${url}.sha256"
+  log "Downloading $url"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "(dry-run) would download $url"
+    return 0
+  fi
+  _TRY_AMST_TMP="$(mktemp -d)"
+  trap _cleanup_try_amst EXIT INT TERM
+  curl -fsSL "$url" -o "$_TRY_AMST_TMP/$AMST_ASSET"
+  if curl -fsSL "$sha_url" -o "$_TRY_AMST_TMP/$AMST_ASSET.sha256" 2>/dev/null; then
+    if ! (cd "$_TRY_AMST_TMP" && (sha256sum -c "$AMST_ASSET.sha256" 2>/dev/null || shasum -a 256 -c "$AMST_ASSET.sha256")); then
+      warn "SHA256 verification failed for $AMST_ASSET — not installing amst."
+      _cleanup_try_amst
+      trap - EXIT INT TERM
+      return 1
+    fi
+  else
+    warn "No SHA256 sidecar for amst; skipping integrity check."
+  fi
+  tar -xzf "$_TRY_AMST_TMP/$AMST_ASSET" -C "$_TRY_AMST_TMP"
+  install_amst_binary "$_TRY_AMST_TMP/amst"
+  _cleanup_try_amst
+  trap - EXIT INT TERM
+  return 0
+}
+
+# amst builds with a plain `cargo build --release --bin amst` — no media or
+# Tauri toolchain — so unlike the GUI/node it can be built from source here
+# too. Reuses the checkout build_from_source already resolved (REPO_DIR).
+build_amst_from_source() {
+  if [ -z "$REPO_DIR" ]; then
+    return 1
+  fi
+  log "Building amst from source…"
+  ( cd "$REPO_DIR" && cargo build --release --bin amst ) || return 1
+  built="$REPO_DIR/target/release/amst"
+  if [ ! -x "$built" ]; then
+    return 1
+  fi
+  install_amst_binary "$built"
 }
 
 # ---------------------------------------------------------------------------
@@ -519,6 +607,8 @@ build_from_source() {
       git clone --depth 1 "https://github.com/${REPO}.git" "$repo_dir"
     fi
   fi
+  # Expose the resolved source dir so amst can build from the same checkout.
+  REPO_DIR="$repo_dir"
   if [ "$DRY_RUN" = "true" ]; then
     log "(dry-run) would build in $repo_dir"
     return 0
@@ -578,6 +668,35 @@ else
   warn "Build it with:  cargo build --release --manifest-path node/Cargo.toml"
 fi
 
+# AMSTerm (amst) — the standalone mesh terminal: a shell on any machine you
+# own, from your own terminal. On by default (--no-amst skips it). Unlike the
+# GUI/node it installs in BOTH paths: the portable binary on a release install,
+# or `cargo build --bin amst` from source (it needs no media/Tauri toolchain).
+# Only the binary lands here; the app launcher and "AMSTerm here" right-click
+# menu are scripts/install-amst's job.
+AMST_INSTALLED=false
+if [ "$INSTALL_AMST" != "true" ]; then
+  log "Skipping AMSTerm (--no-amst)."
+elif [ "$DRY_RUN" = "true" ]; then
+  if [ "$INSTALLED_FROM_RELEASE" = "true" ]; then
+    log "(dry-run) would install the amst binary ($AMST_ASSET) next to allmystuff"
+  else
+    log "(dry-run) would build and install amst from source (cargo build --bin amst)"
+  fi
+elif [ "$INSTALLED_FROM_RELEASE" = "true" ]; then
+  if try_release_amst; then
+    AMST_INSTALLED=true
+  else
+    warn "amst not installed from the release; for it on its own use scripts/install-amst.sh."
+  fi
+else
+  if build_amst_from_source; then
+    AMST_INSTALLED=true
+  else
+    warn "Couldn't build amst from source; install it separately: scripts/install-amst.sh --from-source"
+  fi
+fi
+
 # Mesh daemon — see the block above ensure_mesh for the rules. Both the
 # desktop app *and* the headless node (`allmystuff serve`) run on it, so it's
 # installed whenever either of them is; a from-source build skips it (a GUI
@@ -610,6 +729,10 @@ if [ "$SERVE_INSTALLED" = "true" ] || [ "$DRY_RUN" = "true" ]; then
   log "  allmystuff serve           # run this machine on the mesh, headless (no GUI)"
   log "  allmystuff service install # …and keep it running across reboots (one service runs"
   log "                             # both the node and the myownmesh daemon)"
+fi
+if [ "$AMST_INSTALLED" = "true" ] || [ "$DRY_RUN" = "true" ]; then
+  log "  amst                       # open a shell on THIS machine over the mesh (AMSTerm)"
+  log "  amst <machine>             # …or on another machine you own (amst --list to see them)"
 fi
 if [ "$INSTALL_GUI" = "true" ]; then
   log ""

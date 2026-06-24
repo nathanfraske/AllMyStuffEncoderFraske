@@ -29,7 +29,10 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   one tab per monitor. Keyboard and mouse pass through, so a remote machine
   works as if you were sitting at it.
 - **Remote shell.** Open a real terminal on any of your machines. No SSH daemon,
-  keys, or port forwarding to set up — it runs over the mesh.
+  keys, or port forwarding to set up — it runs over the mesh. There's also a
+  standalone command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
+  you into a shell on any machine you own, right from your own terminal, and a
+  bare `amst` opens one on this machine. It installs on its own (see below).
 - **File access.** Browse, preview, and transfer files between machines.
   Downloads land straight on your disk; nothing routes through a third party.
 - **Automatic discovery.** Each machine reports its hardware and attached
@@ -60,6 +63,28 @@ desktop app to your `PATH`, and sets up the [MyOwnMesh](https://github.com/mrjee
 daemon the app runs on. Pre-built bundles (`.dmg`, `.msi`, `.deb`, `.AppImage`)
 and portable archives are on the
 [releases page](https://github.com/mrjeeves/AllMyStuff/releases).
+
+### AMSTerm (`amst`) — the terminal, on its own
+
+**AMSTerm** is the command-line terminal as a standalone program — a real shell
+on any machine you own, over the mesh. It installs separately (it's the same
+build, just its own small binary):
+
+```sh
+# macOS and Linux
+curl -fsSL https://allmystuff.works/install-amst.sh | sh
+```
+
+```powershell
+# Windows
+irm https://allmystuff.works/install-amst.ps1 | iex
+```
+
+This drops the `amst` command on your `PATH`, adds an **AMSTerm** app launcher
+(and, on Windows, a desktop + Start Menu shortcut and an **"AMSTerm here"**
+right-click menu on folders). `amst` is a client of this machine's AllMyStuff
+node and starts one itself if `allmystuff-serve` is installed — so install
+AllMyStuff too if you want to reach other machines.
 
 ## Getting started
 

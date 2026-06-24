@@ -13,7 +13,7 @@
   // that are perfectly yours a beat later.
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
-  import { setWindowTitle } from "../tauri";
+  import { setWindowTitle, terminalAttachTarget } from "../tauri";
   import { displayName, isAppNode } from "../types";
   import Terminal from "./Terminal.svelte";
   import Toasts from "./Toasts.svelte";
@@ -21,6 +21,11 @@
   let { target }: { target: string } = $props();
 
   const node = $derived(app.machineByAnyId(target));
+
+  // When this window was opened as a popped-out tab (`?attach=<session>`), its
+  // first tab joins that shared shell instead of minting a fresh one. Read once
+  // — it's fixed for the window's lifetime.
+  const initialAttach = terminalAttachTarget();
 
   const stage = $derived.by(() => {
     const n = node;
@@ -44,7 +49,7 @@
 <div class="host">
   {#if stage === "ready" && node}
     {#key node.id}
-      <Terminal host={node.id} windowed={true} />
+      <Terminal host={node.id} windowed={true} {initialAttach} />
     {/key}
   {:else if stage === "unsupported"}
     <div class="notice">

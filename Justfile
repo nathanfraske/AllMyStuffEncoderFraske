@@ -73,6 +73,11 @@ scan:
 caps:
     @cargo run -p allmystuff-cli -- capabilities
 
+# Open a mesh terminal (`amst`) from source — a shell on a machine you own.
+# No MACHINE opens one on this machine; needs a node running (`just serve`).
+term *ARGS:
+    @cargo run -p allmystuff-term --bin amst -- {{ARGS}}
+
 # Run this machine on the mesh, headless (the node `allmystuff serve` runs).
 # Builds from the node workspace and spawns the myownmesh daemon itself.
 serve *ARGS:
