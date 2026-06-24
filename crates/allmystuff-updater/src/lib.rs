@@ -726,23 +726,36 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     let latest = release_tag(&release)?;
     let current = current_version().to_string();
 
-    if compare_semver(&current, &latest) != std::cmp::Ordering::Less {
+    // Which halves are behind `latest` — the CLI gauged by the running binary's
+    // version, each installed sibling (GUI, node) by its recorded stamp. Gating
+    // on *this* rather than the running binary alone is what lets a lagging
+    // serve/gui half be caught up even once the running half is already current.
+    // The old `current >= latest => UpToDate` early return ran before this, so a
+    // sibling left behind by a partial update (or a fresh install that bumped
+    // the binary but not the stamp) was stranded — every check short-circuited
+    // and it was never re-staged. `serve` advertises this node's version to
+    // peers, so a stranded serve makes the update "look like it did nothing".
+    let want = wanted_artifacts(&current, &latest);
+    if want.is_empty() {
         return Ok(CheckOutcome::UpToDate { current, latest });
     }
 
-    let pol = ApplyPolicy::parse(&au.auto_apply).unwrap_or(ApplyPolicy::Patch);
-    if !policy_allows(pol, &current, &latest) {
-        return Ok(CheckOutcome::PolicyBlocked {
-            current,
-            latest,
-            policy: au.auto_apply.clone(),
-        });
+    // The auto-apply policy gates a genuine *upgrade* of the running binary.
+    // Catching a lagging sibling up to a version the running half already
+    // reached is a lockstep repair, not a new upgrade — so it isn't policy
+    // gated (and gating it on the running version would wrongly report
+    // PolicyBlocked whenever current == latest).
+    if compare_semver(&current, &latest) == std::cmp::Ordering::Less {
+        let pol = ApplyPolicy::parse(&au.auto_apply).unwrap_or(ApplyPolicy::Patch);
+        if !policy_allows(pol, &current, &latest) {
+            return Ok(CheckOutcome::PolicyBlocked {
+                current,
+                latest,
+                policy: au.auto_apply.clone(),
+            });
+        }
     }
 
-    // The CLI is behind (we're past the up-to-date check); stage the GUI and
-    // node halves beside it when they're behind too, so all three land in
-    // lockstep.
-    let want = wanted_artifacts(&current, &latest);
     stage_release(&release, &latest, &want).await?;
     Ok(CheckOutcome::Staged { version: latest })
 }
@@ -1069,6 +1082,11 @@ async fn stage_release(
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
     let mut staged = Vec::new();
     let mut manifest = Vec::new();
+    // Real per-half failure reasons, so a release where nothing could be staged
+    // reports *why* (download/checksum/signature/io) instead of the misleading
+    // "no matching platform asset" — the asset usually matched fine and the
+    // actual error was lost to a best-effort warning no CLI subscriber prints.
+    let mut errors: Vec<String> = Vec::new();
     for &kind in want {
         let asset_name = platform_asset(kind.asset_stem());
         let asset = assets
@@ -1100,14 +1118,25 @@ async fn stage_release(
                 staged.push(kind);
             }
             Err(e) if kind.is_required() => return Err(e),
-            Err(e) => tracing::warn!(
-                "self-update: staging the {} half failed ({e}); skipping it",
-                kind.as_str()
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    "self-update: staging the {} half failed ({e}); skipping it",
+                    kind.as_str()
+                );
+                errors.push(format!("{}: {e}", kind.as_str()));
+            }
         }
     }
     if staged.is_empty() {
-        return Err(Error::msg("no matching platform asset in release"));
+        // Surface the real reasons. A bare "no matching platform asset" only
+        // ever fits the case where no half even had an asset for this platform;
+        // a download/checksum/signature/io failure must say so or it's
+        // undiagnosable (the per-half warnings above go nowhere in the CLI).
+        return Err(Error::msg(if errors.is_empty() {
+            "no matching platform asset in release".to_string()
+        } else {
+            format!("could not stage any update — {}", errors.join("; "))
+        }));
     }
 
     std::fs::write(
@@ -1499,6 +1528,32 @@ mod tests {
         // newer does.
         assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.1.16"));
         assert!(artifact_needs_apply(ArtifactKind::Serve, "0.1.17"));
+
+        std::env::remove_var("ALLMYSTUFF_HOME");
+    }
+
+    #[test]
+    fn lagging_sibling_is_behind_even_when_the_cli_is_current() {
+        // The lockstep bug check_now now guards against: once the running CLI
+        // reaches `latest`, the old early `UpToDate` return fired before the
+        // sibling stamps were ever consulted, so a serve/gui half left behind
+        // by a partial update (or a fresh install that bumped the binary but
+        // not the stamp) was stranded and never re-staged. The version gates
+        // underpinning the fix must flag that half as behind regardless of the
+        // CLI's version — that half is what check_now's `wanted_artifacts`
+        // emptiness gate now keys on instead of the running binary alone.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ALLMYSTUFF_HOME", tmp.path());
+
+        // serve stamped a version behind the latest release…
+        record_artifact_version(ArtifactKind::Serve, "0.2.0");
+        // …is "behind" latest 0.2.1 even though the running CLI is already there.
+        assert!(artifact_needs_apply(ArtifactKind::Serve, "0.2.1"));
+        assert!(!artifact_needs_apply(ArtifactKind::Cli, current_version()));
+        // Once caught up, it's no longer behind — no churn on the next check.
+        record_artifact_version(ArtifactKind::Serve, "0.2.1");
+        assert!(!artifact_needs_apply(ArtifactKind::Serve, "0.2.1"));
 
         std::env::remove_var("ALLMYSTUFF_HOME");
     }
