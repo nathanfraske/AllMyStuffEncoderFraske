@@ -5611,6 +5611,17 @@ impl Mesh {
     /// cache denies control rather than guessing.
     fn sender_may_control(&self, sender: &str) -> bool {
         let canon = pubkey_part(sender);
+        // You always control your own machine. A loopback terminal/console to
+        // the box you're sitting at must pass even when it's unclaimed (no
+        // owner) and in no fleet — otherwise opening a terminal to *this*
+        // machine on a fresh install is refused, because the owner/fleet roster
+        // is empty. `sender` is the authenticated mesh identity, so only a
+        // genuine self-route (this node's own id) can match here.
+        if let Some(me) = self.local_node_id() {
+            if pubkey_part(&me) == canon {
+                return true;
+            }
+        }
         if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
             return true;
         }
