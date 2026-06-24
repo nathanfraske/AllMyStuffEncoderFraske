@@ -1615,15 +1615,19 @@ fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_rendering();
 
-    // Apply any update staged on the previous run before anything else.
-    allmystuff_updater::apply_pending_if_any();
-
     let log_level = std::env::var("ALLMYSTUFF_GUI_LOG")
         .unwrap_or_else(|_| "info,allmystuff_gui=info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
         .with_target(false)
         .init();
+
+    // Apply any update staged on the previous run before anything else — but
+    // *after* the tracing subscriber is installed, so a failed swap (e.g. a
+    // kept-and-retried CLI half that can't be replaced) is actually logged
+    // instead of being dropped into a no-op dispatcher and failing silently
+    // on every launch.
+    allmystuff_updater::apply_pending_if_any();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
