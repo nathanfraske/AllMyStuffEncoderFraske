@@ -1630,6 +1630,17 @@ fn main() {
     allmystuff_updater::apply_pending_if_any();
 
     tauri::Builder::default()
+        // Keep AllMyStuff to one running copy. A second launch (the user
+        // double-clicks the app again, the login item fires while it's already
+        // up, `open -n` on macOS) would otherwise stand up a rival process with
+        // its own node and `myownmesh` daemon fighting over the same control
+        // socket. The single-instance plugin makes that second launch hand off
+        // to the first and exit; the callback runs *in the original instance*,
+        // so we just bring its window back to the front. Must be registered
+        // before any other plugin for the guard to take effect.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         // Terminal copy/paste: the async clipboard API is unreliable in

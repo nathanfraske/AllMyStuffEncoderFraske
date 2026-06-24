@@ -31,6 +31,12 @@ tauri-plugin-clipboard-manager = "2"
 # "Start with computer" — registers a per-user login item (Windows Run key /
 # macOS LaunchAgent / Linux ~/.config/autostart), no admin needed.
 tauri-plugin-autostart = "2"
+# Single-instance guard — a second launch of AllMyStuff (double-click, login
+# item, `open` again) hands off to the already-running process and exits,
+# instead of standing up a rival app with its own node + daemon. The handoff
+# fires a callback here that reveals the existing window. Must be the first
+# plugin registered (see `main`).
+tauri-plugin-single-instance = "2"
 
 # The headless mesh **node engine** — every media plane (screen / camera /
 # audio / input / terminal / files / clipboard / sites), the route handshake,
