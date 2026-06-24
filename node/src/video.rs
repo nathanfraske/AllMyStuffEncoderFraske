@@ -767,7 +767,15 @@ fn run_capture(
                         fps,
                         &frames,
                         move |f: crate::win_capture::RawFrame| {
-                            orient_to_monitor(f.rgba, f.width, f.height, rotation_deg, source_hint)
+                            // DXGI duplication is the only raw, unrotated scan-out.
+                            orient_to_monitor(
+                                f.rgba,
+                                f.width,
+                                f.height,
+                                rotation_deg,
+                                source_hint,
+                                true,
+                            )
                         },
                         on_packet,
                         &mut encoder,
@@ -826,7 +834,15 @@ fn run_capture(
                     fps,
                     &frames,
                     move |f: crate::wayland_capture::RawFrame| {
-                        orient_to_monitor(f.rgba, f.width, f.height, rotation_deg, source_hint)
+                        // The portal hands over the upright presentation image.
+                        orient_to_monitor(
+                            f.rgba,
+                            f.width,
+                            f.height,
+                            rotation_deg,
+                            source_hint,
+                            false,
+                        )
                     },
                     on_packet,
                     &mut encoder,
@@ -1087,49 +1103,101 @@ where
 /// Bring a captured frame upright to match a **physically-rotated** monitor.
 ///
 /// Most capture backends (X11's grab, the Wayland portal, macOS
-/// AVFoundation) hand over the presentation image — already oriented the way
-/// the OS shows it and the way remote-control input is mapped against. Windows
-/// DXGI Output Duplication is the exception: it delivers the raw, *unrotated*
-/// scan-out, so a portrait monitor streamed sideways while the controls still
-/// lined up with the upright screen. We spot that case by the captured buffer
-/// being the monitor's logical size with width/height *swapped*, and rotate it
-/// upright; a backend that already presents upright has matching dimensions
-/// and passes through untouched (so applying this on every path is safe).
+/// AVFoundation, Windows' GDI/WGC fallback) hand over the *presentation*
+/// image — already oriented the way the OS shows it and the way
+/// remote-control input is mapped against — so they pass through untouched.
+/// Windows DXGI Output Duplication is the lone exception: it delivers the
+/// raw, *unrotated* scan-out, so a portrait monitor streams sideways while
+/// the controls still line up with the upright screen.
 ///
-/// `logical` is the monitor's reported (presentation) width×height. Only the
-/// 90°/270° cases are corrected — they're the ones the dimension swap can
-/// detect unambiguously; a 180° flip can't be told from an already-upright
-/// buffer by size, and is rare enough to leave.
+/// Detection is **orientation-mismatch first**: the captured buffer is
+/// landscape while the monitor presents portrait (or vice-versa). That signal
+/// is independent of `monitor.rotation()` — which some drivers under-report as
+/// 0/Err, the case that left rotated screens looking "not rotated at all" — and
+/// is invariant to display scaling, since we compare orientation (`>=`) rather
+/// than exact pixel sizes. `rotation_deg` only picks the *direction* (90 vs
+/// 270) and, for a raw buffer, the dimensionally-invisible 180° flip.
+///
+/// `is_raw` must be true **only** at the DXGI call site. A 180°-rotated
+/// *presentation* buffer is already upright (same dims, no mismatch); without
+/// the `is_raw` gate the 180° branch would flip it and stream it upside-down.
+///
+/// `logical` is the monitor's reported (presentation) width×height. xcap's
+/// quarter-turns are clockwise and were verified on hardware (the complement
+/// came out upside-down).
 fn orient_to_monitor(
     rgba: Vec<u8>,
     bw: u32,
     bh: u32,
     rotation_deg: u32,
     logical: (u32, u32),
+    is_raw: bool,
 ) -> (Vec<u8>, u32, u32) {
-    // Clockwise quarter-turns that *undo* the display's rotation. xcap reports
-    // the angle the panel is rotated by, so we rotate the raw scan-out the same
-    // way to bring it upright (verified on hardware: the complement came out
-    // upside-down).
-    let turns: u8 = match rotation_deg % 360 {
-        90 => 1,
-        270 => 3,
-        _ => return (rgba, bw, bh),
-    };
     let (lw, lh) = logical;
-    if lw == 0 || lh == 0 {
+    let r = rotation_deg % 360;
+
+    // Orientation-only comparison (`>=`) is invariant to any uniform HiDPI
+    // scale between the physical buffer and the logical presentation size.
+    let have_dims = lw != 0 && lh != 0 && bw != 0 && bh != 0;
+    let mismatched = have_dims && ((bw >= bh) != (lw >= lh));
+
+    // A buffer/presentation orientation mismatch is itself proof a ±90° turn is
+    // needed, even when rotation() reports 0 — so the mismatch, not the angle,
+    // decides *whether* to rotate. The angle decides the *direction*. The 180°
+    // case is dimensionally invisible (landscape stays landscape), so it can
+    // only ride on a trustworthy rotation()==180 and only for a raw buffer.
+    let turns: u8 = if mismatched {
+        match r {
+            270 => 3,
+            _ => 1, // r==90, or r==0/Err: the mismatch proves a turn is due.
+        }
+    } else if is_raw && r == 180 {
+        2
+    } else {
+        log_orient(r, bw, bh, lw, lh, mismatched, 0, bw, bh);
         return (rgba, bw, bh);
+    };
+
+    // rotate_rgba swaps dims for odd quarter-turns and preserves them for 180°.
+    let (rotated, ow, oh) = allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns);
+    log_orient(r, bw, bh, lw, lh, mismatched, turns, ow, oh);
+    (rotated, ow, oh)
+}
+
+/// One-line ground-truth log for [`orient_to_monitor`], emitted once per
+/// distinct (rotation, dims, action) tuple so a rotated-monitor report is
+/// self-diagnosing without printing a line per frame. Survives multiple
+/// concurrent monitors (each distinct config logs exactly once, ever).
+#[allow(clippy::too_many_arguments)]
+fn log_orient(
+    r: u32,
+    bw: u32,
+    bh: u32,
+    lw: u32,
+    lh: u32,
+    mismatched: bool,
+    turns: u8,
+    ow: u32,
+    oh: u32,
+) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let mut h = DefaultHasher::new();
+    (r, bw, bh, lw, lh, mismatched, turns).hash(&mut h);
+    let fresh = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut s| s.insert(h.finish()))
+        .unwrap_or(false);
+    if fresh {
+        tracing::info!(
+            target: "capture::orient",
+            "R={r} buf={bw}x{bh} logical={lw}x{lh} mismatch={mismatched} -> turns={turns} out={ow}x{oh}"
+        );
     }
-    // Rotate only when the captured buffer is oriented *opposite* the monitor's
-    // presentation — one landscape, the other portrait. That's the unrotated
-    // scan-out case (Windows DXGI); a backend that already presents upright has
-    // the same orientation and is left alone. Comparing orientation (not exact
-    // pixel sizes) is robust to display scaling, where the logical size is
-    // scaled but the captured buffer is the physical resolution.
-    if (bw >= bh) == (lw >= lh) {
-        return (rgba, bw, bh);
-    }
-    allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns)
 }
 
 /// Stream from xcap's persistent AVFoundation capture session. Set-up
@@ -1157,7 +1225,8 @@ fn run_session_capture(
         stop,
         fps,
         &frames,
-        move |f| orient_to_monitor(f.raw, f.width, f.height, rotation_deg, logical),
+        // AVFoundation delivers the upright presentation image.
+        move |f| orient_to_monitor(f.raw, f.width, f.height, rotation_deg, logical, false),
         on_packet,
         encoder,
         stats,
@@ -1193,8 +1262,9 @@ fn run_oneshot_capture(
             .map_err(|e| e.to_string())
             .and_then(|image| {
                 let (sw, sh) = (image.width(), image.height());
+                // capture_image (X11 grab, Windows GDI/WGC fallback) is upright.
                 let (rgba, sw, sh) =
-                    orient_to_monitor(image.into_raw(), sw, sh, rotation_deg, logical);
+                    orient_to_monitor(image.into_raw(), sw, sh, rotation_deg, logical, false);
                 encoder.encode(rgba, sw, sh, stats)
             });
         match outcome {
@@ -1676,6 +1746,64 @@ mod tests {
         // Already small → untouched (never upscaled).
         assert_eq!(fit_within(800, 600, 1280), (800, 600));
         assert_eq!(fit_within(0, 0, 1280), (0, 0));
+    }
+
+    // A buffer whose every byte is distinct, so any reorder (rotation) is
+    // detectable and a pass-through is provably identical.
+    fn distinct_rgba(w: u32, h: u32) -> Vec<u8> {
+        (0..(w * h * 4)).map(|i| i as u8).collect()
+    }
+
+    #[test]
+    fn orient_leaves_an_upright_presentation_buffer_untouched() {
+        // Presentation backends hand over matching orientation: no mismatch,
+        // so nothing rotates — even when rotation() reports a real angle, as
+        // long as the caller is not the raw DXGI path.
+        let buf = distinct_rgba(4, 2);
+        for r in [0, 90, 180, 270] {
+            let (out, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, r, (4, 2), false);
+            assert_eq!((ow, oh), (4, 2), "r={r}: dims unchanged");
+            assert_eq!(out, buf, "r={r}: pixels unchanged");
+        }
+    }
+
+    #[test]
+    fn orient_rotates_a_raw_transposed_buffer_per_direction() {
+        // Raw DXGI scan-out is landscape (4×2) while the panel presents
+        // portrait (2×4): a quarter-turn is due, direction from rotation().
+        let buf = distinct_rgba(4, 2);
+        for r in [90, 270] {
+            let (out, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, r, (2, 4), true);
+            assert_eq!((ow, oh), (2, 4), "r={r}: a quarter-turn swaps dims");
+            assert_ne!(out, buf, "r={r}: pixels were rotated");
+        }
+    }
+
+    #[test]
+    fn orient_rotates_a_transposed_buffer_even_when_rotation_under_reports() {
+        // The regression that read as "not rotated at all": a genuinely
+        // transposed scan-out whose driver reports rotation()==0. The
+        // orientation mismatch alone must still drive a quarter-turn.
+        let buf = distinct_rgba(4, 2);
+        let (out, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 0, (2, 4), true);
+        assert_eq!((ow, oh), (2, 4), "mismatch drives a turn despite r==0");
+        assert_ne!(out, buf);
+    }
+
+    #[test]
+    fn orient_flips_a_raw_180_but_never_a_presentation_180() {
+        // 180° is dimensionally invisible, so it rides on rotation()==180 and
+        // only for a raw buffer. A presentation buffer at 180 is already
+        // upright — flipping it would stream upside-down, so it must pass.
+        let buf = distinct_rgba(4, 2);
+
+        let (raw, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 180, (4, 2), true);
+        assert_eq!((ow, oh), (4, 2), "180 preserves dims");
+        assert_ne!(raw, buf, "raw 180 is flipped upright");
+
+        let (pres, pw, ph) = orient_to_monitor(buf.clone(), 4, 2, 180, (4, 2), false);
+        assert_eq!((pw, ph), (4, 2));
+        assert_eq!(pres, buf, "presentation 180 is left alone");
     }
 
     #[test]
