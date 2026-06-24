@@ -181,7 +181,11 @@ fn default_channel() -> String {
     "stable".into()
 }
 fn default_auto_apply() -> String {
-    "patch".into()
+    // "Up to minor": apply patch + minor bumps automatically (major still
+    // waits for the user). The friendliest default while AllMyStuff is moving
+    // fast — fixes and features land without a manual click, breaking changes
+    // don't.
+    "minor".into()
 }
 fn default_interval() -> u32 {
     24
@@ -1505,6 +1509,17 @@ mod tests {
         assert_eq!(release_tag(&obj).unwrap(), "0.2.0");
         let arr = serde_json::json!([{ "tag_name": "v0.3.1" }]);
         assert_eq!(release_tag(&arr).unwrap(), "0.3.1");
+    }
+
+    #[test]
+    fn auto_apply_defaults_to_up_to_minor() {
+        // The shipped default: patch + minor bumps apply on their own, major
+        // waits. (Existing installs keep whatever they saved.)
+        assert_eq!(AutoUpdateConfig::default().auto_apply, "minor");
+        assert_eq!(
+            ApplyPolicy::parse(&AutoUpdateConfig::default().auto_apply),
+            Some(ApplyPolicy::Minor)
+        );
     }
 
     #[test]

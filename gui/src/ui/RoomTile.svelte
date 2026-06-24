@@ -27,6 +27,11 @@
     $props();
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+  // The role=application tile. Key forwarding lives on this element; hover and
+  // click pin its focus so a room window's keyboard reaches the sharer (a
+  // window-level setFocus alone doesn't push document focus into the webview
+  // on hover-without-click).
+  let tileEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The streamed frame's pixel size — the content box the letterbox math
   // (and pointer normalization) works against.
@@ -155,10 +160,14 @@
 
   function claimFocus() {
     // The KVM rule: with control live, the surface under the mouse is the
-    // one your keyboard should reach — claim OS focus on hover (a no-op
-    // when this window already has it), so keys land on the machine
-    // you're pointing at even with popouts of other machines open.
-    if (!document.hasFocus()) void focusThisWindow();
+    // one your keyboard should reach — claim focus on hover (a no-op when
+    // this window already has it), so keys land on the machine you're
+    // pointing at even with popouts of other machines open. Pin focus on the
+    // tile element too: window-level setFocus alone doesn't reliably push
+    // document focus into the webview on a hover-without-click.
+    if (document.hasFocus()) return;
+    void focusThisWindow();
+    tileEl?.focus({ preventScroll: true });
   }
 
   // Coordinates are normalized 0..1 over the streamed frame's *content
@@ -225,6 +234,7 @@
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div
+  bind:this={tileEl}
   class="tile"
   class:driving={controlActive}
   class:theater

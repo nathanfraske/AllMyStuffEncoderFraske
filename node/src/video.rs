@@ -462,6 +462,19 @@ impl VideoBridge {
         F: Fn(VideoPacket) -> bool + Send + Sync + 'static,
         S: Fn(VideoStatusState, Option<String>) + Send + Sync + 'static,
     {
+        // Exactly one capture pump per route. A duplicate `StartMedia` (the
+        // daemon redelivers an Offer once per shared network) must not start a
+        // second capture for a route that already has one — two backends bound
+        // to one monitor, and with the release profile's `panic = "abort"` a
+        // panic on either aborts the host. A genuine restart (a viewer's
+        // retune) goes through `spawn_route` directly, which is allowed to
+        // replace; only this entry point dedupes.
+        if self.routes.lock().contains_key(&route_id) {
+            tracing::debug!(
+                "video capture already running for {route_id}; ignoring duplicate start"
+            );
+            return;
+        }
         self.spawn_route(
             route_id,
             mode,
@@ -512,19 +525,28 @@ impl VideoBridge {
                 tracing::warn!("{what} capture for {id} stopped: {e}");
             }
         });
-        self.routes.lock().insert(
-            route_id,
-            RouteVideo {
-                stop,
-                thread: Some(thread),
-                mode,
-                source,
-                on_packet,
-                on_status,
-                refresh,
-                idr_ms,
-            },
-        );
+        let displaced = {
+            let mut routes = self.routes.lock();
+            routes.insert(
+                route_id,
+                RouteVideo {
+                    stop,
+                    thread: Some(thread),
+                    mode,
+                    source,
+                    on_packet,
+                    on_status,
+                    refresh,
+                    idr_ms,
+                },
+            )
+        };
+        // Join any displaced capture thread (RouteVideo::drop) only after the
+        // routes lock is released — joining a thread under the lock would
+        // block every other route op, and on the async start path stall a
+        // tokio worker. `start_capture` dedupes so this is normally `None`;
+        // the explicit drop keeps the off-lock guarantee for any caller.
+        drop(displaced);
     }
 
     /// Ask `route_id`'s encoder for a clean decode entry on its next
@@ -613,8 +635,14 @@ impl VideoBridge {
     }
 
     pub fn stop(&self, route_id: &str) {
-        self.routes.lock().remove(route_id);
+        // Bind the removed route so its Drop (the capture-thread join) runs
+        // after the routes lock guard is released, never under it — an
+        // unbound `remove(..);` would drop the RouteVideo (and join) while the
+        // guard is still held (temporary drop order), blocking the lock on a
+        // thread join.
+        let removed = self.routes.lock().remove(route_id);
         self.feedback.lock().remove(route_id);
+        drop(removed);
     }
 }
 
@@ -715,6 +743,11 @@ fn run_capture(
         }
     };
     let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
+    // A physically-rotated monitor: Windows DXGI hands over the raw scan-out and
+    // reports its own rotation per frame (the orient pass rotates it upright);
+    // every other backend delivers the upright presentation image (rotation 0).
+    // `source_hint` is the monitor's reported size — it only pre-budgets the
+    // encoder's starting bitrate; the first real frame locks the true size.
     let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms)?;
     let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
@@ -733,7 +766,12 @@ fn run_capture(
                         stop,
                         fps,
                         &frames,
-                        |f: crate::win_capture::RawFrame| (f.rgba, f.width, f.height),
+                        move |f: crate::win_capture::RawFrame| {
+                            // DXGI is the only raw, unrotated scan-out; its own
+                            // DXGI_OUTDUPL_DESC.Rotation (carried on the frame)
+                            // is authoritative for making it upright.
+                            orient_to_monitor(f.rgba, f.width, f.height, f.rotation_deg)
+                        },
                         on_packet,
                         &mut encoder,
                         &mut stats,
@@ -790,7 +828,10 @@ fn run_capture(
                     stop,
                     fps,
                     &frames,
-                    |f: crate::wayland_capture::RawFrame| (f.rgba, f.width, f.height),
+                    move |f: crate::wayland_capture::RawFrame| {
+                        // The portal hands over the upright presentation image.
+                        orient_to_monitor(f.rgba, f.width, f.height, 0)
+                    },
                     on_packet,
                     &mut encoder,
                     &mut stats,
@@ -1047,6 +1088,61 @@ where
     }
 }
 
+/// Bring a captured frame upright to match a **physically-rotated** monitor.
+///
+/// `rotation_deg` is **authoritative and backend-supplied**. Windows DXGI
+/// Output Duplication hands over the raw, *unrotated* scan-out and reports its
+/// true clockwise orientation via `DXGI_OUTDUPL_DESC.Rotation` (0/90/180/270),
+/// carried on the frame. Every other backend (X11 grab, Wayland portal, macOS
+/// AVFoundation, Windows GDI/WGC fallback) delivers the already-upright
+/// *presentation* image and passes 0, falling through the 0-turn path
+/// untouched.
+///
+/// This replaces an earlier orientation-mismatch heuristic that compared the
+/// buffer against the monitor's reported size: it read as "not rotated at all"
+/// whenever the monitor library reported native (unrotated) dimensions, so the
+/// mismatch never fired. DXGI's rotation is the actual scan-out orientation and
+/// does not under-report, so it is trusted exclusively. Quarter-turns = deg/90,
+/// clockwise (`rotate_rgba`'s convention): ROTATE90→1, ROTATE270→3 — undoing
+/// the display's counter-clockwise rotation (direction verified against the
+/// canonical DXGI Desktop Duplication sample's vertex transform).
+fn orient_to_monitor(rgba: Vec<u8>, bw: u32, bh: u32, rotation_deg: u32) -> (Vec<u8>, u32, u32) {
+    let turns = ((rotation_deg / 90) % 4) as u8;
+    if turns == 0 {
+        log_orient(rotation_deg, bw, bh, turns, bw, bh);
+        return (rgba, bw, bh);
+    }
+    // rotate_rgba swaps dims for odd quarter-turns and preserves them for 180°.
+    let (rotated, ow, oh) = allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns);
+    log_orient(rotation_deg, bw, bh, turns, ow, oh);
+    (rotated, ow, oh)
+}
+
+/// One-line ground-truth log for [`orient_to_monitor`], emitted once per
+/// distinct (rotation, dims, turns) tuple so a rotated-monitor report is
+/// self-diagnosing without printing a line per frame. Survives multiple
+/// concurrent monitors (each distinct config logs exactly once, ever).
+fn log_orient(rotation_deg: u32, bw: u32, bh: u32, turns: u8, ow: u32, oh: u32) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let mut h = DefaultHasher::new();
+    (rotation_deg, bw, bh, turns).hash(&mut h);
+    let fresh = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut s| s.insert(h.finish()))
+        .unwrap_or(false);
+    if fresh {
+        tracing::info!(
+            target: "capture::orient",
+            "rotation_deg={rotation_deg} buf={bw}x{bh} -> turns={turns} out={ow}x{oh}"
+        );
+    }
+}
+
 /// Stream from xcap's persistent AVFoundation capture session. Set-up
 /// happens once; frames arrive as the OS produces them — damage-driven
 /// backends send nothing while the screen is still. (Wayland rides
@@ -1070,7 +1166,8 @@ fn run_session_capture(
         stop,
         fps,
         &frames,
-        |f| (f.raw, f.width, f.height),
+        // AVFoundation delivers the upright presentation image.
+        move |f| orient_to_monitor(f.raw, f.width, f.height, 0),
         on_packet,
         encoder,
         stats,
@@ -1104,7 +1201,9 @@ fn run_oneshot_capture(
             .map_err(|e| e.to_string())
             .and_then(|image| {
                 let (sw, sh) = (image.width(), image.height());
-                encoder.encode(image.into_raw(), sw, sh, stats)
+                // capture_image (X11 grab, Windows GDI/WGC fallback) is upright.
+                let (rgba, sw, sh) = orient_to_monitor(image.into_raw(), sw, sh, 0);
+                encoder.encode(rgba, sw, sh, stats)
             });
         match outcome {
             Ok(Some(packet)) => {
@@ -1585,6 +1684,63 @@ mod tests {
         // Already small → untouched (never upscaled).
         assert_eq!(fit_within(800, 600, 1280), (800, 600));
         assert_eq!(fit_within(0, 0, 1280), (0, 0));
+    }
+
+    // A buffer whose every byte is distinct, so any reorder (rotation) is
+    // detectable and a pass-through is provably identical.
+    fn distinct_rgba(w: u32, h: u32) -> Vec<u8> {
+        (0..(w * h * 4)).map(|i| i as u8).collect()
+    }
+
+    #[test]
+    fn orient_passes_through_at_zero_degrees() {
+        // Every presentation backend (and DXGI at IDENTITY) reports 0: pixels
+        // and dims are returned untouched, no rotation applied.
+        let buf = distinct_rgba(4, 2);
+        let (out, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 0);
+        assert_eq!((ow, oh), (4, 2));
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn orient_rotates_90_and_270_clockwise_swapping_dims() {
+        // Raw DXGI landscape scan-out (4×2) of a portrait panel: a 90 or 270
+        // report drives one/three clockwise quarter-turns → 2×4 upright.
+        let buf = distinct_rgba(4, 2);
+
+        let (cw90, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 90);
+        assert_eq!((ow, oh), (2, 4), "90: dims swap");
+        assert_eq!(cw90, allmystuff_pixels::rotate_rgba(&buf, 4, 2, 1).0);
+
+        let (cw270, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 270);
+        assert_eq!((ow, oh), (2, 4), "270: dims swap");
+        assert_eq!(cw270, allmystuff_pixels::rotate_rgba(&buf, 4, 2, 3).0);
+
+        // 90 and 270 are distinct rotations (direction matters).
+        assert_ne!(cw90, cw270);
+    }
+
+    #[test]
+    fn orient_flips_180_preserving_dims() {
+        // 180 is dimensionally invisible but reorders every pixel.
+        let buf = distinct_rgba(4, 2);
+        let (out, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 180);
+        assert_eq!((ow, oh), (4, 2), "180: dims unchanged");
+        assert_eq!(out, allmystuff_pixels::rotate_rgba(&buf, 4, 2, 2).0);
+        assert_ne!(out, buf, "180: pixels reordered");
+    }
+
+    #[test]
+    fn orient_maps_degrees_to_clockwise_turns() {
+        // The committed DXGI mapping, end to end: turns = (deg/90) mod 4,
+        // clockwise. 90→1, 180→2, 270→3 — the inverse of the display's CCW
+        // rotation, matching the canonical Desktop Duplication sample.
+        let buf = distinct_rgba(4, 2);
+        for (deg, turns) in [(0u32, 0u8), (90, 1), (180, 2), (270, 3)] {
+            let got = orient_to_monitor(buf.clone(), 4, 2, deg).0;
+            let want = allmystuff_pixels::rotate_rgba(&buf, 4, 2, turns).0;
+            assert_eq!(got, want, "deg={deg} must equal {turns} CW turns");
+        }
     }
 
     #[test]

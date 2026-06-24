@@ -628,6 +628,17 @@ pub enum RouteControl {
         #[serde(default)]
         queue_depth: u32,
     },
+    /// "Your inbound video for this route rides track lane N." The streaming
+    /// (host) side tells the viewer which RTP track lane it pinned a
+    /// display/camera route to, so the viewer demuxes inbound H.264 by this
+    /// explicit binding instead of inferring it from a positional sort the two
+    /// ends can briefly disagree on while routes come and go — the
+    /// disagreement that flashed one monitor's frames in another monitor's
+    /// window when several feeds were open. The lane is pinned for the route's
+    /// lifetime, so this is sent once when the stream starts. Unknown to older
+    /// peers (decodes as [`RouteControl::Unknown`] and dropped): they fall back
+    /// to the positional lane, exactly as before.
+    VideoLane { route_id: String, lane: u8 },
     /// "List your open terminal sessions" — a viewer asking a host (its
     /// owner/fleet, enforced host-side exactly like a terminal offer) which
     /// shells it already has running, so the picker can offer to *attach* to
