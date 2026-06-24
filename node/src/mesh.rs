@@ -4462,14 +4462,24 @@ impl Mesh {
                 .as_ref()
                 .and_then(|s| s.route(&route_id))
                 .ok_or("unknown route")?;
-            if !(r.is_active() && is_terminal_route(&r.route) && node_of(r.route.to.as_str()) == me)
+            // Endpoint self-checks compare *canonically*: the UI builds the
+            // route's host endpoint from the suffixed display id while `me` is
+            // the bare node id, so a raw `==` misses a genuine self-route (see
+            // `same_node`). This machine must be the route's viewer…
+            if !(r.is_active()
+                && is_terminal_route(&r.route)
+                && same_node(&node_of(r.route.to.as_str()), &me))
             {
                 return Err("route isn't an active terminal session here".into());
             }
-            // A terminal to this very machine has no peer to frame to: the
-            // shell is hosted right here, so input/resize go straight to the
-            // local PTY rather than out over the mesh.
-            let loopback = node_of(r.route.from.as_str()) == me;
+            // …and a terminal whose *source* is this machine too has no peer to
+            // frame to: the shell is hosted right here, so input/resize go
+            // straight to the local PTY rather than out over the mesh. The raw
+            // `==` this replaces left a loopback ConPTY blank on Windows — the
+            // viewer's cursor-position reply (CSI 6 n) was framed to a
+            // non-existent peer, and ConPTY withholds all output until that
+            // reply lands.
+            let loopback = same_node(&node_of(r.route.from.as_str()), &me);
             (r.peer.to_string(), loopback)
         };
         if loopback {
@@ -6823,6 +6833,58 @@ mod tests {
         // A genuinely remote terminal stays non-loopback under the same check.
         let host = node_of("otherpubkey-99xyz:terminal");
         assert!(!same_node(&host, me));
+    }
+
+    #[test]
+    fn term_send_loopback_check_is_canonical_across_id_forms() {
+        // `term_send` decides "is this a terminal to my own machine?" so input
+        // (incl. xterm's ConPTY cursor-position reply) goes to the local PTY
+        // instead of being framed to a peer. The realistic mixed-form case the
+        // bug hit: the UI builds the *host* endpoint from the node-list display
+        // id (`<pubkey>-ab3d9:terminal`) but the *viewer* endpoint from
+        // `localId`, which equals the backend's bare `me`. A raw `==` on the
+        // source then read the loopback as remote and framed the reply to a
+        // non-existent peer — leaving a ConPTY shell blank on Windows, where no
+        // output flows until that reply arrives.
+        let me = "k7pubkeybody";
+        let display = format!("{me}-ab3d9");
+        let route = term_route(
+            &format!("{display}:terminal"),
+            &format!("{me}:term-view:abc-1"), // built from localId == me
+            MediaKind::Generic,
+        );
+
+        // The viewer-side gate (`to` is this machine) passes either way…
+        assert!(same_node(&node_of(route.to.as_str()), me));
+
+        // …but the loopback flag keys on the *source*, where the forms differ:
+        // the raw `==` the fix replaces misses it; `same_node` catches it, so
+        // input short-circuits to the local PTY.
+        assert_ne!(
+            node_of(route.from.as_str()),
+            me,
+            "raw == missed the self-route"
+        );
+        assert!(
+            same_node(&node_of(route.from.as_str()), me),
+            "canonical check recognises the loopback source"
+        );
+
+        // A genuinely remote terminal (shell elsewhere) stays non-loopback, so
+        // its input is still framed to the host over the mesh.
+        let remote = term_route(
+            "otherpubkey-99xyz:terminal",
+            &format!("{me}:term-view:abc-2"),
+            MediaKind::Generic,
+        );
+        assert!(
+            same_node(&node_of(remote.to.as_str()), me),
+            "we're the viewer"
+        );
+        assert!(
+            !same_node(&node_of(remote.from.as_str()), me),
+            "a remote shell is not a loopback source"
+        );
     }
 
     #[test]
