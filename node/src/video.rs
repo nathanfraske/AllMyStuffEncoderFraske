@@ -1117,8 +1117,16 @@ fn orient_to_monitor(
         _ => return (rgba, bw, bh),
     };
     let (lw, lh) = logical;
-    // Rotate only when the backend gave us the physical (transposed) buffer.
-    if lw == 0 || lh == 0 || bw != lh || bh != lw {
+    if lw == 0 || lh == 0 {
+        return (rgba, bw, bh);
+    }
+    // Rotate only when the captured buffer is oriented *opposite* the monitor's
+    // presentation — one landscape, the other portrait. That's the unrotated
+    // scan-out case (Windows DXGI); a backend that already presents upright has
+    // the same orientation and is left alone. Comparing orientation (not exact
+    // pixel sizes) is robust to display scaling, where the logical size is
+    // scaled but the captured buffer is the physical resolution.
+    if (bw >= bh) == (lw >= lh) {
         return (rgba, bw, bh);
     }
     allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns)

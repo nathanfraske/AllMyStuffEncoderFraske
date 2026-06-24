@@ -3739,19 +3739,15 @@ impl Mesh {
         if cap == 0 {
             return None;
         }
-        // The peer's other H.264 routes, to see which lanes are taken.
-        // Computed before taking the pin lock (it locks session state).
-        let peer_routes = self.sorted_media_routes(peer, true, "h264");
+        let peer_canon = pubkey_part(peer);
+        // The whole get/compute/insert runs under the pin lock — two screens
+        // activating at once can never both pick "lane 0" (the lock serialises
+        // us; the second sees the first's pin). Sampling the live session for
+        // the taken lanes instead raced: it was read before the lock, so a
+        // sibling route not yet visible there left its lane looking free, and
+        // both screens collapsed onto one track.
         let mut pins = self.video_lane_pins.lock();
-        if let Some(&lane) = pins.get(route_id) {
-            return Some(lane);
-        }
-        let used: std::collections::HashSet<u8> = peer_routes
-            .iter()
-            .filter(|id| id.as_str() != route_id)
-            .filter_map(|id| pins.get(id).copied())
-            .collect();
-        let lane = (0..cap).find(|l| !used.contains(l))?;
+        let lane = free_lane_for_peer(&pins, peer_canon, route_id, cap)?;
         pins.insert(route_id.to_string(), lane);
         Some(lane)
     }
@@ -6274,6 +6270,34 @@ fn same_node(a: &str, b: &str) -> bool {
     pubkey_part(a) == pubkey_part(b)
 }
 
+/// The RTP video lane to pin a new route to `peer_canon` on: its existing pin
+/// if it already has one, else the **lowest lane in `[0, cap)` not already
+/// taken** by another of that peer's pinned routes. `None` only when the pool
+/// is full. Pure (takes the pin map directly) so the race-free assignment is
+/// unit-tested. A pinned route's peer is the `to` node of its id
+/// (`route:<from>→<to>`); pins for other peers don't constrain this one.
+fn free_lane_for_peer(
+    pins: &std::collections::HashMap<String, u8>,
+    peer_canon: &str,
+    route_id: &str,
+    cap: u8,
+) -> Option<u8> {
+    if let Some(&lane) = pins.get(route_id) {
+        return Some(lane);
+    }
+    let used: std::collections::HashSet<u8> = pins
+        .iter()
+        .filter(|(rid, _)| {
+            rid.as_str() != route_id
+                && rid
+                    .split_once('→')
+                    .is_some_and(|(_, to)| pubkey_part(&node_of(to)) == peer_canon)
+        })
+        .map(|(_, &l)| l)
+        .collect();
+    (0..cap).find(|l| !used.contains(l))
+}
+
 /// The device part of a capability id — everything after the node
 /// (`"<node>:cam:video0"` → `"cam:video0"`). `None` for a bare node id.
 fn device_of(cap_id: &str) -> Option<String> {
@@ -6799,6 +6823,44 @@ mod tests {
         // A genuinely remote terminal stays non-loopback under the same check.
         let host = node_of("otherpubkey-99xyz:terminal");
         assert!(!same_node(&host, me));
+    }
+
+    #[test]
+    fn video_lanes_pin_distinct_per_peer_and_reuse_when_freed() {
+        use std::collections::HashMap;
+        let mut pins: HashMap<String, u8> = HashMap::new();
+        let r0 = "route:host:screen:0→viewerkey-ab3d9:sink".to_string();
+        let r1 = "route:host:screen:1→viewerkey-ab3d9:sink".to_string();
+        let cap = 8;
+
+        // First screen to this viewer takes lane 0…
+        let l0 = free_lane_for_peer(&pins, "viewerkey", &r0, cap).unwrap();
+        pins.insert(r0.clone(), l0);
+        // …the second can NOT reuse it — it must get a fresh lane.
+        let l1 = free_lane_for_peer(&pins, "viewerkey", &r1, cap).unwrap();
+        pins.insert(r1.clone(), l1);
+        assert_ne!(l0, l1, "two screens to one viewer never share a lane");
+        assert_eq!((l0, l1), (0, 1));
+
+        // Asking again for an already-pinned route returns its pin (idempotent).
+        assert_eq!(free_lane_for_peer(&pins, "viewerkey", &r0, cap), Some(0));
+
+        // A route to a DIFFERENT viewer is independent — it can reuse lane 0.
+        let other = "route:host:screen:0→otherkey-77zzz:sink".to_string();
+        assert_eq!(free_lane_for_peer(&pins, "otherkey", &other, cap), Some(0));
+
+        // Freeing the first screen's pin lets the next route reuse lane 0.
+        pins.remove(&r0);
+        let r2 = "route:host:screen:2→viewerkey-ab3d9:sink".to_string();
+        assert_eq!(free_lane_for_peer(&pins, "viewerkey", &r2, cap), Some(0));
+
+        // A full pool yields None (the extra stream falls back to MJPEG).
+        let mut full: HashMap<String, u8> = HashMap::new();
+        for l in 0..2u8 {
+            full.insert(format!("route:host:screen:{l}→viewerkey-ab3d9:sink"), l);
+        }
+        let r_extra = "route:host:screen:9→viewerkey-ab3d9:sink".to_string();
+        assert_eq!(free_lane_for_peer(&full, "viewerkey", &r_extra, 2), None);
     }
 
     #[test]
