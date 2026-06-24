@@ -4,10 +4,11 @@
 #   1. Download a pre-built release binary from GitHub for the current platform.
 #   2. Fall back to building from source via cargo.
 #
-# Installs both the `allmystuff` CLI and the `allmystuff-gui` desktop
-# app (the app is small and makes a bare `allmystuff` open it — pass
-# -NoGui for a CLI-only install), then makes sure the `myownmesh`
-# daemon the app's live mode runs on is in place:
+# Installs the `allmystuff` CLI, the `allmystuff-gui` desktop app (the app
+# is small and makes a bare `allmystuff` open it — pass -NoGui for a
+# CLI-only install), and the standalone `amst` mesh terminal (`amst
+# <machine>` opens a shell on any machine you own; -NoAmst to skip), then
+# makes sure the `myownmesh` daemon the app's live mode runs on is in place:
 #
 #   * an installed daemon that's new enough (>= the version pinned in
 #     .myownmesh-rev) is used as-is;
@@ -29,6 +30,7 @@ param(
     [switch]$FromSource,
     [switch]$NoGui,
     [switch]$NoMesh,
+    [switch]$NoAmst,
     [string]$Prefix = "$env:LOCALAPPDATA\Programs\AllMyStuff",
     [string]$Repo = $(if ($env:ALLMYSTUFF_REPO) { $env:ALLMYSTUFF_REPO } else { "mrjeeves/AllMyStuff" }),
     [string]$MeshRepo = $(if ($env:MYOWNMESH_REPO) { $env:MYOWNMESH_REPO } else { "mrjeeves/MyOwnMesh" })
@@ -48,7 +50,10 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 $asset = "allmystuff-windows-$arch.zip"
 $guiAsset = "allmystuff-gui-windows-$arch.zip"
 $serveAsset = "allmystuff-serve-windows-$arch.zip"
+$amstAsset = "amst-windows-$arch.zip"
 $meshAsset = "myownmesh-windows-$arch.zip"
+# Set by Build-FromSource so amst can build from the same checkout/clone.
+$script:RepoDir = $null
 
 # Extract a release zip over $Prefix, retrying briefly. Windows can keep a file
 # lock for a moment after a process exits, so a just-stopped .exe may not have
@@ -137,6 +142,18 @@ function Install-ServeFromZip([string]$zipPath) {
     $exe = Join-Path $Prefix "allmystuff-serve.exe"
     if (-not (Test-Path $exe)) {
         throw "allmystuff-serve.exe not found in $zipPath after extraction"
+    }
+    Log "Installed: $exe"
+}
+
+function Install-AmstFromZip([string]$zipPath) {
+    if (-not (Test-Path $Prefix)) {
+        New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+    }
+    Expand-Over $zipPath
+    $exe = Join-Path $Prefix "amst.exe"
+    if (-not (Test-Path $exe)) {
+        throw "amst.exe not found in $zipPath after extraction"
     }
     Log "Installed: $exe"
 }
@@ -292,6 +309,90 @@ function Try-ReleaseServe {
         return $false
     } finally {
         Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Best-effort amst (AMSTerm) install: fetch the portable `amst` zip and drop
+# it next to the CLI — the standalone mesh terminal (`amst <machine>` opens a
+# shell on a machine you own). Returns $false (without aborting the install)
+# if the asset is missing. Only the binary lands here; the shortcuts and the
+# "AMSTerm here" right-click menu are scripts\install-amst.ps1's job.
+function Try-ReleaseAmst {
+    $api = "https://api.github.com/repos/$Repo/releases/latest"
+    try {
+        $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "allmystuff-installer" }
+    } catch {
+        Warn "GitHub releases unreachable; skipping amst."
+        return $false
+    }
+    $match = $release.assets | Where-Object { $_.name -eq $amstAsset } | Select-Object -First 1
+    if (-not $match) {
+        Warn "No amst asset matched $amstAsset in the latest release."
+        return $false
+    }
+    $url = $match.browser_download_url
+    Log "Downloading $url"
+    if ($DryRun) { Log "(dry-run) would download $url"; return $true }
+
+    $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "amst-install-$([guid]::NewGuid())")
+    try {
+        $zip = Join-Path $tmp $amstAsset
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        $shaFile = "$zip.sha256"
+        $haveSha = $true
+        try {
+            Invoke-WebRequest -Uri "$url.sha256" -OutFile $shaFile -UseBasicParsing
+        } catch {
+            Warn "No SHA256 sidecar for amst; skipping integrity check."
+            $haveSha = $false
+        }
+        if ($haveSha) {
+            $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
+            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+            if ($expected -ne $actual) {
+                Warn "SHA256 mismatch for $amstAsset — not installing amst."
+                return $false
+            }
+            Log "SHA256 OK"
+        }
+        Install-AmstFromZip $zip
+        return $true
+    } catch {
+        Warn "amst download/install failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# amst builds with a plain `cargo build --release --bin amst` — no media or
+# Tauri toolchain — so unlike the GUI/node it can be built from source here
+# too. Reuses the checkout Build-FromSource already resolved ($script:RepoDir).
+# cargo output is sent to the host (Out-Host) so it doesn't pollute the bool
+# this returns.
+function Build-AmstFromSource {
+    if (-not $script:RepoDir) { return $false }
+    Log "Building amst from source…"
+    Push-Location $script:RepoDir
+    try {
+        cargo build --release --bin amst 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Warn "amst source build failed (cargo exit $LASTEXITCODE)."
+            return $false
+        }
+        $built = Join-Path $script:RepoDir "target\release\amst.exe"
+        if (-not (Test-Path $built)) {
+            Warn "amst build did not produce $built"
+            return $false
+        }
+        if (-not (Test-Path $Prefix)) {
+            New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+        }
+        Copy-Item -Force $built (Join-Path $Prefix "amst.exe")
+        Log "Installed: $(Join-Path $Prefix 'amst.exe')"
+        return $true
+    } finally {
+        Pop-Location
     }
 }
 
@@ -478,6 +579,8 @@ function Build-FromSource {
         Log "Cloning into $repoDir"
         if (-not $DryRun) { git clone --depth 1 "https://github.com/$Repo.git" $repoDir }
     }
+    # Expose the resolved source dir so amst can build from the same checkout.
+    $script:RepoDir = $repoDir
     if ($DryRun) { Log "(dry-run) would build in $repoDir"; return }
 
     Push-Location $repoDir
@@ -554,6 +657,35 @@ if ($installedFromRelease) {
     Warn "Build it with:  cargo build --release --manifest-path node\Cargo.toml"
 }
 
+# AMSTerm (amst) — the standalone mesh terminal: a shell on any machine you
+# own, from your own terminal. On by default (-NoAmst skips it). Unlike the
+# GUI/node it installs in BOTH paths: the portable binary on a release
+# install, or `cargo build --bin amst` from source (no media/Tauri toolchain).
+# Only the binary lands here; the shortcuts and "AMSTerm here" right-click
+# menu are scripts\install-amst.ps1's job.
+$amstInstalled = $false
+if ($NoAmst) {
+    Log "Skipping AMSTerm (-NoAmst)."
+} elseif ($DryRun) {
+    if ($installedFromRelease) {
+        Log "(dry-run) would install the amst binary ($amstAsset) next to allmystuff"
+    } else {
+        Log "(dry-run) would build and install amst from source (cargo build --bin amst)"
+    }
+} elseif ($installedFromRelease) {
+    if (Try-ReleaseAmst) {
+        $amstInstalled = $true
+    } else {
+        Warn "amst not installed from the release; for it on its own use scripts\install-amst.ps1."
+    }
+} else {
+    if (Build-AmstFromSource) {
+        $amstInstalled = $true
+    } else {
+        Warn "Couldn't build amst from source; install it separately: scripts\install-amst.ps1 -FromSource"
+    }
+}
+
 # Mesh daemon — see the block above Ensure-Mesh for the rules. Both the
 # desktop app *and* the headless node (`allmystuff serve`) run on it, so it's
 # installed whenever either is; a from-source build skips it.
@@ -591,5 +723,9 @@ if (-not $NoGui) {
         Log "Headless node: 'allmystuff serve' runs this machine on the mesh (no GUI)."
         Log "On Windows, register it as a startup task (Task Scheduler) to keep it running."
     }
+}
+if ($amstInstalled -or $DryRun) {
+    Log "AMSTerm: 'amst' opens a shell on this machine over the mesh; 'amst <machine>' on another"
+    Log "you own ('amst --list' to see them). For the launcher + 'AMSTerm here' menu: scripts\install-amst.ps1."
 }
 Log "Open a new terminal so the updated PATH takes effect."
