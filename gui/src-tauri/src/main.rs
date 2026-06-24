@@ -467,7 +467,7 @@ fn open_secondary_window(
     title: &str,
     inner_size: (f64, f64),
     min_inner_size: (f64, f64),
-    aumid: &str,
+    aumid: &'static str,
 ) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window(label) {
         let _ = existing.set_focus();
@@ -479,9 +479,7 @@ fn open_secondary_window(
         .min_inner_size(min_inner_size.0, min_inner_size.1)
         .build()
         .map_err(|e| e.to_string())?;
-    if let Some(w) = app.get_webview_window(label) {
-        set_taskbar_identity(&w, aumid);
-    }
+    set_taskbar_identity(app, label, aumid);
     Ok(())
 }
 
@@ -847,81 +845,110 @@ const AUMID_VIDEO: &str = "works.allmystuff.video";
 ///
 /// Per-window (not per-process) is the point: every Tauri window lives in one
 /// process, so `SetCurrentProcessExplicitAppUserModelID` can't separate them —
-/// only the window's shell property store (`PKEY_AppUserModel_ID`) can. The HWND
-/// is bridged through its raw pointer because Tauri links an older `windows`
-/// crate than this GUI does, so their `HWND` types differ.
+/// only the window's shell property store (`PKEY_AppUserModel_ID`) can.
+///
+/// The shell-store write is marshalled to the **main (event-loop) thread**.
+/// It calls `SHGetPropertyStoreForWindow`, a shell/COM API, and the window
+/// builder runs this from an *async* command — i.e. a runtime worker thread
+/// with no COM initialized. Touching the shell store there is undefined, and
+/// with `panic = abort` a fault takes the whole GUI down (that was the crash
+/// when opening a terminal window on Windows). The main thread is the one tao
+/// initialized COM on (`OleInitialize`) and the one the window belongs to, so
+/// the write happens there.
 #[cfg_attr(not(windows), allow(unused_variables))]
-fn set_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
+fn set_taskbar_identity(app: &tauri::AppHandle, label: &str, aumid: &'static str) {
     #[cfg(windows)]
     {
-        use windows::core::{GUID, PWSTR};
-        use windows::Win32::Foundation::{HWND, PROPERTYKEY};
-        use windows::Win32::System::Com::StructuredStorage::{
-            PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
-        };
-        use windows::Win32::System::Variant::VT_LPWSTR;
-        use windows::Win32::UI::Shell::PropertiesSystem::{
-            IPropertyStore, SHGetPropertyStoreForWindow,
-        };
+        let label = label.to_string();
+        let app_for_lookup = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(window) = app_for_lookup.get_webview_window(&label) {
+                apply_taskbar_identity(&window, aumid);
+            }
+        });
+    }
+}
 
-        // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5.
-        const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
-            fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
-            pid: 5,
-        };
+/// The Windows shell-store write behind [`set_taskbar_identity`]. MUST run on a
+/// COM-initialized thread that owns the window — the main thread (see the
+/// caller). Best-effort: every failure path is a logged no-op.
+#[cfg(windows)]
+fn apply_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
+    use windows::core::{GUID, PWSTR};
+    use windows::Win32::Foundation::{HWND, PROPERTYKEY};
+    use windows::Win32::System::Com::StructuredStorage::{
+        PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+    };
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::UI::Shell::PropertiesSystem::{
+        IPropertyStore, SHGetPropertyStoreForWindow,
+    };
 
-        // Tauri links an older `windows` crate than this GUI, so its `HWND` is a
-        // different type — bridge through the raw pointer. The `as *mut c_void`
-        // is a no-op on the currently pinned crate pair (clippy would flag it),
-        // but it's kept on purpose: if Tauri's `HWND` ever reverts to an `isize`
-        // representation the cast is what keeps this compiling.
-        #[allow(clippy::unnecessary_cast)]
-        let raw = match window.hwnd() {
-            Ok(h) => h.0 as *mut core::ffi::c_void,
+    // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5.
+    const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+        pid: 5,
+    };
+
+    // Tauri links an older `windows` crate than this GUI, so its `HWND` is a
+    // different type — bridge through the raw pointer. The `as *mut c_void`
+    // is a no-op on the currently pinned crate pair (clippy would flag it),
+    // but it's kept on purpose: if Tauri's `HWND` ever reverts to an `isize`
+    // representation the cast is what keeps this compiling.
+    #[allow(clippy::unnecessary_cast)]
+    let raw = match window.hwnd() {
+        Ok(h) => h.0 as *mut core::ffi::c_void,
+        Err(e) => {
+            tracing::warn!("taskbar identity: no window handle ({e})");
+            return;
+        }
+    };
+
+    // A null-terminated wide copy of the id; it must outlive `SetValue`,
+    // which copies the string into the store (see the `drop` at the end).
+    let mut wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+    // A VT_LPWSTR PROPVARIANT pointing at `wide` (windows 0.61 has no
+    // single-string PROPVARIANT constructor, so build the union by hand).
+    //
+    // The whole value is wrapped in `ManuallyDrop` for memory safety, NOT
+    // ergonomics: windows-rs gives `PROPVARIANT` a `Drop` that calls
+    // `PropVariantClear`, which for a VT_LPWSTR would `CoTaskMemFree(pwszVal)`.
+    // But `pwszVal` is our `Vec`, never COM-allocated — freeing it on the COM
+    // heap corrupts the heap (`STATUS_HEAP_CORRUPTION`), and `drop(wide)` would
+    // then double-free it. (The *inner* `ManuallyDrop` is just the union
+    // field's required type and does NOT suppress `PROPVARIANT`'s own `Drop`,
+    // which is the trap the first version fell into.) `SetValue` copies the
+    // string into the store, so nothing here owns COM memory to leak.
+    let value = core::mem::ManuallyDrop::new(PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: core::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_LPWSTR,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    pwszVal: PWSTR(wide.as_mut_ptr()),
+                },
+            }),
+        },
+    });
+
+    unsafe {
+        let store: IPropertyStore = match SHGetPropertyStoreForWindow(HWND(raw)) {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("taskbar identity: no window handle ({e})");
+                tracing::warn!("taskbar identity: property store unavailable ({e})");
                 return;
             }
         };
-
-        // A null-terminated wide copy of the id; it must outlive `SetValue`,
-        // which copies the string into the store (see the `drop` at the end).
-        let mut wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
-        // A VT_LPWSTR PROPVARIANT pointing at `wide`. windows 0.61 has no string
-        // constructor for the structured-storage PROPVARIANT, so build it by
-        // hand. `ManuallyDrop` (and *not* calling `PropVariantClear`) is
-        // deliberate: the buffer is ours (a `Vec`), not COM-allocated.
-        let value = PROPVARIANT {
-            Anonymous: PROPVARIANT_0 {
-                Anonymous: core::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
-                    vt: VT_LPWSTR,
-                    wReserved1: 0,
-                    wReserved2: 0,
-                    wReserved3: 0,
-                    Anonymous: PROPVARIANT_0_0_0 {
-                        pwszVal: PWSTR(wide.as_mut_ptr()),
-                    },
-                }),
-            },
-        };
-
-        unsafe {
-            let store: IPropertyStore = match SHGetPropertyStoreForWindow(HWND(raw)) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("taskbar identity: property store unavailable ({e})");
-                    return;
-                }
-            };
-            if store.SetValue(&PKEY_APPUSERMODEL_ID, &value).is_ok() {
-                let _ = store.Commit();
-            }
+        if store.SetValue(&PKEY_APPUSERMODEL_ID, &*value).is_ok() {
+            let _ = store.Commit();
         }
-        // Keep `wide` alive past `SetValue` (its raw pointer rode inside
-        // `value`); a raw pointer creates no borrow, so without this the buffer
-        // could be freed before the store reads it.
-        drop(wide);
     }
+    // Keep `wide` alive past `SetValue` (its raw pointer rode inside
+    // `value`); a raw pointer creates no borrow, so without this the buffer
+    // could be freed before the store reads it.
+    drop(wide);
 }
 
 /// Current peers + live route states.
