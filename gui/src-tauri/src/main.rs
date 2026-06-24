@@ -907,11 +907,19 @@ fn apply_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
     // A null-terminated wide copy of the id; it must outlive `SetValue`,
     // which copies the string into the store (see the `drop` at the end).
     let mut wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
-    // A VT_LPWSTR PROPVARIANT pointing at `wide`. windows 0.61 has no string
-    // constructor for the structured-storage PROPVARIANT, so build it by
-    // hand. `ManuallyDrop` (and *not* calling `PropVariantClear`) is
-    // deliberate: the buffer is ours (a `Vec`), not COM-allocated.
-    let value = PROPVARIANT {
+    // A VT_LPWSTR PROPVARIANT pointing at `wide` (windows 0.61 has no
+    // single-string PROPVARIANT constructor, so build the union by hand).
+    //
+    // The whole value is wrapped in `ManuallyDrop` for memory safety, NOT
+    // ergonomics: windows-rs gives `PROPVARIANT` a `Drop` that calls
+    // `PropVariantClear`, which for a VT_LPWSTR would `CoTaskMemFree(pwszVal)`.
+    // But `pwszVal` is our `Vec`, never COM-allocated — freeing it on the COM
+    // heap corrupts the heap (`STATUS_HEAP_CORRUPTION`), and `drop(wide)` would
+    // then double-free it. (The *inner* `ManuallyDrop` is just the union
+    // field's required type and does NOT suppress `PROPVARIANT`'s own `Drop`,
+    // which is the trap the first version fell into.) `SetValue` copies the
+    // string into the store, so nothing here owns COM memory to leak.
+    let value = core::mem::ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: core::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_LPWSTR,
@@ -923,7 +931,7 @@ fn apply_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
                 },
             }),
         },
-    };
+    });
 
     unsafe {
         let store: IPropertyStore = match SHGetPropertyStoreForWindow(HWND(raw)) {
@@ -933,7 +941,7 @@ fn apply_taskbar_identity(window: &tauri::WebviewWindow, aumid: &str) {
                 return;
             }
         };
-        if store.SetValue(&PKEY_APPUSERMODEL_ID, &value).is_ok() {
+        if store.SetValue(&PKEY_APPUSERMODEL_ID, &*value).is_ok() {
             let _ = store.Commit();
         }
     }
