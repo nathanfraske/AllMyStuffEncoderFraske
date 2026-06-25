@@ -357,7 +357,20 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -e
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > signing/minisign.key
+          # The minisign secret key is two lines — an "untrusted comment:" line
+          # and the base64 key beneath it. Strip CR as we write it: a key pasted
+          # or stored with Windows CRLF makes minisign fail to load it ("Error
+          # while loading the secret key file") even though the same key signed
+          # fine before the secret was last re-entered. Then sanity-check the
+          # shape and fail with an actionable message rather than minisign's
+          # cryptic one, so a bad secret is obvious instead of shipping a
+          # published-but-unsigned release that blocks every client's update.
+          printf '%s\n' "$MINISIGN_SECRET_KEY" | tr -d '\r' > signing/minisign.key
+          if [ "$(grep -c . signing/minisign.key)" -lt 2 ]; then
+            rm -f signing/minisign.key
+            echo "::error::MINISIGN_SECRET_KEY is malformed. minisign needs the full TWO lines of minisign.key (the 'untrusted comment:' line and the base64 secret key beneath it), with Unix (LF) line endings and no surrounding quotes. Re-add the secret verbatim and re-run. See RELEASE-SIGNING.md."
+            exit 1
+          fi
           cd signing
           shopt -s nullglob
           # Password-less CI key (see RELEASE-SIGNING.md): no prompt, </dev/null
