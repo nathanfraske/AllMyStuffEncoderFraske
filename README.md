@@ -143,6 +143,7 @@ AllMyStuff is under active development. What works today:
 | File access | ✅ | Browse, preview, upload, download, rename, delete; bulk transfers stream in chunks with backpressure, straight to disk |
 | Audio and camera | ✅ | Opus audio and H.264 camera over the same transport |
 | Discovery and routing | ✅ | Peers appear via presence; sessions negotiate and tear down cleanly |
+| Mobile (iOS/Android) | 🚧 | In design; the pure client core has landed (`allmystuff-mobile-core`). See [docs/MOBILE.md](docs/MOBILE.md) |
 
 ## Building from source
 
