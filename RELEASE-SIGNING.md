@@ -39,10 +39,18 @@ signing isn't configured. This mirrors the scheme already used by the bundled
 
 3. **Bake the public key into the shipped binaries.** Set repository *variable*
    `ALLMYSTUFF_RELEASE_PUBKEY` to the base64 public-key string (line 2 of
-   `minisign.pub`). The `bundles` job already passes it into the build env, so
-   once set, `RELEASE_PUBKEY` in `crates/allmystuff-updater/src/lib.rs` is
-   `Some(...)` and the client refuses any artifact without a valid signature.
-   A repo *variable* is fine — the public key isn't secret.
+   `minisign.pub`, e.g. `sed -n '2p' minisign.pub`). The `bundles` job already
+   passes it into the build env, so once set, `RELEASE_PUBKEY` in
+   `crates/allmystuff-updater/src/lib.rs` is `Some(...)` and the client refuses
+   any artifact without a valid signature. A repo *variable* is fine — the
+   public key isn't secret.
+
+   > The updater normalises this value, so pasting the **whole** two-line
+   > `minisign.pub` (the `untrusted comment:` header included), or leaving a
+   > trailing newline / CRLF, still works — it trims whitespace and, when the
+   > value spans two lines, takes the second (the key always follows the
+   > header). The base64 itself is still strictly checked, so a genuinely wrong
+   > key fails closed. Don't paste the *secret* key (`minisign.key`) here.
 
 4. **Cut a test release** and confirm `.minisig` sidecars sit next to each
    `allmystuff-*.tar.gz` / `.zip`, and that `allmystuff update` on a build

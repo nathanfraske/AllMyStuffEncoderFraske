@@ -94,15 +94,32 @@ const USER_AGENT: &str = concat!("allmystuff-self-update/", env!("CARGO_PKG_VERS
 const RELEASE_PUBKEY: Option<&str> = option_env!("ALLMYSTUFF_RELEASE_PUBKEY");
 
 /// The configured release public key, or `None` when signing isn't set up.
-/// Normalises the baked-in [`RELEASE_PUBKEY`] so an empty string (an unset CI
-/// variable still exported as `""`) counts as "not configured".
+/// Normalises the baked-in [`RELEASE_PUBKEY`] — see [`normalize_pubkey`].
 fn release_pubkey() -> Option<&'static str> {
     normalize_pubkey(RELEASE_PUBKEY)
 }
 
-/// Treat an empty baked-in key as "not configured" — see [`RELEASE_PUBKEY`].
+/// Normalise the baked-in key into just the base64 key string, or `None` when
+/// signing isn't configured.
+///
+/// `minisign.pub` is a *two-line* file — an `untrusted comment:` header then the
+/// base64 key on line 2 — and `ALLMYSTUFF_RELEASE_PUBKEY` is only supposed to
+/// hold that second line. But it's easy to paste the whole file, or to leave a
+/// trailing newline / CRLF, and `PublicKey::from_base64` then rejects the lot
+/// with "Invalid encoding in minisign data" (the comment text, spaces and
+/// `\r\n` aren't base64). So tolerate it positionally: trim every line and drop
+/// blanks, then take the **second** line when there is one (the whole-file
+/// paste — the key always follows the header), otherwise the **first** (the key
+/// pasted on its own). An empty / whitespace-only value (e.g. an unset CI
+/// variable exported as `""`) yields `None` — "not configured", SHA-256-only.
+///
+/// This only *locates* the key; the base64 is still strictly validated
+/// downstream by `PublicKey::from_base64`, so a genuinely malformed key still
+/// fails closed.
 fn normalize_pubkey(key: Option<&str>) -> Option<&str> {
-    key.filter(|k| !k.is_empty())
+    let mut lines = key?.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    Some(lines.next().unwrap_or(first))
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,8 +1438,38 @@ mod tests {
         // never published and fail every update closed.
         assert_eq!(normalize_pubkey(Some("")), None);
         assert_eq!(normalize_pubkey(None), None);
+        // Whitespace / CR / blank lines only → nothing left → not configured.
+        assert_eq!(normalize_pubkey(Some("   \r\n  ")), None);
+        assert_eq!(normalize_pubkey(Some("\n\n")), None);
         let real = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
         assert_eq!(normalize_pubkey(Some(real)), Some(real));
+    }
+
+    #[test]
+    fn pasted_minisign_pub_and_stray_whitespace_normalise_to_the_key() {
+        // The variable is meant to hold just line 2 of minisign.pub, but pasting
+        // the whole two-line file (with CRLF), or leaving a trailing newline, is
+        // an easy slip — and made PublicKey::from_base64 reject the comment text
+        // / CR as "Invalid encoding in minisign data". normalize_pubkey recovers
+        // the key line so the base64 still reaches strict validation downstream.
+        let real = "RWRruk/CLy4NQfZshGlgxLS64p+Hqn5yngTMlWzq3HSUPR+tu64wkW4w";
+        // Whole minisign.pub pasted, Windows CRLF, trailing newline.
+        let whole_file =
+            format!("untrusted comment: minisign public key 410D2E2FC24FBA6B\r\n{real}\r\n");
+        assert_eq!(normalize_pubkey(Some(&whole_file)), Some(real));
+        // Just the key, but with a trailing newline (the common rotation slip).
+        assert_eq!(normalize_pubkey(Some(&format!("{real}\n"))), Some(real));
+        // Surrounding whitespace.
+        assert_eq!(normalize_pubkey(Some(&format!("  {real}  "))), Some(real));
+        // Selection is positional — line 2 is the key whatever line 1 says, and
+        // a key on its own (no line 2) is used as-is. We don't sniff for an
+        // "untrusted comment:" prefix.
+        assert_eq!(
+            normalize_pubkey(Some(&format!("anything on the first line\n{real}"))),
+            Some(real)
+        );
+        let solo = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        assert_eq!(normalize_pubkey(Some(solo)), Some(solo));
     }
 
     #[test]
