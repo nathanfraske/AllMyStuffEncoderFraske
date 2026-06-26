@@ -106,20 +106,24 @@ kill:
 restart *ARGS: kill
     @just dev {{ARGS}}
 
-# Discard local changes and pull the latest — a pristine tree so `just dev`
-# starts clean each time (clears stray lockfile / build-artifact edits a dev
-# run leaves behind). git commands are identical on bash and PowerShell, so no
-# [windows] variant is needed.
-[doc("Discard local changes + git pull — a clean slate before `just dev`.")]
+# Discard local changes, pull the latest, and fetch every remote branch — a
+# pristine tree so `just dev` starts clean each time (clears stray lockfile /
+# build-artifact edits a dev run leaves behind), with all of origin's branches
+# fetched and ready to check out. git commands are identical on bash and
+# PowerShell, so no [windows] variant is needed.
+[doc("Discard local changes + git pull + fetch all branches — a clean slate.")]
 pull:
     @git reset --hard HEAD
     @git pull
+    @git fetch --all --prune
 
-# A pure drop-in for `git checkout` — every arg passes straight through, so
-# `just checkout main`, `just checkout -b feature`, `just checkout -- file`
-# all behave exactly like the git command, minus typing `git`.
-[doc("git checkout pass-through (e.g. `just checkout main`).")]
-checkout *args:
+# `git checkout` with a clean slate first: `pull` runs ahead of it (discard
+# local changes, pull, and fetch every remote branch), so the tree is pristine
+# and whatever branch you name is already fetched and ready. Args still pass
+# straight through — `just checkout main`, `just checkout -b feature`,
+# `just checkout -- file` all behave like the git command, minus typing `git`.
+[doc("just pull (clean + fetch all), then git checkout (e.g. `just checkout main`).")]
+checkout *args: pull
     @git checkout {{args}}
 
 # The one-liner clean start: stop the mesh stack, pull a pristine tree, then run
