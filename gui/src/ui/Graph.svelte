@@ -427,6 +427,9 @@
   }
   function onNodePointerMove(e: PointerEvent, n: MeshNode) {
     if (!nodeDrag || nodeDrag.id !== n.id) return;
+    // Only your own devices are draggable share sources — a foreign device
+    // stays a plain click (select), never a drag.
+    if (!app.isMyDevice(n.id)) return;
     if (!nodeDrag.moved && Math.hypot(e.clientX - nodeDrag.sx, e.clientY - nodeDrag.sy) < 6) return;
     nodeDrag = { ...nodeDrag, moved: true };
     dragPos = canvasPoint(e);
@@ -643,6 +646,7 @@
         class:armed={armed && targetable(n)}
         class:dragover={dragOverId === n.id}
         class:dragging-node={nodeDrag?.id === n.id && nodeDrag.moved}
+        class:grabbable={app.isMyDevice(n.id)}
         class:offline={!n.online}
         data-node-id={n.id}
         style="left: {p.x - NODE_W / 2}px; top: {p.y - NODE_H / 2}px; width: {NODE_W}px; min-height: {NODE_H}px;"
@@ -1195,6 +1199,11 @@
   /* The device being dragged (the original stays in place; a ghost rides the
      cursor), and the one it's hovering over — the share-drop target in the
      sharing concept's violet. */
+  /* Your own devices are draggable (to start a share) — show the grab hand,
+     except in connect mode (tap to connect) or while already dragging. */
+  .node.grabbable:not(.armed):not(.dragging-node) {
+    cursor: grab;
+  }
   .node.dragging-node {
     opacity: 0.8;
     cursor: grabbing;
