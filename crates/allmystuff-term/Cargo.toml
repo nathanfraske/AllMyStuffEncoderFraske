@@ -25,8 +25,9 @@ unsafe_code = "forbid"
 # enum — the lightweight library crates, no media stack.
 allmystuff-protocol = { workspace = true }
 allmystuff-session = { workspace = true }
-# Locating the `allmystuff-serve` node binary to auto-start one (the same
-# discovery the CLI's `serve` uses).
+# Locating the `allmystuff-gui` desktop app to open when no node is running
+# (so the node has a visible owner) — the same discovery the CLI's bare
+# invocation uses; the crate also resolves `allmystuff-serve`.
 allmystuff-service = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

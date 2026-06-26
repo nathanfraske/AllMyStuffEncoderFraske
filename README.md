@@ -83,8 +83,9 @@ irm https://allmystuff.works/install-amst.ps1 | iex
 This drops the `amst` command on your `PATH`, adds an **AMSTerm** app launcher
 (and, on Windows, a desktop + Start Menu shortcut and an **"AMSTerm here"**
 right-click menu on folders). `amst` is a client of this machine's AllMyStuff
-node and starts one itself if `allmystuff-serve` is installed — so install
-AllMyStuff too if you want to reach other machines.
+node; if none is running it opens the desktop app to bring one up (or, on a
+headless box, starts a headless node directly and says so) — so install
+AllMyStuff too.
 
 ## Getting started
 

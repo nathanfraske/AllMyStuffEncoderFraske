@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! amst                 # open a shell on THIS machine (a mesh session your
-//!                      #   fleet can attach to) — booting the node if needed
+//!                      #   fleet can attach to) — opening the app if no node yet
 //! amst nas-01          # open a shell on the machine called nas-01
 //! amst --list          # the machines you can open a terminal on
 //! amst nas-01 -s       # the open shell sessions on nas-01 (to --attach)
@@ -17,8 +17,12 @@
 //!
 //! `amst` is a thin **client** of this machine's AllMyStuff node (the
 //! `allmystuff-serve` engine the desktop app and `allmystuff serve` both run).
-//! If no node is running it starts one, so a bare `amst` is enough to bring
-//! this machine onto the mesh and drop you into a shell on it. Reaching another
+//! If no node is running it opens the **desktop app**, so the node it brings up
+//! has a visible owner. Where there's no app to open — a headless box, or the
+//! app isn't installed — it falls back to starting a headless node directly, but
+//! announces it on the terminal first: an ownerless node is fine when you watch
+//! it start, the *silent* auto-boot is what `amst` avoids. (For an always-on
+//! node across reboots, use `allmystuff service install`.) Reaching another
 //! machine needs it to be online and yours (owner or same fleet) — the same
 //! rule the desktop app's terminal enforces, re-checked on the far side.
 
@@ -37,6 +41,14 @@ use client::{wait_for_socket, NodeClient, NodeEvent};
 
 /// How long to wait for a freshly started node's mesh to come up.
 const READY_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long to wait for the node to bind its control socket after we open the
+/// desktop app. The app has to start its webview and spawn the node, so this is
+/// longer than a bare node spawn would need.
+const GUI_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for a headless `allmystuff-serve` node we spawned directly
+/// to bind its control socket — no webview to start first, so shorter than the
+/// app's.
+const SERVE_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a named machine to appear in presence after a cold
 /// start (adverts trickle in over the first few seconds).
 const FIND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -206,36 +218,109 @@ fn cd_command(dir: &str) -> Vec<u8> {
 // Node lifecycle
 // ---------------------------------------------------------------------------
 
-/// Make sure a node answers the control socket, starting one if not. The node
-/// is this machine's persistent mesh presence, so a started one is left running
-/// (orphaned to init) rather than tied to this short-lived process — for an
-/// always-on node across reboots, `allmystuff service install` is the durable
-/// path, which the failure message points at.
+/// Make sure a node answers the control socket, starting one if not. A node is
+/// this machine's mesh presence, and `amst` prefers to give it a visible owner:
+/// when nothing is listening it **opens the desktop app** (`allmystuff-gui`),
+/// which spawns and owns the node.
+///
+/// Where there's no app to open — a headless box, or the app simply isn't
+/// installed — it falls back to starting a headless `allmystuff-serve` node
+/// directly, but **announces it on the terminal** first. That's the line: the
+/// thing `amst` never does is start a *silent* ownerless node behind your back;
+/// a headless node you watched it start (with a pointer at the service for an
+/// always-on one) is fine.
 async fn ensure_node(_client: &Arc<NodeClient>) -> Result<(), String> {
     if NodeClient::probe().await {
         return Ok(());
     }
-    eprintln!("amst: no AllMyStuff node is running here — starting one…");
+
+    // Prefer opening the desktop app, so the node it brings up has a visible
+    // owner rather than running headless.
+    let can_open_gui = gui_can_open();
+    if can_open_gui {
+        if let Some(bin) = allmystuff_service::find_gui_binary() {
+            eprintln!("amst: no AllMyStuff node is running here — opening the AllMyStuff app…");
+            spawn_detached(&bin)?;
+            return if wait_for_socket(GUI_BOOT_TIMEOUT).await {
+                Ok(())
+            } else {
+                Err(
+                    "opened the AllMyStuff app, but its node didn't come up in time. Give \
+                     it a moment and re-run amst, or start one yourself with `allmystuff \
+                     serve`."
+                        .into(),
+                )
+            };
+        }
+    }
+
+    // No app to open — a headless box, or it isn't installed. Fall back to a
+    // headless node, announced (never silent).
+    let reason = if can_open_gui {
+        "the desktop app isn't installed here"
+    } else {
+        "this looks like a headless box (no display)"
+    };
+    boot_headless_node(reason).await
+}
+
+/// Start a headless `allmystuff-serve` node directly, when the desktop app can't
+/// be opened. Warns that the node has no GUI owner — the announcement is exactly
+/// what makes this acceptable, versus the silent ownerless auto-boot `amst`
+/// avoids. `reason` says why we fell back (headless box / app not installed).
+async fn boot_headless_node(reason: &str) -> Result<(), String> {
     let bin = allmystuff_service::find_serve_binary().ok_or(
-        "couldn't find the `allmystuff-serve` node binary. Install AllMyStuff, \
-         or start it yourself with `allmystuff serve`, then re-run amst.",
+        "no AllMyStuff node is running here, and neither the desktop app nor the \
+         `allmystuff-serve` node binary could be found to start one. Install AllMyStuff \
+         (https://allmystuff.works), then re-run amst.",
     )?;
-    spawn_node(&bin)?;
-    if wait_for_socket(Duration::from_secs(30)).await {
+    eprintln!(
+        "amst: no AllMyStuff node is running here and {reason} — starting a headless node \
+         (`allmystuff-serve`, no app/GUI owner) on this machine."
+    );
+    eprintln!(
+        "amst: it keeps running after amst exits. For an always-on node across reboots use \
+         `allmystuff service install`; on a machine with a screen, the desktop app gives \
+         the node an owner."
+    );
+    spawn_detached(&bin)?;
+    if wait_for_socket(SERVE_BOOT_TIMEOUT).await {
         Ok(())
     } else {
         Err(
-            "the node didn't come up in time. Try `allmystuff serve` in another \
-             terminal, then re-run amst."
+            "the node didn't come up in time. Try `allmystuff serve` in another terminal, \
+             then re-run amst."
                 .into(),
         )
     }
 }
 
-/// Start the node detached, with no console of its own and its logs sent to the
-/// void (they'd otherwise scribble over the shell). We deliberately don't keep
-/// or reap the child: it must outlive amst.
-fn spawn_node(bin: &std::path::Path) -> Result<(), String> {
+/// Whether the desktop app can be opened here. It needs a display: on Linux a
+/// session with neither `DISPLAY` nor `WAYLAND_DISPLAY` is headless and there's
+/// nothing to open (mirrors the CLI's bare-`allmystuff` guard). macOS and
+/// Windows always have a window server for a logged-in user.
+fn gui_can_open() -> bool {
+    if cfg!(target_os = "linux") {
+        !linux_is_headless(
+            std::env::var_os("DISPLAY").is_some(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
+    } else {
+        true
+    }
+}
+
+/// A Linux session is headless when neither display server is advertised. Pure
+/// so it's unit-testable without touching the environment.
+fn linux_is_headless(has_x11: bool, has_wayland: bool) -> bool {
+    !has_x11 && !has_wayland
+}
+
+/// Launch `bin` (the desktop app, or a headless node) detached, so it outlives
+/// this short-lived `amst` process and keeps the machine on the mesh after
+/// `amst` exits. No console of its own, stdio to the void so its logs don't
+/// scribble over the shell. We deliberately don't keep or reap the child.
+fn spawn_detached(bin: &std::path::Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null())
@@ -244,12 +329,14 @@ fn spawn_node(bin: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        // CREATE_NO_WINDOW | DETACHED_PROCESS — no console, survives this one.
+        // CREATE_NO_WINDOW | DETACHED_PROCESS — no inherited console, survives
+        // this process. The app is a windowed (windows-subsystem) binary, so it
+        // still puts up its own window; the node has no window either way.
         cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
     cmd.spawn()
         .map(|_child| ())
-        .map_err(|e| format!("couldn't start the node ({}): {e}", bin.display()))
+        .map_err(|e| format!("couldn't launch {}: {e}", bin.display()))
 }
 
 /// Poll the node until its mesh is ready (it has an identity), returning the
@@ -750,9 +837,11 @@ OPTIONS:
     -V, --version        Print the version.
 
 NOTES:
-    Needs a running AllMyStuff node on this machine; if none is running, amst
-    starts one (the same engine the desktop app and `allmystuff serve` run). For
-    an always-on node across reboots, use `allmystuff service install`.
+    Needs a running AllMyStuff node on this machine. If none is running, amst
+    opens the desktop app, so the node has a visible owner. Where there's no app
+    to open — a headless box, or it isn't installed — amst starts a headless node
+    directly instead, and says so (it never starts one silently). For an
+    always-on node across reboots, use `allmystuff service install`.
 
     Reaching another machine needs it online and yours — owner or same fleet —
     the same rule the desktop app's terminal enforces.";
@@ -836,6 +925,17 @@ mod tests {
             cd_command("/a/it's here"),
             b"cd '/a/it'\\''s here'\n".to_vec()
         );
+    }
+
+    #[test]
+    fn linux_headless_only_when_no_display_server() {
+        // A display server of either kind means we can open the desktop app.
+        assert!(!linux_is_headless(true, false));
+        assert!(!linux_is_headless(false, true));
+        assert!(!linux_is_headless(true, true));
+        // Neither ⇒ headless, so amst must not try to open the app (it points
+        // the user at `allmystuff serve` / the service instead).
+        assert!(linux_is_headless(false, false));
     }
 
     #[test]

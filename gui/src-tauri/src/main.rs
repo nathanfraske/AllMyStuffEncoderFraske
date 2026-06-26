@@ -1646,6 +1646,30 @@ fn reveal_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Bring the per-machine node back up if it has gone away, storing the child we
+/// spawn so it still dies with the app. Safe to call any time:
+/// [`ensure_node_running`] probes the control socket first and returns `None`
+/// when a node already answers, so a healthy node is left untouched.
+///
+/// Called on a single-instance hand-off. A second launch is usually the user
+/// re-opening the app, but it can also be `amst` opening it expressly to get a
+/// node onto the mesh — so as well as revealing the window we make sure the node
+/// is actually running, healing one that died under a still-running app (a node
+/// crash, or a reused Always-On service node that bounced) instead of leaving a
+/// live app with no node behind it.
+fn heal_node(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match ensure_node_running().await {
+            Ok(Some(child)) => {
+                handle.state::<AppState>().node_child.lock().replace(child);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!("couldn't bring the allmystuff node back up: {e:#}"),
+        }
+    });
+}
+
 /// Apply the persisted startup preferences once the app is built: reveal the
 /// main window unless this is a login-item launch the user asked to start
 /// minimized, and — on a fresh install — default "Start with computer" on.
@@ -1779,10 +1803,13 @@ fn main() {
         // its own node and `myownmesh` daemon fighting over the same control
         // socket. The single-instance plugin makes that second launch hand off
         // to the first and exit; the callback runs *in the original instance*,
-        // so we just bring its window back to the front. Must be registered
+        // so we bring its window back to the front — and re-ensure the node,
+        // since a second launch may be `amst` opening the app to get one (this
+        // heals a node that died under a still-running app). Must be registered
         // before any other plugin for the guard to take effect.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             reveal_main_window(app);
+            heal_node(app);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())

@@ -1518,6 +1518,89 @@ fn workspace_serve_path(profile: &str, exe: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Locating the desktop-app binary (the GUI a bare `allmystuff` opens, and what
+// `amst` boots when no node is running so the node has a visible GUI owner)
+// ---------------------------------------------------------------------------
+
+fn gui_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "allmystuff-gui.exe"
+    } else {
+        "allmystuff-gui"
+    }
+}
+
+/// Locate the `allmystuff-gui` desktop-app binary — the program a bare
+/// `allmystuff` opens, and what `amst` boots when no node is running (so the
+/// node it brings up has a visible GUI owner rather than running silently
+/// headless). Shared by the CLI's bare-invocation launcher and `amst` so both
+/// find the app the same way.
+///
+/// Order mirrors [`find_serve_binary`]: `ALLMYSTUFF_GUI_BIN` → next to the
+/// running binary (the installer's layout) → `$PATH` → the installer's
+/// well-known destinations → the dev workspace target
+/// (`gui/src-tauri/target/{release,debug}`). The well-known destinations matter
+/// for the same reason they do for the node binary: a process launched from a
+/// desktop launcher inherits a minimal `PATH` that misses `/usr/local/bin` and
+/// `~/.local/bin`. Zero-byte files are skipped (see [`runnable`]), so a failed
+/// sidecar stub falls through instead of "finding" an unrunnable binary.
+pub fn find_gui_binary() -> Option<PathBuf> {
+    let exe = gui_exe_name();
+
+    if let Some(p) = std::env::var_os("ALLMYSTUFF_GUI_BIN") {
+        let p = PathBuf::from(p);
+        if runnable(&p) {
+            return Some(p);
+        }
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
+            if runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(exe);
+            if runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    for dir in install_dirs() {
+        let candidate = dir.join(exe);
+        if runnable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    for profile in ["release", "debug"] {
+        if let Some(p) = workspace_gui_path(profile, exe) {
+            if runnable(&p) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn workspace_gui_path(profile: &str, exe: &str) -> Option<PathBuf> {
+    // CARGO_MANIFEST_DIR = crates/allmystuff-service; repo root is two up, and
+    // the Tauri app's build output lives under `gui/src-tauri/target/<profile>/`.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Some(
+        PathBuf::from(manifest_dir)
+            .parent()? // crates/
+            .parent()? // repo root
+            .join("gui")
+            .join("src-tauri")
+            .join("target")
+            .join(profile)
+            .join(exe),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
