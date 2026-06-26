@@ -361,7 +361,7 @@
     padding: 0.45rem 0.55rem;
   }
   .list li.built {
-    box-shadow: 0 0 0 1.5px var(--accent);
+    box-shadow: 0 0 0 1.5px var(--c-venue);
   }
   .v-main {
     flex: 1;
@@ -382,9 +382,9 @@
     text-overflow: ellipsis;
   }
   .built-chip {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-    border-color: var(--accent);
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    border-color: var(--c-venue);
   }
   .off-chip {
     color: var(--ink-faint);
@@ -414,13 +414,20 @@
     background: var(--ink-faint);
     transition: transform 0.12s ease, background 0.12s ease;
   }
+  /* On = the venue concept colour (gold), buttony like the venues pill. */
   .vswitch.on {
-    background: var(--ok-soft);
-    border-color: var(--ok);
+    background: linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--c-venue) 80%, white),
+      var(--c-venue)
+    );
+    border-color: var(--c-venue);
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.35),
+      0 2px 8px -3px var(--c-venue-soft);
   }
   .vswitch.on .vknob {
     transform: translateX(0.92rem);
-    background: var(--ok);
+    background: linear-gradient(180deg, #fff, oklch(0.95 0.02 80));
   }
   .editor {
     margin-top: 1rem;

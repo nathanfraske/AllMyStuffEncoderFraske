@@ -46,6 +46,29 @@
   --m-clipboard: oklch(0.8 0.13 55);
   --m-data: oklch(0.66 0.03 285);
 
+  /* Concept palette — the four layers of the model, each a single hue carried
+     everywhere that concept is coloured (top-bar pills, graph treatments,
+     settings, and the "How it connects" explainer's word + chip + card).
+     Matching the museum story: venue = the place (warm gold), mesh = the group
+     name you call out (the brand magenta), fleet = your own closed pack
+     (green), sharing = lending to a person (violet). `*-soft` is the
+     translucent fill, `*-ink` the legible text/icon tint on the dark ground. */
+  --c-venue: oklch(0.78 0.13 78);
+  --c-venue-soft: oklch(0.78 0.13 78 / 0.16);
+  --c-venue-ink: oklch(0.83 0.12 80);
+
+  --c-mesh: var(--accent);
+  --c-mesh-soft: var(--accent-soft);
+  --c-mesh-ink: var(--accent-ink);
+
+  --c-fleet: oklch(0.8 0.17 150);
+  --c-fleet-soft: oklch(0.8 0.17 150 / 0.16);
+  --c-fleet-ink: oklch(0.84 0.16 152);
+
+  --c-share: oklch(0.68 0.18 292);
+  --c-share-soft: oklch(0.68 0.18 292 / 0.18);
+  --c-share-ink: oklch(0.8 0.16 292);
+
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 18px 40px -20px rgba(0, 0, 0, 0.7);
   --shadow-lg: 0 40px 90px -40px rgba(0, 0, 0, 0.8);
@@ -95,10 +118,16 @@ button {
   cursor: pointer;
 }
 
-/* Reusable button styles. */
+/* Reusable button styles.
+ *
+ * Buttons read as physically pressable: a top-down gradient for a lit edge, a
+ * hairline inset highlight along the top, a soft drop shadow that grounds them,
+ * and a real press-down on :active (the button sinks and its shadow collapses).
+ * The same language across dark, ghost and primary so one learned affordance
+ * carries everywhere. */
 .btn {
   border: 1px solid var(--line-strong);
-  background: var(--surface);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
   color: var(--ink);
   padding: 0.5rem 0.9rem;
   border-radius: var(--r-pill);
@@ -107,22 +136,32 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
-  transition: transform 0.06s ease, box-shadow 0.12s ease, background 0.12s ease;
-  box-shadow: var(--shadow-sm);
+  transition: transform 0.06s ease, box-shadow 0.12s ease, background 0.12s ease,
+    filter 0.12s ease;
+  box-shadow: var(--shadow-sm), inset 0 1px 0 oklch(1 0 0 / 0.05);
 }
 .btn:hover {
-  background: var(--surface-2);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-2));
 }
 .btn:active {
   transform: translateY(1px);
+  box-shadow: inset 0 1px 2px oklch(0 0 0 / 0.3);
 }
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: linear-gradient(180deg, var(--accent-ink), var(--accent));
+  border-color: oklch(0.58 0.235 350);
   color: #fff;
+  box-shadow: var(--shadow-sm), 0 4px 12px -4px oklch(0.64 0.255 350 / 0.55),
+    inset 0 1px 0 oklch(1 0 0 / 0.28);
 }
 .btn.primary:hover {
-  background: var(--accent-ink);
+  filter: brightness(1.06);
+}
+.btn.primary:active {
+  transform: translateY(1px);
+  filter: brightness(0.96);
+  box-shadow: 0 1px 3px -1px oklch(0.64 0.255 350 / 0.5),
+    inset 0 1px 3px oklch(0 0 0 / 0.3);
 }
 .btn.ghost {
   border-color: transparent;
@@ -132,11 +171,65 @@ button {
 .btn.ghost:hover {
   background: var(--surface-2);
 }
+.btn.ghost:active {
+  box-shadow: inset 0 1px 2px oklch(0 0 0 / 0.25);
+}
 .btn.small {
   padding: 0.32rem 0.6rem;
   font-size: 0.78rem;
 }
 .btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  box-shadow: var(--shadow-sm);
+  filter: none;
+  transform: none;
+}
+
+/* Reusable toggle switch — flat and recessed when off, an accent-buttony lit
+ * track with a raised knob when on. Concept panes override the on-colour by
+ * setting `--toggle-on` (e.g. venue = gold, mesh = magenta) on the element. */
+.toggle {
+  --toggle-on: var(--accent);
+  position: relative;
+  flex-shrink: 0;
+  width: 2.3rem;
+  height: 1.3rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  box-shadow: inset 0 1px 2px oklch(0 0 0 / 0.3);
+  padding: 0;
+  transition: background 0.16s ease, border-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.toggle .knob {
+  position: absolute;
+  top: 50%;
+  left: 0.18rem;
+  width: 0.92rem;
+  height: 0.92rem;
+  border-radius: 50%;
+  background: linear-gradient(180deg, oklch(0.86 0.01 285), oklch(0.72 0.02 285));
+  box-shadow: 0 1px 2px oklch(0 0 0 / 0.45);
+  transform: translateY(-50%);
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+.toggle.on {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklch, var(--toggle-on) 78%, white),
+    var(--toggle-on)
+  );
+  border-color: var(--toggle-on);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.3),
+    0 2px 8px -3px color-mix(in oklch, var(--toggle-on) 60%, transparent);
+}
+.toggle.on .knob {
+  transform: translate(1rem, -50%);
+  background: linear-gradient(180deg, #fff, oklch(0.93 0.01 285));
+}
+.toggle:disabled {
   opacity: 0.5;
   cursor: default;
 }

@@ -884,20 +884,22 @@
     color: var(--ok);
   }
   .pill.guest {
-    background: var(--bronze-soft);
-    color: var(--bronze);
+    background: var(--c-share-soft);
+    color: var(--c-share-ink);
   }
   .pill.soft {
     background: var(--surface-2);
     color: var(--ink-soft);
   }
+  /* "Someone else's, not shared" — bronze, distinct from a device actually
+     shared with you (violet, above). */
   .pill.theirs {
-    background: var(--violet-soft);
-    color: var(--violet);
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .pill.fleet {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
   }
   .pill.claimable {
     background: var(--accent-soft);
@@ -920,9 +922,9 @@
   .net-chip {
     font-size: 0.64rem;
     font-weight: 650;
-    background: var(--violet-soft);
-    border: 1px solid oklch(0.62 0.2 292 / 0.35);
-    color: var(--violet);
+    background: var(--c-mesh-soft);
+    border: 1px solid var(--c-mesh);
+    color: var(--c-mesh-ink);
     border-radius: var(--r-pill);
     padding: 0.04rem 0.4rem;
   }

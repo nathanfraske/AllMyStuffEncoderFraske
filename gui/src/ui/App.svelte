@@ -49,8 +49,8 @@
   // preview, where the badge below simply doesn't render.
   let version = $state("");
 
-  // The "how it works" sheet — the venue graphic that explains mesh / fleet /
-  // servers / sharing in one picture. Local UI state; opened from the top bar.
+  // The "how it works" sheet — the museum-story explainer that teaches venue /
+  // mesh / fleet / sharing. Local UI state; opened from the top bar.
   let infoOpen = $state(false);
 
   onMount(() => {
@@ -309,10 +309,18 @@
     cursor: pointer;
     transition: border-color 0.12s ease, background 0.12s ease;
   }
-  .chip.yours:hover,
+  /* The four summary pills carry their concept's colour, the same hues the
+     "How it connects" explainer teaches: fleet = green (your own pack),
+     sharing = violet (lending to a person). */
+  .chip.yours:hover {
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet);
+    color: var(--c-fleet-ink);
+  }
   .chip.shared:hover {
-    background: var(--surface);
-    border-color: var(--accent);
+    background: var(--c-share-soft);
+    border-color: var(--c-share);
+    color: var(--c-share-ink);
   }
   .net-anchor {
     position: relative;
@@ -334,10 +342,12 @@
     color: var(--danger);
     border-color: oklch(0.7 0.19 14 / 0.35);
   }
+  /* Live mesh wears the mesh concept colour (magenta); the no-mesh state keeps
+     the red warning above — that's connection status, not identity. */
   .chip.net.live {
-    background: var(--ok-soft);
-    color: var(--ok);
-    border-color: oklch(0.8 0.17 150 / 0.3);
+    background: var(--c-mesh-soft);
+    color: var(--c-mesh-ink);
+    border-color: var(--c-mesh);
   }
   /* The presence dot *is* the networks icon — colored from the chip (red
      when there's no live network, green when joined) and given a soft halo
@@ -350,7 +360,7 @@
     flex-shrink: 0;
   }
   .chip.net.live .net-dot {
-    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.18);
+    box-shadow: 0 0 0 3px var(--c-mesh-soft);
   }
   .net-chevron {
     font-size: 0.62rem;
@@ -371,9 +381,9 @@
     border-color: var(--line-strong);
   }
   .chip.venue.live {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
-    border-color: var(--accent-soft);
+    background: var(--c-venue-soft);
+    color: var(--c-venue-ink);
+    border-color: var(--c-venue-soft);
   }
   /* A brief glow when driving a mesh just turned a venue back on. */
   .chip.venue.shimmer {
@@ -381,12 +391,12 @@
   }
   @keyframes venue-shimmer {
     0% {
-      box-shadow: 0 0 0 0 var(--accent-soft);
+      box-shadow: 0 0 0 0 var(--c-venue-soft);
     }
     35% {
-      box-shadow: 0 0 0 6px var(--accent-soft);
-      background: var(--accent-soft);
-      color: var(--accent-ink);
+      box-shadow: 0 0 0 6px var(--c-venue-soft);
+      background: var(--c-venue-soft);
+      color: var(--c-venue-ink);
     }
     100% {
       box-shadow: 0 0 0 0 transparent;
@@ -465,9 +475,9 @@
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0);
     }
   }
-  /* Icon-only "how it works" — opens the venue graphic. Same tight footprint
-     as refresh/gear, with the glyph as a bold accent so it reads as help, not
-     another setting. */
+  /* Icon-only "how it works" — opens the museum-story explainer. Same tight
+     footprint as refresh/gear, with the glyph as a bold accent so it reads as
+     help, not another setting. */
   .help {
     font-size: 0.95rem;
     font-weight: 800;

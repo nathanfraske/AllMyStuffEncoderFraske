@@ -591,9 +591,10 @@
     border-radius: var(--r-lg);
     background: oklch(0.21 0.028 285 / 0.35);
   }
+  /* Your fleet band — the green of the "fleet" concept (your own pack). */
   .section.mine {
-    border-color: oklch(0.64 0.255 350 / 0.45);
-    background: oklch(0.64 0.255 350 / 0.05);
+    border-color: oklch(0.8 0.17 150 / 0.45);
+    background: oklch(0.8 0.17 150 / 0.05);
   }
   .section.unknown {
     border-style: dotted;
@@ -612,7 +613,7 @@
     letter-spacing: 0.01em;
   }
   .section.mine .section-head {
-    color: var(--accent-ink);
+    color: var(--c-fleet-ink);
   }
   .section-count {
     font-size: 0.66rem;
@@ -644,8 +645,9 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
   }
+  /* A device shared with you wears the sharing concept's violet edge. */
   .node.shared {
-    border-color: oklch(0.74 0.085 72 / 0.55);
+    border-color: var(--c-share);
     background: linear-gradient(180deg, var(--surface-2), var(--surface));
   }
   .node.unclaimed {
@@ -836,12 +838,13 @@
     gap: 0.2rem;
     margin-top: 0.1rem;
   }
+  /* Per-node mesh chips wear the mesh concept colour (magenta). */
   .net-chip {
     font-size: 0.6rem;
     font-weight: 650;
-    background: var(--violet-soft);
-    border: 1px solid oklch(0.62 0.2 292 / 0.35);
-    color: var(--violet);
+    background: var(--c-mesh-soft);
+    border: 1px solid var(--c-mesh);
+    color: var(--c-mesh-ink);
     border-radius: var(--r-pill);
     padding: 0.02rem 0.36rem;
   }
@@ -865,8 +868,8 @@
     color: var(--ok);
   }
   .tag.guest {
-    background: var(--bronze-soft);
-    color: var(--bronze);
+    background: var(--c-share-soft);
+    color: var(--c-share-ink);
   }
   .tag.unclaimed {
     background: var(--surface-2);
@@ -879,13 +882,15 @@
     border: 1px solid var(--accent);
     font-weight: 700;
   }
+  /* "Someone else's, not shared with me" — bronze keeps it distinct from a
+     device actually shared with you (violet, above). */
   .tag.theirs {
-    background: var(--violet-soft);
-    color: var(--violet);
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .tag.fleet {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
   }
   .tag.meshonly {
     background: var(--surface-2);

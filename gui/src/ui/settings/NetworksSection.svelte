@@ -456,12 +456,13 @@
   .btn.danger {
     color: var(--danger);
   }
+  /* The fleet mesh — marked in the fleet concept's green. */
   .nets li.fleet {
-    box-shadow: inset 0 0 0 1.5px var(--accent-soft);
+    box-shadow: inset 0 0 0 1.5px var(--c-fleet-soft);
   }
   .badge.fleet-badge {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
   }
   .btn.locked {
     opacity: 0.8;

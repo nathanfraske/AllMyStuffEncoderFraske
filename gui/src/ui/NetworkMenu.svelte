@@ -203,13 +203,20 @@
     background: var(--ink-faint);
     transition: transform 0.12s ease, background 0.12s ease;
   }
+  /* On = the mesh concept colour (magenta), with a lit, buttony track. */
   .switch.on {
-    background: var(--ok-soft);
-    border-color: var(--ok);
+    background: linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--c-mesh) 78%, white),
+      var(--c-mesh)
+    );
+    border-color: var(--c-mesh);
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.3),
+      0 2px 8px -3px var(--c-mesh-soft);
   }
   .switch.on .knob {
     transform: translateX(0.92rem);
-    background: var(--ok);
+    background: linear-gradient(180deg, #fff, oklch(0.93 0.01 285));
   }
   .lock {
     flex-shrink: 0;
@@ -218,18 +225,19 @@
     cursor: not-allowed;
     padding: 0 0.2rem;
   }
+  /* The fleet mesh — tagged in the fleet concept's green. */
   .fleet-tag {
     margin-left: 0.35rem;
     font-size: 0.6rem;
     font-weight: 700;
-    color: var(--accent-ink);
-    background: var(--accent-soft);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.35rem;
     vertical-align: middle;
   }
   .row.fleet {
-    box-shadow: inset 0 0 0 1px var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--c-fleet-soft);
   }
   .menu-foot {
     margin-top: 0.35rem;
