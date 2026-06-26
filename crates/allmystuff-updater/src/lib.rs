@@ -810,14 +810,33 @@ fn wanted_artifacts(current: &str, latest: &str) -> Vec<ArtifactKind> {
         .collect()
 }
 
+/// One attended check, logging the outcome. Shared by the launch check and
+/// every interval tick of [`tick_forever`]. `force` skips only the interval
+/// cooldown ([`is_due`]); the enabled flag and package-manager guard inside
+/// [`check_now`] still apply, so a forced launch check no-ops cleanly when
+/// auto-update is off or the install is package-managed.
+async fn run_attended_check(force: bool) {
+    match check_now(force).await {
+        Ok(CheckOutcome::Staged { version }) => {
+            tracing::info!("self-update staged {version}; applies on next launch");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("self-update check failed: {e}"),
+    }
+}
+
 /// Background auto-update ticker — the half of self-update that makes it
-/// "set and forget". Runs forever: a first check fires shortly after the
-/// process starts, then again every `check_interval_hours` (re-read each
-/// loop so a settings change takes effect without a restart). Each tick is a
-/// non-forced [`check_now`], internally gated on the enabled flag, the
-/// package-manager guard, the apply policy, and the interval cooldown — so
-/// spawning it in a disabled or package-managed install simply no-ops.
-/// Whatever it stages applies on the next launch (see [`apply_pending_if_any`]).
+/// "set and forget". Runs forever: a **launch check** fires shortly after the
+/// process starts and *always* checks when auto-update is enabled — it ignores
+/// the interval cooldown, so opening the app catches a release even when the
+/// last check was under `check_interval_hours` ago (a relaunch within the day
+/// used to no-op on the cooldown and wait the full interval). It then starts
+/// the 24h timer: another check every `check_interval_hours` (re-read each loop
+/// so a settings change takes effect without a restart). Each tick is gated on
+/// the enabled flag, the package-manager guard, and the apply policy — so
+/// spawning it in a disabled or package-managed install simply no-ops, launch
+/// check included. Whatever it stages applies on the next launch (see
+/// [`apply_pending_if_any`]).
 ///
 /// Every long-lived process that links the updater spawns this: the desktop
 /// app's Tauri shell and the headless `allmystuff-serve` node. Without it the
@@ -829,16 +848,14 @@ pub async fn tick_forever() {
     // Let a freshly launched app/node settle (bind sockets, bring the session
     // online) before the first network hit.
     tokio::time::sleep(Duration::from_secs(30)).await;
+    // The launch check: force past the interval cooldown so opening the app is
+    // its own check (still gated on enabled + package manager). Then the 24h
+    // timer takes over for the rest of the run.
+    run_attended_check(true).await;
     loop {
-        match check_now(false).await {
-            Ok(CheckOutcome::Staged { version }) => {
-                tracing::info!("self-update staged {version}; applies on next launch");
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("self-update check failed: {e}"),
-        }
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+        run_attended_check(false).await;
     }
 }
 
@@ -861,35 +878,47 @@ pub async fn tick_forever() {
 /// All the gating of [`tick_forever`] still applies (enabled flag, package
 /// manager, apply policy, interval), so this no-ops cleanly when auto-update
 /// is off or the install is package-managed — `relaunch` never fires then.
+/// Like the attended ticker, the launch check ignores the interval cooldown
+/// (a node that bounces inside the interval still checks once on the way up),
+/// then the 24h timer takes over.
 pub async fn tick_forever_unattended(relaunch: fn() -> !) {
     tokio::time::sleep(Duration::from_secs(30)).await;
+    // Launch check first (cooldown ignored), then the recurring interval.
+    run_unattended_check(true, relaunch).await;
     loop {
-        match check_now(false).await {
-            Ok(CheckOutcome::Staged { version }) => {
-                tracing::info!("self-update staged {version}; applying now (unattended node)");
-                match apply_now() {
-                    Ok(Some(applied)) => {
-                        tracing::info!(
-                            "self-update applied {applied}; relaunching to run the new version"
-                        );
-                        relaunch();
-                    }
-                    // Staged but nothing needed applying (already current on
-                    // disk), or a best-effort half hiccupped — keep serving the
-                    // running version and retry on the next tick.
-                    Ok(None) => tracing::warn!(
-                        "self-update staged {version} but nothing was applied; retrying next tick"
-                    ),
-                    Err(e) => {
-                        tracing::warn!("self-update apply failed: {e}; retrying next tick")
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("self-update check failed: {e}"),
-        }
         let hours = load_auto_update().check_interval_hours.max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+        run_unattended_check(false, relaunch).await;
+    }
+}
+
+/// One unattended check: stage, then *apply + relaunch* immediately (the
+/// "always on, always current" half — a service box has no one to click
+/// "relaunch"). Shared by the launch check and every interval tick of
+/// [`tick_forever_unattended`]. `force` skips only the interval cooldown;
+/// enabled / package-manager gating inside [`check_now`] still applies.
+async fn run_unattended_check(force: bool, relaunch: fn() -> !) {
+    match check_now(force).await {
+        Ok(CheckOutcome::Staged { version }) => {
+            tracing::info!("self-update staged {version}; applying now (unattended node)");
+            match apply_now() {
+                Ok(Some(applied)) => {
+                    tracing::info!(
+                        "self-update applied {applied}; relaunching to run the new version"
+                    );
+                    relaunch();
+                }
+                // Staged but nothing needed applying (already current on
+                // disk), or a best-effort half hiccupped — keep serving the
+                // running version and retry on the next tick.
+                Ok(None) => tracing::warn!(
+                    "self-update staged {version} but nothing was applied; retrying next tick"
+                ),
+                Err(e) => tracing::warn!("self-update apply failed: {e}; retrying next tick"),
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("self-update check failed: {e}"),
     }
 }
 

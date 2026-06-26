@@ -895,7 +895,9 @@ impl Mesh {
         NodeProfile {
             protocol: PROTOCOL_VERSION,
             node: node.clone(),
-            label,
+            // Cloned (not moved) so `fleet_owner` below can fall back to this
+            // device's label for an unnamed fleet it owns.
+            label: label.clone(),
             hostname,
             summary: allmystuff_bridge::node_summary(&inv),
             capabilities: allmystuff_bridge::capabilities_with_screens(
@@ -943,6 +945,31 @@ impl Mesh {
             // staged update only becomes our reported version once we restart
             // onto it (which an `Upgrade` triggers), so this stays honest.
             version: env!("CARGO_PKG_VERSION").to_string(),
+            // The fleet's display name ("Casey"), shared fleet-wide (handed
+            // down with the fleet key), so a peer groups + labels this device's
+            // fleet straight from presence. Empty when not in a fleet / unnamed.
+            fleet_name: self.ownership.fleet_name(),
+            // The fleet **owner's** (person) name — never the owner device's
+            // hostname. See [`Mesh::fleet_owner_name`].
+            fleet_owner: self.fleet_owner_name(&label),
+        }
+    }
+
+    /// The fleet owner's display name to advertise in presence — the *person*
+    /// who owns the fleet, never the owner device's hostname. A fleet is named
+    /// for its owner, so this is the fleet name when one is set; otherwise the
+    /// owner device falls back to its own label (`own_label`) so an as-yet-
+    /// unnamed fleet still says *who* owns it, while a member of an unnamed
+    /// fleet leaves it empty (it can't name the owner until the fleet is named
+    /// or — once roles converge — the signed roster tells it who the owner is).
+    fn fleet_owner_name(&self, own_label: &str) -> String {
+        let name = self.ownership.fleet_name();
+        if !name.trim().is_empty() {
+            name
+        } else if self.ownership.is_fleet_owner() {
+            own_label.to_string()
+        } else {
+            String::new()
         }
     }
 
@@ -2632,6 +2659,33 @@ impl Mesh {
                 .to_string()
             });
         }
+        // The whole fleet should see *who the owner is*, not just the owner
+        // machine. A member always knows its owner locally — the device that
+        // claimed it — so stamp that device "owner" here, covering the window
+        // before the closed network's signed roster converges its role and the
+        // owned-but-keyless case (claimed, no closed network yet, so no roster
+        // to read at all). `or_insert` never overrides a role the signed roster
+        // already projected, and the owner is added to the member list if the
+        // roster hasn't surfaced it yet (label left blank — the GUI resolves it
+        // by canonical id). The MyOwnMesh roster gossip converges the same fact
+        // network-wide; this is the local fast path / fallback.
+        if !self.ownership.is_fleet_owner() {
+            if let Some(owner) = self.ownership.owner() {
+                let canon = pubkey_part(&owner).to_string();
+                if !members
+                    .iter()
+                    .any(|m| pubkey_part(m.device.as_str()) == canon)
+                {
+                    members.push(OwnedMember {
+                        device: NodeId::from(canon.as_str()),
+                        label: String::new(),
+                    });
+                }
+                member_roles
+                    .entry(canon)
+                    .or_insert_with(|| "owner".to_string());
+            }
+        }
         let roster = OwnedRoster {
             key,
             name: self.ownership.fleet_name(),
@@ -2734,6 +2788,11 @@ impl Mesh {
             if let Some(p) = st.profile.as_mut() {
                 p.owner = self.ownership.owner().map(NodeId::from);
                 p.claimable = self.ownership.claimable();
+                // Re-stamp the fleet metadata too: a claim/adopt/leave/rename
+                // is exactly when the fleet name + owner change, and this is the
+                // path that re-broadcasts presence, so peers regroup correctly.
+                p.fleet_name = self.ownership.fleet_name();
+                p.fleet_owner = self.fleet_owner_name(&p.label.clone());
             }
         }
         match peer {
@@ -3232,10 +3291,79 @@ impl Mesh {
             st.networks = networks.clone();
             st.network = primary.clone();
         }
+        // A network reset (one disabled, removed, or left — its config_id is
+        // gone from the joined set) leaves behind ghosts: peers and the
+        // network-derived data we cached for them while it was up. Drop those
+        // now so the graph reflects reality. This clears *network* data only —
+        // long-lived state (shares, fleet membership + the signed-roster cache,
+        // the saved networks, exposed sites) is untouched (see
+        // [`Mesh::prune_unjoined_peers`]).
+        self.prune_unjoined_peers().await;
         self.subscribe_channels(client_id, &networks).await;
         self.advertise_capabilities().await;
         self.broadcast_presence().await;
         self.emit_snapshot();
+    }
+
+    /// Clear the ephemeral, network-derived caches for peers no longer
+    /// reachable on any joined network — what a network reset (a disabled,
+    /// removed, or left network) leaves stale. For each such peer we drop the
+    /// live session entry (tearing down any routes to it) and its per-peer
+    /// presence caches: the last-seen network, advertised features, and boot
+    /// id. A peer still reachable on a network that survived the reset keeps
+    /// its caches and re-converges on its next advert; one only on the gone
+    /// network is forgotten outright.
+    ///
+    /// Deliberately scoped to *network* data. Long-lived state survives a
+    /// reset untouched: durable shares ([`Mesh::shares`]), fleet membership and
+    /// its closed-network signed-roster cache ([`Mesh::ownership`] /
+    /// [`Mesh::fleet_authorized`]), the saved network configs, and the exposed
+    /// sites set are all per-device or per-person, not per-network, so a
+    /// network coming and going never drops them.
+    async fn prune_unjoined_peers(self: &Arc<Self>) {
+        let (effects, dropped) = {
+            let mut st = self.state.lock();
+            let joined: std::collections::HashSet<String> = st.networks.iter().cloned().collect();
+            // Peers whose last-seen network is gone from the joined set.
+            let stale: std::collections::HashSet<String> = st
+                .peer_networks
+                .iter()
+                .filter(|(_, net)| !joined.contains(net.as_str()))
+                .map(|(peer, _)| peer.clone())
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            for peer in &stale {
+                st.peer_networks.remove(peer);
+                st.peer_features.remove(peer);
+                st.peer_boots.remove(peer);
+            }
+            // Drop the same peers (matched by canonical pubkey) from the live
+            // session, tearing down any routes to them.
+            let mut effects = Vec::new();
+            let mut dropped = 0usize;
+            if let Some(session) = st.session.as_mut() {
+                let gone: Vec<NodeId> = session
+                    .peers()
+                    .filter(|p| stale.contains(pubkey_part(p.node.as_str())))
+                    .map(|p| p.node.clone())
+                    .collect();
+                for id in gone {
+                    effects.extend(session.drop_peer(&id));
+                    dropped += 1;
+                }
+            }
+            (effects, dropped)
+        };
+        if dropped > 0 {
+            tracing::info!("network reset: cleared {dropped} stale peer(s) from a removed network");
+        }
+        // Boxed to break the async-fn cycle: `process_effects` can route back
+        // through ownership/`sync_networks`, and without indirection the
+        // `sync_networks` → `prune_unjoined_peers` → `process_effects` chain
+        // would be an infinitely-sized future.
+        Box::pin(self.process_effects(effects)).await;
     }
 
     /// Subscribe presence, control, media, and rooms on each given network.

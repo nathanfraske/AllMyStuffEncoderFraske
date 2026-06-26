@@ -67,6 +67,15 @@ export interface SessionSnapshot {
     /** The AllMyStuff version the peer is running, from its advert. Absent
      *  from an older peer — "unknown". */
     version?: string;
+    /** The peer's fleet display name ("Casey"), from its presence advert —
+     *  so the graph groups + labels its fleet without reconstructing the
+     *  owner's name from the catalog. Absent (an older peer, or not in a
+     *  fleet) — empty. */
+    fleet_name?: string;
+    /** The peer's fleet **owner** (person) name, from its presence advert —
+     *  the human who owns the fleet, not the owner device's hostname. Absent
+     *  (an older peer, or unknown) — empty. */
+    fleet_owner?: string;
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };

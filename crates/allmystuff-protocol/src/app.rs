@@ -182,6 +182,26 @@ pub struct NodeProfile {
     /// older receiver sees exactly the presence shape it always did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// The fleet this device belongs to, by display name — "whatever its owner
+    /// answers to" ("Casey"). Carried in presence so a peer can **group** this
+    /// device into its fleet and **label** that group without reconstructing
+    /// the owner's name from the catalog. Shared fleet-wide: the owner hands it
+    /// down with the fleet key on adoption, so every member advertises the same
+    /// name. Empty = not in a fleet (or an unnamed one); empty serializes
+    /// *without* the key, so an older receiver sees the presence shape it always
+    /// did. `#[serde(default)]` so presence from an older peer still decodes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fleet_name: String,
+    /// The fleet **owner's** display name — the *person* who owns the fleet, not
+    /// the owner device's hostname. Lets every peer render "Casey's fleet" the
+    /// same way the owner does, sourced from the advert rather than resolved
+    /// from whichever device happens to be in the catalog. A fleet is named for
+    /// its owner, so today this tracks [`Self::fleet_name`]; the owner device
+    /// falls back to its own label only for an as-yet-unnamed fleet. Empty when
+    /// unknown; empty serializes *without* the key (additive — older peers see
+    /// the unchanged shape).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fleet_owner: String,
 }
 
 /// One site a node exposes — a TCP service it's listening on that it's
@@ -778,10 +798,45 @@ mod tests {
                 loopback: true,
             }],
             version: "0.1.11".into(),
+            fleet_name: "Casey".into(),
+            fleet_owner: "Casey".into(),
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn presence_fleet_metadata_accepts_skew_both_ways() {
+        // An older peer's advert has no `fleet_name` / `fleet_owner` — they
+        // decode as empty rather than failing, so the node never vanishes from
+        // the graph (it just isn't grouped into a named fleet).
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert!(p.fleet_name.is_empty());
+        assert!(p.fleet_owner.is_empty());
+
+        // Empty fleet metadata serializes *without* the keys, so an older
+        // receiver sees exactly the presence shape it always did.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("fleet_name"));
+        assert!(!s.contains("fleet_owner"));
+
+        // Populated values round-trip and carry the owner's *person* name.
+        let p = NodeProfile {
+            fleet_name: "Casey".into(),
+            fleet_owner: "Casey".into(),
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"fleet_name\":\"Casey\""));
+        assert!(s.contains("\"fleet_owner\":\"Casey\""));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.fleet_name, "Casey");
+        assert_eq!(back.fleet_owner, "Casey");
     }
 
     #[test]

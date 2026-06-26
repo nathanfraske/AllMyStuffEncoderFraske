@@ -1592,6 +1592,12 @@ class AppStore {
       // is behind the channel and offer an upgrade. Absent (older peer) =
       // unknown, and the upgrade button stays hidden.
       node.version = p.version;
+      // Fleet metadata the device advertises — its fleet's name and its
+      // owner's *person* name — so the graph groups + labels its fleet
+      // ("Casey's fleet") straight from presence, even for fleets we don't
+      // own. Absent (an older peer, or not in a fleet) leaves them undefined.
+      node.fleetName = p.fleet_name || undefined;
+      node.fleetOwner = p.fleet_owner || undefined;
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -5929,6 +5935,12 @@ class AppStore {
         return n.relationship.person;
       }
     }
+    // Prefer the owner's *person* name straight from the device's presence
+    // advert (the fleet-owner name every fleet device broadcasts). This labels
+    // "Casey's fleet" by who actually owns it, without depending on the owner
+    // device being present in our catalog — the old fallback below.
+    const advertised = node.fleetOwner?.trim();
+    if (advertised) return { id, name: advertised };
     const ownerNode = this.catalog.nodes.find((n) => sameMachine(n.id, ownerKey));
     return { id, name: ownerNode?.label ?? node.label };
   }
