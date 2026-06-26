@@ -11,9 +11,11 @@
   import SharingSection from "./settings/SharingSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
 
+  // Ordered to match the model's flow — venue → mesh → fleet → sharing — the
+  // same sequence the "How it connects" explainer teaches.
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
-    { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "venues", label: "Venues", icon: "📡" },
+    { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "always_on", label: "Always On", icon: "♾️" },

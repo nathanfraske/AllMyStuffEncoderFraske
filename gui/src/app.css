@@ -186,54 +186,6 @@ button {
   transform: none;
 }
 
-/* Reusable toggle switch — flat and recessed when off, an accent-buttony lit
- * track with a raised knob when on. Concept panes override the on-colour by
- * setting `--toggle-on` (e.g. venue = gold, mesh = magenta) on the element. */
-.toggle {
-  --toggle-on: var(--accent);
-  position: relative;
-  flex-shrink: 0;
-  width: 2.3rem;
-  height: 1.3rem;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--line-strong);
-  background: var(--surface);
-  box-shadow: inset 0 1px 2px oklch(0 0 0 / 0.3);
-  padding: 0;
-  transition: background 0.16s ease, border-color 0.16s ease,
-    box-shadow 0.16s ease;
-}
-.toggle .knob {
-  position: absolute;
-  top: 50%;
-  left: 0.18rem;
-  width: 0.92rem;
-  height: 0.92rem;
-  border-radius: 50%;
-  background: linear-gradient(180deg, oklch(0.86 0.01 285), oklch(0.72 0.02 285));
-  box-shadow: 0 1px 2px oklch(0 0 0 / 0.45);
-  transform: translateY(-50%);
-  transition: transform 0.16s ease, background 0.16s ease;
-}
-.toggle.on {
-  background: linear-gradient(
-    180deg,
-    color-mix(in oklch, var(--toggle-on) 78%, white),
-    var(--toggle-on)
-  );
-  border-color: var(--toggle-on);
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.3),
-    0 2px 8px -3px color-mix(in oklch, var(--toggle-on) 60%, transparent);
-}
-.toggle.on .knob {
-  transform: translate(1rem, -50%);
-  background: linear-gradient(180deg, #fff, oklch(0.93 0.01 285));
-}
-.toggle:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
 .chip {
   display: inline-flex;
   align-items: center;

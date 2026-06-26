@@ -274,25 +274,38 @@
     font-size: 1.2rem;
   }
   .subtabs {
-    display: flex;
+    display: inline-flex;
     gap: 0.2rem;
     background: var(--surface-2);
+    border: 1px solid var(--line);
     border-radius: var(--r-pill);
     padding: 0.2rem;
   }
   .subtabs button {
-    border: none;
+    border: 1px solid transparent;
     background: none;
     color: var(--ink-soft);
     font-size: 0.8rem;
     font-weight: 600;
-    padding: 0.32rem 0.7rem;
+    padding: 0.32rem 0.8rem;
     border-radius: var(--r-pill);
+    transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
   }
-  .subtabs button.active {
+  .subtabs button:hover {
+    color: var(--ink);
     background: var(--surface);
-    color: var(--accent-ink);
-    box-shadow: var(--shadow-sm);
+  }
+  /* The active segment lights in the mesh concept colour (magenta), with the
+     buttony lift the rest of the app uses. */
+  .subtabs button.active {
+    background: linear-gradient(180deg, var(--c-mesh-soft), var(--c-mesh-soft));
+    color: var(--c-mesh-ink);
+    border-color: var(--c-mesh);
+    box-shadow: var(--shadow-sm), inset 0 1px 0 oklch(1 0 0 / 0.06);
+  }
+  .subtabs button.active:hover {
+    background: var(--c-mesh-soft);
+    color: var(--c-mesh-ink);
   }
   .block {
     border-top: 1px solid var(--line);
