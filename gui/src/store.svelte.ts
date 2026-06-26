@@ -1850,9 +1850,13 @@ class AppStore {
   /** Open the builder, optionally pre-filling the sender (one of your devices),
    *  the receiver (a node id of any device in the receiving fleet), and the
    *  consoles to pre-toggle (for "Manage share"). A non-owned device offered as
-   *  the sender is dropped — you only ever share your own stuff. */
+   *  the sender is dropped — you only ever share your own stuff. The sender
+   *  always lands on one of your devices (this one by default) so the capability
+   *  switches are live the moment the builder opens — otherwise they'd all be
+   *  greyed and there'd be nothing to add. */
   openShareFlow(sender?: string | null, receiver?: string | null, caps?: ShareCap[]) {
     if (sender !== undefined) this.shareFlowSender = this.isMyDevice(sender) ? sender : null;
+    if (!this.isMyDevice(this.shareFlowSender)) this.shareFlowSender = this.localId;
     if (receiver !== undefined) this.shareFlowReceiver = receiver;
     this.shareFlowInitialCaps = caps ?? [];
     this.shareFlowOpen = true;
