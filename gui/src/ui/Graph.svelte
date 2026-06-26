@@ -660,6 +660,7 @@
         tabindex="0"
         aria-label={displayName(n)}
       >
+        {#if st.self}<span class="self-corner" aria-hidden="true">This device</span>{/if}
         <div class="node-top">
           <span class="avatar">{nodeAvatar(n)}</span>
           <div class="node-id">
@@ -679,7 +680,6 @@
           <span class="dot" class:on={n.online} title={n.online ? "online" : "offline"}></span>
         </div>
         <div class="node-meta">
-          {#if st.self}<span class="tag you">this device</span>{/if}
           {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
           {:else if st.shared}<span class="tag guest">guest</span>
           {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
@@ -695,19 +695,19 @@
                exactly what a fleet that shared it with you granted. -->
           <div class="node-consoles">
             {#if cons.remote}
-              <button class="cbtn" title="Remote control" aria-label="Remote control {displayName(n)}"
+              <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
             {/if}
             {#if cons.files}
-              <button class="cbtn" title="Files" aria-label="Open files on {displayName(n)}"
+              <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
             {/if}
             {#if cons.terminal}
-              <button class="cbtn" title="Terminal" aria-label="Open terminal on {displayName(n)}"
+              <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
             {/if}
             {#if cons.sites}
-              <button class="cbtn" title="Sites" aria-label="Open sites on {displayName(n)}"
+              <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
             {/if}
           </div>
@@ -1269,6 +1269,7 @@
     margin-top: 0.15rem;
   }
   .cbtn {
+    position: relative;
     display: grid;
     place-items: center;
     width: 1.55rem;
@@ -1292,6 +1293,33 @@
   .cbtn :global(svg) {
     width: 0.95rem;
     height: 0.95rem;
+    /* the line glyphs read a hair left of centre — nudge them right. */
+    transform: translateX(1px);
+  }
+  /* A quick black/grey tooltip (vs the slow native title). */
+  .cbtn[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 5px);
+    left: 50%;
+    transform: translateX(-50%) translateY(3px);
+    background: oklch(0.16 0.02 285 / 0.97);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.1rem 0.4rem;
+    font-size: 0.64rem;
+    font-weight: 650;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    box-shadow: var(--shadow-sm);
+    transition: opacity 0.1s ease 0.1s, transform 0.1s ease 0.1s;
+    z-index: 6;
+  }
+  .cbtn[data-tip]:hover::after {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
   }
   .tag {
     font-size: 0.64rem;
@@ -1304,9 +1332,25 @@
     background: var(--surface-2);
     color: var(--ink-soft);
   }
-  .tag.you {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+  /* "This device" — a pink chip that bumps over the top-left corner of your
+     own card, so it reads as a label on the card rather than another tag. */
+  .self-corner {
+    position: absolute;
+    top: -0.6rem;
+    left: 0.7rem;
+    z-index: 2;
+    font-size: 0.58rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #fff;
+    background: linear-gradient(180deg, var(--accent-ink), var(--accent));
+    border: 1px solid oklch(0.58 0.235 350);
+    border-radius: var(--r-pill);
+    padding: 0.1rem 0.5rem;
+    box-shadow: 0 2px 6px -2px oklch(0.64 0.255 350 / 0.6),
+      inset 0 1px 0 oklch(1 0 0 / 0.3);
+    pointer-events: none;
   }
   .tag.mine {
     background: var(--ok-soft);

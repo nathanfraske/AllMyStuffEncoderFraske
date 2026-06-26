@@ -460,7 +460,7 @@
         {#if st.inFleet}
           <!-- The full fleet view — name, members, key, MFA — lives in Settings;
                this is the jump there from the device you're looking at. -->
-          <button class="linklike fleet-settings" onclick={() => app.openSettings("fleet")}>
+          <button class="btn small fleet-settings" onclick={() => app.openSettings("fleet")}>
             ⚙ Manage fleet in Settings →
           </button>
         {/if}
@@ -853,6 +853,8 @@
     top: 1.1rem;
     /* straddle the panel's outer (left) edge, leaning into the gap */
     left: -7px;
+    /* sit above the hover resize line, not under it */
+    z-index: 1;
     display: grid;
     grid-template-columns: repeat(2, 3px);
     grid-auto-rows: 3px;
@@ -1238,9 +1240,18 @@
     border-color: var(--c-share);
     filter: brightness(1.1);
   }
+  /* Manage fleet — a fleet-green button (the green twin of the violet
+     Add Share button), not a bare link. */
   .fleet-ctl .fleet-settings {
-    display: block;
     margin-top: 0.5rem;
+    color: var(--c-fleet-ink);
+    border-color: var(--c-fleet);
+    background: var(--c-fleet-soft);
+  }
+  .fleet-ctl .fleet-settings:hover {
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet);
+    filter: brightness(1.1);
   }
   /* The "Its stuff" fold: a full-width header row that reads as a count
      until expanded. */

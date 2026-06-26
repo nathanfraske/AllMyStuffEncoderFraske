@@ -304,6 +304,8 @@
     top: 1.1rem;
     /* straddle the panel's outer (right) edge, leaning into the gap */
     right: -7px;
+    /* sit above the hover resize line, not under it */
+    z-index: 1;
     display: grid;
     grid-template-columns: repeat(2, 3px);
     grid-auto-rows: 3px;
