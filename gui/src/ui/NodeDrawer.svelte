@@ -175,25 +175,41 @@
     if (isRemoteApp) void app.loadLatestRelease();
   });
 
+  // The grab handle does double duty: drag to resize, click (no drag) to
+  // collapse. `armed` = pressed; `moved` tells the two apart.
+  let armed = false;
+  let moved = false;
+  let startX = 0;
   function startResize(e: PointerEvent) {
-    resizing = true;
+    armed = true;
+    moved = false;
+    startX = e.clientX;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
     e.preventDefault();
   }
   function onResizeMove(e: PointerEvent) {
-    if (!resizing) return;
+    if (!armed) return;
+    if (!moved && Math.abs(e.clientX - startX) < 4) return;
+    moved = true;
+    resizing = true;
     // The drawer is flush against the window's right edge, so its width is
     // simply the distance from the pointer to that edge.
     width = Math.min(MAX_W, Math.max(MIN_W, window.innerWidth - e.clientX));
   }
   function endResize(e: PointerEvent) {
-    if (!resizing) return;
-    resizing = false;
+    if (!armed) return;
+    armed = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
-    try {
-      localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
-    } catch {
-      /* private mode — the width just doesn't persist */
+    if (moved) {
+      resizing = false;
+      try {
+        localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+      } catch {
+        /* private mode — the width just doesn't persist */
+      }
+    } else {
+      // A click, not a drag → collapse.
+      collapsed = true;
     }
   }
 
@@ -256,17 +272,23 @@
         {/if}
       </div>
     {:else}
-      <!-- Drag this edge to resize the sidebar. -->
+      <!-- The grab handle: drag to resize, click to collapse. Mirrors the
+           left panel — here it sits on the drawer's inner (left) edge. -->
       <div
         class="resizer"
         role="separator"
-        aria-label="Resize panel"
+        aria-label="Resize or collapse panel"
         aria-orientation="vertical"
+        title="Drag to resize · click to collapse"
         onpointerdown={startResize}
         onpointermove={onResizeMove}
         onpointerup={endResize}
         onpointercancel={endResize}
-      ></div>
+      >
+        <span class="grip" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i>
+        </span>
+      </div>
       <div class="drawer-body">
         <header class="head">
       <span class="avatar">{!st || !st.app ? "📡" : st.shared ? "🧑" : st.self ? "💻" : "🖥"}</span>
@@ -794,16 +816,20 @@
     overflow-y: auto;
     padding: 1rem 1.1rem 2rem;
   }
-  /* The grab edge — a hair-line that lights up on hover/drag. */
+  /* The grab handle — a hair-line edge plus a 6-dot grip; drag to resize,
+     click to collapse. Mirrors the left panel's handle. */
   .resizer {
     position: absolute;
     left: 0;
     top: 0;
     height: 100%;
-    width: 8px;
-    cursor: ew-resize;
+    width: 10px;
+    cursor: grab;
     z-index: 5;
     touch-action: none;
+  }
+  .drawer.resizing .resizer {
+    cursor: grabbing;
   }
   .resizer::after {
     content: "";
@@ -818,6 +844,35 @@
   .resizer:hover::after,
   .drawer.resizing .resizer::after {
     background: var(--accent);
+  }
+  .grip {
+    position: absolute;
+    top: 1.1rem;
+    left: 1px;
+    display: grid;
+    grid-template-columns: repeat(2, 3px);
+    grid-auto-rows: 3px;
+    gap: 3px;
+    padding: 4px 2px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--shadow-sm);
+  }
+  .grip i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--ink-faint);
+    transition: background 0.12s ease;
+  }
+  .resizer:hover .grip,
+  .drawer.resizing .grip {
+    border-color: var(--accent);
+  }
+  .resizer:hover .grip i,
+  .drawer.resizing .grip i {
+    background: var(--accent-ink);
   }
   /* Collapsed: a thin rail with just the affordances to come back. */
   .rail {
