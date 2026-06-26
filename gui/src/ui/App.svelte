@@ -18,7 +18,6 @@
   import RoomHost from "./RoomHost.svelte";
   import RoomPanel from "./RoomPanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
-  import ApprovalsPopup from "./ApprovalsPopup.svelte";
   import ClaimSheet from "./ClaimSheet.svelte";
   import FleetCodePrompt from "./FleetCodePrompt.svelte";
   import ShareSheet from "./ShareSheet.svelte";
@@ -189,18 +188,9 @@
     </div>
 
     <div class="actions">
-      <!-- A device asking to join: the outlined, pulsing nudge that opens the
-           approval popup (the code-grid panel). -->
-      {#if app.freshJoins.length > 0}
-        <button class="nudge" onclick={() => app.openApprovals()} title="A device wants to join your mesh">
-          <span class="nudge-mark" aria-hidden="true">!</span>
-          {app.freshJoins.length}
-          {app.freshJoins.length === 1 ? "device wants in" : "devices want in"}
-        </button>
-      {/if}
-      <!-- A device offering itself for adoption: the brand-accent twin of the
-           join nudge — claiming is the step right after joining, so it's just
-           as hard to miss. Opens the Claim sheet. -->
+      <!-- A device offering itself for adoption: the brand-accent claim nudge.
+           (Meshes are fully open now — any node that joins is admitted
+           automatically — so there's no "device wants in" approval nudge.) -->
       {#if app.claimables.length > 0}
         <button class="nudge claim" onclick={() => app.openClaim()} title="A device is ready to claim">
           <span class="nudge-mark claim-mark" aria-hidden="true">＋</span>
@@ -214,9 +204,8 @@
            in its device drawer, above "Its stuff".) -->
       <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
       <button class="btn refresh" class:spinning={refreshSpin} onclick={refresh} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
-      <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
+      <button class="btn gear" onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
-        {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
       </button>
     </div>
   </header>
@@ -230,9 +219,6 @@
 
   {#if app.settingsOpen}
     <SettingsPanel />
-  {/if}
-  {#if app.approvalsOpen}
-    <ApprovalsPopup />
   {/if}
   {#if app.claimOpen}
     <ClaimSheet />
@@ -528,19 +514,8 @@
     }
   }
   .gear {
-    position: relative;
     font-size: 1rem;
     padding: 0.5rem 0.7rem;
-  }
-  .gear-badge {
-    position: absolute;
-    top: 0.3rem;
-    right: 0.35rem;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--warn);
-    box-shadow: 0 0 0 2px var(--surface);
   }
   .stage {
     position: relative;

@@ -1,8 +1,10 @@
 <script lang="ts">
-  // Devices pane — every machine you can see, and which network(s) each is on.
-  // The point: you're joined to however many networks, and a device may be on
-  // only some of them. This makes the overlap explicit rather than pretending
-  // it's one flat mesh.
+  // Devices — the all-machines roster: every machine you've seen, know, or
+  // remember across all your meshes, and which network(s) each one rides. Its
+  // own top-level settings tab now (it used to be a hidden sub-tab under
+  // Meshes). The point: you're joined to however many networks, and a device
+  // may be on only some of them — so this makes the overlap explicit rather
+  // than pretending it's one flat mesh.
   import { app } from "../../store.svelte";
   import { displayName, isAppNode } from "../../types";
   import type { MeshNode } from "../../types";
@@ -28,9 +30,11 @@
 </script>
 
 <div class="devices">
+  <h3>Devices</h3>
   <p class="lead">
-    Everything you can see across your networks. A device is only reachable on a
-    network you both share — so the chips show where each one lives.
+    Every machine you've seen, know, or remember — across all your meshes. A
+    device is only reachable on a network you both share, so the chips show
+    where each one lives.
   </p>
 
   <ul class="list">
@@ -65,6 +69,10 @@
 <style>
   .devices {
     padding-top: 0.6rem;
+  }
+  h3 {
+    margin: 0 0 0.4rem;
+    font-size: 1.2rem;
   }
   .lead {
     font-size: 0.8rem;

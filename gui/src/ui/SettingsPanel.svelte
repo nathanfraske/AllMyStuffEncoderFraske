@@ -9,15 +9,18 @@
   import UpdatesSection from "./settings/UpdatesSection.svelte";
   import FleetSection from "./settings/FleetSection.svelte";
   import SharingSection from "./settings/SharingSection.svelte";
+  import DevicesSection from "./settings/DevicesSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
 
   // Ordered to match the model's flow — venue → mesh → fleet → sharing — the
-  // same sequence the "How it connects" explainer teaches.
+  // same sequence the "How it connects" explainer teaches. Devices (the
+  // all-machines roster) sits right under Sharing.
   const tabs: { id: SettingsTab; label: string; icon: string }[] = [
     { id: "venues", label: "Venues", icon: "📡" },
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
+    { id: "devices", label: "Devices", icon: "🖥" },
     { id: "always_on", label: "Always On", icon: "♾️" },
     { id: "updates", label: "Updates", icon: "⬆️" },
   ];
@@ -50,9 +53,6 @@
         <button class="tab" class:active={app.settingsTab === t.id} onclick={() => select(t.id)}>
           <span class="tab-icon" aria-hidden="true">{t.icon}</span>
           <span>{t.label}</span>
-          {#if t.id === "networks" && app.freshJoins.length > 0}
-            <span class="tab-badge" title="{app.freshJoins.length} waiting">{app.freshJoins.length}</span>
-          {/if}
         </button>
       {/each}
     </nav>
@@ -66,6 +66,8 @@
         <FleetSection />
       {:else if app.settingsTab === "sharing"}
         <SharingSection />
+      {:else if app.settingsTab === "devices"}
+        <DevicesSection />
       {:else if app.settingsTab === "always_on"}
         <AlwaysOnSection />
       {:else if app.settingsTab === "updates"}
@@ -161,19 +163,6 @@
   }
   .tab-icon {
     font-size: 0.95rem;
-  }
-  .tab-badge {
-    margin-left: auto;
-    min-width: 1.1rem;
-    height: 1.1rem;
-    padding: 0 0.3rem;
-    border-radius: var(--r-pill);
-    background: var(--warn);
-    color: var(--bg);
-    font-size: 0.68rem;
-    font-weight: 700;
-    display: grid;
-    place-items: center;
   }
   .content {
     flex: 1;

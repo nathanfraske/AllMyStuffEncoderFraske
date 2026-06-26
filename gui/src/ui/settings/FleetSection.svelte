@@ -108,10 +108,27 @@
     app.settingsOpen = false;
   }
 
-  // Promote a member to co-owner — full fleet authority alongside you, not a
-  // transfer. Re-uses the same governance path as the device drawer.
-  function promote(device: string) {
+  // Roles are layered, and each layer is added — and withdrawn — one step at a
+  // time, so it works the same as the meshes' device controls. Promote stages
+  // up: a plain member becomes a Manager first (can admit members), and only a
+  // Manager is promoted again to a co-owner (full authority alongside you, not a
+  // transfer). Withdraw stages back down the same way: an Owner steps back to
+  // Manager, a Manager back to a plain Member. The backend governance enforces
+  // the quorum for each step (a controller grant needs an owner; an owner grant
+  // is a unanimous owner vote), so we just float the proposal.
+  function promoteToManager(device: string) {
+    void app.grantFleetRole(device, "manager");
+  }
+  function promoteToOwner(device: string) {
     void app.grantFleetRole(device, "owner");
+  }
+  // An owner steps back to manager by re-granting the lower role; a manager
+  // steps back to a plain member by a revoke (which drops to Member).
+  function demoteToManager(device: string) {
+    void app.grantFleetRole(device, "manager");
+  }
+  function demoteToMember(device: string) {
+    void app.withdrawFleetRole(device);
   }
 
   // ---- fleet custody (TOTP / MFA) ----
@@ -260,13 +277,36 @@
             </button>
             {#if app.isFleetOwner && !isSelf}
               <div class="m-actions">
-                {#if !isOwner}
+                {#if isOwner}
                   <button
-                    class="promote"
-                    title="Add as a co-owner — they gain full fleet authority alongside you. This adds an owner; it doesn't hand the fleet away."
-                    onclick={() => promote(m.device)}
+                    class="role-btn down"
+                    title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Withdraws one layer.)"
+                    onclick={() => demoteToManager(m.device)}
                   >
-                    ★ Promote
+                    ⤓ Make manager
+                  </button>
+                {:else if isManager}
+                  <button
+                    class="role-btn up"
+                    title="Promote this manager to a co-owner — full fleet authority alongside you. This adds an owner; it doesn't hand the fleet away."
+                    onclick={() => promoteToOwner(m.device)}
+                  >
+                    ★ Make owner
+                  </button>
+                  <button
+                    class="role-btn down"
+                    title="Withdraw this manager back to a plain member — they keep fleet membership but lose authority to admit members."
+                    onclick={() => demoteToMember(m.device)}
+                  >
+                    ⤓ Make member
+                  </button>
+                {:else}
+                  <button
+                    class="role-btn up"
+                    title="Promote this member to a manager — they can admit members. Promote again afterwards to make them a co-owner."
+                    onclick={() => promoteToManager(m.device)}
+                  >
+                    ★ Make manager
                   </button>
                 {/if}
                 <button
@@ -558,21 +598,33 @@
     gap: 0.35rem;
     flex-shrink: 0;
   }
-  /* Promote = add a co-owner. Gold (the owner colour), and clearly additive —
-     never the dangerous "transfer" it used to read as. */
-  .promote {
-    border: 1px solid var(--c-fleet-soft);
-    background: var(--c-fleet-soft);
-    color: var(--c-fleet-ink);
+  /* Role controls — one layer at a time. "Up" (promote) is additive, in the
+     fleet's green; "down" (withdraw) is a quiet, neutral step-back, so adding
+     and removing a layer read as the same kind of action in opposite directions
+     rather than promote-vs-danger. */
+  .role-btn {
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-soft);
     border-radius: var(--r-pill);
     padding: 0.22rem 0.6rem;
     font-size: 0.72rem;
     font-weight: 650;
     cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
   }
-  .promote:hover {
+  .role-btn.up {
+    border-color: var(--c-fleet-soft);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
+  }
+  .role-btn.up:hover {
     border-color: var(--c-fleet);
+  }
+  .role-btn.down:hover {
+    border-color: var(--line-strong);
+    color: var(--ink);
+    background: var(--surface-2);
   }
   .owner-tag {
     font-size: 0.62rem;

@@ -194,13 +194,17 @@ import {
 export type SettingsTab =
   | "networks"
   | "venues"
-  | "updates"
+  | "devices"
   | "fleet"
   | "sharing"
-  | "always_on";
+  | "always_on"
+  | "updates";
 
-/** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
-export type NetworksSubtab = "status" | "servers" | "devices";
+/** Sub-pane within the Networks settings tab. The all-devices roster used to
+ *  live here as a third "Devices" sub-tab; it's now a top-level Devices tab of
+ *  its own, so a mesh's sub-panes are just its status and its venue (the latter
+ *  reached by clicking a mesh's Venue button). */
+export type NetworksSubtab = "status" | "servers";
 
 /** A capability the Share Flow builder can switch on between two devices.
  *  Audio / Video (the screen feed) / Control all ride the remote-control
