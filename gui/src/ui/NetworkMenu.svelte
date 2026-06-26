@@ -40,7 +40,17 @@
         live: null,
       }),
     );
-    return [...live, ...off].sort(
+    // One row per mesh. While a toggle's live/parked refresh is mid-flight a
+    // mesh can sit in both lists for a beat — enabling adds it to `networks`
+    // before `disabledNets` drops it — keyed identically by its portable
+    // network_id. The keyed {#each} below rejects that duplicate key with
+    // `each_key_duplicate`, which crashes the whole app, so collapse by key
+    // here: each mesh shows once, and the live entry wins (a joined mesh is on).
+    const byKey = new Map<string, MeshRow>();
+    for (const row of [...live, ...off]) {
+      if (!byKey.has(row.key)) byKey.set(row.key, row);
+    }
+    return [...byKey.values()].sort(
       (a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key),
     );
   });
