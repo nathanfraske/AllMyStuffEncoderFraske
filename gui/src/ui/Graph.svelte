@@ -528,6 +528,28 @@
   }
 </script>
 
+<!-- The small console glyphs for the card buttons: remote desktop, files,
+     terminal, sites. Stroke uses currentColor. -->
+{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites")}
+  {#if kind === "remote"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
+    </svg>
+  {:else if kind === "files"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2.2H19a1.5 1.5 0 0 1 1.5 1.5V18a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 18Z" />
+    </svg>
+  {:else if kind === "terminal"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4.5" width="18" height="15" rx="2" /><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4" />
+    </svg>
+  {:else}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.5 2.4 2.5 14.6 0 17M12 3.5c-2.5 2.4-2.5 14.6 0 17" />
+    </svg>
+  {/if}
+{/snippet}
+
 <div
   class="canvas"
   class:panning
@@ -607,6 +629,7 @@
            fleet badge). It recomputes live from the fleet roster + the device's
            advert, so claiming or fleet changes reflect immediately. -->
       {@const st = app.standingOf(n)}
+      {@const cons = app.consoleAccess(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
@@ -667,9 +690,26 @@
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
-        {#if n.networks && n.networks.length}
-          <div class="node-nets" title="On {n.networks.join(', ')}">
-            {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
+        {#if cons.remote || cons.files || cons.terminal || cons.sites}
+          <!-- The consoles you can open on this device — your own fleet's, or
+               exactly what a fleet that shared it with you granted. -->
+          <div class="node-consoles">
+            {#if cons.remote}
+              <button class="cbtn" title="Remote control" aria-label="Remote control {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
+            {/if}
+            {#if cons.files}
+              <button class="cbtn" title="Files" aria-label="Open files on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
+            {/if}
+            {#if cons.terminal}
+              <button class="cbtn" title="Terminal" aria-label="Open terminal on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
+            {/if}
+            {#if cons.sites}
+              <button class="cbtn" title="Sites" aria-label="Open sites on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
+            {/if}
           </div>
         {/if}
         <!-- Claimable affordances drop out from *under* the node, floating
@@ -1220,21 +1260,38 @@
     flex-wrap: wrap;
     gap: 0.25rem;
   }
-  .node-nets {
+  /* Console buttons on the card — replace the old mesh pills. One per console
+     you can open on the device; clicking opens it. */
+  .node-consoles {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.2rem;
-    margin-top: 0.1rem;
+    gap: 0.3rem;
+    margin-top: 0.15rem;
   }
-  /* Per-node mesh chips wear the mesh concept colour (magenta). */
-  .net-chip {
-    font-size: 0.6rem;
-    font-weight: 650;
-    background: var(--c-mesh-soft);
-    border: 1px solid var(--c-mesh);
-    color: var(--c-mesh-ink);
-    border-radius: var(--r-pill);
-    padding: 0.02rem 0.36rem;
+  .cbtn {
+    display: grid;
+    place-items: center;
+    width: 1.55rem;
+    height: 1.55rem;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line-strong);
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    box-shadow: var(--shadow-sm);
+    transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease,
+      transform 0.08s ease;
+  }
+  .cbtn:hover {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--surface);
+  }
+  .cbtn:active {
+    transform: translateY(1px);
+  }
+  .cbtn :global(svg) {
+    width: 0.95rem;
+    height: 0.95rem;
   }
   .tag {
     font-size: 0.64rem;
@@ -1276,15 +1333,13 @@
     background: var(--bronze-soft);
     color: var(--bronze);
   }
+  /* All fleet-role tags stay green; the ★ owner / ⚑ manager / 🔗 fleet
+     glyph + word is what tells them apart (no per-role colour vomit). */
   .tag.fleet {
     background: var(--c-fleet-soft);
     color: var(--c-fleet-ink);
   }
-  /* Owner machines stand out in gold so every member can see, at a glance on
-     the card, who owns the fleet. Managers keep the fleet green. */
   .tag.fleet.owner {
-    background: var(--c-venue-soft);
-    color: var(--c-venue-ink);
     font-weight: 750;
   }
   .tag.meshonly {

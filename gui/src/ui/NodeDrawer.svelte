@@ -361,7 +361,7 @@
          sharing is one-directional: when you share your stuff *with* someone,
          their machine isn't yours to drive, so it never offers a remote
          control (the far side would refuse it anyway). -->
-    {#if isRemoteApp && st?.mine}
+    {#if isRemoteApp && app.consoleAccess(node).remote}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
       </button>
@@ -1059,11 +1059,11 @@
     background: var(--surface-2);
     border: 1px solid var(--line-strong);
   }
-  /* Owner = gold, matching the ★ Owner badge in the Fleet settings pane. */
+  /* Roles all read green; the word (owner / manager) tells them apart. */
   .role-pill.owner {
-    color: var(--c-venue-ink);
-    background: var(--c-venue-soft);
-    border-color: var(--c-venue);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet);
   }
   .role-pill.manager {
     color: var(--ok);

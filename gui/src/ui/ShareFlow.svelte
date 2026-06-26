@@ -33,7 +33,11 @@
   function candidates(side: Side, exclude: string | null) {
     return app.catalog.nodes.filter((n) => {
       if (!isAppNode(n) || n.id === exclude) return false;
-      return side === "sender" ? app.isMyDevice(n.id) : true;
+      // Sender = one of your own machines; Receiver = a device that belongs to
+      // another fleet/person (you grant their fleet access, not your own, and
+      // not an unowned box).
+      if (side === "sender") return app.isMyDevice(n.id);
+      return !app.isMyDevice(n.id) && !!n.owner;
     });
   }
   function nodeOf(id: string | null) {
@@ -150,12 +154,13 @@
 
         <!-- Receiver (right) -->
         <section class="col receiver">
-          <div class="col-kicker">Receiver</div>
-          <div class="col-sub">Device receiving the share</div>
+          <div class="col-kicker">Receiver fleet</div>
+          <div class="col-sub">The fleet you're granting access to</div>
           {@render picker("receiver", receiver)}
           <p class="note">
-            ⓘ The receiver can access whatever the sender makes available. Both
-            parties can revoke at any time.
+            ⓘ This grants the receiving fleet's machines the buttons to open the
+            sender's consoles — it doesn't open a connection. Both parties can
+            revoke any time.
           </p>
         </section>
       </div>

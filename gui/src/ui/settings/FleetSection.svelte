@@ -515,7 +515,7 @@
   /* An owner row gets a faint gold edge so the fleet's authority is legible
      at a glance. */
   .members li.owner {
-    box-shadow: inset 2px 0 0 var(--c-venue);
+    box-shadow: inset 2px 0 0 var(--c-fleet);
   }
   /* The identity is a button — clicking (or right-clicking) jumps to the
      device on the graph. */
@@ -551,9 +551,9 @@
   /* Promote = add a co-owner. Gold (the owner colour), and clearly additive —
      never the dangerous "transfer" it used to read as. */
   .promote {
-    border: 1px solid var(--c-venue-soft);
-    background: var(--c-venue-soft);
-    color: var(--c-venue-ink);
+    border: 1px solid var(--c-fleet-soft);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
     border-radius: var(--r-pill);
     padding: 0.22rem 0.6rem;
     font-size: 0.72rem;
@@ -562,15 +562,15 @@
     transition: border-color 0.12s ease, background 0.12s ease;
   }
   .promote:hover {
-    border-color: var(--c-venue);
+    border-color: var(--c-fleet);
   }
   .owner-tag {
     font-size: 0.62rem;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    color: var(--c-venue-ink);
-    background: var(--c-venue-soft);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
   }
@@ -599,8 +599,8 @@
     height: 1.9rem;
     flex-shrink: 0;
     border-radius: 50%;
-    color: var(--c-venue-ink);
-    background: var(--c-venue-soft);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
     font-size: 0.95rem;
   }
   .owner-id {
@@ -631,7 +631,7 @@
     gap: 0.4rem;
   }
   .owner-name:hover {
-    color: var(--c-venue-ink);
+    color: var(--c-fleet-ink);
     text-decoration: underline;
   }
   .m-name {

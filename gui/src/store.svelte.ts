@@ -155,6 +155,7 @@ import {
   type Catalog,
   type CheckOutcome,
   type Grant,
+  type GrantRole,
   type IdentityInfo,
   type ListeningService,
   type SiteAdvert,
@@ -1871,19 +1872,54 @@ class AppStore {
     return false;
   }
 
-  /** Start the share: grant each chosen capability from sender to receiver.
-   *  Audio/Video stream the sender's console to the receiver; Control wires the
-   *  receiver's input back to the sender (and needs Video to map focus);
-   *  Terminal/Files/Sites pop the sender's host view. Returns how many started. */
+  /** The grants one chosen capability mints — a persistent permission for the
+   *  receiving fleet to open my sender device's console, NOT a live route.
+   *  Each is scoped to the sender device so it only ever unlocks *that* device.
+   *  Directions are what the receiver needs to OPEN the console: the device
+   *  PROVIDES its screen/audio (and CONSUMES the receiver's input for control);
+   *  Terminal/Files/Sites ride a generic grant carrying a `<device>:<kind>`
+   *  capability. */
+  private shareCapGrants(person: string, cap: ShareCap, sender: string, senderLabel: string): Grant[] {
+    const mk = (media: MediaKind, role: GrantRole, suffix: string, what: string): Grant => {
+      const capability = `${sender}:${suffix}`;
+      return {
+        id: scopedGrantId(person, media, role, capability),
+        media,
+        role,
+        capability,
+        label: `${senderLabel} — ${what}`,
+      };
+    };
+    switch (cap) {
+      case "video":
+        return [mk("display", "provide", "screen", "see its screen")];
+      case "audio":
+        return [mk("audio", "provide", "audio", "hear its audio")];
+      case "control":
+        // Control rides with the clipboard, and needs Video to map focus.
+        return [
+          mk("input", "consume", "control", "control it"),
+          mk("clipboard", "both", "clipboard", "share its clipboard"),
+        ];
+      case "files":
+        return [mk("storage", "both", "files", "use its files")];
+      case "terminal":
+        return [mk("generic", "provide", "terminal", "use its terminal")];
+      case "sites":
+        return [mk("generic", "provide", "sites", "reach its sites")];
+    }
+  }
+
+  /** Start the share: grant the receiving FLEET access to my sender device's
+   *  consoles. This is a persistent grant (it rides shareGrant to the daemon),
+   *  not a live connection — the receiver's machines then see the console
+   *  buttons on my device and open them on demand. Returns how many consoles
+   *  were granted. */
   startShareFlow(caps: ShareCap[]): number {
     const sender = this.shareFlowSender;
     const receiver = this.shareFlowReceiver;
     if (!sender || !receiver) {
-      this.toast("warn", "Pick a sender and a receiver first");
-      return 0;
-    }
-    if (sender === receiver) {
-      this.toast("warn", "A device can't share with itself");
+      this.toast("warn", "Pick a device of yours to share, and a fleet to share it with");
       return 0;
     }
     // You can only share your *own* devices' stuff — never someone else's.
@@ -1891,78 +1927,60 @@ class AppStore {
       this.toast("warn", "You can only share your own devices");
       return 0;
     }
-    const set = new Set(caps);
+    // The receiver is another fleet — not one of your own machines.
+    if (this.isMyDevice(receiver)) {
+      this.toast("warn", "Share with another fleet — the receiver can't be your own device");
+      return 0;
+    }
+    const recv = this.node(receiver);
+    if (!recv || !isAppNode(recv)) {
+      this.toast("warn", "That device can't receive a share");
+      return 0;
+    }
+    // Establish the share with the receiver's fleet/person, then record the
+    // console grants on it (a grant authorizes the whole fleet).
+    if (recv.relationship.kind !== "shared") this.markShared(receiver);
+    const rel = this.node(receiver)?.relationship;
+    if (!rel || rel.kind !== "shared") {
+      this.toast("warn", "Couldn't establish the share");
+      return 0;
+    }
+    const person = rel.person;
+    const senderLabel = this.node(sender)?.label ?? "device";
     let started = 0;
-    const skipped: string[] = [];
-    // Audio + Video: the sender's console media flows to the receiver.
-    if (set.has("audio")) {
-      const src = matchEndpoint(this.catalog, sender, "audio", "provide");
-      const dst = matchEndpoint(this.catalog, receiver, "audio", "consume");
-      if (src && dst && this.connect(src.id, dst.id)) started++;
-      else skipped.push("audio");
-    }
-    if (set.has("video")) {
-      const src = matchEndpoint(this.catalog, sender, "display", "provide");
-      const dst = matchEndpoint(this.catalog, receiver, "display", "consume");
-      if (src && dst && this.connect(src.id, dst.id)) started++;
-      else skipped.push("video");
-    }
-    // Control & clipboard rides back the other way (the receiver drives the
-    // sender) and only makes sense with Video to map focus.
-    if (set.has("control")) {
-      if (!set.has("video")) {
-        skipped.push("control (needs video)");
-      } else {
-        const inSrc = matchEndpoint(this.catalog, receiver, "input", "provide");
-        const inDst = matchEndpoint(this.catalog, sender, "input", "consume");
-        let ok = false;
-        if (inSrc && inDst && this.connect(inSrc.id, inDst.id)) ok = true;
-        const clipS = matchEndpoint(this.catalog, sender, "clipboard", "provide");
-        const clipD = matchEndpoint(this.catalog, receiver, "clipboard", "consume");
-        if (clipS && clipD) this.connect(clipS.id, clipD.id);
-        if (ok) started++;
-        else skipped.push("control");
+    for (const cap of caps) {
+      // Control implies Video (to map focus) — pull it in if missing.
+      if (cap === "control" && !caps.includes("video")) {
+        for (const g of this.shareCapGrants(person.id, "video", sender, senderLabel)) this.grant(receiver, g);
       }
-    }
-    if (set.has("files")) {
-      this.openFiles(sender);
+      for (const g of this.shareCapGrants(person.id, cap, sender, senderLabel)) this.grant(receiver, g);
       started++;
-    }
-    if (set.has("terminal")) {
-      this.openTerminal(sender);
-      started++;
-    }
-    if (set.has("sites")) {
-      const site = this.node(sender)?.sites?.[0];
-      if (site) {
-        void this.mapSite(sender, site);
-        started++;
-      } else skipped.push("sites");
     }
     if (started > 0) {
-      const sLabel = this.node(sender)?.label ?? "sender";
-      const rLabel = this.node(receiver)?.label ?? "receiver";
-      this.toast("ok", `Sharing ${sLabel} → ${rLabel} (${started} ${started === 1 ? "thing" : "things"})`);
+      this.toast("ok", `Shared ${senderLabel} with ${person.name} — ${started} console${started === 1 ? "" : "s"}`);
     }
-    if (skipped.length) this.toast("warn", `Couldn't start: ${skipped.join(", ")}`);
     return started;
   }
 
-  /** Stop everything riding between the two builder devices — every route from
-   *  the sender's endpoints to the receiver's. */
+  /** Stop the share: revoke every console grant my sender device gave the
+   *  receiving fleet (the persistent permission, not a live route). */
   stopShareFlow() {
     const sender = this.shareFlowSender;
     const receiver = this.shareFlowReceiver;
-    if (!sender || !receiver) return;
-    const toDrop = this.catalog.routes.filter((r) => {
-      const from = this.capabilityForDisplay(r.from);
-      const to = this.capabilityForDisplay(r.to);
-      return (
-        from && to && sameMachine(from.node, sender) && sameMachine(to.node, receiver)
-      );
+    if (!receiver) return;
+    const recv = this.node(receiver);
+    if (!recv || recv.relationship.kind !== "shared") {
+      this.toast("warn", "Nothing to stop");
+      return;
+    }
+    const senderCanon = sender ? canonicalNodeId(sender) : null;
+    const toRevoke = recv.relationship.grants.filter((g) => {
+      if (!g.capability) return false;
+      const gNode = canonicalNodeId(g.capability.slice(0, g.capability.indexOf(":")));
+      return senderCanon ? gNode === senderCanon : true;
     });
-    for (const r of toDrop) void this.disconnect(r.id);
-    this.toast(toDrop.length ? "info" : "warn", toDrop.length ? "Share stopped" : "Nothing to stop");
+    for (const g of toRevoke) this.revokeGrant(receiver, g.id);
+    this.toast(toRevoke.length ? "info" : "warn", toRevoke.length ? "Share stopped" : "Nothing to stop");
   }
 
   /** When a real backend is connected, fire the actual mesh route offer.
@@ -2681,7 +2699,7 @@ class AppStore {
     if (!this.terminalSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "terminal");
   }
 
   /** Whether a terminal to *this* machine is offerable. The running binary
@@ -2798,7 +2816,7 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.filesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "files");
   }
 
   /** Open the file manager on a remote machine. On the desktop this opens
@@ -2902,19 +2920,25 @@ class AppStore {
     const gs = this.shareGrantsFor(node);
     const provide = (g: Grant) => g.role === "provide" || g.role === "both";
     const consume = (g: Grant) => g.role === "consume" || g.role === "both";
+    // A grant only unlocks the device it names — a grant scoped to my MacBook's
+    // screen mustn't light up a different device's card. A capability-less grant
+    // (media-wide) covers any of the person's devices.
+    const canon = canonicalNodeId(node.id);
+    const forNode = (g: Grant) =>
+      !g.capability || canonicalNodeId(g.capability.slice(0, g.capability.indexOf(":"))) === canon;
     switch (kind) {
       case "remote":
-        return gs.some((g) => g.media === "display" && provide(g));
+        return gs.some((g) => g.media === "display" && provide(g) && forNode(g));
       case "audio":
-        return gs.some((g) => g.media === "audio" && provide(g));
+        return gs.some((g) => g.media === "audio" && provide(g) && forNode(g));
       case "control":
-        return gs.some((g) => g.media === "input" && consume(g));
+        return gs.some((g) => g.media === "input" && consume(g) && forNode(g));
       case "files":
-        return gs.some((g) => g.media === "storage");
+        return gs.some((g) => g.media === "storage" && forNode(g));
       case "terminal":
-        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal"));
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal") && forNode(g));
       case "sites":
-        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":sites"));
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":sites") && forNode(g));
     }
   }
 
