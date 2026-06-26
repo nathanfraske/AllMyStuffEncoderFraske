@@ -58,26 +58,42 @@
     if (tab !== "rooms") app.roomDraftOpen = false;
   }
 
+  // The grab handle does double duty: drag to resize, click (no drag) to
+  // collapse/expand. `armed` = pressed; `moved` tells the two apart.
+  let armed = false;
+  let moved = false;
+  let startX = 0;
   function startResize(e: PointerEvent) {
-    resizing = true;
+    armed = true;
+    moved = false;
+    startX = e.clientX;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
     e.preventDefault();
   }
   function onResizeMove(e: PointerEvent) {
-    if (!resizing || !el) return;
+    if (!armed || !el) return;
+    if (!moved && Math.abs(e.clientX - startX) < 4) return;
+    moved = true;
+    resizing = true;
     // The panel is flush against the stage's left edge; its width is the
     // distance from that edge to the pointer.
     const left = el.getBoundingClientRect().left;
     width = Math.min(MAX_W, Math.max(MIN_W, e.clientX - left));
   }
   function endResize(e: PointerEvent) {
-    if (!resizing) return;
-    resizing = false;
+    if (!armed) return;
+    armed = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
-    try {
-      localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
-    } catch {
-      /* private mode — the width just doesn't persist */
+    if (moved) {
+      resizing = false;
+      try {
+        localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+      } catch {
+        /* private mode — the width just doesn't persist */
+      }
+    } else {
+      // A click, not a drag → collapse.
+      setCollapsed(true);
     }
   }
 </script>
@@ -92,18 +108,28 @@
   {#if collapsed}
     <!-- The thin rail: the two tab icons, click to expand into that tab. -->
     <div class="rail">
-      <button class="rail-btn" title="Rooms" aria-label="Rooms" onclick={() => select("rooms")}>
-        🪩
-        {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
-      </button>
       <button class="rail-btn" title="Sites" aria-label="Sites" onclick={() => select("sites")}>
         🌐
         {#if siteCount > 0}<span class="rail-count">{siteCount}</span>{/if}
       </button>
+      <button class="rail-btn" title="Rooms" aria-label="Rooms" onclick={() => select("rooms")}>
+        🪩
+        {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
+      </button>
     </div>
   {:else}
     <div class="head">
-      <div class="tabs" role="tablist" aria-label="Rooms and Sites">
+      <div class="tabs" role="tablist" aria-label="Sites and Rooms">
+        <button
+          class="tab"
+          class:active={app.sidebarTab === "sites"}
+          role="tab"
+          aria-selected={app.sidebarTab === "sites"}
+          onclick={() => select("sites")}
+        >
+          🌐 Sites
+          {#if siteCount > 0}<span class="count">{siteCount}</span>{/if}
+        </button>
         <button
           class="tab"
           class:active={app.sidebarTab === "rooms"}
@@ -114,16 +140,6 @@
           🪩 Rooms
           {#if app.rooms.length > 0}<span class="count">{app.rooms.length}</span>{/if}
           {#if roomAttention > 0 && app.sidebarTab !== "rooms"}<span class="attn" title="{roomAttention} asking to join"></span>{/if}
-        </button>
-        <button
-          class="tab"
-          class:active={app.sidebarTab === "sites"}
-          role="tab"
-          aria-selected={app.sidebarTab === "sites"}
-          onclick={() => select("sites")}
-        >
-          🌐 Sites
-          {#if siteCount > 0}<span class="count">{siteCount}</span>{/if}
         </button>
       </div>
       <button class="collapse" title="Collapse" aria-label="Collapse sidebar" onclick={() => setCollapsed(true)}>‹</button>
@@ -137,17 +153,23 @@
       {/if}
     </div>
 
-    <!-- Drag this edge to resize. -->
+    <!-- The grab handle: drag to resize, click to collapse. Snapped to the
+         panel's edge, with a 6-dot grip near the top. -->
     <div
       class="resizer"
       role="separator"
-      aria-label="Resize sidebar"
+      aria-label="Resize or collapse sidebar"
       aria-orientation="vertical"
+      title="Drag to resize · click to collapse"
       onpointerdown={startResize}
       onpointermove={onResizeMove}
       onpointerup={endResize}
       onpointercancel={endResize}
-    ></div>
+    >
+      <span class="grip" aria-hidden="true">
+        <i></i><i></i><i></i><i></i><i></i><i></i>
+      </span>
+    </div>
   {/if}
 </aside>
 
@@ -254,10 +276,14 @@
     right: 0;
     top: 0;
     bottom: 0;
-    width: 8px;
-    cursor: ew-resize;
+    width: 10px;
+    cursor: grab;
     touch-action: none;
   }
+  .sidebar.resizing .resizer {
+    cursor: grabbing;
+  }
+  /* The hairline that lights up the whole edge on hover/resize. */
   .resizer::after {
     content: "";
     position: absolute;
@@ -266,10 +292,44 @@
     bottom: 0;
     width: 2px;
     background: transparent;
+    transition: background 0.12s ease;
   }
   .resizer:hover::after,
   .sidebar.resizing .resizer::after {
     background: var(--accent);
+  }
+  /* The 6-dot grip, near the top of the edge, snapped to the panel. */
+  .grip {
+    position: absolute;
+    top: 1.1rem;
+    /* straddle the panel's outer (right) edge, leaning into the gap */
+    right: -7px;
+    /* sit above the hover resize line, not under it */
+    z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(2, 3px);
+    grid-auto-rows: 3px;
+    gap: 3px;
+    padding: 4px 2px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--shadow-sm);
+  }
+  .grip i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--ink-faint);
+    transition: background 0.12s ease;
+  }
+  .resizer:hover .grip,
+  .sidebar.resizing .grip {
+    border-color: var(--accent);
+  }
+  .resizer:hover .grip i,
+  .sidebar.resizing .grip i {
+    background: var(--accent-ink);
   }
   /* Collapsed rail */
   .rail {

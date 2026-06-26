@@ -173,13 +173,20 @@
     background: var(--ink-faint);
     transition: transform 0.12s ease, background 0.12s ease;
   }
+  /* On = the venue concept colour (gold), with a lit, buttony track. */
   .switch.on {
-    background: var(--ok-soft);
-    border-color: var(--ok);
+    background: linear-gradient(
+      180deg,
+      color-mix(in oklch, var(--c-venue) 80%, white),
+      var(--c-venue)
+    );
+    border-color: var(--c-venue);
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.35),
+      0 2px 8px -3px var(--c-venue-soft);
   }
   .switch.on .knob {
     transform: translateX(0.92rem);
-    background: var(--ok);
+    background: linear-gradient(180deg, #fff, oklch(0.95 0.02 80));
   }
   .menu-foot {
     margin-top: 0.35rem;

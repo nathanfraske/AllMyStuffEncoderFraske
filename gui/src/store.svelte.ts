@@ -155,6 +155,7 @@ import {
   type Catalog,
   type CheckOutcome,
   type Grant,
+  type GrantRole,
   type IdentityInfo,
   type ListeningService,
   type SiteAdvert,
@@ -167,6 +168,7 @@ import {
   type NetworkConfigFull,
   type NetworkSummary,
   type OwnedRoster,
+  type OwnedMember,
   type PeerInfo,
   type Person,
   type Relationship,
@@ -197,6 +199,12 @@ export type SettingsTab =
 
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
+
+/** A capability the Share Flow builder can switch on between two devices.
+ *  Audio / Video (the screen feed) / Control all ride the remote-control
+ *  console; Control needs Video to map focus. Terminal / Files / Sites are
+ *  their own console shares. */
+export type ShareCap = "audio" | "video" | "control" | "terminal" | "files" | "sites";
 
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
@@ -382,6 +390,20 @@ class AppStore {
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
 
+  // ---- share flow builder (Sender → Receiver) ---------------------
+  /** The side-by-side share builder, when open. `sender` makes things
+   *  available; `receiver` gets them. Opened from "New Share" or by dragging
+   *  one device onto another on the graph. */
+  shareFlowOpen = $state(false);
+  shareFlowSender = $state<string | null>(null);
+  // A node id of *any* device in the receiving fleet — the builder presents it
+  // as that fleet (its owner/person), and the share fans across all their
+  // devices. Kept a node id (not a person id) so the existing grant path works.
+  shareFlowReceiver = $state<string | null>(null);
+  /** Consoles to pre-toggle when the builder opens — used by "Manage share" to
+   *  show what's already granted to that fleet. */
+  shareFlowInitialCaps = $state<ShareCap[]>([]);
+
   // ---- remote console (the pikvm-style session popup) -------------
   /** The remote machine a console session is open on, if any. */
   consoleNodeId = $state<string | null>(null);
@@ -550,7 +572,7 @@ class AppStore {
   // ---- sites (the reverse-proxy plane) ------------------------------
   /** Which sidebar tab is showing — the rooms/sites bar is one tabbed
    *  panel now. */
-  sidebarTab = $state<"rooms" | "sites">("rooms");
+  sidebarTab = $state<"rooms" | "sites">("sites");
   /** This machine's discovered listening TCP services (the full set), so
    *  the Sites tab can list them under "this machine" with expose toggles.
    *  Seeded with demo data in web mode, replaced by a real scan under the
@@ -617,6 +639,10 @@ class AppStore {
   /** Briefly true right after driving a mesh turned a venue back on, so the
    *  venues pill can shimmer to say "something here changed". */
   venuePillShimmer = $state(false);
+  /** The refresh control's 3-step progress, shown floating over the graph while
+   *  a restart runs. Each step's status drives a red→yellow→green dot:
+   *  `wait` (red) → `go` (yellow) → `ok` (green). Null when idle. */
+  restartFlow = $state<{ label: string; status: "wait" | "go" | "ok" }[] | null>(null);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -694,6 +720,10 @@ class AppStore {
     if (!m) return null;
     if (m.role === "owner") return "owner";
     if (m.role === "controller") return "manager";
+    // The founding owner's member entry often isn't stamped with a role — the
+    // roster only carries `is_owner` for *this* device. Honour it so the owner
+    // machine reads as "owner", not a plain member, on its own screen.
+    if (this.isMe(deviceId) && this.isFleetOwner) return "owner";
     return "member";
   }
 
@@ -802,7 +832,7 @@ class AppStore {
     }
     try {
       await action(undefined);
-      this.toast("ok", `${title} ✓`);
+      // No toast on success — the fleet roster's role tags update in place.
     } catch (e) {
       this.toast("warn", `${title} failed: ${String(e)}`);
     }
@@ -828,7 +858,7 @@ class AppStore {
     if (this.backendConnected) {
       try {
         await fleetSetName(clean);
-        this.toast("ok", clean ? `Fleet named “${clean}”` : "Fleet name cleared");
+        // No toast — the fleet name shows its new value in the pane immediately.
       } catch (e) {
         this.toast("warn", `Couldn't name the fleet: ${String(e)}`);
       }
@@ -846,7 +876,7 @@ class AppStore {
         version: this.ownedFleet.version + 1,
       };
     }
-    this.toast("ok", clean ? `Fleet named “${clean}” (demo)` : "Fleet name cleared (demo)");
+    // No toast — the fleet name shows its new value in the pane immediately.
   }
 
   // ---- self-update -------------------------------------------------
@@ -1484,9 +1514,8 @@ class AppStore {
       ...scan.capabilities,
       ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
-    // A console window scans too (it needs the local sinks to wire routes),
-    // but only the main window announces it.
-    if (!consoleWindowTarget()) this.toast("ok", "Scanned this machine");
+    // A console window scans too (it needs the local sinks to wire routes).
+    // No toast — the refresh panel (and the repopulated graph) is the feedback.
   }
 
   /** Point the graph's local identity at `id`, re-homing the "this" node and
@@ -1787,7 +1816,8 @@ class AppStore {
     if (res.ok) {
       this.addRoute(res.route.from, res.route.to);
       this.fireBackendConnect(res.route.from, res.route.to, res.route.media);
-      this.toast("ok", `Shared — connected ${p.fromLabel} → ${p.toLabel}`);
+      // No toast — the new wire on the graph (and the console that pops) is the
+      // confirmation. Toasts are reserved for failures.
       const ends = [this.capability(p.from)?.node, this.capability(p.to)?.node];
       const remote = ends.find((n) => n && !this.isMe(n));
       if (remote) this.popConsoleFor(remote, res.route.media);
@@ -1797,6 +1827,279 @@ class AppStore {
 
   dismissPendingShare() {
     this.pendingShare = null;
+  }
+
+  // ---- share flow builder ------------------------------------------
+  //
+  // The Sender → Receiver composer. It doesn't invent any new wiring: each
+  // media capability resolves the sender's source endpoint and the receiver's
+  // sink through `matchEndpoint`, then rides the ordinary `connect()` path
+  // (grants and all); the Files / Terminal / Sites toggles pop the existing
+  // host views for the sender.
+
+  /** Whether a device is one of *yours* — the only kind you may put on the
+   *  sending side of a share. You can't share someone else's stuff. */
+  isMyDevice(id: string | null): boolean {
+    if (!id) return false;
+    const n = this.node(id);
+    if (!n) return false;
+    const st = this.standingOf(n);
+    return st.mine || st.self;
+  }
+
+  /** Open the builder, optionally pre-filling the sender (one of your devices),
+   *  the receiver (a node id of any device in the receiving fleet), and the
+   *  consoles to pre-toggle (for "Manage share"). A non-owned device offered as
+   *  the sender is dropped — you only ever share your own stuff. The sender
+   *  always lands on one of your devices (this one by default) so the capability
+   *  switches are live the moment the builder opens — otherwise they'd all be
+   *  greyed and there'd be nothing to add. */
+  openShareFlow(sender?: string | null, receiver?: string | null, caps?: ShareCap[]) {
+    if (sender !== undefined) this.shareFlowSender = this.isMyDevice(sender) ? sender : null;
+    if (!this.isMyDevice(this.shareFlowSender)) this.shareFlowSender = this.localId;
+    if (receiver !== undefined) this.shareFlowReceiver = receiver;
+    this.shareFlowInitialCaps = caps ?? [];
+    this.shareFlowOpen = true;
+  }
+  closeShareFlow() {
+    this.shareFlowOpen = false;
+  }
+
+  /** The fleets you can share TO — everyone you already share with, plus the
+   *  owner of any other fleet's device on the graph. Each carries a node id of
+   *  one of that fleet's devices (what the builder's receiver state holds). */
+  shareFleetOptions(): { personId: string; name: string; nodeId: string; devices: number }[] {
+    const byPerson = new Map<string, { personId: string; name: string; nodeId: string; devices: number }>();
+    for (const n of this.catalog.nodes) {
+      if (!isAppNode(n) || this.isMyDevice(n.id) || !n.owner) continue;
+      const p = this.personFor(n);
+      const existing = byPerson.get(p.id);
+      if (existing) existing.devices += 1;
+      else byPerson.set(p.id, { personId: p.id, name: p.name, nodeId: n.id, devices: 1 });
+    }
+    return [...byPerson.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** The fleet/person a receiver node belongs to (for the builder's card). */
+  receiverFleet(nodeId: string | null): { name: string; devices: number } | null {
+    if (!nodeId) return null;
+    const n = this.node(nodeId);
+    if (!n) return null;
+    const p = this.personFor(n);
+    const devices = this.catalog.nodes.filter(
+      (x) => isAppNode(x) && !this.isMyDevice(x.id) && this.personFor(x).id === p.id,
+    ).length;
+    return { name: p.name, devices };
+  }
+
+  /** A capability's device id (the bit before the first ":"). */
+  private capNodeOf(cap: string): string {
+    const i = cap.indexOf(":");
+    return canonicalNodeId(i >= 0 ? cap.slice(0, i) : cap);
+  }
+
+  /** Whether a grant is a *share-out* — something one of MY devices lets the
+   *  fleet do (capability on my device, or a legacy media-wide grant) — vs a
+   *  share-in (a console of THEIRS I may open). The drawer's "What X can do"
+   *  shows only share-out. */
+  isShareOutGrant(g: Grant): boolean {
+    if (!g.capability) return true;
+    return this.isMyDevice(this.capNodeOf(g.capability));
+  }
+
+  /** The consoles already granted to a fleet from a given sender device — to
+   *  pre-toggle the builder. The reverse of shareCapGrants. */
+  existingShareCaps(senderId: string | null, receiverNodeId: string | null): ShareCap[] {
+    if (!senderId || !receiverNodeId) return [];
+    const recv = this.node(receiverNodeId);
+    if (!recv || recv.relationship.kind !== "shared") return [];
+    const pid = recv.relationship.person.id;
+    const grants: Grant[] = [];
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === pid) grants.push(...n.relationship.grants);
+    }
+    const sc = canonicalNodeId(senderId);
+    const forSender = (g: Grant) => !!g.capability && this.capNodeOf(g.capability) === sc;
+    const out: ShareCap[] = [];
+    if (grants.some((g) => forSender(g) && g.media === "display")) out.push("video");
+    if (grants.some((g) => forSender(g) && g.media === "audio")) out.push("audio");
+    if (grants.some((g) => forSender(g) && g.media === "input")) out.push("control");
+    if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
+    if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
+    if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
+    return out;
+  }
+
+  /** Whether the sender can actually offer a given capability — drives which
+   *  toggles are live (you can't share what isn't there). Audio / Video (the
+   *  screen feed) / Control ride the remote-control console; Terminal / Files /
+   *  Sites are their own console shares. */
+  shareFlowCapAvailable(node: string | null, cap: ShareCap): boolean {
+    if (!node) return false;
+    const n = this.node(node);
+    if (!n) return false;
+    if (cap === "audio") return !!matchEndpoint(this.catalog, node, "audio", "provide");
+    // "Video" is the device's screen feed — what the receiver sees in the
+    // remote-control console (and what Control needs to map focus).
+    if (cap === "video") return !!matchEndpoint(this.catalog, node, "display", "provide");
+    // Control & clipboard: the device must accept remote control (a control
+    // sink). The UI also gates it behind Video.
+    if (cap === "control") return !!matchEndpoint(this.catalog, node, "input", "consume");
+    const feats = n.features ?? [];
+    if (cap === "files") return isAppNode(n) && feats.includes(FEATURE_FILES);
+    if (cap === "terminal") return isAppNode(n) && feats.includes(FEATURE_TERMINAL);
+    if (cap === "sites") return (n.sites?.length ?? 0) > 0;
+    return false;
+  }
+
+  /** Why a capability toggle is greyed for this sender — so the builder can
+   *  say *why* it can't share Terminal/Files/Sites instead of a vague "not
+   *  offered". Terminal & Files need the device to advertise that console
+   *  (a current AllMyStuff with it enabled); Sites needs at least one exposed
+   *  service. Returns null when the capability *is* available. */
+  shareCapReason(node: string | null, cap: ShareCap): string | null {
+    if (this.shareFlowCapAvailable(node, cap)) return null;
+    if (!node) return "Pick one of your devices to share first";
+    const n = this.node(node);
+    const who = n?.label ?? "this device";
+    if (!n || !isAppNode(n)) return `${who} isn't running AllMyStuff`;
+    switch (cap) {
+      case "audio":
+        return `${who} has no audio output to share`;
+      case "video":
+        return `${who} has no screen to share`;
+      case "control":
+        return `${who} doesn't accept remote control`;
+      case "terminal":
+        return `${who} isn't offering its terminal (older AllMyStuff, or it's turned off)`;
+      case "files":
+        return `${who} isn't offering file browsing (older AllMyStuff, or it's turned off)`;
+      case "sites":
+        return `${who} isn't exposing any sites — host a service on it first`;
+      default:
+        return `${who} can't share that`;
+    }
+  }
+
+  /** The grants one chosen capability mints — a persistent permission for the
+   *  receiving fleet to open my sender device's console, NOT a live route.
+   *  Each is scoped to the sender device so it only ever unlocks *that* device.
+   *  Directions are what the receiver needs to OPEN the console: the device
+   *  PROVIDES its screen/audio (and CONSUMES the receiver's input for control);
+   *  Terminal/Files/Sites ride a generic grant carrying a `<device>:<kind>`
+   *  capability. */
+  private shareCapGrants(person: string, cap: ShareCap, sender: string, senderLabel: string): Grant[] {
+    const mk = (media: MediaKind, role: GrantRole, suffix: string, what: string): Grant => {
+      const capability = `${sender}:${suffix}`;
+      return {
+        id: scopedGrantId(person, media, role, capability),
+        media,
+        role,
+        capability,
+        label: `${senderLabel} — ${what}`,
+      };
+    };
+    switch (cap) {
+      case "video":
+        return [mk("display", "provide", "screen", "see its screen")];
+      case "audio":
+        return [mk("audio", "provide", "audio", "hear its audio")];
+      case "control":
+        // Control rides with the clipboard, and needs Video to map focus.
+        return [
+          mk("input", "consume", "control", "control it"),
+          mk("clipboard", "both", "clipboard", "share its clipboard"),
+        ];
+      case "files":
+        return [mk("storage", "both", "files", "use its files")];
+      case "terminal":
+        return [mk("generic", "provide", "terminal", "use its terminal")];
+      case "sites":
+        return [mk("generic", "provide", "sites", "reach its sites")];
+    }
+  }
+
+  /** Start the share: grant the receiving FLEET access to my sender device's
+   *  consoles. This is a persistent grant (it rides shareGrant to the daemon),
+   *  not a live connection — the receiver's machines then see the console
+   *  buttons on my device and open them on demand. Returns how many consoles
+   *  were granted. */
+  startShareFlow(caps: ShareCap[]): number {
+    const sender = this.shareFlowSender;
+    const receiver = this.shareFlowReceiver;
+    if (!sender || !receiver) {
+      this.toast("warn", "Pick a device of yours to share, and a fleet to share it with");
+      return 0;
+    }
+    // You can only share your *own* devices' stuff — never someone else's.
+    if (!this.isMyDevice(sender)) {
+      this.toast("warn", "You can only share your own devices");
+      return 0;
+    }
+    // The receiver is another fleet — not one of your own machines.
+    if (this.isMyDevice(receiver)) {
+      this.toast("warn", "Share with another fleet — the receiver can't be your own device");
+      return 0;
+    }
+    const recv = this.node(receiver);
+    if (!recv || !isAppNode(recv)) {
+      this.toast("warn", "That device can't receive a share");
+      return 0;
+    }
+    // Establish the share with the receiver's fleet/person, then record the
+    // console grants on it (a grant authorizes the whole fleet).
+    if (recv.relationship.kind !== "shared") this.markShared(receiver);
+    const rel = this.node(receiver)?.relationship;
+    if (!rel || rel.kind !== "shared") {
+      this.toast("warn", "Couldn't establish the share");
+      return 0;
+    }
+    const person = rel.person;
+    const senderLabel = this.node(sender)?.label ?? "device";
+
+    // Reconcile against what's chosen: grant the selected consoles, revoke the
+    // ones turned off — so the builder *manages* the share, not just adds to it.
+    // Control implies Video (to map focus).
+    const want = new Set(caps);
+    if (want.has("control")) want.add("video");
+    const ALL: ShareCap[] = ["video", "audio", "control", "files", "terminal", "sites"];
+    for (const cap of ALL) {
+      const grants = this.shareCapGrants(person.id, cap, sender, senderLabel);
+      if (want.has(cap)) {
+        for (const g of grants) this.grant(receiver, g);
+      } else {
+        for (const g of grants) this.revokeGrant(receiver, g.id);
+      }
+    }
+    // No toast — on success the builder closes and the share shows up inline:
+    // the grant rows in the device drawer's "What X can do", the Sharing pane,
+    // and the console buttons on the fleet's cards.
+    return want.size;
+  }
+
+  /** Stop the share: revoke every console grant my sender device gave the
+   *  receiving fleet (the persistent permission, not a live route). Returns how
+   *  many grants were pulled so the builder can close on success (its own
+   *  disappearance — and the now-empty grant list behind it — is the feedback);
+   *  only the nothing-to-stop case keeps a toast, since it's a soft failure. */
+  stopShareFlow(): number {
+    const sender = this.shareFlowSender;
+    const receiver = this.shareFlowReceiver;
+    if (!receiver) return 0;
+    const recv = this.node(receiver);
+    if (!recv || recv.relationship.kind !== "shared") {
+      this.toast("warn", "Nothing to stop");
+      return 0;
+    }
+    const senderCanon = sender ? canonicalNodeId(sender) : null;
+    const toRevoke = recv.relationship.grants.filter((g) => {
+      if (!g.capability) return false;
+      const gNode = canonicalNodeId(g.capability.slice(0, g.capability.indexOf(":")));
+      return senderCanon ? gNode === senderCanon : true;
+    });
+    for (const g of toRevoke) this.revokeGrant(receiver, g.id);
+    if (!toRevoke.length) this.toast("warn", "Nothing to stop");
+    return toRevoke.length;
   }
 
   /** When a real backend is connected, fire the actual mesh route offer.
@@ -2515,7 +2818,7 @@ class AppStore {
     if (!this.terminalSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "terminal");
   }
 
   /** Whether a terminal to *this* machine is offerable. The running binary
@@ -2632,7 +2935,7 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.filesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "files");
   }
 
   /** Open the file manager on a remote machine. On the desktop this opens
@@ -2705,7 +3008,95 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.sitesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
+  }
+
+  // ---- cross-fleet console access (the share-enforcement the gates above
+  //      anticipated) -------------------------------------------------------
+
+  /** Every grant covering `node`, unioned across the whole person/fleet (a
+   *  grant authorizes the person wherever it's recorded). */
+  private shareGrantsFor(node: MeshNode): Grant[] {
+    if (node.relationship.kind !== "shared") return [];
+    const pid = node.relationship.person.id;
+    const out: Grant[] = [];
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === pid) {
+        out.push(...n.relationship.grants);
+      }
+    }
+    return out;
+  }
+
+  /** Whether a fleet that shared `node` with me granted me a given console on
+   *  it. Direction matters: to *open* their console I need them to PROVIDE
+   *  their screen/audio (and CONSUME my input for control) — the opposite of a
+   *  grant where *I* let *them* see *my* screen, so sharing out never unlocks
+   *  the same button on the way back. Terminal/Sites ride a generic grant
+   *  carrying the synthetic `<node>:terminal` / `<node>:sites` capability. */
+  hasShareGrant(node: MeshNode | undefined, kind: "remote" | "audio" | "control" | "files" | "terminal" | "sites"): boolean {
+    if (!node || node.relationship.kind !== "shared") return false;
+    const gs = this.shareGrantsFor(node);
+    const provide = (g: Grant) => g.role === "provide" || g.role === "both";
+    const consume = (g: Grant) => g.role === "consume" || g.role === "both";
+    // A grant only unlocks the device it names — a grant scoped to my MacBook's
+    // screen mustn't light up a different device's card. A capability-less grant
+    // (media-wide) covers any of the person's devices.
+    const canon = canonicalNodeId(node.id);
+    const forNode = (g: Grant) =>
+      !g.capability || canonicalNodeId(g.capability.slice(0, g.capability.indexOf(":"))) === canon;
+    switch (kind) {
+      case "remote":
+        return gs.some((g) => g.media === "display" && provide(g) && forNode(g));
+      case "audio":
+        return gs.some((g) => g.media === "audio" && provide(g) && forNode(g));
+      case "control":
+        return gs.some((g) => g.media === "input" && consume(g) && forNode(g));
+      case "files":
+        return gs.some((g) => g.media === "storage" && forNode(g));
+      case "terminal":
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal") && forNode(g));
+      case "sites":
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":sites") && forNode(g));
+    }
+  }
+
+  /** The consoles you may open on a node *right now* — your own fleet gets
+   *  every console it supports; a device a fleet shared with you gets exactly
+   *  the ones their grant covers. One source of truth for the graph-card
+   *  buttons and the drawer's buttons so they can't disagree. */
+  consoleAccess(node: MeshNode | undefined): { remote: boolean; files: boolean; terminal: boolean; sites: boolean } {
+    const none = { remote: false, files: false, terminal: false, sites: false };
+    if (!node || !isAppNode(node)) return none;
+    const self = this.isMe(node.id);
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
+    return {
+      // You don't remote into yourself; otherwise your fleet, or a granted share.
+      remote: !self && (mineOrFleet || this.hasShareGrant(node, "remote")),
+      files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
+      terminal:
+        this.terminalSupported(node) &&
+        (self ? this.localTerminalAllowed : mineOrFleet || this.hasShareGrant(node, "terminal")),
+      sites:
+        this.sitesSupported(node) &&
+        (node.sites?.length ?? 0) > 0 &&
+        !self &&
+        (mineOrFleet || this.hasShareGrant(node, "sites")),
+    };
+  }
+
+  /** Open the right console for a graph-card button click. */
+  openConsoleKind(nodeId: string, kind: "remote" | "files" | "terminal" | "sites") {
+    if (kind === "remote") this.openConsole(nodeId);
+    else if (kind === "files") this.openFiles(nodeId);
+    else if (kind === "terminal") this.openTerminal(nodeId);
+    else if (kind === "sites") {
+      const n = this.node(nodeId);
+      const site = n?.sites?.[0];
+      if (site) void this.mapSite(nodeId, site);
+    }
   }
 
   /** The machines whose sites this device can reach, each with its exposed
@@ -2834,7 +3225,7 @@ class AppStore {
         ...this.siteMappings,
         { node: nodeId, site: site.id, port: site.port, localPort, scheme: site.scheme ?? "", label: site.label },
       ];
-      this.toast("ok", `Mapped ${node.label}'s ${site.label} to localhost:${localPort} (demo)`);
+      // No toast — the row now shows its localhost:<port> address inline.
       return;
     }
     const r = await siteMap(nodeId, site.port);
@@ -2846,7 +3237,7 @@ class AppStore {
       ...this.siteMappings,
       { node: nodeId, site: site.id, port: site.port, localPort: r.localPort, scheme: site.scheme ?? "", label: site.label },
     ];
-    this.toast("ok", `${node.label}'s ${site.label} is at localhost:${r.localPort}`);
+    // No toast — the row now shows its localhost:<port> address inline.
   }
 
   /** A demo local port that doesn't collide with an existing demo mapping. */
@@ -2876,13 +3267,18 @@ class AppStore {
   }
 
   /** Copy a mapped site's `localhost:<port>` address to the clipboard — for
-   *  pasting into whatever client speaks it (a DB tool, an ssh command). */
-  copySite(m: SiteMapping) {
+   *  pasting into whatever client speaks it (a DB tool, an ssh command).
+   *  Resolves true on success so the caller can flash an inline "Copied ✓" on
+   *  the button itself; only a clipboard *failure* falls back to a toast. */
+  async copySite(m: SiteMapping): Promise<boolean> {
     const url = this.siteUrl(m);
-    void navigator.clipboard?.writeText(url).then(
-      () => this.toast("ok", `Copied ${url}`),
-      () => this.toast("warn", `Reach it at ${url}`),
-    );
+    try {
+      await navigator.clipboard?.writeText(url);
+      return true;
+    } catch {
+      this.toast("warn", `Reach it at ${url}`);
+      return false;
+    }
   }
 
   // ---- managing a device's exposure (this machine *or* a fleet member) ---
@@ -3007,7 +3403,8 @@ class AppStore {
       n.claimable = false;
       n.relationship = { kind: "mine" };
       this.addToDemoFleet(n);
-      this.toast("ok", `${n.label} joined your fleet`);
+      // No toast — the claimable card gives way and the device joins your fleet
+      // band on the graph (and the Fleet roster) in front of you.
       this.reauthorize();
     }
   }
@@ -3027,14 +3424,29 @@ class AppStore {
   }
 
   /** Demo/web only: seed the fleet from the machines already marked yours, so
-   *  the Fleet view isn't empty before you claim anything in the preview. */
+   *  the Fleet view isn't empty before you claim anything in the preview. A
+   *  believable named fleet with this device as owner and one promoted
+   *  co-owner, so the owner/promote/evict controls are all alive to try. */
   private seedDemoFleet() {
-    const members = this.catalog.nodes
-      .filter((n) => n.relationship.kind === "mine")
-      .map((n) => ({ device: n.id, label: n.label }));
-    if (members.length > 1) {
-      this.ownedFleet = { key: "demo-fleet-key-7f3a91c2", version: 1, members };
-    }
+    const mine = this.catalog.nodes.filter((n) => n.relationship.kind === "mine");
+    if (mine.length <= 1) return;
+    const members: OwnedMember[] = mine.map((n) => ({
+      device: n.id,
+      label: n.label,
+      // This device founded the fleet; one other is a promoted co-owner — the
+      // rest are plain members, so Promote has somewhere to go.
+      // This device's owner role is left unstamped on purpose — it reads as
+      // owner via the roster's is_owner flag (the realistic backend shape).
+      role: this.isMe(n.id) ? undefined : n.id === "desk" ? "owner" : n.id === "tv" ? "controller" : "member",
+    }));
+    this.ownedFleet = {
+      key: "demo-fleet-key-7f3a91c2",
+      name: "Nathan Paul",
+      version: 1,
+      members,
+      is_owner: true,
+      in_fleet: true,
+    };
   }
 
   /** Demo/web only: a starter room so the rooms bar isn't empty in the
@@ -3120,7 +3532,7 @@ class AppStore {
       }
     } else {
       if (me) me.claimable = on;
-      this.toast("info", on ? "Adoption on (demo)" : "Adoption off (demo)");
+      // No toast — the claim-mode toggle in the drawer reflects the new state.
     }
   }
 
@@ -3355,7 +3767,7 @@ class AppStore {
     if (add.length === 0) return;
     room.members = [...room.members, ...add];
     this.saveRooms();
-    this.toast("ok", `Invited ${add.length} machine${add.length === 1 ? "" : "s"} to “${room.name}”`);
+    // No toast — the invited machines appear in the room's roster immediately.
     this.broadcastRoom(room, this.inviteMessage(room));
     // The new members may now fetch what we're offering — widen the gate.
     this.refreshSharePeers(roomId);
@@ -3378,8 +3790,7 @@ class AppStore {
     if (room.members.length === before.length) return;
     this.saveRooms();
     this.presenceDrop(room.id, target);
-    const label = this.machineByAnyId(target)?.label ?? shortId(target);
-    this.toast("info", `Removed ${label} from “${room.name}”`);
+    // No toast — the member disappears from the room's People panel.
     if (this.backendConnected) {
       const others = before.filter((m) => !this.isMe(m));
       if (others.length) void roomSend(others, this.inviteMessage(room));
@@ -3428,7 +3839,7 @@ class AppStore {
     }
     room.name = clean;
     this.saveRooms();
-    this.toast("ok", `Room renamed to “${clean}”`);
+    // No toast — the new name shows in the room tile and panel header.
     this.broadcastRoom(room, this.inviteMessage(room));
   }
 
@@ -3458,13 +3869,15 @@ class AppStore {
   }
 
   /** Copy a room's join id — the `room:…` handle others paste into "Join
-   *  with an id" to knock — to the clipboard. */
-  async copyRoomId(roomId: string) {
+   *  with an id" to knock — to the clipboard. Resolves true on success so the
+   *  caller can flash an inline "Copied ✓" on the button; only a failure toasts. */
+  async copyRoomId(roomId: string): Promise<boolean> {
     try {
       await navigator.clipboard.writeText(roomId);
-      this.toast("ok", "Join ID copied");
+      return true;
     } catch {
       this.toast("warn", "Couldn't copy the join ID");
+      return false;
     }
   }
 
@@ -3616,8 +4029,9 @@ class AppStore {
     }
     const wired = this.wireRoomLegs(roomId, "mic", from, "audio");
     this.setRoomSend(roomId, "mic", wired > 0);
-    if (wired > 0) this.toastLegs("Your mic is live", wired);
-    else this.toast("warn", "Nobody in the room can receive audio right now");
+    // Success shows inline (the self tile's live-mic badge); only warn if nobody
+    // could receive it.
+    if (wired === 0) this.toast("warn", "Nobody in the room can receive audio right now");
   }
 
   /** Share this machine's **sound** — what it's playing, captured off the
@@ -3638,8 +4052,8 @@ class AppStore {
     }
     const wired = this.wireRoomLegs(roomId, "sound", from, "audio");
     this.setRoomSend(roomId, "sound", wired > 0);
-    if (wired > 0) this.toastLegs("Sharing this machine's sound", wired);
-    else this.toast("warn", "Nobody in the room can receive audio right now");
+    // Success shows inline (the self tile's "sharing sound" badge).
+    if (wired === 0) this.toast("warn", "Nobody in the room can receive audio right now");
   }
 
   /** This machine's shareable screens — the display sources behind the
@@ -3675,8 +4089,8 @@ class AppStore {
     }
     const wired = this.wireRoomLegs(roomId, "screen", from, "display");
     this.setRoomSend(roomId, "screen", wired > 0);
-    if (wired > 0) this.toastLegs(`Sharing ${sources.length > 1 ? from.label : "your screen"}`, wired);
-    else this.toast("warn", "Nobody in the room can receive a screen right now");
+    // Success shows inline (the self tile's "sharing screen" badge + banner).
+    if (wired === 0) this.toast("warn", "Nobody in the room can receive a screen right now");
   }
 
   /** Send your camera to the room: this machine's default camera to every
@@ -3700,8 +4114,8 @@ class AppStore {
     }
     const wired = this.wireRoomLegs(roomId, "cam", from, "video");
     this.setRoomSend(roomId, "cam", wired > 0);
-    if (wired > 0) this.toastLegs("Your camera is live", wired);
-    else this.toast("warn", "Nobody in the room can receive camera video right now");
+    // Success shows inline (the self tile's "camera live" badge).
+    if (wired === 0) this.toast("warn", "Nobody in the room can receive camera video right now");
   }
 
   /** Let the room drive this machine: each member's keyboard & mouse is
@@ -3733,8 +4147,8 @@ class AppStore {
       if (leg) wired += 1;
     }
     this.setRoomSend(roomId, "control", wired > 0);
-    if (wired > 0) this.toastLegs("Members can drive this machine", wired);
-    else this.toast("warn", "No member can send control right now");
+    // Success shows inline (the self tile's "control open" badge).
+    if (wired === 0) this.toast("warn", "No member can send control right now");
   }
 
   /** Send a chat line to the room. */
@@ -3839,7 +4253,7 @@ class AppStore {
       return;
     }
     this.addMyShares(room.id, metas);
-    this.toast("ok", `Sharing ${metas.length} file${metas.length === 1 ? "" : "s"} with the room`);
+    // No toast — the files appear in the room's Shared Files list immediately.
   }
 
   /** Stop offering one of *your* shared files (the ✕ on your entry).
@@ -4228,8 +4642,8 @@ class AppStore {
       // The admitted machine may now fetch what we're offering.
       this.refreshSharePeers(roomId);
     }
-    const label = this.machineByAnyId(from)?.label ?? shortId(from);
-    this.toast("ok", `Let ${label} into “${room.name}”`);
+    // No toast — the admitted machine moves from "Asking to join" into the
+    // room's roster in the People panel.
   }
 
   /** Turn one knock away (the asker hears a `deny`, not silence). */
@@ -4419,10 +4833,6 @@ class AppStore {
     if (n) this.callLog(`drop "${channel}" — tore down ${n} leg(s) in ${roomId}`);
   }
 
-  private toastLegs(what: string, n: number) {
-    this.toast("ok", `${what} — ${n} member${n === 1 ? "" : "s"}`);
-  }
-
   /** Rooms persist on this device (like the graph's relationships, the
    *  mesh holds no central copy — every member keeps their own). Every
    *  save is announced on the local bus so this app's other windows (the
@@ -4479,15 +4889,18 @@ class AppStore {
     }
   }
 
-  /** Set this device's display-name override (empty resets to the hostname). */
-  async setIdentityLabel(label: string) {
+  /** Set this device's display-name override (empty resets to the hostname).
+   *  Resolves true on success so the pane can flash an inline "Saved ✓" on the
+   *  button; only a failure toasts. */
+  async setIdentityLabel(label: string): Promise<boolean> {
     try {
       await meshIdentitySetLabel(label);
       this.identity = { device_id: this.identity?.device_id ?? "", label };
       this.applyLocalLabel();
-      this.toast("ok", label.trim() ? "Updated this device's name" : "Reset to the machine name");
+      return true;
     } catch (e) {
       this.toast("warn", `Couldn't set name: ${errMsg(e)}`);
+      return false;
     }
   }
 
@@ -4513,7 +4926,7 @@ class AppStore {
       );
       this.networkVenues[id] = venues.map((v) => v.id);
       this.persistNetworkVenues();
-      this.toast("ok", typed ? `Joined ${id}` : `Created ${id}`);
+      // No toast — the new mesh appears as a row in the Meshes list.
       await this.refreshNetworks();
     } catch (e) {
       this.toast("warn", `Couldn't ${typed ? "join" : "set up"} the network: ${errMsg(e)}`);
@@ -4524,10 +4937,10 @@ class AppStore {
    *  file you can hand to another device — the no-typing twin of "Copy id".
    *  Works for live or parked networks; pulls the full config if it isn't
    *  already loaded. */
-  async exportNetwork(configId: string) {
+  async exportNetwork(configId: string): Promise<boolean> {
     if (!this.backendConnected) {
       this.toast("info", "Exporting a network needs the desktop app");
-      return;
+      return false;
     }
     let cfg =
       this.networkConfig(configId) ??
@@ -4539,7 +4952,7 @@ class AppStore {
     }
     if (!cfg) {
       this.toast("warn", "Couldn't find that network's settings to export");
-      return;
+      return false;
     }
     try {
       // Bundle the mesh's custom venues so importing the file brings them too;
@@ -4547,10 +4960,11 @@ class AppStore {
       const venues = this.venuesForNetwork(cfg.network_id).filter((v) => !v.builtin);
       const env = exportNetworkSettings(cfg, venues);
       const base = (env.label || env.network_id || "network").replace(/[^\w.-]+/g, "_").slice(0, 48);
-      const saved = await exportNetworkFile(`${base}.network-settings.json`, env);
-      if (saved) this.toast("ok", `Exported ${env.label || env.network_id}`);
+      // No toast on success — the caller flashes an inline "Exported ✓".
+      return !!(await exportNetworkFile(`${base}.network-settings.json`, env));
     } catch (e) {
       this.toast("warn", `Couldn't export the network: ${errMsg(e)}`);
+      return false;
     }
   }
 
@@ -4574,7 +4988,7 @@ class AppStore {
     }
     try {
       await meshNetworkAdd(networkAddPayloadFromEnvelope(env));
-      this.toast("ok", `Imported ${env.label || env.network_id}`);
+      // No toast — the imported mesh appears as a row in the Meshes list.
       await this.refreshNetworks();
       await this.loadNetworkConfigs();
       // Recreate the venues the mesh travelled with, map the mesh to them, and
@@ -4601,7 +5015,8 @@ class AppStore {
         this.roster = [];
         this.livePeers = [];
       }
-      this.toast("info", "Left the network");
+      // No toast — the mesh's row leaves the Meshes list (and its nodes drop
+      // from the graph).
       await this.refreshNetworks();
       // Re-derive the graph now so the left network's nodes drop immediately,
       // rather than lingering until the next 3 s poll happens to run (matches
@@ -4633,10 +5048,8 @@ class AppStore {
     }
     try {
       await setNetworkEnabled(key, on);
-      this.toast(
-        on ? "ok" : "info",
-        on ? "Network enabled — reconnecting" : "Network disabled — kept for when you want it back",
-      );
+      // No toast — the mesh's switch flips and its row moves between the live
+      // and disabled lists.
       await this.refreshNetworks();
       await this.loadDisabledNetworks();
       // Driving a mesh on turns its venues back on if any were off, and shimmers
@@ -4661,36 +5074,75 @@ class AppStore {
    *  when a network goes quiet (stuck handshaking, peers fallen silent). It
    *  acts on every currently-joined network, since the control is global. */
   async restartNetwork() {
-    if (!this.backendConnected) {
-      this.toast("info", "Nothing live to restart — connect to a network first");
-      return;
-    }
+    // Guard against a double-click while a restart is already playing out.
+    if (this.restartFlow) return;
+    const settle = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    // The 3-step panel is the feedback now (it floats over the graph), so the
+    // restart no longer narrates itself through toasts — only failures speak.
+    const steps: { label: string; status: "wait" | "go" | "ok" }[] = [
+      { label: "Restarting", status: "wait" },
+      { label: "Reconnecting", status: "wait" },
+      { label: "Connected", status: "wait" },
+    ];
+    this.restartFlow = steps;
+    const mark = (i: number, status: "wait" | "go" | "ok") => {
+      steps[i].status = status;
+      this.restartFlow = [...steps];
+    };
+
     const joined = (Array.isArray(this.networks) ? this.networks : []).slice();
-    if (joined.length === 0) {
-      this.toast("warn", "No live network to restart");
-      return;
-    }
-    const many = joined.length > 1;
-    this.toast("info", many ? "Restarting networks — reconnecting…" : "Restarting the network — reconnecting…");
     let failed = 0;
-    for (const n of joined) {
-      // `config_id` is the stable local key the off→on round-trip parks and
-      // takes the config back under; fall back to the wire id just in case.
-      const key = n.config_id || n.network_id;
-      try {
-        await setNetworkEnabled(key, false);
-        await setNetworkEnabled(key, true);
-      } catch (e) {
-        failed++;
-        this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
+
+    // Step 1 — restart: park every live mesh (leave from the live config).
+    mark(0, "go");
+    await settle(420);
+    if (this.backendConnected) {
+      for (const n of joined) {
+        try {
+          await setNetworkEnabled(n.config_id || n.network_id, false);
+        } catch (e) {
+          failed++;
+          this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
+        }
       }
     }
-    // Re-sync regardless of partial failure so the pills/graph match reality
-    // (a failed re-join leaves that network parked, recoverable from the menu).
-    await this.refreshNetworks();
-    await this.loadDisabledNetworks();
-    await this.syncMeshGraph();
-    if (failed === 0) this.toast("ok", many ? "Networks restarted" : "Network restarted");
+    mark(0, "ok");
+
+    // Step 2 — reconnect: re-join each from the parked config, then re-sync.
+    mark(1, "go");
+    if (this.backendConnected) {
+      for (const n of joined) {
+        try {
+          await setNetworkEnabled(n.config_id || n.network_id, true);
+        } catch (e) {
+          failed++;
+          this.toast("warn", `Couldn't reconnect ${networkDisplayName(n)}: ${errMsg(e)}`);
+        }
+      }
+      // Re-sync regardless of partial failure so the pills/graph match reality
+      // (a failed re-join leaves that mesh parked, recoverable from the menu).
+      await this.refreshNetworks();
+      await this.loadDisabledNetworks();
+      await this.syncMeshGraph();
+    } else {
+      // Demo/web: nothing live to cycle, but play the sequence so the panel is
+      // a real, visible thing in the preview.
+      await settle(700);
+    }
+    await settle(260);
+    mark(1, failed === 0 ? "ok" : "ok");
+
+    // Step 3 — connected: the all-clear.
+    mark(2, "go");
+    await settle(280);
+    mark(2, "ok");
+
+    if (failed > 0) this.toast("warn", "Some meshes didn't come back — open the meshes menu to retry");
+
+    // Let the green "Connected" sit a beat, then fade the panel away.
+    await settle(1000);
+    this.restartFlow = null;
   }
 
   /** Demo/web twin of the toggle: move the network between the live and
@@ -4730,7 +5182,7 @@ class AppStore {
       }
       if (n.networks?.length) n.online = n.networks.some((name) => enabledNames.has(name));
     }
-    this.toast(on ? "ok" : "info", on ? "Network enabled (demo)" : "Network disabled (demo)");
+    // No toast — the mesh's switch flips and its row moves between lists.
   }
 
   // ---- per-network transport config (signaling · STUN · TURN) -----
@@ -4760,11 +5212,11 @@ class AppStore {
   async updateNetworkServers(
     configId: string,
     servers: { signaling: string[]; stun: string[]; turn: TurnEntry[] },
-  ) {
+  ): Promise<boolean> {
     const cfg = this.networkConfig(configId);
     if (!cfg) {
       this.toast("warn", "That network isn't loaded — reopen Settings");
-      return;
+      return false;
     }
     // The fleet's venue is owner-defined and owner-broadcast: members and
     // managers ride the owner's choice. Refuse here too, so no UI path (the
@@ -4772,7 +5224,7 @@ class AppStore {
     // — the owner's next broadcast would just overwrite it anyway.
     if (this.isFleetMesh(cfg) && !this.isFleetOwner) {
       this.toast("warn", "The fleet's venue is set by the fleet owner — you ride the owner's choice.");
-      return;
+      return false;
     }
     const next: NetworkConfigFull = {
       ...cfg,
@@ -4791,11 +5243,13 @@ class AppStore {
     };
     try {
       await meshNetworkUpdate(next);
-      this.toast("ok", "Saved — reconnecting with the new servers");
+      // No toast — the Save button flashes "Saved ✓" inline.
       await this.loadNetworkConfigs();
       await this.refreshNetworks();
+      return true;
     } catch (e) {
       this.toast("warn", `Couldn't save servers: ${errMsg(e)}`);
+      return false;
     }
   }
 
@@ -4936,20 +5390,22 @@ class AppStore {
     this.persistNetworkVenues();
     for (const nid of affected) await this.applyNetworkVenuesByWireId(nid);
     if (this.venueDraft?.id === id) this.venueDraft = null;
-    this.toast("info", `Removed ${v.label}`);
+    // No toast — the venue's row leaves the Venues list.
   }
 
   /** Re-fetch a remote venue's servers from its url, cache them, and re-apply
-   *  to any mesh using it. */
-  async refreshVenue(id: string) {
+   *  to any mesh using it. Resolves true on success so the pane can flash an
+   *  inline "Fetched ✓" on the button; only a failure toasts. */
+  async refreshVenue(id: string): Promise<boolean> {
     const v = this.venueById(id);
-    if (!v?.url) return;
+    if (!v?.url) return false;
     try {
       const s = await fetchVenueServers(v.url);
       await this.saveVenue({ ...v, signaling: s.signaling, stun: s.stun, turn: s.turn, fetchedAt: Date.now() });
-      this.toast("ok", `Refreshed ${v.label}`);
+      return true;
     } catch (e) {
       this.toast("warn", `Couldn't reach ${v.label}: ${errMsg(e)}`);
+      return false;
     }
   }
 
@@ -5028,7 +5484,7 @@ class AppStore {
   async approveDevice(configId: string, deviceId: string, label?: string) {
     try {
       await meshRosterApprove(configId, deviceId, label);
-      this.toast("ok", "Approved — it can join now");
+      // No toast — the device moves from "Waiting for you" to "Approved".
       await this.refreshRoster(configId);
     } catch (e) {
       this.toast("warn", `Couldn't approve: ${errMsg(e)}`);
@@ -5038,7 +5494,7 @@ class AppStore {
   async removeDevice(configId: string, deviceId: string) {
     try {
       await meshRosterRemove(configId, deviceId);
-      this.toast("info", "Removed from the network");
+      // No toast — the device's row leaves the roster list.
       await this.refreshRoster(configId);
     } catch (e) {
       this.toast("warn", `Couldn't remove: ${errMsg(e)}`);
@@ -5126,7 +5582,8 @@ class AppStore {
         // being claimable-blocked, so the make-claimable affordance returns.
         this.ownedFleet = null;
         this.reconcileFleetRelationships();
-        this.toast("ok", "Left the fleet");
+        // No toast — the Fleet pane drops to its "No fleet yet" state and the
+        // graph regroups the devices you no longer co-own.
       } catch (e) {
         this.toast("warn", `Couldn't leave the fleet: ${String(e)}`);
       }
@@ -5142,7 +5599,7 @@ class AppStore {
       ? { ...this.ownedFleet, version: this.ownedFleet.version + 1, members }
       : null;
     this.reconcileFleetRelationships();
-    this.toast("ok", "Left the fleet");
+    // No toast — the Fleet pane drops to its "No fleet yet" state.
   }
 
   /** Evict a member from the fleet (owner-only). Routes through the governance
@@ -5168,7 +5625,7 @@ class AppStore {
       version: this.ownedFleet.version + 1,
       members: this.ownedFleet.members.filter((m) => !sameMachine(m.device, device)),
     };
-    this.toast("ok", `Kicked ${label} from the fleet`);
+    // No toast — the evicted device's row leaves the Fleet roster.
   }
 
   async loadUpdateStatus() {
@@ -5191,7 +5648,8 @@ class AppStore {
     try {
       this.updateOutcome = await updateCheck();
       this.updateInfo = (await updateStatus()) ?? this.updateInfo;
-      this.describeCheckOutcome(this.updateOutcome);
+      // No toast — the Updates pane reads updateOutcome and shows the result
+      // inline (staged/ready blocks, or the "check result" line) right there.
     } catch (e) {
       this.toast("warn", `Update check failed: ${errMsg(e)}`);
     } finally {
@@ -5207,10 +5665,9 @@ class AppStore {
     this.updateBusy = true;
     try {
       const r = await updateApply();
-      if (r?.applied) {
-        this.updateApplied = r.applied;
-        this.toast("ok", `Update ${r.applied} applied — relaunch to run it`);
-      } else this.toast("info", "Nothing staged to apply");
+      if (r?.applied) this.updateApplied = r.applied;
+      // No toast — the pane swaps to its "<version> is ready · Relaunch now"
+      // block when applied; nothing staged simply leaves the block hidden.
       this.updateInfo = (await updateStatus()) ?? this.updateInfo;
     } catch (e) {
       this.toast("warn", `Couldn't apply update: ${errMsg(e)}`);
@@ -5277,9 +5734,9 @@ class AppStore {
       const r = await action();
       if (!r.ok) {
         this.toast("warn", r.output || `Couldn't ${label} the service`);
-      } else {
-        this.toast("ok", `Service ${label} — done`);
       }
+      // No toast on success — the Always On pane's status pill (Running/Stopped)
+      // updates from loadServiceStatus() below.
     } catch (e) {
       this.toast("warn", `Couldn't ${label} the service: ${errMsg(e)}`);
     } finally {
@@ -5407,27 +5864,27 @@ class AppStore {
     this.toast("info", `Asking ${n.label} to upgrade and restart…`);
   }
 
-  private describeCheckOutcome(o: CheckOutcome | null) {
-    if (!o) return;
+  /** A human one-liner for the last check's outcome, shown inline in the
+   *  Updates pane (no toast). Null when there's nothing to add — the staged /
+   *  ready blocks already cover the downloaded & applied cases, so this carries
+   *  the outcomes that otherwise had no inline home. */
+  checkOutcomeText(o: CheckOutcome | null): string | null {
+    if (!o) return null;
     switch (o.outcome) {
       case "staged":
-        this.toast("ok", `Update ${o.version} downloaded — applies on next launch`);
-        break;
+        return `Update ${o.version} downloaded — applies on next launch`;
       case "up_to_date":
-        this.toast("ok", "You're on the latest version");
-        break;
+        return "You're on the latest version";
       case "policy_blocked":
-        this.toast("info", `${o.latest} is available but held by your auto-apply setting`);
-        break;
+        return `${o.latest} is available but held by your auto-apply setting`;
       case "package_manager":
-        this.toast("info", "Installed via a package manager — update through it");
-        break;
+        return "Installed via a package manager — update through it";
       case "disabled":
-        this.toast("info", "Auto-update is off");
-        break;
+        return "Auto-update is off";
       case "not_due":
-        this.toast("info", "Checked recently — try again shortly");
-        break;
+        return "Checked recently — try again shortly";
+      default:
+        return null;
     }
   }
 
@@ -5528,16 +5985,15 @@ class AppStore {
    *  goes back to unclaimed, every grant (and any route riding one) goes
    *  with it. */
   stopSharingWith(personId: string) {
-    let name = "";
     for (const n of this.catalog.nodes) {
       if (n.relationship.kind === "shared" && n.relationship.person.id === personId) {
-        name = n.relationship.person.name;
         n.relationship = { kind: "unclaimed" };
       }
     }
     void shareStop(personId).catch(() => {});
     this.reauthorize();
-    if (name) this.toast("info", `Stopped sharing with ${name}`);
+    // No toast — the partner drops off the Sharing list and their nodes leave
+    // the shared band on the graph.
   }
 
   grant(nodeId: string, grant: Grant) {
@@ -5570,7 +6026,8 @@ class AppStore {
     n.relationship.grants = n.relationship.grants.filter((g) => g.id !== grantId);
     void shareRevoke(personId, grantId).catch(() => {});
     this.reauthorize();
-    this.toast("info", "Permission removed");
+    // No toast — the grant row vanishes from the drawer / Sharing pane (and this
+    // is called in a loop when reconciling a share, so a toast would flood).
   }
 
   /** After any authorization change, drop routes that are no longer

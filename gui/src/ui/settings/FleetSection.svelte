@@ -5,6 +5,7 @@
   // things.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import { displayName } from "../../types";
   import {
     fleetMfaStatus,
     fleetMfaEnroll,
@@ -81,9 +82,36 @@
     }
   }
 
+  // Resolve a roster device id to its display name the same way the graph and
+  // drawer do — by *canonical* machine match, not a strict id equality. A
+  // roster id can be a different form of the same machine's id (bare pubkey vs
+  // display id), so the strict lookup missed it and the name vanished.
   function nodeLabel(device: string): string {
-    const n = app.catalog.nodes.find((x) => x.id === device) ?? null;
-    return n?.label ?? "";
+    const n = app.machineByAnyId(device);
+    return n ? displayName(n) : "";
+  }
+
+  function memberName(m: { device: string; label: string }): string {
+    // This device always knows its own name, even when the roster didn't stamp
+    // a label on it. Otherwise prefer the live node's name, then the roster
+    // label, then a short id as a last resort.
+    if (app.isMe(m.device)) {
+      return (app.localNode ? displayName(app.localNode) : "") || nodeLabel(m.device) || m.label || "This device";
+    }
+    return nodeLabel(m.device) || m.label || m.device.slice(0, 12);
+  }
+
+  // Jump to a fleet device on the graph: select it (the drawer + graph focus
+  // it) and close settings. Right-click does the same (parity).
+  function jumpToDevice(device: string) {
+    app.selectNode(device);
+    app.settingsOpen = false;
+  }
+
+  // Promote a member to co-owner — full fleet authority alongside you, not a
+  // transfer. Re-uses the same governance path as the device drawer.
+  function promote(device: string) {
+    void app.grantFleetRole(device, "owner");
   }
 
   // ---- fleet custody (TOTP / MFA) ----
@@ -147,6 +175,41 @@
   </p>
 
   {#if hasFleet}
+    <!-- Whose fleet this is — the owning *person's* name, which leads. It's not
+         the fleet's mesh id (that's the word-salad network name over in Meshes),
+         and it's not a device name: the owner *machines* are marked ★ Owner in
+         the device list below (they're fleet owners too, just identified by
+         their device name). -->
+    <section class="block name-block">
+      <div class="name-row">
+        <label class="name-label" for="fleet-owner-name">👤 Fleet owner</label>
+        {#if app.isFleetOwner}
+          <input
+            id="fleet-owner-name"
+            class="name-input"
+            placeholder="The person who owns this fleet…"
+            bind:value={nameDraft}
+            oninput={() => (nameDirty = true)}
+            onkeydown={(e) => e.key === "Enter" && saveName()}
+            onblur={saveName}
+          />
+        {:else}
+          <!-- Non-owners can't change it, but they (and everyone in the mesh)
+               see it — plain text, not a greyed-out field. -->
+          <div class="name-value" class:unnamed={!app.fleetName}>
+            {app.fleetName || "Unnamed owner"}
+          </div>
+        {/if}
+      </div>
+      <p class="hint">
+        The name of the <b>person</b> who owns this fleet. It leads everywhere —
+        the graph's “{app.fleetName || "Your"}{app.fleetName ? "'s" : ""} fleet”
+        band, and new rooms default to it. (The fleet's <i>mesh</i> name — its id
+        for networks — lives under Meshes.)
+        {#if !app.isFleetOwner} Only the fleet owner can change it.{/if}
+      </p>
+    </section>
+
     {#if hasKey}
       <section class="block key-block">
         <div class="key-head">
@@ -170,50 +233,51 @@
       </section>
     {/if}
 
-    {#if hasKey}
-      <section class="block name-block">
-      <div class="name-row">
-        <label class="name-label" for="fleet-owner-name">🪪 Fleet owner name</label>
-        <input
-          id="fleet-owner-name"
-          class="name-input"
-          placeholder="Unnamed — whose fleet is this?"
-          disabled={!app.isFleetOwner}
-          bind:value={nameDraft}
-          oninput={() => (nameDirty = true)}
-          onkeydown={(e) => e.key === "Enter" && saveName()}
-          onblur={saveName}
-        />
-      </div>
-      <p class="hint">
-        The fleet answers to this name everywhere — the graph's “{app.fleetName ||
-          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it.
-        {#if !app.isFleetOwner}Only the fleet owner can change it.{/if}
-      </p>
-      </section>
-    {/if}
-
     <section class="block">
       <h4>{members.length} device{members.length === 1 ? "" : "s"} in your fleet</h4>
       <ul class="members">
         {#each members as m (m.device)}
-          {@const live = nodeLabel(m.device)}
           {@const isSelf = app.isMe(m.device)}
-          <li>
-            <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
-            <div class="m-id">
-              <div class="m-name">{m.label || live || m.device.slice(0, 12)}{#if isSelf} <span class="self-tag">this device</span>{/if}</div>
-              <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
-            </div>
+          {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
+          {@const isManager = app.fleetRoleOf(m.device) === "manager"}
+          <li class:owner={isOwner}>
+            <button
+              class="m-jump"
+              title="Show this device on the graph"
+              onclick={() => jumpToDevice(m.device)}
+              oncontextmenu={(e) => { e.preventDefault(); jumpToDevice(m.device); }}
+            >
+              <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
+              <div class="m-id">
+                <div class="m-name">
+                  {memberName(m)}
+                  {#if isSelf} <span class="self-tag">this device</span>{/if}
+                  {#if isOwner} <span class="owner-tag">★ Owner</span>
+                  {:else if isManager} <span class="mgr-tag">Manager</span>{/if}
+                </div>
+                <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
+              </div>
+            </button>
             {#if app.isFleetOwner && !isSelf}
-              <button
-                class="kick"
-                class:armed={armed === m.device}
-                title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
-                onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
-              >
-                {armed === m.device ? "Evict — sure?" : "Evict"}
-              </button>
+              <div class="m-actions">
+                {#if !isOwner}
+                  <button
+                    class="promote"
+                    title="Add as a co-owner — they gain full fleet authority alongside you. This adds an owner; it doesn't hand the fleet away."
+                    onclick={() => promote(m.device)}
+                  >
+                    ★ Promote
+                  </button>
+                {/if}
+                <button
+                  class="kick"
+                  class:armed={armed === m.device}
+                  title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                  onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                >
+                  {armed === m.device ? "Evict — sure?" : "Evict"}
+                </button>
+              </div>
             {/if}
           </li>
         {/each}
@@ -409,6 +473,21 @@
   .name-input:disabled {
     opacity: 0.6;
   }
+  /* The non-owner, read-only rendering of the fleet name — plain, legible
+     text so the name is unmistakably visible (not a greyed field). */
+  .name-value {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.95rem;
+    font-weight: 650;
+    color: var(--ink);
+    padding: 0.4rem 0;
+  }
+  .name-value.unnamed {
+    color: var(--ink-faint);
+    font-weight: 500;
+    font-style: italic;
+  }
   code {
     flex: 1;
     min-width: 0;
@@ -438,10 +517,33 @@
   .members li {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 0.4rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
-    padding: 0.5rem 0.6rem;
+    padding: 0.3rem 0.5rem 0.3rem 0.1rem;
+  }
+  /* An owner row gets a faint gold edge so the fleet's authority is legible
+     at a glance. */
+  .members li.owner {
+    box-shadow: inset 2px 0 0 var(--c-fleet);
+  }
+  /* The identity is a button — clicking (or right-clicking) jumps to the
+     device on the graph. */
+  .m-jump {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    border: none;
+    background: none;
+    text-align: left;
+    padding: 0.2rem 0.5rem;
+    border-radius: var(--r-sm);
+    color: inherit;
+  }
+  .m-jump:hover {
+    background: var(--surface);
   }
   .m-avatar {
     font-size: 1.2rem;
@@ -450,6 +552,50 @@
     min-width: 0;
     flex: 1;
   }
+  .m-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+  /* Promote = add a co-owner. Gold (the owner colour), and clearly additive —
+     never the dangerous "transfer" it used to read as. */
+  .promote {
+    border: 1px solid var(--c-fleet-soft);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
+    border-radius: var(--r-pill);
+    padding: 0.22rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 650;
+    cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease;
+  }
+  .promote:hover {
+    border-color: var(--c-fleet);
+  }
+  .owner-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.4rem;
+  }
+  /* Manager — distinct from the gold owner, in the fleet's green. */
+  .mgr-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.4rem;
+  }
+
   .m-name {
     font-size: 0.88rem;
     font-weight: 600;

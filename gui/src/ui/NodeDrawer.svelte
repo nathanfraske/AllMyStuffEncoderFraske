@@ -9,8 +9,6 @@
     mediaColor,
     siteIcon,
     type Capability,
-    type Grant,
-    type GrantRole,
     type ListeningService,
     type MediaKind,
   } from "../types";
@@ -86,17 +84,6 @@
     return out;
   });
 
-  // Friendly share presets — what you can let a guest do — minus what's
-  // already granted.
-  interface Preset { label: string; media: MediaKind; role: GrantRole }
-  const PRESETS: Preset[] = [
-    { label: "See your screen", media: "display", role: "consume" },
-    { label: "Hear your audio", media: "audio", role: "consume" },
-    { label: "Send you their camera", media: "video", role: "provide" },
-    { label: "Speak to you (their mic)", media: "audio", role: "provide" },
-    { label: "Share files both ways", media: "storage", role: "both" },
-  ];
-
   // The share partner this node belongs to, with the *person-wide* grant
   // list (a grant covers every node they bring, wherever it's recorded)
   // and their other machines for the "applies to all of these" hint.
@@ -108,12 +95,10 @@
       : null,
   );
   const grants = $derived(partner?.grants ?? []);
-
-  const availablePresets = $derived(
-    PRESETS.filter((p) => !grants.some(({ grant: g }) => g.media === p.media && g.role === p.role)),
-  );
-
-  let addingGrant = $state(false);
+  // Only the share-*out* grants belong here — what this fleet can do with MY
+  // devices. The share-in grants (consoles of *theirs* I may open) are read off
+  // their own card, not listed as "what they can do".
+  const outGrants = $derived(grants.filter(({ grant: g }) => app.isShareOutGrant(g)));
   /** Whether the capability list is expanded — starts folded so the drawer
    *  leads with the relationship, not a wall of devices. */
   let stuffOpen = $state(false);
@@ -175,44 +160,65 @@
     if (isRemoteApp) void app.loadLatestRelease();
   });
 
+  // The grab handle does double duty: drag to resize, click (no drag) to
+  // collapse. `armed` = pressed; `moved` tells the two apart.
+  let armed = false;
+  let moved = false;
+  let startX = 0;
   function startResize(e: PointerEvent) {
-    resizing = true;
+    armed = true;
+    moved = false;
+    startX = e.clientX;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
     e.preventDefault();
   }
   function onResizeMove(e: PointerEvent) {
-    if (!resizing) return;
+    if (!armed) return;
+    if (!moved && Math.abs(e.clientX - startX) < 4) return;
+    moved = true;
+    resizing = true;
     // The drawer is flush against the window's right edge, so its width is
     // simply the distance from the pointer to that edge.
     width = Math.min(MAX_W, Math.max(MIN_W, window.innerWidth - e.clientX));
   }
   function endResize(e: PointerEvent) {
-    if (!resizing) return;
-    resizing = false;
+    if (!armed) return;
+    armed = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
-    try {
-      localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
-    } catch {
-      /* private mode — the width just doesn't persist */
+    if (moved) {
+      resizing = false;
+      try {
+        localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+      } catch {
+        /* private mode — the width just doesn't persist */
+      }
+    } else {
+      // A click, not a drag → collapse.
+      collapsed = true;
     }
   }
 
-  function addGrant(p: Preset) {
+  // Manage the share with this fleet in the builder, pre-filled: receiver = this
+  // fleet (this device belongs to it), sender = the device the existing grants
+  // are scoped to (else this machine), with the already-granted consoles on.
+  function manageShare() {
     if (!node) return;
-    const g: Grant = {
-      id: `grant:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
-      media: p.media,
-      role: p.role,
-      capability: null,
-      label: p.label,
-    };
-    app.grant(node.id, g);
-    addingGrant = false;
+    let senderId = app.localId;
+    const scoped = outGrants.map((x) => x.grant).find((g) => g.capability);
+    if (scoped?.capability) {
+      const sc = scoped.capability.slice(0, scoped.capability.indexOf(":"));
+      if (app.isMyDevice(sc)) senderId = sc;
+    }
+    app.openShareFlow(senderId, node.id, app.existingShareCaps(senderId, node.id));
   }
 
-  function makeShared() {
+  // Open the Share Flow builder primed with this device: if it's yours it's the
+  // sender (it shares its stuff); if it's someone else's it's the receiver (you
+  // share your stuff to them), with this machine as the sender.
+  function addShare() {
     if (!node) return;
-    app.markShared(node.id);
+    if (st?.mine || st?.self) app.openShareFlow(node.id, null);
+    else app.openShareFlow(app.localId, node.id);
   }
   /** Adopt this device — gated: only takes if it's in claim mode (Task 4). */
   function claimThis() {
@@ -252,17 +258,23 @@
         {/if}
       </div>
     {:else}
-      <!-- Drag this edge to resize the sidebar. -->
+      <!-- The grab handle: drag to resize, click to collapse. Mirrors the
+           left panel — here it sits on the drawer's inner (left) edge. -->
       <div
         class="resizer"
         role="separator"
-        aria-label="Resize panel"
+        aria-label="Resize or collapse panel"
         aria-orientation="vertical"
+        title="Drag to resize · click to collapse"
         onpointerdown={startResize}
         onpointermove={onResizeMove}
         onpointerup={endResize}
         onpointercancel={endResize}
-      ></div>
+      >
+        <span class="grip" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i>
+        </span>
+      </div>
       <div class="drawer-body">
         <header class="head">
       <span class="avatar">{!st || !st.app ? "📡" : st.shared ? "🧑" : st.self ? "💻" : "🖥"}</span>
@@ -335,7 +347,7 @@
          sharing is one-directional: when you share your stuff *with* someone,
          their machine isn't yours to drive, so it never offers a remote
          control (the far side would refuse it anyway). -->
-    {#if isRemoteApp && st?.mine}
+    {#if isRemoteApp && app.consoleAccess(node).remote}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
       </button>
@@ -434,7 +446,7 @@
         {#if st.inFleet}
           <!-- The full fleet view — name, members, key, MFA — lives in Settings;
                this is the jump there from the device you're looking at. -->
-          <button class="linklike fleet-settings" onclick={() => app.openSettings("fleet")}>
+          <button class="btn small fleet-settings" onclick={() => app.openSettings("fleet")}>
             ⚙ Manage fleet in Settings →
           </button>
         {/if}
@@ -453,12 +465,10 @@
       {:else if st.shared}
         <div class="block-head">
           <h4>What {st.shared.name} can do</h4>
-          <button class="btn small" onclick={() => (addingGrant = !addingGrant)}>
-            {addingGrant ? "Done" : "Allow more"}
-          </button>
+          <button class="btn small add-share" onclick={manageShare}>⚙ Manage share</button>
         </div>
-        {#if grants.length === 0}
-          <p class="muted">Nothing yet — they can't reach any of your stuff until you allow it.</p>
+        {#if outGrants.length === 0}
+          <p class="muted">Nothing yet — use <b>Manage share</b> to let {st.shared.name} open one of your device's consoles.</p>
         {:else if (partner?.nodes.length ?? 0) > 1}
           <p class="muted">
             You're sharing with {st.shared.name}, not one machine — these work to
@@ -466,7 +476,7 @@
           </p>
         {/if}
         <ul class="grants">
-          {#each grants as { node: holder, grant: g } (g.id)}
+          {#each outGrants as { node: holder, grant: g } (g.id)}
             <li>
               <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
               <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
@@ -474,19 +484,6 @@
             </li>
           {/each}
         </ul>
-        {#if addingGrant}
-          <div class="presets">
-            {#each availablePresets as p}
-              <button class="preset" onclick={() => addGrant(p)}>
-                <span class="g-dot" style="background: {mediaColor(p.media)}"></span>
-                {p.label}
-              </button>
-            {/each}
-            {#if availablePresets.length === 0}
-              <p class="muted">They can already do everything in the presets.</p>
-            {/if}
-          </div>
-        {/if}
         {#if st.offering || st.ownedByMe}
           <button class="linklike" onclick={claimThis}>This is actually my own device →</button>
         {/if}
@@ -509,27 +506,27 @@
             same kind of authorization you'll use to share with people.
           </p>
           <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
-          <button class="linklike" onclick={makeShared}>It's someone else's — I'm just sharing with them →</button>
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
         </div>
       {:else if st.kind === "theirs"}
         <p class="muted">
           This device already has an owner, so you can't adopt it. If they
           want to share it with you, you'll get exactly what they allow.
         </p>
-        <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
+        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
       {:else if st.kind === "free"}
         <p class="muted">
           This device hasn't been put up for adoption. You can't just take
           ownership — start AllMyStuff on it in claim mode (or toggle
           “allow adoption” there), then claim it from here.
         </p>
-        <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
+        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
       {:else}
         <p class="muted own-note">
           {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
         {#if !st.self}
-          <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
         {/if}
       {/if}
     </section>
@@ -775,7 +772,9 @@
     background: var(--surface);
     border-left: 1px solid var(--line);
     box-shadow: var(--shadow-lg);
-    overflow: hidden;
+    /* visible (not hidden) so the grab handle can sit on the OUTER edge,
+       protruding into the gap toward the graph; the body does its own scroll. */
+    overflow: visible;
     z-index: 20;
     animation: slidein 0.16s ease;
   }
@@ -788,18 +787,23 @@
   .drawer-body {
     height: 100%;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 1rem 1.1rem 2rem;
   }
-  /* The grab edge — a hair-line that lights up on hover/drag. */
+  /* The grab handle — a hair-line edge plus a 6-dot grip; drag to resize,
+     click to collapse. Mirrors the left panel's handle. */
   .resizer {
     position: absolute;
     left: 0;
     top: 0;
     height: 100%;
-    width: 8px;
-    cursor: ew-resize;
+    width: 10px;
+    cursor: grab;
     z-index: 5;
     touch-action: none;
+  }
+  .drawer.resizing .resizer {
+    cursor: grabbing;
   }
   .resizer::after {
     content: "";
@@ -814,6 +818,38 @@
   .resizer:hover::after,
   .drawer.resizing .resizer::after {
     background: var(--accent);
+  }
+  .grip {
+    position: absolute;
+    top: 1.1rem;
+    /* straddle the panel's outer (left) edge, leaning into the gap */
+    left: -7px;
+    /* sit above the hover resize line, not under it */
+    z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(2, 3px);
+    grid-auto-rows: 3px;
+    gap: 3px;
+    padding: 4px 2px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--shadow-sm);
+  }
+  .grip i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--ink-faint);
+    transition: background 0.12s ease;
+  }
+  .resizer:hover .grip,
+  .drawer.resizing .grip {
+    border-color: var(--accent);
+  }
+  .resizer:hover .grip i,
+  .drawer.resizing .grip i {
+    background: var(--accent-ink);
   }
   /* Collapsed: a thin rail with just the affordances to come back. */
   .rail {
@@ -884,20 +920,22 @@
     color: var(--ok);
   }
   .pill.guest {
-    background: var(--bronze-soft);
-    color: var(--bronze);
+    background: var(--c-share-soft);
+    color: var(--c-share-ink);
   }
   .pill.soft {
     background: var(--surface-2);
     color: var(--ink-soft);
   }
+  /* "Someone else's, not shared" — bronze, distinct from a device actually
+     shared with you (violet, above). */
   .pill.theirs {
-    background: var(--violet-soft);
-    color: var(--violet);
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
   .pill.fleet {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
   }
   .pill.claimable {
     background: var(--accent-soft);
@@ -920,9 +958,9 @@
   .net-chip {
     font-size: 0.64rem;
     font-weight: 650;
-    background: var(--violet-soft);
-    border: 1px solid oklch(0.62 0.2 292 / 0.35);
-    color: var(--violet);
+    background: var(--c-mesh-soft);
+    border: 1px solid var(--c-mesh);
+    color: var(--c-mesh-ink);
     border-radius: var(--r-pill);
     padding: 0.04rem 0.4rem;
   }
@@ -972,11 +1010,11 @@
     width: 100%;
     justify-content: center;
   }
-  .claim-card .linklike {
-    display: block;
+  .claim-card .add-share {
+    display: flex;
     width: 100%;
-    text-align: center;
-    color: var(--ink-soft);
+    justify-content: center;
+    margin-top: 0.6rem;
   }
   /* Fleet controls — its own block, distinct from the sharing block. */
   .fleet-ctl .hint.tiny {
@@ -994,10 +1032,11 @@
     background: var(--surface-2);
     border: 1px solid var(--line-strong);
   }
+  /* Roles all read green; the word (owner / manager) tells them apart. */
   .role-pill.owner {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-    border-color: var(--accent);
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet);
   }
   .role-pill.manager {
     color: var(--ok);
@@ -1127,28 +1166,6 @@
     background: var(--danger-soft);
     color: var(--danger);
   }
-  .presets {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-    margin: 0.3rem 0 0.5rem;
-  }
-  .preset {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    text-align: left;
-    border: 1px dashed var(--line-strong);
-    background: var(--surface);
-    border-radius: var(--r-sm);
-    padding: 0.45rem 0.55rem;
-    font-size: 0.82rem;
-    color: var(--ink);
-  }
-  .preset:hover {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-  }
   .linklike {
     border: none;
     background: none;
@@ -1160,9 +1177,30 @@
   .linklike:hover {
     text-decoration: underline;
   }
-  .fleet-ctl .fleet-settings {
-    display: block;
+  /* Add Share — opens the builder, in the sharing concept's violet. */
+  .add-share {
     margin-top: 0.5rem;
+    color: var(--c-share-ink);
+    border-color: var(--c-share);
+    background: var(--c-share-soft);
+  }
+  .add-share:hover {
+    background: var(--c-share-soft);
+    border-color: var(--c-share);
+    filter: brightness(1.1);
+  }
+  /* Manage fleet — a fleet-green button (the green twin of the violet
+     Add Share button), not a bare link. */
+  .fleet-ctl .fleet-settings {
+    margin-top: 0.5rem;
+    color: var(--c-fleet-ink);
+    border-color: var(--c-fleet);
+    background: var(--c-fleet-soft);
+  }
+  .fleet-ctl .fleet-settings:hover {
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet);
+    filter: brightness(1.1);
   }
   /* The "Its stuff" fold: a full-width header row that reads as a count
      until expanded. */

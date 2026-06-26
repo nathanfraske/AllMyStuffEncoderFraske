@@ -11,6 +11,18 @@
   // fleet's sites lead.
   let portsOpen = $state(false);
 
+  // Inline copy feedback: the row whose address was just copied flashes its
+  // Copy button to "✓ Copied" for a beat, instead of firing a toast.
+  let copiedSite = $state<string | null>(null);
+  async function copyAddr(node: string, site: string, mapping: Parameters<typeof app.copySite>[0]) {
+    if (await app.copySite(mapping)) {
+      copiedSite = `${node}:${site}`;
+      setTimeout(() => {
+        if (copiedSite === `${node}:${site}`) copiedSite = null;
+      }, 1400);
+    }
+  }
+
   // Per-row name drafts for the expose inputs, so typing a name doesn't
   // re-render away. Falls back to the advertised name, then the probed
   // default (page title) / classified name.
@@ -60,8 +72,10 @@
                     >
                     <button
                       class="btn small ghost"
+                      class:copied={copiedSite === `${group.node.id}:${site.id}`}
                       title="Copy its local address"
-                      onclick={() => app.copySite(mapping)}>Copy</button
+                      onclick={() => copyAddr(group.node.id, site.id, mapping)}
+                      >{copiedSite === `${group.node.id}:${site.id}` ? "✓ Copied" : "Copy"}</button
                     >
                     <button
                       class="btn small ghost s-x"
@@ -152,6 +166,12 @@
     display: flex;
     flex-direction: column;
     gap: 0.7rem;
+  }
+  /* The transient "✓ Copied" state on a row's Copy button. */
+  .btn.copied {
+    color: var(--ok);
+    border-color: color-mix(in oklab, var(--ok) 45%, transparent);
+    background: color-mix(in oklab, var(--ok) 14%, transparent);
   }
   .block-head {
     margin: 0 0 0.4rem;

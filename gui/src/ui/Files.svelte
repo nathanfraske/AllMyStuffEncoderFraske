@@ -245,7 +245,8 @@
           t.done = t.total;
           t.note = "uploaded";
         }
-        if (op.label) app.toast("ok", op.label);
+        // No toast — the file list refreshes below (the new/renamed/removed
+        // entry is the confirmation); uploads show "done" in the transfer row.
         if (op.refresh) refresh();
         return;
       }

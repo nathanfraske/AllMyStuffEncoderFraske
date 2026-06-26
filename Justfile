@@ -115,6 +115,20 @@ pull:
     @git reset --hard HEAD
     @git pull
 
+# A pure drop-in for `git checkout` — every arg passes straight through, so
+# `just checkout main`, `just checkout -b feature`, `just checkout -- file`
+# all behave exactly like the git command, minus typing `git`.
+[doc("git checkout pass-through (e.g. `just checkout main`).")]
+checkout *args:
+    @git checkout {{args}}
+
+# The one-liner clean start: stop the mesh stack, pull a pristine tree, then run
+# the app. `kill` and `pull` run first (in order), then `just dev` (the OS
+# variant resolves itself). `just go -- <args>` forwards to `dev`.
+[doc("just kill + just pull + just dev.")]
+go *ARGS: kill pull
+    @just dev {{ARGS}}
+
 fmt:
     @cargo fmt --all
 

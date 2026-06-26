@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
-  import { displayName, mediaColor, humanBytes, isAppNode, type MediaKind } from "../types";
+  import { displayName, mediaColor, humanBytes, isAppNode, MEDIA, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
 
   // Canvas size tracked via ResizeObserver so the layout fits its
@@ -219,7 +219,7 @@
   // on. Curved + coloured by media, with parallel routes fanned apart.
   // Endpoints resolve through the display fallback so a live terminal
   // session (whose endpoints aren't catalog capabilities) draws its wire.
-  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string };
+  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string; media: MediaKind };
   const edges = $derived.by((): Edge[] => {
     const pairCount = new Map<string, number>();
     const out: Edge[] = [];
@@ -249,19 +249,93 @@
         cx: mx + (-dy / len) * off,
         cy: my + (dx / len) * off,
         color: mediaColor(r.media as MediaKind),
+        media: r.media as MediaKind,
       });
     }
     return out;
   });
 
-  // ---- pan / zoom ---------------------------------------------------
+  // A small label that follows the cursor along a connection wire, naming what
+  // flows down it (1–2 words). Placed in canvas coordinates so it sits right
+  // under the pointer — zero eye travel.
+  let lineTip = $state<{ x: number; y: number; text: string } | null>(null);
+  function onWireMove(e: PointerEvent, media: MediaKind) {
+    const rect = canvas?.getBoundingClientRect();
+    if (!rect) return;
+    lineTip = { x: e.clientX - rect.left, y: e.clientY - rect.top, text: MEDIA[media].label };
+  }
+  function onWireLeave() {
+    lineTip = null;
+  }
+
+  // ---- pan / zoom / select ------------------------------------------
+  //
+  // Matching every graph and design tool: right-drag pans, left-drag on empty
+  // space marquee-selects, and a left-drag from one device onto another opens
+  // the share builder. A plain left-click still selects a single device.
   let panX = $state(0);
   let panY = $state(0);
   let zoom = $state(1);
-  let dragging = $state(false);
-  let dragStart = $state<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const MIN_ZOOM = 0.4;
   const MAX_ZOOM = 2.2;
+
+  // The active canvas gesture: panning (right-drag) or marqueeing (left-drag on
+  // empty). Node drags are tracked separately, below.
+  type Gesture =
+    | { kind: "pan"; x: number; y: number; panX: number; panY: number }
+    | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number };
+  let gesture = $state<Gesture | null>(null);
+  const panning = $derived(gesture?.kind === "pan");
+
+  // Multi-selection (the marquee's result). The single-click selection still
+  // flows through app.selectedNodeId so the drawer always has one focused node;
+  // these add the extra highlighted devices on top.
+  let selectedIds = $state<Set<string>>(new Set());
+
+  // Live marquee preview — the devices currently inside the box, recomputed as
+  // it's dragged so the highlight tracks the rubber-band in real time. Folded
+  // into the selected look while dragging, then committed on release.
+  const marqueeHits = $derived.by((): Set<string> => {
+    const set = new Set<string>();
+    if (gesture?.kind !== "marquee") return set;
+    const x1 = Math.min(gesture.x0, gesture.x1);
+    const x2 = Math.max(gesture.x0, gesture.x1);
+    const y1 = Math.min(gesture.y0, gesture.y1);
+    const y2 = Math.max(gesture.y0, gesture.y1);
+    if (x2 - x1 < 4 && y2 - y1 < 4) return set;
+    for (const p of layout) {
+      const sx = p.x * zoom + panX;
+      const sy = p.y * zoom + panY;
+      if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) set.add(p.node.id);
+    }
+    return set;
+  });
+
+  function isSelected(id: string): boolean {
+    return app.selectedNodeId === id || selectedIds.has(id) || marqueeHits.has(id);
+  }
+
+  // A left-drag that started on a device — used for drag-onto-another-device (or
+  // fleet) to open the share builder. `moved` tells a real drag from a plain
+  // click. A ghost chip follows the cursor while it's in flight.
+  let nodeDrag = $state<{ id: string; sx: number; sy: number; moved: boolean } | null>(null);
+  let dragOverId = $state<string | null>(null);
+  let dragOverSection = $state<string | null>(null);
+  let dragLabel = $state("");
+  let dragPos = $state<{ x: number; y: number } | null>(null);
+
+  const dropTargetLabel = $derived.by(() => {
+    if (dragOverId) {
+      const t = app.node(dragOverId);
+      return t ? displayName(t) : "";
+    }
+    return dragOverSection ?? "";
+  });
+
+  function canvasPoint(e: PointerEvent): { x: number; y: number } {
+    const r = canvas?.getBoundingClientRect();
+    return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
+  }
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
@@ -280,28 +354,123 @@
 
   function onPointerDown(e: PointerEvent) {
     const target = e.target as Element | null;
-    // Let node clicks through — and never capture the pointer on the
-    // floating controls, or their buttons swallow the click (capturing
-    // re-targets the pointerup, so the browser never composes a click).
-    if (target?.closest?.(".node, .zoombar, .arm-banner")) return;
+    // Let node clicks/drags and the floating controls handle themselves —
+    // capturing here would swallow their clicks.
+    if (target?.closest?.(".node, .zoombar, .arm-banner, .restart-panel")) return;
     if (app.dragFrom) {
       app.cancelConnect();
       return;
     }
-    app.selectNode(null);
-    dragging = true;
-    dragStart = { x: e.clientX, y: e.clientY, panX, panY };
-    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    // Stop a drag from turning into a native text selection.
+    e.preventDefault();
+    if (e.button === 2 || e.button === 1) {
+      // Right (or middle) drag pans — the platform convention.
+      gesture = { kind: "pan", x: e.clientX, y: e.clientY, panX, panY };
+      (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    } else if (e.button === 0) {
+      // Left drag on empty space marquee-selects. Without a modifier it starts
+      // a fresh selection.
+      if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        selectedIds = new Set();
+        app.selectNode(null);
+      }
+      const p = canvasPoint(e);
+      gesture = { kind: "marquee", x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    }
   }
   function onPointerMove(e: PointerEvent) {
-    if (!dragging || !dragStart) return;
-    panX = dragStart.panX + (e.clientX - dragStart.x);
-    panY = dragStart.panY + (e.clientY - dragStart.y);
+    if (!gesture) return;
+    if (gesture.kind === "pan") {
+      panX = gesture.panX + (e.clientX - gesture.x);
+      panY = gesture.panY + (e.clientY - gesture.y);
+    } else {
+      const p = canvasPoint(e);
+      gesture = { ...gesture, x1: p.x, y1: p.y };
+    }
   }
   function onPointerUp(e: PointerEvent) {
-    dragging = false;
-    dragStart = null;
+    if (gesture?.kind === "marquee") {
+      // Commit whatever the live preview is highlighting (read it before the
+      // gesture clears, since it's derived from the box).
+      const hits = marqueeHits;
+      if (hits.size > 0) {
+        const next = new Set(selectedIds);
+        for (const id of hits) next.add(id);
+        selectedIds = next;
+        // Keep the drawer useful: focus the single marqueed device, if one.
+        if (next.size === 1) app.selectNode([...next][0]);
+      }
+    }
+    gesture = null;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+  }
+
+  // No browser context menu on the canvas — right-drag is pan, and an empty
+  // right-click should do nothing (not pop the OS menu).
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+  }
+
+  // ---- drag one device onto another → open the share builder ----------
+  function onNodePointerDown(e: PointerEvent, n: MeshNode) {
+    if (e.button !== 0 || app.dragFrom) return; // left only; connect mode uses clicks
+    // A press on an inline control (Claim, Make claimable…) is that button's —
+    // don't hijack it into a node drag, or capturing the pointer eats its click.
+    if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
+    e.stopPropagation();
+    e.preventDefault(); // don't let the drag select the node's text
+    nodeDrag = { id: n.id, sx: e.clientX, sy: e.clientY, moved: false };
+    dragLabel = displayName(n);
+    dragPos = canvasPoint(e);
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+  function onNodePointerMove(e: PointerEvent, n: MeshNode) {
+    if (!nodeDrag || nodeDrag.id !== n.id) return;
+    // Only your own devices are draggable share sources — a foreign device
+    // stays a plain click (select), never a drag.
+    if (!app.isMyDevice(n.id)) return;
+    if (!nodeDrag.moved && Math.hypot(e.clientX - nodeDrag.sx, e.clientY - nodeDrag.sy) < 6) return;
+    nodeDrag = { ...nodeDrag, moved: true };
+    dragPos = canvasPoint(e);
+    // Hit-test what's under the cursor: another device, or a fleet band.
+    const hit = document.elementFromPoint(e.clientX, e.clientY);
+    const overNode = hit?.closest?.(".node")?.getAttribute("data-node-id") ?? null;
+    if (overNode && overNode !== n.id) {
+      dragOverId = overNode;
+      dragOverSection = null;
+    } else {
+      dragOverId = null;
+      dragOverSection = hit?.closest?.(".section")?.getAttribute("data-section-label") ?? null;
+    }
+  }
+  function onNodePointerUp(e: PointerEvent, n: MeshNode) {
+    // Only act when this device actually started the gesture (a press that
+    // began on an inline button left nodeDrag null — let that button win).
+    if (app.dragFrom) {
+      // Connect mode: a tap completes the wire, exactly as before.
+      onNodeClick(n);
+      return;
+    }
+    if (!nodeDrag || nodeDrag.id !== n.id) return;
+    const moved = nodeDrag.moved;
+    const overNode = dragOverId;
+    const overSection = dragOverSection;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    nodeDrag = null;
+    dragOverId = null;
+    dragOverSection = null;
+    dragPos = null;
+    if (moved) {
+      // Dropped on another device → sender = dragged, receiver = target. Dropped
+      // on a fleet band → open the builder with the dragged device as sender and
+      // let you pick the receiver in that fleet.
+      if (overNode) app.openShareFlow(n.id, overNode);
+      else if (overSection) app.openShareFlow(n.id, null);
+    } else {
+      // Didn't move — it's a plain click: select (the old behaviour).
+      onNodeClick(n);
+    }
   }
 
   function nodeAvatar(n: MeshNode): string {
@@ -357,14 +526,39 @@
       app.selectNode(n.id);
     } else {
       claimRevealed = null;
-      app.selectNode(app.selectedNodeId === n.id ? null : n.id);
+      // Clicking a device always selects it and keeps it selected — re-clicking
+      // the focused node no longer toggles it off (close the drawer to deselect).
+      app.selectNode(n.id);
     }
   }
 </script>
 
+<!-- The small console glyphs for the card buttons: remote desktop, files,
+     terminal, sites. Stroke uses currentColor. -->
+{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites")}
+  {#if kind === "remote"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
+    </svg>
+  {:else if kind === "files"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2.2H19a1.5 1.5 0 0 1 1.5 1.5V18a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 18Z" />
+    </svg>
+  {:else if kind === "terminal"}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4.5" width="18" height="15" rx="2" /><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4" />
+    </svg>
+  {:else}
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.5 2.4 2.5 14.6 0 17M12 3.5c-2.5 2.4-2.5 14.6 0 17" />
+    </svg>
+  {/if}
+{/snippet}
+
 <div
   class="canvas"
-  class:dragging
+  class:panning
+  class:marqueeing={gesture?.kind === "marquee"}
   class:armed
   bind:this={canvas}
   onwheel={onWheel}
@@ -372,6 +566,7 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  oncontextmenu={onContextMenu}
   role="application"
   aria-label="Your stuff, as a graph"
 >
@@ -397,6 +592,18 @@
           stroke={e.color}
           fill="none"
         />
+        <!-- A wide transparent hit path so hovering anywhere near the wire
+             raises its cursor-following media label. The edge layer is
+             aria-hidden; this is a decorative hover affordance. -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <path
+          class="wire-hit"
+          d="M {e.x1} {e.y1} Q {e.cx} {e.cy} {e.x2} {e.y2}"
+          fill="none"
+          onpointerenter={(ev) => onWireMove(ev, e.media)}
+          onpointermove={(ev) => onWireMove(ev, e.media)}
+          onpointerleave={onWireLeave}
+        />
       {/each}
     </g>
   </svg>
@@ -409,6 +616,8 @@
         class="section"
         class:mine={s.key === "mine"}
         class:unknown={s.key === "unknown"}
+        class:dragover={dragOverSection === s.label}
+        data-section-label={s.label}
         style="left: {s.x}px; top: {s.y}px; width: {s.w}px; height: {s.h}px;"
       >
         <div class="section-head">
@@ -425,6 +634,7 @@
            fleet badge). It recomputes live from the fleet roster + the device's
            advert, so claiming or fleet changes reflect immediately. -->
       {@const st = app.standingOf(n)}
+      {@const cons = app.consoleAccess(n)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="node"
@@ -434,14 +644,18 @@
         class:unclaimed={st.kind === "free" || st.kind === "theirs"}
         class:claimable={st.claimable}
         class:meshonly={!st.app}
-        class:selected={app.selectedNodeId === n.id}
+        class:selected={isSelected(n.id)}
         class:armed={armed && targetable(n)}
+        class:dragover={dragOverId === n.id}
+        class:dragging-node={nodeDrag?.id === n.id && nodeDrag.moved}
+        class:grabbable={app.isMyDevice(n.id)}
         class:offline={!n.online}
+        data-node-id={n.id}
         style="left: {p.x - NODE_W / 2}px; top: {p.y - NODE_H / 2}px; width: {NODE_W}px; min-height: {NODE_H}px;"
-        onclick={(e) => {
-          e.stopPropagation();
-          onNodeClick(n);
-        }}
+        onpointerdown={(e) => onNodePointerDown(e, n)}
+        onpointermove={(e) => onNodePointerMove(e, n)}
+        onpointerup={(e) => onNodePointerUp(e, n)}
+        onpointercancel={(e) => onNodePointerUp(e, n)}
         onkeydown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -452,6 +666,7 @@
         tabindex="0"
         aria-label={displayName(n)}
       >
+        {#if st.self}<span class="self-corner" aria-hidden="true">This device</span>{/if}
         <div class="node-top">
           <span class="avatar">{nodeAvatar(n)}</span>
           <div class="node-id">
@@ -471,20 +686,36 @@
           <span class="dot" class:on={n.online} title={n.online ? "online" : "offline"}></span>
         </div>
         <div class="node-meta">
-          {#if st.self}<span class="tag you">this device</span>{/if}
           {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
           {:else if st.shared}<span class="tag guest">guest</span>
           {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
           {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
           {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
           {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-          {#if st.inFleet}<span class="tag fleet" title="In your fleet · {st.role}">🔗 {st.role === "member" ? "fleet" : st.role}</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
-        {#if n.networks && n.networks.length}
-          <div class="node-nets" title="On {n.networks.join(', ')}">
-            {#each n.networks as net}<span class="net-chip">{net}</span>{/each}
+        {#if cons.remote || cons.files || cons.terminal || cons.sites}
+          <!-- The consoles you can open on this device — your own fleet's, or
+               exactly what a fleet that shared it with you granted. -->
+          <div class="node-consoles">
+            {#if cons.remote}
+              <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
+            {/if}
+            {#if cons.files}
+              <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
+            {/if}
+            {#if cons.terminal}
+              <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
+            {/if}
+            {#if cons.sites}
+              <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
+                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
+            {/if}
           </div>
         {/if}
         <!-- Claimable affordances drop out from *under* the node, floating
@@ -506,6 +737,45 @@
       </div>
     {/each}
   </div>
+
+  {#if gesture?.kind === "marquee"}
+    <div
+      class="marquee"
+      style="left: {Math.min(gesture.x0, gesture.x1)}px; top: {Math.min(gesture.y0, gesture.y1)}px; width: {Math.abs(gesture.x1 - gesture.x0)}px; height: {Math.abs(gesture.y1 - gesture.y0)}px;"
+    ></div>
+  {/if}
+
+  {#if nodeDrag?.moved && dragPos}
+    <!-- The ghost that follows the cursor while a device is being dragged onto
+         another device or fleet to start a share. -->
+    <div class="ghost" class:ready={!!dropTargetLabel} style="left: {dragPos.x}px; top: {dragPos.y}px;">
+      <span class="ghost-card">🔗 {dragLabel}</span>
+      <span class="ghost-tip">
+        {dropTargetLabel ? `New share → ${dropTargetLabel}` : "Drop on a device or fleet to share"}
+      </span>
+    </div>
+  {/if}
+
+  {#if lineTip}
+    <div class="line-tip" style="left: {lineTip.x}px; top: {lineTip.y}px;">{lineTip.text}</div>
+  {/if}
+
+  <!-- Refresh progress — Restarting → Reconnecting → Connected, each dot going
+       red → yellow → green, floating just above the bottom-centre of the graph
+       so the result shows where the connections live. -->
+  {#if app.restartFlow}
+    <div class="restart-panel" role="status" aria-live="polite">
+      {#each app.restartFlow as s, i (s.label)}
+        {#if i > 0}
+          <span class="restart-sep" class:done={app.restartFlow[i - 1].status === "ok"}></span>
+        {/if}
+        <span class="restart-step">
+          <span class="restart-dot {s.status}"></span>
+          <span class="restart-label">{s.label}</span>
+        </span>
+      {/each}
+    </div>
+  {/if}
 
   {#if app.catalog.nodes.length === 0}
     <div class="empty" aria-live="polite">
@@ -549,12 +819,64 @@
     position: relative;
     flex: 1;
     overflow: hidden;
-    cursor: grab;
+    cursor: default;
     touch-action: none;
     user-select: none;
   }
-  .canvas.dragging {
+  /* Right-drag pans (grabbing hand); left-drag on empty marquee-selects
+     (crosshair). */
+  .canvas.panning {
     cursor: grabbing;
+  }
+  .canvas.marqueeing {
+    cursor: crosshair;
+  }
+  /* The marquee selection box. */
+  .marquee {
+    position: absolute;
+    z-index: 4;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 2px;
+    pointer-events: none;
+  }
+  /* The drag-to-share ghost — a chip that rides the cursor with a tooltip
+     telling you a new share opens on drop. */
+  .ghost {
+    position: absolute;
+    z-index: 8;
+    transform: translate(14px, 14px);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    pointer-events: none;
+  }
+  .ghost-card {
+    align-self: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--c-share);
+    color: var(--ink);
+    border-radius: var(--r-md);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    box-shadow: var(--shadow-lg);
+  }
+  .ghost-tip {
+    align-self: flex-start;
+    background: oklch(0.16 0.02 285 / 0.97);
+    border: 1px solid var(--line-strong);
+    color: var(--ink-soft);
+    border-radius: var(--r-pill);
+    padding: 0.18rem 0.55rem;
+    font-size: 0.7rem;
+    font-weight: 650;
+    box-shadow: var(--shadow-sm);
+  }
+  .ghost.ready .ghost-tip {
+    border-color: var(--c-share);
+    color: var(--c-share-ink);
+    background: var(--c-share-soft);
   }
   .edges {
     position: absolute;
@@ -573,10 +895,104 @@
     opacity: 0.9;
     animation: flow 1.1s linear infinite;
   }
+  /* Invisible, fat hit target so the cursor-following label is easy to raise —
+     opts back into pointer events even though the edge layer ignores them. */
+  .wire-hit {
+    stroke: transparent;
+    stroke-width: 16;
+    pointer-events: stroke;
+    cursor: help;
+  }
   @keyframes flow {
     to {
       stroke-dashoffset: -30;
     }
+  }
+  /* The cursor-following wire label — a small black/grey tooltip naming what
+     flows down the wire, placed right under the pointer. */
+  .line-tip {
+    position: absolute;
+    z-index: 5;
+    transform: translate(-50%, calc(-100% - 0.5rem));
+    background: oklch(0.16 0.02 285 / 0.96);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.12rem 0.45rem;
+    font-size: 0.7rem;
+    font-weight: 650;
+    white-space: nowrap;
+    pointer-events: none;
+    box-shadow: var(--shadow-sm);
+  }
+  /* The refresh 3-step panel — floats above the zoom bar at bottom centre. */
+  .restart-panel {
+    position: absolute;
+    bottom: 4.4rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    z-index: 6;
+    background: oklch(0.16 0.02 285 / 0.97);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-pill);
+    padding: 0.5rem 0.95rem;
+    box-shadow: var(--shadow-lg);
+    animation: restart-rise 0.18s ease;
+  }
+  @keyframes restart-rise {
+    from {
+      transform: translate(-50%, 8px);
+      opacity: 0;
+    }
+  }
+  .restart-step {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .restart-label {
+    font-size: 0.78rem;
+    font-weight: 650;
+    color: var(--ink-soft);
+  }
+  .restart-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--danger);
+    transition: background 0.3s ease, box-shadow 0.3s ease;
+  }
+  /* wait = red (default), go = yellow + pulse, ok = green. */
+  .restart-dot.go {
+    background: var(--warn);
+    box-shadow: 0 0 0 3px var(--warn-soft);
+    animation: restart-pulse 1s ease-in-out infinite;
+  }
+  .restart-dot.ok {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px var(--ok-soft);
+  }
+  @keyframes restart-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 2px var(--warn-soft);
+    }
+    50% {
+      box-shadow: 0 0 0 5px oklch(0.79 0.14 75 / 0.06);
+    }
+  }
+  .restart-sep {
+    width: 1.5rem;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--line-strong);
+    transition: background 0.3s ease;
+  }
+  .restart-sep.done {
+    background: var(--ok);
   }
   .nodes {
     position: absolute;
@@ -591,13 +1007,20 @@
     border-radius: var(--r-lg);
     background: oklch(0.21 0.028 285 / 0.35);
   }
+  /* Your fleet band — the green of the "fleet" concept (your own pack). */
   .section.mine {
-    border-color: oklch(0.64 0.255 350 / 0.45);
-    background: oklch(0.64 0.255 350 / 0.05);
+    border-color: oklch(0.8 0.17 150 / 0.45);
+    background: oklch(0.8 0.17 150 / 0.05);
   }
   .section.unknown {
     border-style: dotted;
     background: transparent;
+  }
+  /* A fleet band lit as a share-drop target. */
+  .section.dragover {
+    border-color: var(--c-share);
+    border-style: solid;
+    background: var(--c-share-soft);
   }
   .section-head {
     position: absolute;
@@ -612,7 +1035,7 @@
     letter-spacing: 0.01em;
   }
   .section.mine .section-head {
-    color: var(--accent-ink);
+    color: var(--c-fleet-ink);
   }
   .section-count {
     font-size: 0.66rem;
@@ -638,14 +1061,16 @@
   }
   .node:hover {
     transform: translateY(-2px);
-    box-shadow: var(--shadow-lg);
+    box-shadow: var(--shadow-lg), 0 0 0 1px var(--accent-soft),
+      0 8px 30px -10px oklch(0.64 0.255 350 / 0.45);
   }
   .node.self {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md);
   }
+  /* A device shared with you wears the sharing concept's violet edge. */
   .node.shared {
-    border-color: oklch(0.74 0.085 72 / 0.55);
+    border-color: var(--c-share);
     background: linear-gradient(180deg, var(--surface-2), var(--surface));
   }
   .node.unclaimed {
@@ -773,6 +1198,22 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
   }
+  /* The device being dragged (the original stays in place; a ghost rides the
+     cursor), and the one it's hovering over — the share-drop target in the
+     sharing concept's violet. */
+  /* Your own devices are draggable (to start a share) — show the grab hand,
+     except in connect mode (tap to connect) or while already dragging. */
+  .node.grabbable:not(.armed):not(.dragging-node) {
+    cursor: grab;
+  }
+  .node.dragging-node {
+    opacity: 0.8;
+    cursor: grabbing;
+  }
+  .node.dragover {
+    border-color: var(--c-share);
+    box-shadow: 0 0 0 3px var(--c-share-soft), var(--shadow-lg);
+  }
   .node.offline {
     opacity: 0.6;
   }
@@ -830,20 +1271,67 @@
     flex-wrap: wrap;
     gap: 0.25rem;
   }
-  .node-nets {
+  /* Console buttons on the card — replace the old mesh pills. One per console
+     you can open on the device; clicking opens it. */
+  .node-consoles {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.2rem;
-    margin-top: 0.1rem;
+    gap: 0.3rem;
+    margin-top: 0.15rem;
   }
-  .net-chip {
-    font-size: 0.6rem;
+  .cbtn {
+    position: relative;
+    display: grid;
+    place-items: center;
+    width: 1.55rem;
+    height: 1.55rem;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line-strong);
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    box-shadow: var(--shadow-sm);
+    transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease,
+      transform 0.08s ease;
+  }
+  .cbtn:hover {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--surface);
+  }
+  .cbtn:active {
+    transform: translateY(1px);
+  }
+  .cbtn :global(svg) {
+    width: 0.95rem;
+    height: 0.95rem;
+    /* the glyphs sit right of centre — nudge them left so the spare pixels
+       land on the right. */
+    transform: translateX(-3px);
+  }
+  /* A quick black/grey tooltip (vs the slow native title). */
+  .cbtn[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 5px);
+    left: 50%;
+    transform: translateX(-50%) translateY(3px);
+    background: oklch(0.16 0.02 285 / 0.97);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.1rem 0.4rem;
+    font-size: 0.64rem;
     font-weight: 650;
-    background: var(--violet-soft);
-    border: 1px solid oklch(0.62 0.2 292 / 0.35);
-    color: var(--violet);
-    border-radius: var(--r-pill);
-    padding: 0.02rem 0.36rem;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    box-shadow: var(--shadow-sm);
+    transition: opacity 0.1s ease 0.1s, transform 0.1s ease 0.1s;
+    z-index: 6;
+  }
+  .cbtn[data-tip]:hover::after {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
   }
   .tag {
     font-size: 0.64rem;
@@ -856,17 +1344,33 @@
     background: var(--surface-2);
     color: var(--ink-soft);
   }
-  .tag.you {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+  /* "This device" — a pink chip that bumps over the top-left corner of your
+     own card, so it reads as a label on the card rather than another tag. */
+  .self-corner {
+    position: absolute;
+    top: -0.6rem;
+    left: 0.7rem;
+    z-index: 2;
+    font-size: 0.58rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #fff;
+    background: linear-gradient(180deg, var(--accent-ink), var(--accent));
+    border: 1px solid oklch(0.58 0.235 350);
+    border-radius: var(--r-pill);
+    padding: 0.1rem 0.5rem;
+    box-shadow: 0 2px 6px -2px oklch(0.64 0.255 350 / 0.6),
+      inset 0 1px 0 oklch(1 0 0 / 0.3);
+    pointer-events: none;
   }
   .tag.mine {
     background: var(--ok-soft);
     color: var(--ok);
   }
   .tag.guest {
-    background: var(--bronze-soft);
-    color: var(--bronze);
+    background: var(--c-share-soft);
+    color: var(--c-share-ink);
   }
   .tag.unclaimed {
     background: var(--surface-2);
@@ -879,13 +1383,20 @@
     border: 1px solid var(--accent);
     font-weight: 700;
   }
+  /* "Someone else's, not shared with me" — bronze keeps it distinct from a
+     device actually shared with you (violet, above). */
   .tag.theirs {
-    background: var(--violet-soft);
-    color: var(--violet);
+    background: var(--bronze-soft);
+    color: var(--bronze);
   }
+  /* All fleet-role tags stay green; the ★ owner / ⚑ manager / 🔗 fleet
+     glyph + word is what tells them apart (no per-role colour vomit). */
   .tag.fleet {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
+  }
+  .tag.fleet.owner {
+    font-weight: 750;
   }
   .tag.meshonly {
     background: var(--surface-2);

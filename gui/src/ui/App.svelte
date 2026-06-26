@@ -22,6 +22,7 @@
   import ClaimSheet from "./ClaimSheet.svelte";
   import FleetCodePrompt from "./FleetCodePrompt.svelte";
   import ShareSheet from "./ShareSheet.svelte";
+  import ShareFlow from "./ShareFlow.svelte";
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
   import Files from "./Files.svelte";
@@ -49,9 +50,18 @@
   // preview, where the badge below simply doesn't render.
   let version = $state("");
 
-  // The "how it works" sheet — the venue graphic that explains mesh / fleet /
-  // servers / sharing in one picture. Local UI state; opened from the top bar.
+  // The "how it works" sheet — the museum-story explainer that teaches venue /
+  // mesh / fleet / sharing. Local UI state; opened from the top bar.
   let infoOpen = $state(false);
+
+  // The refresh button only spins briefly on click — the real progress lives in
+  // the 3-step panel that floats over the graph (driven by app.restartFlow).
+  let refreshSpin = $state(false);
+  function refresh() {
+    refreshSpin = true;
+    setTimeout(() => (refreshSpin = false), 650);
+    void app.restartNetwork();
+  }
 
   onMount(() => {
     if (consoleTarget || terminalTarget || filesTarget || roomTarget || videoTarget) return;
@@ -203,7 +213,7 @@
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
       <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
-      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
+      <button class="btn refresh" class:spinning={refreshSpin} onclick={refresh} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
         {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
@@ -248,6 +258,7 @@
     {/key}
   {/if}
   <ShareSheet />
+  <ShareFlow />
   <Toasts />
 </div>
 {/if}
@@ -305,14 +316,36 @@
     margin-left: auto;
   }
   .chip.yours,
-  .chip.shared {
+  .chip.shared,
+  .chip.net,
+  .chip.venue {
     cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: border-color 0.12s ease, background 0.12s ease,
+      filter 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
   }
+  /* The summary pills wear their concept's colour at rest, the same hues the
+     "How it connects" explainer teaches: fleet = green (your own pack),
+     sharing = violet (lending to a person) — matching the mesh/venue pills. */
+  .chip.yours {
+    background: var(--c-fleet-soft);
+    border-color: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
+  }
+  .chip.shared {
+    background: var(--c-share-soft);
+    border-color: var(--c-share-soft);
+    color: var(--c-share-ink);
+  }
+  /* Every header pill is clickable, so they share one obvious hover — a small
+     lift, a brighter fill, a shadow and a firmer edge. */
   .chip.yours:hover,
-  .chip.shared:hover {
-    background: var(--surface);
-    border-color: var(--accent);
+  .chip.shared:hover,
+  .chip.net:hover,
+  .chip.venue:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-sm), 0 5px 12px -5px oklch(0 0 0 / 0.45);
+    border-color: currentColor;
   }
   .net-anchor {
     position: relative;
@@ -334,10 +367,12 @@
     color: var(--danger);
     border-color: oklch(0.7 0.19 14 / 0.35);
   }
+  /* Live mesh wears the mesh concept colour (magenta); the no-mesh state keeps
+     the red warning above — that's connection status, not identity. */
   .chip.net.live {
-    background: var(--ok-soft);
-    color: var(--ok);
-    border-color: oklch(0.8 0.17 150 / 0.3);
+    background: var(--c-mesh-soft);
+    color: var(--c-mesh-ink);
+    border-color: var(--c-mesh);
   }
   /* The presence dot *is* the networks icon — colored from the chip (red
      when there's no live network, green when joined) and given a soft halo
@@ -350,7 +385,7 @@
     flex-shrink: 0;
   }
   .chip.net.live .net-dot {
-    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.18);
+    box-shadow: 0 0 0 3px var(--c-mesh-soft);
   }
   .net-chevron {
     font-size: 0.62rem;
@@ -371,9 +406,9 @@
     border-color: var(--line-strong);
   }
   .chip.venue.live {
-    background: var(--accent-soft);
-    color: var(--accent-ink);
-    border-color: var(--accent-soft);
+    background: var(--c-venue-soft);
+    color: var(--c-venue-ink);
+    border-color: var(--c-venue-soft);
   }
   /* A brief glow when driving a mesh just turned a venue back on. */
   .chip.venue.shimmer {
@@ -381,12 +416,12 @@
   }
   @keyframes venue-shimmer {
     0% {
-      box-shadow: 0 0 0 0 var(--accent-soft);
+      box-shadow: 0 0 0 0 var(--c-venue-soft);
     }
     35% {
-      box-shadow: 0 0 0 6px var(--accent-soft);
-      background: var(--accent-soft);
-      color: var(--accent-ink);
+      box-shadow: 0 0 0 6px var(--c-venue-soft);
+      background: var(--c-venue-soft);
+      color: var(--c-venue-ink);
     }
     100% {
       box-shadow: 0 0 0 0 transparent;
@@ -465,9 +500,9 @@
       box-shadow: 0 0 0 0 oklch(0.64 0.255 350 / 0);
     }
   }
-  /* Icon-only "how it works" — opens the venue graphic. Same tight footprint
-     as refresh/gear, with the glyph as a bold accent so it reads as help, not
-     another setting. */
+  /* Icon-only "how it works" — opens the museum-story explainer. Same tight
+     footprint as refresh/gear, with the glyph as a bold accent so it reads as
+     help, not another setting. */
   .help {
     font-size: 0.95rem;
     font-weight: 800;
@@ -483,6 +518,14 @@
   .refresh {
     font-size: 1rem;
     padding: 0.5rem 0.7rem;
+  }
+  .refresh.spinning {
+    animation: refresh-spin 0.65s ease;
+  }
+  @keyframes refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .gear {
     position: relative;
