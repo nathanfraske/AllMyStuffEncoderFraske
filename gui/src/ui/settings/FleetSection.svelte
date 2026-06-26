@@ -5,6 +5,7 @@
   // things.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import { displayName } from "../../types";
   import {
     fleetMfaStatus,
     fleetMfaEnroll,
@@ -81,18 +82,23 @@
     }
   }
 
+  // Resolve a roster device id to its display name the same way the graph and
+  // drawer do — by *canonical* machine match, not a strict id equality. A
+  // roster id can be a different form of the same machine's id (bare pubkey vs
+  // display id), so the strict lookup missed it and the name vanished.
   function nodeLabel(device: string): string {
-    const n = app.catalog.nodes.find((x) => x.id === device) ?? null;
-    return n?.label ?? "";
+    const n = app.machineByAnyId(device);
+    return n ? displayName(n) : "";
   }
 
-  // The owner(s) of the fleet — the founding machine and anyone promoted to
-  // co-owner. Use fleetRoleOf so the founding owner (whose member role often
-  // isn't stamped — it's known via is_owner) still counts.
-  const owners = $derived(members.filter((m) => app.fleetRoleOf(m.device) === "owner"));
-
   function memberName(m: { device: string; label: string }): string {
-    return m.label || nodeLabel(m.device) || m.device.slice(0, 12);
+    // This device always knows its own name, even when the roster didn't stamp
+    // a label on it. Otherwise prefer the live node's name, then the roster
+    // label, then a short id as a last resort.
+    if (app.isMe(m.device)) {
+      return (app.localNode ? displayName(app.localNode) : "") || nodeLabel(m.device) || m.label || "This device";
+    }
+    return nodeLabel(m.device) || m.label || m.device.slice(0, 12);
   }
 
   // Jump to a fleet device on the graph: select it (the drawer + graph focus
@@ -169,28 +175,40 @@
   </p>
 
   {#if hasFleet}
-    {#if owners.length > 0}
-      <section class="block owner-block">
-        <div class="owner-row">
-          <span class="owner-star" aria-hidden="true">★</span>
-          <div class="owner-id">
-            <div class="owner-kicker">{owners.length > 1 ? "Owners" : "Owner"}</div>
-            <div class="owner-names">
-              {#each owners as o (o.device)}
-                <button class="owner-name" onclick={() => jumpToDevice(o.device)} title="Show this device on the graph">
-                  {memberName(o)}{#if app.isMe(o.device)} <span class="self-tag">this device</span>{/if}
-                </button>
-              {/each}
-            </div>
+    <!-- Whose fleet this is — the owning *person's* name, which leads. It's not
+         the fleet's mesh id (that's the word-salad network name over in Meshes),
+         and it's not a device name: the owner *machines* are marked ★ Owner in
+         the device list below (they're fleet owners too, just identified by
+         their device name). -->
+    <section class="block name-block">
+      <div class="name-row">
+        <label class="name-label" for="fleet-owner-name">👤 Fleet owner</label>
+        {#if app.isFleetOwner}
+          <input
+            id="fleet-owner-name"
+            class="name-input"
+            placeholder="The person who owns this fleet…"
+            bind:value={nameDraft}
+            oninput={() => (nameDirty = true)}
+            onkeydown={(e) => e.key === "Enter" && saveName()}
+            onblur={saveName}
+          />
+        {:else}
+          <!-- Non-owners can't change it, but they (and everyone in the mesh)
+               see it — plain text, not a greyed-out field. -->
+          <div class="name-value" class:unnamed={!app.fleetName}>
+            {app.fleetName || "Unnamed owner"}
           </div>
-        </div>
-        <p class="hint">
-          The owner is a <b>machine</b> — the device that founded the fleet, plus
-          anyone you've promoted to co-owner. Owners can rename the fleet,
-          promote others and evict a device.
-        </p>
-      </section>
-    {/if}
+        {/if}
+      </div>
+      <p class="hint">
+        The name of the <b>person</b> who owns this fleet. It leads everywhere —
+        the graph's “{app.fleetName || "Your"}{app.fleetName ? "'s" : ""} fleet”
+        band, and new rooms default to it. (The fleet's <i>mesh</i> name — its id
+        for networks — lives under Meshes.)
+        {#if !app.isFleetOwner} Only the fleet owner can change it.{/if}
+      </p>
+    </section>
 
     {#if hasKey}
       <section class="block key-block">
@@ -215,34 +233,10 @@
       </section>
     {/if}
 
-    {#if hasKey}
-      <section class="block name-block">
-      <div class="name-row">
-        <label class="name-label" for="fleet-owner-name">🪪 Fleet owner name</label>
-        <input
-          id="fleet-owner-name"
-          class="name-input"
-          placeholder="Unnamed — whose fleet is this?"
-          disabled={!app.isFleetOwner}
-          bind:value={nameDraft}
-          oninput={() => (nameDirty = true)}
-          onkeydown={(e) => e.key === "Enter" && saveName()}
-          onblur={saveName}
-        />
-      </div>
-      <p class="hint">
-        The fleet answers to this name everywhere — the graph's “{app.fleetName ||
-          "Your"}{app.fleetName ? "'s" : ""} fleet” section, and new rooms default to it.
-        {#if !app.isFleetOwner}Only the fleet owner can change it.{/if}
-      </p>
-      </section>
-    {/if}
-
     <section class="block">
       <h4>{members.length} device{members.length === 1 ? "" : "s"} in your fleet</h4>
       <ul class="members">
         {#each members as m (m.device)}
-          {@const live = nodeLabel(m.device)}
           {@const isSelf = app.isMe(m.device)}
           {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
           {@const isManager = app.fleetRoleOf(m.device) === "manager"}
@@ -256,7 +250,7 @@
               <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
               <div class="m-id">
                 <div class="m-name">
-                  {m.label || live || m.device.slice(0, 12)}
+                  {memberName(m)}
                   {#if isSelf} <span class="self-tag">this device</span>{/if}
                   {#if isOwner} <span class="owner-tag">★ Owner</span>
                   {:else if isManager} <span class="mgr-tag">Manager</span>{/if}
@@ -479,6 +473,21 @@
   .name-input:disabled {
     opacity: 0.6;
   }
+  /* The non-owner, read-only rendering of the fleet name — plain, legible
+     text so the name is unmistakably visible (not a greyed field). */
+  .name-value {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.95rem;
+    font-weight: 650;
+    color: var(--ink);
+    padding: 0.4rem 0;
+  }
+  .name-value.unnamed {
+    color: var(--ink-faint);
+    font-weight: 500;
+    font-style: italic;
+  }
   code {
     flex: 1;
     min-width: 0;
@@ -587,54 +596,6 @@
     padding: 0.05rem 0.4rem;
   }
 
-  /* ---- owner above the key ---- */
-  .owner-row {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-  }
-  .owner-star {
-    display: grid;
-    place-items: center;
-    width: 1.9rem;
-    height: 1.9rem;
-    flex-shrink: 0;
-    border-radius: 50%;
-    color: var(--c-fleet-ink);
-    background: var(--c-fleet-soft);
-    font-size: 0.95rem;
-  }
-  .owner-id {
-    min-width: 0;
-  }
-  .owner-kicker {
-    font-size: 0.66rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--ink-faint);
-  }
-  .owner-names {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-  }
-  .owner-name {
-    border: none;
-    background: none;
-    padding: 0;
-    font-size: 0.92rem;
-    font-weight: 650;
-    color: var(--ink);
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-  .owner-name:hover {
-    color: var(--c-fleet-ink);
-    text-decoration: underline;
-  }
   .m-name {
     font-size: 0.88rem;
     font-weight: 600;
