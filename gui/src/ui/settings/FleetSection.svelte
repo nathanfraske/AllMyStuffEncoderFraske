@@ -86,6 +86,27 @@
     return n?.label ?? "";
   }
 
+  // The owner(s) of the fleet — the founding machine and anyone promoted to
+  // co-owner. Promote *adds* a co-owner; it never hands the fleet away.
+  const owners = $derived(members.filter((m) => m.role === "owner"));
+
+  function memberName(m: { device: string; label: string }): string {
+    return m.label || nodeLabel(m.device) || m.device.slice(0, 12);
+  }
+
+  // Jump to a fleet device on the graph: select it (the drawer + graph focus
+  // it) and close settings. Right-click does the same (parity).
+  function jumpToDevice(device: string) {
+    app.selectNode(device);
+    app.settingsOpen = false;
+  }
+
+  // Promote a member to co-owner — full fleet authority alongside you, not a
+  // transfer. Re-uses the same governance path as the device drawer.
+  function promote(device: string) {
+    void app.grantFleetRole(device, "owner");
+  }
+
   // ---- fleet custody (TOTP / MFA) ----
   // The fleet is a closed network underneath; enrolling an authenticator on
   // this device tells the daemon to refuse a fleet governance change (kind
@@ -147,6 +168,29 @@
   </p>
 
   {#if hasFleet}
+    {#if owners.length > 0}
+      <section class="block owner-block">
+        <div class="owner-row">
+          <span class="owner-star" aria-hidden="true">★</span>
+          <div class="owner-id">
+            <div class="owner-kicker">{owners.length > 1 ? "Owners" : "Owner"}</div>
+            <div class="owner-names">
+              {#each owners as o (o.device)}
+                <button class="owner-name" onclick={() => jumpToDevice(o.device)} title="Show this device on the graph">
+                  {memberName(o)}{#if app.isMe(o.device)} <span class="self-tag">this device</span>{/if}
+                </button>
+              {/each}
+            </div>
+          </div>
+        </div>
+        <p class="hint">
+          The owner is a <b>machine</b> — the device that founded the fleet, plus
+          anyone you've promoted to co-owner. Owners can rename the fleet,
+          promote others and evict a device.
+        </p>
+      </section>
+    {/if}
+
     {#if hasKey}
       <section class="block key-block">
         <div class="key-head">
@@ -199,21 +243,44 @@
         {#each members as m (m.device)}
           {@const live = nodeLabel(m.device)}
           {@const isSelf = app.isMe(m.device)}
-          <li>
-            <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
-            <div class="m-id">
-              <div class="m-name">{m.label || live || m.device.slice(0, 12)}{#if isSelf} <span class="self-tag">this device</span>{/if}</div>
-              <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
-            </div>
+          {@const isOwner = m.role === "owner"}
+          <li class:owner={isOwner}>
+            <button
+              class="m-jump"
+              title="Show this device on the graph"
+              onclick={() => jumpToDevice(m.device)}
+              oncontextmenu={(e) => { e.preventDefault(); jumpToDevice(m.device); }}
+            >
+              <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
+              <div class="m-id">
+                <div class="m-name">
+                  {m.label || live || m.device.slice(0, 12)}
+                  {#if isSelf} <span class="self-tag">this device</span>{/if}
+                  {#if isOwner} <span class="owner-tag">★ Owner</span>{/if}
+                </div>
+                <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
+              </div>
+            </button>
             {#if app.isFleetOwner && !isSelf}
-              <button
-                class="kick"
-                class:armed={armed === m.device}
-                title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
-                onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
-              >
-                {armed === m.device ? "Evict — sure?" : "Evict"}
-              </button>
+              <div class="m-actions">
+                {#if !isOwner}
+                  <button
+                    class="promote"
+                    title="Add as a co-owner — they gain full fleet authority alongside you. This adds an owner; it doesn't hand the fleet away."
+                    onclick={() => promote(m.device)}
+                  >
+                    ★ Promote
+                  </button>
+                {/if}
+                <button
+                  class="kick"
+                  class:armed={armed === m.device}
+                  title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                  onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                >
+                  {armed === m.device ? "Evict — sure?" : "Evict"}
+                </button>
+              </div>
             {/if}
           </li>
         {/each}
@@ -438,10 +505,33 @@
   .members li {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 0.4rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
-    padding: 0.5rem 0.6rem;
+    padding: 0.3rem 0.5rem 0.3rem 0.1rem;
+  }
+  /* An owner row gets a faint gold edge so the fleet's authority is legible
+     at a glance. */
+  .members li.owner {
+    box-shadow: inset 2px 0 0 var(--c-venue);
+  }
+  /* The identity is a button — clicking (or right-clicking) jumps to the
+     device on the graph. */
+  .m-jump {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    border: none;
+    background: none;
+    text-align: left;
+    padding: 0.2rem 0.5rem;
+    border-radius: var(--r-sm);
+    color: inherit;
+  }
+  .m-jump:hover {
+    background: var(--surface);
   }
   .m-avatar {
     font-size: 1.2rem;
@@ -449,6 +539,87 @@
   .m-id {
     min-width: 0;
     flex: 1;
+  }
+  .m-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+  /* Promote = add a co-owner. Gold (the owner colour), and clearly additive —
+     never the dangerous "transfer" it used to read as. */
+  .promote {
+    border: 1px solid var(--c-venue-soft);
+    background: var(--c-venue-soft);
+    color: var(--c-venue-ink);
+    border-radius: var(--r-pill);
+    padding: 0.22rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 650;
+    cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease;
+  }
+  .promote:hover {
+    border-color: var(--c-venue);
+  }
+  .owner-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.4rem;
+  }
+
+  /* ---- owner above the key ---- */
+  .owner-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .owner-star {
+    display: grid;
+    place-items: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    flex-shrink: 0;
+    border-radius: 50%;
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    font-size: 0.95rem;
+  }
+  .owner-id {
+    min-width: 0;
+  }
+  .owner-kicker {
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .owner-names {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .owner-name {
+    border: none;
+    background: none;
+    padding: 0;
+    font-size: 0.92rem;
+    font-weight: 650;
+    color: var(--ink);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .owner-name:hover {
+    color: var(--c-venue-ink);
+    text-decoration: underline;
   }
   .m-name {
     font-size: 0.88rem;

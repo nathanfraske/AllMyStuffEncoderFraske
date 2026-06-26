@@ -996,10 +996,11 @@
     background: var(--surface-2);
     border: 1px solid var(--line-strong);
   }
+  /* Owner = gold, matching the ★ Owner badge in the Fleet settings pane. */
   .role-pill.owner {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-    border-color: var(--accent);
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    border-color: var(--c-venue);
   }
   .role-pill.manager {
     color: var(--ok);

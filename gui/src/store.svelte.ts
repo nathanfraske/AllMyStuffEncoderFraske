@@ -167,6 +167,7 @@ import {
   type NetworkConfigFull,
   type NetworkSummary,
   type OwnedRoster,
+  type OwnedMember,
   type PeerInfo,
   type Person,
   type Relationship,
@@ -3027,14 +3028,27 @@ class AppStore {
   }
 
   /** Demo/web only: seed the fleet from the machines already marked yours, so
-   *  the Fleet view isn't empty before you claim anything in the preview. */
+   *  the Fleet view isn't empty before you claim anything in the preview. A
+   *  believable named fleet with this device as owner and one promoted
+   *  co-owner, so the owner/promote/evict controls are all alive to try. */
   private seedDemoFleet() {
-    const members = this.catalog.nodes
-      .filter((n) => n.relationship.kind === "mine")
-      .map((n) => ({ device: n.id, label: n.label }));
-    if (members.length > 1) {
-      this.ownedFleet = { key: "demo-fleet-key-7f3a91c2", version: 1, members };
-    }
+    const mine = this.catalog.nodes.filter((n) => n.relationship.kind === "mine");
+    if (mine.length <= 1) return;
+    const members: OwnedMember[] = mine.map((n) => ({
+      device: n.id,
+      label: n.label,
+      // This device founded the fleet; one other is a promoted co-owner — the
+      // rest are plain members, so Promote has somewhere to go.
+      role: this.isMe(n.id) ? "owner" : n.id === "desk" ? "owner" : "member",
+    }));
+    this.ownedFleet = {
+      key: "demo-fleet-key-7f3a91c2",
+      name: "Nathan Paul",
+      version: 1,
+      members,
+      is_owner: true,
+      in_fleet: true,
+    };
   }
 
   /** Demo/web only: a starter room so the rooms bar isn't empty in the
