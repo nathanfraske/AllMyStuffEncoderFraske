@@ -316,22 +316,36 @@
     margin-left: auto;
   }
   .chip.yours,
-  .chip.shared {
+  .chip.shared,
+  .chip.net,
+  .chip.venue {
     cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: border-color 0.12s ease, background 0.12s ease,
+      filter 0.12s ease, transform 0.08s ease, box-shadow 0.12s ease;
   }
-  /* The four summary pills carry their concept's colour, the same hues the
+  /* The summary pills wear their concept's colour at rest, the same hues the
      "How it connects" explainer teaches: fleet = green (your own pack),
-     sharing = violet (lending to a person). */
-  .chip.yours:hover {
+     sharing = violet (lending to a person) — matching the mesh/venue pills. */
+  .chip.yours {
     background: var(--c-fleet-soft);
-    border-color: var(--c-fleet);
+    border-color: var(--c-fleet-soft);
     color: var(--c-fleet-ink);
   }
-  .chip.shared:hover {
+  .chip.shared {
     background: var(--c-share-soft);
-    border-color: var(--c-share);
+    border-color: var(--c-share-soft);
     color: var(--c-share-ink);
+  }
+  /* Every header pill is clickable, so they share one obvious hover — a small
+     lift, a brighter fill, a shadow and a firmer edge. */
+  .chip.yours:hover,
+  .chip.shared:hover,
+  .chip.net:hover,
+  .chip.venue:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-sm), 0 5px 12px -5px oklch(0 0 0 / 0.45);
+    border-color: currentColor;
   }
   .net-anchor {
     position: relative;
