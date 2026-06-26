@@ -541,6 +541,8 @@ mod tests {
             features: vec![],
             sites: vec![],
             version: String::new(),
+            fleet_name: String::new(),
+            fleet_owner: String::new(),
         }
     }
 

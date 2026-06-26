@@ -141,6 +141,15 @@ export interface MeshNode {
    *  on several networks at once and a device may share only some of them, so
    *  the graph shows which — it's never just "the" mesh. */
   networks?: string[];
+  /** The device's fleet display name ("Casey"), from its presence advert.
+   *  Lets the graph group + label its fleet straight from the advert. Absent
+   *  (an older peer, or not in a fleet) means unknown. */
+  fleetName?: string;
+  /** The device's fleet **owner** (person) name, from its presence advert —
+   *  the human who owns the fleet, not the owner device's hostname. Used to
+   *  label "Casey's fleet" without resolving the owner device from the
+   *  catalog. Absent means unknown. */
+  fleetOwner?: string;
 }
 
 /** The mesh capability tag that marks a node as a real AllMyStuff app node
