@@ -618,6 +618,10 @@ class AppStore {
   /** Briefly true right after driving a mesh turned a venue back on, so the
    *  venues pill can shimmer to say "something here changed". */
   venuePillShimmer = $state(false);
+  /** The refresh control's 3-step progress, shown floating over the graph while
+   *  a restart runs. Each step's status drives a red→yellow→green dot:
+   *  `wait` (red) → `go` (yellow) → `ok` (green). Null when idle. */
+  restartFlow = $state<{ label: string; status: "wait" | "go" | "ok" }[] | null>(null);
   /** The network whose roster/approvals the Networks panel is showing. */
   rosterNetwork = $state<string | null>(null);
   roster = $state<RosterPeer[]>([]);
@@ -4675,36 +4679,75 @@ class AppStore {
    *  when a network goes quiet (stuck handshaking, peers fallen silent). It
    *  acts on every currently-joined network, since the control is global. */
   async restartNetwork() {
-    if (!this.backendConnected) {
-      this.toast("info", "Nothing live to restart — connect to a network first");
-      return;
-    }
+    // Guard against a double-click while a restart is already playing out.
+    if (this.restartFlow) return;
+    const settle = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    // The 3-step panel is the feedback now (it floats over the graph), so the
+    // restart no longer narrates itself through toasts — only failures speak.
+    const steps: { label: string; status: "wait" | "go" | "ok" }[] = [
+      { label: "Restarting", status: "wait" },
+      { label: "Reconnecting", status: "wait" },
+      { label: "Connected", status: "wait" },
+    ];
+    this.restartFlow = steps;
+    const mark = (i: number, status: "wait" | "go" | "ok") => {
+      steps[i].status = status;
+      this.restartFlow = [...steps];
+    };
+
     const joined = (Array.isArray(this.networks) ? this.networks : []).slice();
-    if (joined.length === 0) {
-      this.toast("warn", "No live network to restart");
-      return;
-    }
-    const many = joined.length > 1;
-    this.toast("info", many ? "Restarting networks — reconnecting…" : "Restarting the network — reconnecting…");
     let failed = 0;
-    for (const n of joined) {
-      // `config_id` is the stable local key the off→on round-trip parks and
-      // takes the config back under; fall back to the wire id just in case.
-      const key = n.config_id || n.network_id;
-      try {
-        await setNetworkEnabled(key, false);
-        await setNetworkEnabled(key, true);
-      } catch (e) {
-        failed++;
-        this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
+
+    // Step 1 — restart: park every live mesh (leave from the live config).
+    mark(0, "go");
+    await settle(420);
+    if (this.backendConnected) {
+      for (const n of joined) {
+        try {
+          await setNetworkEnabled(n.config_id || n.network_id, false);
+        } catch (e) {
+          failed++;
+          this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
+        }
       }
     }
-    // Re-sync regardless of partial failure so the pills/graph match reality
-    // (a failed re-join leaves that network parked, recoverable from the menu).
-    await this.refreshNetworks();
-    await this.loadDisabledNetworks();
-    await this.syncMeshGraph();
-    if (failed === 0) this.toast("ok", many ? "Networks restarted" : "Network restarted");
+    mark(0, "ok");
+
+    // Step 2 — reconnect: re-join each from the parked config, then re-sync.
+    mark(1, "go");
+    if (this.backendConnected) {
+      for (const n of joined) {
+        try {
+          await setNetworkEnabled(n.config_id || n.network_id, true);
+        } catch (e) {
+          failed++;
+          this.toast("warn", `Couldn't reconnect ${networkDisplayName(n)}: ${errMsg(e)}`);
+        }
+      }
+      // Re-sync regardless of partial failure so the pills/graph match reality
+      // (a failed re-join leaves that mesh parked, recoverable from the menu).
+      await this.refreshNetworks();
+      await this.loadDisabledNetworks();
+      await this.syncMeshGraph();
+    } else {
+      // Demo/web: nothing live to cycle, but play the sequence so the panel is
+      // a real, visible thing in the preview.
+      await settle(700);
+    }
+    await settle(260);
+    mark(1, failed === 0 ? "ok" : "ok");
+
+    // Step 3 — connected: the all-clear.
+    mark(2, "go");
+    await settle(280);
+    mark(2, "ok");
+
+    if (failed > 0) this.toast("warn", "Some meshes didn't come back — open the meshes menu to retry");
+
+    // Let the green "Connected" sit a beat, then fade the panel away.
+    await settle(1000);
+    this.restartFlow = null;
   }
 
   /** Demo/web twin of the toggle: move the network between the live and

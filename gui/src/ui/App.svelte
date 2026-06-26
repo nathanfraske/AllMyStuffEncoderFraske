@@ -53,6 +53,15 @@
   // mesh / fleet / sharing. Local UI state; opened from the top bar.
   let infoOpen = $state(false);
 
+  // The refresh button only spins briefly on click — the real progress lives in
+  // the 3-step panel that floats over the graph (driven by app.restartFlow).
+  let refreshSpin = $state(false);
+  function refresh() {
+    refreshSpin = true;
+    setTimeout(() => (refreshSpin = false), 650);
+    void app.restartNetwork();
+  }
+
   onMount(() => {
     if (consoleTarget || terminalTarget || filesTarget || roomTarget || videoTarget) return;
     // Wire up live backend data (scan + presence + routes) if the Tauri
@@ -203,7 +212,7 @@
            a network goes quiet. (Scanning *this* machine's hardware now lives
            in its device drawer, above "Its stuff".) -->
       <button class="btn help" onclick={() => (infoOpen = true)} title="How it works — the layers of connection" aria-label="How it works">?</button>
-      <button class="btn refresh" onclick={() => app.restartNetwork()} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
+      <button class="btn refresh" class:spinning={refreshSpin} onclick={refresh} title="Restart mesh — reconnect" aria-label="Restart mesh">↻</button>
       <button class="btn gear" class:has-alert={app.freshJoins.length > 0} onclick={() => app.openSettings()} title="Settings" aria-label="Settings">
         ⚙
         {#if app.freshJoins.length > 0}<span class="gear-badge" aria-hidden="true"></span>{/if}
@@ -493,6 +502,14 @@
   .refresh {
     font-size: 1rem;
     padding: 0.5rem 0.7rem;
+  }
+  .refresh.spinning {
+    animation: refresh-spin 0.65s ease;
+  }
+  @keyframes refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .gear {
     position: relative;

@@ -537,6 +537,23 @@
     <div class="line-tip" style="left: {lineTip.x}px; top: {lineTip.y}px;">{lineTip.text}</div>
   {/if}
 
+  <!-- Refresh progress — Restarting → Reconnecting → Connected, each dot going
+       red → yellow → green, floating just above the bottom-centre of the graph
+       so the result shows where the connections live. -->
+  {#if app.restartFlow}
+    <div class="restart-panel" role="status" aria-live="polite">
+      {#each app.restartFlow as s, i (s.label)}
+        {#if i > 0}
+          <span class="restart-sep" class:done={app.restartFlow[i - 1].status === "ok"}></span>
+        {/if}
+        <span class="restart-step">
+          <span class="restart-dot {s.status}"></span>
+          <span class="restart-label">{s.label}</span>
+        </span>
+      {/each}
+    </div>
+  {/if}
+
   {#if app.catalog.nodes.length === 0}
     <div class="empty" aria-live="polite">
       <div class="empty-orb">🧦</div>
@@ -632,6 +649,75 @@
     white-space: nowrap;
     pointer-events: none;
     box-shadow: var(--shadow-sm);
+  }
+  /* The refresh 3-step panel — floats above the zoom bar at bottom centre. */
+  .restart-panel {
+    position: absolute;
+    bottom: 4.4rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    z-index: 6;
+    background: oklch(0.16 0.02 285 / 0.97);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-pill);
+    padding: 0.5rem 0.95rem;
+    box-shadow: var(--shadow-lg);
+    animation: restart-rise 0.18s ease;
+  }
+  @keyframes restart-rise {
+    from {
+      transform: translate(-50%, 8px);
+      opacity: 0;
+    }
+  }
+  .restart-step {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .restart-label {
+    font-size: 0.78rem;
+    font-weight: 650;
+    color: var(--ink-soft);
+  }
+  .restart-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--danger);
+    transition: background 0.3s ease, box-shadow 0.3s ease;
+  }
+  /* wait = red (default), go = yellow + pulse, ok = green. */
+  .restart-dot.go {
+    background: var(--warn);
+    box-shadow: 0 0 0 3px var(--warn-soft);
+    animation: restart-pulse 1s ease-in-out infinite;
+  }
+  .restart-dot.ok {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px var(--ok-soft);
+  }
+  @keyframes restart-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 2px var(--warn-soft);
+    }
+    50% {
+      box-shadow: 0 0 0 5px oklch(0.79 0.14 75 / 0.06);
+    }
+  }
+  .restart-sep {
+    width: 1.5rem;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--line-strong);
+    transition: background 0.3s ease;
+  }
+  .restart-sep.done {
+    background: var(--ok);
   }
   .nodes {
     position: absolute;
