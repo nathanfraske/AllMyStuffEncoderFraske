@@ -5,12 +5,14 @@
 //! hands off to it, exactly like a bare `myownmesh` opens `myownmesh-gui`.
 //! The GUI in turn auto-spawns the `myownmesh serve` daemon it needs.
 //!
-//! Discovery order: `ALLMYSTUFF_GUI_BIN` → next to this binary (the
-//! release layout) → `$PATH` → dev artefacts under
-//! `gui/src-tauri/target/{debug,release}/`.
+//! Discovery is [`allmystuff_service::find_gui_binary`] — the same lookup
+//! `amst` uses to open the app when no node is running, so both find it the
+//! same way (`ALLMYSTUFF_GUI_BIN` → next to this binary → `$PATH` → the
+//! installer's dirs → dev artefacts under `gui/src-tauri/target/`).
 
-use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+
+use allmystuff_service::find_gui_binary;
 
 pub fn launch() -> ExitCode {
     // A webview can't attach to a headless box; bail with a pointer at the
@@ -51,61 +53,4 @@ pub fn launch() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn gui_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "allmystuff-gui.exe"
-    } else {
-        "allmystuff-gui"
-    }
-}
-
-fn find_gui_binary() -> Option<PathBuf> {
-    let exe = gui_exe_name();
-
-    if let Some(p) = std::env::var_os("ALLMYSTUFF_GUI_BIN") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(exe);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    for profile in ["debug", "release"] {
-        if let Some(p) = workspace_gui_path(profile, exe) {
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-fn workspace_gui_path(profile: &str, exe: &str) -> Option<PathBuf> {
-    // CARGO_MANIFEST_DIR = crates/allmystuff-cli; repo root is two up.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Some(
-        PathBuf::from(manifest_dir)
-            .parent()? // crates/
-            .parent()? // repo root
-            .join("gui")
-            .join("src-tauri")
-            .join("target")
-            .join(profile)
-            .join(exe),
-    )
 }

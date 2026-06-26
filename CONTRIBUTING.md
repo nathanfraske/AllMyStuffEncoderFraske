@@ -79,11 +79,14 @@ amst nas-01 --attach term-3  # join nas-01's existing shell `term-3` (shared, tm
 amst --cwd /path           # start the local shell in /path ("open a terminal here")
 ```
 
-It's a thin client of this machine's node and starts one itself if none is
-running (`allmystuff-serve`), so a bare `amst` is enough to bring this machine
-onto the mesh and drop you into a shell on it. Reaching another machine needs it
-online and yours (owner or same fleet) — the same rule the desktop app's
-terminal enforces. It ships and installs on its own (`scripts/install-amst.sh` /
+It's a thin client of this machine's node; if none is running it opens the
+desktop app to bring one up (so the node has a visible owner — `amst` never
+quietly starts a silent headless node, that's `allmystuff serve` by hand). So a
+bare `amst` on a machine with a screen is enough to bring it onto the mesh and
+drop you into a shell on it; on a headless box, with no app to open, `amst`
+points you at `allmystuff serve` / `allmystuff service install` instead.
+Reaching another machine needs it online and yours (owner or same fleet) — the
+same rule the desktop app's terminal enforces. It ships and installs on its own (`scripts/install-amst.sh` /
 `install-amst.ps1`), which also adds the app launcher / shortcuts / "AMSTerm
 here" context menu. From a source checkout: `cargo run -p allmystuff-term --bin
 amst -- <args>` (or `just term <args>`).
