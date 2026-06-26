@@ -663,7 +663,7 @@
           {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
           {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
           {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-          {#if st.inFleet}<span class="tag fleet" title="In your fleet · {st.role}">🔗 {st.role === "member" ? "fleet" : st.role}</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
           {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
           {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
@@ -1279,6 +1279,13 @@
   .tag.fleet {
     background: var(--c-fleet-soft);
     color: var(--c-fleet-ink);
+  }
+  /* Owner machines stand out in gold so every member can see, at a glance on
+     the card, who owns the fleet. Managers keep the fleet green. */
+  .tag.fleet.owner {
+    background: var(--c-venue-soft);
+    color: var(--c-venue-ink);
+    font-weight: 750;
   }
   .tag.meshonly {
     background: var(--surface-2);

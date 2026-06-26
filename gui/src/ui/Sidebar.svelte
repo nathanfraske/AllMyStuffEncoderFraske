@@ -302,7 +302,8 @@
   .grip {
     position: absolute;
     top: 1.1rem;
-    right: 1px;
+    /* straddle the panel's outer (right) edge, leaning into the gap */
+    right: -7px;
     display: grid;
     grid-template-columns: repeat(2, 3px);
     grid-auto-rows: 3px;

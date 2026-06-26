@@ -244,6 +244,7 @@
           {@const live = nodeLabel(m.device)}
           {@const isSelf = app.isMe(m.device)}
           {@const isOwner = m.role === "owner"}
+          {@const isManager = m.role === "controller"}
           <li class:owner={isOwner}>
             <button
               class="m-jump"
@@ -256,7 +257,8 @@
                 <div class="m-name">
                   {m.label || live || m.device.slice(0, 12)}
                   {#if isSelf} <span class="self-tag">this device</span>{/if}
-                  {#if isOwner} <span class="owner-tag">★ Owner</span>{/if}
+                  {#if isOwner} <span class="owner-tag">★ Owner</span>
+                  {:else if isManager} <span class="mgr-tag">Manager</span>{/if}
                 </div>
                 <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
               </div>
@@ -569,6 +571,17 @@
     letter-spacing: 0.03em;
     color: var(--c-venue-ink);
     background: var(--c-venue-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.4rem;
+  }
+  /* Manager — distinct from the gold owner, in the fleet's green. */
+  .mgr-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--c-fleet-ink);
+    background: var(--c-fleet-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
   }

@@ -801,7 +801,9 @@
     background: var(--surface);
     border-left: 1px solid var(--line);
     box-shadow: var(--shadow-lg);
-    overflow: hidden;
+    /* visible (not hidden) so the grab handle can sit on the OUTER edge,
+       protruding into the gap toward the graph; the body does its own scroll. */
+    overflow: visible;
     z-index: 20;
     animation: slidein 0.16s ease;
   }
@@ -814,6 +816,7 @@
   .drawer-body {
     height: 100%;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 1rem 1.1rem 2rem;
   }
   /* The grab handle — a hair-line edge plus a 6-dot grip; drag to resize,
@@ -848,7 +851,8 @@
   .grip {
     position: absolute;
     top: 1.1rem;
-    left: 1px;
+    /* straddle the panel's outer (left) edge, leaning into the gap */
+    left: -7px;
     display: grid;
     grid-template-columns: repeat(2, 3px);
     grid-auto-rows: 3px;

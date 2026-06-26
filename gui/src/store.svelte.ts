@@ -2871,7 +2871,89 @@ class AppStore {
     if (!node || this.isMe(node.id) || !this.sitesSupported(node)) return false;
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
-    return ownerIsMe || coFleet;
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
+  }
+
+  // ---- cross-fleet console access (the share-enforcement the gates above
+  //      anticipated) -------------------------------------------------------
+
+  /** Every grant covering `node`, unioned across the whole person/fleet (a
+   *  grant authorizes the person wherever it's recorded). */
+  private shareGrantsFor(node: MeshNode): Grant[] {
+    if (node.relationship.kind !== "shared") return [];
+    const pid = node.relationship.person.id;
+    const out: Grant[] = [];
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === pid) {
+        out.push(...n.relationship.grants);
+      }
+    }
+    return out;
+  }
+
+  /** Whether a fleet that shared `node` with me granted me a given console on
+   *  it. Direction matters: to *open* their console I need them to PROVIDE
+   *  their screen/audio (and CONSUME my input for control) — the opposite of a
+   *  grant where *I* let *them* see *my* screen, so sharing out never unlocks
+   *  the same button on the way back. Terminal/Sites ride a generic grant
+   *  carrying the synthetic `<node>:terminal` / `<node>:sites` capability. */
+  hasShareGrant(node: MeshNode | undefined, kind: "remote" | "audio" | "control" | "files" | "terminal" | "sites"): boolean {
+    if (!node || node.relationship.kind !== "shared") return false;
+    const gs = this.shareGrantsFor(node);
+    const provide = (g: Grant) => g.role === "provide" || g.role === "both";
+    const consume = (g: Grant) => g.role === "consume" || g.role === "both";
+    switch (kind) {
+      case "remote":
+        return gs.some((g) => g.media === "display" && provide(g));
+      case "audio":
+        return gs.some((g) => g.media === "audio" && provide(g));
+      case "control":
+        return gs.some((g) => g.media === "input" && consume(g));
+      case "files":
+        return gs.some((g) => g.media === "storage");
+      case "terminal":
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal"));
+      case "sites":
+        return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":sites"));
+    }
+  }
+
+  /** The consoles you may open on a node *right now* — your own fleet gets
+   *  every console it supports; a device a fleet shared with you gets exactly
+   *  the ones their grant covers. One source of truth for the graph-card
+   *  buttons and the drawer's buttons so they can't disagree. */
+  consoleAccess(node: MeshNode | undefined): { remote: boolean; files: boolean; terminal: boolean; sites: boolean } {
+    const none = { remote: false, files: false, terminal: false, sites: false };
+    if (!node || !isAppNode(node)) return none;
+    const self = this.isMe(node.id);
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
+    return {
+      // You don't remote into yourself; otherwise your fleet, or a granted share.
+      remote: !self && (mineOrFleet || this.hasShareGrant(node, "remote")),
+      files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
+      terminal:
+        this.terminalSupported(node) &&
+        (self ? this.localTerminalAllowed : mineOrFleet || this.hasShareGrant(node, "terminal")),
+      sites:
+        this.sitesSupported(node) &&
+        (node.sites?.length ?? 0) > 0 &&
+        !self &&
+        (mineOrFleet || this.hasShareGrant(node, "sites")),
+    };
+  }
+
+  /** Open the right console for a graph-card button click. */
+  openConsoleKind(nodeId: string, kind: "remote" | "files" | "terminal" | "sites") {
+    if (kind === "remote") this.openConsole(nodeId);
+    else if (kind === "files") this.openFiles(nodeId);
+    else if (kind === "terminal") this.openTerminal(nodeId);
+    else if (kind === "sites") {
+      const n = this.node(nodeId);
+      const site = n?.sites?.[0];
+      if (site) void this.mapSite(nodeId, site);
+    }
   }
 
   /** The machines whose sites this device can reach, each with its exposed
@@ -3204,7 +3286,7 @@ class AppStore {
       label: n.label,
       // This device founded the fleet; one other is a promoted co-owner — the
       // rest are plain members, so Promote has somewhere to go.
-      role: this.isMe(n.id) ? "owner" : n.id === "desk" ? "owner" : "member",
+      role: this.isMe(n.id) ? "owner" : n.id === "desk" ? "owner" : n.id === "tv" ? "controller" : "member",
     }));
     this.ownedFleet = {
       key: "demo-fleet-key-7f3a91c2",

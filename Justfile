@@ -115,6 +115,13 @@ pull:
     @git reset --hard HEAD
     @git pull
 
+# A pure drop-in for `git checkout` — every arg passes straight through, so
+# `just checkout main`, `just checkout -b feature`, `just checkout -- file`
+# all behave exactly like the git command, minus typing `git`.
+[doc("git checkout pass-through (e.g. `just checkout main`).")]
+checkout *args:
+    @git checkout {{args}}
+
 fmt:
     @cargo fmt --all
 
