@@ -1293,8 +1293,9 @@
   .cbtn :global(svg) {
     width: 0.95rem;
     height: 0.95rem;
-    /* the line glyphs read a hair left of centre — nudge them right. */
-    transform: translateX(1px);
+    /* the glyphs sit a hair right of centre — nudge them left so the spare
+       pixel lands on the right. */
+    transform: translateX(-1px);
   }
   /* A quick black/grey tooltip (vs the slow native title). */
   .cbtn[data-tip]::after {
