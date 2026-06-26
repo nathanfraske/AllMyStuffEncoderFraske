@@ -15,22 +15,26 @@
   // The capabilities switched on for this share.
   let chosen = $state<Set<ShareCap>>(new Set());
 
-  const CAPS: { key: ShareCap; label: string; icon: string; popout?: boolean }[] = [
+  const CAPS: { key: ShareCap; label: string; icon: string; popout?: boolean; note?: string; requires?: ShareCap }[] = [
+    { key: "video", label: "Video", icon: "🖥", note: "screen" },
     { key: "audio", label: "Audio", icon: "🔊" },
-    { key: "video", label: "Video devices", icon: "🎥" },
-    { key: "screens", label: "Screens", icon: "🖥" },
+    { key: "control", label: "Control & clipboard", icon: "🕹", requires: "video" },
+    { key: "terminal", label: "Terminal", icon: "📟", popout: true },
     { key: "files", label: "Files", icon: "🗂", popout: true },
-    { key: "terminal", label: "Terminal", icon: "📟" },
     { key: "sites", label: "Sites", icon: "🌐", popout: true },
   ];
 
   const sender = $derived(app.shareFlowSender);
   const receiver = $derived(app.shareFlowReceiver);
 
-  // Candidate devices for either side: real app machines, the opposite side
-  // excluded so you can't pick the same device twice.
-  function candidates(exclude: string | null) {
-    return app.catalog.nodes.filter((n) => isAppNode(n) && n.id !== exclude);
+  // Candidate devices. The *sender* may only be one of your own machines —
+  // you can't share someone else's stuff. The receiver can be any device. The
+  // opposite side is excluded so you can't pick the same device twice.
+  function candidates(side: Side, exclude: string | null) {
+    return app.catalog.nodes.filter((n) => {
+      if (!isAppNode(n) || n.id === exclude) return false;
+      return side === "sender" ? app.isMyDevice(n.id) : true;
+    });
   }
   function nodeOf(id: string | null) {
     return id ? app.node(id) : null;
@@ -50,8 +54,16 @@
   function toggleCap(c: ShareCap) {
     if (!app.shareFlowCapAvailable(sender, c)) return;
     const next = new Set(chosen);
-    if (next.has(c)) next.delete(c);
-    else next.add(c);
+    if (next.has(c)) {
+      next.delete(c);
+      // Turning off Video turns off anything that depends on it (Control).
+      for (const dep of CAPS) if (dep.requires === c) next.delete(dep.key);
+    } else {
+      next.add(c);
+      // Turning on a dependent (Control) pulls in what it needs (Video).
+      const def = CAPS.find((d) => d.key === c);
+      if (def?.requires && app.shareFlowCapAvailable(sender, def.requires)) next.add(def.requires);
+    }
     chosen = next;
   }
 
@@ -102,16 +114,27 @@
           <div class="what">What to share</div>
           <div class="caps">
             {#each CAPS as c (c.key)}
-              {@const avail = app.shareFlowCapAvailable(sender, c.key)}
+              {@const avail =
+                app.shareFlowCapAvailable(sender, c.key) &&
+                (!c.requires || app.shareFlowCapAvailable(sender, c.requires))}
+              {@const needs = c.requires && !chosen.has(c.requires)}
               <button
                 class="cap"
                 class:on={chosen.has(c.key)}
                 disabled={!avail}
-                title={avail ? (c.popout ? `${c.label} (opens a popout)` : c.label) : `${c.label} — not offered by this device`}
+                title={avail
+                  ? c.requires
+                    ? `${c.label} — needs Video to map focus`
+                    : c.popout
+                      ? `${c.label} (opens a popout)`
+                      : c.label
+                  : `${c.label} — not offered by this device`}
                 onclick={() => toggleCap(c.key)}
               >
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
-                {c.label}{#if c.popout}<span class="cap-pop">popout</span>{/if}
+                {c.label}{#if c.note}<span class="cap-note"> · {c.note}</span>{/if}
+                {#if needs}<span class="cap-req">needs Video</span>
+                {:else if c.popout}<span class="cap-pop">popout</span>{/if}
               </button>
             {/each}
           </div>
@@ -157,14 +180,14 @@
     </button>
     {#if picking === side}
       <div class="menu" role="listbox">
-        {#each candidates(side === "sender" ? receiver : sender) as cand (cand.id)}
+        {#each candidates(side, side === "sender" ? receiver : sender) as cand (cand.id)}
           <button class="menu-item" role="option" aria-selected={cand.id === id} onclick={() => pick(side, cand.id)}>
             <span class="mi-icon" aria-hidden="true">{cand.kind === "this" ? "💻" : "🖥"}</span>
             <span class="mi-name">{displayName(cand)}</span>
             <span class="mi-dot" class:on={cand.online}></span>
           </button>
         {:else}
-          <div class="menu-empty">No other devices to pick</div>
+          <div class="menu-empty">{side === "sender" ? "No devices of yours" : "No other devices"}</div>
         {/each}
       </div>
     {/if}
@@ -479,11 +502,26 @@
   .cap-i {
     font-size: 0.95rem;
   }
+  .cap-note {
+    color: var(--ink-faint);
+    font-weight: 500;
+  }
   .cap-pop {
     margin-left: auto;
     font-size: 0.62rem;
     font-weight: 600;
     color: var(--ink-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .cap-req {
+    margin-left: auto;
+    font-size: 0.62rem;
+    font-weight: 700;
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    border-radius: var(--r-pill);
+    padding: 0.02rem 0.4rem;
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }

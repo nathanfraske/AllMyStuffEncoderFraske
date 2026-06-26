@@ -361,6 +361,8 @@
       app.cancelConnect();
       return;
     }
+    // Stop a drag from turning into a native text selection.
+    e.preventDefault();
     if (e.button === 2 || e.button === 1) {
       // Right (or middle) drag pans — the platform convention.
       gesture = { kind: "pan", x: e.clientX, y: e.clientY, panX, panY };
@@ -417,6 +419,7 @@
     // don't hijack it into a node drag, or capturing the pointer eats its click.
     if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
     e.stopPropagation();
+    e.preventDefault(); // don't let the drag select the node's text
     nodeDrag = { id: n.id, sx: e.clientX, sy: e.clientY, moved: false };
     dragLabel = displayName(n);
     dragPos = canvasPoint(e);

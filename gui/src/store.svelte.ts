@@ -199,8 +199,11 @@ export type SettingsTab =
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
 
-/** A capability the Share Flow builder can switch on between two devices. */
-export type ShareCap = "audio" | "video" | "screens" | "files" | "terminal" | "sites";
+/** A capability the Share Flow builder can switch on between two devices.
+ *  Audio / Video (the screen feed) / Control all ride the remote-control
+ *  console; Control needs Video to map focus. Terminal / Files / Sites are
+ *  their own console shares. */
+export type ShareCap = "audio" | "video" | "control" | "terminal" | "files" | "sites";
 
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
@@ -1823,9 +1826,22 @@ class AppStore {
   // (grants and all); the Files / Terminal / Sites toggles pop the existing
   // host views for the sender.
 
-  /** Open the builder, optionally pre-filling the two sides. */
+  /** Whether a device is one of *yours* — the only kind you may put on the
+   *  sending side of a share. You can't share someone else's stuff. */
+  isMyDevice(id: string | null): boolean {
+    if (!id) return false;
+    const n = this.node(id);
+    if (!n) return false;
+    const st = this.standingOf(n);
+    return st.mine || st.self;
+  }
+
+  /** Open the builder, optionally pre-filling the two sides. The sender is
+   *  forced to be one of your devices — you only ever share your own stuff, so
+   *  a non-owned device offered as the sender is dropped (it can still be the
+   *  receiver). */
   openShareFlow(sender?: string | null, receiver?: string | null) {
-    if (sender !== undefined) this.shareFlowSender = sender;
+    if (sender !== undefined) this.shareFlowSender = this.isMyDevice(sender) ? sender : null;
     if (receiver !== undefined) this.shareFlowReceiver = receiver;
     this.shareFlowOpen = true;
   }
@@ -1834,15 +1850,20 @@ class AppStore {
   }
 
   /** Whether the sender can actually offer a given capability — drives which
-   *  toggles are live (you can't share what isn't there). */
+   *  toggles are live (you can't share what isn't there). Audio / Video (the
+   *  screen feed) / Control ride the remote-control console; Terminal / Files /
+   *  Sites are their own console shares. */
   shareFlowCapAvailable(node: string | null, cap: ShareCap): boolean {
     if (!node) return false;
     const n = this.node(node);
     if (!n) return false;
-    if (cap === "audio" || cap === "video" || cap === "screens") {
-      const media = cap === "screens" ? "display" : cap;
-      return !!matchEndpoint(this.catalog, node, media as MediaKind, "provide");
-    }
+    if (cap === "audio") return !!matchEndpoint(this.catalog, node, "audio", "provide");
+    // "Video" is the device's screen feed — what the receiver sees in the
+    // remote-control console (and what Control needs to map focus).
+    if (cap === "video") return !!matchEndpoint(this.catalog, node, "display", "provide");
+    // Control & clipboard: the device must accept remote control (a control
+    // sink). The UI also gates it behind Video.
+    if (cap === "control") return !!matchEndpoint(this.catalog, node, "input", "consume");
     const feats = n.features ?? [];
     if (cap === "files") return isAppNode(n) && feats.includes(FEATURE_FILES);
     if (cap === "terminal") return isAppNode(n) && feats.includes(FEATURE_TERMINAL);
@@ -1850,9 +1871,10 @@ class AppStore {
     return false;
   }
 
-  /** Start the share: wire each chosen capability from sender to receiver.
-   *  Media caps connect through the normal route path; Files/Terminal/Sites
-   *  pop the sender's host view. Returns the count actually started. */
+  /** Start the share: grant each chosen capability from sender to receiver.
+   *  Audio/Video stream the sender's console to the receiver; Control wires the
+   *  receiver's input back to the sender (and needs Video to map focus);
+   *  Terminal/Files/Sites pop the sender's host view. Returns how many started. */
   startShareFlow(caps: ShareCap[]): number {
     const sender = this.shareFlowSender;
     const receiver = this.shareFlowReceiver;
@@ -1864,33 +1886,58 @@ class AppStore {
       this.toast("warn", "A device can't share with itself");
       return 0;
     }
-    const mediaMap: Partial<Record<ShareCap, MediaKind>> = {
-      audio: "audio",
-      video: "video",
-      screens: "display",
-    };
+    // You can only share your *own* devices' stuff — never someone else's.
+    if (!this.isMyDevice(sender)) {
+      this.toast("warn", "You can only share your own devices");
+      return 0;
+    }
+    const set = new Set(caps);
     let started = 0;
     const skipped: string[] = [];
-    for (const cap of caps) {
-      const media = mediaMap[cap];
-      if (media) {
-        const src = matchEndpoint(this.catalog, sender, media, "provide");
-        const dst = matchEndpoint(this.catalog, receiver, media, "consume");
-        if (src && dst && this.connect(src.id, dst.id)) started++;
-        else skipped.push(cap);
-      } else if (cap === "files") {
-        this.openFiles(sender);
-        started++;
-      } else if (cap === "terminal") {
-        this.openTerminal(sender);
-        started++;
-      } else if (cap === "sites") {
-        const site = this.node(sender)?.sites?.[0];
-        if (site) {
-          void this.mapSite(sender, site);
-          started++;
-        } else skipped.push("sites");
+    // Audio + Video: the sender's console media flows to the receiver.
+    if (set.has("audio")) {
+      const src = matchEndpoint(this.catalog, sender, "audio", "provide");
+      const dst = matchEndpoint(this.catalog, receiver, "audio", "consume");
+      if (src && dst && this.connect(src.id, dst.id)) started++;
+      else skipped.push("audio");
+    }
+    if (set.has("video")) {
+      const src = matchEndpoint(this.catalog, sender, "display", "provide");
+      const dst = matchEndpoint(this.catalog, receiver, "display", "consume");
+      if (src && dst && this.connect(src.id, dst.id)) started++;
+      else skipped.push("video");
+    }
+    // Control & clipboard rides back the other way (the receiver drives the
+    // sender) and only makes sense with Video to map focus.
+    if (set.has("control")) {
+      if (!set.has("video")) {
+        skipped.push("control (needs video)");
+      } else {
+        const inSrc = matchEndpoint(this.catalog, receiver, "input", "provide");
+        const inDst = matchEndpoint(this.catalog, sender, "input", "consume");
+        let ok = false;
+        if (inSrc && inDst && this.connect(inSrc.id, inDst.id)) ok = true;
+        const clipS = matchEndpoint(this.catalog, sender, "clipboard", "provide");
+        const clipD = matchEndpoint(this.catalog, receiver, "clipboard", "consume");
+        if (clipS && clipD) this.connect(clipS.id, clipD.id);
+        if (ok) started++;
+        else skipped.push("control");
       }
+    }
+    if (set.has("files")) {
+      this.openFiles(sender);
+      started++;
+    }
+    if (set.has("terminal")) {
+      this.openTerminal(sender);
+      started++;
+    }
+    if (set.has("sites")) {
+      const site = this.node(sender)?.sites?.[0];
+      if (site) {
+        void this.mapSite(sender, site);
+        started++;
+      } else skipped.push("sites");
     }
     if (started > 0) {
       const sLabel = this.node(sender)?.label ?? "sender";
