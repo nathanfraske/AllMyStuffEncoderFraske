@@ -6,11 +6,44 @@
   // seeing this device) but the full config is kept; on = re-join with
   // everything (servers, label, roster) intact.
   import { app } from "../store.svelte";
-  import { networkDisplayName } from "../types";
+  import { networkDisplayName, type NetworkSummary, type NetworkConfigFull } from "../types";
 
   function close() {
     app.netMenuOpen = false;
   }
+
+  // One stably-ordered list of every mesh — live and parked — so flipping a
+  // switch only changes its on/off state, never its place in the list. Keyed
+  // and sorted by the portable network_id (which a mesh keeps whether it's on
+  // or off), so a toggle never makes the row jump between groups.
+  interface MeshRow {
+    key: string;
+    configId: string;
+    label: string;
+    on: boolean;
+    live: NetworkSummary | null;
+  }
+  const meshRows = $derived.by((): MeshRow[] => {
+    const live: MeshRow[] = (Array.isArray(app.networks) ? app.networks : []).map((n) => ({
+      key: n.network_id || n.config_id,
+      configId: n.config_id,
+      label: app.meshLabel(n),
+      on: true,
+      live: n,
+    }));
+    const off: MeshRow[] = (Array.isArray(app.disabledNets) ? app.disabledNets : []).map(
+      (c: NetworkConfigFull) => ({
+        key: c.network_id || c.id,
+        configId: c.id,
+        label: networkDisplayName(c),
+        on: false,
+        live: null,
+      }),
+    );
+    return [...live, ...off].sort(
+      (a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key),
+    );
+  });
 
   // Close on a click anywhere outside the menu (the pill itself stops
   // propagation so it can toggle).
@@ -35,13 +68,13 @@
     </p>
   {/if}
 
-  {#each app.networks as n (n.config_id)}
-    {@const fleetMesh = app.isFleetMesh(n)}
-    <div class="row" class:fleet={fleetMesh}>
-      <span class="row-dot live"></span>
+  {#each meshRows as m (m.key)}
+    {@const fleetMesh = !!m.live && app.isFleetMesh(m.live)}
+    <div class="row" class:fleet={fleetMesh} class:off={!m.on}>
+      <span class="row-dot" class:live={m.on}></span>
       <div class="row-main">
-        <div class="row-name">{app.meshLabel(n)}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
-        <div class="row-sub">{n.network_id}</div>
+        <div class="row-name">{m.label}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
+        <div class="row-sub">{m.on ? m.live?.network_id : "disabled — kept for later"}</div>
       </div>
       {#if fleetMesh}
         <!-- The fleet mesh can't be switched off here — it's the closed
@@ -53,36 +86,17 @@
         >🔒</span>
       {:else}
         <button
-          class="switch on"
+          class="switch"
+          class:on={m.on}
           role="switch"
-          aria-checked="true"
-          aria-label="Disable {networkDisplayName(n)}"
-          title="Disable — leave this mesh but keep it for later"
-          onclick={() => app.toggleNetworkEnabled(n.config_id, false)}
+          aria-checked={m.on}
+          aria-label="{m.on ? 'Disable' : 'Enable'} {m.label}"
+          title={m.on ? "Disable — leave this mesh but keep it for later" : "Enable — re-join this mesh"}
+          onclick={() => app.toggleNetworkEnabled(m.configId, !m.on)}
         >
           <span class="knob"></span>
         </button>
       {/if}
-    </div>
-  {/each}
-
-  {#each app.disabledNets as c (c.id)}
-    <div class="row off">
-      <span class="row-dot"></span>
-      <div class="row-main">
-        <div class="row-name">{networkDisplayName(c)}</div>
-        <div class="row-sub">disabled — kept for later</div>
-      </div>
-      <button
-        class="switch"
-        role="switch"
-        aria-checked="false"
-        aria-label="Enable {networkDisplayName(c)}"
-        title="Enable — re-join this mesh"
-        onclick={() => app.toggleNetworkEnabled(c.id, true)}
-      >
-        <span class="knob"></span>
-      </button>
     </div>
   {/each}
 
