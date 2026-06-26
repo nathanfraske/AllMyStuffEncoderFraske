@@ -1,10 +1,13 @@
 <script lang="ts">
-  // Share Flow — the side-by-side builder for a device share. The Sender (right)
-  // makes things available; the Receiver (left) gets them. It composes the same
-  // capabilities the rest of the app uses — each toggle resolves through the
-  // store's startShareFlow, which rides the ordinary connect()/grant path; it
-  // doesn't invent any new wiring. Opened from "New Share" in the Sharing pane,
-  // or by dragging one device onto another on the graph.
+  // Share Flow — the side-by-side builder for a device share. The Sender (left)
+  // is one of *your* devices and makes things available; the Receiver (right) is
+  // a *fleet* (someone else's) whose machines get the buttons to open them. It
+  // composes the same capabilities the rest of the app uses — each toggle
+  // resolves through the store's startShareFlow, which grants/revokes on the
+  // ordinary grant path; it doesn't invent any new wiring. Opened from "New
+  // Share" in the Sharing pane, from "Manage share" in a device drawer (which
+  // pre-fills the already-granted consoles), or by dragging a device onto a
+  // fleet on the graph.
   import { app, type ShareCap } from "../store.svelte";
   import { displayName, isAppNode } from "../types";
 
@@ -26,19 +29,26 @@
 
   const sender = $derived(app.shareFlowSender);
   const receiver = $derived(app.shareFlowReceiver);
+  // The receiver is a *fleet*, shown by its name (and how many devices it
+  // brings), resolved from whatever device node id the receiver state holds.
+  const receiverFleet = $derived(app.receiverFleet(receiver));
 
-  // Candidate devices. The *sender* may only be one of your own machines —
-  // you can't share someone else's stuff. The receiver can be any device. The
-  // opposite side is excluded so you can't pick the same device twice.
-  function candidates(side: Side, exclude: string | null) {
-    return app.catalog.nodes.filter((n) => {
-      if (!isAppNode(n) || n.id === exclude) return false;
-      // Sender = one of your own machines; Receiver = a device that belongs to
-      // another fleet/person (you grant their fleet access, not your own, and
-      // not an unowned box).
-      if (side === "sender") return app.isMyDevice(n.id);
-      return !app.isMyDevice(n.id) && !!n.owner;
-    });
+  // Seed the toggles when the builder opens — "Manage share" passes the consoles
+  // already granted to that fleet so they show on. Re-seeds whenever a fresh
+  // open changes the initial set.
+  $effect(() => {
+    if (app.shareFlowOpen) {
+      chosen = new Set(app.shareFlowInitialCaps);
+    }
+  });
+
+  // Sender candidates = your own machines. Receiver candidates = the fleets you
+  // can share to (other people's fleets), each backed by one of their devices.
+  function senderCandidates(exclude: string | null) {
+    return app.catalog.nodes.filter((n) => isAppNode(n) && n.id !== exclude && app.isMyDevice(n.id));
+  }
+  function fleetCandidates() {
+    return app.shareFleetOptions();
   }
   function nodeOf(id: string | null) {
     return id ? app.node(id) : null;
@@ -46,14 +56,14 @@
   function osOf(id: string | null): string {
     return nodeOf(id)?.summary?.os ?? "";
   }
-  function pick(side: Side, id: string) {
-    if (side === "sender") app.shareFlowSender = id;
-    else app.shareFlowReceiver = id;
+  function pickSender(id: string) {
+    app.shareFlowSender = id;
     picking = null;
-    // A capability the new sender can't offer can't stay selected.
-    if (side === "sender") {
-      chosen = new Set([...chosen].filter((c) => app.shareFlowCapAvailable(id, c)));
-    }
+    chosen = new Set([...chosen].filter((c) => app.shareFlowCapAvailable(id, c)));
+  }
+  function pickFleet(nodeId: string) {
+    app.shareFlowReceiver = nodeId;
+    picking = null;
   }
   function toggleCap(c: ShareCap) {
     if (!app.shareFlowCapAvailable(sender, c)) return;
@@ -105,8 +115,8 @@
              capability switches. -->
         <section class="col sender">
           <div class="col-kicker">Sender</div>
-          <div class="col-sub">Device sharing its stuff</div>
-          {@render picker("sender", sender)}
+          <div class="col-sub">Your device sharing its stuff</div>
+          {@render senderPicker()}
 
           <div class="sharing-line">
             <span class="sl-k">Sharing</span>
@@ -156,7 +166,7 @@
         <section class="col receiver">
           <div class="col-kicker">Receiver fleet</div>
           <div class="col-sub">The fleet you're granting access to</div>
-          {@render picker("receiver", receiver)}
+          {@render fleetPicker()}
           <p class="note">
             ⓘ This grants the receiving fleet's machines the buttons to open the
             sender's consoles — it doesn't open a connection. Both parties can
@@ -168,31 +178,59 @@
   </div>
 {/if}
 
-<!-- A device picker card: the chosen device, or a "+" to pick one. Clicking
-     opens a dropdown of the candidate machines. -->
-{#snippet picker(side: Side, id: string | null)}
-  {@const n = nodeOf(id)}
+<!-- The sender card: one of YOUR devices. -->
+{#snippet senderPicker()}
+  {@const n = nodeOf(sender)}
   <div class="pick-wrap">
-    <button class="pick" class:filled={!!n} onclick={() => (picking = picking === side ? null : side)}>
+    <button class="pick" class:filled={!!n} onclick={() => (picking = picking === "sender" ? null : "sender")}>
       {#if n}
         <span class="pick-icon" aria-hidden="true">{n.kind === "this" ? "💻" : "🖥"}<span class="pick-dot" class:on={n.online}></span></span>
         <span class="pick-name">{displayName(n)}</span>
-        <span class="pick-os">{osOf(id) || "device"}</span>
+        <span class="pick-os">{osOf(sender) || "device"}</span>
       {:else}
         <span class="pick-plus" aria-hidden="true">＋</span>
         <span class="pick-name muted">Pick a device</span>
       {/if}
     </button>
-    {#if picking === side}
+    {#if picking === "sender"}
       <div class="menu" role="listbox">
-        {#each candidates(side, side === "sender" ? receiver : sender) as cand (cand.id)}
-          <button class="menu-item" role="option" aria-selected={cand.id === id} onclick={() => pick(side, cand.id)}>
+        {#each senderCandidates(receiver) as cand (cand.id)}
+          <button class="menu-item" role="option" aria-selected={cand.id === sender} onclick={() => pickSender(cand.id)}>
             <span class="mi-icon" aria-hidden="true">{cand.kind === "this" ? "💻" : "🖥"}</span>
             <span class="mi-name">{displayName(cand)}</span>
             <span class="mi-dot" class:on={cand.online}></span>
           </button>
         {:else}
-          <div class="menu-empty">{side === "sender" ? "No devices of yours" : "No other devices"}</div>
+          <div class="menu-empty">No devices of yours</div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+<!-- The receiver card: a FLEET (a person), not a single device. -->
+{#snippet fleetPicker()}
+  <div class="pick-wrap">
+    <button class="pick" class:filled={!!receiverFleet} onclick={() => (picking = picking === "receiver" ? null : "receiver")}>
+      {#if receiverFleet}
+        <span class="pick-icon fleet-icon" aria-hidden="true">🧑‍🤝‍🧑</span>
+        <span class="pick-name">{receiverFleet.name}</span>
+        <span class="pick-os">{receiverFleet.devices} device{receiverFleet.devices === 1 ? "" : "s"}</span>
+      {:else}
+        <span class="pick-plus" aria-hidden="true">＋</span>
+        <span class="pick-name muted">Pick a fleet</span>
+      {/if}
+    </button>
+    {#if picking === "receiver"}
+      <div class="menu" role="listbox">
+        {#each fleetCandidates() as f (f.personId)}
+          <button class="menu-item" role="option" aria-selected={f.nodeId === receiver} onclick={() => pickFleet(f.nodeId)}>
+            <span class="mi-icon" aria-hidden="true">🧑‍🤝‍🧑</span>
+            <span class="mi-name">{f.name}</span>
+            <span class="mi-sub">{f.devices} device{f.devices === 1 ? "" : "s"}</span>
+          </button>
+        {:else}
+          <div class="menu-empty">No other fleets on the graph</div>
         {/each}
       </div>
     {/if}
@@ -399,6 +437,14 @@
   }
   .mi-dot.on {
     background: var(--ok);
+  }
+  .mi-sub {
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    flex-shrink: 0;
+  }
+  .fleet-icon {
+    font-size: 1.6rem;
   }
   .menu-empty {
     font-size: 0.8rem;

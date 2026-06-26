@@ -124,9 +124,11 @@ export function demoCatalog(): Catalog {
         kind: "shared",
         person: { id: "person:alex", name: "Alex" },
         grants: [
-          // What Alex may do with *your* stuff (a consume grant: Alex sees your
-          // screen) — the share-out direction.
-          { id: "g-screen", media: "display", role: "consume", capability: null, label: "See your screen" },
+          // Share-OUT: you've let Alex's fleet open My MacBook's screen + terminal
+          // (scoped to "this" device), so "What Alex can do" lists them and
+          // Manage share pre-fills Video + Terminal.
+          { id: "g-out-screen", media: "display", role: "provide", capability: "this:screen", label: "My MacBook — see its screen" },
+          { id: "g-out-term", media: "generic", role: "provide", capability: "this:terminal", label: "My MacBook — use its terminal" },
           // What Alex's fleet shared back with you: their laptop's consoles, so
           // its card + drawer light up the Remote / Files / Terminal / Sites
           // buttons. Provide = they provide their screen; you consume into them

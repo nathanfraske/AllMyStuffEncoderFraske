@@ -396,7 +396,13 @@ class AppStore {
    *  one device onto another on the graph. */
   shareFlowOpen = $state(false);
   shareFlowSender = $state<string | null>(null);
+  // A node id of *any* device in the receiving fleet — the builder presents it
+  // as that fleet (its owner/person), and the share fans across all their
+  // devices. Kept a node id (not a person id) so the existing grant path works.
   shareFlowReceiver = $state<string | null>(null);
+  /** Consoles to pre-toggle when the builder opens — used by "Manage share" to
+   *  show what's already granted to that fleet. */
+  shareFlowInitialCaps = $state<ShareCap[]>([]);
 
   // ---- remote console (the pikvm-style session popup) -------------
   /** The remote machine a console session is open on, if any. */
@@ -1841,17 +1847,83 @@ class AppStore {
     return st.mine || st.self;
   }
 
-  /** Open the builder, optionally pre-filling the two sides. The sender is
-   *  forced to be one of your devices — you only ever share your own stuff, so
-   *  a non-owned device offered as the sender is dropped (it can still be the
-   *  receiver). */
-  openShareFlow(sender?: string | null, receiver?: string | null) {
+  /** Open the builder, optionally pre-filling the sender (one of your devices),
+   *  the receiver (a node id of any device in the receiving fleet), and the
+   *  consoles to pre-toggle (for "Manage share"). A non-owned device offered as
+   *  the sender is dropped — you only ever share your own stuff. */
+  openShareFlow(sender?: string | null, receiver?: string | null, caps?: ShareCap[]) {
     if (sender !== undefined) this.shareFlowSender = this.isMyDevice(sender) ? sender : null;
     if (receiver !== undefined) this.shareFlowReceiver = receiver;
+    this.shareFlowInitialCaps = caps ?? [];
     this.shareFlowOpen = true;
   }
   closeShareFlow() {
     this.shareFlowOpen = false;
+  }
+
+  /** The fleets you can share TO — everyone you already share with, plus the
+   *  owner of any other fleet's device on the graph. Each carries a node id of
+   *  one of that fleet's devices (what the builder's receiver state holds). */
+  shareFleetOptions(): { personId: string; name: string; nodeId: string; devices: number }[] {
+    const byPerson = new Map<string, { personId: string; name: string; nodeId: string; devices: number }>();
+    for (const n of this.catalog.nodes) {
+      if (!isAppNode(n) || this.isMyDevice(n.id) || !n.owner) continue;
+      const p = this.personFor(n);
+      const existing = byPerson.get(p.id);
+      if (existing) existing.devices += 1;
+      else byPerson.set(p.id, { personId: p.id, name: p.name, nodeId: n.id, devices: 1 });
+    }
+    return [...byPerson.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** The fleet/person a receiver node belongs to (for the builder's card). */
+  receiverFleet(nodeId: string | null): { name: string; devices: number } | null {
+    if (!nodeId) return null;
+    const n = this.node(nodeId);
+    if (!n) return null;
+    const p = this.personFor(n);
+    const devices = this.catalog.nodes.filter(
+      (x) => isAppNode(x) && !this.isMyDevice(x.id) && this.personFor(x).id === p.id,
+    ).length;
+    return { name: p.name, devices };
+  }
+
+  /** A capability's device id (the bit before the first ":"). */
+  private capNodeOf(cap: string): string {
+    const i = cap.indexOf(":");
+    return canonicalNodeId(i >= 0 ? cap.slice(0, i) : cap);
+  }
+
+  /** Whether a grant is a *share-out* — something one of MY devices lets the
+   *  fleet do (capability on my device, or a legacy media-wide grant) — vs a
+   *  share-in (a console of THEIRS I may open). The drawer's "What X can do"
+   *  shows only share-out. */
+  isShareOutGrant(g: Grant): boolean {
+    if (!g.capability) return true;
+    return this.isMyDevice(this.capNodeOf(g.capability));
+  }
+
+  /** The consoles already granted to a fleet from a given sender device — to
+   *  pre-toggle the builder. The reverse of shareCapGrants. */
+  existingShareCaps(senderId: string | null, receiverNodeId: string | null): ShareCap[] {
+    if (!senderId || !receiverNodeId) return [];
+    const recv = this.node(receiverNodeId);
+    if (!recv || recv.relationship.kind !== "shared") return [];
+    const pid = recv.relationship.person.id;
+    const grants: Grant[] = [];
+    for (const n of this.catalog.nodes) {
+      if (n.relationship.kind === "shared" && n.relationship.person.id === pid) grants.push(...n.relationship.grants);
+    }
+    const sc = canonicalNodeId(senderId);
+    const forSender = (g: Grant) => !!g.capability && this.capNodeOf(g.capability) === sc;
+    const out: ShareCap[] = [];
+    if (grants.some((g) => forSender(g) && g.media === "display")) out.push("video");
+    if (grants.some((g) => forSender(g) && g.media === "audio")) out.push("audio");
+    if (grants.some((g) => forSender(g) && g.media === "input")) out.push("control");
+    if (grants.some((g) => forSender(g) && g.media === "storage")) out.push("files");
+    if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":terminal"))) out.push("terminal");
+    if (grants.some((g) => forSender(g) && g.media === "generic" && !!g.capability?.endsWith(":sites"))) out.push("sites");
+    return out;
   }
 
   /** Whether the sender can actually offer a given capability — drives which
@@ -1951,19 +2023,27 @@ class AppStore {
     }
     const person = rel.person;
     const senderLabel = this.node(sender)?.label ?? "device";
-    let started = 0;
-    for (const cap of caps) {
-      // Control implies Video (to map focus) — pull it in if missing.
-      if (cap === "control" && !caps.includes("video")) {
-        for (const g of this.shareCapGrants(person.id, "video", sender, senderLabel)) this.grant(receiver, g);
+
+    // Reconcile against what's chosen: grant the selected consoles, revoke the
+    // ones turned off — so the builder *manages* the share, not just adds to it.
+    // Control implies Video (to map focus).
+    const want = new Set(caps);
+    if (want.has("control")) want.add("video");
+    const ALL: ShareCap[] = ["video", "audio", "control", "files", "terminal", "sites"];
+    for (const cap of ALL) {
+      const grants = this.shareCapGrants(person.id, cap, sender, senderLabel);
+      if (want.has(cap)) {
+        for (const g of grants) this.grant(receiver, g);
+      } else {
+        for (const g of grants) this.revokeGrant(receiver, g.id);
       }
-      for (const g of this.shareCapGrants(person.id, cap, sender, senderLabel)) this.grant(receiver, g);
-      started++;
     }
-    if (started > 0) {
-      this.toast("ok", `Shared ${senderLabel} with ${person.name} — ${started} console${started === 1 ? "" : "s"}`);
+    if (want.size > 0) {
+      this.toast("ok", `Sharing ${senderLabel} with ${person.name} — ${want.size} console${want.size === 1 ? "" : "s"}`);
+    } else {
+      this.toast("info", `Stopped sharing ${senderLabel} with ${person.name}`);
     }
-    return started;
+    return want.size;
   }
 
   /** Stop the share: revoke every console grant my sender device gave the

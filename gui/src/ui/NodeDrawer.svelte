@@ -9,8 +9,6 @@
     mediaColor,
     siteIcon,
     type Capability,
-    type Grant,
-    type GrantRole,
     type ListeningService,
     type MediaKind,
   } from "../types";
@@ -86,17 +84,6 @@
     return out;
   });
 
-  // Friendly share presets — what you can let a guest do — minus what's
-  // already granted.
-  interface Preset { label: string; media: MediaKind; role: GrantRole }
-  const PRESETS: Preset[] = [
-    { label: "See your screen", media: "display", role: "consume" },
-    { label: "Hear your audio", media: "audio", role: "consume" },
-    { label: "Send you their camera", media: "video", role: "provide" },
-    { label: "Speak to you (their mic)", media: "audio", role: "provide" },
-    { label: "Share files both ways", media: "storage", role: "both" },
-  ];
-
   // The share partner this node belongs to, with the *person-wide* grant
   // list (a grant covers every node they bring, wherever it's recorded)
   // and their other machines for the "applies to all of these" hint.
@@ -108,12 +95,10 @@
       : null,
   );
   const grants = $derived(partner?.grants ?? []);
-
-  const availablePresets = $derived(
-    PRESETS.filter((p) => !grants.some(({ grant: g }) => g.media === p.media && g.role === p.role)),
-  );
-
-  let addingGrant = $state(false);
+  // Only the share-*out* grants belong here — what this fleet can do with MY
+  // devices. The share-in grants (consoles of *theirs* I may open) are read off
+  // their own card, not listed as "what they can do".
+  const outGrants = $derived(grants.filter(({ grant: g }) => app.isShareOutGrant(g)));
   /** Whether the capability list is expanded — starts folded so the drawer
    *  leads with the relationship, not a wall of devices. */
   let stuffOpen = $state(false);
@@ -213,17 +198,18 @@
     }
   }
 
-  function addGrant(p: Preset) {
+  // Manage the share with this fleet in the builder, pre-filled: receiver = this
+  // fleet (this device belongs to it), sender = the device the existing grants
+  // are scoped to (else this machine), with the already-granted consoles on.
+  function manageShare() {
     if (!node) return;
-    const g: Grant = {
-      id: `grant:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
-      media: p.media,
-      role: p.role,
-      capability: null,
-      label: p.label,
-    };
-    app.grant(node.id, g);
-    addingGrant = false;
+    let senderId = app.localId;
+    const scoped = outGrants.map((x) => x.grant).find((g) => g.capability);
+    if (scoped?.capability) {
+      const sc = scoped.capability.slice(0, scoped.capability.indexOf(":"));
+      if (app.isMyDevice(sc)) senderId = sc;
+    }
+    app.openShareFlow(senderId, node.id, app.existingShareCaps(senderId, node.id));
   }
 
   // Open the Share Flow builder primed with this device: if it's yours it's the
@@ -479,12 +465,10 @@
       {:else if st.shared}
         <div class="block-head">
           <h4>What {st.shared.name} can do</h4>
-          <button class="btn small" onclick={() => (addingGrant = !addingGrant)}>
-            {addingGrant ? "Done" : "Allow more"}
-          </button>
+          <button class="btn small add-share" onclick={manageShare}>⚙ Manage share</button>
         </div>
-        {#if grants.length === 0}
-          <p class="muted">Nothing yet — they can't reach any of your stuff until you allow it.</p>
+        {#if outGrants.length === 0}
+          <p class="muted">Nothing yet — use <b>Manage share</b> to let {st.shared.name} open one of your device's consoles.</p>
         {:else if (partner?.nodes.length ?? 0) > 1}
           <p class="muted">
             You're sharing with {st.shared.name}, not one machine — these work to
@@ -492,7 +476,7 @@
           </p>
         {/if}
         <ul class="grants">
-          {#each grants as { node: holder, grant: g } (g.id)}
+          {#each outGrants as { node: holder, grant: g } (g.id)}
             <li>
               <span class="g-dot" style="background: {mediaColor(g.media)}"></span>
               <span class="g-label">{g.label || `${g.role} ${MEDIA[g.media].label}`}</span>
@@ -500,19 +484,6 @@
             </li>
           {/each}
         </ul>
-        {#if addingGrant}
-          <div class="presets">
-            {#each availablePresets as p}
-              <button class="preset" onclick={() => addGrant(p)}>
-                <span class="g-dot" style="background: {mediaColor(p.media)}"></span>
-                {p.label}
-              </button>
-            {/each}
-            {#if availablePresets.length === 0}
-              <p class="muted">They can already do everything in the presets.</p>
-            {/if}
-          </div>
-        {/if}
         {#if st.offering || st.ownedByMe}
           <button class="linklike" onclick={claimThis}>This is actually my own device →</button>
         {/if}
@@ -1194,28 +1165,6 @@
   .revoke:hover {
     background: var(--danger-soft);
     color: var(--danger);
-  }
-  .presets {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-    margin: 0.3rem 0 0.5rem;
-  }
-  .preset {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    text-align: left;
-    border: 1px dashed var(--line-strong);
-    background: var(--surface);
-    border-radius: var(--r-sm);
-    padding: 0.45rem 0.55rem;
-    font-size: 0.82rem;
-    color: var(--ink);
-  }
-  .preset:hover {
-    border-color: var(--accent);
-    background: var(--accent-soft);
   }
   .linklike {
     border: none;
