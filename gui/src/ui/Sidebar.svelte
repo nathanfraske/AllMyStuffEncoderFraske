@@ -108,18 +108,28 @@
   {#if collapsed}
     <!-- The thin rail: the two tab icons, click to expand into that tab. -->
     <div class="rail">
-      <button class="rail-btn" title="Rooms" aria-label="Rooms" onclick={() => select("rooms")}>
-        🪩
-        {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
-      </button>
       <button class="rail-btn" title="Sites" aria-label="Sites" onclick={() => select("sites")}>
         🌐
         {#if siteCount > 0}<span class="rail-count">{siteCount}</span>{/if}
       </button>
+      <button class="rail-btn" title="Rooms" aria-label="Rooms" onclick={() => select("rooms")}>
+        🪩
+        {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
+      </button>
     </div>
   {:else}
     <div class="head">
-      <div class="tabs" role="tablist" aria-label="Rooms and Sites">
+      <div class="tabs" role="tablist" aria-label="Sites and Rooms">
+        <button
+          class="tab"
+          class:active={app.sidebarTab === "sites"}
+          role="tab"
+          aria-selected={app.sidebarTab === "sites"}
+          onclick={() => select("sites")}
+        >
+          🌐 Sites
+          {#if siteCount > 0}<span class="count">{siteCount}</span>{/if}
+        </button>
         <button
           class="tab"
           class:active={app.sidebarTab === "rooms"}
@@ -130,16 +140,6 @@
           🪩 Rooms
           {#if app.rooms.length > 0}<span class="count">{app.rooms.length}</span>{/if}
           {#if roomAttention > 0 && app.sidebarTab !== "rooms"}<span class="attn" title="{roomAttention} asking to join"></span>{/if}
-        </button>
-        <button
-          class="tab"
-          class:active={app.sidebarTab === "sites"}
-          role="tab"
-          aria-selected={app.sidebarTab === "sites"}
-          onclick={() => select("sites")}
-        >
-          🌐 Sites
-          {#if siteCount > 0}<span class="count">{siteCount}</span>{/if}
         </button>
       </div>
       <button class="collapse" title="Collapse" aria-label="Collapse sidebar" onclick={() => setCollapsed(true)}>‹</button>

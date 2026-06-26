@@ -566,7 +566,7 @@ class AppStore {
   // ---- sites (the reverse-proxy plane) ------------------------------
   /** Which sidebar tab is showing — the rooms/sites bar is one tabbed
    *  panel now. */
-  sidebarTab = $state<"rooms" | "sites">("rooms");
+  sidebarTab = $state<"rooms" | "sites">("sites");
   /** This machine's discovered listening TCP services (the full set), so
    *  the Sites tab can list them under "this machine" with expose toggles.
    *  Seeded with demo data in web mode, replaced by a real scan under the
