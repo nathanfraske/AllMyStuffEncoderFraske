@@ -268,14 +268,42 @@
     lineTip = null;
   }
 
-  // ---- pan / zoom ---------------------------------------------------
+  // ---- pan / zoom / select ------------------------------------------
+  //
+  // Matching every graph and design tool: right-drag pans, left-drag on empty
+  // space marquee-selects, and a left-drag from one device onto another opens
+  // the share builder. A plain left-click still selects a single device.
   let panX = $state(0);
   let panY = $state(0);
   let zoom = $state(1);
-  let dragging = $state(false);
-  let dragStart = $state<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const MIN_ZOOM = 0.4;
   const MAX_ZOOM = 2.2;
+
+  // The active canvas gesture: panning (right-drag) or marqueeing (left-drag on
+  // empty). Node drags are tracked separately, below.
+  type Gesture =
+    | { kind: "pan"; x: number; y: number; panX: number; panY: number }
+    | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number };
+  let gesture = $state<Gesture | null>(null);
+  const panning = $derived(gesture?.kind === "pan");
+
+  // Multi-selection (the marquee's result). The single-click selection still
+  // flows through app.selectedNodeId so the drawer always has one focused node;
+  // these add the extra highlighted devices on top.
+  let selectedIds = $state<Set<string>>(new Set());
+  function isSelected(id: string): boolean {
+    return app.selectedNodeId === id || selectedIds.has(id);
+  }
+
+  // A left-drag that started on a device — used for drag-onto-another-device to
+  // open the share builder. `moved` tells a real drag from a plain click.
+  let nodeDrag = $state<{ id: string; sx: number; sy: number; moved: boolean } | null>(null);
+  let dragOverId = $state<string | null>(null);
+
+  function canvasPoint(e: PointerEvent): { x: number; y: number } {
+    const r = canvas?.getBoundingClientRect();
+    return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
+  }
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
@@ -294,28 +322,110 @@
 
   function onPointerDown(e: PointerEvent) {
     const target = e.target as Element | null;
-    // Let node clicks through — and never capture the pointer on the
-    // floating controls, or their buttons swallow the click (capturing
-    // re-targets the pointerup, so the browser never composes a click).
-    if (target?.closest?.(".node, .zoombar, .arm-banner")) return;
+    // Let node clicks/drags and the floating controls handle themselves —
+    // capturing here would swallow their clicks.
+    if (target?.closest?.(".node, .zoombar, .arm-banner, .restart-panel")) return;
     if (app.dragFrom) {
       app.cancelConnect();
       return;
     }
-    app.selectNode(null);
-    dragging = true;
-    dragStart = { x: e.clientX, y: e.clientY, panX, panY };
-    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    if (e.button === 2 || e.button === 1) {
+      // Right (or middle) drag pans — the platform convention.
+      gesture = { kind: "pan", x: e.clientX, y: e.clientY, panX, panY };
+      (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    } else if (e.button === 0) {
+      // Left drag on empty space marquee-selects. Without a modifier it starts
+      // a fresh selection.
+      if (!e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        selectedIds = new Set();
+        app.selectNode(null);
+      }
+      const p = canvasPoint(e);
+      gesture = { kind: "marquee", x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    }
   }
   function onPointerMove(e: PointerEvent) {
-    if (!dragging || !dragStart) return;
-    panX = dragStart.panX + (e.clientX - dragStart.x);
-    panY = dragStart.panY + (e.clientY - dragStart.y);
+    if (!gesture) return;
+    if (gesture.kind === "pan") {
+      panX = gesture.panX + (e.clientX - gesture.x);
+      panY = gesture.panY + (e.clientY - gesture.y);
+    } else {
+      const p = canvasPoint(e);
+      gesture = { ...gesture, x1: p.x, y1: p.y };
+    }
   }
   function onPointerUp(e: PointerEvent) {
-    dragging = false;
-    dragStart = null;
+    if (gesture?.kind === "marquee") {
+      // Select every device whose centre falls inside the box. A tiny box
+      // (a click that barely moved) selects nothing — it just clears, above.
+      const g = gesture;
+      const x1 = Math.min(g.x0, g.x1);
+      const x2 = Math.max(g.x0, g.x1);
+      const y1 = Math.min(g.y0, g.y1);
+      const y2 = Math.max(g.y0, g.y1);
+      if (x2 - x1 > 4 || y2 - y1 > 4) {
+        const next = new Set(selectedIds);
+        for (const p of layout) {
+          const sx = p.x * zoom + panX;
+          const sy = p.y * zoom + panY;
+          if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) next.add(p.node.id);
+        }
+        selectedIds = next;
+        // Keep the drawer useful: focus the single marqueed device, if one.
+        if (next.size === 1) app.selectNode([...next][0]);
+      }
+    }
+    gesture = null;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+  }
+
+  // No browser context menu on the canvas — right-drag is pan, and an empty
+  // right-click should do nothing (not pop the OS menu).
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+  }
+
+  // ---- drag one device onto another → open the share builder ----------
+  function onNodePointerDown(e: PointerEvent, n: MeshNode) {
+    if (e.button !== 0 || app.dragFrom) return; // left only; connect mode uses clicks
+    // A press on an inline control (Claim, Make claimable…) is that button's —
+    // don't hijack it into a node drag, or capturing the pointer eats its click.
+    if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
+    e.stopPropagation();
+    nodeDrag = { id: n.id, sx: e.clientX, sy: e.clientY, moved: false };
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+  function onNodePointerMove(e: PointerEvent, n: MeshNode) {
+    if (!nodeDrag || nodeDrag.id !== n.id) return;
+    if (!nodeDrag.moved && Math.hypot(e.clientX - nodeDrag.sx, e.clientY - nodeDrag.sy) < 6) return;
+    nodeDrag = { ...nodeDrag, moved: true };
+    const el = document.elementFromPoint(e.clientX, e.clientY)?.closest?.(".node");
+    const over = el?.getAttribute("data-node-id") ?? null;
+    dragOverId = over && over !== n.id ? over : null;
+  }
+  function onNodePointerUp(e: PointerEvent, n: MeshNode) {
+    // Only act when this device actually started the gesture (a press that
+    // began on an inline button left nodeDrag null — let that button win).
+    if (app.dragFrom) {
+      // Connect mode: a tap completes the wire, exactly as before.
+      onNodeClick(n);
+      return;
+    }
+    if (!nodeDrag || nodeDrag.id !== n.id) return;
+    const moved = nodeDrag.moved;
+    const over = dragOverId;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    nodeDrag = null;
+    dragOverId = null;
+    if (moved) {
+      // Dropped on another device: the dragged one is the sender, the target
+      // the receiver — open the builder primed that way.
+      if (over) app.openShareFlow(n.id, over);
+    } else {
+      // Didn't move — it's a plain click: select (the old behaviour).
+      onNodeClick(n);
+    }
   }
 
   function nodeAvatar(n: MeshNode): string {
@@ -378,7 +488,8 @@
 
 <div
   class="canvas"
-  class:dragging
+  class:panning
+  class:marqueeing={gesture?.kind === "marquee"}
   class:armed
   bind:this={canvas}
   onwheel={onWheel}
@@ -386,6 +497,7 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  oncontextmenu={onContextMenu}
   role="application"
   aria-label="Your stuff, as a graph"
 >
@@ -460,14 +572,17 @@
         class:unclaimed={st.kind === "free" || st.kind === "theirs"}
         class:claimable={st.claimable}
         class:meshonly={!st.app}
-        class:selected={app.selectedNodeId === n.id}
+        class:selected={isSelected(n.id)}
         class:armed={armed && targetable(n)}
+        class:dragover={dragOverId === n.id}
+        class:dragging-node={nodeDrag?.id === n.id && nodeDrag.moved}
         class:offline={!n.online}
+        data-node-id={n.id}
         style="left: {p.x - NODE_W / 2}px; top: {p.y - NODE_H / 2}px; width: {NODE_W}px; min-height: {NODE_H}px;"
-        onclick={(e) => {
-          e.stopPropagation();
-          onNodeClick(n);
-        }}
+        onpointerdown={(e) => onNodePointerDown(e, n)}
+        onpointermove={(e) => onNodePointerMove(e, n)}
+        onpointerup={(e) => onNodePointerUp(e, n)}
+        onpointercancel={(e) => onNodePointerUp(e, n)}
         onkeydown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -533,6 +648,19 @@
     {/each}
   </div>
 
+  {#if gesture?.kind === "marquee"}
+    <div
+      class="marquee"
+      style="left: {Math.min(gesture.x0, gesture.x1)}px; top: {Math.min(gesture.y0, gesture.y1)}px; width: {Math.abs(gesture.x1 - gesture.x0)}px; height: {Math.abs(gesture.y1 - gesture.y0)}px;"
+    ></div>
+  {/if}
+
+  {#if nodeDrag?.moved}
+    <div class="drag-hint" class:ready={!!dragOverId}>
+      {dragOverId ? "Drop to build a share" : "Drag onto another device to share"}
+    </div>
+  {/if}
+
   {#if lineTip}
     <div class="line-tip" style="left: {lineTip.x}px; top: {lineTip.y}px;">{lineTip.text}</div>
   {/if}
@@ -596,12 +724,49 @@
     position: relative;
     flex: 1;
     overflow: hidden;
-    cursor: grab;
+    cursor: default;
     touch-action: none;
     user-select: none;
   }
-  .canvas.dragging {
+  /* Right-drag pans (grabbing hand); left-drag on empty marquee-selects
+     (crosshair). */
+  .canvas.panning {
     cursor: grabbing;
+  }
+  .canvas.marqueeing {
+    cursor: crosshair;
+  }
+  /* The marquee selection box. */
+  .marquee {
+    position: absolute;
+    z-index: 4;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 2px;
+    pointer-events: none;
+  }
+  /* The drag-to-share hint, pinned to the top of the graph while a node drag is
+     in flight. */
+  .drag-hint {
+    position: absolute;
+    z-index: 7;
+    top: 0.8rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: oklch(0.16 0.02 285 / 0.97);
+    border: 1px solid var(--line-strong);
+    color: var(--ink-soft);
+    border-radius: var(--r-pill);
+    padding: 0.4rem 0.85rem;
+    font-size: 0.78rem;
+    font-weight: 650;
+    pointer-events: none;
+    box-shadow: var(--shadow-md);
+  }
+  .drag-hint.ready {
+    border-color: var(--c-share);
+    color: var(--c-share-ink);
+    background: var(--c-share-soft);
   }
   .edges {
     position: absolute;
@@ -916,6 +1081,16 @@
   .node.selected {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
+  }
+  /* The device being dragged, and the one it's hovering over (the share-drop
+     target, in the sharing concept's violet). */
+  .node.dragging-node {
+    opacity: 0.65;
+    cursor: grabbing;
+  }
+  .node.dragover {
+    border-color: var(--c-share);
+    box-shadow: 0 0 0 3px var(--c-share-soft), var(--shadow-lg);
   }
   .node.offline {
     opacity: 0.6;
