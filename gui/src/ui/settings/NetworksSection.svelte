@@ -18,6 +18,10 @@
   let joinVenue = $state(PUBLIC_VENUE_ID);
   let mode = $state<"none" | "join">("none");
   let copied = $state("");
+  // Transient inline confirmations (replace success toasts): the name Save
+  // button flashes "Saved ✓", each Export button flashes "Exported ✓".
+  let savedName = $state(false);
+  let exported = $state("");
 
   const sub = $derived(app.networksSubtab);
   const hostname = $derived(app.node(app.localId)?.hostname ?? "");
@@ -36,7 +40,18 @@
   });
 
   async function saveName() {
-    await app.setIdentityLabel(trimmedName);
+    if (await app.setIdentityLabel(trimmedName)) {
+      savedName = true;
+      setTimeout(() => (savedName = false), 1500);
+    }
+  }
+  async function exportNet(configId: string) {
+    if (await app.exportNetwork(configId)) {
+      exported = configId;
+      setTimeout(() => {
+        if (exported === configId) exported = "";
+      }, 1500);
+    }
   }
   async function join() {
     await app.joinNetwork(joinId, [joinVenue]);
@@ -108,7 +123,9 @@
       </p>
       <div class="row">
         <input class="field" placeholder={hostname || "device name"} bind:value={nameInput} />
-        <button class="btn small primary" onclick={saveName}>Save</button>
+        <button class="btn small primary" class:saved={savedName} onclick={saveName}>
+          {savedName ? "Saved ✓" : "Save"}
+        </button>
       </div>
       <div class="preview">Shows as <b>{namePreview}</b></div>
       {#if app.identity?.device_id}
@@ -163,7 +180,7 @@
                  *disabled*; its venue is owner-only (members and managers ride
                  the owner's choice, broadcast to them); and leaving it leaves
                  the fleet, so its Leave warns and routes to the real exit. -->
-            <button class="btn small" title="Save this mesh's full settings to a file to import on another device" onclick={() => app.exportNetwork(n.config_id)}>Export</button>
+            <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
             {#if fleetMesh && !app.isFleetOwner}
               <button class="btn small locked" disabled title="The fleet's venue is set by the fleet owner — every device rides the owner's choice. Managers manage members, not core settings.">🔒 Venue</button>
             {:else}
@@ -378,6 +395,12 @@
     background: var(--accent-soft);
     border-color: var(--accent);
     color: var(--accent-ink);
+  }
+  /* Transient "Saved ✓" / "Exported ✓" confirmation (replaces a success toast). */
+  .btn.saved {
+    color: var(--ok);
+    border-color: color-mix(in oklab, var(--ok) 45%, transparent);
+    background: color-mix(in oklab, var(--ok) 14%, transparent);
   }
   .nets,
   .people {

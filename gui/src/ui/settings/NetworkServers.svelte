@@ -21,6 +21,9 @@
   let saving = $state(false);
   let advanced = $state(false);
   let saveAsName = $state("");
+  // Transient inline confirmations (replace success toasts).
+  let saved = $state(false);
+  let venueSaved = $state(false);
 
   const configs = $derived(app.networkConfigs);
   const selectedId = $derived(app.serversNetwork);
@@ -68,7 +71,10 @@
     if (!selectedId) return;
     saving = true;
     try {
-      await app.updateNetworkServers(selectedId, { signaling, stun, turn });
+      if (await app.updateNetworkServers(selectedId, { signaling, stun, turn })) {
+        saved = true;
+        setTimeout(() => (saved = false), 1600);
+      }
     } finally {
       saving = false;
     }
@@ -83,8 +89,9 @@
     }
     const v = app.saveServersAsVenue(selectedId, name);
     if (v) {
-      app.toast("ok", `Saved “${v.label}” — this mesh now calls out at it`);
       saveAsName = "";
+      venueSaved = true;
+      setTimeout(() => (venueSaved = false), 1600);
     }
   }
 </script>
@@ -198,12 +205,12 @@
 
           <div class="actions">
             <button class="btn small" onclick={applyDefaults}>Reset to MyOwnMesh defaults</button>
-            <button class="btn small primary" disabled={saving} onclick={save}>{saving ? "Saving…" : "Save & reconnect"}</button>
+            <button class="btn small primary" class:saved disabled={saving} onclick={save}>{saved ? "Saved ✓ — reconnecting" : saving ? "Saving…" : "Save & reconnect"}</button>
           </div>
 
           <div class="save-as">
             <input class="field" placeholder="Save these servers as a venue named…" bind:value={saveAsName} />
-            <button class="btn small" onclick={saveAsVenue}>Save as a venue</button>
+            <button class="btn small" class:saved={venueSaved} onclick={saveAsVenue}>{venueSaved ? "Saved ✓" : "Save as a venue"}</button>
           </div>
         {/if}
       </section>
@@ -214,6 +221,12 @@
 <style>
   .servers {
     padding-top: 0.6rem;
+  }
+  /* Transient "Saved ✓" confirmation (replaces a success toast). */
+  .btn.saved {
+    color: var(--ok);
+    border-color: color-mix(in oklab, var(--ok) 45%, transparent);
+    background: color-mix(in oklab, var(--ok) 14%, transparent);
   }
   .picker {
     display: flex;

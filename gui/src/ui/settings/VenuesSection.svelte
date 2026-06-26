@@ -176,7 +176,7 @@
         const v = venueFromExport(env);
         await app.saveVenue(v);
         if (v.url) await app.refreshVenue(v.id);
-        app.toast("ok", `Imported ${v.label}`);
+        // No toast — the imported venue appears as a row in the Venues list.
       })
       .catch((err) => app.toast("warn", `Couldn't read that file: ${String(err)}`));
   }

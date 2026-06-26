@@ -9,6 +9,8 @@
   const s = $derived(app.updateInfo);
   const pkg = $derived(s?.install_kind === "package_manager");
   const web = !isTauri();
+  // The result of the last "Check now", shown inline here instead of as a toast.
+  const checkResult = $derived(app.checkOutcomeText(app.updateOutcome));
 
   onMount(() => void app.loadUpdateStatus());
 
@@ -39,6 +41,10 @@
         {app.updateBusy ? "Checking…" : "Check now"}
       </button>
     </section>
+
+    {#if checkResult && !app.updateBusy}
+      <p class="check-result">{checkResult}</p>
+    {/if}
 
     {#if pkg}
       <section class="block">
@@ -148,6 +154,17 @@
   h3 {
     margin: 0 0 0.4rem;
     font-size: 1.2rem;
+  }
+  /* Inline result of the last "Check now" — replaces the old toast. */
+  .check-result {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink-soft);
+    margin: 0.5rem 0 0;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
   }
   .hint {
     font-size: 0.78rem;

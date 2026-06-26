@@ -33,7 +33,8 @@
     error = null;
     try {
       await p.run(code.trim());
-      app.toast("ok", `${p.title} ✓`);
+      // No toast — the prompt closing (and the fleet roster updating) is the
+      // confirmation; an error stays inline below.
       app.fleetCodePrompt = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);

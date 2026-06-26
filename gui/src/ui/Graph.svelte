@@ -526,7 +526,9 @@
       app.selectNode(n.id);
     } else {
       claimRevealed = null;
-      app.selectNode(app.selectedNodeId === n.id ? null : n.id);
+      // Clicking a device always selects it and keeps it selected — re-clicking
+      // the focused node no longer toggles it off (close the drawer to deselect).
+      app.selectNode(n.id);
     }
   }
 </script>

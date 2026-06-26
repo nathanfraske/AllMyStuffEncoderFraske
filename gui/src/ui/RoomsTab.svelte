@@ -85,9 +85,19 @@
     menuFor = roomId;
   }
 
-  function copyId(roomId: string) {
-    void app.copyRoomId(roomId);
-    menuFor = null;
+  // The room whose join id was just copied — its menu item flashes "Copied ✓"
+  // for a beat before the menu closes, instead of firing a toast.
+  let copiedId = $state<string | null>(null);
+  async function copyId(roomId: string) {
+    if (await app.copyRoomId(roomId)) {
+      copiedId = roomId;
+      setTimeout(() => {
+        if (copiedId === roomId) copiedId = null;
+        if (menuFor === roomId) menuFor = null;
+      }, 1100);
+    } else {
+      menuFor = null;
+    }
   }
 
   // Close the menu on any outside pointer-down (the button + the menu itself
@@ -236,11 +246,11 @@
             role="menu"
             style="right: {menuPos.right}px; bottom: {menuPos.bottom}px;"
           >
-            <button class="r-menu-item" role="menuitem" onclick={() => copyId(r.id)}>
-              <span class="rm-icon" aria-hidden="true">📋</span>
+            <button class="r-menu-item" class:copied={copiedId === r.id} role="menuitem" onclick={() => copyId(r.id)}>
+              <span class="rm-icon" aria-hidden="true">{copiedId === r.id ? "✓" : "📋"}</span>
               <span class="rm-text">
-                <span class="rm-label">Copy Join ID</span>
-                <span class="rm-sub">share it so a machine can ask in</span>
+                <span class="rm-label">{copiedId === r.id ? "Copied" : "Copy Join ID"}</span>
+                <span class="rm-sub">{copiedId === r.id ? "join id on your clipboard" : "share it so a machine can ask in"}</span>
               </span>
             </button>
             {#if joined}
@@ -518,6 +528,15 @@
   }
   .r-menu-item:hover {
     background: var(--surface-2);
+  }
+  /* The transient "Copied ✓" state after copying the join id. */
+  .r-menu-item.copied,
+  .r-menu-item.copied:hover {
+    background: color-mix(in oklab, var(--ok) 14%, transparent);
+  }
+  .r-menu-item.copied .rm-icon,
+  .r-menu-item.copied .rm-label {
+    color: var(--ok);
   }
   .rm-icon {
     font-size: 0.95rem;

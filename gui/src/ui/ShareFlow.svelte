@@ -142,7 +142,7 @@
                     : c.popout
                       ? `${c.label} (opens a popout)`
                       : c.label
-                  : `${c.label} — not offered by this device`}
+                  : (app.shareCapReason(sender, c.key) ?? `${c.label} — not offered by this device`)}
                 onclick={() => toggleCap(c.key)}
               >
                 <span class="cap-i" aria-hidden="true">{c.icon}</span>
@@ -158,7 +158,12 @@
         <div class="mid">
           <div class="arrows" aria-hidden="true">▶▶▶</div>
           <button class="btn primary start" disabled={!canStart} onclick={start}>🔗 Start Share</button>
-          <button class="btn ghost stop" onclick={() => app.stopShareFlow()}>⤓ Stop Share</button>
+          <button
+            class="btn ghost stop"
+            onclick={() => {
+              if (app.stopShareFlow() > 0) app.closeShareFlow();
+            }}
+          >⤓ Stop Share</button>
           <div class="dir">SENDER → RECEIVER</div>
         </div>
 
