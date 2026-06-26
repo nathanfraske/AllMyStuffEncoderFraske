@@ -99,6 +99,51 @@
     {/if}
   </section>
 
+  <!-- This machine's own exposed sites — always listed, even when their
+       server has gone offline, so an exposed port is never just a count
+       with nothing behind it. Open reaches the local service; Stop stops
+       advertising it to the fleet; a red dot flags one that isn't
+       responding. -->
+  {#if app.myExposedSites.length > 0}
+    <section class="block">
+      <h5 class="block-head">Exposed from this machine</h5>
+      <ul class="list">
+        {#each app.myExposedSites as site (site.id)}
+          <li class="row">
+            <span class="s-icon" aria-hidden="true">{siteIcon(site.scheme)}</span>
+            <span class="s-main">
+              <span class="s-name">
+                <span
+                  class="svc-dot"
+                  class:on={site.online}
+                  title={site.online ? "Service is responding" : "Service isn't responding — it's offline"}
+                ></span>
+                {site.name}<span class="s-port">:{site.port}</span>
+              </span>
+              <span class="s-sub">
+                {#if !site.online}<span class="tag bad">offline</span>{/if}
+                {#if site.loopback}<span class="tag">local-only</span>{/if}
+                {#if site.process}{site.process}{/if}
+              </span>
+            </span>
+            <div class="row-actions">
+              <button
+                class="btn small primary"
+                title="Open the local service in your browser"
+                onclick={() => app.openLocalSite(site)}>Open</button
+              >
+              <button
+                class="btn small ghost"
+                title="Stop exposing it to your fleet"
+                onclick={() => app.unexpose(site.id)}>Stop</button
+              >
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+
   <!-- This machine's services — collapsed by default. -->
   <section class="block ports">
     <button class="ports-head" aria-expanded={portsOpen} onclick={() => (portsOpen = !portsOpen)}>
@@ -288,6 +333,27 @@
     font-size: 0.62rem;
     font-weight: 700;
     color: var(--ink-faint);
+  }
+  /* "offline" tag on an exposed site whose server isn't responding. */
+  .tag.bad {
+    color: var(--danger);
+    border-color: color-mix(in oklab, var(--danger) 45%, transparent);
+    background: color-mix(in oklab, var(--danger) 12%, transparent);
+  }
+  /* Per-site health dot for this machine's exposed sites: green when the
+     service is responding, red when it's gone offline. */
+  .svc-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--danger);
+    margin-right: 0.35rem;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }
+  .svc-dot.on {
+    background: var(--ok);
   }
   .s-x {
     flex-shrink: 0;

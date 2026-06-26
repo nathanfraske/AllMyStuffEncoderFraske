@@ -151,9 +151,11 @@ import {
   isOlderVersion,
   networkDisplayName,
   siteIsWeb,
+  sitePort,
   type Capability,
   type Catalog,
   type CheckOutcome,
+  type ExposedSite,
   type Grant,
   type GrantRole,
   type IdentityInfo,
@@ -3119,6 +3121,41 @@ class AppStore {
     return out;
   });
 
+  /** This machine's exposed sites — the persisted exposure set joined with
+   *  the live scan, so each entry carries its current online status. An
+   *  entry stays here after its server stops listening (it just flips
+   *  `online` false); that's what lets the Sites tab keep an exposed-but-
+   *  offline site visible — with a red dot and a Stop control — instead of
+   *  leaving the "N exposed" count pointing at nothing. Sorted by port for
+   *  a stable order. */
+  myExposedSites = $derived.by<ExposedSite[]>(() => {
+    const live = new Map(this.myListening.map((s) => [s.id, s]));
+    return Object.entries(this.exposedSites)
+      .map(([id, name]): ExposedSite => {
+        const svc = live.get(id);
+        const port = svc?.port ?? sitePort(id);
+        return {
+          id,
+          name: name.trim() || (svc ? this.defaultSiteName(svc) : `Port ${port}`),
+          port,
+          scheme: svc?.scheme ?? "",
+          loopback: svc?.loopback ?? false,
+          process: svc?.process ?? "",
+          online: !!svc,
+        };
+      })
+      .sort((a, b) => a.port - b.port);
+  });
+
+  /** Open one of this machine's exposed sites in the system browser at its
+   *  local address. A web scheme opens as-is; anything else — or an unknown
+   *  scheme on a service that's gone offline — defaults to http so the
+   *  button always does something. */
+  openLocalSite(site: { scheme: string; port: number }) {
+    const scheme = siteIsWeb(site) ? site.scheme : "http";
+    void openExternal(`${scheme}://localhost:${site.port}`);
+  }
+
   /** The live mapping for one site, if this device has mapped it. */
   siteMappingFor(nodeId: string, siteId: string): SiteMapping | undefined {
     return this.siteMappings.find((m) => sameMachine(m.node, nodeId) && m.site === siteId);
@@ -3158,7 +3195,10 @@ class AppStore {
       { id: "tcp:8000", name: "HTTP", port: 8000, kind: "http", scheme: "http", loopback: true, process: "python", title: "" },
       { id: "tcp:22", name: "SSH", port: 22, kind: "ssh", scheme: "ssh", loopback: false, process: "sshd", title: "" },
     ];
-    this.exposedSites = { "tcp:5173": "My Project — Dev" };
+    // tcp:5173 is live (a row in `myListening`); tcp:3000 is exposed but no
+    // longer listening — it shows in "Exposed from this machine" with a red
+    // dot, demoing the offline case.
+    this.exposedSites = { "tcp:5173": "My Project — Dev", "tcp:3000": "Grafana" };
   }
 
   /** The default name to offer when exposing a discovered service: the page
