@@ -9,9 +9,9 @@
 # *just* `amst` and its desktop integration — separate from the main AllMyStuff
 # install, which it neither needs nor touches. It does rely on an AllMyStuff
 # node being present to actually reach machines; if none is running, `amst`
-# opens the desktop app to bring one up (never a silent headless node — that's
-# `allmystuff serve`, by hand), and tells you how to get AllMyStuff if it's
-# missing.
+# opens the desktop app to bring one up — or, on a headless box, starts a
+# headless node directly and says so — and tells you how to get AllMyStuff if
+# it's missing.
 #
 # POSIX sh-compatible (dash / busybox / bash). Avoid bash-only constructs.
 
@@ -241,7 +241,7 @@ ensure_on_path
 # opens the desktop app to bring one up — so check AllMyStuff is installed.
 if ! command -v allmystuff >/dev/null 2>&1 && ! command -v allmystuff-serve >/dev/null 2>&1; then
   warn "AllMyStuff isn't installed here. amst opens the desktop app to start a node"
-  warn "(or run it headless yourself with 'allmystuff serve') — either needs AllMyStuff."
+  warn "(or starts a headless one directly on a box with no app) — either needs AllMyStuff."
   warn "Install it:  curl -fsSL https://allmystuff.works/install.sh | sh"
 fi
 

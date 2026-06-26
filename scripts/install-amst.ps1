@@ -9,8 +9,8 @@
 # `amst` plus its desktop integration — a desktop + Start Menu shortcut and an
 # "AMSTerm here" right-click context menu — separate from the main AllMyStuff
 # install. It relies on an AllMyStuff node being present to reach machines; if
-# none is running, `amst` opens the desktop app to bring one up (never a silent
-# headless node — that's `allmystuff serve`, by hand).
+# none is running, `amst` opens the desktop app to bring one up — or, on a
+# headless box, starts a headless node directly and says so.
 
 [CmdletBinding()]
 param(
@@ -187,7 +187,7 @@ if (-not $NoDesktop) {
 if (-not (Get-Command allmystuff -ErrorAction SilentlyContinue) -and
     -not (Get-Command allmystuff-serve -ErrorAction SilentlyContinue)) {
     Warn "AllMyStuff isn't installed here. amst opens the desktop app to start a node"
-    Warn "(or run it headless yourself with 'allmystuff serve') - either needs AllMyStuff."
+    Warn "(or starts a headless one directly on a box with no app) - either needs AllMyStuff."
     Warn 'Install it:  irm https://allmystuff.works/install.ps1 | iex'
 }
 
