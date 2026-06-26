@@ -291,8 +291,28 @@
   // flows through app.selectedNodeId so the drawer always has one focused node;
   // these add the extra highlighted devices on top.
   let selectedIds = $state<Set<string>>(new Set());
+
+  // Live marquee preview — the devices currently inside the box, recomputed as
+  // it's dragged so the highlight tracks the rubber-band in real time. Folded
+  // into the selected look while dragging, then committed on release.
+  const marqueeHits = $derived.by((): Set<string> => {
+    const set = new Set<string>();
+    if (gesture?.kind !== "marquee") return set;
+    const x1 = Math.min(gesture.x0, gesture.x1);
+    const x2 = Math.max(gesture.x0, gesture.x1);
+    const y1 = Math.min(gesture.y0, gesture.y1);
+    const y2 = Math.max(gesture.y0, gesture.y1);
+    if (x2 - x1 < 4 && y2 - y1 < 4) return set;
+    for (const p of layout) {
+      const sx = p.x * zoom + panX;
+      const sy = p.y * zoom + panY;
+      if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) set.add(p.node.id);
+    }
+    return set;
+  });
+
   function isSelected(id: string): boolean {
-    return app.selectedNodeId === id || selectedIds.has(id);
+    return app.selectedNodeId === id || selectedIds.has(id) || marqueeHits.has(id);
   }
 
   // A left-drag that started on a device — used for drag-onto-another-device to
@@ -357,20 +377,12 @@
   }
   function onPointerUp(e: PointerEvent) {
     if (gesture?.kind === "marquee") {
-      // Select every device whose centre falls inside the box. A tiny box
-      // (a click that barely moved) selects nothing — it just clears, above.
-      const g = gesture;
-      const x1 = Math.min(g.x0, g.x1);
-      const x2 = Math.max(g.x0, g.x1);
-      const y1 = Math.min(g.y0, g.y1);
-      const y2 = Math.max(g.y0, g.y1);
-      if (x2 - x1 > 4 || y2 - y1 > 4) {
+      // Commit whatever the live preview is highlighting (read it before the
+      // gesture clears, since it's derived from the box).
+      const hits = marqueeHits;
+      if (hits.size > 0) {
         const next = new Set(selectedIds);
-        for (const p of layout) {
-          const sx = p.x * zoom + panX;
-          const sy = p.y * zoom + panY;
-          if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) next.add(p.node.id);
-        }
+        for (const id of hits) next.add(id);
         selectedIds = next;
         // Keep the drawer useful: focus the single marqueed device, if one.
         if (next.size === 1) app.selectNode([...next][0]);
