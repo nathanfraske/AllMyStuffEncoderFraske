@@ -199,6 +199,9 @@ export type SettingsTab =
 /** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
 export type NetworksSubtab = "status" | "servers" | "devices";
 
+/** A capability the Share Flow builder can switch on between two devices. */
+export type ShareCap = "audio" | "video" | "screens" | "files" | "terminal" | "sites";
+
 /** A device waiting to be let onto a network — surfaced across *all* joined
  *  networks for the "new device joining" approval nudge. */
 export interface PendingJoin {
@@ -382,6 +385,14 @@ class AppStore {
   manageShareNodeId = $state<string | null>(null);
   toasts = $state<Toast[]>([]);
   backendConnected = $state(false);
+
+  // ---- share flow builder (Sender → Receiver) ---------------------
+  /** The side-by-side share builder, when open. `sender` makes things
+   *  available; `receiver` gets them. Opened from "New Share" or by dragging
+   *  one device onto another on the graph. */
+  shareFlowOpen = $state(false);
+  shareFlowSender = $state<string | null>(null);
+  shareFlowReceiver = $state<string | null>(null);
 
   // ---- remote console (the pikvm-style session popup) -------------
   /** The remote machine a console session is open on, if any. */
@@ -1802,6 +1813,109 @@ class AppStore {
 
   dismissPendingShare() {
     this.pendingShare = null;
+  }
+
+  // ---- share flow builder ------------------------------------------
+  //
+  // The Sender → Receiver composer. It doesn't invent any new wiring: each
+  // media capability resolves the sender's source endpoint and the receiver's
+  // sink through `matchEndpoint`, then rides the ordinary `connect()` path
+  // (grants and all); the Files / Terminal / Sites toggles pop the existing
+  // host views for the sender.
+
+  /** Open the builder, optionally pre-filling the two sides. */
+  openShareFlow(sender?: string | null, receiver?: string | null) {
+    if (sender !== undefined) this.shareFlowSender = sender;
+    if (receiver !== undefined) this.shareFlowReceiver = receiver;
+    this.shareFlowOpen = true;
+  }
+  closeShareFlow() {
+    this.shareFlowOpen = false;
+  }
+
+  /** Whether the sender can actually offer a given capability — drives which
+   *  toggles are live (you can't share what isn't there). */
+  shareFlowCapAvailable(node: string | null, cap: ShareCap): boolean {
+    if (!node) return false;
+    const n = this.node(node);
+    if (!n) return false;
+    if (cap === "audio" || cap === "video" || cap === "screens") {
+      const media = cap === "screens" ? "display" : cap;
+      return !!matchEndpoint(this.catalog, node, media as MediaKind, "provide");
+    }
+    const feats = n.features ?? [];
+    if (cap === "files") return isAppNode(n) && feats.includes(FEATURE_FILES);
+    if (cap === "terminal") return isAppNode(n) && feats.includes(FEATURE_TERMINAL);
+    if (cap === "sites") return (n.sites?.length ?? 0) > 0;
+    return false;
+  }
+
+  /** Start the share: wire each chosen capability from sender to receiver.
+   *  Media caps connect through the normal route path; Files/Terminal/Sites
+   *  pop the sender's host view. Returns the count actually started. */
+  startShareFlow(caps: ShareCap[]): number {
+    const sender = this.shareFlowSender;
+    const receiver = this.shareFlowReceiver;
+    if (!sender || !receiver) {
+      this.toast("warn", "Pick a sender and a receiver first");
+      return 0;
+    }
+    if (sender === receiver) {
+      this.toast("warn", "A device can't share with itself");
+      return 0;
+    }
+    const mediaMap: Partial<Record<ShareCap, MediaKind>> = {
+      audio: "audio",
+      video: "video",
+      screens: "display",
+    };
+    let started = 0;
+    const skipped: string[] = [];
+    for (const cap of caps) {
+      const media = mediaMap[cap];
+      if (media) {
+        const src = matchEndpoint(this.catalog, sender, media, "provide");
+        const dst = matchEndpoint(this.catalog, receiver, media, "consume");
+        if (src && dst && this.connect(src.id, dst.id)) started++;
+        else skipped.push(cap);
+      } else if (cap === "files") {
+        this.openFiles(sender);
+        started++;
+      } else if (cap === "terminal") {
+        this.openTerminal(sender);
+        started++;
+      } else if (cap === "sites") {
+        const site = this.node(sender)?.sites?.[0];
+        if (site) {
+          void this.mapSite(sender, site);
+          started++;
+        } else skipped.push("sites");
+      }
+    }
+    if (started > 0) {
+      const sLabel = this.node(sender)?.label ?? "sender";
+      const rLabel = this.node(receiver)?.label ?? "receiver";
+      this.toast("ok", `Sharing ${sLabel} → ${rLabel} (${started} ${started === 1 ? "thing" : "things"})`);
+    }
+    if (skipped.length) this.toast("warn", `Couldn't start: ${skipped.join(", ")}`);
+    return started;
+  }
+
+  /** Stop everything riding between the two builder devices — every route from
+   *  the sender's endpoints to the receiver's. */
+  stopShareFlow() {
+    const sender = this.shareFlowSender;
+    const receiver = this.shareFlowReceiver;
+    if (!sender || !receiver) return;
+    const toDrop = this.catalog.routes.filter((r) => {
+      const from = this.capabilityForDisplay(r.from);
+      const to = this.capabilityForDisplay(r.to);
+      return (
+        from && to && sameMachine(from.node, sender) && sameMachine(to.node, receiver)
+      );
+    });
+    for (const r of toDrop) void this.disconnect(r.id);
+    this.toast(toDrop.length ? "info" : "warn", toDrop.length ? "Share stopped" : "Nothing to stop");
   }
 
   /** When a real backend is connected, fire the actual mesh route offer.

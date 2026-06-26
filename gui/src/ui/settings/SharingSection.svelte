@@ -38,6 +38,12 @@
     and you can take back any grant, or the whole connection, any time.
   </p>
 
+  <div class="new-share-row">
+    <button class="btn primary new-share" onclick={() => app.openShareFlow()}>
+      <span aria-hidden="true">＋</span> New Share
+    </button>
+  </div>
+
   {#if partners.length === 0}
     <div class="empty">
       <div class="glyph">🤝</div>
@@ -129,7 +135,18 @@
     color: var(--ink-soft);
     font-size: 0.84rem;
     line-height: 1.5;
+    margin: 0 0 0.9rem;
+  }
+  .new-share-row {
     margin: 0 0 1.1rem;
+  }
+  /* The builder's entry point — the sharing concept's violet, matching the
+     Start Share button inside the flow. */
+  .new-share.primary {
+    background: linear-gradient(180deg, var(--c-share-ink), var(--c-share));
+    border-color: var(--c-share);
+    box-shadow: var(--shadow-sm), 0 4px 12px -4px var(--c-share),
+      inset 0 1px 0 oklch(1 0 0 / 0.25);
   }
   .empty {
     text-align: center;

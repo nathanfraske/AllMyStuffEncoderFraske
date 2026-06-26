@@ -22,6 +22,7 @@
   import ClaimSheet from "./ClaimSheet.svelte";
   import FleetCodePrompt from "./FleetCodePrompt.svelte";
   import ShareSheet from "./ShareSheet.svelte";
+  import ShareFlow from "./ShareFlow.svelte";
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
   import Files from "./Files.svelte";
@@ -257,6 +258,7 @@
     {/key}
   {/if}
   <ShareSheet />
+  <ShareFlow />
   <Toasts />
 </div>
 {/if}
