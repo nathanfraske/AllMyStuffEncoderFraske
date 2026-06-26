@@ -714,6 +714,10 @@ class AppStore {
     if (!m) return null;
     if (m.role === "owner") return "owner";
     if (m.role === "controller") return "manager";
+    // The founding owner's member entry often isn't stamped with a role — the
+    // roster only carries `is_owner` for *this* device. Honour it so the owner
+    // machine reads as "owner", not a plain member, on its own screen.
+    if (this.isMe(deviceId) && this.isFleetOwner) return "owner";
     return "member";
   }
 
@@ -3310,7 +3314,9 @@ class AppStore {
       label: n.label,
       // This device founded the fleet; one other is a promoted co-owner — the
       // rest are plain members, so Promote has somewhere to go.
-      role: this.isMe(n.id) ? "owner" : n.id === "desk" ? "owner" : n.id === "tv" ? "controller" : "member",
+      // This device's owner role is left unstamped on purpose — it reads as
+      // owner via the roster's is_owner flag (the realistic backend shape).
+      role: this.isMe(n.id) ? undefined : n.id === "desk" ? "owner" : n.id === "tv" ? "controller" : "member",
     }));
     this.ownedFleet = {
       key: "demo-fleet-key-7f3a91c2",

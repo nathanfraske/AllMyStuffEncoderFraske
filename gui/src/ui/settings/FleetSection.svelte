@@ -87,8 +87,9 @@
   }
 
   // The owner(s) of the fleet — the founding machine and anyone promoted to
-  // co-owner. Promote *adds* a co-owner; it never hands the fleet away.
-  const owners = $derived(members.filter((m) => m.role === "owner"));
+  // co-owner. Use fleetRoleOf so the founding owner (whose member role often
+  // isn't stamped — it's known via is_owner) still counts.
+  const owners = $derived(members.filter((m) => app.fleetRoleOf(m.device) === "owner"));
 
   function memberName(m: { device: string; label: string }): string {
     return m.label || nodeLabel(m.device) || m.device.slice(0, 12);
@@ -243,8 +244,8 @@
         {#each members as m (m.device)}
           {@const live = nodeLabel(m.device)}
           {@const isSelf = app.isMe(m.device)}
-          {@const isOwner = m.role === "owner"}
-          {@const isManager = m.role === "controller"}
+          {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
+          {@const isManager = app.fleetRoleOf(m.device) === "manager"}
           <li class:owner={isOwner}>
             <button
               class="m-jump"
