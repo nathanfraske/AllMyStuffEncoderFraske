@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
-  import { displayName, mediaColor, humanBytes, isAppNode, type MediaKind } from "../types";
+  import { displayName, mediaColor, humanBytes, isAppNode, MEDIA, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
 
   // Canvas size tracked via ResizeObserver so the layout fits its
@@ -219,7 +219,7 @@
   // on. Curved + coloured by media, with parallel routes fanned apart.
   // Endpoints resolve through the display fallback so a live terminal
   // session (whose endpoints aren't catalog capabilities) draws its wire.
-  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string };
+  type Edge = { id: string; x1: number; y1: number; x2: number; y2: number; cx: number; cy: number; color: string; media: MediaKind };
   const edges = $derived.by((): Edge[] => {
     const pairCount = new Map<string, number>();
     const out: Edge[] = [];
@@ -249,10 +249,24 @@
         cx: mx + (-dy / len) * off,
         cy: my + (dx / len) * off,
         color: mediaColor(r.media as MediaKind),
+        media: r.media as MediaKind,
       });
     }
     return out;
   });
+
+  // A small label that follows the cursor along a connection wire, naming what
+  // flows down it (1–2 words). Placed in canvas coordinates so it sits right
+  // under the pointer — zero eye travel.
+  let lineTip = $state<{ x: number; y: number; text: string } | null>(null);
+  function onWireMove(e: PointerEvent, media: MediaKind) {
+    const rect = canvas?.getBoundingClientRect();
+    if (!rect) return;
+    lineTip = { x: e.clientX - rect.left, y: e.clientY - rect.top, text: MEDIA[media].label };
+  }
+  function onWireLeave() {
+    lineTip = null;
+  }
 
   // ---- pan / zoom ---------------------------------------------------
   let panX = $state(0);
@@ -397,6 +411,18 @@
           stroke={e.color}
           fill="none"
         />
+        <!-- A wide transparent hit path so hovering anywhere near the wire
+             raises its cursor-following media label. The edge layer is
+             aria-hidden; this is a decorative hover affordance. -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <path
+          class="wire-hit"
+          d="M {e.x1} {e.y1} Q {e.cx} {e.cy} {e.x2} {e.y2}"
+          fill="none"
+          onpointerenter={(ev) => onWireMove(ev, e.media)}
+          onpointermove={(ev) => onWireMove(ev, e.media)}
+          onpointerleave={onWireLeave}
+        />
       {/each}
     </g>
   </svg>
@@ -507,6 +533,10 @@
     {/each}
   </div>
 
+  {#if lineTip}
+    <div class="line-tip" style="left: {lineTip.x}px; top: {lineTip.y}px;">{lineTip.text}</div>
+  {/if}
+
   {#if app.catalog.nodes.length === 0}
     <div class="empty" aria-live="polite">
       <div class="empty-orb">🧦</div>
@@ -573,10 +603,35 @@
     opacity: 0.9;
     animation: flow 1.1s linear infinite;
   }
+  /* Invisible, fat hit target so the cursor-following label is easy to raise —
+     opts back into pointer events even though the edge layer ignores them. */
+  .wire-hit {
+    stroke: transparent;
+    stroke-width: 16;
+    pointer-events: stroke;
+    cursor: help;
+  }
   @keyframes flow {
     to {
       stroke-dashoffset: -30;
     }
+  }
+  /* The cursor-following wire label — a small black/grey tooltip naming what
+     flows down the wire, placed right under the pointer. */
+  .line-tip {
+    position: absolute;
+    z-index: 5;
+    transform: translate(-50%, calc(-100% - 0.5rem));
+    background: oklch(0.16 0.02 285 / 0.96);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.12rem 0.45rem;
+    font-size: 0.7rem;
+    font-weight: 650;
+    white-space: nowrap;
+    pointer-events: none;
+    box-shadow: var(--shadow-sm);
   }
   .nodes {
     position: absolute;
@@ -639,7 +694,8 @@
   }
   .node:hover {
     transform: translateY(-2px);
-    box-shadow: var(--shadow-lg);
+    box-shadow: var(--shadow-lg), 0 0 0 1px var(--accent-soft),
+      0 8px 30px -10px oklch(0.64 0.255 350 / 0.45);
   }
   .node.self {
     border-color: var(--accent);
