@@ -85,26 +85,8 @@
       </header>
 
       <div class="body">
-        <!-- Receiver (left) -->
-        <section class="col receiver">
-          <div class="col-kicker">Receiver</div>
-          <div class="col-sub">Device receiving the share</div>
-          {@render picker("receiver", receiver)}
-          <p class="note">
-            ⓘ The receiver can access whatever the sender makes available. Both
-            parties can revoke at any time.
-          </p>
-        </section>
-
-        <!-- Middle: direction + actions -->
-        <div class="mid">
-          <div class="arrows" aria-hidden="true">▼▼▼</div>
-          <button class="btn primary start" disabled={!canStart} onclick={start}>🔗 Start Share</button>
-          <button class="btn ghost stop" onclick={() => app.stopShareFlow()}>⤓ Stop Share</button>
-          <div class="dir">SENDER → RECEIVER</div>
-        </div>
-
-        <!-- Sender (right) -->
+        <!-- Sender (left) — the device making things available, plus the
+             capability switches. -->
         <section class="col sender">
           <div class="col-kicker">Sender</div>
           <div class="col-sub">Device sharing its stuff</div>
@@ -133,6 +115,25 @@
               </button>
             {/each}
           </div>
+        </section>
+
+        <!-- Middle: direction + actions -->
+        <div class="mid">
+          <div class="arrows" aria-hidden="true">▶▶▶</div>
+          <button class="btn primary start" disabled={!canStart} onclick={start}>🔗 Start Share</button>
+          <button class="btn ghost stop" onclick={() => app.stopShareFlow()}>⤓ Stop Share</button>
+          <div class="dir">SENDER → RECEIVER</div>
+        </div>
+
+        <!-- Receiver (right) -->
+        <section class="col receiver">
+          <div class="col-kicker">Receiver</div>
+          <div class="col-sub">Device receiving the share</div>
+          {@render picker("receiver", receiver)}
+          <p class="note">
+            ⓘ The receiver can access whatever the sender makes available. Both
+            parties can revoke at any time.
+          </p>
         </section>
       </div>
     </div>

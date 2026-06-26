@@ -315,10 +315,22 @@
     return app.selectedNodeId === id || selectedIds.has(id) || marqueeHits.has(id);
   }
 
-  // A left-drag that started on a device — used for drag-onto-another-device to
-  // open the share builder. `moved` tells a real drag from a plain click.
+  // A left-drag that started on a device — used for drag-onto-another-device (or
+  // fleet) to open the share builder. `moved` tells a real drag from a plain
+  // click. A ghost chip follows the cursor while it's in flight.
   let nodeDrag = $state<{ id: string; sx: number; sy: number; moved: boolean } | null>(null);
   let dragOverId = $state<string | null>(null);
+  let dragOverSection = $state<string | null>(null);
+  let dragLabel = $state("");
+  let dragPos = $state<{ x: number; y: number } | null>(null);
+
+  const dropTargetLabel = $derived.by(() => {
+    if (dragOverId) {
+      const t = app.node(dragOverId);
+      return t ? displayName(t) : "";
+    }
+    return dragOverSection ?? "";
+  });
 
   function canvasPoint(e: PointerEvent): { x: number; y: number } {
     const r = canvas?.getBoundingClientRect();
@@ -406,15 +418,25 @@
     if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
     e.stopPropagation();
     nodeDrag = { id: n.id, sx: e.clientX, sy: e.clientY, moved: false };
+    dragLabel = displayName(n);
+    dragPos = canvasPoint(e);
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
   }
   function onNodePointerMove(e: PointerEvent, n: MeshNode) {
     if (!nodeDrag || nodeDrag.id !== n.id) return;
     if (!nodeDrag.moved && Math.hypot(e.clientX - nodeDrag.sx, e.clientY - nodeDrag.sy) < 6) return;
     nodeDrag = { ...nodeDrag, moved: true };
-    const el = document.elementFromPoint(e.clientX, e.clientY)?.closest?.(".node");
-    const over = el?.getAttribute("data-node-id") ?? null;
-    dragOverId = over && over !== n.id ? over : null;
+    dragPos = canvasPoint(e);
+    // Hit-test what's under the cursor: another device, or a fleet band.
+    const hit = document.elementFromPoint(e.clientX, e.clientY);
+    const overNode = hit?.closest?.(".node")?.getAttribute("data-node-id") ?? null;
+    if (overNode && overNode !== n.id) {
+      dragOverId = overNode;
+      dragOverSection = null;
+    } else {
+      dragOverId = null;
+      dragOverSection = hit?.closest?.(".section")?.getAttribute("data-section-label") ?? null;
+    }
   }
   function onNodePointerUp(e: PointerEvent, n: MeshNode) {
     // Only act when this device actually started the gesture (a press that
@@ -426,14 +448,19 @@
     }
     if (!nodeDrag || nodeDrag.id !== n.id) return;
     const moved = nodeDrag.moved;
-    const over = dragOverId;
+    const overNode = dragOverId;
+    const overSection = dragOverSection;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
     nodeDrag = null;
     dragOverId = null;
+    dragOverSection = null;
+    dragPos = null;
     if (moved) {
-      // Dropped on another device: the dragged one is the sender, the target
-      // the receiver — open the builder primed that way.
-      if (over) app.openShareFlow(n.id, over);
+      // Dropped on another device → sender = dragged, receiver = target. Dropped
+      // on a fleet band → open the builder with the dragged device as sender and
+      // let you pick the receiver in that fleet.
+      if (overNode) app.openShareFlow(n.id, overNode);
+      else if (overSection) app.openShareFlow(n.id, null);
     } else {
       // Didn't move — it's a plain click: select (the old behaviour).
       onNodeClick(n);
@@ -559,6 +586,8 @@
         class="section"
         class:mine={s.key === "mine"}
         class:unknown={s.key === "unknown"}
+        class:dragover={dragOverSection === s.label}
+        data-section-label={s.label}
         style="left: {s.x}px; top: {s.y}px; width: {s.w}px; height: {s.h}px;"
       >
         <div class="section-head">
@@ -667,9 +696,14 @@
     ></div>
   {/if}
 
-  {#if nodeDrag?.moved}
-    <div class="drag-hint" class:ready={!!dragOverId}>
-      {dragOverId ? "Drop to build a share" : "Drag onto another device to share"}
+  {#if nodeDrag?.moved && dragPos}
+    <!-- The ghost that follows the cursor while a device is being dragged onto
+         another device or fleet to start a share. -->
+    <div class="ghost" class:ready={!!dropTargetLabel} style="left: {dragPos.x}px; top: {dragPos.y}px;">
+      <span class="ghost-card">🔗 {dragLabel}</span>
+      <span class="ghost-tip">
+        {dropTargetLabel ? `New share → ${dropTargetLabel}` : "Drop on a device or fleet to share"}
+      </span>
     </div>
   {/if}
 
@@ -757,25 +791,40 @@
     border-radius: 2px;
     pointer-events: none;
   }
-  /* The drag-to-share hint, pinned to the top of the graph while a node drag is
-     in flight. */
-  .drag-hint {
+  /* The drag-to-share ghost — a chip that rides the cursor with a tooltip
+     telling you a new share opens on drop. */
+  .ghost {
     position: absolute;
-    z-index: 7;
-    top: 0.8rem;
-    left: 50%;
-    transform: translateX(-50%);
+    z-index: 8;
+    transform: translate(14px, 14px);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    pointer-events: none;
+  }
+  .ghost-card {
+    align-self: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--c-share);
+    color: var(--ink);
+    border-radius: var(--r-md);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    box-shadow: var(--shadow-lg);
+  }
+  .ghost-tip {
+    align-self: flex-start;
     background: oklch(0.16 0.02 285 / 0.97);
     border: 1px solid var(--line-strong);
     color: var(--ink-soft);
     border-radius: var(--r-pill);
-    padding: 0.4rem 0.85rem;
-    font-size: 0.78rem;
+    padding: 0.18rem 0.55rem;
+    font-size: 0.7rem;
     font-weight: 650;
-    pointer-events: none;
-    box-shadow: var(--shadow-md);
+    box-shadow: var(--shadow-sm);
   }
-  .drag-hint.ready {
+  .ghost.ready .ghost-tip {
     border-color: var(--c-share);
     color: var(--c-share-ink);
     background: var(--c-share-soft);
@@ -917,6 +966,12 @@
   .section.unknown {
     border-style: dotted;
     background: transparent;
+  }
+  /* A fleet band lit as a share-drop target. */
+  .section.dragover {
+    border-color: var(--c-share);
+    border-style: solid;
+    background: var(--c-share-soft);
   }
   .section-head {
     position: absolute;
@@ -1094,10 +1149,11 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-lg);
   }
-  /* The device being dragged, and the one it's hovering over (the share-drop
-     target, in the sharing concept's violet). */
+  /* The device being dragged (the original stays in place; a ghost rides the
+     cursor), and the one it's hovering over — the share-drop target in the
+     sharing concept's violet. */
   .node.dragging-node {
-    opacity: 0.65;
+    opacity: 0.8;
     cursor: grabbing;
   }
   .node.dragover {

@@ -210,9 +210,13 @@
     addingGrant = false;
   }
 
-  function makeShared() {
+  // Open the Share Flow builder primed with this device: if it's yours it's the
+  // sender (it shares its stuff); if it's someone else's it's the receiver (you
+  // share your stuff to them), with this machine as the sender.
+  function addShare() {
     if (!node) return;
-    app.markShared(node.id);
+    if (st?.mine || st?.self) app.openShareFlow(node.id, null);
+    else app.openShareFlow(app.localId, node.id);
   }
   /** Adopt this device — gated: only takes if it's in claim mode (Task 4). */
   function claimThis() {
@@ -509,27 +513,27 @@
             same kind of authorization you'll use to share with people.
           </p>
           <button class="btn primary claim-go" onclick={claimThis}>Claim this device</button>
-          <button class="linklike" onclick={makeShared}>It's someone else's — I'm just sharing with them →</button>
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
         </div>
       {:else if st.kind === "theirs"}
         <p class="muted">
           This device already has an owner, so you can't adopt it. If they
           want to share it with you, you'll get exactly what they allow.
         </p>
-        <button class="linklike" onclick={makeShared}>I'm sharing with its owner →</button>
+        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
       {:else if st.kind === "free"}
         <p class="muted">
           This device hasn't been put up for adoption. You can't just take
           ownership — start AllMyStuff on it in claim mode (or toggle
           “allow adoption” there), then claim it from here.
         </p>
-        <button class="linklike" onclick={makeShared}>I'm sharing with someone →</button>
+        <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
       {:else}
         <p class="muted own-note">
           {st.self ? "This is you." : "Yours — it connects freely with everything else you own."}
         </p>
         {#if !st.self}
-          <button class="linklike" onclick={makeShared}>Actually, I'm sharing this with someone →</button>
+          <button class="btn small add-share" onclick={addShare}>＋ Add Share</button>
         {/if}
       {/if}
     </section>
@@ -974,11 +978,11 @@
     width: 100%;
     justify-content: center;
   }
-  .claim-card .linklike {
-    display: block;
+  .claim-card .add-share {
+    display: flex;
     width: 100%;
-    text-align: center;
-    color: var(--ink-soft);
+    justify-content: center;
+    margin-top: 0.6rem;
   }
   /* Fleet controls — its own block, distinct from the sharing block. */
   .fleet-ctl .hint.tiny {
@@ -1162,6 +1166,18 @@
   }
   .linklike:hover {
     text-decoration: underline;
+  }
+  /* Add Share — opens the builder, in the sharing concept's violet. */
+  .add-share {
+    margin-top: 0.5rem;
+    color: var(--c-share-ink);
+    border-color: var(--c-share);
+    background: var(--c-share-soft);
+  }
+  .add-share:hover {
+    background: var(--c-share-soft);
+    border-color: var(--c-share);
+    filter: brightness(1.1);
   }
   .fleet-ctl .fleet-settings {
     display: block;
