@@ -5037,6 +5037,25 @@ class AppStore {
     }
   }
 
+  /** Refresh the live and parked mesh lists *together*, assigning both within
+   *  one synchronous tick so a render can never catch them out of step. A
+   *  toggle flips a mesh between the two lists; refreshing them as two separate
+   *  awaited steps lets a render land in the gap — when enabling, the mesh is
+   *  already in `networks` but not yet gone from `disabledNets`, so the keyed
+   *  meshes menu sees it twice under the same network_id and throws
+   *  `each_key_duplicate`. Fetch both, then assign back-to-back. */
+  async refreshNetworkLists() {
+    if (!isTauri()) return;
+    try {
+      const [nets, disabled] = await Promise.all([meshNetworks(), disabledNetworks()]);
+      this.networks = nets ?? [];
+      this.disabledNets = disabled ?? [];
+    } catch (e) {
+      this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+    }
+    if (this.rosterNetwork) await this.refreshRoster(this.rosterNetwork);
+  }
+
   /** Switch a network off or back on **without deleting it** — the pill
    *  menu's toggle. Off = leave the daemon but park the full config (the
    *  roster file survives on disk); on = re-join from the parked config.
@@ -5049,9 +5068,9 @@ class AppStore {
     try {
       await setNetworkEnabled(key, on);
       // No toast — the mesh's switch flips and its row moves between the live
-      // and disabled lists.
-      await this.refreshNetworks();
-      await this.loadDisabledNetworks();
+      // and disabled lists. Refresh both lists in one tick so the row is never
+      // caught in both at once mid-swap (that duplicate key crashes the menu).
+      await this.refreshNetworkLists();
       // Driving a mesh on turns its venues back on if any were off, and shimmers
       // the venues pill so the change is seen. Disabling never touches a venue —
       // other meshes may still ride it, and turning one off is the user's call.
@@ -5122,8 +5141,7 @@ class AppStore {
       }
       // Re-sync regardless of partial failure so the pills/graph match reality
       // (a failed re-join leaves that mesh parked, recoverable from the menu).
-      await this.refreshNetworks();
-      await this.loadDisabledNetworks();
+      await this.refreshNetworkLists();
       await this.syncMeshGraph();
     } else {
       // Demo/web: nothing live to cycle, but play the sequence so the panel is

@@ -213,7 +213,11 @@
             <div class="card-title">{l.title}</div>
             <p class="card-blurb">{l.blurb}</p>
             <div class="card-chips">
-              {#each data.shown as c (c.label)}
+              <!-- Keyed by position, not label: these are a static, capped row
+                   of display chips, and labels aren't unique (two meshes/venues
+                   can share a name), which would otherwise crash with
+                   each_key_duplicate. Index is stable here and always unique. -->
+              {#each data.shown as c, i (i)}
                 <span class="dchiplet">{c.label}{#if c.tag}<span class="dchiplet-tag"> · {c.tag}</span>{/if}</span>
               {/each}
               {#if data.shown.length === 0}
