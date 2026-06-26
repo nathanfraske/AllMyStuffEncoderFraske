@@ -248,6 +248,36 @@ export interface SiteMapping {
   label: string;
 }
 
+/** One site *this* machine currently exposes to the fleet — the persisted
+ *  exposure (id + chosen name) joined with whatever the live scan still
+ *  knows about it. Unlike a raw `ListeningService`, an entry survives the
+ *  underlying server going offline (`online` flips false); the Sites tab
+ *  keeps showing it with a red dot and a Stop control, so an exposed port
+ *  is never a phantom in the count. UI-only, not on any wire. */
+export interface ExposedSite {
+  /** Site id (`tcp:<port>`). */
+  id: string;
+  /** The name advertised to the fleet (the chosen name, or a derived default). */
+  name: string;
+  port: number;
+  /** URL scheme from the live scan ("http", "ssh", …), "" when offline/unknown. */
+  scheme: string;
+  /** Whether the host bound it to loopback only — carried from the live scan. */
+  loopback: boolean;
+  /** The owning process, from the live scan; "" when offline/unknown. */
+  process: string;
+  /** `true` while the service is still listening (present in the live scan);
+   *  `false` once it's gone — what drives the row's red "offline" dot. */
+  online: boolean;
+}
+
+/** The TCP port encoded in a site id (`tcp:8080` → 8080), 0 if unparseable.
+ *  Lets an exposed-but-offline site — gone from the scan, so only its id
+ *  survives — still resolve a port to open / label by. */
+export function sitePort(id: string): number {
+  return Number.parseInt(id.slice(id.lastIndexOf(":") + 1), 10) || 0;
+}
+
 /** Whether a node is actually running AllMyStuff (vs. a bare mesh device).
  *  The local node and any node we've had presence from count as app nodes. */
 export function isAppNode(n: { kind?: NodeKind; app?: boolean }): boolean {
