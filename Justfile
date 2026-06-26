@@ -122,6 +122,13 @@ pull:
 checkout *args:
     @git checkout {{args}}
 
+# The one-liner clean start: stop the mesh stack, pull a pristine tree, then run
+# the app. `kill` and `pull` run first (in order), then `just dev` (the OS
+# variant resolves itself). `just go -- <args>` forwards to `dev`.
+[doc("just kill + just pull + just dev.")]
+go *ARGS: kill pull
+    @just dev {{ARGS}}
+
 fmt:
     @cargo fmt --all
 
