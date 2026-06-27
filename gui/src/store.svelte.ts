@@ -682,6 +682,12 @@ class AppStore {
    *  insists you're not. */
   inFleet = $derived.by(() => this.ownedFleet?.in_fleet === true);
 
+  /** This device's *own* role in the fleet ("owner" | "manager" | "member" |
+   *  null when not in one). Gates which governance controls are shown, matching
+   *  the backend's flat-tier authority: an owner can act on anyone, a manager on
+   *  managers and members, a member on no one. */
+  myFleetRole = $derived.by(() => this.fleetRoleOf(this.localId));
+
   /** Whether this device is the fleet owner (founder / key-holder). Only the
    *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
    *  backend enforces it; the UI gates to match so members aren't shown
