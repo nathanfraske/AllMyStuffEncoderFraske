@@ -1128,6 +1128,9 @@ impl Mesh {
             // The fleet **owner's** (person) name — never the owner device's
             // hostname. See [`Mesh::fleet_owner_name`].
             fleet_owner: self.fleet_owner_name(&label),
+            // An ordinary machine is not a KVM appliance — only a NanoKVM-class
+            // device (its Go mesh bridge) ever fills this in. See FEATURE_KVM.
+            kvm: None,
         }
     }
 
