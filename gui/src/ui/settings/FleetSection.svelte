@@ -276,7 +276,7 @@
                 title="Show this device on the graph — leaves Settings, then selects and centres it"
                 onclick={() => viewOnGraph(m.device)}
               >
-                👁 View
+                🔍 View
               </button>
               <!-- Controls reflect what the mesh layer actually enforces (these
                    are MyOwnMesh's closed-network roles): only an owner can make
