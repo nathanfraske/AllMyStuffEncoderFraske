@@ -6057,7 +6057,17 @@ class AppStore {
     for (const n of this.catalog.nodes) {
       if (n.kind === "this" || this.isMe(n.id)) continue;
       if (n.relationship.kind === "mine") continue;
-      const share = byPerson.get(this.personFor(n).id);
+      // Match the node's *own* pubkey first, then its fleet/person. An inbound
+      // share is keyed by the **sending device's** pubkey — the trust rule binds
+      // a peer only to its own node — which is the device's own id, not its
+      // fleet owner. Matching only by `personFor` (owner-based) meant a share
+      // from a *non-owner* fleet device (a manager, say) never landed on that
+      // device's node, so the receiver never reclassified it shared, never grew
+      // the provide-grant the console buttons read, and never redrew. Checking
+      // the node's own id first also gives it *its own* grants (device-scoped),
+      // not a sibling's, when several of a fleet's devices share separately.
+      const share =
+        byPerson.get(`person:${canonicalNodeId(n.id)}`) ?? byPerson.get(this.personFor(n).id);
       if (share) {
         n.relationship = { kind: "shared", person: share.person, grants: [...share.grants] };
       }
