@@ -378,6 +378,10 @@ class AppStore {
 
   // ---- interaction state ------------------------------------------
   selectedNodeId = $state<string | null>(null);
+  /** A "centre the graph on this node" request. Bumped by [`focusNode`]; the
+   *  graph watches the `seq` and pans to the node once per new request (so a
+   *  repeat focus of the same node still re-centres). Null = nothing pending. */
+  focusRequest = $state<{ id: string; seq: number } | null>(null);
   /** Capability the user is dragging a wire from, if any. */
   dragFrom = $state<string | null>(null);
   pendingShare = $state<PendingShare | null>(null);
@@ -1700,6 +1704,21 @@ class AppStore {
   // ---- selection ---------------------------------------------------
   selectNode(id: string | null) {
     this.selectedNodeId = id;
+  }
+
+  /** "Show me this device": the one entry point the settings lists use to take
+   *  you to a node on the graph. Resolves the id canonically first — a roster or
+   *  presence id can be a different *form* of the same machine's id than the one
+   *  the graph lays out under, so selecting the raw id would highlight nothing —
+   *  then selects it, asks the graph to centre on it, and leaves Settings so it's
+   *  actually visible. A no-op selection (id resolves to no live node) still
+   *  closes settings and selects the id, so the drawer can show what it knows. */
+  focusNode(idOrDevice: string) {
+    const n = this.machineByAnyId(idOrDevice);
+    const id = n?.id ?? idOrDevice;
+    this.selectedNodeId = id;
+    this.focusRequest = { id, seq: (this.focusRequest?.seq ?? 0) + 1 };
+    this.settingsOpen = false;
   }
 
   // ---- connecting --------------------------------------------------

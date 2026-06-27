@@ -419,23 +419,23 @@
         {:else if st.iAmFleetOwner}
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
           <div class="fleet-actions">
-            {#if st.role === "member"}
-              <button class="btn small" title="A manager can admit devices to the fleet" onclick={() => app.grantFleetRole(node.id, "manager")}>Make manager</button>
-            {/if}
-            {#if st.role !== "owner"}
-              <button class="btn small" title="An owner has full fleet authority and co-signs governance" onclick={() => app.grantFleetRole(node.id, "owner")}>Make owner</button>
-            {/if}
-            {#if st.role === "manager"}
-              <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw manager</button>
-            {/if}
+            <!-- Staged, same as the Fleet settings list: a member is promoted to
+                 manager first, a manager to owner, with a matching step-down — so
+                 each authority layer is added and withdrawn the same way. -->
             {#if st.role === "owner"}
-              <button class="btn small" onclick={() => app.withdrawFleetRole(node.id)}>Withdraw owner</button>
+              <button class="btn small" title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority" onclick={() => app.grantFleetRole(node.id, "manager")}>⤓ Make manager</button>
+            {:else if st.role === "manager"}
+              <button class="btn small" title="Promote this manager to a co-owner — full fleet authority alongside you" onclick={() => app.grantFleetRole(node.id, "owner")}>★ Make owner</button>
+              <button class="btn small" title="Withdraw this manager back to a plain member" onclick={() => app.withdrawFleetRole(node.id)}>⤓ Make member</button>
+            {:else}
+              <button class="btn small" title="Promote this member to a manager — they can admit members. Promote again to make them a co-owner." onclick={() => app.grantFleetRole(node.id, "manager")}>★ Make manager</button>
             {/if}
             <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
           </div>
           <p class="hint tiny">
             A <b>manager</b> can admit devices; an <b>owner</b> has full
-            authority. Withdrawing returns them to a plain member.
+            authority. Promote stages up one layer at a time; withdrawing steps
+            back down the same way.
           </p>
         {:else}
           <p class="hint">

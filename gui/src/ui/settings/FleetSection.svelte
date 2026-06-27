@@ -101,11 +101,13 @@
     return nodeLabel(m.device) || m.label || m.device.slice(0, 12);
   }
 
-  // Jump to a fleet device on the graph: select it (the drawer + graph focus
-  // it) and close settings. Right-click does the same (parity).
-  function jumpToDevice(device: string) {
-    app.selectNode(device);
-    app.settingsOpen = false;
+  // "View on the graph" — the explicit way out of Settings to a device. Clicking
+  // a row no longer yanks you to the graph; this dedicated button does. It
+  // resolves the roster id to the live node first (a roster id is often a
+  // different *form* of the same machine's id than the graph lays out under, so
+  // selecting the raw id highlighted nothing), then selects and centres it.
+  function viewOnGraph(device: string) {
+    app.focusNode(device);
   }
 
   // Roles are layered, and each layer is added — and withdrawn — one step at a
@@ -258,12 +260,7 @@
           {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
           {@const isManager = app.fleetRoleOf(m.device) === "manager"}
           <li class:owner={isOwner}>
-            <button
-              class="m-jump"
-              title="Show this device on the graph"
-              onclick={() => jumpToDevice(m.device)}
-              oncontextmenu={(e) => { e.preventDefault(); jumpToDevice(m.device); }}
-            >
+            <div class="m-id-wrap">
               <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
               <div class="m-id">
                 <div class="m-name">
@@ -274,9 +271,16 @@
                 </div>
                 <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
               </div>
-            </button>
-            {#if app.isFleetOwner && !isSelf}
-              <div class="m-actions">
+            </div>
+            <div class="m-actions">
+              <button
+                class="role-btn"
+                title="Show this device on the graph — leaves Settings, then selects and centres it"
+                onclick={() => viewOnGraph(m.device)}
+              >
+                👁 View
+              </button>
+              {#if app.isFleetOwner && !isSelf}
                 {#if isOwner}
                   <button
                     class="role-btn down"
@@ -317,8 +321,8 @@
                 >
                   {armed === m.device ? "Evict — sure?" : "Evict"}
                 </button>
-              </div>
-            {/if}
+              {/if}
+            </div>
           </li>
         {/each}
       </ul>
@@ -567,23 +571,15 @@
   .members li.owner {
     box-shadow: inset 2px 0 0 var(--c-fleet);
   }
-  /* The identity is a button — clicking (or right-clicking) jumps to the
-     device on the graph. */
-  .m-jump {
+  /* The identity is display-only now — clicking it no longer yanks you out to
+     the graph. The explicit "View" button in the actions does that instead. */
+  .m-id-wrap {
     flex: 1;
     min-width: 0;
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    border: none;
-    background: none;
-    text-align: left;
     padding: 0.2rem 0.5rem;
-    border-radius: var(--r-sm);
-    color: inherit;
-  }
-  .m-jump:hover {
-    background: var(--surface);
   }
   .m-avatar {
     font-size: 1.2rem;
