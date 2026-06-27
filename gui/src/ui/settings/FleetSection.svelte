@@ -110,15 +110,12 @@
     app.focusNode(device);
   }
 
-  // Roles are layered, and each layer is added — and withdrawn — one step at a
-  // time, so it works the same as the meshes' device controls. Promote stages
-  // up: a plain member becomes a Manager first (can admit members), and only a
-  // Manager is promoted again to a co-owner (full authority alongside you, not a
-  // transfer). Withdraw stages back down the same way: an Owner steps back to
-  // Manager, a Manager back to a plain Member. The backend enforces the
-  // flat-tier authority — a manager can promote/withdraw managers and members,
-  // any owner can promote/withdraw any owner, a member can do neither — so the
-  // buttons above are gated to the same rule and we just float the proposal.
+  // Roles are layered: promote stages a member up to Manager, then a Manager to
+  // co-owner, with a matching step-down. The mesh layer (MyOwnMesh's closed-
+  // network governance) is the authority, so the buttons are gated to exactly
+  // what it enforces — only an owner can grant or withdraw a manager or owner,
+  // and an owner or manager can evict a member — and we just float the signed
+  // proposal for the daemon to ratify.
   function promoteToManager(device: string) {
     void app.grantFleetRole(device, "manager");
   }
@@ -281,33 +278,34 @@
               >
                 👁 View
               </button>
-              <!-- Controls reflect *your* authority: an owner can act on
-                   anyone, a manager on managers and members, a member on no one.
-                   So you can only reach an owner if you're an owner, and only
-                   mint an owner (Make owner) if you're an owner. -->
+              <!-- Controls reflect what the mesh layer actually enforces (these
+                   are MyOwnMesh's closed-network roles): only an owner can make
+                   or withdraw managers and owners; a manager (controller) can
+                   only evict a member; a member changes nothing. Evicting an
+                   owner outright needs every owner's consent, so it isn't
+                   offered — step an owner down to manager first, then evict. -->
               {#if !isSelf}
-                {@const iManage = app.myFleetRole === "owner" || app.myFleetRole === "manager"}
                 {@const iOwn = app.myFleetRole === "owner"}
-                {@const canActHere = isOwner ? iOwn : iManage}
-                {#if canActHere}
-                  {#if isOwner}
+                {@const iManage = iOwn || app.myFleetRole === "manager"}
+                {#if isOwner}
+                  {#if iOwn}
                     <button
                       class="role-btn down"
-                      title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Withdraws one layer.)"
+                      title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent, so step them down first.)"
                       onclick={() => demoteToManager(m.device)}
                     >
                       ⤓ Make manager
                     </button>
-                  {:else if isManager}
-                    {#if iOwn}
-                      <button
-                        class="role-btn up"
-                        title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner."
-                        onclick={() => promoteToOwner(m.device)}
-                      >
-                        ★ Make owner
-                      </button>
-                    {/if}
+                  {/if}
+                {:else if isManager}
+                  {#if iOwn}
+                    <button
+                      class="role-btn up"
+                      title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner."
+                      onclick={() => promoteToOwner(m.device)}
+                    >
+                      ★ Make owner
+                    </button>
                     <button
                       class="role-btn down"
                       title="Withdraw this manager back to a plain member — they keep fleet membership but lose authority to admit members."
@@ -315,23 +313,35 @@
                     >
                       ⤓ Make member
                     </button>
-                  {:else}
+                    <button
+                      class="kick"
+                      class:armed={armed === m.device}
+                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                    >
+                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                    </button>
+                  {/if}
+                {:else}
+                  {#if iOwn}
                     <button
                       class="role-btn up"
-                      title="Promote this member to a manager — they can admit members. Promote again afterwards to make them a co-owner."
+                      title="Promote this member to a manager — they can admit members. Promote again afterwards to make them a co-owner. (Only an owner can promote.)"
                       onclick={() => promoteToManager(m.device)}
                     >
                       ★ Make manager
                     </button>
                   {/if}
-                  <button
-                    class="kick"
-                    class:armed={armed === m.device}
-                    title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
-                    onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
-                  >
-                    {armed === m.device ? "Evict — sure?" : "Evict"}
-                  </button>
+                  {#if iManage}
+                    <button
+                      class="kick"
+                      class:armed={armed === m.device}
+                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                    >
+                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                    </button>
+                  {/if}
                 {/if}
               {/if}
             </div>
@@ -340,14 +350,13 @@
       </ul>
       {#if app.myFleetRole === "manager"}
         <p class="hint">
-          As a manager you can admit, promote, withdraw and evict managers and
-          members — but only an owner can make or remove an owner. This device
-          can leave on its own below.
+          As a manager you can evict a member; promoting and withdrawing roles
+          is the owner's call. This device can leave on its own below.
         </p>
       {:else if app.myFleetRole !== "owner"}
         <p class="hint">
-          Only managers and owners can change roles or evict a device. This
-          device can leave on its own below.
+          Only an owner can change roles; an owner or a manager can evict a
+          member. This device can leave on its own below.
         </p>
       {/if}
     </section>

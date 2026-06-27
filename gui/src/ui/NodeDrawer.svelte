@@ -387,12 +387,13 @@
          device for adoption, leave the fleet, and (as owner) hand out manager
          / owner authority. -->
     {#if st && st.app && (st.self || st.inFleet)}
-      <!-- Controls reflect *your* authority: an owner can act on anyone, a
-           manager on managers and members, a member on no one. So `canActHere`
-           gates the whole control set, and "Make owner" is owner-only. -->
-      {@const iManage = app.myFleetRole === "owner" || app.myFleetRole === "manager"}
+      <!-- Controls reflect what the mesh layer actually enforces: only an owner
+           can grant or withdraw a manager or owner; a manager (controller) can
+           only evict a member. So acting on a manager/owner needs owner
+           authority, while acting on a member needs owner-or-manager. -->
       {@const iOwn = app.myFleetRole === "owner"}
-      {@const canActHere = st.role === "owner" ? iOwn : iManage}
+      {@const iManage = iOwn || app.myFleetRole === "manager"}
+      {@const canActHere = st.role === "owner" || st.role === "manager" ? iOwn : iManage}
       <section class="block fleet-ctl">
         <div class="block-head">
           <h4>🔗 Fleet</h4>
@@ -425,34 +426,35 @@
         {:else if canActHere}
           <p class="hint">Manage {displayName(node)}'s authority in your fleet.</p>
           <div class="fleet-actions">
-            <!-- Staged, same as the Fleet settings list: a member is promoted to
-                 manager first, a manager to owner, with a matching step-down — so
-                 each authority layer is added and withdrawn the same way. "Make
-                 owner" is owner-only; managers stage up to manager. -->
+            <!-- Staged, same as the Fleet settings list, gated to what the mesh
+                 enforces: only an owner grants/withdraws managers and owners;
+                 evicting an owner needs every owner's consent, so step them down
+                 to manager first rather than evicting outright. -->
             {#if st.role === "owner"}
-              <button class="btn small" title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority" onclick={() => app.grantFleetRole(node.id, "manager")}>⤓ Make manager</button>
+              <button class="btn small" title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent.)" onclick={() => app.grantFleetRole(node.id, "manager")}>⤓ Make manager</button>
             {:else if st.role === "manager"}
-              {#if iOwn}
-                <button class="btn small" title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner." onclick={() => app.grantFleetRole(node.id, "owner")}>★ Make owner</button>
-              {/if}
+              <button class="btn small" title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner." onclick={() => app.grantFleetRole(node.id, "owner")}>★ Make owner</button>
               <button class="btn small" title="Withdraw this manager back to a plain member" onclick={() => app.withdrawFleetRole(node.id)}>⤓ Make member</button>
+              <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
             {:else}
-              <button class="btn small" title="Promote this member to a manager — they can admit members. Promote again to make them a co-owner." onclick={() => app.grantFleetRole(node.id, "manager")}>★ Make manager</button>
+              {#if iOwn}
+                <button class="btn small" title="Promote this member to a manager — they can admit members. Promote again to make them a co-owner. (Only an owner can promote.)" onclick={() => app.grantFleetRole(node.id, "manager")}>★ Make manager</button>
+              {/if}
+              <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
             {/if}
-            <button class="btn small danger" title="Evict — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere" onclick={() => app.kickFleetMember(node.id)}>Evict</button>
           </div>
           <p class="hint tiny">
-            A <b>manager</b> can admit devices and manage managers + members; an
-            <b>owner</b> has full authority. Promote stages up one layer at a
-            time; withdrawing steps back down the same way.
+            A <b>manager</b> can admit and evict members; an <b>owner</b> has
+            full authority over roles. Promote stages up one layer at a time;
+            withdrawing steps back down the same way.
           </p>
         {:else}
           <p class="hint">
             In your fleet{#if st.role && st.role !== "member"} as <b>{st.role}</b>{/if}.
-            {#if st.role === "owner" && app.myFleetRole === "manager"}
-              Only an owner can change another owner's role.
+            {#if app.myFleetRole === "manager"}
+              Only an owner can change a manager's or owner's role.
             {:else}
-              Only managers and owners can change roles.
+              Only an owner can change roles; an owner or manager can evict a member.
             {/if}
           </p>
         {/if}
