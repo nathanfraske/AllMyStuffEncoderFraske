@@ -29,9 +29,9 @@ use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
-    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl,
-    SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS, PROTOCOL_VERSION,
+    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
+    SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA,
+    CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -3147,11 +3147,7 @@ impl Mesh {
     /// re-advertising its new owner. A send the daemon couldn't deliver is
     /// surfaced so the UI can say so rather than leaving the ask hanging.
     pub async fn kvm_attach(self: &Arc<Self>, node: String, target: String) -> Result<(), String> {
-        tracing::info!(
-            "pointing KVM {} at {}",
-            short_id(&node),
-            short_id(&target)
-        );
+        tracing::info!("pointing KVM {} at {}", short_id(&node), short_id(&target));
         let msg = ControlMessage::Kvm(KvmControl::Attach {
             node: target.into(),
         });

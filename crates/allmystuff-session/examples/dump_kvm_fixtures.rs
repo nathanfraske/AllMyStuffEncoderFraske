@@ -228,7 +228,11 @@ fn main() {
     );
     fixtures.insert(
         "site_frame_close",
-        to_value(&SiteFrame::new(site_route.id.clone(), 3, SiteEvent::Close { conn: 1 })),
+        to_value(&SiteFrame::new(
+            site_route.id.clone(),
+            3,
+            SiteEvent::Close { conn: 1 },
+        )),
     );
 
     // -- the daemon control socket (line-delimited JSON) ----------------
@@ -262,7 +266,10 @@ fn main() {
             }),
         }),
     );
-    fixtures.insert("response_ok", to_value(&Response::ok(json!({"client_id": "c7"}))));
+    fixtures.insert(
+        "response_ok",
+        to_value(&Response::ok(json!({"client_id": "c7"}))),
+    );
     fixtures.insert(
         "server_out_channel_inbound",
         to_value(&ServerOut::ChannelInbound {

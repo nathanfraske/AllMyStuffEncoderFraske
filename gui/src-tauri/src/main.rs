@@ -190,7 +190,11 @@ async fn set_claimable(state: State<'_, AppState>, claimable: bool) -> Result<bo
 /// KVM enforces owner/fleet before applying, then re-advertises its new
 /// binding — that presence is the confirmation, exactly as a claim confirms.
 #[tauri::command]
-async fn kvm_attach(state: State<'_, AppState>, node: String, target: String) -> Result<(), String> {
+async fn kvm_attach(
+    state: State<'_, AppState>,
+    node: String,
+    target: String,
+) -> Result<(), String> {
     state
         .node
         .request("kvm_attach", json!({ "node": node, "target": target }))
