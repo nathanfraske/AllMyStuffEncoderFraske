@@ -591,7 +591,8 @@ impl Mesh {
             .map_err(|e| e.to_string())
     }
 
-    /// The network to reach `peer` on: the one we last saw them advertise on,
+    /// The network to reach `peer` on: the one we last saw them on (an inbound
+    /// app frame, or the daemon's peer list — see [`Mesh::refresh_peer_networks`]),
     /// falling back to the primary. This is what lets a connection cross to a
     /// peer that only shares a secondary network with us.
     fn network_for_peer(&self, peer: &str) -> Option<String> {
@@ -600,6 +601,52 @@ impl Mesh {
             .get(pubkey_part(peer))
             .cloned()
             .or_else(|| st.network.clone())
+    }
+
+    /// Seed `peer_networks` from the daemon's per-network peer list — the same
+    /// reliable view the graph reads a peer's "online + on AllMyStuff" from.
+    ///
+    /// [`Mesh::network_for_peer`] otherwise learns a peer's network *only* from an
+    /// inbound app frame (its presence advert, a route `Accept`, …). A peer the
+    /// daemon already reports connected — so it shows online and, via its
+    /// advertised endpoints, fully wireable — but that we have not yet heard from
+    /// directly has no entry, so `network_for_peer` falls back to the **primary**
+    /// network. A peer that shares only a **secondary** mesh then has every
+    /// control/media frame addressed to the wrong network, where the daemon
+    /// silently drops it: the machine "shows up online, in the graph, but the
+    /// console wires up with no audio or video, and nothing else reaches it
+    /// either." Learning the network from the peer list closes that gap — the
+    /// first offer/update already lands on the right mesh, and the peer's reply
+    /// keeps the mapping fresh thereafter.
+    ///
+    /// Records only a network the daemon reports the peer **reachable** on, and
+    /// never clobbers one already learned from an inbound frame (that one is
+    /// proven to carry traffic to us) — it just fills the gap. The stored id is
+    /// the network's `config_id`, matching what an inbound frame records and what
+    /// [`Mesh::prune_unjoined_peers`] reconciles against.
+    async fn refresh_peer_networks(self: &Arc<Self>) {
+        let networks = { self.state.lock().networks.clone() };
+        for network in networks {
+            let Ok(resp) = self
+                .client
+                .request(&Request::PeersList {
+                    network: network.clone(),
+                })
+                .await
+            else {
+                continue;
+            };
+            let Some(peers) = resp
+                .data
+                .as_ref()
+                .and_then(|d| d.get("peers"))
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            let mut st = self.state.lock();
+            seed_peer_networks(&mut st.peer_networks, peers, &network);
+        }
     }
 
     /// This node's mesh id once known (the daemon device id), else `None`.
@@ -688,6 +735,12 @@ impl Mesh {
             // secondary network had no subscriber on the receiving side and
             // the daemon silently dropped it.
             self.subscribe_channels(client_id, &networks).await;
+            // Learn which network each *already-connected* peer lives on from the
+            // daemon's peer list (their "approved" events fired before we
+            // subscribed, so we'd otherwise only learn it once they send us a
+            // frame). Without this the first offer/update to a peer that shares
+            // only a secondary mesh is addressed to the primary and dropped.
+            self.refresh_peer_networks().await;
             // App-load trigger of the claim-status check: sanitize stale
             // fleet residue, then assert presence + roster to everyone.
             self.ownership_check(None).await;
@@ -1100,6 +1153,12 @@ impl Mesh {
                             let mesh = self.clone();
                             let device = device.to_string();
                             crate::spawn(async move {
+                                // Record which network this peer just went live on
+                                // *before* anything is sent to it (the ownership
+                                // check below included): otherwise the very first
+                                // frame to a peer sharing only a secondary mesh
+                                // falls back to the primary network and is dropped.
+                                mesh.refresh_peer_networks().await;
                                 mesh.ownership_check(Some(&device)).await;
                             });
                         }
@@ -3426,6 +3485,11 @@ impl Mesh {
         // [`Mesh::prune_unjoined_peers`]).
         self.prune_unjoined_peers().await;
         self.subscribe_channels(client_id, &networks).await;
+        // The joined set changed — re-learn each connected peer's network from
+        // the daemon peer list so a peer reachable only on a newly-arrived or
+        // re-enabled mesh (e.g. the fleet network) is addressed there, not the
+        // primary fallback.
+        self.refresh_peer_networks().await;
         // The joined set just changed (a create / join / import / re-enable, or
         // the fleet network arriving). Reconcile open-mesh policy now so a mesh
         // doesn't wait for the next ownership broadcast to drop its approval
@@ -6703,6 +6767,33 @@ fn pubkey_part(id: &str) -> &str {
     id
 }
 
+/// Fold one network's daemon peer list into the `pubkey → network` map that
+/// [`Mesh::network_for_peer`] addresses control/media with. Each peer the daemon
+/// reports **reachable** (`active`/`shelved` — the same cut the graph reads
+/// "online" from) learns *this* network as where to address it, keyed by
+/// canonical pubkey and only when it has no network yet: a mapping already
+/// learned from an inbound frame is proven to carry traffic to us and must win,
+/// so this only *fills the gap* for a peer the daemon reports connected but that
+/// we have not yet heard from directly. Pure (no daemon, no lock) so the
+/// reachable-only / gap-fill / canonical-key rules are unit-tested. See
+/// [`Mesh::refresh_peer_networks`] for why the gap is what stranded a peer
+/// sharing only a secondary mesh.
+fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], network: &str) {
+    for p in peers {
+        let reachable = p
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "active" || s == "shelved");
+        if !reachable {
+            continue;
+        }
+        if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {
+            map.entry(pubkey_part(id).to_string())
+                .or_insert_with(|| network.to_string());
+        }
+    }
+}
+
 /// A fresh opaque fetch token for one shared file — 16 random bytes as
 /// hex, so it can't be guessed and never leaks the path it stands for.
 fn fresh_share_token() -> String {
@@ -7048,6 +7139,37 @@ mod tests {
         // (the media is part of the contract, not just the suffix).
         let display = term_route("host:terminal", "me:term-view:1", MediaKind::Display);
         assert!(!is_terminal_route(&display));
+    }
+
+    #[test]
+    fn seed_peer_networks_fills_gaps_for_reachable_peers_only() {
+        use serde_json::json;
+        let mut map: HashMap<String, String> = HashMap::new();
+        // An inbound frame already proved this peer reachable on the fleet mesh —
+        // that mapping carries traffic to us and must survive the peer-list seed.
+        map.insert("alice".into(), "fleet".into());
+        let peers = vec![
+            // alice is also listed on the public mesh, but her proven mapping stands.
+            json!({ "device_id": "alice-AB12C", "status": "active" }),
+            // bob is reachable here and unknown to us → learns this network instead
+            // of falling back to the primary (the bug: a secondary-only peer shows
+            // online + wireable yet every frame went to the wrong mesh).
+            json!({ "device_id": "bob-9Z8Y7", "status": "active" }),
+            // shelved keeps its data channel open, so it is reachable too.
+            json!({ "device_id": "carol", "status": "shelved" }),
+            // not reachable yet → no mapping (addressing it now would mis-route).
+            json!({ "device_id": "dave", "status": "handshaking" }),
+            json!({ "device_id": "erin", "status": "offline" }),
+        ];
+        seed_peer_networks(&mut map, &peers, "public");
+        // Proven inbound mapping is never clobbered…
+        assert_eq!(map.get("alice").map(String::as_str), Some("fleet"));
+        // …a gap is filled, keyed by canonical pubkey (suffix stripped)…
+        assert_eq!(map.get("bob").map(String::as_str), Some("public"));
+        assert_eq!(map.get("carol").map(String::as_str), Some("public"));
+        // …and an unreachable peer claims no slot.
+        assert_eq!(map.get("dave"), None);
+        assert_eq!(map.get("erin"), None);
     }
 
     #[test]
