@@ -64,6 +64,11 @@ export interface SessionSnapshot {
     /** Sites the peer exposes for reverse-proxying (from its presence
      *  advert). Absent — an older peer, or one exposing nothing — is empty. */
     sites?: SiteAdvert[];
+    /** KVM-appliance binding (from the peer's `NodeProfile.kvm`), present
+     *  only when it advertises `FEATURE_KVM`. The Rust struct's fields are
+     *  snake_case on the wire — `attached_to` / `web` — so the store maps
+     *  them onto the camelCase `MeshNode.kvm`. Absent on an ordinary peer. */
+    kvm?: { attached_to?: string; web?: string };
     /** The AllMyStuff version the peer is running, from its advert. Absent
      *  from an older peer — "unknown". */
     version?: string;
@@ -300,6 +305,26 @@ export async function requestNodeRefresh(node?: string): Promise<void> {
  *  adopt it. Returns whether it's now claimable (null in web mode). */
 export function setClaimable(claimable: boolean): Promise<boolean | null> {
   return tryInvoke<boolean>("set_claimable", { claimable });
+}
+
+/** Point a KVM appliance at the machine it controls — binds `node` (the KVM)
+ *  to `target` (the graph node it's wired into). The KVM enforces owner/fleet
+ *  before applying, then re-advertises presence with the new binding (the
+ *  authoritative confirmation, exactly as a claim confirms). Throws when the
+ *  backend couldn't deliver the ask so the UI can say so. No-op in web mode
+ *  (the store simulates the binding on the demo graph). */
+export async function kvmAttach(node: string, target: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_attach", { node, target });
+}
+
+/** Clear a KVM appliance's binding — it no longer represents any machine.
+ *  Same delivery/confirmation model as {@link kvmAttach}. No-op in web mode. */
+export async function kvmDetach(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_detach", { node });
 }
 
 /** Ownership feedback from the mesh — a `claimed` / `declined` reply to a

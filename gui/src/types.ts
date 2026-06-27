@@ -132,6 +132,14 @@ export interface MeshNode {
    *  over the mesh (from its presence advert). The owner curates this; absent
    *  means none. The Sites sidebar lists them per machine. */
   sites?: SiteAdvert[];
+  /** KVM-appliance state, present only on a node that advertises
+   *  `FEATURE_KVM` (a NanoKVM-class device) — mirrors the Rust
+   *  `NodeProfile.kvm` (a `KvmAdvert`). `attachedTo` is the graph node this
+   *  KVM physically controls (absent = not bound to anything yet); `web` is
+   *  the `SiteAdvert.id` serving the KVM's own web UI (absent = the UI falls
+   *  back to the first web-scheme site). Absent on an ordinary node or an
+   *  older peer. */
+  kvm?: { attachedTo?: string; web?: string };
   /** The AllMyStuff version this node is running, from its presence advert
    *  (e.g. "0.1.11"). Absent from an older peer (or the in-browser demo) —
    *  the upgrade affordance only appears once we know both this and the
@@ -178,6 +186,15 @@ export const FEATURE_CAMERA = "camera";
  *  on over the mesh. A node without it (an older build) never advertises
  *  sites and is never offered a site route. */
 export const FEATURE_SITES = "sites";
+
+/** The presence feature tag for a **KVM appliance** (mirrors the Rust
+ *  `FEATURE_KVM`): a NanoKVM-class device that captures a target machine's
+ *  HDMI and injects USB-HID into it, carrying its own web UI as a
+ *  `SiteAdvert`. A node with it gets the KVM drawer — "Open KVM", the
+ *  Power/Reset feature buttons, and the attach/detach affordance — and its
+ *  binding rides presence in `MeshNode.kvm`. Absent (an older peer) means an
+ *  ordinary app node. */
+export const FEATURE_KVM = "kvm";
 
 // ---- sites (the reverse-proxy plane) ----------------------------------
 

@@ -118,6 +118,33 @@
     if (sitesOpen && node) app.ensureDeviceSites(node.id);
   });
 
+  // ---- KVM appliance ---------------------------------------------------
+  /** Whether this node is a KVM you own — gates the KVM section's actions. */
+  const isKvm = $derived(!!node && app.kvmAllowed(node));
+  /** The KVM (if any) controlling *this* (non-KVM) machine — drives the
+   *  "Controlled by KVM <label>" affordance shown on the target node. */
+  const controllingKvm = $derived(node && !isKvm ? app.kvmAttachedTo(node.id) ?? null : null);
+  /** The candidate machines this KVM can be pointed at. */
+  const kvmTargets = $derived(node && isKvm ? app.kvmAttachTargets(node.id) : []);
+  /** The attach picker's draft target — defaults to the KVM's owner. */
+  let kvmTarget = $state("");
+  $effect(() => {
+    // Re-default the picker whenever the shown KVM changes.
+    kvmTarget = node && isKvm ? app.kvmDefaultTarget(node.id) ?? "" : "";
+  });
+  /** Whether the "are you absolutely sure?" Detach confirmation is showing. */
+  let detachConfirm = $state(false);
+  $effect(() => {
+    // A fresh selection clears any half-finished detach confirmation.
+    void node?.id;
+    detachConfirm = false;
+  });
+  function doDetach() {
+    if (!node) return;
+    void app.detachKVM(node.id);
+    detachConfirm = false;
+  }
+
   // ---- sidebar sizing --------------------------------------------------
   //
   // The drawer is a real sidebar beside the graph now (it shares the flex
@@ -691,10 +718,92 @@
     </section>
     {/if}
     {/if}
+
+    <!-- Controlled-by-KVM affordance — shown on a *non-KVM* machine that some
+         KVM you own is attached to: it has an out-of-band screen/keyboard you
+         can reach even when its own agent is down. -->
+    {#if controllingKvm}
+      <section class="block kvm-controlled">
+        <h4>Out-of-band</h4>
+        <p class="kvm-note">
+          Controlled by KVM <b>{displayName(controllingKvm)}</b> — its screen and
+          keyboard reach this machine even when it's off or stuck.
+        </p>
+        <button class="btn small primary" onclick={() => controllingKvm && app.openKVM(controllingKvm.id)}>
+          🖥 Open KVM
+        </button>
+      </section>
+    {/if}
+
+    <!-- KVM appliance section — for a KVM you own. The same quick actions as
+         the graph drawer, plus the buried, confirm-gated Detach at the very
+         bottom (detaching strips a machine of its out-of-band access). -->
+    {#if isKvm && node}
+      <section class="block kvm-section">
+        <h4>KVM</h4>
+        {#if node.kvm?.attachedTo}
+          {@const target = app.node(node.kvm.attachedTo)}
+          <p class="kvm-note">
+            Controls <b>{target ? displayName(target) : "a machine"}</b>.
+          </p>
+        {:else}
+          <p class="kvm-note">Not pointed at any machine yet.</p>
+        {/if}
+        <div class="kvm-actions">
+          <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🖥 Open KVM</button>
+          <button class="btn small" onclick={() => app.kvmFeature(node.id, "power")}>⏻ Power</button>
+          <button class="btn small" onclick={() => app.kvmFeature(node.id, "reset")}>↻ Reset</button>
+        </div>
+        <div class="kvm-attach">
+          {#if kvmTargets.length === 0}
+            <p class="kvm-note">No machines of yours to attach to yet.</p>
+          {:else}
+            <label class="kvm-attach-label" for="kvm-target">Point this KVM at</label>
+            <div class="kvm-attach-row">
+              <select id="kvm-target" class="kvm-select" bind:value={kvmTarget}>
+                {#each kvmTargets as t (t.id)}
+                  <option value={t.id}>{displayName(t)}</option>
+                {/each}
+              </select>
+              <button class="btn small" disabled={!kvmTarget} onclick={() => kvmTarget && app.attachKVM(node.id, kvmTarget)}>🔗 Attach</button>
+            </div>
+          {/if}
+        </div>
+        <!-- Detach lives at the very bottom, behind an annoying confirm. -->
+        <div class="kvm-detach">
+          <button class="btn small danger" onclick={() => (detachConfirm = true)}>Detach</button>
+        </div>
+      </section>
+    {/if}
     {/if}
       </div>
     {/if}
   </aside>
+
+  {#if detachConfirm && node}
+    <div class="kvm-scrim">
+      <button class="kvm-backdrop" onclick={() => (detachConfirm = false)} aria-label="Cancel"></button>
+      <div class="kvm-popup" role="dialog" aria-modal="true" aria-label="Detach this KVM" tabindex="-1">
+        <header class="kvm-modal-head">
+          <span class="kvm-mark" aria-hidden="true">!</span>
+          <div class="kvm-modal-text">
+            <div class="kvm-modal-title">Are you absolutely sure?</div>
+            <div class="kvm-modal-sub">{displayName(node)}</div>
+          </div>
+        </header>
+        <p class="kvm-modal-lead">
+          Detaching removes this machine's out-of-band screen &amp; keyboard. You
+          won't be able to reach it through the KVM until you attach it again —
+          including when its own agent is down (a crashed OS, a BIOS screen, a
+          headless box). This is exactly the case the KVM is there for.
+        </p>
+        <footer class="kvm-modal-foot">
+          <button class="btn small" onclick={() => (detachConfirm = false)}>Keep it attached</button>
+          <button class="btn small danger" onclick={doDetach}>Yes, detach it</button>
+        </footer>
+      </div>
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -1381,5 +1490,136 @@
     font-size: 0.72rem;
     color: var(--ink-faint);
     margin-top: 0.4rem;
+  }
+
+  /* ---- KVM section ---------------------------------------------------- */
+  .btn.danger {
+    color: var(--danger);
+    border-color: oklch(0.7 0.19 14 / 0.5);
+    background: var(--danger-soft);
+  }
+  .kvm-note {
+    margin: 0.2rem 0 0.4rem;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--ink-soft);
+  }
+  .kvm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+  .kvm-attach {
+    margin-top: 0.55rem;
+  }
+  .kvm-attach-label {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    margin-bottom: 0.25rem;
+  }
+  .kvm-attach-row {
+    display: flex;
+    gap: 0.35rem;
+  }
+  .kvm-select {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 0.3rem 0.35rem;
+    font-size: 0.8rem;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+  }
+  /* The buried Detach: pushed to the bottom of the section, set apart by a
+     hairline so it never sits flush with the everyday actions. */
+  .kvm-detach {
+    margin-top: 0.7rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid var(--line);
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  /* ---- detach confirmation modal (mirrors ClaimSheet's scrim/popup) --- */
+  .kvm-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: grid;
+    place-items: center;
+    background: oklch(0 0 0 / 0.42);
+    padding: 1rem;
+  }
+  .kvm-backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    background: transparent;
+    cursor: default;
+  }
+  .kvm-popup {
+    position: relative;
+    z-index: 1;
+    width: 26rem;
+    max-width: 94vw;
+    background: var(--surface);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-lg);
+    animation: kvm-rise 0.16s ease;
+  }
+  @keyframes kvm-rise {
+    from {
+      transform: translateY(12px) scale(0.98);
+      opacity: 0;
+    }
+  }
+  .kvm-modal-head {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 1.1rem 1.3rem 0.9rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .kvm-mark {
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: var(--danger);
+    color: var(--bg);
+    font-weight: 800;
+    font-size: 1.2rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .kvm-modal-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .kvm-modal-title {
+    font-weight: 750;
+    font-size: 1.05rem;
+  }
+  .kvm-modal-sub {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    margin-top: 0.1rem;
+  }
+  .kvm-modal-lead {
+    margin: 0;
+    padding: 0.9rem 1.3rem;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: var(--ink-soft);
+  }
+  .kvm-modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.4rem 1.3rem 1.2rem;
   }
 </style>

@@ -63,6 +63,8 @@ import {
   fleetRevokeRole,
   fleetMfaStatus,
   isTauri,
+  kvmAttach,
+  kvmDetach,
   onFileProgress,
   onFileSaved,
   openFilesWindow,
@@ -148,6 +150,7 @@ import {
   CAP_TAG_ALLMYSTUFF,
   FEATURE_CAMERA,
   FEATURE_FILES,
+  FEATURE_KVM,
   FEATURE_ROOMS,
   FEATURE_SITES,
   FEATURE_TERMINAL,
@@ -437,6 +440,10 @@ class AppStore {
    *  joining a network, so it gets the same prominence the join nudge has. */
   claimOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
+  /** The KVM node whose inline graph drawer is currently dropped out (revealed
+   *  by tapping it) — the same one-at-a-time reveal model as the claim drawer.
+   *  Null = none showing. */
+  kvmRevealed = $state<string | null>(null);
   toasts = $state<Toast[]>([]);
   /** Nodes with a refresh in flight — the card's refresh ring spins and its
    *  button is disabled until the data lands (the node's fingerprint changes on
@@ -1691,6 +1698,13 @@ class AppStore {
       // node's final site.) A briefly-missed frame self-heals on the next
       // advert, which presence re-sends on every change.
       node.sites = p.sites ?? [];
+      // KVM-appliance binding (present only on a node advertising FEATURE_KVM)
+      // — what the KVM controls + which site is its web UI. The wire is
+      // snake_case (`attached_to`/`web`); map it onto the camelCase shape.
+      // Absent on an ordinary peer leaves it undefined (no KVM drawer).
+      node.kvm = p.kvm
+        ? { attachedTo: p.kvm.attached_to || undefined, web: p.kvm.web || undefined }
+        : undefined;
       // The AllMyStuff version it's running — let it tell when the machine
       // is behind the channel and offer an upgrade. Absent (older peer) =
       // unknown, and the upgrade button stays hidden.
@@ -3431,7 +3445,10 @@ class AppStore {
   async mapSite(nodeId: string, site: SiteAdvert) {
     const node = this.node(nodeId);
     if (!node) return;
-    if (!this.sitesAllowed(node)) {
+    // A KVM's own web UI rides this same proxy path; it's gated by the same
+    // owner/fleet rule (`kvmAllowed`), so accept it even if the appliance
+    // advertises only FEATURE_KVM and not the FEATURE_SITES tag.
+    if (!this.sitesAllowed(node) && !this.kvmAllowed(node)) {
       this.toast("warn", `Sites are owner/fleet only — ${node.label} isn't yours`);
       return;
     }
@@ -3498,6 +3515,163 @@ class AppStore {
       this.toast("warn", `Reach it at ${url}`);
       return false;
     }
+  }
+
+  // ---- KVM appliance (the out-of-band screen/keyboard plane) ---------
+  //
+  // A KVM is a NanoKVM-class device: it carries its own web UI (a SiteAdvert)
+  // reachable through the mesh proxy, and it's bound (attached) to the one
+  // machine it physically controls. "Open KVM" maps + opens that web UI; the
+  // Power/Reset feature buttons drive the KVM's GPIO endpoint through the same
+  // tunnel (auth is bypassed over the mesh, so no token); Attach/Detach curate
+  // the binding via a gated control message the KVM confirms by re-advertising.
+
+  /** Whether `node` is a KVM appliance — it runs AllMyStuff and its presence
+   *  advertises `FEATURE_KVM` (an older build never does). */
+  isKvm(node: MeshNode | undefined): boolean {
+    return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_KVM);
+  }
+
+  /** The site serving a KVM's own web UI: the one whose id matches
+   *  `node.kvm.web`, else the first web-scheme (http/https) site it exposes.
+   *  Undefined when the KVM advertises no usable web site. */
+  kvmWebSite(node: MeshNode | undefined): SiteAdvert | undefined {
+    if (!node) return undefined;
+    const sites = node.sites ?? [];
+    const named = node.kvm?.web ? sites.find((s) => s.id === node.kvm!.web) : undefined;
+    return named ?? sites.find((s) => siteIsWeb(s)) ?? undefined;
+  }
+
+  /** Whether the KVM's actions are reachable for you — the same owner/fleet
+   *  rule as its sites (a KVM's web UI + GPIO are just as privileged). Lets
+   *  the drawers show the KVM affordances only for a KVM that's yours. */
+  kvmAllowed(node: MeshNode | undefined): boolean {
+    if (!this.isKvm(node) || this.isMe(node!.id)) return false;
+    const ownerIsMe = !!node!.owner && this.isMe(node!.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node!.id);
+    return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
+  }
+
+  /** Open a KVM's own web UI through the mesh — map its web site to a local
+   *  port if it isn't already, then open `http(s)://localhost:<port>` in the
+   *  system browser. In web mode (no backend) there's nothing to map, so the
+   *  flow is just demoed via a toast. */
+  async openKVM(nodeId: string) {
+    const node = this.node(nodeId);
+    const site = this.kvmWebSite(node);
+    if (!node || !site) {
+      this.toast("warn", `${node?.label ?? "This KVM"} hasn't published a web UI yet`);
+      return;
+    }
+    if (!this.backendConnected) {
+      this.toast("info", `Opening ${node.label}'s KVM console…`);
+      return;
+    }
+    await this.mapSite(nodeId, site);
+    const m = this.siteMappingFor(nodeId, site.id);
+    if (!m) return; // mapSite already toasted the failure
+    this.openSite(m);
+  }
+
+  /** Drive a KVM feature button (Power / Reset) — ensure its web UI is mapped,
+   *  then POST NanoKVM's GPIO endpoint through the tunnel. Auth is bypassed
+   *  over the mesh, so no token is needed. No-op (a toast) in web mode. */
+  async kvmFeature(nodeId: string, action: "power" | "reset") {
+    const node = this.node(nodeId);
+    const site = this.kvmWebSite(node);
+    if (!node || !site) {
+      this.toast("warn", `${node?.label ?? "This KVM"} hasn't published a web UI yet`);
+      return;
+    }
+    if (!this.backendConnected) {
+      this.toast("info", `${action === "power" ? "Power" : "Reset"} sent to ${node.label}`);
+      return;
+    }
+    await this.mapSite(nodeId, site);
+    const m = this.siteMappingFor(nodeId, site.id);
+    if (!m) return; // mapSite already toasted the failure
+    try {
+      const res = await fetch(`http://localhost:${m.localPort}/api/vm/gpio`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: action }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      this.toast("info", `${action === "power" ? "Power" : "Reset"} sent to ${node.label}`);
+    } catch (e) {
+      this.toast("warn", `Couldn't ${action} ${node.label}: ${String(e)}`);
+    }
+  }
+
+  /** Point a KVM at the machine it controls — bind `nodeId` (the KVM) to
+   *  `target`. The KVM confirms by re-advertising its new binding; a delivery
+   *  failure surfaces so the ask never silently hangs. In web mode it's
+   *  simulated on the demo graph so the flow is demoable. */
+  async attachKVM(nodeId: string, target: string) {
+    const node = this.node(nodeId);
+    if (!node || !this.isKvm(node)) return;
+    if (!this.kvmAllowed(node)) {
+      this.toast("warn", `KVM controls are owner/fleet only — ${node.label} isn't yours`);
+      return;
+    }
+    if (this.backendConnected) {
+      kvmAttach(nodeId, target).catch((e) => {
+        this.toast("warn", `Couldn't point ${node.label}: ${String(e)}`);
+      });
+      const tlabel = this.node(target)?.label ?? "that machine";
+      this.toast("info", `Pointing ${node.label} at ${tlabel}…`);
+    } else {
+      node.kvm = { ...(node.kvm ?? {}), attachedTo: target };
+    }
+  }
+
+  /** Clear a KVM's binding — the deliberately-buried, confirm-gated action
+   *  (detaching strips a machine of its out-of-band screen/keyboard). The KVM
+   *  confirms by re-advertising the cleared binding. Simulated in web mode. */
+  async detachKVM(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node || !this.isKvm(node)) return;
+    if (!this.kvmAllowed(node)) {
+      this.toast("warn", `KVM controls are owner/fleet only — ${node.label} isn't yours`);
+      return;
+    }
+    if (this.backendConnected) {
+      kvmDetach(nodeId).catch((e) => {
+        this.toast("warn", `Couldn't detach ${node.label}: ${String(e)}`);
+      });
+      this.toast("info", `Detaching ${node.label}…`);
+    } else if (node.kvm) {
+      node.kvm = { ...node.kvm, attachedTo: undefined };
+    }
+  }
+
+  /** The machines a KVM can be pointed at — your own devices and fleet
+   *  members (the binding only makes sense for a machine you control), minus
+   *  the KVM itself. The picker lists these. */
+  kvmAttachTargets(kvmId: string): MeshNode[] {
+    return this.catalog.nodes.filter(
+      (n) => isAppNode(n) && !sameMachine(n.id, kvmId) && !this.isKvm(n) && this.isMyDevice(n.id),
+    );
+  }
+
+  /** The target the attach picker defaults to — the KVM's owner when it's one
+   *  of your machines, else the first candidate. Undefined when there are no
+   *  candidates. */
+  kvmDefaultTarget(kvmId: string): string | undefined {
+    const targets = this.kvmAttachTargets(kvmId);
+    if (targets.length === 0) return undefined;
+    const kvm = this.node(kvmId);
+    const owner = kvm?.owner ? targets.find((t) => sameMachine(t.id, kvm.owner!)) : undefined;
+    return (owner ?? targets[0]).id;
+  }
+
+  /** The KVM (if any) currently attached to `nodeId` — scan the catalog for a
+   *  KVM node whose binding points here, so a controlled machine can show
+   *  "Controlled by KVM <label>" with its own Open-KVM affordance. */
+  kvmAttachedTo(nodeId: string): MeshNode | undefined {
+    return this.catalog.nodes.find(
+      (n) => this.isKvm(n) && !!n.kvm?.attachedTo && sameMachine(n.kvm.attachedTo, nodeId),
+    );
   }
 
   // ---- managing a device's exposure (this machine *or* a fleet member) ---

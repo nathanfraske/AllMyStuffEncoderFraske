@@ -186,6 +186,31 @@ async fn set_claimable(state: State<'_, AppState>, claimable: bool) -> Result<bo
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
+/// Point a KVM appliance (`node`) at the machine it controls (`target`). The
+/// KVM enforces owner/fleet before applying, then re-advertises its new
+/// binding — that presence is the confirmation, exactly as a claim confirms.
+#[tauri::command]
+async fn kvm_attach(state: State<'_, AppState>, node: String, target: String) -> Result<(), String> {
+    state
+        .node
+        .request("kvm_attach", json!({ "node": node, "target": target }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Clear a KVM appliance's binding — it no longer represents any machine. Same
+/// owner/fleet enforcement + presence confirmation as [`kvm_attach`].
+#[tauri::command]
+async fn kvm_detach(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("kvm_detach", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Persist an outbound grant to a person — what they may do with my stuff —
 /// so it survives a restart. The GUI resolves the person and the node the
 /// grant is recorded against; the node is the durable source of truth and the
@@ -1901,6 +1926,8 @@ fn main() {
             restart_app,
             refresh_node,
             set_claimable,
+            kvm_attach,
+            kvm_detach,
             share_grant,
             share_revoke,
             share_stop,
