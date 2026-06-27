@@ -6073,8 +6073,15 @@ class AppStore {
       if (n.relationship.kind !== "shared") continue;
       const share = n.relationship;
       const p = map.get(share.person.id) ?? { person: share.person, nodes: [], grants: [] };
-      p.nodes.push(n);
-      for (const g of share.grants) p.grants.push({ node: n, grant: g });
+      // Dedupe by the keys the Sharing list renders with (node id, grant id):
+      // a grant is to the *person*, so the same grant id is recorded on each of
+      // their devices — collecting them raw gives a duplicate key per grant and
+      // crashes the keyed {#each} (`each_key_duplicate`). Show each device, and
+      // each person-level grant, once.
+      if (!p.nodes.some((x) => x.id === n.id)) p.nodes.push(n);
+      for (const g of share.grants) {
+        if (!p.grants.some((x) => x.grant.id === g.id)) p.grants.push({ node: n, grant: g });
+      }
       map.set(share.person.id, p);
     }
     return [...map.values()].sort((a, b) => a.person.name.localeCompare(b.person.name));
@@ -6122,7 +6129,16 @@ class AppStore {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
     const personId = n.relationship.person.id;
-    n.relationship.grants = n.relationship.grants.filter((g) => g.id !== grantId);
+    // A grant is to the person, so it can be recorded on several of their nodes
+    // (and the backend revoke is person-level). Pull it from every one of them,
+    // not just the holder the row named — otherwise the Sharing list, which
+    // shows person-level grants, would keep showing it from a sibling node until
+    // the next backend snapshot reconciles.
+    for (const x of this.catalog.nodes) {
+      if (x.relationship.kind === "shared" && x.relationship.person.id === personId) {
+        x.relationship.grants = x.relationship.grants.filter((g) => g.id !== grantId);
+      }
+    }
     void shareRevoke(personId, grantId).catch(() => {});
     this.reauthorize();
     // No toast — the grant row vanishes from the drawer / Sharing pane (and this
