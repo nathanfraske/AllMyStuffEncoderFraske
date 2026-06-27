@@ -1389,7 +1389,15 @@ function newNetworkInternalId(): string {
  *  created/joined network connects out of the box; the Servers pane can change
  *  any of them later. Importing a network-settings file passes the file's own
  *  servers in instead — an empty list there is sent as "none" (the daemon
- *  resolves empty signaling to its built-in relay either way). */
+ *  resolves empty signaling to its built-in relay either way).
+ *
+ *  Auto-approve defaults **on**: every ordinary mesh in AllMyStuff is fully
+ *  open — there's no per-mesh approval gate, so any node that joins is admitted
+ *  automatically. Meshing is controlled by private venues, the Fleet, and
+ *  Sharing, not by approving devices one by one. (The fleet's own closed mesh
+ *  is created by the node, never through this builder, so it's never affected.)
+ *  The node also enforces this on every non-fleet mesh it already holds, so an
+ *  older mesh that predates the open default is migrated on the next launch. */
 export function buildNetworkConfig(args: {
   networkId: string;
   label?: string;
@@ -1417,7 +1425,7 @@ export function buildNetworkConfig(args: {
             credential: t.credential || undefined,
           }))
         : undefined,
-    auto_approve: args.autoApprove ?? false,
+    auto_approve: args.autoApprove ?? true,
   };
 }
 

@@ -1,17 +1,18 @@
 <script lang="ts">
-  // Networks pane — the real, multi-network system. Sub-tabs (MyOwnLLM-style):
-  //   • Status  — this device's name, add-a-device handle, your networks, and
-  //               who's waiting to join.
-  //   • Servers — per-network signaling / STUN / TURN.
-  //   • Devices — every machine you can see and which network(s) it's on
-  //               (you're on as many networks as you've joined, and a device
-  //               may share only some of them).
+  // Meshes pane — the real, multi-network system.
+  //   • Status — this device's name, your meshes, and (per mesh) its members.
+  //   • Venue  — where a mesh calls out; reached by a mesh's "Venue" button.
+  // Meshes here are fully open: any node that joins is admitted automatically,
+  // so there's no approval queue. Who can mesh with you is shaped by private
+  // venues, the Fleet, and Sharing — not by approving devices one by one.
+  // The all-machines roster moved out to its own top-level Devices tab. The
+  // fleet's closed mesh shows here too, but as a link to its Fleet settings —
+  // you manage its devices there, not as a plain mesh roster.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { networkDisplayName } from "../../types";
   import { PUBLIC_VENUE_ID } from "../../venues";
   import NetworkServers from "./NetworkServers.svelte";
-  import NetworkDevices from "./NetworkDevices.svelte";
 
   let nameInput = $state("");
   let joinId = $state("");
@@ -30,7 +31,6 @@
     trimmedName && trimmedName !== hostname ? `${trimmedName} (${hostname})` : hostname || trimmedName || "—",
   );
   const rosterNet = $derived(app.networks.find((n) => n.config_id === app.rosterNetwork) ?? null);
-  const pending = $derived(app.pendingPeers);
 
   onMount(() => {
     nameInput = app.identity?.label ?? "";
@@ -69,19 +69,13 @@
     }
   }
 
-  // The fleet mesh has no plain "leave" — leaving it *is* leaving the fleet. So
-  // the button warns first (a toast + an armed second click), then routes to the
-  // real exit, `leaveFleet`, which releases this device and tears down the mesh.
-  let armedFleetLeave = $state(false);
-  function fleetMeshLeave() {
-    if (!armedFleetLeave) {
-      armedFleetLeave = true;
-      app.toast("warn", "This is your fleet mesh — leaving it leaves the fleet. Click again to confirm.");
-      setTimeout(() => (armedFleetLeave = false), 4000);
-      return;
-    }
-    armedFleetLeave = false;
-    void app.leaveFleet();
+  // The fleet is a mesh, but THIS program treats it specially: you don't manage
+  // its devices here as a plain roster — you manage them in Fleet settings
+  // (including leaving the fleet, which is how you leave its mesh). So the fleet
+  // row links there instead of opening a member list.
+  function goToFleet() {
+    app.settingsTab = "fleet";
+    void app.loadOwnedFleet();
   }
 
   // Import = the no-typing way onto a network: pick a settings file the other
@@ -104,15 +98,12 @@
     <h3>Meshes</h3>
     <div class="subtabs">
       <button class:active={sub === "status"} onclick={() => (app.networksSubtab = "status")}>Status</button>
-      <button class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
-      <button class:active={sub === "devices"} onclick={() => (app.networksSubtab = "devices")}>Devices</button>
+      <button class="venue-tab" class:active={sub === "servers"} onclick={() => { app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
     </div>
   </div>
 
   {#if sub === "servers"}
     <NetworkServers />
-  {:else if sub === "devices"}
-    <NetworkDevices />
   {:else}
     <!-- This device -->
     <section class="block">
@@ -168,41 +159,35 @@
 
       <ul class="nets">
         {#each app.networks as n (n.config_id)}
-          {@const fleetMesh = app.isFleetMesh(n)}
-          <li class:on={app.rosterNetwork === n.config_id} class:fleet={fleetMesh}>
-            <button class="net-main" onclick={() => app.refreshRoster(n.config_id)}>
-              <span class="net-name">{app.meshLabel(n)}{#if fleetMesh}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{/if}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
-              <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
-            </button>
-            <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
-            <!-- Export and Copy id work the same for every mesh — even the
-                 fleet's. The fleet mesh differs in three ways: it can't be
-                 *disabled*; its venue is owner-only (members and managers ride
-                 the owner's choice, broadcast to them); and leaving it leaves
-                 the fleet, so its Leave warns and routes to the real exit. -->
-            <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
-            {#if fleetMesh && !app.isFleetOwner}
-              <button class="btn small locked" disabled title="The fleet's venue is set by the fleet owner — every device rides the owner's choice. Managers manage members, not core settings.">🔒 Venue</button>
-            {:else}
+          {#if app.isFleetMesh(n)}
+            <!-- The fleet IS a closed mesh, but this program treats it as its
+                 own thing: no device roster here, just a link to Fleet settings
+                 where you manage its devices, owner, key and security. The
+                 owner-set venue stays (it has no other home); everything else
+                 about the fleet — including leaving it — lives over there. -->
+            <li class="fleet">
+              <button class="net-main" title="Manage your fleet in Fleet settings" onclick={goToFleet}>
+                <span class="net-name">{app.meshLabel(n)}<span class="badge fleet-badge" title="The closed mesh that backs your fleet">🔗 fleet</span>{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
+                <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
+              </button>
+              {#if app.isFleetOwner}
+                <button class="btn small" title="Choose where the fleet calls out (its venue) — owner only" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
+              {/if}
+              <button class="btn small primary" onclick={goToFleet}>Manage in Fleet settings →</button>
+            </li>
+          {:else}
+            <li class:on={app.rosterNetwork === n.config_id}>
+              <button class="net-main" title="Show this mesh's members" onclick={() => app.refreshRoster(n.config_id)}>
+                <span class="net-name">{app.meshLabel(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
+                <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
+              </button>
+              <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+              <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
               <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
-            {/if}
-            {#if fleetMesh}
-              <button
-                class="btn small locked"
-                disabled
-                title="This is your fleet mesh — it can't be disabled. Leave the fleet to leave this mesh."
-              >🔒 Can't disable</button>
-              <button
-                class="btn small danger"
-                class:armed={armedFleetLeave}
-                title="Leaving this mesh leaves your fleet — this device is released back to unclaimed."
-                onclick={fleetMeshLeave}
-              >{armedFleetLeave ? "Leaves the fleet — sure?" : "Leave"}</button>
-            {:else}
               <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
               <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>
-            {/if}
-          </li>
+            </li>
+          {/if}
         {/each}
         {#each app.disabledNets as c (c.id)}
           <li class="off">
@@ -223,37 +208,19 @@
     <section class="block">
       <h4>Add a device</h4>
       <p class="hint">
-        Machines aren't added by hand — install AllMyStuff on the other device,
-        join one of your networks with its handle (Copy id above), then approve
-        it below. It then appears on the graph on its own.
+        Machines aren't added by hand — install AllMyStuff on the other device
+        and join this mesh with its handle (Copy id above). Meshes are open, so
+        it's admitted automatically and shows up here and on the graph on its own.
       </p>
     </section>
 
-    <!-- Approvals / roster -->
-    {#if rosterNet}
+    <!-- Members of the selected mesh. Meshes are fully open — any node that
+         joins is admitted automatically — so there's no approval queue here,
+         just who's on it. The fleet mesh never lands here: its row links to
+         Fleet settings rather than selecting a member list. -->
+    {#if rosterNet && !app.isFleetMesh(rosterNet)}
       <section class="block">
-        <h4>Devices on “{app.meshLabel(rosterNet)}”</h4>
-
-        {#if pending.length > 0}
-          <div class="subhead">Waiting for you</div>
-          <ul class="people">
-            {#each pending as p (p.device_id)}
-              <li>
-                <div class="p-main">
-                  <div class="p-name">{p.label || p.device_id.slice(0, 10)}</div>
-                  <div class="p-sub">
-                    {#if p.device_suffix}#{p.device_suffix}{/if}
-                    {#if p.verification_code_received}· code {p.verification_code_received}{/if}
-                  </div>
-                </div>
-                <button class="btn small" onclick={() => app.dismissJoin(p.device_id)} title="Not now (you can still approve later)">Not now</button>
-                <button class="btn small primary" onclick={() => app.approveDevice(rosterNet.config_id, p.device_id, p.label)}>Approve</button>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-
-        <div class="subhead">Approved</div>
+        <h4>Members of “{app.meshLabel(rosterNet)}”</h4>
         <ul class="people">
           {#each app.roster as r (r.device_id)}
             <li>
@@ -261,11 +228,11 @@
                 <div class="p-name">{r.label || r.device_id.slice(0, 10)}</div>
                 <div class="p-sub">{r.device_id.slice(0, 12)}…</div>
               </div>
-              <button class="btn small danger" onclick={() => app.removeDevice(rosterNet.config_id, r.device_id)}>Remove</button>
+              <button class="btn small danger" title="Drop this device from the mesh's member list" onclick={() => app.removeDevice(rosterNet.config_id, r.device_id)}>Remove</button>
             </li>
           {/each}
-          {#if app.roster.length === 0 && pending.length === 0}
-            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this mesh.</li>
+          {#if app.roster.length === 0}
+            <li class="empty">No devices yet. Install AllMyStuff on another machine and join this mesh — it shows up here on its own.</li>
           {/if}
         </ul>
       </section>
@@ -323,6 +290,17 @@
   .subtabs button.active:hover {
     background: var(--c-mesh-soft);
     color: var(--c-mesh-ink);
+  }
+  /* The Venue sub-tab is a venue surface (reached by a mesh's Venue button), so
+     when active it lights in the venue concept colour (gold), not mesh magenta. */
+  .subtabs button.venue-tab.active {
+    background: linear-gradient(180deg, var(--c-venue-soft), var(--c-venue-soft));
+    color: var(--c-venue-ink);
+    border-color: var(--c-venue);
+  }
+  .subtabs button.venue-tab.active:hover {
+    background: var(--c-venue-soft);
+    color: var(--c-venue-ink);
   }
   .block {
     border-top: 1px solid var(--line);
@@ -475,13 +453,6 @@
     flex: 1;
     min-width: 0;
   }
-  .subhead {
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--ink-faint);
-    margin-top: 0.6rem;
-  }
   li.empty {
     display: block;
     background: transparent;
@@ -499,10 +470,5 @@
   .badge.fleet-badge {
     color: var(--c-fleet-ink);
     background: var(--c-fleet-soft);
-  }
-  .btn.locked {
-    opacity: 0.8;
-    cursor: not-allowed;
-    color: var(--ink-faint);
   }
 </style>

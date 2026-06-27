@@ -194,13 +194,17 @@ import {
 export type SettingsTab =
   | "networks"
   | "venues"
-  | "updates"
+  | "devices"
   | "fleet"
   | "sharing"
-  | "always_on";
+  | "always_on"
+  | "updates";
 
-/** Sub-pane within the Networks settings tab (MyOwnLLM-style sub-tabs). */
-export type NetworksSubtab = "status" | "servers" | "devices";
+/** Sub-pane within the Networks settings tab. The all-devices roster used to
+ *  live here as a third "Devices" sub-tab; it's now a top-level Devices tab of
+ *  its own, so a mesh's sub-panes are just its status and its venue (the latter
+ *  reached by clicking a mesh's Venue button). */
+export type NetworksSubtab = "status" | "servers";
 
 /** A capability the Share Flow builder can switch on between two devices.
  *  Audio / Video (the screen feed) / Control all ride the remote-control
@@ -374,6 +378,10 @@ class AppStore {
 
   // ---- interaction state ------------------------------------------
   selectedNodeId = $state<string | null>(null);
+  /** A "centre the graph on this node" request. Bumped by [`focusNode`]; the
+   *  graph watches the `seq` and pans to the node once per new request (so a
+   *  repeat focus of the same node still re-centres). Null = nothing pending. */
+  focusRequest = $state<{ id: string; seq: number } | null>(null);
   /** Capability the user is dragging a wire from, if any. */
   dragFrom = $state<string | null>(null);
   pendingShare = $state<PendingShare | null>(null);
@@ -673,6 +681,12 @@ class AppStore {
    *  all read this, so none of them can claim you're in a fleet while another
    *  insists you're not. */
   inFleet = $derived.by(() => this.ownedFleet?.in_fleet === true);
+
+  /** This device's *own* role in the fleet ("owner" | "manager" | "member" |
+   *  null when not in one). Gates which governance controls are shown, matching
+   *  the backend's flat-tier authority: an owner can act on anyone, a manager on
+   *  managers and members, a member on no one. */
+  myFleetRole = $derived.by(() => this.fleetRoleOf(this.localId));
 
   /** Whether this device is the fleet owner (founder / key-holder). Only the
    *  owner can rename the fleet, grant/withdraw roles, or evict a device — the
@@ -1696,6 +1710,21 @@ class AppStore {
   // ---- selection ---------------------------------------------------
   selectNode(id: string | null) {
     this.selectedNodeId = id;
+  }
+
+  /** "Show me this device": the one entry point the settings lists use to take
+   *  you to a node on the graph. Resolves the id canonically first — a roster or
+   *  presence id can be a different *form* of the same machine's id than the one
+   *  the graph lays out under, so selecting the raw id would highlight nothing —
+   *  then selects it, asks the graph to centre on it, and leaves Settings so it's
+   *  actually visible. A no-op selection (id resolves to no live node) still
+   *  closes settings and selects the id, so the drawer can show what it knows. */
+  focusNode(idOrDevice: string) {
+    const n = this.machineByAnyId(idOrDevice);
+    const id = n?.id ?? idOrDevice;
+    this.selectedNodeId = id;
+    this.focusRequest = { id, seq: (this.focusRequest?.seq ?? 0) + 1 };
+    this.settingsOpen = false;
   }
 
   // ---- connecting --------------------------------------------------
@@ -6028,7 +6057,17 @@ class AppStore {
     for (const n of this.catalog.nodes) {
       if (n.kind === "this" || this.isMe(n.id)) continue;
       if (n.relationship.kind === "mine") continue;
-      const share = byPerson.get(this.personFor(n).id);
+      // Match the node's *own* pubkey first, then its fleet/person. An inbound
+      // share is keyed by the **sending device's** pubkey — the trust rule binds
+      // a peer only to its own node — which is the device's own id, not its
+      // fleet owner. Matching only by `personFor` (owner-based) meant a share
+      // from a *non-owner* fleet device (a manager, say) never landed on that
+      // device's node, so the receiver never reclassified it shared, never grew
+      // the provide-grant the console buttons read, and never redrew. Checking
+      // the node's own id first also gives it *its own* grants (device-scoped),
+      // not a sibling's, when several of a fleet's devices share separately.
+      const share =
+        byPerson.get(`person:${canonicalNodeId(n.id)}`) ?? byPerson.get(this.personFor(n).id);
       if (share) {
         n.relationship = { kind: "shared", person: share.person, grants: [...share.grants] };
       }
@@ -6044,8 +6083,15 @@ class AppStore {
       if (n.relationship.kind !== "shared") continue;
       const share = n.relationship;
       const p = map.get(share.person.id) ?? { person: share.person, nodes: [], grants: [] };
-      p.nodes.push(n);
-      for (const g of share.grants) p.grants.push({ node: n, grant: g });
+      // Dedupe by the keys the Sharing list renders with (node id, grant id):
+      // a grant is to the *person*, so the same grant id is recorded on each of
+      // their devices — collecting them raw gives a duplicate key per grant and
+      // crashes the keyed {#each} (`each_key_duplicate`). Show each device, and
+      // each person-level grant, once.
+      if (!p.nodes.some((x) => x.id === n.id)) p.nodes.push(n);
+      for (const g of share.grants) {
+        if (!p.grants.some((x) => x.grant.id === g.id)) p.grants.push({ node: n, grant: g });
+      }
       map.set(share.person.id, p);
     }
     return [...map.values()].sort((a, b) => a.person.name.localeCompare(b.person.name));
@@ -6093,7 +6139,16 @@ class AppStore {
     const n = this.node(nodeId);
     if (!n || n.relationship.kind !== "shared") return;
     const personId = n.relationship.person.id;
-    n.relationship.grants = n.relationship.grants.filter((g) => g.id !== grantId);
+    // A grant is to the person, so it can be recorded on several of their nodes
+    // (and the backend revoke is person-level). Pull it from every one of them,
+    // not just the holder the row named — otherwise the Sharing list, which
+    // shows person-level grants, would keep showing it from a sibling node until
+    // the next backend snapshot reconciles.
+    for (const x of this.catalog.nodes) {
+      if (x.relationship.kind === "shared" && x.relationship.person.id === personId) {
+        x.relationship.grants = x.relationship.grants.filter((g) => g.id !== grantId);
+      }
+    }
     void shareRevoke(personId, grantId).catch(() => {});
     this.reauthorize();
     // No toast — the grant row vanishes from the drawer / Sharing pane (and this

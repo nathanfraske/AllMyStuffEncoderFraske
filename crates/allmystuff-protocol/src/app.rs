@@ -104,7 +104,16 @@ pub const FEATURE_MEDIA_LANES: &str = "media-lanes";
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` (all-empty) so a presence advert whose summary is absent, partial,
+/// or still being scanned **decodes** rather than dropping the whole profile —
+/// the node card just shows the "unknown hardware" fallback until a fuller
+/// advert lands. The container `#[serde(default)]` carries that leniency *into*
+/// the summary: a partial summary (some hardware fields missing, e.g. an older
+/// or mid-scan peer) fills the gaps with defaults instead of failing the whole
+/// `NodeProfile` decode. See [`NodeProfile::summary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct InventorySummary {
     pub os: String,
     pub cpu: String,
@@ -118,17 +127,32 @@ pub struct InventorySummary {
 /// change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProfile {
+    /// Presence protocol version, informational only (we never gate inbound
+    /// adverts on it). `#[serde(default)]` so an advert omitting it still
+    /// decodes rather than being discarded whole.
+    #[serde(default)]
     pub protocol: u32,
     pub node: NodeId,
     /// Display name for this node — the machine's hostname by default, or a
     /// user-set override. When it differs from `hostname`, the UI renders
     /// "label (hostname)" so the real machine is always visible.
+    /// `#[serde(default)]` so a label-less advert still decodes (the UI falls
+    /// back to the hostname / a short id) instead of dropping the whole update.
+    #[serde(default)]
     pub label: String,
     /// The node's real machine hostname, always straight from its own scan.
     /// `#[serde(default)]` so presence from an older peer (no hostname field)
     /// still decodes — the UI just falls back to `label`.
     #[serde(default)]
     pub hostname: String,
+    /// Hardware thumbnail for the node card. `#[serde(default)]` so an advert
+    /// with no summary yet (a peer mid-scan, an older/minimal build, or a
+    /// partial summary) still decodes — only this field falls back to empty,
+    /// rather than the **entire** profile being discarded in the parse. This
+    /// was the central "we get presence updates but silently drop them" bug:
+    /// one missing/retyped required field failed the whole `NodeProfile`
+    /// decode, so the peer never appeared or never refreshed.
+    #[serde(default)]
     pub summary: InventorySummary,
     /// The capabilities this node is willing to expose. The owner curates
     /// this; nothing here is reachable without the receiver's catalog also
@@ -1457,5 +1481,31 @@ mod tests {
             "teleport_range": 42, "vibes": ["immaculate"]
         }"#;
         serde_json::from_str::<NodeProfile>(json).expect("unknown profile fields must be ignored");
+    }
+
+    #[test]
+    fn node_profile_decodes_with_missing_or_partial_fields() {
+        // The mirror of the unknown-fields rule: a *missing* or partial field
+        // must not drop the whole advert either. A peer mid-scan (no summary
+        // yet), or one that omits `protocol`/`label`, still decodes — only those
+        // fields fall back to their defaults. This is the fix for the "we get
+        // presence updates but silently discard them in the parse" bug, where a
+        // single absent required field failed the entire `NodeProfile` decode.
+        let json = r#"{ "node": "scanning" }"#;
+        let p: NodeProfile =
+            serde_json::from_str(json).expect("a sparse advert must still decode, not drop");
+        assert_eq!(p.node.as_str(), "scanning");
+        assert_eq!(p.protocol, 0);
+        assert!(p.label.is_empty());
+        assert_eq!(p.summary, InventorySummary::default());
+
+        // A partial summary (missing some hardware fields) also decodes — the
+        // absent fields default rather than failing the whole profile.
+        let json = r#"{ "node": "n", "summary": { "os": "linux" } }"#;
+        let p: NodeProfile =
+            serde_json::from_str(json).expect("a partial summary must not drop the profile");
+        assert_eq!(p.summary.os, "linux");
+        assert_eq!(p.summary.cpu, "");
+        assert_eq!(p.summary.ram_bytes, 0);
     }
 }

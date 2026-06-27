@@ -101,17 +101,34 @@
     return nodeLabel(m.device) || m.label || m.device.slice(0, 12);
   }
 
-  // Jump to a fleet device on the graph: select it (the drawer + graph focus
-  // it) and close settings. Right-click does the same (parity).
-  function jumpToDevice(device: string) {
-    app.selectNode(device);
-    app.settingsOpen = false;
+  // "View on the graph" — the explicit way out of Settings to a device. Clicking
+  // a row no longer yanks you to the graph; this dedicated button does. It
+  // resolves the roster id to the live node first (a roster id is often a
+  // different *form* of the same machine's id than the graph lays out under, so
+  // selecting the raw id highlighted nothing), then selects and centres it.
+  function viewOnGraph(device: string) {
+    app.focusNode(device);
   }
 
-  // Promote a member to co-owner — full fleet authority alongside you, not a
-  // transfer. Re-uses the same governance path as the device drawer.
-  function promote(device: string) {
+  // Roles are layered: promote stages a member up to Manager, then a Manager to
+  // co-owner, with a matching step-down. The mesh layer (MyOwnMesh's closed-
+  // network governance) is the authority, so the buttons are gated to exactly
+  // what it enforces — only an owner can grant or withdraw a manager or owner,
+  // and an owner or manager can evict a member — and we just float the signed
+  // proposal for the daemon to ratify.
+  function promoteToManager(device: string) {
+    void app.grantFleetRole(device, "manager");
+  }
+  function promoteToOwner(device: string) {
     void app.grantFleetRole(device, "owner");
+  }
+  // An owner steps back to manager by re-granting the lower role; a manager
+  // steps back to a plain member by a revoke (which drops to Member).
+  function demoteToManager(device: string) {
+    void app.grantFleetRole(device, "manager");
+  }
+  function demoteToMember(device: string) {
+    void app.withdrawFleetRole(device);
   }
 
   // ---- fleet custody (TOTP / MFA) ----
@@ -241,12 +258,7 @@
           {@const isOwner = app.fleetRoleOf(m.device) === "owner"}
           {@const isManager = app.fleetRoleOf(m.device) === "manager"}
           <li class:owner={isOwner}>
-            <button
-              class="m-jump"
-              title="Show this device on the graph"
-              onclick={() => jumpToDevice(m.device)}
-              oncontextmenu={(e) => { e.preventDefault(); jumpToDevice(m.device); }}
-            >
+            <div class="m-id-wrap">
               <span class="m-avatar" aria-hidden="true">{isSelf ? "💻" : "🖥"}</span>
               <div class="m-id">
                 <div class="m-name">
@@ -257,35 +269,94 @@
                 </div>
                 <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
               </div>
-            </button>
-            {#if app.isFleetOwner && !isSelf}
-              <div class="m-actions">
-                {#if !isOwner}
-                  <button
-                    class="promote"
-                    title="Add as a co-owner — they gain full fleet authority alongside you. This adds an owner; it doesn't hand the fleet away."
-                    onclick={() => promote(m.device)}
-                  >
-                    ★ Promote
-                  </button>
+            </div>
+            <div class="m-actions">
+              <button
+                class="role-btn"
+                title="Show this device on the graph — leaves Settings, then selects and centres it"
+                onclick={() => viewOnGraph(m.device)}
+              >
+                🔍 View
+              </button>
+              <!-- Controls reflect what the mesh layer actually enforces (these
+                   are MyOwnMesh's closed-network roles): only an owner can make
+                   or withdraw managers and owners; a manager (controller) can
+                   only evict a member; a member changes nothing. Evicting an
+                   owner outright needs every owner's consent, so it isn't
+                   offered — step an owner down to manager first, then evict. -->
+              {#if !isSelf}
+                {@const iOwn = app.myFleetRole === "owner"}
+                {@const iManage = iOwn || app.myFleetRole === "manager"}
+                {#if isOwner}
+                  {#if iOwn}
+                    <button
+                      class="role-btn down"
+                      title="Step this co-owner back down to manager — they keep authority to admit members, but lose owner authority. (Evicting an owner outright needs every owner's consent, so step them down first.)"
+                      onclick={() => demoteToManager(m.device)}
+                    >
+                      ⤓ Make manager
+                    </button>
+                  {/if}
+                {:else if isManager}
+                  {#if iOwn}
+                    <button
+                      class="role-btn up"
+                      title="Promote this manager to a co-owner — full fleet authority alongside you. Only an owner can make an owner."
+                      onclick={() => promoteToOwner(m.device)}
+                    >
+                      ★ Make owner
+                    </button>
+                    <button
+                      class="role-btn down"
+                      title="Withdraw this manager back to a plain member — they keep fleet membership but lose authority to admit members."
+                      onclick={() => demoteToMember(m.device)}
+                    >
+                      ⤓ Make member
+                    </button>
+                    <button
+                      class="kick"
+                      class:armed={armed === m.device}
+                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                    >
+                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                    </button>
+                  {/if}
+                {:else}
+                  {#if iOwn}
+                    <button
+                      class="role-btn up"
+                      title="Promote this member to a manager — they can admit members. Promote again afterwards to make them a co-owner. (Only an owner can promote.)"
+                      onclick={() => promoteToManager(m.device)}
+                    >
+                      ★ Make manager
+                    </button>
+                  {/if}
+                  {#if iManage}
+                    <button
+                      class="kick"
+                      class:armed={armed === m.device}
+                      title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
+                      onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
+                    >
+                      {armed === m.device ? "Evict — sure?" : "Evict"}
+                    </button>
+                  {/if}
                 {/if}
-                <button
-                  class="kick"
-                  class:armed={armed === m.device}
-                  title="Evict this device from the fleet — a signed removal that propagates to every member, so a lost or stolen device loses control everywhere"
-                  onclick={() => confirmThen(m.device, () => void app.kickFleetMember(m.device))}
-                >
-                  {armed === m.device ? "Evict — sure?" : "Evict"}
-                </button>
-              </div>
-            {/if}
+              {/if}
+            </div>
           </li>
         {/each}
       </ul>
-      {#if !app.isFleetOwner}
+      {#if app.myFleetRole === "manager"}
         <p class="hint">
-          Only the fleet owner (the device that founded the fleet) can evict a
-          device. This device can leave on its own below.
+          As a manager you can evict a member; promoting and withdrawing roles
+          is the owner's call. This device can leave on its own below.
+        </p>
+      {:else if app.myFleetRole !== "owner"}
+        <p class="hint">
+          Only an owner can change roles; an owner or a manager can evict a
+          member. This device can leave on its own below.
         </p>
       {/if}
     </section>
@@ -527,23 +598,15 @@
   .members li.owner {
     box-shadow: inset 2px 0 0 var(--c-fleet);
   }
-  /* The identity is a button — clicking (or right-clicking) jumps to the
-     device on the graph. */
-  .m-jump {
+  /* The identity is display-only now — clicking it no longer yanks you out to
+     the graph. The explicit "View" button in the actions does that instead. */
+  .m-id-wrap {
     flex: 1;
     min-width: 0;
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    border: none;
-    background: none;
-    text-align: left;
     padding: 0.2rem 0.5rem;
-    border-radius: var(--r-sm);
-    color: inherit;
-  }
-  .m-jump:hover {
-    background: var(--surface);
   }
   .m-avatar {
     font-size: 1.2rem;
@@ -558,21 +621,33 @@
     gap: 0.35rem;
     flex-shrink: 0;
   }
-  /* Promote = add a co-owner. Gold (the owner colour), and clearly additive —
-     never the dangerous "transfer" it used to read as. */
-  .promote {
-    border: 1px solid var(--c-fleet-soft);
-    background: var(--c-fleet-soft);
-    color: var(--c-fleet-ink);
+  /* Role controls — one layer at a time. "Up" (promote) is additive, in the
+     fleet's green; "down" (withdraw) is a quiet, neutral step-back, so adding
+     and removing a layer read as the same kind of action in opposite directions
+     rather than promote-vs-danger. */
+  .role-btn {
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-soft);
     border-radius: var(--r-pill);
     padding: 0.22rem 0.6rem;
     font-size: 0.72rem;
     font-weight: 650;
     cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
   }
-  .promote:hover {
+  .role-btn.up {
+    border-color: var(--c-fleet-soft);
+    background: var(--c-fleet-soft);
+    color: var(--c-fleet-ink);
+  }
+  .role-btn.up:hover {
     border-color: var(--c-fleet);
+  }
+  .role-btn.down:hover {
+    border-color: var(--line-strong);
+    color: var(--ink);
+    background: var(--surface-2);
   }
   .owner-tag {
     font-size: 0.62rem;

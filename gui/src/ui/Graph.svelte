@@ -279,6 +279,23 @@
   const MIN_ZOOM = 0.4;
   const MAX_ZOOM = 2.2;
 
+  // "Show me this device" from a settings list: when the store bumps a focus
+  // request, pan the camera so the node sits at the canvas centre (at the
+  // current zoom), so the View buttons actually reveal the node rather than
+  // just selecting it somewhere off-screen. Guarded by the request's seq so it
+  // fires once per request — a plain counter, not $state, so updating it doesn't
+  // re-run this effect.
+  let lastFocusSeq = 0;
+  $effect(() => {
+    const req = app.focusRequest;
+    if (!req || req.seq === lastFocusSeq) return;
+    lastFocusSeq = req.seq;
+    const p = layout.find((pl) => pl.node.id === req.id);
+    if (!p) return;
+    panX = width / 2 - p.x * zoom;
+    panY = height / 2 - p.y * zoom;
+  });
+
   // The active canvas gesture: panning (right-drag) or marqueeing (left-drag on
   // empty). Node drags are tracked separately, below.
   type Gesture =

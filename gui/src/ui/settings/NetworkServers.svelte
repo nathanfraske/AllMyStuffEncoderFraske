@@ -244,9 +244,9 @@
     color: var(--ink-soft);
   }
   .pick.active {
-    background: var(--accent-soft);
-    border-color: var(--accent);
-    color: var(--accent-ink);
+    background: var(--c-venue-soft);
+    border-color: var(--c-venue);
+    color: var(--c-venue-ink);
   }
   .lead {
     font-size: 0.8rem;
@@ -284,11 +284,11 @@
     padding: 0.5rem 0.6rem;
   }
   .venue:hover {
-    border-color: var(--accent);
+    border-color: var(--c-venue);
   }
   .venue.on {
-    background: var(--accent-soft);
-    border-color: var(--accent);
+    background: var(--c-venue-soft);
+    border-color: var(--c-venue);
   }
   .dot {
     width: 0.85rem;
@@ -298,9 +298,9 @@
     flex-shrink: 0;
   }
   .venue.on .dot {
-    border-color: var(--accent);
+    border-color: var(--c-venue);
     background:
-      radial-gradient(circle, var(--accent) 0 38%, transparent 42%);
+      radial-gradient(circle, var(--c-venue) 0 38%, transparent 42%);
   }
   .vt {
     display: flex;
@@ -321,9 +321,9 @@
   .chip.mini {
     font-size: 0.6rem;
     padding: 0.04rem 0.4rem;
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-    border-color: var(--accent);
+    color: var(--c-venue-ink);
+    background: var(--c-venue-soft);
+    border-color: var(--c-venue);
   }
   .add-venue {
     margin-top: 0.45rem;

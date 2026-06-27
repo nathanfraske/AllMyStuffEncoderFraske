@@ -1129,7 +1129,19 @@ impl Mesh {
         }
         match channel {
             CHANNEL_PRESENCE => {
-                if let Ok(profile) = serde_json::from_value::<NodeProfile>(payload) {
+                // Never silently discard a node-information update on a parse
+                // slip: a peer's presence is how we learn its name, owner,
+                // sites, version and fleet, so a dropped advert is a node that
+                // never appears or never refreshes. Parse once and log the
+                // reason on failure — failing closed with no trace is what hid
+                // this for so long. The profile is lenient about absent/older
+                // fields now (they default), so a hard error here is genuinely
+                // malformed input worth seeing.
+                let parsed = serde_json::from_value::<NodeProfile>(payload);
+                if let Err(e) = &parsed {
+                    tracing::warn!("dropping presence advert from {}: {e}", short_id(&from));
+                }
+                if let Ok(profile) = parsed {
                     // We answer a peer's presence with our own (+ roster) when
                     // either it's the first we've heard of them this session or
                     // their app just (re)started — so the bootstrap is mutual
@@ -2814,6 +2826,11 @@ impl Mesh {
         // refresh runs on every check.
         if peer.is_none() {
             self.ensure_fleet_network().await;
+            // Same cadence, opposite policy: every *non*-fleet mesh is made
+            // fully open (auto-approve), so older meshes are migrated and any
+            // newly joined one is reconciled — no mesh keeps a stale approval
+            // gate now that the approval queue is gone.
+            self.ensure_open_meshes_auto_approve().await;
         }
         self.refresh_fleet_authorization().await;
     }
@@ -2932,6 +2949,115 @@ impl Mesh {
                 })
                 .await;
         }
+    }
+
+    /// Make every ordinary (non-fleet) mesh fully open by turning on
+    /// `auto_approve`: any node that joins is admitted automatically, with no
+    /// per-mesh approval gate. AllMyStuff shapes who can mesh with you through
+    /// private venues, the Fleet, and Sharing — not by approving devices one by
+    /// one — so the approval queue is gone and every mesh must auto-admit or
+    /// peers would be stranded with no way in.
+    ///
+    /// New meshes are already created auto-approve by the GUI; this migrates any
+    /// older mesh (made before the open default, or joined some other way) on
+    /// the next launch. The fleet's own mesh is **skipped**: its membership is
+    /// the signed roster (claim-based), never open admission, so a stranger can
+    /// never auto-join it. Idempotent — a mesh already open is left untouched,
+    /// so there is no churn after the first pass.
+    async fn ensure_open_meshes_auto_approve(self: &Arc<Self>) {
+        let fleet = self.ownership.fleet_network_id();
+        let resp = match self.client.request(&Request::ConfigShow).await {
+            Ok(r) if r.ok => r,
+            _ => return,
+        };
+        let Some(data) = resp.data else { return };
+        let Some(nets) = data.pointer("/config/networks").and_then(|v| v.as_array()) else {
+            return;
+        };
+        // Snapshot the configs that need flipping first, so no borrow of `data`
+        // is held across the awaited NetworkUpdate calls below.
+        let to_open: Vec<Value> = nets
+            .iter()
+            .filter(|n| {
+                let nid = n
+                    .get("network_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if nid.is_empty() {
+                    return false;
+                }
+                // Never auto-open the fleet's closed mesh — its members are the
+                // signed roster, not anyone who connects.
+                if fleet.as_deref() == Some(nid) {
+                    return false;
+                }
+                // Already open → nothing to do (keeps this idempotent).
+                !n.get("auto_approve")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for mut config in to_open {
+            let nid = config
+                .get("network_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // Safety net for closed networks. The fleet-id match above is the
+            // primary skip, but if `fleet_network_id` is momentarily unset
+            // (mid-leave, or the ownership store still loading) the fleet's mesh
+            // could slip past it — and auto-opening a *closed* governance network
+            // would let anyone connect straight into it. So never open a network
+            // whose **signed** governance is closed, whatever its config `kind`
+            // (the fleet mesh is created `open` then transitioned, so the config
+            // field lies) or our fleet state says.
+            if self.is_closed_governance(&nid).await {
+                tracing::debug!(
+                    "leaving closed-governance mesh {nid} approval-gated (not auto-opened)"
+                );
+                continue;
+            }
+            if let Some(obj) = config.as_object_mut() {
+                obj.insert("auto_approve".into(), Value::Bool(true));
+            }
+            // A full-config round-trip (only `auto_approve` changed) — the same
+            // shape `network_set_enabled` parks and re-adds, so the daemon
+            // hot-applies it without dropping live peers.
+            match self
+                .client
+                .request(&Request::NetworkUpdate { config })
+                .await
+            {
+                Ok(r) if r.ok => tracing::info!("opened mesh {nid} — auto-approve on (fully open)"),
+                Ok(r) => tracing::warn!(
+                    "couldn't open mesh {nid}: {}",
+                    r.error.unwrap_or_else(|| "(no error)".into())
+                ),
+                Err(e) => tracing::warn!("couldn't open mesh {nid}: {e}"),
+            }
+        }
+    }
+
+    /// Whether `network`'s **authoritative** governance — the signed state log,
+    /// not the config's initial `kind` field — is closed. A closed network must
+    /// never be auto-opened: its membership is the signed roster, not anyone who
+    /// connects. Mirrors the GovernanceState read in [`Mesh::is_fleet_founded`].
+    /// Any error reads as *not* closed: the fleet-id skip in
+    /// [`Mesh::ensure_open_meshes_auto_approve`] remains the first line of
+    /// defence, and an ordinary open mesh has no governance log to consult.
+    async fn is_closed_governance(self: &Arc<Self>, network: &str) -> bool {
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return false,
+        };
+        data.pointer("/state/kind").and_then(|v| v.as_str()) == Some("closed")
     }
 
     /// Whether this device already holds the founder-Owner role on the fleet's
@@ -3300,6 +3426,13 @@ impl Mesh {
         // [`Mesh::prune_unjoined_peers`]).
         self.prune_unjoined_peers().await;
         self.subscribe_channels(client_id, &networks).await;
+        // The joined set just changed (a create / join / import / re-enable, or
+        // the fleet network arriving). Reconcile open-mesh policy now so a mesh
+        // doesn't wait for the next ownership broadcast to drop its approval
+        // gate — in particular a legacy mesh just **re-enabled** from its parked
+        // config (which kept `auto_approve: false`) would otherwise reject
+        // joiners with no UI to admit them until that later pass.
+        self.ensure_open_meshes_auto_approve().await;
         self.advertise_capabilities().await;
         self.broadcast_presence().await;
         self.emit_snapshot();
