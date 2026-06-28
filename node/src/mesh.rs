@@ -7324,7 +7324,10 @@ mod tests {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));
         let before = mesh.boot_id.load(Ordering::Relaxed);
-        assert_ne!(before, 0, "boot id is never 0 — 0 means a peer without the field");
+        assert_ne!(
+            before, 0,
+            "boot id is never 0 — 0 means a peer without the field"
+        );
         // What the prune does after clearing a reset network's peer caches.
         mesh.boot_id.store(fresh_boot_id(), Ordering::Relaxed);
         let after = mesh.boot_id.load(Ordering::Relaxed);
