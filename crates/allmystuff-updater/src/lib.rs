@@ -578,11 +578,8 @@ fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
 /// `*.app` path component, so it catches the binary at
 /// `Foo.app/Contents/MacOS/<bin>` and any resource beneath it.
 fn path_in_os_bundle(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| s.ends_with(".app"))
-    })
+    path.components()
+        .any(|c| c.as_os_str().to_str().is_some_and(|s| s.ends_with(".app")))
 }
 
 /// The raw install-location discovery, before the OS-bundle guard
@@ -1496,7 +1493,9 @@ mod tests {
         )));
         // Loose installs (portable / curl|sh / dev) are fair game to swap.
         assert!(!path_in_os_bundle(Path::new("/usr/local/bin/allmystuff")));
-        assert!(!path_in_os_bundle(Path::new("/home/me/.local/bin/allmystuff-gui")));
+        assert!(!path_in_os_bundle(Path::new(
+            "/home/me/.local/bin/allmystuff-gui"
+        )));
         assert!(!path_in_os_bundle(Path::new(
             r"C:\Program Files\AllMyStuff\allmystuff-gui.exe"
         )));

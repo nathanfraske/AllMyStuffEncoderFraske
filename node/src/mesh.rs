@@ -7502,7 +7502,10 @@ mod tests {
             DrivePlane::Sites,
             DrivePlane::Clipboard,
         ] {
-            assert!(!grant_authorizes_plane(&control, p), "control leaked to {p:?}");
+            assert!(
+                !grant_authorizes_plane(&control, p),
+                "control leaked to {p:?}"
+            );
         }
 
         // Terminal and Sites are both Generic grants — the capability suffix is
@@ -7532,7 +7535,10 @@ mod tests {
             DrivePlane::Sites,
             DrivePlane::Clipboard,
         ] {
-            assert!(!grant_authorizes_plane(&screen, p), "screen leaked to {p:?}");
+            assert!(
+                !grant_authorizes_plane(&screen, p),
+                "screen leaked to {p:?}"
+            );
         }
 
         // route_drive_plane classifies exactly the privileged routes.
