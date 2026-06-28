@@ -1327,13 +1327,16 @@ impl Mesh {
                         let hosts_here = self
                             .local_node_id()
                             .is_some_and(|me| node_of(route.from.as_str()) == me);
-                        if let Some(reason) = privileged_offer_refusal(
-                            route,
-                            hosts_here,
-                            self.sender_may_control(&from),
-                        ) {
+                        // Authorized for this exact plane: owner/fleet, or a
+                        // share grant the owner extended for it. Non-privileged
+                        // routes (`None` plane) are never refused here.
+                        let authorized = route_drive_plane(route)
+                            .is_none_or(|plane| self.sender_may_drive(&from, plane));
+                        if let Some(reason) =
+                            privileged_offer_refusal(route, hosts_here, authorized)
+                        {
                             tracing::warn!(
-                                "privileged offer {} from {} refused: not owner/fleet",
+                                "privileged offer {} from {} refused: not owner/fleet/share",
                                 route.id,
                                 short_id(&from)
                             );
@@ -1456,12 +1459,14 @@ impl Mesh {
                     MediaPayload::Input(ev) => {
                         // Injecting keystrokes is the most privileged thing
                         // on the mesh, so it takes both gates: a live input
-                        // route from this exact sender, *and* the sender
-                        // being this device's recorded owner or a co-owned
-                        // fleet member. (Share-grant-based control rides on
-                        // the share enforcement work — not wired yet.)
+                        // route from this exact sender, *and* the sender being
+                        // authorized to drive this machine's control plane —
+                        // its recorded owner, a co-owned fleet member, or a
+                        // person the owner deliberately granted control to (the
+                        // share path; without it a shared "Control" route
+                        // activates but every event is dropped here).
                         if self.inbound_media_ok(&ev.route, &from, MediaKind::Input)
-                            && self.sender_may_control(&from)
+                            && self.sender_may_drive(&from, DrivePlane::Input)
                         {
                             self.injector.apply(&ev.route, ev.action);
                         } else {
@@ -4268,7 +4273,7 @@ impl Mesh {
         let viewer = node_of(route.to.as_str());
         let peer = self.route_peer(&route.id).unwrap_or(viewer);
         let rid = route.id.clone();
-        if !self.sender_may_control(&peer) {
+        if !self.sender_may_drive(&peer, DrivePlane::Terminal) {
             tracing::warn!(
                 "route {rid} — terminal for non-controller {} refused",
                 short_id(&peer)
@@ -4533,7 +4538,7 @@ impl Mesh {
         let peer = self
             .route_peer(&rid)
             .unwrap_or_else(|| node_of(route.to.as_str()));
-        if !self.sender_may_control(&peer) {
+        if !self.sender_may_drive(&peer, DrivePlane::Terminal) {
             tracing::warn!(
                 "route {rid} — local terminal refused (not owner/fleet of this machine)"
             );
@@ -4707,7 +4712,7 @@ impl Mesh {
             )
         };
         if hosts_here {
-            if !self.sender_may_control(from) {
+            if !self.sender_may_drive(from, DrivePlane::Terminal) {
                 tracing::warn!("dropped terminal input from {from}: not an authorized controller");
                 return;
             }
@@ -4912,7 +4917,7 @@ impl Mesh {
     /// the same owner/fleet check the terminal host itself uses, so a
     /// stranger on the mesh can't even enumerate our shells.
     async fn handle_terminal_sessions_request(self: &Arc<Self>, from: &str) {
-        if !self.sender_may_control(from) {
+        if !self.sender_may_drive(from, DrivePlane::Terminal) {
             tracing::warn!(
                 "terminal-sessions request from {} ignored: not owner/fleet",
                 short_id(from)
@@ -4992,7 +4997,7 @@ impl Mesh {
                 other => tracing::debug!("shared-files host ignoring {other:?}"),
             }
         } else if hosts_here {
-            if !self.sender_may_control(from) {
+            if !self.sender_may_drive(from, DrivePlane::Files) {
                 tracing::warn!("dropped file request from {from}: not an authorized controller");
                 return;
             }
@@ -5207,7 +5212,7 @@ impl Mesh {
     async fn handle_site_control(self: &Arc<Self>, from: &str, sc: SiteControl) {
         match sc {
             SiteControl::List => {
-                if !self.sender_may_control(from) {
+                if !self.sender_may_drive(from, DrivePlane::Sites) {
                     tracing::warn!("site list from {} refused: not owner/fleet", short_id(from));
                     return;
                 }
@@ -5546,7 +5551,7 @@ impl Mesh {
         if hosts_here {
             // The proxy *into* this machine — as privileged as the terminal,
             // so the same owner/fleet gate, re-cleared per frame.
-            if !self.sender_may_control(from) {
+            if !self.sender_may_drive(from, DrivePlane::Sites) {
                 tracing::warn!(
                     "dropped site frame from {}: not an authorized controller",
                     short_id(from)
@@ -5934,6 +5939,12 @@ impl Mesh {
     /// this closes (AMS-01); membership is now the signed roster a peer can
     /// only enter via the owner's governance. Fails closed — an empty or stale
     /// cache denies control rather than guessing.
+    ///
+    /// This is the **owner/fleet** trust only. A person-to-person *share* is the
+    /// other authorized path (the owner deliberately granting one plane to
+    /// someone outside their fleet); it's honoured per-plane in
+    /// [`Self::sender_may_drive`], never here, so a screen-share grant can't
+    /// leak into the planes it didn't name.
     fn sender_may_control(&self, sender: &str) -> bool {
         let canon = pubkey_part(sender);
         // You always control your own machine. A loopback terminal/console to
@@ -5951,6 +5962,32 @@ impl Mesh {
             return true;
         }
         self.fleet_authorized.lock().contains(canon)
+    }
+
+    /// Whether `sender` may drive one privileged `plane` on this machine: the
+    /// owner/fleet trust of [`Self::sender_may_control`], **or** an explicit
+    /// person-to-person *share grant* this machine extended that names exactly
+    /// that plane. Honouring the grant is what makes a share actually work — the
+    /// route authorization already lets a granted route activate, so without
+    /// this the console's terminal/files/control/clipboard frames would reach an
+    /// active route and then be dropped here ("appears to work but doesn't pass
+    /// through"). A grant authorizes only its own plane — a control grant never
+    /// opens a shell, a files grant never injects — and the owner/fleet check
+    /// runs first, so this only ever *widens* access to exactly who the owner
+    /// chose, never narrows the existing owner/fleet path. Config writes
+    /// (`SetExposed`) and the `Upgrade` command deliberately stay
+    /// owner/fleet-only and keep calling [`Self::sender_may_control`] directly.
+    fn sender_may_drive(&self, sender: &str, plane: DrivePlane) -> bool {
+        if self.sender_may_control(sender) {
+            return true;
+        }
+        let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
+            return false;
+        };
+        self.shares
+            .out_grants_for(&person.id)
+            .iter()
+            .any(|g| grant_authorizes_plane(g, plane))
     }
 
     /// Ask the far end of an inbound display/camera route for a clean
@@ -6284,7 +6321,7 @@ impl Mesh {
         };
 
         if sinks_here {
-            if !self.sender_may_control(from) {
+            if !self.sender_may_drive(from, DrivePlane::Clipboard) {
                 tracing::warn!("dropped clipboard from {from}: not an authorized controller");
                 return;
             }
@@ -6702,28 +6739,77 @@ fn audio_capture_source(route: &Route) -> CaptureSource {
     }
 }
 
-/// Why an inbound terminal/files offer must be refused, if it must: it
-/// asks *this* machine to host a shell (or hand over its disk) and the
-/// offerer isn't an authorized controller. `None` = fine (not a
-/// privileged offer, not our side to host, or the sender is owner/fleet).
-/// Pure, so the rule that guards the most privileged things on the mesh
-/// is unit-testable.
-fn privileged_offer_refusal(
-    route: &Route,
-    hosts_here: bool,
-    sender_may_control: bool,
-) -> Option<String> {
-    if !hosts_here || sender_may_control {
+/// A privileged plane a peer can drive on this machine — the unit a share
+/// grant authorizes. Owner/fleet trust covers every plane; a person-to-person
+/// share covers only the exact plane(s) the owner granted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DrivePlane {
+    /// Keyboard/mouse injection into this machine's `:control` input sink.
+    Input,
+    /// A shell on this machine.
+    Terminal,
+    /// This machine's disk.
+    Files,
+    /// Reverse-proxying a service this machine exposes.
+    Sites,
+    /// Writing this machine's clipboard (rides with the control grant).
+    Clipboard,
+}
+
+/// The privileged plane a route carries, if any — so the offer screen and the
+/// per-frame gate authorize the same plane for the same route.
+fn route_drive_plane(route: &Route) -> Option<DrivePlane> {
+    if is_terminal_route(route) {
+        Some(DrivePlane::Terminal)
+    } else if is_files_route(route) {
+        Some(DrivePlane::Files)
+    } else if is_site_route(route) {
+        Some(DrivePlane::Sites)
+    } else {
+        None
+    }
+}
+
+/// Whether `grant` authorizes `plane`. Each plane maps to exactly the grant the
+/// share builder mints for it (`gui/src/store.svelte.ts::shareCapGrants`), so
+/// the planes never cross-authorize: a control (input) grant only injects, a
+/// files (storage) grant only reaches the disk, terminal/sites are distinct
+/// generic grants told apart by their capability suffix.
+fn grant_authorizes_plane(grant: &Grant, plane: DrivePlane) -> bool {
+    let cap_ends = |suffix: &str| {
+        grant
+            .capability
+            .as_ref()
+            .is_some_and(|c| c.as_str().ends_with(suffix))
+    };
+    match plane {
+        DrivePlane::Input => grant.media == MediaKind::Input && grant.role.allows_sink(),
+        DrivePlane::Terminal => grant.media == MediaKind::Generic && cap_ends(":terminal"),
+        DrivePlane::Files => grant.media == MediaKind::Storage && cap_ends(":files"),
+        DrivePlane::Sites => grant.media == MediaKind::Generic && cap_ends(":sites"),
+        DrivePlane::Clipboard => grant.media == MediaKind::Clipboard,
+    }
+}
+
+/// Why an inbound terminal/files/site offer must be refused, if it must: it
+/// asks *this* machine to host a shell (or hand over its disk, or proxy a
+/// service) and the offerer is neither owner/fleet nor holds a share grant for
+/// that plane (`authorized` folds both — the caller computes it per the route's
+/// plane). `None` = fine (not a privileged offer, not our side to host, or the
+/// sender is authorized). Pure, so the rule that guards the most privileged
+/// things on the mesh is unit-testable.
+fn privileged_offer_refusal(route: &Route, hosts_here: bool, authorized: bool) -> Option<String> {
+    if !hosts_here || authorized {
         return None;
     }
     if is_terminal_route(route) {
-        return Some("not authorized: terminal access is owner/fleet only".into());
+        return Some("not authorized: terminal access needs owner/fleet or a share".into());
     }
     if is_files_route(route) {
-        return Some("not authorized: file access is owner/fleet only".into());
+        return Some("not authorized: file access needs owner/fleet or a share".into());
     }
     if is_site_route(route) {
-        return Some("not authorized: site access is owner/fleet only".into());
+        return Some("not authorized: site access needs owner/fleet or a share".into());
     }
     None
 }
@@ -7393,6 +7479,79 @@ mod tests {
         // owner/fleet rule) is what keeps it to explicitly-shared files.
         let shared = term_route("me:shared", "them:shared-view:1", MediaKind::Generic);
         assert_eq!(privileged_offer_refusal(&shared, true, false), None);
+    }
+
+    #[test]
+    fn share_grants_authorize_exactly_their_own_plane() {
+        use allmystuff_graph::GrantRole;
+        let g = |media: MediaKind, role: GrantRole, cap: &str| Grant {
+            id: "g".into(),
+            media,
+            role,
+            capability: Some(cap.into()),
+            label: String::new(),
+        };
+
+        // A control grant injects — and opens neither a shell, the disk, nor
+        // anything else.
+        let control = g(MediaKind::Input, GrantRole::Consume, "me:control");
+        assert!(grant_authorizes_plane(&control, DrivePlane::Input));
+        for p in [
+            DrivePlane::Terminal,
+            DrivePlane::Files,
+            DrivePlane::Sites,
+            DrivePlane::Clipboard,
+        ] {
+            assert!(!grant_authorizes_plane(&control, p), "control leaked to {p:?}");
+        }
+
+        // Terminal and Sites are both Generic grants — the capability suffix is
+        // what tells them apart, so neither is mistaken for the other.
+        let terminal = g(MediaKind::Generic, GrantRole::Provide, "me:terminal");
+        assert!(grant_authorizes_plane(&terminal, DrivePlane::Terminal));
+        assert!(!grant_authorizes_plane(&terminal, DrivePlane::Sites));
+        let sites = g(MediaKind::Generic, GrantRole::Provide, "me:sites");
+        assert!(grant_authorizes_plane(&sites, DrivePlane::Sites));
+        assert!(!grant_authorizes_plane(&sites, DrivePlane::Terminal));
+
+        // Files is a storage grant; clipboard its own kind.
+        let files = g(MediaKind::Storage, GrantRole::Both, "me:files");
+        assert!(grant_authorizes_plane(&files, DrivePlane::Files));
+        assert!(!grant_authorizes_plane(&files, DrivePlane::Input));
+        let clip = g(MediaKind::Clipboard, GrantRole::Both, "me:clipboard");
+        assert!(grant_authorizes_plane(&clip, DrivePlane::Clipboard));
+
+        // A screen grant (watch only) authorizes NO privileged plane — sharing
+        // a screen never hands over control, a shell, the disk, or the
+        // clipboard.
+        let screen = g(MediaKind::Display, GrantRole::Provide, "me:screen");
+        for p in [
+            DrivePlane::Input,
+            DrivePlane::Terminal,
+            DrivePlane::Files,
+            DrivePlane::Sites,
+            DrivePlane::Clipboard,
+        ] {
+            assert!(!grant_authorizes_plane(&screen, p), "screen leaked to {p:?}");
+        }
+
+        // route_drive_plane classifies exactly the privileged routes.
+        assert_eq!(
+            route_drive_plane(&term_route("me:terminal", "them:tv:1", MediaKind::Generic)),
+            Some(DrivePlane::Terminal)
+        );
+        assert_eq!(
+            route_drive_plane(&term_route("me:files", "them:fv:1", MediaKind::Generic)),
+            Some(DrivePlane::Files)
+        );
+        assert_eq!(
+            route_drive_plane(&term_route("me:site", "them:sv:1", MediaKind::Generic)),
+            Some(DrivePlane::Sites)
+        );
+        assert_eq!(
+            route_drive_plane(&term_route("me:mic", "them:speaker", MediaKind::Audio)),
+            None
+        );
     }
 
     #[test]

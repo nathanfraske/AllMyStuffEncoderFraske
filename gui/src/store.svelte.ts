@@ -271,7 +271,37 @@ const CONNECTED_STATUSES = new Set(["active", "shelved"]);
  *  enough to swallow every routine transport rebuild, short enough that
  *  a genuinely gone machine isn't painted reachable for long. An
  *  explicit `offline`/`error` status skips the grace entirely. */
-const PRESENCE_GRACE_MS = 15_000;
+const PRESENCE_GRACE_MS = 45_000;
+
+/** The app features the running binary always supports — the GUI's mirror of
+ *  the node's `build_profile` feature list (node/src/mesh.rs). A peer learns
+ *  these from our presence/capability advert, but the *local* node never
+ *  receives its own advert (presence arrives from peers), so it must stamp
+ *  them itself — otherwise sharing this machine's Terminal/Files/Sites is
+ *  greyed out (their availability gates read `node.features`), while
+ *  Screen/Audio/Control work because they resolve through scanned
+ *  capabilities. Sites additionally needs at least one exposed site (wired
+ *  from `exposedSites`), so it isn't claimed until something is exposed. */
+const LOCAL_FEATURES = [
+  FEATURE_TERMINAL,
+  FEATURE_FILES,
+  FEATURE_ROOMS,
+  FEATURE_CAMERA,
+  FEATURE_SITES,
+];
+
+/** Which of a machine's consoles/legs are available to open *right now* — the
+ *  per-capability availability the graph cards, the drawer, and the console
+ *  itself all read so they agree on what to show (and what to hide). */
+export type ConsoleAccess = {
+  remote: boolean;
+  files: boolean;
+  terminal: boolean;
+  sites: boolean;
+  audio: boolean;
+  control: boolean;
+  clipboard: boolean;
+};
 
 /** The send channels a room can have live, each owning the routes its
  *  toggle created. `mic` is the call (your voice); `sound` is the
@@ -1253,6 +1283,15 @@ class AppStore {
       (deviceNets.get(k) ?? deviceNets.set(k, new Set()).get(k)!).add(name);
     };
     const nets = Array.isArray(this.networks) ? this.networks : [];
+    // A machine can appear in several networks' peer lists with independent
+    // transport state (a link on one mesh rebuilding while another is steady).
+    // The presence grace is machine-wide ("connected on ANY network recently"),
+    // so accumulate the best status across all networks first and only settle
+    // the grace marker once per machine — otherwise an `offline` row on one
+    // mesh deletes the grace an `active` row on another just earned, and the
+    // machine flaps offline on the next poll.
+    const activeCanons = new Set<string>();
+    const offlineCanons = new Set<string>();
     for (const net of nets) {
       const netName = this.meshLabel(net);
       let peers: PeerInfo[] = [];
@@ -1304,11 +1343,12 @@ class AppStore {
         const canon = canonicalNodeId(p.device_id);
         if (CONNECTED_STATUSES.has(p.status)) {
           e.online = true;
-          this.lastConnectedAt.set(canon, Date.now());
+          activeCanons.add(canon);
         } else if (p.status === "offline" || p.status === "error") {
-          // The daemon's explicit verdict — no grace, and no lingering
-          // marker for the vanish sweep below to resurrect it with.
-          this.lastConnectedAt.delete(canon);
+          // The daemon's explicit verdict on THIS network — recorded, but only
+          // allowed to clear the machine-wide grace if no other network reports
+          // it connected this poll (settled after the loop).
+          offlineCanons.add(canon);
         } else if (this.withinPresenceGrace(canon)) {
           // Transient (sighted / handshaking / reconnecting): a link
           // mid-rebuild. Recently-connected machines hold online through
@@ -1319,6 +1359,13 @@ class AppStore {
       }
       for (const r of roster) addNet(r.device_id, netName);
       rosterAll.push(...roster);
+    }
+    // Settle the machine-wide grace once all networks are folded: a connected
+    // reading on any mesh refreshes it; an explicit offline clears it only when
+    // NO mesh reported the machine connected this poll.
+    for (const canon of activeCanons) this.lastConnectedAt.set(canon, Date.now());
+    for (const canon of offlineCanons) {
+      if (!activeCanons.has(canon)) this.lastConnectedAt.delete(canon);
     }
     this.pendingJoins = joins;
     // Forget declines for devices that are no longer pending (approved or
@@ -1507,6 +1554,7 @@ class AppStore {
       online: true,
       app: true,
       summary: scan.summary,
+      features: [...LOCAL_FEATURES],
     };
     me.id = newId;
     me.kind = "this";
@@ -1515,6 +1563,9 @@ class AppStore {
     me.summary = scan.summary;
     me.online = true;
     me.app = true;
+    // This binary's own feature set — the local node never hears its own
+    // advert, so without this its Terminal/Files/Sites stay un-shareable.
+    me.features = [...LOCAL_FEATURES];
     if (!existing) this.catalog.nodes.push(me);
     // Exactly one local node: keep the one at `newId`, drop any other "this"
     // node and any peer twin of this machine (an early daemon poll may have
@@ -1581,7 +1632,13 @@ class AppStore {
           hostname: p.hostname,
           kind: "machine",
           relationship: { kind: "unclaimed" },
-          online: true,
+          // Presence carries DETAIL, not liveness — a peer's NodeProfile
+          // lingers in the session map after it goes offline (it's only
+          // dropped on an explicit Leave), so being in a snapshot is no proof
+          // of reachability. Derive online from the same grace memory the
+          // mesh poll owns, so the 1s snapshot pull (Terminal/Files windows)
+          // can't resurrect an offline node as "online for a second".
+          online: this.withinPresenceGrace(canonicalNodeId(p.node)),
         };
         this.catalog.nodes.push(node);
       } else {
@@ -1590,7 +1647,9 @@ class AppStore {
         if (node.id !== p.node) node.id = p.node;
         node.label = p.label;
         node.hostname = p.hostname;
-        node.online = true;
+        // See above — online is the poll's call (lastConnectedAt + grace), not
+        // the snapshot's; the snapshot only ever merges presence detail.
+        node.online = this.withinPresenceGrace(canonicalNodeId(p.node));
       }
       node.summary = p.summary;
       // Presence means it's running AllMyStuff — it has wireable stuff.
@@ -1598,12 +1657,14 @@ class AppStore {
       // Ownership the device advertises about itself (Task 4).
       node.owner = p.owner ?? null;
       node.claimable = p.claimable ?? false;
-      // App features it supports ("terminal", …) — absent from an older
-      // peer means none, and the matching buttons stay hidden.
-      node.features = p.features ?? [];
-      // Sites it exposes for reverse-proxying (the Sites sidebar lists
-      // them) — absent/empty from an older peer or one exposing nothing.
-      node.sites = p.sites ?? [];
+      // App features it supports ("terminal", …) and the sites it exposes.
+      // Only overwrite when the frame actually carried them: a sparse or
+      // missed presence frame must NOT blank what the reliable peer-list/tags
+      // path already populated — the same rule the capabilities refresh below
+      // follows. An empty list is omitted on the wire (skip_serializing_if),
+      // so "absent" reads as keep-what-we-have, never clear.
+      if (p.features) node.features = p.features;
+      if (p.sites) node.sites = p.sites;
       // The AllMyStuff version it's running — let it tell when the machine
       // is behind the channel and offer an upgrade. Absent (older peer) =
       // unknown, and the upgrade button stays hidden.
@@ -2040,7 +2101,13 @@ class AppStore {
       case "video":
         return [mk("display", "provide", "screen", "see its screen")];
       case "audio":
-        return [mk("audio", "provide", "audio", "hear its audio")];
+        // The machine's audio source is the synthetic `system-audio`
+        // endpoint the bridge advertises (`<node>:system-audio`), NOT a bare
+        // `:audio` — scope the grant to the id `matchEndpoint(remote,"audio",
+        // "provide")` actually resolves, or it authorizes nothing and the
+        // route is denied (the way video's `screen` / control's `control`
+        // already match their endpoints).
+        return [mk("audio", "provide", "system-audio", "hear its audio")];
       case "control":
         // Control rides with the clipboard, and needs Video to map focus.
         return [
@@ -2288,18 +2355,16 @@ class AppStore {
       this.consoleAutoLegsFallback = null;
     }
     if (!this.consoleNodeId) return;
-    if (!this.consoleAudio) this.toggleConsoleAudio();
-    if (!this.consoleControl) this.toggleConsoleControl();
-    // Clipboard is newer than audio/control: only auto-enable it when the
-    // remote advertises a clipboard endpoint, so a console onto a
-    // not-yet-updated peer doesn't warn about a path that can't exist yet.
-    // An explicit toggle still reports it.
-    if (
-      !this.consoleClipboard &&
-      matchEndpoint(this.catalog, this.consoleNodeId, "clipboard", "consume")
-    ) {
-      this.toggleConsoleClipboard();
-    }
+    // Only bring up the legs the remote actually shared — auto-enabling an
+    // ungranted one used to call connect() -> proposeRoute() and pop a
+    // "share more access" approval sheet just for opening the console. With
+    // this, a screen-only share opens to the screen and whatever else was
+    // granted, and nothing prompts; the toggles for the rest stay hidden
+    // (Console.svelte gates them on the same access).
+    const access = this.consoleAccess(this.consoleNode ?? undefined);
+    if (!this.consoleAudio && access.audio) this.toggleConsoleAudio();
+    if (!this.consoleControl && access.control) this.toggleConsoleControl();
+    if (!this.consoleClipboard && access.clipboard) this.toggleConsoleClipboard();
   }
 
   /** The gate both console entries share: a known remote machine that runs
@@ -2481,8 +2546,10 @@ class AppStore {
     }
   }
 
-  /** Send this machine's keyboard & mouse to the remote (input injection on
-   *  the far side is a follow-up; the route is real and shows active). */
+  /** Send this machine's keyboard & mouse to the remote. The far side injects
+   *  it once authorized — its owner/fleet, or a person it granted control to
+   *  (the backend honours the share grant, so a shared "Control" actually
+   *  drives the machine rather than lighting an inert route). */
   toggleConsoleControl() {
     const remote = this.consoleNodeId;
     if (!remote) return;
@@ -3071,7 +3138,7 @@ class AppStore {
    *  grant where *I* let *them* see *my* screen, so sharing out never unlocks
    *  the same button on the way back. Terminal/Sites ride a generic grant
    *  carrying the synthetic `<node>:terminal` / `<node>:sites` capability. */
-  hasShareGrant(node: MeshNode | undefined, kind: "remote" | "audio" | "control" | "files" | "terminal" | "sites"): boolean {
+  hasShareGrant(node: MeshNode | undefined, kind: "remote" | "audio" | "control" | "clipboard" | "files" | "terminal" | "sites"): boolean {
     if (!node || node.relationship.kind !== "shared") return false;
     const gs = this.shareGrantsFor(node);
     const provide = (g: Grant) => g.role === "provide" || g.role === "both";
@@ -3091,6 +3158,10 @@ class AppStore {
         return gs.some((g) => g.media === "input" && consume(g) && forNode(g));
       case "files":
         return gs.some((g) => g.media === "storage" && forNode(g));
+      case "clipboard":
+        // The clipboard rides with the control grant (the share builder mints
+        // both for "Control"), so a control grant is what unlocks it.
+        return gs.some((g) => g.media === "clipboard" && forNode(g));
       case "terminal":
         return gs.some((g) => g.media === "generic" && !!g.capability?.endsWith(":terminal") && forNode(g));
       case "sites":
@@ -3102,13 +3173,30 @@ class AppStore {
    *  every console it supports; a device a fleet shared with you gets exactly
    *  the ones their grant covers. One source of truth for the graph-card
    *  buttons and the drawer's buttons so they can't disagree. */
-  consoleAccess(node: MeshNode | undefined): { remote: boolean; files: boolean; terminal: boolean; sites: boolean } {
-    const none = { remote: false, files: false, terminal: false, sites: false };
+  consoleAccess(node: MeshNode | undefined): ConsoleAccess {
+    const none: ConsoleAccess = {
+      remote: false,
+      files: false,
+      terminal: false,
+      sites: false,
+      audio: false,
+      control: false,
+      clipboard: false,
+    };
     if (!node || !isAppNode(node)) return none;
     const self = this.isMe(node.id);
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
     const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
+    // A capability is *available on the console* only when the remote actually
+    // exposes the endpoint AND you're authorized for it — so the console
+    // activates with whatever subset was shared and hides the rest, instead of
+    // forcing every leg on (which used to pop a grant prompt for a screen-only
+    // share). Endpoints resolve canonically, so a fleet machine that exposes
+    // audio/control/clipboard lights those up while one that doesn't leaves them
+    // hidden.
+    const exposes = (media: MediaKind, flow: "provide" | "consume") =>
+      !!matchEndpoint(this.catalog, node.id, media, flow);
     return {
       // You don't remote into yourself; otherwise your fleet, or a granted share.
       remote: !self && (mineOrFleet || this.hasShareGrant(node, "remote")),
@@ -3121,6 +3209,19 @@ class AppStore {
         (node.sites?.length ?? 0) > 0 &&
         !self &&
         (mineOrFleet || this.hasShareGrant(node, "sites")),
+      // Audio passthrough: only when the machine has audio to send and you may
+      // hear it.
+      audio:
+        !self && exposes("audio", "provide") && (mineOrFleet || this.hasShareGrant(node, "audio")),
+      // Control (keyboard & mouse): the machine must accept control and you must
+      // be its fleet or hold a control grant.
+      control:
+        !self && exposes("input", "consume") && (mineOrFleet || this.hasShareGrant(node, "control")),
+      // The clipboard rides with control (same grant), gated on the endpoint.
+      clipboard:
+        !self &&
+        exposes("clipboard", "consume") &&
+        (mineOrFleet || this.hasShareGrant(node, "clipboard") || this.hasShareGrant(node, "control")),
     };
   }
 
@@ -3215,6 +3316,22 @@ class AppStore {
     this.myListening = listening;
     this.exposedSites = exposed;
     this.siteMappings = mappings.map((m) => this.mappingFromInfo(m));
+    this.syncLocalSites();
+  }
+
+  /** Mirror this machine's exposed services onto the local node's `sites`, so
+   *  sharing Sites from your own machine lights up (its availability gate reads
+   *  `node.sites`, which only ever arrives from a peer's advert for remote
+   *  nodes — the local node must stamp its own). */
+  private syncLocalSites() {
+    const me = this.node(this.localId) ?? this.catalog.nodes.find((n) => n.kind === "this");
+    if (!me) return;
+    me.sites = this.myExposedSites.map((s) => ({
+      id: s.id,
+      label: s.name,
+      port: s.port,
+      scheme: s.scheme,
+    }));
   }
 
   /** Seed the Sites tab with demo data in web mode (no scan to run). */
@@ -3279,6 +3396,7 @@ class AppStore {
     if (this.backendConnected) {
       this.exposedSites = await siteSetExposed(next);
     }
+    this.syncLocalSites();
   }
 
   /** Map a peer's site to a local port — sets up the reverse-proxy and binds

@@ -44,6 +44,14 @@
   let { windowed = false }: { windowed?: boolean } = $props();
 
   const node = $derived(app.consoleNode);
+  // What this machine actually shared with us — the console activates with
+  // whatever subset is available and hides the toggles for the rest (a
+  // screen-only share shows the screen, no inert Audio/Control buttons).
+  const access = $derived(
+    node
+      ? app.consoleAccess(node)
+      : { remote: false, files: false, terminal: false, sites: false, audio: false, control: false, clipboard: false },
+  );
   const inputs = $derived(node ? app.consoleVideoInputs(node.id) : []);
   const selectedId = $derived(app.consoleInput);
   const selected = $derived<Capability | null>(
@@ -977,36 +985,42 @@
       {/snippet}
       <footer class="controls">
         <div class="toggles">
-          <button
-            class="toggle"
-            class:on={app.consoleAudio}
-            onclick={() => app.toggleConsoleAudio()}
-            title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
-          >
-            <span class="t-icon">🔊</span>
-            Audio
-            <span class="pip" class:lit={app.consoleAudio}></span>
-          </button>
-          <button
-            class="toggle"
-            class:on={app.consoleControl}
-            onclick={toggleControl}
-            title="Send this machine's keyboard & mouse to the remote"
-          >
-            <span class="t-icon">⌨️</span>
-            Control
-            <span class="pip" class:lit={app.consoleControl}></span>
-          </button>
-          <button
-            class="toggle"
-            class:on={app.consoleClipboard}
-            onclick={() => app.toggleConsoleClipboard()}
-            title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote. Each machine keeps its own clipboard otherwise."
-          >
-            <span class="t-icon">📋</span>
-            Clipboard
-            <span class="pip" class:lit={app.consoleClipboard}></span>
-          </button>
+          {#if access.audio}
+            <button
+              class="toggle"
+              class:on={app.consoleAudio}
+              onclick={() => app.toggleConsoleAudio()}
+              title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
+            >
+              <span class="t-icon">🔊</span>
+              Audio
+              <span class="pip" class:lit={app.consoleAudio}></span>
+            </button>
+          {/if}
+          {#if access.control}
+            <button
+              class="toggle"
+              class:on={app.consoleControl}
+              onclick={toggleControl}
+              title="Send this machine's keyboard & mouse to the remote"
+            >
+              <span class="t-icon">⌨️</span>
+              Control
+              <span class="pip" class:lit={app.consoleControl}></span>
+            </button>
+          {/if}
+          {#if access.clipboard}
+            <button
+              class="toggle"
+              class:on={app.consoleClipboard}
+              onclick={() => app.toggleConsoleClipboard()}
+              title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote. Each machine keeps its own clipboard otherwise."
+            >
+              <span class="t-icon">📋</span>
+              Clipboard
+              <span class="pip" class:lit={app.consoleClipboard}></span>
+            </button>
+          {/if}
         </div>
 
         <!-- Quick handles to the rest of this machine — its file manager
