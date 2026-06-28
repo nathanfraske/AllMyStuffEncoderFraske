@@ -749,14 +749,25 @@
               {/if}
             </div>
           </div>
-          <!-- Status + actions cluster (top-right): the online dot sits inside a
-               refresh ring (click = re-learn this node's details), and a gear
-               opens the node's actions menu. -->
+        </div>
+        <div class="node-meta">
+          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+          {:else if st.shared}<span class="tag guest">guest</span>
+          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+          {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+          {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+          <!-- Status + actions cluster, dropped under the title to the right of
+               the chips: the online dot sits inside a refresh ring (click =
+               re-learn this node's details), and a gear opens its menu. -->
           <div class="node-ctl">
             <button
               class="status-refresh"
               class:online={n.online}
-              title={`${n.online ? "online" : "offline"} · click to refresh ${app.isMe(n.id) ? "(rescan this device)" : "(re-learn its details)"}`}
+              data-tip="Refresh"
               aria-label={`Refresh ${displayName(n)}`}
               onclick={(e) => {
                 e.stopPropagation();
@@ -773,24 +784,13 @@
             </button>
             <button
               class="node-gear"
-              title="Node actions"
-              aria-label={`Actions for ${displayName(n)}`}
+              data-tip="Settings"
+              aria-label={`Settings for ${displayName(n)}`}
               aria-haspopup="menu"
               aria-expanded={nodeMenu?.id === n.id}
               onclick={(e) => openNodeMenu(e, n.id)}
             >⚙</button>
           </div>
-        </div>
-        <div class="node-meta">
-          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
-          {:else if st.shared}<span class="tag guest">guest</span>
-          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
-          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
-          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
-          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-          {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-          {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
         {#if cons.remote || cons.files || cons.terminal || cons.sites}
           <!-- The consoles you can open on this device — your own fleet's, or
@@ -1397,14 +1397,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Status + actions cluster, top-right of the card. */
+  /* Status + actions cluster, dropped onto the chips row and pushed to its
+     right edge (`margin-left: auto`). */
   .node-ctl {
     display: flex;
     align-items: center;
     gap: 0.1rem;
     flex-shrink: 0;
+    margin-left: auto;
   }
-  /* The online dot ringed by refresh arrows — clicking reconnects. */
+  /* The online dot ringed by refresh arrows — clicking re-learns the node. */
   .status-refresh {
     position: relative;
     width: 24px;
@@ -1457,6 +1459,7 @@
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
   .node-gear {
+    position: relative;
     border: none;
     background: transparent;
     padding: 0.1rem 0.2rem;
@@ -1529,6 +1532,7 @@
   .node-meta {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 0.25rem;
   }
   /* Console buttons on the card — replace the old mesh pills. One per console
@@ -1568,8 +1572,11 @@
        land on the right. */
     transform: translateX(-3px);
   }
-  /* A quick black/grey tooltip (vs the slow native title). */
-  .cbtn[data-tip]::after {
+  /* A quick black/grey tooltip (vs the slow native title) — shared by the
+     console buttons below and the refresh/gear controls on the chips row. */
+  .cbtn[data-tip]::after,
+  .status-refresh[data-tip]::after,
+  .node-gear[data-tip]::after {
     content: attr(data-tip);
     position: absolute;
     bottom: calc(100% + 5px);
@@ -1589,7 +1596,9 @@
     transition: opacity 0.1s ease 0.1s, transform 0.1s ease 0.1s;
     z-index: 6;
   }
-  .cbtn[data-tip]:hover::after {
+  .cbtn[data-tip]:hover::after,
+  .status-refresh[data-tip]:hover::after,
+  .node-gear[data-tip]:hover::after {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
   }
