@@ -316,6 +316,9 @@ impl Session {
             // before the session ever sees it — it touches no route state —
             // so the state machine just ignores it.
             ControlMessage::Site(_) => Vec::new(),
+            // A refresh's "re-announce your presence" ask is answered by the
+            // backend directly (it replies with an advert); no route state.
+            ControlMessage::ProfileRequest => Vec::new(),
             ControlMessage::App(ac) => vec![Effect::App { from, message: ac }],
             // A control kind a newer peer introduced that this build doesn't
             // know (decoded as `Unknown` rather than failing the message):

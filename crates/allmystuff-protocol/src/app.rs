@@ -469,6 +469,13 @@ pub enum ControlMessage {
     Ownership(OwnershipControl),
     Site(SiteControl),
     App(AppControl),
+    /// "Re-send me your presence." A peer's per-node *refresh* asks the target
+    /// to re-announce its profile so the asker re-learns it on the spot — the
+    /// guaranteed round-trip behind the refresh control (the receiver answers
+    /// with an ordinary presence advert). The asker rate-limits these per
+    /// target; an older peer drops the unknown `t` and the refresh simply falls
+    /// back to re-pulling the daemon's cached view.
+    ProfileRequest,
     /// A control kind a newer build introduced that this one doesn't know.
     /// Decodes here and is ignored, so an unrecognised `t` can never fail the
     /// decode of the whole control channel — the route/share/ownership
@@ -547,6 +554,12 @@ pub enum AppControl {
     /// the confirmation, exactly as a claim confirms by re-advertising its
     /// new owner.
     Upgrade,
+    /// "Restart your AllMyStuff app." Sent to a fleet machine to relaunch its
+    /// node onto the same build — the recovery step heavier than a reconnect
+    /// but lighter than an upgrade (it stages/applies nothing). The receiver
+    /// gates it owner/fleet, exactly like [`AppControl::Upgrade`], and relaunches
+    /// the same OS-aware way; its next presence advert is the confirmation.
+    Restart,
     /// An app-level command a newer build introduced. Ignored here rather
     /// than failing the enclosing [`ControlMessage`].
     #[serde(other)]
