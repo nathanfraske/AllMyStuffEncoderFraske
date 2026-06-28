@@ -209,6 +209,10 @@ pub struct Mesh {
     /// When each route last asked its sender for a clean decode entry —
     /// decode errors arrive at frame rate; the asks must not.
     refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
+    /// Per-peer backoff state for the refresh round-trip ([`ControlMessage::
+    /// ProfileRequest`]), so a held-down refresh can't hammer a peer. See
+    /// [`Mesh::allow_profile_request`].
+    profile_req: Mutex<HashMap<String, ProfileReqState>>,
     /// Per-route Opus decoders for inbound lane audio (stateful across
     /// frames; dropped with the route).
     audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
@@ -405,6 +409,7 @@ impl Mesh {
             video_in_stats: Mutex::new(HashMap::new()),
             video_diag_last: Mutex::new(HashMap::new()),
             refresh_asks: Mutex::new(HashMap::new()),
+            profile_req: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
@@ -1377,6 +1382,17 @@ impl Mesh {
                             // H.264 rides — record it so inbound samples demux to
                             // the right console window by binding, not by guess.
                             self.record_video_lane(&from, &route_id, lane);
+                        }
+                        ControlMessage::ProfileRequest => {
+                            // A peer's refresh asks us to re-announce — send our
+                            // current presence straight back so it re-learns us
+                            // on the spot. The asker spaces these under its own
+                            // backoff envelope, so we just answer.
+                            tracing::debug!(
+                                "presence re-announce requested by {}",
+                                short_id(&from)
+                            );
+                            self.send_presence_to(&from).await;
                         }
                         msg => {
                             let effects = {
@@ -2880,10 +2896,40 @@ impl Mesh {
             return Ok(());
         }
         let peer = node.unwrap_or_default();
+        if peer.is_empty() {
+            return Ok(());
+        }
+        // One backoff tick guards every peer-bound action of a refresh, so a
+        // held-down refresh can't hammer the peer (the envelope grows from once
+        // every 5 s to once a minute over a sustained burst).
+        if !self.allow_profile_request(&peer) {
+            tracing::debug!("refresh of {} throttled by backoff", short_id(&peer));
+            return Ok(());
+        }
         tracing::info!("refresh: re-learning {}", short_id(&peer));
+        // The guaranteed round-trip: ask the peer to re-announce its profile so
+        // we re-learn it now (it answers with an ordinary presence advert).
+        let _ = self
+            .send_control(&peer, &ControlMessage::ProfileRequest)
+            .await;
+        // And re-sync our ownership/fleet view + its exposed sites while we're
+        // here.
         self.ownership_check(Some(pubkey_part(&peer))).await;
         let _ = self.site_remote_list(peer).await;
         Ok(())
+    }
+
+    /// Whether a refresh round-trip to `peer` is allowed under the backoff
+    /// envelope right now, recording it as sent when it is. Keyed per canonical
+    /// peer so refreshing different machines stays independent. See
+    /// [`profile_req_decide`] for the envelope itself.
+    fn allow_profile_request(&self, peer: &str) -> bool {
+        let now = std::time::Instant::now();
+        let key = pubkey_part(peer).to_string();
+        let mut map = self.profile_req.lock();
+        let (allow, st) = profile_req_decide(map.get(&key).copied(), now);
+        map.insert(key, st);
+        allow
     }
 
     /// Front-end command: put *this* device into (or out of) claim mode, so
@@ -6747,6 +6793,90 @@ fn mode_label(mode: VideoMode) -> &'static str {
     }
 }
 
+// ---- refresh round-trip backoff -------------------------------------------
+//
+// The per-node refresh asks a peer to re-announce its profile
+// ([`ControlMessage::ProfileRequest`]). To keep a held-down refresh from
+// hammering a peer, the asker spaces those requests per target under a growing
+// envelope: at most one every `PROFILE_REQ_MIN_SECS`, and that floor *doubles*
+// each minute of a sustained burst up to a `PROFILE_REQ_MAX_SECS` ceiling
+// (5 → 10 → 20 → 40 → 60 s). The envelope resets to its fast floor after a
+// `PROFILE_REQ_RESET_IDLE` quiet spell, or after it's sat at the ceiling for
+// `PROFILE_REQ_CAP_HOLD` (so a steady once-a-minute refresh eventually earns a
+// fresh fast window).
+
+/// Floor between refresh round-trips to one peer — "at most every 5 s".
+const PROFILE_REQ_MIN_SECS: u64 = 5;
+/// Ceiling the floor grows to over a sustained burst — "down to once a minute".
+const PROFILE_REQ_MAX_SECS: u64 = 60;
+/// Quiet spell after which the envelope resets to its fast floor.
+const PROFILE_REQ_RESET_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long the envelope may sit at the ceiling before it resets anyway.
+const PROFILE_REQ_CAP_HOLD: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Per-peer backoff state for the refresh round-trip.
+#[derive(Clone, Copy)]
+struct ProfileReqState {
+    /// When the current burst of refreshes began (drives the growing floor).
+    burst_start: std::time::Instant,
+    /// When we last actually sent a request.
+    last_request: std::time::Instant,
+}
+
+/// The minimum spacing between refresh round-trips given how long the current
+/// burst has run: `PROFILE_REQ_MIN_SECS` through the first minute, then doubling
+/// each further minute (10, 20, 40 s …) up to the `PROFILE_REQ_MAX_SECS` ceiling.
+fn profile_req_interval(burst_age: std::time::Duration) -> std::time::Duration {
+    let level = (burst_age.as_secs() / 60).min(64) as u32; // burst minute (0-based)
+    let secs = PROFILE_REQ_MIN_SECS
+        .checked_shl(level)
+        .unwrap_or(PROFILE_REQ_MAX_SECS)
+        .min(PROFILE_REQ_MAX_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The burst age at which the floor first reaches the ceiling — where the
+/// "sat at the cap" reset window starts counting from.
+fn profile_req_cap_reached() -> std::time::Duration {
+    let mut level = 0u32;
+    while PROFILE_REQ_MIN_SECS.checked_shl(level).unwrap_or(u64::MAX) < PROFILE_REQ_MAX_SECS {
+        level += 1;
+    }
+    std::time::Duration::from_secs(u64::from(level) * 60)
+}
+
+/// The pure backoff decision (factored out so the envelope is unit-testable
+/// without a clock): given the prior per-peer state and `now`, whether a
+/// refresh round-trip is allowed, and the state to store. Resets the burst
+/// after a long idle or a long hold at the ceiling.
+fn profile_req_decide(
+    prev: Option<ProfileReqState>,
+    now: std::time::Instant,
+) -> (bool, ProfileReqState) {
+    let Some(mut st) = prev else {
+        return (
+            true,
+            ProfileReqState {
+                burst_start: now,
+                last_request: now,
+            },
+        );
+    };
+    let idle = now.duration_since(st.last_request);
+    if idle >= PROFILE_REQ_RESET_IDLE
+        || now.duration_since(st.burst_start) >= profile_req_cap_reached() + PROFILE_REQ_CAP_HOLD
+    {
+        st.burst_start = now;
+    }
+    let interval = profile_req_interval(now.duration_since(st.burst_start));
+    if now.duration_since(st.last_request) >= interval {
+        st.last_request = now;
+        (true, st)
+    } else {
+        (false, st)
+    }
+}
+
 /// Whether `route` is a mesh-native terminal session: generic media whose
 /// source endpoint is a machine's `…:terminal` handle. (Terminal
 /// endpoints are deliberately *not* catalog capabilities — generic would
@@ -7610,6 +7740,74 @@ mod tests {
             route_drive_plane(&term_route("me:mic", "them:speaker", MediaKind::Audio)),
             None
         );
+    }
+
+    #[test]
+    fn refresh_backoff_interval_grows_each_minute_then_caps() {
+        use std::time::Duration;
+        // 5 s through the first minute, doubling each further minute up to a
+        // 60 s ceiling.
+        assert_eq!(profile_req_interval(Duration::ZERO), Duration::from_secs(5));
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(59)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(60)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(120)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(180)),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(240)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            profile_req_interval(Duration::from_secs(3600)),
+            Duration::from_secs(60)
+        );
+        // The ceiling is first reached at the 4-minute mark.
+        assert_eq!(profile_req_cap_reached(), Duration::from_secs(240));
+    }
+
+    #[test]
+    fn refresh_backoff_spaces_requests_and_resets_when_idle() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        // The first request is always allowed.
+        let (allow, st) = profile_req_decide(None, t0);
+        assert!(allow);
+
+        // A second within the 5 s floor is refused…
+        let (allow, st) = profile_req_decide(Some(st), at(3));
+        assert!(!allow);
+        // …and allowed once the floor passes.
+        let (allow, st) = profile_req_decide(Some(st), at(5));
+        assert!(allow);
+
+        // Five minutes into a sustained burst the floor has grown to the 60 s
+        // ceiling: a request 295 s after the last is fine, but 30 s later is not.
+        let (allow, st) = profile_req_decide(Some(st), at(300));
+        assert!(allow);
+        let (allow, st) = profile_req_decide(Some(st), at(330));
+        assert!(!allow);
+
+        // A five-minute quiet spell resets the envelope back to the fast floor.
+        let (allow, st) = profile_req_decide(Some(st), at(300 + 5 * 60));
+        assert!(allow);
+        let base = 300 + 5 * 60;
+        let (allow, st) = profile_req_decide(Some(st), at(base + 3));
+        assert!(!allow); // 3 s — back under the 5 s floor
+        let (allow, _) = profile_req_decide(Some(st), at(base + 5));
+        assert!(allow);
     }
 
     #[test]

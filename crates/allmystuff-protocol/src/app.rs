@@ -469,6 +469,13 @@ pub enum ControlMessage {
     Ownership(OwnershipControl),
     Site(SiteControl),
     App(AppControl),
+    /// "Re-send me your presence." A peer's per-node *refresh* asks the target
+    /// to re-announce its profile so the asker re-learns it on the spot — the
+    /// guaranteed round-trip behind the refresh control (the receiver answers
+    /// with an ordinary presence advert). The asker rate-limits these per
+    /// target; an older peer drops the unknown `t` and the refresh simply falls
+    /// back to re-pulling the daemon's cached view.
+    ProfileRequest,
     /// A control kind a newer build introduced that this one doesn't know.
     /// Decodes here and is ignored, so an unrecognised `t` can never fail the
     /// decode of the whole control channel — the route/share/ownership
