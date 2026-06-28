@@ -2930,11 +2930,12 @@ impl Mesh {
     /// ICE without leaving the room. The non-destructive twin of a leave+rejoin
     /// (`network_set_enabled` off-then-on): every session and all app-level
     /// state survives, so a refresh on one side never strands the other.
-    /// Resolution of what to reconnect:
-    ///   * `network` set → every peer on that mesh (the global refresh control).
-    ///   * `peer` only → that one node, on the mesh it's reachable on (the same
-    ///     network resolution our sends use), for the per-node refresh.
-    ///   * neither → every joined mesh.
+    ///
+    /// Resolution of what to reconnect: a set `network` is every peer on that
+    /// mesh (the global refresh control); `peer` alone is that one node, on the
+    /// mesh it's reachable on (the same network resolution our sends use, for
+    /// the per-node refresh); neither is every joined mesh.
+    ///
     /// Best-effort: a per-network failure is logged and the rest still run.
     pub async fn reconnect(
         self: &Arc<Self>,
