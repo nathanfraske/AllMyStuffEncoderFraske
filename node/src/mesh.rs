@@ -179,9 +179,16 @@ pub struct Mesh {
     /// reply that arrives within [`CLIPBOARD_PULL_WINDOW`] of our own pull is
     /// accepted, so a misbehaving peer can't clobber our clipboard unasked.
     clip_pull_at: Mutex<HashMap<String, std::time::Instant>>,
-    /// This app run's random presence boot id — how peers detect that we
-    /// (re)started and answer with their state (see `NodeProfile::boot`).
-    boot_id: u64,
+    /// Our presence boot id — how peers detect that we (re)started and answer
+    /// with their state (see `NodeProfile::boot`). Seeded once per app run, but
+    /// **refreshed whenever a local network reset drops our peer caches** (see
+    /// [`Mesh::prune_unjoined_peers`]): the reset discards everything we knew
+    /// about each peer, so we are a fresh incarnation as far as their state is
+    /// concerned, and a new boot id is exactly what makes them re-send it.
+    /// Without the bump, a network refresh on one side left the *other* side
+    /// (same boot id, peer still "known") silent, stranding the connection
+    /// until both sides refreshed or an app restarted.
+    boot_id: AtomicU64,
     /// Reassembles chunked inbound video frames (a frame bigger than the
     /// data channel's ~64 KiB message ceiling arrives in pieces).
     video_in: Mutex<VideoAssembler>,
@@ -402,7 +409,7 @@ impl Mesh {
             clipboard: ClipboardService::spawn(),
             clip_inbound: Mutex::new(HashMap::new()),
             clip_pull_at: Mutex::new(HashMap::new()),
-            boot_id: fresh_boot_id(),
+            boot_id: AtomicU64::new(fresh_boot_id()),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(HashMap::new()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
@@ -968,7 +975,7 @@ impl Mesh {
             // spoken for (or one that was never put into claim mode).
             owner: self.ownership.owner().map(NodeId::from),
             claimable: self.ownership.claimable(),
-            boot: self.boot_id,
+            boot: self.boot_id.load(Ordering::Relaxed),
             // This build can host mesh-native terminals on every OS the
             // app ships for (openpty / ConPTY) — advertise it so peers
             // know to offer one. Runtime spawn failures still degrade
@@ -2919,6 +2926,64 @@ impl Mesh {
         Ok(())
     }
 
+    /// Reconnect mesh transport **in place** — redial signaling and renegotiate
+    /// ICE without leaving the room. The non-destructive twin of a leave+rejoin
+    /// (`network_set_enabled` off-then-on): every session and all app-level
+    /// state survives, so a refresh on one side never strands the other.
+    /// Resolution of what to reconnect:
+    ///   * `network` set → every peer on that mesh (the global refresh control).
+    ///   * `peer` only → that one node, on the mesh it's reachable on (the same
+    ///     network resolution our sends use), for the per-node refresh.
+    ///   * neither → every joined mesh.
+    /// Best-effort: a per-network failure is logged and the rest still run.
+    pub async fn reconnect(
+        self: &Arc<Self>,
+        network: Option<String>,
+        peer: Option<String>,
+    ) -> Result<(), String> {
+        let networks: Vec<String> = match (&network, &peer) {
+            (Some(net), _) => vec![net.clone()],
+            (None, Some(p)) => self.network_for_peer(p).into_iter().collect(),
+            (None, None) => self.state.lock().networks.clone(),
+        };
+        if networks.is_empty() {
+            return Err("no joined network to reconnect on".into());
+        }
+        // The daemon keys peer sessions by canonical pubkey, so strip any
+        // display decoration off the node id before forwarding.
+        let peer_canon = peer.as_deref().map(|p| pubkey_part(p).to_string());
+        let mut any_ok = false;
+        let mut last_err: Option<String> = None;
+        for net in networks {
+            match self
+                .client
+                .request(&Request::NetworkReconnect {
+                    network: net.clone(),
+                    peer: peer_canon.clone(),
+                })
+                .await
+            {
+                Ok(resp) if resp.ok => any_ok = true,
+                Ok(resp) => {
+                    let e = resp.error.unwrap_or_else(|| "reconnect rejected".into());
+                    tracing::warn!("reconnect on {net}: {e}");
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    tracing::warn!("reconnect on {net} failed: {e}");
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+        // A partial success still counts as success (the failed mesh is logged
+        // above); a total failure surfaces so the GUI can report it.
+        if any_ok {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or_else(|| "reconnect failed".into()))
+        }
+    }
+
     /// Whether a refresh round-trip to `peer` is allowed under the backoff
     /// envelope right now, recording it as sent when it is. Keyed per canonical
     /// peer so refreshing different machines stays independent. See
@@ -3658,6 +3723,17 @@ impl Mesh {
         };
         if dropped > 0 {
             tracing::info!("network reset: cleared {dropped} stale peer(s) from a removed network");
+            // We just threw away everything we knew about those peers (their
+            // profile, features, network, boot id). As far as their state goes
+            // we're now a fresh incarnation, so refresh our boot id: the *next*
+            // presence advert carries a new one, which is what makes a peer
+            // that never reset — same boot id on file, still holding us as a
+            // `known` peer — actually re-send its state instead of treating our
+            // advert as old news. This is the fix for "refresh on one side
+            // breaks the connection until *both* sides refresh": without it the
+            // resetting side discarded its caches but the other side never
+            // re-fed them.
+            self.boot_id.store(fresh_boot_id(), Ordering::Relaxed);
         }
         // Boxed to break the async-fn cycle: `process_effects` can route back
         // through ownership/`sync_networks`, and without indirection the
@@ -7232,6 +7308,28 @@ mod tests {
     fn new_does_not_require_a_running_tokio_runtime() {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let _mesh = Mesh::new(client, Arc::new(NoopSink));
+    }
+
+    /// The presence boot id is the re-sync trigger: a peer answers another's
+    /// advert with its own state only when the boot id is one it hasn't
+    /// recorded. A network reset drops our peer caches, so we *refresh* the
+    /// boot id (see [`Mesh::prune_unjoined_peers`]) — otherwise the side that
+    /// reset re-advertises the same id and the other side, still holding us as
+    /// `known`, never re-feeds the state we just threw away (the "refresh on one
+    /// side strands the connection until both refresh" bug). Guard the two
+    /// invariants that mechanism rests on: the id is never 0 (0 is reserved for
+    /// pre-field peers), and a refresh actually changes it.
+    #[test]
+    fn network_reset_refreshes_a_nonzero_presence_boot_id() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let before = mesh.boot_id.load(Ordering::Relaxed);
+        assert_ne!(before, 0, "boot id is never 0 — 0 means a peer without the field");
+        // What the prune does after clearing a reset network's peer caches.
+        mesh.boot_id.store(fresh_boot_id(), Ordering::Relaxed);
+        let after = mesh.boot_id.load(Ordering::Relaxed);
+        assert_ne!(after, 0, "a refreshed boot id is still non-zero");
+        assert_ne!(before, after, "a network reset must change the boot id");
     }
 
     /// Regression guard for the screen/audio outage: the engine fires tasks

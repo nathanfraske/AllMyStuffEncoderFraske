@@ -126,6 +126,7 @@ import {
   sessionSnapshot,
   setClaimable,
   setNetworkEnabled,
+  networkReconnect,
   updateApply,
   updateCheck,
   requestNodeRefresh,
@@ -5305,20 +5306,27 @@ class AppStore {
     }
   }
 
-  /** Restart the live network(s) — leave and immediately re-join from the
-   *  parked config, tearing down each transport and reconnecting without
-   *  touching settings. The top bar's refresh control: a clean reconnect for
-   *  when a network goes quiet (stuck handshaking, peers fallen silent). It
-   *  acts on every currently-joined network, since the control is global. */
+  /** Reconnect the live network(s) **in place** — redial signaling and
+   *  renegotiate ICE without leaving the room. The top bar's refresh control:
+   *  a clean reconnect for when a network goes quiet (stuck handshaking, peers
+   *  fallen silent). It acts on every currently-joined network, since the
+   *  control is global.
+   *
+   *  This used to leave-and-rejoin each network (`setNetworkEnabled` off then
+   *  on), which was needlessly destructive: a leave announces a departure and
+   *  drops the local peer caches, so a refresh on *one* side stranded the
+   *  *other* side on a stale session until it, too, refreshed (or rebooted).
+   *  The in-place reconnect keeps every session and all app-level state, so
+   *  the link comes back without taking the peer down with it. */
   async restartNetwork() {
-    // Guard against a double-click while a restart is already playing out.
+    // Guard against a double-click while a reconnect is already playing out.
     if (this.restartFlow) return;
     const settle = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
     // The 3-step panel is the feedback now (it floats over the graph), so the
-    // restart no longer narrates itself through toasts — only failures speak.
+    // reconnect no longer narrates itself through toasts — only failures speak.
     const steps: { label: string; status: "wait" | "go" | "ok" }[] = [
-      { label: "Restarting", status: "wait" },
+      { label: "Refreshing", status: "wait" },
       { label: "Reconnecting", status: "wait" },
       { label: "Connected", status: "wait" },
     ];
@@ -5331,34 +5339,26 @@ class AppStore {
     const joined = (Array.isArray(this.networks) ? this.networks : []).slice();
     let failed = 0;
 
-    // Step 1 — restart: park every live mesh (leave from the live config).
+    // Step 1 — kick an in-place reconnect on every live mesh: redial signaling
+    // and renegotiate ICE with every peer, no leave, no teardown.
     mark(0, "go");
     await settle(420);
     if (this.backendConnected) {
       for (const n of joined) {
         try {
-          await setNetworkEnabled(n.config_id || n.network_id, false);
-        } catch (e) {
-          failed++;
-          this.toast("warn", `Couldn't restart ${networkDisplayName(n)}: ${errMsg(e)}`);
-        }
-      }
-    }
-    mark(0, "ok");
-
-    // Step 2 — reconnect: re-join each from the parked config, then re-sync.
-    mark(1, "go");
-    if (this.backendConnected) {
-      for (const n of joined) {
-        try {
-          await setNetworkEnabled(n.config_id || n.network_id, true);
+          await networkReconnect({ network: n.config_id || n.network_id });
         } catch (e) {
           failed++;
           this.toast("warn", `Couldn't reconnect ${networkDisplayName(n)}: ${errMsg(e)}`);
         }
       }
-      // Re-sync regardless of partial failure so the pills/graph match reality
-      // (a failed re-join leaves that mesh parked, recoverable from the menu).
+    }
+    mark(0, "ok");
+
+    // Step 2 — let the redial + renegotiation land, then re-sync the view.
+    mark(1, "go");
+    if (this.backendConnected) {
+      await settle(700);
       await this.refreshNetworkLists();
       await this.syncMeshGraph();
     } else {
@@ -5367,14 +5367,14 @@ class AppStore {
       await settle(700);
     }
     await settle(260);
-    mark(1, failed === 0 ? "ok" : "ok");
+    mark(1, "ok");
 
     // Step 3 — connected: the all-clear.
     mark(2, "go");
     await settle(280);
     mark(2, "ok");
 
-    if (failed > 0) this.toast("warn", "Some meshes didn't come back — open the meshes menu to retry");
+    if (failed > 0) this.toast("warn", "Some meshes couldn't reconnect — open the meshes menu to retry");
 
     // Let the green "Connected" sit a beat, then fade the panel away.
     await settle(1000);
@@ -6140,6 +6140,11 @@ class AppStore {
     // the spinner keeps going until `settleRefreshing` sees the details change
     // (or the timeout fires). Only a failed nudge stops it here.
     try {
+      // Kick an in-place transport reconnect at this one node too — renegotiate
+      // ICE on its link (and re-seed discovery if we'd lost it), the per-node
+      // twin of the top bar's refresh. Non-destructive: no leave, no teardown.
+      // Fire-and-forget so a quiet link doesn't hold up the detail re-pull.
+      void networkReconnect({ peer: canon });
       await requestNodeRefresh(nodeId);
       await this.syncMeshGraph();
       await this.refreshSession();

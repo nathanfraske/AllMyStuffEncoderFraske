@@ -92,6 +92,18 @@ pub enum Request {
     NetworkUpdate {
         config: Value,
     },
+    /// Reconnect a joined network in place — redial signaling and renegotiate
+    /// ICE without leaving the room (the non-destructive twin of
+    /// `NetworkRemove` + `NetworkAdd`). Peers keep their sessions and
+    /// app-level state, so this is what the GUI's refresh / reconnect controls
+    /// drive. `peer` omitted reconnects every peer on the network; `peer` set
+    /// reconnects just that one (a per-node refresh). Mirrors the daemon's
+    /// `control::Request::NetworkReconnect`.
+    NetworkReconnect {
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+    },
 
     // ---- event stream ------------------------------------------------
     /// Upgrade this connection to a duplex event socket. After the ack,
