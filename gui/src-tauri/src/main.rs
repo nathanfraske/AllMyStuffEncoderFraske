@@ -156,6 +156,24 @@ fn restart_app(app: tauri::AppHandle) {
     app.restart()
 }
 
+/// Re-learn a node's details for the refresh control. `node` omitted = **this**
+/// device (re-scan + re-advertise its own profile); a peer id asks that node to
+/// re-send its profile (rate-limited on the far side) so our stored view of its
+/// UI/options/shares is refreshed. Best-effort; the next presence is the proof.
+#[tauri::command]
+async fn refresh_node(state: State<'_, AppState>, node: Option<String>) -> Result<(), String> {
+    let arg = match node {
+        Some(node) => json!({ "node": node }),
+        None => json!({}),
+    };
+    state
+        .node
+        .request("refresh_node", arg)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Put this device into / out of claim mode so another of your machines can
 /// adopt it. Returns whether it's now claimable.
 #[tauri::command]
@@ -1858,6 +1876,7 @@ fn main() {
             upgrade_node,
             restart_node,
             restart_app,
+            refresh_node,
             set_claimable,
             share_grant,
             share_revoke,
