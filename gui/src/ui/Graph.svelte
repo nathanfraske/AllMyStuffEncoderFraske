@@ -750,27 +750,29 @@
             </div>
           </div>
         </div>
-        <div class="node-meta">
-          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
-          {:else if st.shared}<span class="tag guest">guest</span>
-          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
-          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
-          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
-          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-          {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-          {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
-        </div>
-        <!-- Bottom button row. The refresh (online dot ringed by refresh arrows
-             = re-learn this node) and the settings gear lead, inline with the
-             console buttons; a divider separates them from the consoles you can
-             open on this device (your own fleet's, or what a fleet granted). -->
-        <div class="node-consoles">
+        <!-- Chips fill the row; the refresh control is pinned to its right. The
+             online dot ringed by refresh arrows; clicking re-learns this node.
+             It spins while a refresh is in flight and is disabled until the
+             details land (or the request times out). -->
+        <div class="node-meta-row">
+          <div class="node-meta">
+            {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+            {:else if st.shared}<span class="tag guest">guest</span>
+            {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+            {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+            {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+            {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+            {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+            {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+            {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+          </div>
           <button
             class="cbtn status-refresh"
             class:online={n.online}
+            class:spinning={app.isRefreshing(n.id)}
             data-tip="Refresh"
             aria-label={`Refresh ${displayName(n)}`}
+            disabled={app.isRefreshing(n.id)}
             onclick={(e) => {
               e.stopPropagation();
               void app.refreshNode(n.id);
@@ -784,6 +786,27 @@
             </svg>
             <span class="dot" class:on={n.online}></span>
           </button>
+        </div>
+        <!-- Bottom button row: the consoles you can open on this device (your
+             own fleet's, or exactly what a fleet that shared it granted), with
+             the settings gear pinned to the right. -->
+        <div class="node-consoles">
+          {#if cons.remote}
+            <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
+              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
+          {/if}
+          {#if cons.files}
+            <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
+              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
+          {/if}
+          {#if cons.terminal}
+            <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
+              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
+          {/if}
+          {#if cons.sites}
+            <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
+              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
+          {/if}
           <button
             class="cbtn node-gear"
             data-tip="Settings"
@@ -792,25 +815,6 @@
             aria-expanded={nodeMenu?.id === n.id}
             onclick={(e) => openNodeMenu(e, n.id)}
           >⚙</button>
-          {#if cons.remote || cons.files || cons.terminal || cons.sites}
-            <span class="ctl-div" aria-hidden="true"></span>
-            {#if cons.remote}
-              <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
-                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
-            {/if}
-            {#if cons.files}
-              <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
-                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
-            {/if}
-            {#if cons.terminal}
-              <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
-                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
-            {/if}
-            {#if cons.sites}
-              <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
-                onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
-            {/if}
-          {/if}
         </div>
         <!-- Claimable affordances drop out from *under* the node, floating
              below it so they never disturb the graph's layout. -->
@@ -1395,18 +1399,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* A thin rule in the bottom row, between the refresh/settings controls and
-     the console buttons. */
-  .ctl-div {
-    align-self: stretch;
-    width: 1px;
-    margin: 0.1rem 0.1rem;
-    background: var(--line-strong);
-    flex-shrink: 0;
-  }
   /* The refresh control is a cbtn whose face is the online dot ringed by
      refresh arrows (clicking re-learns the node) rather than an icon. The ring
      fills the button, so it overrides cbtn's centred-svg sizing. */
+  .status-refresh {
+    flex-shrink: 0;
+  }
   .status-refresh .refresh-ring {
     position: absolute;
     inset: 0;
@@ -1429,6 +1427,23 @@
   .status-refresh:active .refresh-ring {
     transform: rotate(-180deg);
   }
+  /* While a refresh is in flight the ring spins and the button stops taking
+     clicks/hover; the dot keeps showing live status underneath. */
+  .status-refresh.spinning {
+    pointer-events: none;
+  }
+  .status-refresh.spinning .refresh-ring {
+    opacity: 1;
+    animation: refresh-spin 0.9s linear infinite;
+  }
+  @keyframes refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .cbtn:disabled {
+    cursor: default;
+  }
   /* Centred inside the ring rather than free-standing. */
   .dot {
     position: relative;
@@ -1443,8 +1458,10 @@
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
   /* The settings gear is a cbtn with a glyph face instead of an icon — sized a
-     touch larger than the console icons so it reads clearly. */
+     touch larger than the console icons so it reads clearly — pinned to the
+     right of the bottom row. */
   .node-gear {
+    margin-left: auto;
     font-size: 1.05rem;
     line-height: 1;
   }
@@ -1504,7 +1521,16 @@
     font-size: 0.72rem;
     color: var(--ink-faint);
   }
+  /* Chips row: the chips fill the line, the refresh control sits at its right
+     edge (not just trailing the last chip). */
+  .node-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
   .node-meta {
+    flex: 1;
+    min-width: 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;

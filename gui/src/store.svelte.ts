@@ -276,6 +276,12 @@ const CONNECTED_STATUSES = new Set(["active", "shelved"]);
  *  explicit `offline`/`error` status skips the grace entirely. */
 const PRESENCE_GRACE_MS = 45_000;
 
+/** How long a node refresh may spin before we stop waiting. A reachable node's
+ *  re-learn round-trip lands in a second or two (then the spinner clears the
+ *  moment its details change); this is the fallback for a node that's gone or
+ *  simply never answers, so the ring doesn't spin forever. */
+const REFRESH_TIMEOUT_MS = 12_000;
+
 /** The app features the running binary always supports — the GUI's mirror of
  *  the node's `build_profile` feature list (node/src/mesh.rs). A peer learns
  *  these from our presence/capability advert, but the *local* node never
@@ -431,6 +437,14 @@ class AppStore {
   claimOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
   toasts = $state<Toast[]>([]);
+  /** Nodes with a refresh in flight — the card's refresh ring spins and its
+   *  button is disabled until the data lands (the node's fingerprint changes on
+   *  a later sync) or the request times out. Keyed by canonical pubkey; the
+   *  value carries the fingerprint captured when the refresh started and its
+   *  timeout handle. */
+  private refreshInFlight = $state<
+    Record<string, { fp: string; timer: ReturnType<typeof setTimeout> }>
+  >({});
   backendConnected = $state(false);
 
   // ---- share flow builder (Sender → Receiver) ---------------------
@@ -1508,6 +1522,9 @@ class AppStore {
     // A freshly-discovered device may belong to someone we already share
     // with — fold it into that share.
     this.reconcileShares();
+    // Now the graph reflects this poll, stop the spinner on any peer whose
+    // refreshed details just landed.
+    this.settleRefreshing();
   }
 
   /** Whether `canon` (a canonical pubkey) was in a connected status
@@ -6095,27 +6112,104 @@ class AppStore {
   async refreshNode(nodeId: string) {
     const n = this.node(nodeId);
     if (!n) return;
+    // Already spinning — the button is disabled, but guard re-entry from the
+    // gear menu's "Refresh details" too.
+    if (this.isRefreshing(nodeId)) return;
     if (!this.backendConnected) {
       // Demo/web: nothing live to re-pull; the catalog already reflects the
       // mock graph.
       this.toast("info", "Refreshing needs the desktop app");
       return;
     }
+    const canon = canonicalNodeId(nodeId);
+    this.beginRefresh(canon); // ring starts spinning, button disabled
     if (this.isMe(nodeId)) {
-      await requestNodeRefresh(); // backend: re-scan + re-advertise to peers
-      await this.hydrateFromBackend(); // re-scan into our own catalog
-      await this.loadSites();
-      this.toast("info", "Rescanned this device");
+      // Self: fully awaitable, so "done" is the rescan resolving.
+      try {
+        await requestNodeRefresh(); // backend: re-scan + re-advertise to peers
+        await this.hydrateFromBackend(); // re-scan into our own catalog
+        await this.loadSites();
+        this.toast("info", "Rescanned this device");
+      } finally {
+        this.endRefresh(canon);
+      }
       return;
     }
-    // A peer: nudge it to re-sync, then re-pull the daemon's view of it.
-    await requestNodeRefresh(nodeId);
-    await this.syncMeshGraph();
-    await this.refreshSession();
-    // Re-request its exposed sites (the backend gates this to managed peers;
-    // a refusal is harmless).
-    void siteRemoteList(nodeId);
-    this.toast("info", `Refreshing ${n.label}…`);
+    // A peer: nudge it to re-sync, then re-pull the daemon's view of it. The
+    // real round-trip is async — its fresh profile lands on a later poll — so
+    // the spinner keeps going until `settleRefreshing` sees the details change
+    // (or the timeout fires). Only a failed nudge stops it here.
+    try {
+      await requestNodeRefresh(nodeId);
+      await this.syncMeshGraph();
+      await this.refreshSession();
+      // Re-request its exposed sites (the backend gates this to managed peers;
+      // a refusal is harmless).
+      void siteRemoteList(nodeId);
+      this.toast("info", `Refreshing ${n.label}…`);
+    } catch {
+      this.endRefresh(canon);
+    }
+  }
+
+  /** Whether a refresh is in flight for `nodeId` — drives the spinning ring and
+   *  the disabled button. Canonicalised so a display id and its bare pubkey
+   *  resolve to the same in-flight entry. */
+  isRefreshing(nodeId: string): boolean {
+    return !!this.refreshInFlight[canonicalNodeId(nodeId)];
+  }
+
+  /** Start a node's refresh spinner: record the fingerprint we're refreshing
+   *  away from and arm the give-up timer. */
+  private beginRefresh(canon: string) {
+    const prev = this.refreshInFlight[canon];
+    if (prev) clearTimeout(prev.timer);
+    const timer = setTimeout(() => this.endRefresh(canon), REFRESH_TIMEOUT_MS);
+    this.refreshInFlight[canon] = { fp: this.nodeFingerprint(canon), timer };
+  }
+
+  /** Stop a node's refresh spinner and clear its timer. */
+  private endRefresh(canon: string) {
+    const entry = this.refreshInFlight[canon];
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    delete this.refreshInFlight[canon];
+  }
+
+  /** After a graph sync, stop the spinner on any peer whose details actually
+   *  changed since the refresh started — the round-trip landed. Self refreshes
+   *  resolve on their own await, so they're skipped here. */
+  private settleRefreshing() {
+    for (const canon of Object.keys(this.refreshInFlight)) {
+      if (this.isMe(canon)) continue;
+      const entry = this.refreshInFlight[canon];
+      if (entry && this.nodeFingerprint(canon) !== entry.fp) this.endRefresh(canon);
+    }
+  }
+
+  /** A compact signature of the facts a refresh re-learns about a node — its
+   *  presence, app/version/features, hardware summary, owner, exposed sites and
+   *  wireable capabilities. When this changes after a peer refresh, the
+   *  round-trip has delivered fresh details and the spinner can stop. */
+  private nodeFingerprint(nodeId: string): string {
+    const n = this.nodeByCanonical(nodeId);
+    if (!n) return "";
+    const caps = this.capsOf(nodeId)
+      .map((c) => c.id)
+      .sort();
+    return JSON.stringify({
+      online: n.online,
+      app: n.app ?? false,
+      version: n.version ?? null,
+      features: [...(n.features ?? [])].sort(),
+      summary: n.summary ?? null,
+      owner: n.owner ?? null,
+      claimable: n.claimable ?? false,
+      sites: n.sites ?? [],
+      fleetName: n.fleetName ?? null,
+      fleetOwner: n.fleetOwner ?? null,
+      caps,
+    });
   }
 
   /** Whether "Restart app" is offerable for `node`: your own machine (restart
