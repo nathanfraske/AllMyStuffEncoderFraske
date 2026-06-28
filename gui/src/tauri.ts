@@ -268,6 +268,25 @@ export async function upgradeNode(node: string): Promise<void> {
   await invoke("upgrade_node", { node });
 }
 
+/** Ask one of your fleet machines to restart its AllMyStuff app (relaunch onto
+ *  the same build — no update). Owner/fleet enforced on the far side; its next
+ *  presence advert confirms it came back. Throws when the ask couldn't be
+ *  delivered (machine offline / no shared network). No-op in web mode. */
+export async function restartNode(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("restart_node", { node });
+}
+
+/** Restart *this* machine's AllMyStuff app now (the local twin of
+ *  {@link restartNode}). Never returns on the desktop — the app relaunches.
+ *  No-op in web mode. */
+export async function restartApp(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("restart_app");
+}
+
 /** Put this device into / out of claim mode so another of your machines can
  *  adopt it. Returns whether it's now claimable (null in web mode). */
 export function setClaimable(claimable: boolean): Promise<boolean | null> {

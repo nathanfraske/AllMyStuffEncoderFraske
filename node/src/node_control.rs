@@ -777,6 +777,10 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_upgrade(node).await)
         }
+        "restart_node" => {
+            let node: String = try_arg!(arg(a, "node"));
+            json_result(mesh.request_restart(node).await)
+        }
         "set_claimable" => {
             let claimable: bool = try_arg!(arg(a, "claimable"));
             json_result(mesh.set_claimable(claimable).await)

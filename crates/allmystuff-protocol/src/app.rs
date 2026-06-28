@@ -547,6 +547,12 @@ pub enum AppControl {
     /// the confirmation, exactly as a claim confirms by re-advertising its
     /// new owner.
     Upgrade,
+    /// "Restart your AllMyStuff app." Sent to a fleet machine to relaunch its
+    /// node onto the same build — the recovery step heavier than a reconnect
+    /// but lighter than an upgrade (it stages/applies nothing). The receiver
+    /// gates it owner/fleet, exactly like [`AppControl::Upgrade`], and relaunches
+    /// the same OS-aware way; its next presence advert is the confirmation.
+    Restart,
     /// An app-level command a newer build introduced. Ignored here rather
     /// than failing the enclosing [`ControlMessage`].
     #[serde(other)]

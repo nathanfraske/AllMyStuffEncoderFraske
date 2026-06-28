@@ -128,6 +128,8 @@ import {
   setNetworkEnabled,
   updateApply,
   updateCheck,
+  restartApp,
+  restartNode,
   updateLatestVersion,
   updateRelaunch,
   updateSetPrefs,
@@ -1657,14 +1659,19 @@ class AppStore {
       // Ownership the device advertises about itself (Task 4).
       node.owner = p.owner ?? null;
       node.claimable = p.claimable ?? false;
-      // App features it supports ("terminal", …) and the sites it exposes.
-      // Only overwrite when the frame actually carried them: a sparse or
-      // missed presence frame must NOT blank what the reliable peer-list/tags
-      // path already populated — the same rule the capabilities refresh below
-      // follows. An empty list is omitted on the wire (skip_serializing_if),
-      // so "absent" reads as keep-what-we-have, never clear.
+      // App features it supports ("terminal", …). Only overwrite when the
+      // frame carried them: features ALSO arrive on the reliable peer-list/tags
+      // path, so a sparse/missed presence frame must not blank that (an empty
+      // list is omitted on the wire, so "absent" reads as keep-what-we-have).
       if (p.features) node.features = p.features;
-      if (p.sites) node.sites = p.sites;
+      // Sites it exposes. Presence is the SOLE source for a peer's sites (no
+      // peer-list fallback), and empty is omitted on the wire — so this must be
+      // presence-authoritative, not guarded: a node that withdraws its last
+      // exposed site (Stop) advertises no `sites`, and that has to CLEAR the
+      // peer's list, not pin the stale one. (Guarding it broke withdrawal of a
+      // node's final site.) A briefly-missed frame self-heals on the next
+      // advert, which presence re-sends on every change.
+      node.sites = p.sites ?? [];
       // The AllMyStuff version it's running — let it tell when the machine
       // is behind the channel and offer an upgrade. Absent (older peer) =
       // unknown, and the upgrade button stays hidden.
@@ -6073,6 +6080,54 @@ class AppStore {
       this.toast("warn", `Couldn't ask ${n.label} to upgrade: ${String(e)}`);
     });
     this.toast("info", `Asking ${n.label} to upgrade and restart…`);
+  }
+
+  /** Reconnect — the per-node twin of the top bar's refresh: a clean
+   *  leave-and-rejoin of the live network(s) so a link that's gone quiet
+   *  (stuck handshaking, peers fallen silent) re-establishes. The mesh has no
+   *  reconnect-one-peer primitive, so this restarts the transport the same way
+   *  the global control does; surfaced on each card and in its gear menu so the
+   *  fix is one click from the node that looks stuck. */
+  reconnectNode(_nodeId?: string) {
+    void this.restartNetwork();
+  }
+
+  /** Whether "Restart app" is offerable for `node`: your own machine (restart
+   *  it locally) or one you may drive — owner/fleet — since the far side gates
+   *  the restart on exactly that, the same rule as Upgrade. A guest's machine
+   *  is never restartable from here. */
+  canRestartApp(node: MeshNode | null | undefined): boolean {
+    if (!node || !isAppNode(node)) return false;
+    if (this.isMe(node.id)) return true;
+    const ownerIsMe = !!node.owner && this.isMe(node.owner);
+    const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
+    return ownerIsMe || coFleet;
+  }
+
+  /** Restart a machine's AllMyStuff app. Your own machine relaunches locally;
+   *  a fleet machine is asked over the mesh (owner/fleet enforced there), its
+   *  next presence advert the confirmation. Heavier than a reconnect — the
+   *  whole app comes down and back — so it's the gear menu's deeper recovery. */
+  restartNodeApp(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    if (!this.backendConnected) {
+      this.toast("info", "Restarting the app needs the desktop app");
+      return;
+    }
+    if (this.isMe(nodeId)) {
+      this.toast("info", "Restarting AllMyStuff…");
+      restartApp().catch((e) => this.toast("warn", `Couldn't restart: ${String(e)}`));
+      return;
+    }
+    if (!this.canRestartApp(n)) {
+      this.toast("warn", `${n.label} isn't yours to restart`);
+      return;
+    }
+    restartNode(nodeId).catch((e) => {
+      this.toast("warn", `Couldn't ask ${n.label} to restart: ${String(e)}`);
+    });
+    this.toast("info", `Asking ${n.label} to restart its app…`);
   }
 
   /** A human one-liner for the last check's outcome, shown inline in the

@@ -134,6 +134,28 @@ async fn upgrade_node(state: State<'_, AppState>, node: String) -> Result<(), St
     Ok(())
 }
 
+/// Ask one of your fleet machines to **restart** its AllMyStuff app (relaunch
+/// onto the same build — no update). Owner/fleet enforced on the far side; its
+/// next presence advert is the confirmation.
+#[tauri::command]
+async fn restart_node(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("restart_node", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Restart **this** machine's AllMyStuff app right now — the local twin of
+/// [`restart_node`], for the gear menu's "Restart app" on your own device.
+/// Tauri relaunches the window (and the supervised node child comes back with
+/// it). Never returns.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart()
+}
+
 /// Put this device into / out of claim mode so another of your machines can
 /// adopt it. Returns whether it's now claimable.
 #[tauri::command]
@@ -1834,6 +1856,8 @@ fn main() {
             client_log,
             claim_node,
             upgrade_node,
+            restart_node,
+            restart_app,
             set_claimable,
             share_grant,
             share_revoke,

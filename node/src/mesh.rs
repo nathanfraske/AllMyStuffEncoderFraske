@@ -2273,6 +2273,22 @@ impl Mesh {
                     }
                 });
             }
+            AppControl::Restart => {
+                tracing::info!(
+                    "app restart requested by {} — relaunching this node",
+                    short_id(from.as_str())
+                );
+                // No update, no network I/O — just relaunch onto the same
+                // build (the OS-aware relaunch the sink owns). Like the upgrade
+                // path, the confirmation is the node's next presence advert; no
+                // reply is sent. Done on a fresh task so the relaunch's
+                // never-returning exec/exit doesn't strand the inbound-frame
+                // loop mid-handler.
+                let sink = self.sink.clone();
+                crate::spawn(async move {
+                    sink.restart();
+                });
+            }
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
@@ -2831,6 +2847,15 @@ impl Mesh {
     pub async fn request_upgrade(self: &Arc<Self>, node: String) -> Result<(), String> {
         tracing::info!("asking {} to upgrade + restart", short_id(&node));
         let msg = ControlMessage::App(AppControl::Upgrade);
+        self.send_control(&node, &msg).await
+    }
+
+    /// Ask a fleet machine to **restart** its AllMyStuff app (relaunch onto the
+    /// same build — no update). The target enforces owner/fleet before acting;
+    /// its next presence advert is the confirmation.
+    pub async fn request_restart(self: &Arc<Self>, node: String) -> Result<(), String> {
+        tracing::info!("asking {} to restart its app", short_id(&node));
+        let msg = ControlMessage::App(AppControl::Restart);
         self.send_control(&node, &msg).await
     }
 

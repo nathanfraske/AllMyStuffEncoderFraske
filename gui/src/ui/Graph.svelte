@@ -548,6 +548,55 @@
       app.selectNode(n.id);
     }
   }
+
+  // ---- per-node actions menu (the gear) -----------------------------
+  //
+  // Opened from a card's gear and positioned in viewport coordinates so it
+  // can flip up / left to stay on screen — the cards live in a panned + zoomed
+  // layer, so the menu is rendered OUTSIDE that layer (a top-level sibling) and
+  // anchored with `position: fixed` from the gear's on-screen rect.
+  let nodeMenu = $state<{ id: string; left: number; top: number } | null>(null);
+  const MENU_W = 216;
+  const MENU_H = 124;
+
+  function openNodeMenu(e: MouseEvent, nodeId: string) {
+    e.stopPropagation();
+    if (nodeMenu?.id === nodeId) {
+      nodeMenu = null; // toggle closed
+      return;
+    }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // Flip toward whichever side has room: open up when the gear is near the
+    // bottom, and align to the right edge when it's near the right.
+    const openUp = r.bottom + MENU_H + 8 > vh;
+    const openLeft = r.left + MENU_W + 8 > vw;
+    const left = openLeft
+      ? Math.max(8, r.right - MENU_W)
+      : Math.min(r.left, vw - MENU_W - 8);
+    const top = openUp ? Math.max(8, r.top - MENU_H - 6) : r.bottom + 6;
+    nodeMenu = { id: nodeId, left, top };
+  }
+
+  // Close the menu on any outside pointer-down (the gear + the menu are exempt
+  // so they can toggle / be clicked), and on Escape.
+  $effect(() => {
+    if (!nodeMenu) return;
+    function onDown(e: PointerEvent) {
+      const t = e.target as Element | null;
+      if (!t?.closest?.(".node-menu, .node-gear")) nodeMenu = null;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") nodeMenu = null;
+    }
+    window.addEventListener("pointerdown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  });
 </script>
 
 <!-- The small console glyphs for the card buttons: remote desktop, files,
@@ -700,7 +749,37 @@
               {/if}
             </div>
           </div>
-          <span class="dot" class:on={n.online} title={n.online ? "online" : "offline"}></span>
+          <!-- Status + actions cluster (top-right): the online dot sits inside a
+               refresh ring (click = reconnect), and a gear opens the node's
+               actions menu. -->
+          <div class="node-ctl">
+            <button
+              class="status-refresh"
+              class:online={n.online}
+              title={`${n.online ? "online" : "offline"} · click to reconnect`}
+              aria-label={`Reconnect ${displayName(n)}`}
+              onclick={(e) => {
+                e.stopPropagation();
+                app.reconnectNode(n.id);
+              }}
+            >
+              <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
+                <polyline points="22 5 22 10 17 10" />
+                <polyline points="2 19 2 14 7 14" />
+                <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
+                <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
+              </svg>
+              <span class="dot" class:on={n.online}></span>
+            </button>
+            <button
+              class="node-gear"
+              title="Node actions"
+              aria-label={`Actions for ${displayName(n)}`}
+              aria-haspopup="menu"
+              aria-expanded={nodeMenu?.id === n.id}
+              onclick={(e) => openNodeMenu(e, n.id)}
+            >⚙</button>
+          </div>
         </div>
         <div class="node-meta">
           {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
@@ -830,6 +909,48 @@
     <button class="zbtn" title="Zoom in" onclick={() => (zoom = Math.min(MAX_ZOOM, zoom * 1.2))}>+</button>
   </div>
 </div>
+
+<!-- The per-node actions menu, rendered at the component root (outside the
+     panned/zoomed `.nodes` layer) so its `position: fixed` anchors to the
+     viewport, and flipped up/left by `openNodeMenu` to stay on screen. -->
+{#if nodeMenu}
+  {@const menuId = nodeMenu.id}
+  {@const mn = app.node(menuId)}
+  <div class="node-menu" role="menu" style="left: {nodeMenu.left}px; top: {nodeMenu.top}px;">
+    <button
+      class="nm-item"
+      role="menuitem"
+      onclick={() => {
+        app.reconnectNode(menuId);
+        nodeMenu = null;
+      }}
+    >
+      <span class="nm-icon" aria-hidden="true">↻</span>
+      <span class="nm-text">
+        <span class="nm-label">Reconnect</span>
+        <span class="nm-sub">re-establish the link (same as the dot)</span>
+      </span>
+    </button>
+    {#if app.canRestartApp(mn)}
+      <button
+        class="nm-item"
+        role="menuitem"
+        onclick={() => {
+          app.restartNodeApp(menuId);
+          nodeMenu = null;
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">⟲</span>
+        <span class="nm-text">
+          <span class="nm-label">{app.isMe(menuId) ? "Restart this app" : "Restart app"}</span>
+          <span class="nm-sub"
+            >{app.isMe(menuId) ? "relaunch AllMyStuff here" : "relaunch it on that machine"}</span
+          >
+        </span>
+      </button>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .canvas {
@@ -1272,16 +1393,134 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* Status + actions cluster, top-right of the card. */
+  .node-ctl {
+    display: flex;
+    align-items: center;
+    gap: 0.1rem;
+    flex-shrink: 0;
+  }
+  /* The online dot ringed by refresh arrows — clicking reconnects. */
+  .status-refresh {
+    position: relative;
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
+    border: none;
+    background: transparent;
+    padding: 0;
+    border-radius: 50%;
+    cursor: pointer;
+    color: var(--ink-faint);
+  }
+  .status-refresh:hover {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  .refresh-ring {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.5;
+    transition:
+      opacity 0.12s ease,
+      transform 0.5s ease;
+  }
+  .status-refresh:hover .refresh-ring {
+    opacity: 1;
+  }
+  .status-refresh:active .refresh-ring {
+    transform: rotate(-180deg);
+  }
+  /* Now centred inside the ring rather than free-standing. */
   .dot {
-    width: 9px;
-    height: 9px;
+    position: relative;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: var(--line-strong);
     flex-shrink: 0;
   }
   .dot.on {
     background: var(--ok);
-    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.16);
+    box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
+  }
+  .node-gear {
+    border: none;
+    background: transparent;
+    padding: 0 0.12rem;
+    font-size: 0.92rem;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--ink-faint);
+    border-radius: var(--r-sm);
+  }
+  .node-gear:hover {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  /* The gear's actions menu — fixed-positioned, flipped on screen by JS. */
+  .node-menu {
+    position: fixed;
+    z-index: 70;
+    width: 216px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg);
+    padding: 0.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
+    animation: nmenu 0.12s ease;
+  }
+  @keyframes nmenu {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+  }
+  .nm-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    padding: 0.4rem 0.5rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .nm-item:hover {
+    background: var(--accent-soft);
+  }
+  .nm-icon {
+    font-size: 0.95rem;
+    width: 1.1rem;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .nm-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .nm-label {
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+  .nm-sub {
+    font-size: 0.72rem;
+    color: var(--ink-faint);
   }
   .node-meta {
     display: flex;
