@@ -1374,6 +1374,21 @@ export async function disabledNetworks(): Promise<NetworkConfigFull[]> {
 export const setNetworkEnabled = (network: string, enabled: boolean) =>
   invokeReq<unknown>("network_set_enabled", { network, enabled });
 
+/** Reconnect mesh transport *in place* — redial signaling and renegotiate ICE
+ *  without leaving the room. The non-destructive twin of a leave+rejoin: peers
+ *  keep their sessions and app-level state, so the connection comes back
+ *  without stranding the other side. Resolution mirrors the daemon:
+ *    - `network` set → every peer on that mesh (the global refresh).
+ *    - `peer` only   → that one node, on the mesh it's reachable on (the
+ *                      per-node refresh — the daemon resolves the network).
+ *    - neither       → every joined mesh.
+ *  `network` may be the config id or network id. No-op in web mode. */
+export const networkReconnect = (opts: { network?: string; peer?: string } = {}) =>
+  invokeReq<unknown>("network_reconnect", {
+    network: opts.network ?? null,
+    peer: opts.peer ?? null,
+  });
+
 /** The whole daemon config (every network with its full signaling/STUN/TURN).
  *  The Servers settings pane reads this to populate its editor. */
 export async function meshConfigShow(): Promise<NetworkConfigFull[]> {

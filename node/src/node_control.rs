@@ -1082,6 +1082,19 @@ pub async fn dispatch(
             )
             .await
         }
+        // The non-destructive twin of remove+re-add: redial signaling and
+        // renegotiate ICE in place. Deliberately *not* wrapped in `sync_after`
+        // — the network stays joined, so there's no prune / re-subscribe to do
+        // (and no peer caches to drop, which is exactly what made the old
+        // remove+re-add refresh strand the other side). Both args optional:
+        // `network` reconnects every peer on that mesh (the global refresh);
+        // `peer` alone reconnects one node on the mesh it's reachable on (the
+        // per-node refresh); neither reconnects every joined mesh.
+        "mesh_network_reconnect" => {
+            let network: Option<String> = try_arg!(opt(a, "network"));
+            let peer: Option<String> = try_arg!(opt(a, "peer"));
+            json_result(mesh.reconnect(network, peer).await)
+        }
         "mesh_identity_set_label" => {
             let label: String = try_arg!(arg(a, "label"));
             let out = daemon_request(

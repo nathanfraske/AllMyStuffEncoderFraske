@@ -1378,6 +1378,29 @@ async fn network_set_enabled(
         .map_err(|e| e.to_string())
 }
 
+/// Reconnect a joined network *in place* — redial signaling and renegotiate
+/// ICE without leaving the room. The non-destructive twin of a leave+rejoin:
+/// peers keep their sessions and app-level state, so this is what the refresh
+/// controls drive instead of `network_set_enabled(false)`+`(true)`. `peer`
+/// omitted reconnects every peer on the network; `peer` set reconnects just
+/// that one node (the per-node refresh). `network` may be the config id or
+/// network id.
+#[tauri::command]
+async fn network_reconnect(
+    state: State<'_, AppState>,
+    network: Option<String>,
+    peer: Option<String>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "mesh_network_reconnect",
+            json!({ "network": network, "peer": peer }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Write a network-settings envelope (the GUI's flat, shareable JSON for a
 /// network's handle + servers) to disk. Pretty-printed so it's easy to read
 /// by hand. Import is a renderer-side `<input type="file">` read, so there's
@@ -1936,6 +1959,7 @@ fn main() {
             mesh_network_update,
             disabled_networks,
             network_set_enabled,
+            network_reconnect,
             mesh_config_show,
             mesh_network_export_file,
             mesh_network_id_generate,
