@@ -560,7 +560,31 @@ fn apply_one(art: &StagedArtifact) -> Result<bool> {
 /// (env override → running exe / sibling → `PATH`). Returns `None` when the
 /// host doesn't have that half (a headless box with no GUI, say), or when it
 /// lives in an OS bundle we shouldn't touch.
+///
+/// The bundle guard is load-bearing: inside a macOS `.app` an in-place Mach-O
+/// swap breaks the bundle's code signature and identity, so the relaunch comes
+/// back refused or running the stale cached image — the "ran the update, came
+/// back on the same version" symptom. A bundled app is updated by its own
+/// installer (a DMG / pkg), never by swapping a binary under it, so the updater
+/// leaves bundle paths alone and reports nothing to apply — the same stance
+/// MyOwnMesh's `find_installed_gui_binary` takes. Loose siblings and `PATH`
+/// copies (portable / `curl | sh` installs) still swap as before.
 fn installed_path(kind: ArtifactKind) -> Option<PathBuf> {
+    resolve_installed_path(kind).filter(|p| !path_in_os_bundle(p))
+}
+
+/// Whether `path` lives inside an OS application bundle the updater must not
+/// mutate — today a macOS `.app` (its `Contents/` subtree). Detected by an
+/// `*.app` path component, so it catches the binary at
+/// `Foo.app/Contents/MacOS/<bin>` and any resource beneath it.
+fn path_in_os_bundle(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_str().is_some_and(|s| s.ends_with(".app")))
+}
+
+/// The raw install-location discovery, before the OS-bundle guard
+/// ([`installed_path`]) decides whether it's safe to swap.
+fn resolve_installed_path(kind: ArtifactKind) -> Option<PathBuf> {
     let current = std::env::current_exe().ok();
 
     // The kind matching the running binary is that binary itself.
@@ -1455,6 +1479,26 @@ mod tests {
             detect_install_kind_from_path("/home/me/.local/bin/allmystuff"),
             InstallKind::Raw
         );
+    }
+
+    #[test]
+    fn os_bundle_paths_are_left_alone() {
+        // A binary inside a macOS .app must never be swapped in place — the
+        // updater treats it as bundle-owned and reports nothing to apply.
+        assert!(path_in_os_bundle(Path::new(
+            "/Applications/AllMyStuff.app/Contents/MacOS/allmystuff-gui"
+        )));
+        assert!(path_in_os_bundle(Path::new(
+            "/Applications/AllMyStuff.app/Contents/MacOS/allmystuff-serve"
+        )));
+        // Loose installs (portable / curl|sh / dev) are fair game to swap.
+        assert!(!path_in_os_bundle(Path::new("/usr/local/bin/allmystuff")));
+        assert!(!path_in_os_bundle(Path::new(
+            "/home/me/.local/bin/allmystuff-gui"
+        )));
+        assert!(!path_in_os_bundle(Path::new(
+            r"C:\Program Files\AllMyStuff\allmystuff-gui.exe"
+        )));
     }
 
     #[test]

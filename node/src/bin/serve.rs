@@ -50,7 +50,18 @@ use allmystuff_node::UiSink;
 /// `…/video-ready`, room/owned updates, …) are all front-end concerns, so a
 /// node with no webview logs them at `trace` for debugging and otherwise
 /// lets them fall on the floor.
-struct LogSink;
+struct LogSink {
+    /// How to relaunch onto a just-applied update — the SAME OS-aware strategy
+    /// the unattended updater uses (`pick_relaunch(as_service)`): a re-exec on
+    /// a shell/desktop process, but an **exit-for-the-SCM** under a Windows
+    /// service (a service can't re-exec itself — the SCM only tracks the
+    /// original process, so a spawned child orphans and the service reads as a
+    /// clean stop and never restarts). The remote "upgrade this machine" path
+    /// went through a hardcoded re-exec and so left a Windows-service node dead;
+    /// carrying the strategy here makes the remote upgrade relaunch exactly like
+    /// the unattended one that already works on all three OSes.
+    relaunch: fn() -> !,
+}
 
 impl UiSink for LogSink {
     fn emit(&self, event: &str, _payload: serde_json::Value) {
@@ -58,13 +69,11 @@ impl UiSink for LogSink {
     }
 
     fn restart(&self) -> ! {
-        // The fleet "upgrade this machine" path applied a new build and
-        // wants us to run it. The GUI relaunches its window; headless, we
-        // re-exec ourselves so the next process picks up the staged update
-        // (`apply_pending_if_any` at startup). A service manager would also
-        // restart us, but re-execing makes the upgrade land immediately even
-        // when run straight from a shell.
-        reexec_self()
+        // The fleet "upgrade this machine" path applied a new build and wants us
+        // to run it. The GUI (if attached) relaunches its window off the
+        // `NodeEvent::Restart` the SocketSink fanned out; here we bring the node
+        // itself up onto the new binary via the OS-aware relaunch.
+        (self.relaunch)()
     }
 }
 
@@ -219,7 +228,12 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
     let broadcaster = node_control::new_broadcaster();
     let (event_tx, event_rx) = node_control::event_channel();
     let disabled = Arc::new(DisabledNetworks::load());
-    let sink = SocketSink::new(Arc::new(LogSink), event_tx);
+    let sink = SocketSink::new(
+        Arc::new(LogSink {
+            relaunch: pick_relaunch(as_service),
+        }),
+        event_tx,
+    );
     let mesh = Mesh::new(client.clone(), Arc::new(sink));
     mesh.clone().start().await;
 
