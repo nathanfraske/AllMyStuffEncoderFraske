@@ -733,36 +733,43 @@
         aria-label={displayName(n)}
       >
         {#if st.self}<span class="self-corner" aria-hidden="true">This device</span>{/if}
-        <div class="node-top">
-          <span class="avatar">{nodeAvatar(n)}</span>
-          <div class="node-id">
-            <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
-            <div class="node-sub">
-              {#if st.shared}
-                shared with {st.shared.name}
-              {:else if !st.app}
-                on the mesh · not running AllMyStuff
-              {:else if n.summary}
-                {n.summary.cpu}
-              {:else}
-                device
-              {/if}
+        <!-- Header row: the identity + chips fill the left column, while the
+             status/actions cluster stacks against the right edge (refresh on
+             top, settings under). -->
+        <div class="node-head">
+          <div class="node-head-main">
+            <div class="node-top">
+              <span class="avatar">{nodeAvatar(n)}</span>
+              <div class="node-id">
+                <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
+                <div class="node-sub">
+                  {#if st.shared}
+                    shared with {st.shared.name}
+                  {:else if !st.app}
+                    on the mesh · not running AllMyStuff
+                  {:else if n.summary}
+                    {n.summary.cpu}
+                  {:else}
+                    device
+                  {/if}
+                </div>
+              </div>
+            </div>
+            <div class="node-meta">
+              {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+              {:else if st.shared}<span class="tag guest">guest</span>
+              {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+              {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+              {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+              {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+              {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+              {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+              {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
             </div>
           </div>
-        </div>
-        <div class="node-meta">
-          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
-          {:else if st.shared}<span class="tag guest">guest</span>
-          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
-          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
-          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
-          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-          {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-          {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
-          <!-- Status + actions cluster, dropped under the title to the right of
-               the chips: the online dot sits inside a refresh ring (click =
-               re-learn this node's details), and a gear opens its menu. -->
+          <!-- Status + actions cluster, stacked at the right edge: the online
+               dot sits inside a refresh ring (click = re-learn this node's
+               details), and a gear opens its menu below it. -->
           <div class="node-ctl">
             <button
               class="status-refresh"
@@ -1369,6 +1376,19 @@
     border-color: var(--ok);
     box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.18), var(--shadow-lg);
   }
+  /* Header row: identity + chips on the left, the action stack on the right. */
+  .node-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .node-head-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
   .node-top {
     display: flex;
     align-items: center;
@@ -1397,14 +1417,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Status + actions cluster, dropped onto the chips row and pushed to its
-     right edge (`margin-left: auto`). */
+  /* Status + actions cluster, stacked against the card's right edge with the
+     refresh on top and the settings gear directly under it. */
   .node-ctl {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 0.1rem;
+    gap: 0.15rem;
     flex-shrink: 0;
-    margin-left: auto;
   }
   /* The online dot ringed by refresh arrows — clicking re-learns the node. */
   .status-refresh {
