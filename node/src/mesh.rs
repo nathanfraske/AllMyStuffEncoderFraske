@@ -2745,7 +2745,9 @@ impl Mesh {
         if members.is_empty() {
             for m in self.fleet_roster_cache.lock().iter() {
                 let canon = pubkey_part(m.device.as_str()).to_string();
-                member_roles.entry(canon).or_insert_with(|| "member".to_string());
+                member_roles
+                    .entry(canon)
+                    .or_insert_with(|| "member".to_string());
                 members.push(m.clone());
             }
         } else {
