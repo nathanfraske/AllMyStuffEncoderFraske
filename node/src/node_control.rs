@@ -781,6 +781,11 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_restart(node).await)
         }
+        "refresh_node" => {
+            // `node` omitted / null = this device (re-scan + re-advertise).
+            let node = a.get("node").and_then(|v| v.as_str()).map(str::to_string);
+            json_result(mesh.refresh_node(node).await)
+        }
         "set_claimable" => {
             let claimable: bool = try_arg!(arg(a, "claimable"));
             json_result(mesh.set_claimable(claimable).await)

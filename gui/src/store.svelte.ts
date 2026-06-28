@@ -128,6 +128,7 @@ import {
   setNetworkEnabled,
   updateApply,
   updateCheck,
+  requestNodeRefresh,
   restartApp,
   restartNode,
   updateLatestVersion,
@@ -6082,14 +6083,39 @@ class AppStore {
     this.toast("info", `Asking ${n.label} to upgrade and restart…`);
   }
 
-  /** Reconnect — the per-node twin of the top bar's refresh: a clean
-   *  leave-and-rejoin of the live network(s) so a link that's gone quiet
-   *  (stuck handshaking, peers fallen silent) re-establishes. The mesh has no
-   *  reconnect-one-peer primitive, so this restarts the transport the same way
-   *  the global control does; surfaced on each card and in its gear menu so the
-   *  fix is one click from the node that looks stuck. */
-  reconnectNode(_nodeId?: string) {
-    void this.restartNetwork();
+  /** Refresh what we know about a node — re-learn its details, not the
+   *  transport. For *this* device it re-scans the hardware (so newly
+   *  plugged-in stuff, changed sites, etc. show up) and re-advertises the
+   *  fresh picture to peers. For another node it nudges that machine to
+   *  re-sync (ownership/fleet + its exposed sites) and re-pulls everything the
+   *  daemon holds about it — capabilities, endpoints, summary, version,
+   *  features, presence detail, fleet and shares — so its card, console
+   *  options and shared/available stuff all reflect reality again. The refresh
+   *  ring around the dot and the gear menu's Refresh both call this. */
+  async refreshNode(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    if (!this.backendConnected) {
+      // Demo/web: nothing live to re-pull; the catalog already reflects the
+      // mock graph.
+      this.toast("info", "Refreshing needs the desktop app");
+      return;
+    }
+    if (this.isMe(nodeId)) {
+      await requestNodeRefresh(); // backend: re-scan + re-advertise to peers
+      await this.hydrateFromBackend(); // re-scan into our own catalog
+      await this.loadSites();
+      this.toast("info", "Rescanned this device");
+      return;
+    }
+    // A peer: nudge it to re-sync, then re-pull the daemon's view of it.
+    await requestNodeRefresh(nodeId);
+    await this.syncMeshGraph();
+    await this.refreshSession();
+    // Re-request its exposed sites (the backend gates this to managed peers;
+    // a refusal is harmless).
+    void siteRemoteList(nodeId);
+    this.toast("info", `Refreshing ${n.label}…`);
   }
 
   /** Whether "Restart app" is offerable for `node`: your own machine (restart

@@ -750,17 +750,17 @@
             </div>
           </div>
           <!-- Status + actions cluster (top-right): the online dot sits inside a
-               refresh ring (click = reconnect), and a gear opens the node's
-               actions menu. -->
+               refresh ring (click = re-learn this node's details), and a gear
+               opens the node's actions menu. -->
           <div class="node-ctl">
             <button
               class="status-refresh"
               class:online={n.online}
-              title={`${n.online ? "online" : "offline"} · click to reconnect`}
-              aria-label={`Reconnect ${displayName(n)}`}
+              title={`${n.online ? "online" : "offline"} · click to refresh ${app.isMe(n.id) ? "(rescan this device)" : "(re-learn its details)"}`}
+              aria-label={`Refresh ${displayName(n)}`}
               onclick={(e) => {
                 e.stopPropagation();
-                app.reconnectNode(n.id);
+                void app.refreshNode(n.id);
               }}
             >
               <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
@@ -921,14 +921,18 @@
       class="nm-item"
       role="menuitem"
       onclick={() => {
-        app.reconnectNode(menuId);
+        void app.refreshNode(menuId);
         nodeMenu = null;
       }}
     >
       <span class="nm-icon" aria-hidden="true">↻</span>
       <span class="nm-text">
-        <span class="nm-label">Reconnect</span>
-        <span class="nm-sub">re-establish the link (same as the dot)</span>
+        <span class="nm-label">{app.isMe(menuId) ? "Rescan this device" : "Refresh details"}</span>
+        <span class="nm-sub"
+          >{app.isMe(menuId)
+            ? "re-scan hardware, sites & options"
+            : "re-learn its details, options & shares"}</span
+        >
       </span>
     </button>
     {#if app.canRestartApp(mn)}
@@ -1455,8 +1459,8 @@
   .node-gear {
     border: none;
     background: transparent;
-    padding: 0 0.12rem;
-    font-size: 0.92rem;
+    padding: 0.1rem 0.2rem;
+    font-size: 1.18rem;
     line-height: 1;
     cursor: pointer;
     color: var(--ink-faint);

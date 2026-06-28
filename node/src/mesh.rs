@@ -2859,6 +2859,33 @@ impl Mesh {
         self.send_control(&node, &msg).await
     }
 
+    /// Re-learn a node's details on demand — the per-node refresh control.
+    ///
+    /// For **this** device (`None`, or our own id), re-scan its hardware and
+    /// re-advertise the fresh profile, so both our own capabilities and what
+    /// peers see of us update. For a **peer**, re-stamp + re-send our presence
+    /// to it (an ownership/fleet re-sync that also nudges it) and re-request its
+    /// exposed sites; the daemon already holds the peer's latest capability
+    /// advert, so the GUI's follow-up resync picks up the rest. Best-effort: a
+    /// site request to a non-managed peer is simply refused on the far side.
+    pub async fn refresh_node(self: &Arc<Self>, node: Option<String>) -> Result<(), String> {
+        let is_self = match (&node, self.local_node_id()) {
+            (None, _) => true,
+            (Some(n), Some(me)) => pubkey_part(n) == pubkey_part(&me),
+            _ => false,
+        };
+        if is_self {
+            tracing::info!("refresh: re-scanning this device + re-advertising");
+            self.restamp_profile().await;
+            return Ok(());
+        }
+        let peer = node.unwrap_or_default();
+        tracing::info!("refresh: re-learning {}", short_id(&peer));
+        self.ownership_check(Some(pubkey_part(&peer))).await;
+        let _ = self.site_remote_list(peer).await;
+        Ok(())
+    }
+
     /// Front-end command: put *this* device into (or out of) claim mode, so
     /// another of your machines can adopt it. Re-advertises immediately.
     pub async fn set_claimable(self: &Arc<Self>, on: bool) -> Result<bool, String> {

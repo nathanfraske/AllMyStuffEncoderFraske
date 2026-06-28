@@ -287,6 +287,15 @@ export async function restartApp(): Promise<void> {
   await invoke("restart_app");
 }
 
+/** Re-learn a node's details. `node` omitted = *this* device (re-scan its
+ *  hardware + re-advertise); a peer id = nudge it to re-sync ownership/sites.
+ *  The GUI follows up by re-pulling the daemon's view. No-op in web mode. */
+export async function requestNodeRefresh(node?: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("refresh_node", node ? { node } : {});
+}
+
 /** Put this device into / out of claim mode so another of your machines can
  *  adopt it. Returns whether it's now claimable (null in web mode). */
 export function setClaimable(claimable: boolean): Promise<boolean | null> {
