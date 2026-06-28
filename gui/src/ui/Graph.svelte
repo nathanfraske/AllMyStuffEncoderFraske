@@ -750,57 +750,50 @@
             </div>
           </div>
         </div>
-        <!-- Chips on the left, the status/actions stack against the right edge —
-             both sit below the title/subtitle, so the controls are to the right
-             of the chips rather than crowding the name. -->
-        <div class="node-meta-row">
-          <div class="node-meta">
-            {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
-            {:else if st.shared}<span class="tag guest">guest</span>
-            {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
-            {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
-            {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
-            {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-            {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-            {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-            {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
-          </div>
-          <!-- Status + actions cluster, stacked at the right edge: the online
-               dot sits inside a refresh ring (click = re-learn this node's
-               details), and a gear opens its menu below it. -->
-          <div class="node-ctl">
-            <button
-              class="status-refresh"
-              class:online={n.online}
-              data-tip="Refresh"
-              aria-label={`Refresh ${displayName(n)}`}
-              onclick={(e) => {
-                e.stopPropagation();
-                void app.refreshNode(n.id);
-              }}
-            >
-              <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
-                <polyline points="22 5 22 10 17 10" />
-                <polyline points="2 19 2 14 7 14" />
-                <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
-                <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
-              </svg>
-              <span class="dot" class:on={n.online}></span>
-            </button>
-            <button
-              class="node-gear"
-              data-tip="Settings"
-              aria-label={`Settings for ${displayName(n)}`}
-              aria-haspopup="menu"
-              aria-expanded={nodeMenu?.id === n.id}
-              onclick={(e) => openNodeMenu(e, n.id)}
-            >⚙</button>
-          </div>
+        <div class="node-meta">
+          {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+          {:else if st.shared}<span class="tag guest">guest</span>
+          {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+          {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+          {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+          {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+          {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+          {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+          {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
         </div>
-        {#if cons.remote || cons.files || cons.terminal || cons.sites}
-          <!-- The consoles you can open on this device — your own fleet's, or
-               exactly what a fleet that shared it with you granted. -->
-          <div class="node-consoles">
+        <!-- Bottom button row. The refresh (online dot ringed by refresh arrows
+             = re-learn this node) and the settings gear lead, inline with the
+             console buttons; a divider separates them from the consoles you can
+             open on this device (your own fleet's, or what a fleet granted). -->
+        <div class="node-consoles">
+          <button
+            class="cbtn status-refresh"
+            class:online={n.online}
+            data-tip="Refresh"
+            aria-label={`Refresh ${displayName(n)}`}
+            onclick={(e) => {
+              e.stopPropagation();
+              void app.refreshNode(n.id);
+            }}
+          >
+            <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
+              <polyline points="22 5 22 10 17 10" />
+              <polyline points="2 19 2 14 7 14" />
+              <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
+              <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
+            </svg>
+            <span class="dot" class:on={n.online}></span>
+          </button>
+          <button
+            class="cbtn node-gear"
+            data-tip="Settings"
+            aria-label={`Settings for ${displayName(n)}`}
+            aria-haspopup="menu"
+            aria-expanded={nodeMenu?.id === n.id}
+            onclick={(e) => openNodeMenu(e, n.id)}
+          >⚙</button>
+          {#if cons.remote || cons.files || cons.terminal || cons.sites}
+            <span class="ctl-div" aria-hidden="true"></span>
             {#if cons.remote}
               <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
@@ -817,8 +810,8 @@
               <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
                 onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
             {/if}
-          </div>
-        {/if}
+          {/if}
+        </div>
         <!-- Claimable affordances drop out from *under* the node, floating
              below it so they never disturb the graph's layout. -->
         {#if st.self && st.app && !st.inFleet && !st.offering}
@@ -1402,51 +1395,30 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Chips row: chips fill the left, the action stack sits at the right edge,
-     both tucked under the title/subtitle. */
-  .node-meta-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-  }
-  /* Status + actions cluster, stacked against the card's right edge with the
-     refresh on top and the settings gear directly under it. */
-  .node-ctl {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.15rem;
+  /* A thin rule in the bottom row, between the refresh/settings controls and
+     the console buttons. */
+  .ctl-div {
+    align-self: stretch;
+    width: 1px;
+    margin: 0.1rem 0.1rem;
+    background: var(--line-strong);
     flex-shrink: 0;
   }
-  /* The online dot ringed by refresh arrows — clicking re-learns the node. */
-  .status-refresh {
-    position: relative;
-    width: 24px;
-    height: 24px;
-    display: grid;
-    place-items: center;
-    border: none;
-    background: transparent;
-    padding: 0;
-    border-radius: 50%;
-    cursor: pointer;
-    color: var(--ink-faint);
-  }
-  .status-refresh:hover {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
-  }
-  .refresh-ring {
+  /* The refresh control is a cbtn whose face is the online dot ringed by
+     refresh arrows (clicking re-learns the node) rather than an icon. The ring
+     fills the button, so it overrides cbtn's centred-svg sizing. */
+  .status-refresh .refresh-ring {
     position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
+    transform: none;
     fill: none;
     stroke: currentColor;
     stroke-width: 2;
     stroke-linecap: round;
     stroke-linejoin: round;
-    opacity: 0.5;
+    opacity: 0.6;
     transition:
       opacity 0.12s ease,
       transform 0.5s ease;
@@ -1457,7 +1429,7 @@
   .status-refresh:active .refresh-ring {
     transform: rotate(-180deg);
   }
-  /* Now centred inside the ring rather than free-standing. */
+  /* Centred inside the ring rather than free-standing. */
   .dot {
     position: relative;
     width: 7px;
@@ -1470,20 +1442,11 @@
     background: var(--ok);
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
+  /* The settings gear is a cbtn with a glyph face instead of an icon — sized a
+     touch larger than the console icons so it reads clearly. */
   .node-gear {
-    position: relative;
-    border: none;
-    background: transparent;
-    padding: 0.1rem 0.2rem;
-    font-size: 1.42rem;
+    font-size: 1.05rem;
     line-height: 1;
-    cursor: pointer;
-    color: var(--ink-faint);
-    border-radius: var(--r-sm);
-  }
-  .node-gear:hover {
-    color: var(--accent-ink);
-    background: var(--accent-soft);
   }
   /* The gear's actions menu — fixed-positioned, flipped on screen by JS. */
   .node-menu {
@@ -1542,8 +1505,6 @@
     color: var(--ink-faint);
   }
   .node-meta {
-    flex: 1;
-    min-width: 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
