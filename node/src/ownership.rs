@@ -698,21 +698,18 @@ mod tests {
         let minter = memory();
         minter.ensure_fleet_key();
         assert!(minter.is_fleet_owner());
-        assert!(minter.is_fleet_founder(), "the key-minter founds the genesis");
+        // the key-minter founds the genesis
+        assert!(minter.is_fleet_founder());
 
-        // Adopter: holds an un-owned key it was *handed*, but didn't mint —
-        // structurally a fleet owner, yet it must never self-elect a parallel
+        // Adopter: holds an un-owned key it was *handed*, but didn't mint — so
+        // it's structurally a fleet owner, yet must never self-elect a parallel
         // genesis (the split-brain the engine then refuses to merge).
         let adopter = memory();
         assert!(adopter.adopt_fleet_key("some-handed-down-key", "Casey"));
-        assert!(
-            adopter.is_fleet_owner(),
-            "an un-owned key-holder is structurally a fleet owner"
-        );
-        assert!(
-            !adopter.is_fleet_founder(),
-            "an adopted key must not found a second, parallel genesis"
-        );
+        // un-owned key-holder => structurally a fleet owner
+        assert!(adopter.is_fleet_owner());
+        // ...but an adopted key must not found a second, parallel genesis
+        assert!(!adopter.is_fleet_founder());
     }
 
     #[test]
@@ -720,11 +717,13 @@ mod tests {
         // A pre-`minted` file: an un-owned key-holder with no `minted` field is
         // migrated to founder, so the real minter keeps founding after upgrade.
         let legacy: Persisted = serde_json::from_str(r#"{"fleet_key":"abc"}"#).unwrap();
-        assert_eq!(legacy.minted, None, "legacy file carries no minted field");
+        // legacy file carries no minted field
+        assert_eq!(legacy.minted, None);
         let resolved = legacy
             .minted
             .unwrap_or_else(|| legacy.owner.is_none() && legacy.fleet_key.is_some());
-        assert!(resolved, "an existing un-owned key-holder migrates to founder");
+        // an existing un-owned key-holder migrates to founder
+        assert!(resolved);
 
         // A legacy *claimed* device (owner set) is never a founder.
         let claimed: Persisted =
@@ -732,7 +731,8 @@ mod tests {
         let resolved_claimed = claimed
             .minted
             .unwrap_or_else(|| claimed.owner.is_none() && claimed.fleet_key.is_some());
-        assert!(!resolved_claimed, "a claimed device never founds");
+        // a claimed device never founds
+        assert!(!resolved_claimed);
     }
 
     #[test]
