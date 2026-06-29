@@ -767,8 +767,10 @@
           <button
             class="cbtn status-refresh"
             class:online={n.online}
+            class:spinning={app.isRefreshing(n.id)}
             data-tip="Refresh"
             aria-label={`Refresh ${displayName(n)}`}
+            disabled={app.isRefreshing(n.id)}
             onclick={(e) => {
               e.stopPropagation();
               void app.refreshNode(n.id);
@@ -1420,8 +1422,21 @@
   .status-refresh:hover .refresh-ring {
     opacity: 1;
   }
-  .status-refresh:active .refresh-ring {
-    transform: rotate(-180deg);
+  /* While a refresh is in flight the ring spins continuously and the button
+     stops taking clicks/hover; the dot keeps showing live status underneath.
+     The spin is the only transform on the ring — there's no competing :active
+     press-rotate to jank against it. */
+  .status-refresh.spinning {
+    pointer-events: none;
+  }
+  .status-refresh.spinning .refresh-ring {
+    opacity: 1;
+    animation: refresh-spin 0.9s linear infinite;
+  }
+  @keyframes refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .cbtn:disabled {
     cursor: default;
