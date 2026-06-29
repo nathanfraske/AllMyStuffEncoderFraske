@@ -3146,16 +3146,24 @@ impl Mesh {
         // some unrelated network change happens to trigger a sync.
         self.sync_networks().await;
 
-        if !self.ownership.is_fleet_owner() {
-            // A member pre-rosters its **owner**. Fleet membership is mutual
+        let is_owner = self.ownership.is_fleet_owner();
+        // A **manager** (controller) isn't the structural fleet owner, but the
+        // signed governance gives it authority to admit members. So it doesn't
+        // stop at the member path below — it skips founding (only the owner
+        // self-elects) and runs the admit loop too, signing members into the
+        // multi-writer member log even while the owner is offline. We read the
+        // *converged* signed role, so a freshly-promoted manager only starts
+        // admitting once it has adopted the owner's grant.
+        let is_manager = !is_owner && self.is_fleet_manager(&network).await;
+        if !is_owner {
+            // A non-owner pre-rosters its **owner**. Fleet membership is mutual
             // trust established by the claim, but MyOwnMesh only auto-approves a
             // connection from a peer that's already in your roster — so without
-            // this the member would be prompted to "let in" its own owner (and
+            // this the device would be prompted to "let in" its own owner (and
             // approving it would admit the owner via the handshake). The owner
             // already pre-rosters the member at claim time; this is the
             // symmetric half. We trust our owner inherently (it owns us), so
-            // there's no authority gap — and this never propagates (a member
-            // isn't a roster-grant authority, so peers refuse its roster gossip).
+            // there's no authority gap.
             if let Some(owner) = self.ownership.owner() {
                 let _ = self
                     .client
@@ -3166,14 +3174,19 @@ impl Mesh {
                     })
                     .await;
             }
-            return;
+            // A plain member has no roster authority and stops here; a manager
+            // continues to the admit loop.
+            if !is_manager {
+                return;
+            }
         }
 
-        // Found the closed governance if it isn't already ours. Only propose
-        // when the network is still open — a redundant propose on an
-        // already-closed network would sit in pending forever (propose doesn't
-        // pre-validate). `is_fleet_founded` reads the signed state.
-        if !self.is_fleet_founded(&network).await {
+        // Found the closed governance if it isn't already ours — **owner only**.
+        // A manager never founds: the owner self-elects, and a redundant
+        // kind-change proposal from a non-owner would sit in pending forever
+        // (propose doesn't pre-validate). `is_fleet_founded` reads the signed
+        // state.
+        if is_owner && !self.is_fleet_founded(&network).await {
             match self
                 .client
                 .request(&Request::GovernanceProposeKindChange {
@@ -3195,12 +3208,14 @@ impl Mesh {
         }
 
         // Admit every fleet member by **signing** them into the closed
-        // network's governance log — a ratified `RoleGrant` authored by us, the
-        // owner. This is what makes membership owner-signed and self-sufficient:
+        // network's **member log** — a ratified `RoleGrant` authored by an owner
+        // or manager. This is what makes membership signed and self-sufficient:
         // every other member derives the complete roster from the *verified*
-        // log, so they no longer depend on receiving our live (unsigned) roster
-        // gossip while we happen to be online. That dependency was the fleet
-        // bug — a member couldn't see its co-members until the owner re-gossiped.
+        // log, so they no longer depend on receiving live (unsigned) roster
+        // gossip while the author happens to be online. That dependency was the
+        // fleet bug — a member couldn't see its co-members until the owner
+        // re-gossiped. The member log is union-merged, so a manager re-asserting
+        // here converges with the owner's admits instead of forking them.
         //
         // We sign in only members the log doesn't already carry. Re-granting
         // `member` to someone already signed would be a redundant transition at
@@ -3386,6 +3401,38 @@ impl Mesh {
             })
             .unwrap_or(false);
         closed && i_am_owner
+    }
+
+    /// True if this device holds the **manager** (controller) role in
+    /// `network`'s signed governance — authority to admit members even though
+    /// it isn't the fleet owner. Reads the signed state; any error → false
+    /// (assume no authority). `me` is matched in bare-pubkey form, as the roles
+    /// map keys it.
+    async fn is_fleet_manager(self: &Arc<Self>, network: &str) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let me = pubkey_part(&me).to_string();
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return false,
+        };
+        data.get("state")
+            .and_then(|v| v.get("roles"))
+            .and_then(|v| v.as_object())
+            .and_then(|roles| {
+                roles
+                    .iter()
+                    .find(|(k, _)| pubkey_part(k) == me)
+                    .map(|(_, v)| v.as_str() == Some("controller"))
+            })
+            .unwrap_or(false)
     }
 
     /// The device ids (bare pubkey form) that already hold *any* signed role in
