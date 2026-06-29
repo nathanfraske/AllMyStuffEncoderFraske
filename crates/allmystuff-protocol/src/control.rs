@@ -88,6 +88,14 @@ pub enum Request {
     },
     NetworkRemove {
         network: String,
+        /// Also purge the network's persisted **governance state + roster** — a
+        /// genuine *forget* (e.g. leaving a fleet), not just unloading the live
+        /// network. Default `false` so disabling/refreshing a network keeps its
+        /// signed state for a later rejoin; only a deliberate leave sets it.
+        /// Matches the daemon's field; leaving it on disk is what makes a
+        /// leave-then-rejoin reload a stale (forked) genesis.
+        #[serde(default)]
+        purge: bool,
     },
     NetworkUpdate {
         config: Value,

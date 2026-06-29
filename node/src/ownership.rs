@@ -36,6 +36,13 @@ struct Persisted {
     /// this device is itself adopted.
     #[serde(default)]
     fleet_key: Option<String>,
+    /// Whether this device **minted** the fleet key (vs. having it handed down
+    /// when adopted). Only a minter founds the fleet's closed-network genesis;
+    /// a device merely holding an adopted key must never self-elect a *parallel*
+    /// genesis. `Option` so a legacy file (no field) migrates on load — an
+    /// existing un-owned key-holder is assumed to be its own minter.
+    #[serde(default)]
+    minted: Option<bool>,
     /// The fleet's display name ("Casey") — cosmetic, empty when unnamed.
     /// Handed down with the fleet key when this device is adopted; the
     /// owner's copy is authoritative.
@@ -63,6 +70,9 @@ struct Inner {
     owner: Option<String>,
     claim_mode: bool,
     fleet_key: Option<String>,
+    /// True iff this device minted `fleet_key` (gates founding — see
+    /// [`Ownership::is_fleet_founder`]).
+    minted: bool,
     fleet_name: String,
     fleet_version: u64,
     fleet_members: Vec<OwnedMember>,
@@ -85,10 +95,18 @@ impl Ownership {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
             .unwrap_or_default();
+        // Resolve `minted`, migrating a legacy file (no field): an existing
+        // un-owned key-holder is assumed to be its own minter, so the real
+        // founder keeps founding, while any future *adopted* key (which sets the
+        // flag false explicitly) never self-elects a parallel genesis.
+        let minted = persisted
+            .minted
+            .unwrap_or_else(|| persisted.owner.is_none() && persisted.fleet_key.is_some());
         let inner = Inner {
             claim_mode: persisted.owner.is_none() && env_claim_flag(),
             owner: persisted.owner,
             fleet_key: persisted.fleet_key,
+            minted,
             fleet_name: persisted.fleet_name,
             fleet_version: persisted.fleet_version,
             fleet_members: persisted.fleet_members,
@@ -217,6 +235,9 @@ impl Ownership {
         let mut changed = false;
         if i.fleet_key.as_deref() != Some(key) {
             i.fleet_key = Some(key.to_string());
+            // Handed down, not minted — an adopted-key device joins the
+            // founder's fleet and must never self-elect a parallel genesis.
+            i.minted = false;
             changed = true;
         }
         if !name.is_empty() && i.fleet_name != name {
@@ -255,6 +276,17 @@ impl Ownership {
         i.owner.is_none() && i.fleet_key.is_some()
     }
 
+    /// Whether this device may **found** the fleet's closed-network genesis: it
+    /// owns the fleet (un-owned key-holder) *and* it **minted** the key. A
+    /// device that merely adopted a key is a fleet owner structurally but must
+    /// not self-elect a *second, parallel* genesis — that's the split-brain the
+    /// engine then (correctly) refuses to merge. Distinct fleets stay distinct;
+    /// consolidating two is a deliberate leave-and-rejoin, never an auto-merge.
+    pub fn is_fleet_founder(&self) -> bool {
+        let i = self.inner.lock();
+        i.owner.is_none() && i.fleet_key.is_some() && i.minted
+    }
+
     /// Canonical member device-ids of the fleet — for the owner to admit into
     /// the closed-network roster. Empty when not in a fleet.
     pub fn fleet_member_ids(&self) -> Vec<String> {
@@ -281,6 +313,9 @@ impl Ownership {
         let mut i = self.inner.lock();
         if i.fleet_key.is_none() {
             i.fleet_key = Some(new_fleet_key());
+            // We minted this key, so this device is the fleet's founder — the
+            // only device that may self-elect the closed-network genesis.
+            i.minted = true;
             i.fleet_version = i.fleet_version.max(1);
             persist(&self.path, &i);
         }
@@ -546,6 +581,7 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
     let persisted = Persisted {
         owner: inner.owner.clone(),
         fleet_key: inner.fleet_key.clone(),
+        minted: Some(inner.minted),
         fleet_name: inner.fleet_name.clone(),
         fleet_version: inner.fleet_version,
         fleet_members: inner.fleet_members.clone(),
@@ -654,6 +690,49 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two mints must not collide");
+    }
+
+    #[test]
+    fn only_the_key_minter_is_a_founder() {
+        // Minter: ensure_fleet_key mints, so this device founds the genesis.
+        let minter = memory();
+        minter.ensure_fleet_key();
+        assert!(minter.is_fleet_owner());
+        assert!(minter.is_fleet_founder(), "the key-minter founds the genesis");
+
+        // Adopter: holds an un-owned key it was *handed*, but didn't mint —
+        // structurally a fleet owner, yet it must never self-elect a parallel
+        // genesis (the split-brain the engine then refuses to merge).
+        let adopter = memory();
+        assert!(adopter.adopt_fleet_key("some-handed-down-key", "Casey"));
+        assert!(
+            adopter.is_fleet_owner(),
+            "an un-owned key-holder is structurally a fleet owner"
+        );
+        assert!(
+            !adopter.is_fleet_founder(),
+            "an adopted key must not found a second, parallel genesis"
+        );
+    }
+
+    #[test]
+    fn legacy_record_without_minted_is_assumed_its_own_founder() {
+        // A pre-`minted` file: an un-owned key-holder with no `minted` field is
+        // migrated to founder, so the real minter keeps founding after upgrade.
+        let legacy: Persisted = serde_json::from_str(r#"{"fleet_key":"abc"}"#).unwrap();
+        assert_eq!(legacy.minted, None, "legacy file carries no minted field");
+        let resolved = legacy
+            .minted
+            .unwrap_or_else(|| legacy.owner.is_none() && legacy.fleet_key.is_some());
+        assert!(resolved, "an existing un-owned key-holder migrates to founder");
+
+        // A legacy *claimed* device (owner set) is never a founder.
+        let claimed: Persisted =
+            serde_json::from_str(r#"{"owner":"laptop","fleet_key":"abc"}"#).unwrap();
+        let resolved_claimed = claimed
+            .minted
+            .unwrap_or_else(|| claimed.owner.is_none() && claimed.fleet_key.is_some());
+        assert!(!resolved_claimed, "a claimed device never founds");
     }
 
     #[test]
