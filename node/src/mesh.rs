@@ -136,6 +136,15 @@ pub struct Mesh {
     /// the fleet-conscription takeover (AMS-01). Refreshed on ownership changes
     /// and on a periodic tick.
     fleet_authorized: Mutex<std::collections::HashSet<String>>,
+    /// Last non-empty fleet roster we read from the closed network's signed
+    /// roster (`fleet_roster_value`). A member-side resilience cache — the
+    /// symmetric twin of the owner's durable `fleet_members()` fallback: the
+    /// signed roster is the source of truth, but it's momentarily unreadable
+    /// while the fleet's closed network is mid-(re)join, and during that gap a
+    /// co-member must not flicker to "another fleet". A non-empty read always
+    /// replaces this, so an eviction propagates the instant the roster is
+    /// readable again — we never resurrect a removed member.
+    fleet_roster_cache: Mutex<Vec<OwnedMember>>,
     /// Durable share relationships — who I share with and the grants in each
     /// direction. Node-owned (enforcement lives here), persisted beside the
     /// ownership record, and projected into [`Mesh::snapshot`] so the GUI
@@ -398,6 +407,7 @@ impl Mesh {
             }),
             ownership: Arc::new(Ownership::load()),
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
+            fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
             video_out,
@@ -2723,6 +2733,26 @@ impl Mesh {
                 }
             }
         }
+        // Member-side resilience for the signed roster (the symmetric twin of
+        // the owner's `fleet_members()` fallback below). `members` here holds
+        // exactly what the closed network's signed roster returned. A non-empty
+        // read is authoritative — cache it. An empty read means the fleet's
+        // closed network is momentarily unreadable (mid-(re)join), not that the
+        // fleet emptied: fall back to the last cached roster so a co-member
+        // doesn't flicker to "another fleet" during a reconnect. Because a
+        // non-empty read always replaces the cache, an eviction propagates the
+        // instant the roster is readable again.
+        if members.is_empty() {
+            for m in self.fleet_roster_cache.lock().iter() {
+                let canon = pubkey_part(m.device.as_str()).to_string();
+                member_roles
+                    .entry(canon)
+                    .or_insert_with(|| "member".to_string());
+                members.push(m.clone());
+            }
+        } else {
+            *self.fleet_roster_cache.lock() = members.clone();
+        }
         // Fold in the owner's durable local member list so its devices show as
         // members immediately — before the closed network's signed roster
         // re-converges on startup, and through a transient roster-read failure —
@@ -3116,16 +3146,24 @@ impl Mesh {
         // some unrelated network change happens to trigger a sync.
         self.sync_networks().await;
 
-        if !self.ownership.is_fleet_owner() {
-            // A member pre-rosters its **owner**. Fleet membership is mutual
+        let is_owner = self.ownership.is_fleet_owner();
+        // A **manager** (controller) isn't the structural fleet owner, but the
+        // signed governance gives it authority to admit members. So it doesn't
+        // stop at the member path below — it skips founding (only the owner
+        // self-elects) and runs the admit loop too, signing members into the
+        // multi-writer member log even while the owner is offline. We read the
+        // *converged* signed role, so a freshly-promoted manager only starts
+        // admitting once it has adopted the owner's grant.
+        let is_manager = !is_owner && self.is_fleet_manager(&network).await;
+        if !is_owner {
+            // A non-owner pre-rosters its **owner**. Fleet membership is mutual
             // trust established by the claim, but MyOwnMesh only auto-approves a
             // connection from a peer that's already in your roster — so without
-            // this the member would be prompted to "let in" its own owner (and
+            // this the device would be prompted to "let in" its own owner (and
             // approving it would admit the owner via the handshake). The owner
             // already pre-rosters the member at claim time; this is the
             // symmetric half. We trust our owner inherently (it owns us), so
-            // there's no authority gap — and this never propagates (a member
-            // isn't a roster-grant authority, so peers refuse its roster gossip).
+            // there's no authority gap.
             if let Some(owner) = self.ownership.owner() {
                 let _ = self
                     .client
@@ -3136,14 +3174,19 @@ impl Mesh {
                     })
                     .await;
             }
-            return;
+            // A plain member has no roster authority and stops here; a manager
+            // continues to the admit loop.
+            if !is_manager {
+                return;
+            }
         }
 
-        // Found the closed governance if it isn't already ours. Only propose
-        // when the network is still open — a redundant propose on an
-        // already-closed network would sit in pending forever (propose doesn't
-        // pre-validate). `is_fleet_founded` reads the signed state.
-        if !self.is_fleet_founded(&network).await {
+        // Found the closed governance if it isn't already ours — **owner only**.
+        // A manager never founds: the owner self-elects, and a redundant
+        // kind-change proposal from a non-owner would sit in pending forever
+        // (propose doesn't pre-validate). `is_fleet_founded` reads the signed
+        // state.
+        if is_owner && !self.is_fleet_founded(&network).await {
             match self
                 .client
                 .request(&Request::GovernanceProposeKindChange {
@@ -3164,15 +3207,51 @@ impl Mesh {
             }
         }
 
-        // Admit every fleet member into the signed roster — the authenticated
-        // membership `sender_may_control` trusts. Idempotent re-approve keeps
-        // the roster (and its gossip to members) converged across restarts.
+        // Admit every fleet member by **signing** them into the closed
+        // network's **member log** — a ratified `RoleGrant` authored by an owner
+        // or manager. This is what makes membership signed and self-sufficient:
+        // every other member derives the complete roster from the *verified*
+        // log, so they no longer depend on receiving live (unsigned) roster
+        // gossip while the author happens to be online. That dependency was the
+        // fleet bug — a member couldn't see its co-members until the owner
+        // re-gossiped. The member log is union-merged, so a manager re-asserting
+        // here converges with the owner's admits instead of forking them.
+        //
+        // We sign in only members the log doesn't already carry. Re-granting
+        // `member` to someone already signed would be a redundant transition at
+        // best, and — for a device we'd promoted to manager/owner — a *demotion*
+        // back to member. So pull who's already signed (any role) and skip them;
+        // this also migrates fleets whose members were only ever plain
+        // roster-approved before signed membership (they aren't in the log yet,
+        // so they get signed now). Re-asserting on every startup is therefore
+        // free once converged. We keep the local `RosterApprove` for everyone so
+        // our own auto-approve and peer list reflect each member immediately,
+        // before ratification mirrors the grant into the roster projection.
+        let already_signed = self.signed_role_holders(&network).await;
+        let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
         for member in self.ownership.fleet_member_ids() {
+            let device_id = pubkey_part(&member).to_string();
+            // Never author a grant over ourselves: the founder election already
+            // made us Owner, and a `member` grant here would demote us.
+            if Some(&device_id) == me.as_ref() {
+                continue;
+            }
+            if !already_signed.contains(&device_id) {
+                let _ = self
+                    .client
+                    .request(&Request::GovernanceProposeRoleGrant {
+                        network: network.clone(),
+                        target: device_id.clone(),
+                        role: "member".to_string(),
+                        mfa_code: None,
+                    })
+                    .await;
+            }
             let _ = self
                 .client
                 .request(&Request::RosterApprove {
                     network: network.clone(),
-                    device_id: pubkey_part(&member).to_string(),
+                    device_id,
                     label: None,
                 })
                 .await;
@@ -3322,6 +3401,68 @@ impl Mesh {
             })
             .unwrap_or(false);
         closed && i_am_owner
+    }
+
+    /// True if this device holds the **manager** (controller) role in
+    /// `network`'s signed governance — authority to admit members even though
+    /// it isn't the fleet owner. Reads the signed state; any error → false
+    /// (assume no authority). `me` is matched in bare-pubkey form, as the roles
+    /// map keys it.
+    async fn is_fleet_manager(self: &Arc<Self>, network: &str) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let me = pubkey_part(&me).to_string();
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return false,
+        };
+        data.get("state")
+            .and_then(|v| v.get("roles"))
+            .and_then(|v| v.as_object())
+            .and_then(|roles| {
+                roles
+                    .iter()
+                    .find(|(k, _)| pubkey_part(k) == me)
+                    .map(|(_, v)| v.as_str() == Some("controller"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// The device ids (bare pubkey form) that already hold *any* signed role in
+    /// `network`'s governance log — owners, controllers, and members alike.
+    ///
+    /// The fleet-admit path uses this to sign in only members the log doesn't
+    /// already carry. Re-granting `member` to a device already in the log is a
+    /// redundant transition at best and, for one we'd promoted to
+    /// controller/owner, a *demotion* back to member. On any daemon/parse error
+    /// this returns the empty set, so the caller falls back to re-asserting the
+    /// grant — idempotent and safe, just chattier than necessary.
+    async fn signed_role_holders(
+        self: &Arc<Self>,
+        network: &str,
+    ) -> std::collections::HashSet<String> {
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return std::collections::HashSet::new(),
+        };
+        data.get("state")
+            .and_then(|s| s.get("roles"))
+            .and_then(|v| v.as_object())
+            .map(|roles| roles.keys().map(|k| pubkey_part(k).to_string()).collect())
+            .unwrap_or_default()
     }
 
     /// Refresh the authorised-controller cache ([`Mesh::fleet_authorized`])

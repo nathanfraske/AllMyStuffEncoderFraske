@@ -167,6 +167,23 @@ Everything AllMyStuff puts on a wire, with no dependency heavier than
   the graph's fleet section and is what new rooms are titled after. For now the key only groups devices internally
   (a later edition links it to other things). It's persisted next to the
   ownership record.
+- **The fleet's signed membership** — under the app-level `OwnedRoster`
+  gossip, the fleet is a **closed MyOwnMesh network** whose membership is
+  cryptographically signed, not merely gossiped. It's a three-tier cert
+  chain: the fleet **owner** (the device that minted the fleet key) founds the
+  closed network and signs each device in; a device the owner promotes to
+  **manager** (Fleet pane → "make manager" — a MyOwnMesh *controller*) can
+  also admit members; plain **members** hold no roster authority. Owner and
+  manager changes ride a strict, owner-signed governance log (owners issue
+  managers); member admits/removes ride a separate **union-merged member log**
+  (managers issue members), so two managers can admit devices concurrently —
+  even with the owner offline — and converge without forking. Each device
+  re-derives the whole roster from the *verified* logs, so a co-member shows
+  up reliably from the signed log alone instead of depending on the owner
+  being online to re-gossip it — the dependency that used to make a refreshed
+  device briefly think a co-member was "in another fleet." Keys are
+  per-device identities (no shared secrets); see MyOwnMesh
+  `docs/NETWORK-TYPES.md` for the governance contract.
 
 ### allmystuff-bridge
 
