@@ -45,40 +45,38 @@
         : "Your devices";
 
   function fleetKeyOf(n: MeshNode): { key: string; label: string } {
-    // The local device groups with your fleet — but only while it actually
-    // belongs to one. Leaving a fleet releases this machine's ownership, so a
-    // fleet-less "this" device drops to "Unknown fleet" alongside any other
-    // owner-less node, instead of clinging to a "Your devices" group of one.
-    // It still anchors your group while you genuinely own other machines, and
-    // while it's the only machine on the graph (a lone first-run device isn't
-    // "unknown").
+    // Group by the authoritative `standing()` — the same roster-driven verdict
+    // the drawer and every claim/fleet button read — NOT the node's stored
+    // `relationship.kind` or its self-advertised `owner`. Those are stale: an
+    // evicted/orphaned device keeps a "mine" relationship and keeps advertising
+    // "owner = you" for a while, which used to pin it inside your fleet group on
+    // the graph long after the signed roster dropped it (the graph-vs-settings
+    // divergence). `standing()` only honours the advert when you hold no fleet
+    // of your own, so once you do, an evicted device falls to "Unknown fleet"
+    // and an unclaimed one never enters your fleet. Because `standing()` reads
+    // the reactive fleet roster, a refresh (which reloads it) re-groups — and
+    // re-lays-out — these nodes automatically.
+    const st = app.standingOf(n);
     if (n.kind === "this") {
-      const inFleet = app.isFleetMember(n.id) || (!!n.owner && app.isMe(n.owner));
+      // "This" anchors your group while it's genuinely in a fleet, owns other
+      // machines, or is the only device on the graph; otherwise a fleet-less
+      // local device drops to "Unknown fleet" rather than a group of one.
       const ownsOthers = app.catalog.nodes.some(
-        (m) =>
-          m.id !== n.id &&
-          (m.relationship.kind === "mine" ||
-            app.isFleetMember(m.id) ||
-            (!!m.owner && app.isMe(m.owner))),
+        (m) => m.id !== n.id && app.standingOf(m).ownedByMe,
       );
       const aloneHere =
         app.catalog.nodes.filter((m) => m.id !== n.id && isAppNode(m)).length === 0;
-      return inFleet || ownsOthers || aloneHere
+      return st.inFleet || ownsOthers || aloneHere
         ? { key: "mine", label: mineLabel() }
         : { key: "unknown", label: "Unknown fleet" };
     }
-    if (
-      n.relationship.kind === "mine" ||
-      app.isFleetMember(n.id) ||
-      (!!n.owner && app.isMe(n.owner))
-    ) {
+    if (st.ownedByMe) {
       return { key: "mine", label: mineLabel() };
     }
-    if (n.relationship.kind === "shared") {
-      const p = n.relationship.person;
-      return { key: `fleet:${p.id}`, label: `${p.name}'s fleet` };
+    if (st.shared) {
+      return { key: `fleet:${st.shared.id}`, label: `${st.shared.name}'s fleet` };
     }
-    if (n.owner) {
+    if (st.ownedByOther) {
       const person = app.personFor(n);
       return { key: `fleet:${person.id}`, label: `${person.name}'s fleet` };
     }
@@ -769,10 +767,8 @@
           <button
             class="cbtn status-refresh"
             class:online={n.online}
-            class:spinning={app.isRefreshing(n.id)}
             data-tip="Refresh"
             aria-label={`Refresh ${displayName(n)}`}
-            disabled={app.isRefreshing(n.id)}
             onclick={(e) => {
               e.stopPropagation();
               void app.refreshNode(n.id);
@@ -1426,20 +1422,6 @@
   }
   .status-refresh:active .refresh-ring {
     transform: rotate(-180deg);
-  }
-  /* While a refresh is in flight the ring spins and the button stops taking
-     clicks/hover; the dot keeps showing live status underneath. */
-  .status-refresh.spinning {
-    pointer-events: none;
-  }
-  .status-refresh.spinning .refresh-ring {
-    opacity: 1;
-    animation: refresh-spin 0.9s linear infinite;
-  }
-  @keyframes refresh-spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
   .cbtn:disabled {
     cursor: default;
