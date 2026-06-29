@@ -2401,7 +2401,13 @@ impl Mesh {
                     if let Some(network) = fleet_net {
                         let _ = self
                             .client
-                            .request(&Request::NetworkRemove { network })
+                            // Released by our owner — we've left this fleet, so
+                            // purge its signed state too: no stale genesis to
+                            // reload if we later join a different fleet.
+                            .request(&Request::NetworkRemove {
+                                network,
+                                purge: true,
+                            })
                             .await;
                     }
                     self.refresh_fleet_authorization().await;
@@ -3181,12 +3187,13 @@ impl Mesh {
             }
         }
 
-        // Found the closed governance if it isn't already ours — **owner only**.
-        // A manager never founds: the owner self-elects, and a redundant
-        // kind-change proposal from a non-owner would sit in pending forever
-        // (propose doesn't pre-validate). `is_fleet_founded` reads the signed
-        // state.
-        if is_owner && !self.is_fleet_founded(&network).await {
+        // Found the closed governance only if we're the genuine **founder** —
+        // the device that MINTED the fleet key. A structural owner that merely
+        // adopted a key must NOT self-elect a parallel genesis: the engine would
+        // (correctly) refuse to merge it, leaving two split-brain fleets that
+        // only a deliberate leave-and-rejoin can consolidate. A manager never
+        // founds either. `is_fleet_founded` reads the signed state.
+        if self.ownership.is_fleet_founder() && !self.is_fleet_founded(&network).await {
             match self
                 .client
                 .request(&Request::GovernanceProposeKindChange {
@@ -3563,7 +3570,12 @@ impl Mesh {
             tracing::info!("leaving the fleet — forgetting closed network {network}");
             let _ = self
                 .client
-                .request(&Request::NetworkRemove { network })
+                // A deliberate leave: purge the signed governance state + roster
+                // so a later rejoin can't reload a stale (forked) genesis.
+                .request(&Request::NetworkRemove {
+                    network,
+                    purge: true,
+                })
                 .await;
         } else {
             tracing::info!(

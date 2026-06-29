@@ -1078,7 +1078,14 @@ pub async fn dispatch(
             let network: String = try_arg!(arg(a, "network"));
             sync_after(
                 mesh,
-                daemon_request(client, Request::NetworkRemove { network }).await,
+                daemon_request(
+                    client,
+                    Request::NetworkRemove {
+                        network,
+                        purge: false,
+                    },
+                )
+                .await,
             )
             .await
         }
@@ -1346,6 +1353,8 @@ async fn network_set_enabled(
             client,
             Request::NetworkRemove {
                 network: network.clone(),
+                // Disabling parks the config for re-enable — keep its state.
+                purge: false,
             },
         )
         .await;
