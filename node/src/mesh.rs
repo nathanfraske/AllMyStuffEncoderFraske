@@ -6445,9 +6445,13 @@ impl Mesh {
         {
             let mut asks = self.refresh_asks.lock();
             let now = std::time::Instant::now();
+            // 300 ms floor: a re-key is the recovery from visible corruption, so
+            // it must turn around fast (was 600 ms). Still throttled so a viewer
+            // failing every frame can't trigger a keyframe storm — at most a few
+            // re-keys/s while it's actually broken.
             if asks
                 .get(&route_id)
-                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(600))
+                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(300))
             {
                 return Ok(());
             }

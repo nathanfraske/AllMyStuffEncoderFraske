@@ -253,7 +253,9 @@
     const route = app.consoleVideoLive;
     if (!route) return;
     const now = performance.now();
-    if (now - lastRefreshAsk < 700) return;
+    // 300 ms floor (was 700): a re-key recovers visible corruption, so ask
+    // fast. The backend throttles again (300 ms) so a storm can't form.
+    if (now - lastRefreshAsk < 300) return;
     lastRefreshAsk = now;
     void refreshRoute(route);
   }
@@ -370,7 +372,10 @@
     // rung down on software decode, and a stall *there* hands the stream
     // to the backend's native decoder. The chip's diag line records the
     // step.
-    let decodeMode: HardwareAcceleration = "no-preference";
+    // Start on GPU decode (VideoToolbox/D3D11/VA-API behind WebCodecs) — it's
+    // the lowest-latency, lowest-CPU rung. The ladder steps down to software
+    // then native on a stall, so a box without HW decode still recovers.
+    let decodeMode: HardwareAcceleration = "prefer-hardware";
     let decodeCalls = 0;
     let decodeOutputs = 0;
     // Decoded frames don't paint inside the output callback: the freshest
@@ -383,7 +388,7 @@
     decodeModeNote = native ? "native" : "";
 
     const rebuildDecoder = () => {
-      if (decodeMode === "no-preference") {
+      if (decodeMode !== "prefer-software") {
         decodeMode = "prefer-software";
         decodeModeNote = "sw";
       } else {
