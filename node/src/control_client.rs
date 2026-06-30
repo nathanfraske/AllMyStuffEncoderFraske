@@ -26,8 +26,8 @@ use interprocess::local_socket::GenericNamespaced;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-pub use allmystuff_protocol::{Request, Response};
 use allmystuff_protocol::control::{encode_media_frame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
+pub use allmystuff_protocol::{Request, Response};
 
 /// Where the daemon's control socket lives. Recomputed locally (via the
 /// protocol crate) so the GUI never has to link `myownmesh-core`.
@@ -298,7 +298,10 @@ impl MediaTrackPipe {
                 .write_all(line.as_bytes())
                 .await
                 .context("media-track handshake")?;
-            send_half.flush().await.context("media-track handshake flush")?;
+            send_half
+                .flush()
+                .await
+                .context("media-track handshake flush")?;
             *writer = Some(send_half);
         }
         // Header and body go out under one lock so frames never interleave.

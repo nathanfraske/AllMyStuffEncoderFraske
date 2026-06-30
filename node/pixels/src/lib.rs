@@ -80,9 +80,8 @@ pub fn scale_rgba_to_i420(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec
             y_plane[y1 * dw + x0] = rgb_to_y(p01);
             y_plane[y1 * dw + x0 + 1] = rgb_to_y(p11);
             // Average the 2×2 RGB block, then convert once for U and V.
-            let avg = |i: usize| {
-                (p00[i] as u32 + p10[i] as u32 + p01[i] as u32 + p11[i] as u32 + 2) / 4
-            };
+            let avg =
+                |i: usize| (p00[i] as u32 + p10[i] as u32 + p01[i] as u32 + p11[i] as u32 + 2) / 4;
             let (r, g, b) = (avg(0), avg(1), avg(2));
             let ci = by * cw + bx;
             u_plane[ci] = rgb_to_u(r, g, b);

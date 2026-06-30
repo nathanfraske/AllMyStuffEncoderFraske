@@ -495,9 +495,13 @@ pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
     let stream = rd(body, &mut p, 1)?[0];
     let duration_us = u64::from_le_bytes(rd(body, &mut p, 8)?.try_into().ok()?);
     let net_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let network = std::str::from_utf8(rd(body, &mut p, net_len)?).ok()?.to_string();
+    let network = std::str::from_utf8(rd(body, &mut p, net_len)?)
+        .ok()?
+        .to_string();
     let peer_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?).ok()?.to_string();
+    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?)
+        .ok()?
+        .to_string();
     let data = body.get(p..)?.to_vec();
     Some(MediaFrame {
         kind,
@@ -515,7 +519,14 @@ mod tests {
 
     #[test]
     fn media_frame_round_trips() {
-        let body = encode_media_frame(MEDIA_KIND_VIDEO, 3, 33_333, "home", "peerpub", &[1, 2, 3, 9]);
+        let body = encode_media_frame(
+            MEDIA_KIND_VIDEO,
+            3,
+            33_333,
+            "home",
+            "peerpub",
+            &[1, 2, 3, 9],
+        );
         let f = decode_media_frame(&body).expect("decode");
         assert_eq!(f.kind, MEDIA_KIND_VIDEO);
         assert_eq!(f.stream, 3);
