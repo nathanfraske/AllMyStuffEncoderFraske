@@ -472,8 +472,15 @@ Tauri 2 + Svelte 5, a client of the daemon.
    already ended is taken over, and the console serializes its tab switches
    so the teardown precedes the next offer — frames ride **MyOwnMesh's
    H.264 video track lane**: openh264 in screen-content mode at native
-   resolution up to 4K, bitrate budgeted from the monitor's true pixel
-   count (~0.16 bpp, 8–40 Mbps), real RTP, no JSON/base64/64 KiB ceiling.
+   resolution up to 4K (capture RGBA is converted straight to I420 in one
+   fused pass — no RGB intermediate, no separate RGB→YUV walk), bitrate
+   budgeted from the monitor's true pixel count (~0.16 bpp, 8–40 Mbps), real
+   RTP on the wire. Access units reach (and return from) the daemon over a
+   **dedicated binary media pipe** — `MediaTrackPipe` outbound,
+   `MediaSourcePipe` inbound — so there is no base64 or per-frame JSON on the
+   IPC either, and no 64 KiB ceiling. (MJPEG, PCM and route signalling keep the
+   JSON control pipe; the base64 `video_inbound`/`audio_inbound` event path
+   stays only as a version-skew fallback.)
    Otherwise they fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA`
    (1280 edge, chunked JPEGs), so any version skew degrades to working
    video. Either way the console window renders packets it *pulls* per

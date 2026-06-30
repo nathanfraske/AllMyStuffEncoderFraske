@@ -169,6 +169,17 @@ pub enum Request {
     /// `VideoSend`/`AudioSend` (and the MJPEG/PCM/route-signaling media
     /// channel) stay on the ordinary JSON pipe, untouched.
     MediaTrackPipe,
+    /// Convert this connection into a dedicated **binary media-source pipe**
+    /// for the client identified by `client_id` (its `EventsSubscribe` id):
+    /// after the ack, the daemon pushes length-prefixed inbound media frames
+    /// (`[u32 len][body]`, see [`decode_inbound_frame`]) for everything that
+    /// client is subscribed to — H.264/Opus from peers, with no base64 and no
+    /// JSON. While this pipe is registered the daemon routes inbound media here
+    /// instead of as base64 `video_inbound`/`audio_inbound` on the event
+    /// socket. The client sends nothing after the handshake.
+    MediaSourcePipe {
+        client_id: ClientId,
+    },
     /// Route assembled video access units from this network's peers to
     /// this client's event socket as `video_inbound` frames.
     VideoSubscribe {
@@ -513,9 +524,107 @@ pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
     })
 }
 
+// ---- binary media-source pipe (inbound) frame codec ------------------------
+//
+// The daemon→client direction. A [`Request::MediaSourcePipe`] connection
+// carries `[u32 len LE][body]` frames, where `body` is what
+// [`encode_inbound_frame`] / [`decode_inbound_frame`] produce and parse. The
+// fields mirror the old base64 `video_inbound`/`audio_inbound` events. Mirrored
+// verbatim in the daemon; keep byte-for-byte identical (round-trip tested).
+
+/// One decoded inbound media frame (from a peer, arriving at this client).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundFrame {
+    pub kind: u8,
+    /// Video keyframe flag (always false for audio).
+    pub key: bool,
+    pub stream: u8,
+    pub rtp_timestamp: u32,
+    /// Sending peer (display id, as the old `from` field carried).
+    pub from: String,
+    pub data: Vec<u8>,
+}
+
+/// Serialize an inbound frame **body** (no length prefix). Layout:
+/// `kind u8 · key u8 · stream u8 · rtp_timestamp u32 · from_len u16 · from ·
+/// data…`, integers little-endian.
+pub fn encode_inbound_frame(
+    kind: u8,
+    key: bool,
+    stream: u8,
+    rtp_timestamp: u32,
+    from: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let from = from.as_bytes();
+    let mut out = Vec::with_capacity(9 + from.len() + data.len());
+    out.push(kind);
+    out.push(key as u8);
+    out.push(stream);
+    out.extend_from_slice(&rtp_timestamp.to_le_bytes());
+    out.extend_from_slice(&(from.len() as u16).to_le_bytes());
+    out.extend_from_slice(from);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Parse an inbound frame body. `None` on truncation / non-UTF-8 — dropped,
+/// never panics.
+pub fn decode_inbound_frame(body: &[u8]) -> Option<InboundFrame> {
+    fn rd<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
+        let end = p.checked_add(n)?;
+        let s = b.get(*p..end)?;
+        *p = end;
+        Some(s)
+    }
+    let mut p = 0;
+    let kind = rd(body, &mut p, 1)?[0];
+    let key = rd(body, &mut p, 1)?[0] != 0;
+    let stream = rd(body, &mut p, 1)?[0];
+    let rtp_timestamp = u32::from_le_bytes(rd(body, &mut p, 4)?.try_into().ok()?);
+    let from_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
+    let from = std::str::from_utf8(rd(body, &mut p, from_len)?)
+        .ok()?
+        .to_string();
+    let data = body.get(p..)?.to_vec();
+    Some(InboundFrame {
+        kind,
+        key,
+        stream,
+        rtp_timestamp,
+        from,
+        data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_frame_round_trips() {
+        let body = encode_inbound_frame(MEDIA_KIND_VIDEO, true, 2, 90_000, "peer-ABC", &[4, 5, 6]);
+        let f = decode_inbound_frame(&body).expect("decode");
+        assert_eq!(f.kind, MEDIA_KIND_VIDEO);
+        assert!(f.key);
+        assert_eq!(f.stream, 2);
+        assert_eq!(f.rtp_timestamp, 90_000);
+        assert_eq!(f.from, "peer-ABC");
+        assert_eq!(f.data, vec![4, 5, 6]);
+        // Audio frame: no key, empty/short payloads also round-trip.
+        let a = encode_inbound_frame(MEDIA_KIND_AUDIO, false, 0, 1, "p", &[]);
+        let f = decode_inbound_frame(&a).expect("decode");
+        assert!(!f.key);
+        assert!(f.data.is_empty());
+    }
+
+    #[test]
+    fn inbound_frame_truncation_is_none() {
+        let body = encode_inbound_frame(MEDIA_KIND_VIDEO, false, 1, 7, "peer", &[1, 2]);
+        for cut in 0..9 + "peer".len() {
+            assert!(decode_inbound_frame(&body[..cut]).is_none(), "short {cut}");
+        }
+    }
 
     #[test]
     fn media_frame_round_trips() {

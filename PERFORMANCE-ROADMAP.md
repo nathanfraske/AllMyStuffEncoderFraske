@@ -33,7 +33,24 @@ code with `file:line` anchors so it can be picked up cold.
 - **A decode ladder already exists** — WebCodecs (hardware) → native openh264
   (`node/src/video_decode.rs`).
 
+## Shipped so far
+
+- **Fused RGBA→I420 encode** (item 2 below, the CPU-pass half). `scale_rgba_to_i420`
+  (`node/pixels/src/lib.rs`) does the downscale + BT.601 conversion in one pass straight to a
+  contiguous I420 buffer, fed to openh264 via a borrowing `YUVSource` — the old RGB intermediate and
+  openh264's separate RGB→YUV walk are gone; the unchanged-frame compare runs on 1.5 B/px I420.
+- **Binary media IPC, both directions** (item 11 below). The base64+JSON per-frame tax on the
+  node↔daemon socket is gone: H.264/Opus **sends** ride a dedicated binary `MediaTrackPipe`
+  (`node/src/control_client.rs` ↔ MyOwnMesh `run_media_track_pipe`), and inbound H.264/Opus rides a
+  dedicated binary `MediaSourcePipe` (MyOwnMesh per-client media sink → `run_media_source_pipe` ↔
+  node `subscribe_media_source`). MJPEG, PCM and route signalling stay on the JSON pipe; the base64
+  `video_inbound`/`audio_inbound` event path remains only as a version-skew fallback.
+
 ## The real critical path (this sets the ordering)
+
+(State *before* the fixes above — the diagram the ordering was derived from.)
+
+```
 
 ```
 capture → CPU scale+color → SW openh264 (inline, ONE thread) → base64 → JSON-over-local-socket
@@ -153,13 +170,20 @@ readback and the two CPU passes. Large latency+fps. *Prereq: 3.*
   Static-skip diff (`video.rs:1563`) also has no cheap CPU buffer on a GPU path — rely on DXGI
   `LastPresentTime==0` damage (`win_capture.rs:254`) or keep a small CPU thumbnail.
 
-**11. Kill the per-frame base64+JSON IPC tax on the bitstream.**
-`node/src/mesh.rs:591` (base64 every access unit), `node/src/control_client.rs:211` (JSON line over the
-socket); MyOwnMesh `crates/myownmesh/src/control.rs` (base64-decode). Every encoded frame is base64'd
-(~1.33×) + JSON-serialized across the process boundary, twice, on the hot path — real CPU competing for
-the cores #3 needs. Move media to **binary/shared-memory IPC**, or fold into #10's encoder-in-daemon move
-(then the bitstream never round-trips). This also cheapens the **MJPEG floor**, which rides the same path.
-*Effort: weeks, or folds into #10.*
+**11. Kill the per-frame base64+JSON IPC tax on the bitstream. ✅ DONE (both directions).**
+Every encoded frame used to be base64'd (~1.33×) + JSON-serialized across the node↔daemon process
+boundary, twice (once each way), on the hot path — real CPU competing with the encoder. Now:
+- **Sends** (`node/src/mesh.rs` `send_video_track`/`send_audio_track` → `MediaTrackPipe` in
+  `node/src/control_client.rs`) ride a dedicated binary connection: a one-line handshake, then
+  length-prefixed raw frames (`allmystuff_protocol::control` media-frame codec). The daemon reads them
+  in `run_media_track_pipe` (`MyOwnMesh/crates/myownmesh/src/control.rs`).
+- **Inbound** (MyOwnMesh pumps → a per-client binary sink on `ClientHandle` → `run_media_source_pipe`)
+  reaches the node over `MediaSourcePipe` (`subscribe_media_source`), decoded straight to raw bytes —
+  no base64 `video_inbound`/`audio_inbound` JSON. That event path stays only as a version-skew fallback.
+
+MJPEG, PCM and route signalling deliberately stay on the JSON pipe (the floor + control plane), so the
+binary pipes carry only the high-rate H.264/Opus. The frame codecs are round-trip + truncation tested
+on both sides and kept byte-for-byte identical. *Shipped; was estimated weeks.*
 
 ### Codec dimension + the unified slider (weeks–months)
 

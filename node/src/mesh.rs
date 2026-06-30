@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use crate::UiSink;
 
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
+use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
     Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
@@ -736,6 +737,45 @@ impl Mesh {
             st.networks = networks.clone();
         }
 
+        // Inbound media (H.264/Opus from peers) rides a dedicated binary pipe —
+        // no base64 — instead of the JSON event socket. Open it for our event
+        // `client_id` before subscribing video/audio, so the daemon has the
+        // sink registered when its pumps start; if it can't open, the daemon
+        // falls back to base64 `video_inbound`/`audio_inbound` events, which the
+        // value dispatcher below still handles.
+        {
+            let (media_tx, mut media_rx) = mpsc::channel::<InboundFrame>(256);
+            match self
+                .client
+                .subscribe_media_source(client_id, media_tx)
+                .await
+            {
+                Ok(()) => {
+                    let mesh = self.clone();
+                    crate::spawn(async move {
+                        while let Some(f) = media_rx.recv().await {
+                            match f.kind {
+                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound(
+                                    &f.from,
+                                    f.stream,
+                                    f.rtp_timestamp,
+                                    f.key,
+                                    f.data,
+                                ),
+                                MEDIA_KIND_AUDIO => {
+                                    mesh.handle_audio_inbound(&f.from, f.stream, f.data)
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("mesh: media-source pipe unavailable, using base64 events: {e}");
+                }
+            }
+        }
+
         if networks.is_empty() {
             // Still run the claim-status check (it sanitizes stale fleet
             // residue and refreshes the UI); the broadcasts inside are
@@ -1148,6 +1188,12 @@ impl Mesh {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                // Base64 fallback path (a daemon without the binary media-source
+                // pipe): decode here so the handler always gets raw bytes.
+                use base64::Engine as _;
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    return;
+                };
                 self.handle_video_inbound(from, stream, rtp_timestamp, key, data);
             }
             "audio_inbound" => {
@@ -1156,6 +1202,10 @@ impl Mesh {
                     return;
                 };
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                use base64::Engine as _;
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    return;
+                };
                 self.handle_audio_inbound(from, stream, data);
             }
             "event" => {
@@ -1556,8 +1606,7 @@ impl Mesh {
     /// gated exactly like every other media frame (route live, sinks here,
     /// sender is the route's peer) — then decodes straight into the
     /// route's playback ring.
-    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data_b64: &str) {
-        use base64::Engine as _;
+    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data: Vec<u8>) {
         let Some(route_id) = self.audio_route_for_lane(from, stream) else {
             // The audio twin of the video lane's "no route for it" warn
             // (rate-limited the same way): Opus arriving with nowhere to
@@ -1575,9 +1624,6 @@ impl Mesh {
             tracing::debug!("audio frame for {route_id} refused (route not live here)");
             return;
         }
-        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
-            return;
-        };
         // Up to 120 ms per packet is legal Opus; ours are 20 ms.
         let mut pcm = vec![0i16; crate::audio::OPUS_FRAME_SAMPLES * 6];
         let decoded = {
@@ -1655,9 +1701,8 @@ impl Mesh {
         stream: u8,
         rtp_timestamp: u32,
         key: bool,
-        data_b64: &str,
+        data: Vec<u8>,
     ) {
-        use base64::Engine as _;
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_route_for_lane(from, stream) else {
             // The sender is streaming the track lane at us but no route
@@ -1681,9 +1726,6 @@ impl Mesh {
             }
             return;
         }
-        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
-            return;
-        };
         // The arrival side of the sender's "route active — streaming"
         // line: one INFO per stream, so a healthy hop is attributable
         // from this end too (the MJPEG path has logged its first frame

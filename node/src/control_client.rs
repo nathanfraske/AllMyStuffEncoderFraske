@@ -23,10 +23,13 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use allmystuff_protocol::control::{encode_media_frame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
+use allmystuff_protocol::control::{
+    decode_inbound_frame, encode_media_frame, InboundFrame, MAX_MEDIA_FRAME_BYTES,
+    MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
+};
 pub use allmystuff_protocol::{Request, Response};
 
 /// Where the daemon's control socket lives. Recomputed locally (via the
@@ -156,6 +159,82 @@ impl ControlClient {
         });
 
         Ok(client_id)
+    }
+
+    /// Open a dedicated binary **media-source** pipe for `client_id` (the id
+    /// from [`subscribe_events`]). After the handshake the daemon pushes
+    /// length-prefixed inbound media frames (`[u32 len][body]`) for everything
+    /// that client subscribed to; this reads them and forwards each decoded
+    /// [`InboundFrame`] to `tx`. Inbound H.264/Opus then carries no base64.
+    /// The spawned reader ends when the daemon closes the pipe or `tx` is
+    /// dropped; the caller can reconnect on the next session.
+    ///
+    /// [`subscribe_events`]: ControlClient::subscribe_events
+    pub async fn subscribe_media_source(
+        &self,
+        client_id: allmystuff_protocol::ClientId,
+        tx: mpsc::Sender<InboundFrame>,
+    ) -> Result<()> {
+        let stream = self.connect().await?;
+        let (reader, mut writer) = stream.split();
+        let mut reader = BufReader::new(reader);
+
+        let line = serde_json::to_string(&Request::MediaSourcePipe { client_id })? + "\n";
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("write media-source handshake")?;
+        writer
+            .flush()
+            .await
+            .context("flush media-source handshake")?;
+
+        let mut ack = String::new();
+        let n = reader
+            .read_line(&mut ack)
+            .await
+            .context("read media-source ack")?;
+        if n == 0 {
+            bail!("daemon closed the connection before the media-source ack");
+        }
+        let parsed: Response = serde_json::from_str(ack.trim())
+            .with_context(|| format!("parse media-source ack: {ack}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "media-source rejected: {}",
+                parsed.error.unwrap_or_else(|| "(no error)".into())
+            ));
+        }
+
+        tokio::spawn(async move {
+            // Hold the writer half open for the lifetime of the read loop
+            // (dropping it would half-close the pipe).
+            let _writer_keepalive = writer;
+            loop {
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len > MAX_MEDIA_FRAME_BYTES {
+                    tracing::warn!("media-source frame too large ({len} bytes) — closing pipe");
+                    break;
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+                let Some(frame) = decode_inbound_frame(&body) else {
+                    tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
+                    continue;
+                };
+                if tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(())
     }
 
     async fn connect(&self) -> Result<LocalSocketStream> {
