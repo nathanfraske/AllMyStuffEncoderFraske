@@ -38,13 +38,13 @@ setup:
 [unix]
 [doc("Run the app with hot reload (node + mesh daemon bundled automatically).")]
 dev *ARGS:
-    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve --features hwenc
+    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve
     @cd gui && pnpm install --silent && pnpm tauri dev {{ARGS}}
 
 [windows]
 [doc("Run the app with hot reload (node + mesh daemon bundled automatically).")]
 dev *ARGS:
-    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve --features hwenc
+    @cargo build --manifest-path node/Cargo.toml --bin allmystuff-serve
     @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
 
 # Build the library workspace (no webview / Tauri compile).
@@ -81,7 +81,7 @@ term *ARGS:
 # Run this machine on the mesh, headless (the node `allmystuff serve` runs).
 # Builds from the node workspace and spawns the myownmesh daemon itself.
 serve *ARGS:
-    @cargo run --manifest-path node/Cargo.toml --bin allmystuff-serve --features hwenc -- {{ARGS}}
+    @cargo run --manifest-path node/Cargo.toml --bin allmystuff-serve -- {{ARGS}}
 
 # Stop this machine's whole mesh stack: the AllMyStuff node (`allmystuff-serve`)
 # and the `myownmesh` daemon it spawns. Use it for a clean slate between `just
