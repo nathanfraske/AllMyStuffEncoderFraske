@@ -35,6 +35,14 @@ code with `file:line` anchors so it can be picked up cold.
 
 ## Shipped so far
 
+- **Hardware H.264 encode with a frame-send-tested step-down ladder** (item 3, the headline win).
+  A `H264Codec` trait (`node/src/video.rs`) sits behind `H264Stream`; `make_h264_codec` walks the
+  platform's hardware encoders best-first — **NVENC → AMF → QuickSync** (Windows), **VideoToolbox**
+  (macOS), **NVENC → VA-API → QuickSync** (Linux) — via FFmpeg (`node/src/hwenc.rs`, the `hwenc`
+  feature), opens each and **frame-send-tests it** (encode one grey frame), and the first that
+  actually emits an access unit wins. Anything that won't open or won't produce a frame is stepped
+  over, down to software **openh264** as the guaranteed floor. `h264_nvenc` is real NVENC. Built into
+  `just dev`/`just serve` (needs FFmpeg dev libs); a plain `cargo build` stays software-only.
 - **Fused RGBA→I420 encode** (item 2 below, the CPU-pass half). `scale_rgba_to_i420`
   (`node/pixels/src/lib.rs`) does the downscale + BT.601 conversion in one pass straight to a
   contiguous I420 buffer, fed to openh264 via a borrowing `YUVSource` — the old RGB intermediate and

@@ -471,9 +471,13 @@ Tauri 2 + Svelte 5, a client of the daemon.
    — see below); when the peer's lane is free — a lane whose holding route
    already ended is taken over, and the console serializes its tab switches
    so the teardown precedes the next offer — frames ride **MyOwnMesh's
-   H.264 video track lane**: openh264 in screen-content mode at native
-   resolution up to 4K (capture RGBA is converted straight to I420 in one
-   fused pass — no RGB intermediate, no separate RGB→YUV walk), bitrate
+   H.264 video track lane**: a hardware encoder where one is present —
+   NVENC/AMF/QuickSync (Windows), VideoToolbox (macOS), NVENC/VA-API (Linux),
+   chosen by a frame-send-tested step-down ladder (`make_h264_codec`, the
+   `hwenc` FFmpeg feature) that falls to software **openh264** as the floor —
+   in screen-content mode at native resolution up to 4K (capture RGBA is
+   converted straight to I420 in one fused pass — no RGB intermediate, no
+   separate RGB→YUV walk), bitrate
    budgeted from the monitor's true pixel count (~0.16 bpp, 8–40 Mbps), real
    RTP on the wire. When the local daemon advertises the binary media pipes
    (Status `media_pipes` — a capability flag, since the feature predates a

@@ -806,6 +806,9 @@ impl Mesh {
                 .await
             {
                 Ok(()) => {
+                    tracing::info!(
+                        "binary media pipes active — H.264/Opus carry raw over the IPC (no base64) in both directions"
+                    );
                     let mesh = self.clone();
                     crate::spawn(async move {
                         while let Some(f) = media_rx.recv().await {

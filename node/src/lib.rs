@@ -36,6 +36,11 @@ pub mod clipboard;
 pub mod control_client;
 pub mod daemon_spawn;
 pub mod files;
+/// Hardware H.264 encode via FFmpeg vendor encoders. Only built with the
+/// `hwenc` feature (which pulls FFmpeg); the encoder ladder in [`video`] skips
+/// it otherwise and runs software openh264.
+#[cfg(feature = "hwenc")]
+pub mod hwenc;
 pub mod input_inject;
 pub mod mesh;
 pub mod networks_store;

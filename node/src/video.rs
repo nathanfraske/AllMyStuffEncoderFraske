@@ -1475,7 +1475,10 @@ impl StreamEncoder {
 /// a decode entry point within seconds. A resolution change (monitor swap)
 /// re-initializes the encoder inside openh264; the next unit out is an IDR.
 struct H264Stream {
-    encoder: openh264::encoder::Encoder,
+    /// The active H.264 backend — a hardware encoder (NVENC/AMF/QSV/
+    /// VideoToolbox/VA-API via FFmpeg) when one passed the frame-send test, else
+    /// software openh264. Rebuilt (re-laddered) on a resize.
+    codec: Box<dyn H264Codec>,
     /// The fitted size the current encoder's bitrate was budgeted for.
     /// The first real frame (or a monitor swap) that fits to a different
     /// size rebuilds the encoder with a corrected budget — monitor
@@ -1513,9 +1516,9 @@ impl H264Stream {
         } else {
             fit_within_even(source_hint.0, source_hint.1, tune.h264_edge())
         };
-        let encoder = make_h264_encoder(bw, bh, fps, tune)?;
+        let codec = make_h264_codec(bw, bh, fps, tune)?;
         Ok(H264Stream {
-            encoder,
+            codec,
             budget_size: (bw, bh),
             tune,
             fps,
@@ -1544,7 +1547,7 @@ impl H264Stream {
         // but *capture* physical ones), rebuild the encoder on a corrected
         // budget. Its first unit out is an IDR.
         if (dw, dh) != self.budget_size {
-            self.encoder = make_h264_encoder(dw, dh, self.fps, self.tune)?;
+            self.codec = make_h264_codec(dw, dh, self.fps, self.tune)?;
             self.budget_size = (dw, dh);
             self.last_idr = None;
         }
@@ -1569,35 +1572,26 @@ impl H264Stream {
         // relaxes it on a healthy link and tightens it on a struggling one
         // (see `adaptive_idr_ms`). Default `IDR_MS_TIGHT` = the old fixed 2 s.
         let idr_every = Duration::from_millis(self.idr_ms.load(Ordering::Relaxed));
-        if refresh_asked || self.last_idr.is_none_or(|idr| idr.elapsed() >= idr_every) {
-            self.encoder.force_intra_frame();
-        }
+        let force_idr = refresh_asked || self.last_idr.is_none_or(|idr| idr.elapsed() >= idr_every);
+        // Hand the I420 to whichever backend the ladder selected — hardware or
+        // software. It returns the Annex-B access unit and whether it's a key.
         let t1 = Instant::now();
-        // Feed the encoder our I420 planes directly (zero-copy borrow), so it
-        // skips the RGB→YUV conversion `from_rgb8_source` used to do.
-        let stream = self
-            .encoder
-            .encode(&I420Frame {
-                buf: &i420,
-                w: dw as usize,
-                h: dh as usize,
-            })
-            .map_err(|e| format!("h264 encode: {e}"))?;
-        let key = matches!(
-            stream.frame_type(),
-            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-        );
-        let data = stream.to_vec();
+        let out = self
+            .codec
+            .encode_i420(&i420, dw as usize, dh as usize, force_idr)?;
         stats.encode += t1.elapsed();
         self.prev = i420;
         self.prev_size = (dw, dh);
         self.last_sent = Some(Instant::now());
+        // Rate control (or an encoder still buffering) may emit nothing.
+        let Some((data, key)) = out else {
+            return Ok(None);
+        };
         if key {
             self.last_idr = Some(Instant::now());
             stats.keyframes += 1;
         }
         if data.is_empty() {
-            // Rate control may skip a frame outright; nothing to send.
             return Ok(None);
         }
         stats.bytes += data.len() as u64;
@@ -1639,6 +1633,146 @@ impl openh264::formats::YUVSource for I420Frame<'_> {
     }
 }
 
+/// A pluggable H.264 backend: one fitted I420 frame in, an Annex-B access unit
+/// out. The ladder ([`make_h264_codec`]) selects the implementation; everything
+/// around it (scaling, the static-frame skip, the adaptive IDR cadence, stats)
+/// stays in [`H264Stream`]. `Send` so the whole stream can live on the route's
+/// capture/encode thread.
+trait H264Codec: Send {
+    /// Encode one contiguous I420 frame (`w*h` Y, then quarter-size U, then V).
+    /// `force_idr` requests a keyframe. Returns the access unit + whether it was
+    /// a keyframe, or `None` when the encoder emitted nothing (rate-control skip
+    /// or buffering).
+    fn encode_i420(
+        &mut self,
+        i420: &[u8],
+        w: usize,
+        h: usize,
+        force_idr: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String>;
+    /// Human label for logs ("openh264 (software)", "h264_nvenc", …).
+    fn label(&self) -> &str;
+}
+
+/// Software openh264 — the guaranteed floor of the ladder.
+struct OpenH264Codec(openh264::encoder::Encoder);
+
+impl H264Codec for OpenH264Codec {
+    fn encode_i420(
+        &mut self,
+        i420: &[u8],
+        w: usize,
+        h: usize,
+        force_idr: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        if force_idr {
+            self.0.force_intra_frame();
+        }
+        let stream = self
+            .0
+            .encode(&I420Frame { buf: i420, w, h })
+            .map_err(|e| format!("openh264 encode: {e}"))?;
+        let key = matches!(
+            stream.frame_type(),
+            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+        );
+        let data = stream.to_vec();
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((data, key)))
+        }
+    }
+    fn label(&self) -> &str {
+        "openh264 (software)"
+    }
+}
+
+/// FFmpeg hardware backend (NVENC/AMF/QSV/VideoToolbox/VA-API), behind the
+/// `hwenc` feature. Thin wrapper so the inherent methods on `hwenc::FfmpegH264`
+/// don't clash with the trait.
+#[cfg(feature = "hwenc")]
+struct FfmpegCodec(crate::hwenc::FfmpegH264);
+
+#[cfg(feature = "hwenc")]
+impl H264Codec for FfmpegCodec {
+    fn encode_i420(
+        &mut self,
+        i420: &[u8],
+        _w: usize,
+        _h: usize,
+        force_idr: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        // The FFmpeg encoder is fixed to the size it was opened at — the same
+        // (dw, dh) the ladder built it for; `H264Stream` rebuilds on resize.
+        self.0.encode_i420(i420, force_idr)
+    }
+    fn label(&self) -> &str {
+        self.0.label()
+    }
+}
+
+/// Build the best H.264 backend for `bw`×`bh` at `fps`: walk the platform's
+/// hardware candidates (NVENC first), open each and **frame-send-test** it —
+/// the first that actually emits an access unit wins. Anything that won't open
+/// or won't produce a frame (no GPU, driver/permission/session-cap trouble) is
+/// stepped over, down to software openh264, which is the guaranteed floor.
+fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H264Codec>, String> {
+    #[cfg(feature = "hwenc")]
+    {
+        let bitrate = tune
+            .bitrate
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .clamp(250_000, 80_000_000);
+        for &name in crate::hwenc::candidates() {
+            match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate) {
+                Ok(enc) => {
+                    let mut codec = FfmpegCodec(enc);
+                    if codec_emits_frame(&mut codec, bw, bh) {
+                        tracing::info!(
+                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                            codec.label(),
+                            bitrate as f64 / 1e6
+                        );
+                        return Ok(Box::new(codec));
+                    }
+                    tracing::info!(
+                        "H.264 encoder {name} opened but produced no frame in the send test — stepping down"
+                    );
+                }
+                Err(e) => tracing::debug!("H.264 encoder {name} unavailable: {e}"),
+            }
+        }
+    }
+    let codec: Box<dyn H264Codec> = Box::new(OpenH264Codec(make_h264_encoder(bw, bh, fps, tune)?));
+    tracing::info!(
+        "H.264 software encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+        codec.label(),
+        tune.bitrate
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .clamp(250_000, 80_000_000) as f64
+            / 1e6
+    );
+    Ok(codec)
+}
+
+/// The frame-send test that drives the step-down: feed one neutral-grey I420
+/// and confirm the encoder emits an access unit within a few frames. A backend
+/// that opens but won't actually produce frames is stepped over.
+#[cfg(feature = "hwenc")]
+fn codec_emits_frame(codec: &mut dyn H264Codec, w: u32, h: u32) -> bool {
+    let (w, h) = (w as usize, h as usize);
+    let grey = vec![128u8; w * h + 2 * ((w / 2) * (h / 2))];
+    for _ in 0..3 {
+        match codec.encode_i420(&grey, w, h, true) {
+            Ok(Some((d, _))) if !d.is_empty() => return true,
+            Ok(_) => continue, // buffering — try another frame
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// One openh264 encoder, budgeted for the given fitted size: the tune's
 /// explicit bitrate when the viewer set one, the pixel budget otherwise.
 fn make_h264_encoder(
@@ -1654,10 +1788,6 @@ fn make_h264_encoder(
         .bitrate
         .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
         .clamp(250_000, 80_000_000);
-    tracing::info!(
-        "H.264 encoder ready: {bw}×{bh} · {:.1} Mbps @ {fps} fps",
-        bitrate as f64 / 1e6
-    );
     let config = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -1711,6 +1841,27 @@ use allmystuff_pixels::{scale_rgba, scale_rgba_to_i420};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h264_ladder_picks_a_backend_that_emits_a_frame() {
+        // Runs the real step-down ladder: it tries each hardware encoder
+        // (NVENC/VA-API/…) and frame-send-tests it; on a box without a GPU
+        // those open or test-fail and it lands on software openh264. Either
+        // way the returned backend must actually encode a frame — that's the
+        // contract the whole ladder exists to guarantee.
+        let (w, h) = (640u32, 480u32);
+        let mut codec = make_h264_codec(w, h, 30, Tune::default()).expect("a working backend");
+        let grey = vec![128u8; (w * h) as usize + 2 * ((w / 2 * h / 2) as usize)];
+        // First frame forced as an IDR — must come out non-empty.
+        let out = codec
+            .encode_i420(&grey, w as usize, h as usize, true)
+            .expect("encode");
+        assert!(
+            out.is_some_and(|(d, key)| !d.is_empty() && key),
+            "ladder backend ({}) must emit a keyframe",
+            codec.label()
+        );
+    }
 
     #[test]
     fn fit_within_caps_the_long_edge_and_keeps_aspect() {

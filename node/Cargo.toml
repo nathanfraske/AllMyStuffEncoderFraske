@@ -30,7 +30,30 @@ path = "src/lib.rs"
 name = "allmystuff-serve"
 path = "src/bin/serve.rs"
 
+[features]
+# Hardware video encode (NVENC / AMF / QuickSync / VideoToolbox / VA-API) via
+# FFmpeg, behind a frame-send-tested step-down ladder that falls to software
+# openh264 when no hardware encoder produces frames. On by default; building
+# `--no-default-features` drops the FFmpeg dependency and ships software-only.
+#
+# Requires FFmpeg dev libs at build time (libavcodec/avutil/swscale ≥ the
+# `ffmpeg-next` line below). The pinned `ffmpeg-next` major must match the
+# FFmpeg the build/runtime machine carries — bump it alongside a platform's
+# bundled FFmpeg (the encode code itself is version-agnostic).
+#
+# OFF by default so a plain `cargo build`/CI without an FFmpeg toolchain still
+# compiles (software openh264 only). The `just dev`/`just serve` recipes turn
+# it on, and release builds should too; at runtime the frame-send-test ladder
+# still falls back to openh264 when no hardware encoder produces frames.
+default = []
+hwenc = ["dep:ffmpeg-next"]
+
 [dependencies]
+# Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one
+# API — `h264_nvenc` is real NVENC, plus AMF/QSV/VideoToolbox/VA-API. Optional
+# so a software-only build needs no FFmpeg toolchain; see the `hwenc` feature.
+ffmpeg-next = { version = "6.1", optional = true }
+
 # Async runtime — control-socket client + the media-plane tasks. "process"
 # backs the daemon self-update the spawner runs when the installed myownmesh
 # is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
