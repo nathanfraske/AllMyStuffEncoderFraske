@@ -41,7 +41,7 @@ use allmystuff_session::{
 
 use crate::audio::{AudioBridge, CaptureSource};
 use crate::clipboard::{ClipboardService, LocalClip};
-use crate::control_client::{ControlClient, MediaPipe};
+use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
@@ -56,6 +56,9 @@ pub struct Mesh {
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
     media_pipe: MediaPipe,
+    /// The binary lane for H.264/Opus track sends (no base64); MJPEG, PCM and
+    /// route signalling stay on `media_pipe`.
+    media_track_pipe: MediaTrackPipe,
     /// Where node events surface. The GUI wires this to Tauri's event bus
     /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
     /// sink — the events are all front-end concerns, so a node with no UI
@@ -379,6 +382,7 @@ impl Mesh {
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
+            media_track_pipe: MediaTrackPipe::new(client.clone()),
             sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
@@ -569,8 +573,8 @@ impl Mesh {
             .map_err(|e| e.to_string())
     }
 
-    /// Send one H.264 access unit to `peer` over the daemon's video
-    /// track lane (base64 on the control socket, RTP on the wire).
+    /// Send one H.264 access unit to `peer` over the daemon's video track
+    /// lane — raw binary on the control socket (no base64), RTP on the wire.
     async fn send_video_track(
         &self,
         peer: &str,
@@ -578,37 +582,29 @@ impl Mesh {
         data: Vec<u8>,
         duration_us: u64,
     ) -> Result<(), String> {
-        use base64::Engine as _;
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        self.media_pipe
-            .send(&Request::VideoSend {
-                network,
-                peer: pubkey_part(peer).to_string(),
-                stream: lane,
-                duration_us,
-                data: base64::engine::general_purpose::STANDARD.encode(&data),
-            })
+        self.media_track_pipe
+            .send_video(&network, pubkey_part(peer), lane, duration_us, &data)
             .await
             .map_err(|e| e.to_string())
     }
 
-    /// Send one encoded Opus frame to `peer` over the daemon's audio
-    /// track lane (base64 on the control socket, RTP on the wire).
+    /// Send one encoded Opus frame to `peer` over the daemon's audio track
+    /// lane — raw binary on the control socket (no base64), RTP on the wire.
     async fn send_audio_track(&self, peer: &str, lane: u8, data: Vec<u8>) -> Result<(), String> {
-        use base64::Engine as _;
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        self.media_pipe
-            .send(&Request::AudioSend {
-                network,
-                peer: pubkey_part(peer).to_string(),
-                stream: lane,
-                duration_us: crate::audio::OPUS_FRAME_US,
-                data: base64::engine::general_purpose::STANDARD.encode(&data),
-            })
+        self.media_track_pipe
+            .send_audio(
+                &network,
+                pubkey_part(peer),
+                lane,
+                crate::audio::OPUS_FRAME_US,
+                &data,
+            )
             .await
             .map_err(|e| e.to_string())
     }

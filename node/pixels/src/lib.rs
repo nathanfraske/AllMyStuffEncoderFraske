@@ -38,6 +38,78 @@ pub fn scale_rgba_to_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<
     out
 }
 
+/// Scale RGBA straight to a tightly packed **I420** (YUV 4:2:0) buffer in a
+/// single pass — the H.264 path's real shape. Replaces the old two-step
+/// `scale_rgba_to_rgb` → openh264 RGB→YUV, which materialised a full RGB
+/// intermediate and then walked it again: this fuses the downscale and the
+/// colour conversion so every output pixel is touched once. The layout is
+/// the contiguous I420 openh264's `YUVBuffer::from_vec` expects — Y plane
+/// (`dw*dh`), then U, then V (each `dw/2 * dh/2`) — so the caller can feed
+/// it to the encoder with a borrowing `YUVSource` and never copy.
+///
+/// Both output edges must be even (4:2:0 needs it; callers already force it
+/// via `fit_within_even`). Conversion is the standard integer BT.601
+/// limited-range transform; chroma is the average of each 2×2 luma block.
+pub fn scale_rgba_to_i420(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    debug_assert!(dw % 2 == 0 && dh % 2 == 0, "I420 needs even output edges");
+    // Source byte-offset of each output column, computed once (nearest
+    // neighbour, same mapping the RGBA/RGB scalers use).
+    let xmap: Vec<usize> = (0..dw).map(|x| (x * sw / dw) * 4).collect();
+    let ysize = dw * dh;
+    let csize = (dw / 2) * (dh / 2);
+    let mut out = vec![0u8; ysize + 2 * csize];
+    let (y_plane, chroma) = out.split_at_mut(ysize);
+    let (u_plane, v_plane) = chroma.split_at_mut(csize);
+    let cw = dw / 2;
+    // Two output rows at a time: 4:2:0 chroma is one sample per 2×2 luma block.
+    for by in 0..dh / 2 {
+        let y0 = 2 * by;
+        let y1 = y0 + 1;
+        let srow0 = &src[(y0 * sh / dh) * sw * 4..][..sw * 4];
+        let srow1 = &src[(y1 * sh / dh) * sw * 4..][..sw * 4];
+        for bx in 0..cw {
+            let x0 = 2 * bx;
+            let (sx0, sx1) = (xmap[x0], xmap[x0 + 1]);
+            let p00 = &srow0[sx0..sx0 + 3];
+            let p10 = &srow0[sx1..sx1 + 3];
+            let p01 = &srow1[sx0..sx0 + 3];
+            let p11 = &srow1[sx1..sx1 + 3];
+            y_plane[y0 * dw + x0] = rgb_to_y(p00);
+            y_plane[y0 * dw + x0 + 1] = rgb_to_y(p10);
+            y_plane[y1 * dw + x0] = rgb_to_y(p01);
+            y_plane[y1 * dw + x0 + 1] = rgb_to_y(p11);
+            // Average the 2×2 RGB block, then convert once for U and V.
+            let avg = |i: usize| {
+                (p00[i] as u32 + p10[i] as u32 + p01[i] as u32 + p11[i] as u32 + 2) / 4
+            };
+            let (r, g, b) = (avg(0), avg(1), avg(2));
+            let ci = by * cw + bx;
+            u_plane[ci] = rgb_to_u(r, g, b);
+            v_plane[ci] = rgb_to_v(r, g, b);
+        }
+    }
+    out
+}
+
+#[inline]
+fn rgb_to_y(p: &[u8]) -> u8 {
+    let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+}
+
+#[inline]
+fn rgb_to_u(r: u32, g: u32, b: u32) -> u8 {
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
+#[inline]
+fn rgb_to_v(r: u32, g: u32, b: u32) -> u8 {
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
 /// Rotate a packed RGBA buffer clockwise by `quarter_turns` × 90°
 /// (`quarter_turns` is taken mod 4). For an odd number of turns the output
 /// dimensions are swapped. Used to bring a capture backend's raw, *unrotated*
@@ -157,6 +229,47 @@ mod tests {
         // Growth repeats pixels (callers never ask, the fn never errors).
         let one = [9, 8, 7, 255];
         assert_eq!(scale_rgba(&one, 1, 1, 2, 2), one.repeat(4));
+    }
+
+    #[test]
+    fn i420_has_correct_layout_and_neutral_chroma() {
+        // A 2×2 mid-grey image: every channel 128, alpha ignored.
+        let grey = [128u8, 128, 128, 255];
+        let src: Vec<u8> = grey.repeat(4);
+        let out = scale_rgba_to_i420(&src, 2, 2, 2, 2);
+        // Y plane (4) + U (1) + V (1) for a 2×2.
+        assert_eq!(out.len(), 2 * 2 + 1 + 1);
+        // Grey → Y≈126 (16 + 219*0.5), U=V=128 (no colour).
+        for &y in &out[..4] {
+            assert!((125..=127).contains(&y), "grey luma {y} out of range");
+        }
+        assert_eq!(out[4], 128, "neutral U");
+        assert_eq!(out[5], 128, "neutral V");
+    }
+
+    #[test]
+    fn i420_black_and_white_hit_limited_range_endpoints() {
+        let black: Vec<u8> = [0u8, 0, 0, 255].repeat(4);
+        let white: Vec<u8> = [255u8, 255, 255, 255].repeat(4);
+        let kb = scale_rgba_to_i420(&black, 2, 2, 2, 2);
+        let kw = scale_rgba_to_i420(&white, 2, 2, 2, 2);
+        // BT.601 limited range: black luma 16, white luma 235.
+        assert!(kb[..4].iter().all(|&y| y == 16), "black luma = 16");
+        assert!(kw[..4].iter().all(|&y| y == 235), "white luma = 235");
+    }
+
+    #[test]
+    fn i420_downscale_picks_the_same_columns_as_the_rgb_scaler() {
+        // 4×2 → 2×2: nearest-neighbour keeps columns 0 and 2, rows 0 and 1.
+        // Build a frame whose top-left 2×2 (after subsample) is pure red.
+        let red = [255u8, 0, 0, 255];
+        let blu = [0u8, 0, 255, 255];
+        // row pattern: red blu red blu  (cols 0,2 = red; the scaler samples those)
+        let row: Vec<u8> = [red, blu, red, blu].concat();
+        let src: Vec<u8> = [row.clone(), row].concat();
+        let out = scale_rgba_to_i420(&src, 4, 2, 2, 2);
+        // Red in BT.601: Y≈81. All four luma should match the red sample.
+        assert!(out[..4].iter().all(|&y| (80..=82).contains(&y)), "red luma");
     }
 
     #[test]

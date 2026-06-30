@@ -1548,11 +1548,12 @@ impl H264Stream {
             self.budget_size = (dw, dh);
             self.last_idr = None;
         }
-        // Scale and strip alpha in one pass: the encoder's fast RGB→YUV
-        // path wants tightly packed 3-byte pixels, and the unchanged-
-        // frame compare gets 25% cheaper for free.
+        // Downscale and convert straight to I420 in one fused pass — no RGB
+        // intermediate buffer, and openh264's separate RGB→YUV walk is gone
+        // (we hand it the planes directly below). The unchanged-frame compare
+        // also runs on the smaller 1.5-byte/pixel I420 instead of 3-byte RGB.
         let t0 = Instant::now();
-        let scaled = scale_rgba_to_rgb(&rgba, sw, sh, dw, dh);
+        let i420 = scale_rgba_to_i420(&rgba, sw, sh, dw, dh);
         stats.scale += t0.elapsed();
         (stats.out_w, stats.out_h) = (dw, dh);
         let refresh_asked = self.refresh.swap(false, Ordering::SeqCst);
@@ -1560,7 +1561,7 @@ impl H264Stream {
             || self
                 .last_sent
                 .is_none_or(|sent| sent.elapsed() >= STATIC_REFRESH);
-        if !refresh_due && self.prev_size == (dw, dh) && self.prev == scaled {
+        if !refresh_due && self.prev_size == (dw, dh) && self.prev == i420 {
             stats.static_skipped += 1;
             return Ok(None);
         }
@@ -1572,12 +1573,15 @@ impl H264Stream {
             self.encoder.force_intra_frame();
         }
         let t1 = Instant::now();
-        let yuv = openh264::formats::YUVBuffer::from_rgb8_source(
-            openh264::formats::RgbSliceU8::new(&scaled, (dw as usize, dh as usize)),
-        );
+        // Feed the encoder our I420 planes directly (zero-copy borrow), so it
+        // skips the RGB→YUV conversion `from_rgb8_source` used to do.
         let stream = self
             .encoder
-            .encode(&yuv)
+            .encode(&I420Frame {
+                buf: &i420,
+                w: dw as usize,
+                h: dh as usize,
+            })
             .map_err(|e| format!("h264 encode: {e}"))?;
         let key = matches!(
             stream.frame_type(),
@@ -1585,7 +1589,7 @@ impl H264Stream {
         );
         let data = stream.to_vec();
         stats.encode += t1.elapsed();
-        self.prev = scaled;
+        self.prev = i420;
         self.prev_size = (dw, dh);
         self.last_sent = Some(Instant::now());
         if key {
@@ -1601,6 +1605,37 @@ impl H264Stream {
             data,
             duration_us: 1_000_000u64 / u64::from(self.fps),
         }))
+    }
+}
+
+/// A borrowing view over a contiguous I420 buffer (Y, then U, then V) that
+/// satisfies openh264's `YUVSource` — lets [`H264Stream::encode`] hand the
+/// planes straight to the encoder with no copy and no RGB→YUV step.
+struct I420Frame<'a> {
+    buf: &'a [u8],
+    w: usize,
+    h: usize,
+}
+
+impl openh264::formats::YUVSource for I420Frame<'_> {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.w, self.w / 2, self.w / 2)
+    }
+    fn y(&self) -> &[u8] {
+        &self.buf[..self.w * self.h]
+    }
+    fn u(&self) -> &[u8] {
+        let ys = self.w * self.h;
+        let cs = (self.w / 2) * (self.h / 2);
+        &self.buf[ys..ys + cs]
+    }
+    fn v(&self) -> &[u8] {
+        let ys = self.w * self.h;
+        let cs = (self.w / 2) * (self.h / 2);
+        &self.buf[ys + cs..ys + 2 * cs]
     }
 }
 
@@ -1671,7 +1706,7 @@ fn fit_within(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
 // The scalers live in `allmystuff-pixels` (path crate) purely so dev
 // builds run them at opt-level 3 — at opt 0 they alone cap the stream at
 // single-digit fps on a Retina/4K source.
-use allmystuff_pixels::{scale_rgba, scale_rgba_to_rgb};
+use allmystuff_pixels::{scale_rgba, scale_rgba_to_i420};
 
 #[cfg(test)]
 mod tests {
