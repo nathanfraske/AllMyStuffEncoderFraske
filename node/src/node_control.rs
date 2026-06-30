@@ -790,6 +790,15 @@ pub async fn dispatch(
             let claimable: bool = try_arg!(arg(a, "claimable"));
             json_result(mesh.set_claimable(claimable).await)
         }
+        "kvm_attach" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let target: String = try_arg!(arg(a, "target"));
+            json_result(mesh.kvm_attach(node, target).await)
+        }
+        "kvm_detach" => {
+            let node: String = try_arg!(arg(a, "node"));
+            json_result(mesh.kvm_detach(node).await)
+        }
 
         // ---- shares ------------------------------------------------------
         "share_grant" => {

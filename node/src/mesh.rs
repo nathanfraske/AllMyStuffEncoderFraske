@@ -28,10 +28,10 @@ use crate::UiSink;
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
-    AppControl, ClientId, ControlMessage, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
-    Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
-    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    PROTOCOL_VERSION,
+    AppControl, ClientId, ControlMessage, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
+    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
+    SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA,
+    CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -1128,6 +1128,9 @@ impl Mesh {
             // The fleet **owner's** (person) name — never the owner device's
             // hostname. See [`Mesh::fleet_owner_name`].
             fleet_owner: self.fleet_owner_name(&label),
+            // An ordinary machine is not a KVM appliance — only a NanoKVM-class
+            // device (its Go mesh bridge) ever fills this in. See FEATURE_KVM.
+            kvm: None,
         }
     }
 
@@ -3135,6 +3138,29 @@ impl Mesh {
         let (allow, st) = profile_req_decide(map.get(&key).copied(), now);
         map.insert(key, st);
         allow
+    }
+
+    /// Front-end command: point a KVM appliance (`node`) at the machine it
+    /// controls (`target`). The KVM enforces owner/fleet before applying, then
+    /// re-advertises its new binding ([`NodeProfile::kvm`]) — that presence is
+    /// the authoritative confirmation, exactly as a claim confirms by
+    /// re-advertising its new owner. A send the daemon couldn't deliver is
+    /// surfaced so the UI can say so rather than leaving the ask hanging.
+    pub async fn kvm_attach(self: &Arc<Self>, node: String, target: String) -> Result<(), String> {
+        tracing::info!("pointing KVM {} at {}", short_id(&node), short_id(&target));
+        let msg = ControlMessage::Kvm(KvmControl::Attach {
+            node: target.into(),
+        });
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: clear a KVM appliance's binding — it no longer
+    /// represents any machine. Same delivery + presence-confirmation model as
+    /// [`Mesh::kvm_attach`].
+    pub async fn kvm_detach(self: &Arc<Self>, node: String) -> Result<(), String> {
+        tracing::info!("detaching KVM {}", short_id(&node));
+        let msg = ControlMessage::Kvm(KvmControl::Detach);
+        self.send_control(&node, &msg).await
     }
 
     /// Front-end command: put *this* device into (or out of) claim mode, so

@@ -87,6 +87,23 @@ export function demoCatalog(): Catalog {
       summary: { os: "Linux", cpu: "Pi 5", ram_bytes: 8 * 2 ** 30, device_count: 6 },
     },
     {
+      // A KVM appliance (a NanoKVM-class device) you own, wired into the Desk
+      // PC: it carries its own web UI as a site and is attached to "desk", so
+      // its KVM drawer (Open KVM + Power/Reset + Attach) and the Desk PC's
+      // "Controlled by KVM" affordance both light up in the preview.
+      id: "kvm",
+      label: "Desk KVM",
+      kind: "machine",
+      relationship: { kind: "mine" },
+      online: true,
+      app: true,
+      features: ["kvm", "sites"],
+      owner: "this",
+      summary: { os: "Linux", cpu: "RV1106", ram_bytes: 256 * 2 ** 20, device_count: 2 },
+      sites: [{ id: "tcp:80", label: "KVM web UI", port: 80, scheme: "http", loopback: false }],
+      kvm: { attachedTo: "desk", web: "tcp:80" },
+    },
+    {
       // A spare box that was booted in claim mode — it's offering itself for
       // adoption, so it can be claimed (Task 4). Runs AllMyStuff (has caps).
       id: "nuc",

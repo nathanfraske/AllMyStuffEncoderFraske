@@ -320,6 +320,11 @@ impl Session {
             // backend directly (it replies with an advert); no route state.
             ControlMessage::ProfileRequest => Vec::new(),
             ControlMessage::App(ac) => vec![Effect::App { from, message: ac }],
+            // KVM attach/detach is curated on the **KVM appliance** itself (its
+            // Go mesh bridge is the receiver, gated owner/fleet, persisting the
+            // binding and re-advertising presence). An ordinary app node only
+            // ever *sends* it, so there's no route state to drive here.
+            ControlMessage::Kvm(_) => Vec::new(),
             // A control kind a newer peer introduced that this build doesn't
             // know (decoded as `Unknown` rather than failing the message):
             // nothing to drive here.
@@ -546,6 +551,7 @@ mod tests {
             version: String::new(),
             fleet_name: String::new(),
             fleet_owner: String::new(),
+            kvm: None,
         }
     }
 

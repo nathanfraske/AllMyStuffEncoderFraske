@@ -101,6 +101,16 @@ pub const FEATURE_CAMERA: &str = "camera";
 /// falls back to MJPEG, exactly as before the pool.
 pub const FEATURE_MEDIA_LANES: &str = "media-lanes";
 
+/// Feature tag a node advertises in [`NodeProfile::features`] when it is a
+/// **KVM appliance** (a NanoKVM-class device): it captures a target machine's
+/// HDMI and injects USB-HID into it, and it carries its own web UI as a
+/// [`SiteAdvert`]. A peer that sees this tag renders the KVM drawer — the
+/// "Open KVM" button (maps + opens [`KvmAdvert::web`]) plus the
+/// attach/detach affordance. The KVM's current binding rides presence in
+/// [`NodeProfile::kvm`]. Additive: an older peer that doesn't know the tag
+/// just sees an ordinary app node.
+pub const FEATURE_KVM: &str = "kvm";
+
 /// A thumbnail of a node's hardware — enough for the graph's node card
 /// without shipping the whole [`allmystuff_inventory::Inventory`]. The
 /// backend fills this from a scan.
@@ -226,6 +236,14 @@ pub struct NodeProfile {
     /// the unchanged shape).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fleet_owner: String,
+    /// KVM-appliance state, present only on a node that advertises
+    /// [`FEATURE_KVM`] (a NanoKVM-class device). Carries what the KVM is
+    /// currently *attached to* — the graph node it physically controls — and
+    /// which site is its web UI. `None` on every ordinary machine; an older
+    /// peer (or a non-KVM) omits it, and `None` serializes *without* the key,
+    /// so the presence shape an older receiver sees is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvm: Option<KvmAdvert>,
 }
 
 /// One site a node exposes — a TCP service it's listening on that it's
@@ -476,6 +494,7 @@ pub enum ControlMessage {
     /// target; an older peer drops the unknown `t` and the refresh simply falls
     /// back to re-pulling the daemon's cached view.
     ProfileRequest,
+    Kvm(KvmControl),
     /// A control kind a newer build introduced that this one doesn't know.
     /// Decodes here and is ignored, so an unrecognised `t` can never fail the
     /// decode of the whole control channel — the route/share/ownership
@@ -562,6 +581,57 @@ pub enum AppControl {
     Restart,
     /// An app-level command a newer build introduced. Ignored here rather
     /// than failing the enclosing [`ControlMessage`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// A KVM appliance's binding, carried in [`NodeProfile::kvm`] when the node
+/// advertises [`FEATURE_KVM`]. A KVM is wired (HDMI + USB) into one machine
+/// at a time; this says which graph node that is, so the UI can show "this
+/// KVM controls *that* machine" and offer the target's screen/keyboard
+/// through the KVM even when the target's own AllMyStuff agent is down (a
+/// crashed OS, a BIOS screen, a headless box). The owner curates the binding
+/// with [`KvmControl`]; the KVM is the source of truth and re-advertises on
+/// every change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KvmAdvert {
+    /// The graph node this KVM is currently attached to — the machine it
+    /// physically controls. `None` = not attached to anything yet (freshly
+    /// claimed but never pointed at a target, or just detached). `None`
+    /// serializes *without* the key, so an older receiver sees the unchanged
+    /// shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<NodeId>,
+    /// The [`SiteAdvert::id`] (one of [`NodeProfile::sites`]) that serves the
+    /// KVM's own web UI — the "Open KVM" button maps and opens this. Empty
+    /// when the KVM hasn't named one; the UI then falls back to the first
+    /// web-scheme site. Empty serializes *without* the key.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub web: String,
+}
+
+/// Curating a KVM appliance's attachment — the "what does this KVM control?"
+/// binding surfaced in the KVM drawer. Authorized exactly like a terminal or
+/// a site route: only the device's owner or a fleet co-member is obeyed (the
+/// mesh authenticates the sender), so a stranger can't re-point your KVM. The
+/// KVM applies the change, persists it, and re-advertises presence with the
+/// new [`NodeProfile::kvm`] — that presence is the authoritative confirmation,
+/// exactly as a claim confirms by re-advertising its new owner. An older peer
+/// doesn't know the `kvm` tag and drops the whole [`ControlMessage`], so the
+/// command simply goes unanswered there — never misinterpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KvmControl {
+    /// "Point this KVM at `node`." Binds the KVM to the target machine it
+    /// controls. Re-attaching to a different node just replaces the binding.
+    Attach { node: NodeId },
+    /// "This KVM no longer represents anything." Clears the binding. This is
+    /// the deliberately-buried, confirm-gated action in the UI — detaching a
+    /// KVM strips a machine of its out-of-band screen/keyboard, so it never
+    /// rides the quick graph drawer.
+    Detach,
+    /// A KVM-control kind a newer build introduced. Ignored here rather than
+    /// failing the enclosing [`ControlMessage`].
     #[serde(other)]
     Unknown,
 }
@@ -837,6 +907,7 @@ mod tests {
             version: "0.1.11".into(),
             fleet_name: "Casey".into(),
             fleet_owner: "Casey".into(),
+            kvm: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
@@ -956,6 +1027,89 @@ mod tests {
         assert!(s.contains("\"kind\":\"upgrade\""));
         let back: ControlMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn kvm_control_attach_detach_round_trip_and_tag() {
+        // Attach is tagged `t: "kvm"` outer, `kind: "attach"` within, carrying
+        // the target node it binds the KVM to.
+        let attach = ControlMessage::Kvm(KvmControl::Attach {
+            node: "den-tower".into(),
+        });
+        let s = serde_json::to_string(&attach).unwrap();
+        assert!(s.contains("\"t\":\"kvm\""));
+        assert!(s.contains("\"kind\":\"attach\""));
+        assert!(s.contains("\"node\":\"den-tower\""));
+        assert_eq!(serde_json::from_str::<ControlMessage>(&s).unwrap(), attach);
+
+        let detach = ControlMessage::Kvm(KvmControl::Detach);
+        let s = serde_json::to_string(&detach).unwrap();
+        assert!(s.contains("\"kind\":\"detach\""));
+        assert_eq!(serde_json::from_str::<ControlMessage>(&s).unwrap(), detach);
+    }
+
+    #[test]
+    fn old_peer_drops_kvm_control_to_unknown() {
+        // A build that never heard of the `kvm` tag must decode the whole
+        // message as `ControlMessage::Unknown` — never fail the control
+        // channel, so the route/share traffic it *does* know keeps flowing.
+        let unknown = serde_json::json!({ "t": "kvm", "kind": "attach", "node": "x" });
+        let m: ControlMessage =
+            serde_json::from_value(unknown).expect("unknown outer tag must not error");
+        // (This build *does* know `kvm`, so it decodes to the real variant; the
+        // guarantee under test is that an *unknown nested kind* never errors.)
+        let future = serde_json::json!({ "t": "kvm", "kind": "attach_to_two_at_once" });
+        let m2: ControlMessage =
+            serde_json::from_value(future).expect("unknown nested kind must not error");
+        assert_eq!(m2, ControlMessage::Kvm(KvmControl::Unknown));
+        assert!(matches!(m, ControlMessage::Kvm(KvmControl::Attach { .. })));
+    }
+
+    #[test]
+    fn presence_kvm_accepts_skew_both_ways() {
+        // An ordinary machine (or an older peer) has no `kvm` field — it
+        // decodes as `None` rather than failing, so the node never vanishes.
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.kvm, None);
+
+        // `None` serializes *without* the key, so an older receiver sees the
+        // unchanged presence shape.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("kvm"));
+
+        // A KVM advertising an attachment + web site round-trips, and an empty
+        // `web` is omitted on the wire.
+        let p = NodeProfile {
+            features: vec![FEATURE_KVM.into()],
+            kvm: Some(KvmAdvert {
+                attached_to: Some("den-tower".into()),
+                web: "tcp:80".into(),
+            }),
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"kvm\""));
+        assert!(s.contains("\"attached_to\":\"den-tower\""));
+        assert!(s.contains("\"web\":\"tcp:80\""));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, p);
+
+        // A freshly-claimed-but-unattached KVM omits `attached_to`.
+        let p = NodeProfile {
+            kvm: Some(KvmAdvert {
+                attached_to: None,
+                web: String::new(),
+            }),
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"kvm\":{}"));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.kvm.unwrap().attached_to, None);
     }
 
     #[test]

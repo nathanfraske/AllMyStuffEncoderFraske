@@ -521,6 +521,18 @@
    *  (revealed by tapping it). Null = none showing. */
   let claimRevealed = $state<string | null>(null);
 
+  /** Whether the KVM drawer's inline "attach target" picker is open (only one
+   *  KVM drawer shows at a time, so a single flag suffices). */
+  let kvmPickerOpen = $state(false);
+  /** The picker's chosen target, defaulted to the KVM's owner when it opens. */
+  let kvmTarget = $state("");
+
+  /** Open the attach picker for `kvmId`, defaulting the target to its owner. */
+  function openKvmPicker(kvmId: string) {
+    kvmTarget = app.kvmDefaultTarget(kvmId) ?? "";
+    kvmPickerOpen = true;
+  }
+
   function onNodeClick(n: MeshNode) {
     if (app.dragFrom) {
       // Mesh-only and not-yet-claimed nodes aren't connection targets.
@@ -539,8 +551,18 @@
       // graph — and opens the drawer for the full story.
       claimRevealed = claimRevealed === n.id ? null : n.id;
       app.selectNode(n.id);
+    } else if (app.kvmAllowed(n)) {
+      // Tapping a KVM you own drops its slide-out drawer (Open KVM + the
+      // quick feature buttons + Attach) — the same reveal model as Claim.
+      // Every (re)reveal starts with the picker closed, so switching KVMs
+      // never carries a stale target across.
+      app.kvmRevealed = app.kvmRevealed === n.id ? null : n.id;
+      kvmPickerOpen = false;
+      claimRevealed = null;
+      app.selectNode(n.id);
     } else {
       claimRevealed = null;
+      app.kvmRevealed = null;
       // Clicking a device always selects it and keeps it selected — re-clicking
       // the focused node no longer toggles it off (close the drawer to deselect).
       app.selectNode(n.id);
@@ -829,6 +851,64 @@
             class="node-drawer claim-go"
             onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
           >＋ Claim this device</button>
+        {:else if app.kvmAllowed(n) && app.kvmRevealed === n.id}
+          <!-- A KVM you own, tapped: its quick drawer slides in — open its web
+               UI, fire the feature buttons, or point it at a machine. No Detach
+               here; that's the buried, confirm-gated action in the sidebar. -->
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="node-drawer kvm-drawer" onclick={(e) => e.stopPropagation()}>
+            <button
+              class="kvm-act primary"
+              title="Open this KVM's own web console through the mesh"
+              onclick={(e) => { e.stopPropagation(); void app.openKVM(n.id); }}
+            >🖥 Open KVM</button>
+            <div class="kvm-row">
+              <button
+                class="kvm-act"
+                title="Power button — toggle the controlled machine's power"
+                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(n.id, "power"); }}
+              >⏻ Power</button>
+              <button
+                class="kvm-act"
+                title="Reset button — hard-reset the controlled machine"
+                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(n.id, "reset"); }}
+              >↻ Reset</button>
+              <button
+                class="kvm-act"
+                title="Point this KVM at the machine it controls"
+                onclick={(e) => { e.stopPropagation(); if (kvmPickerOpen) kvmPickerOpen = false; else openKvmPicker(n.id); }}
+              >🔗 Attach</button>
+            </div>
+            {#if kvmPickerOpen}
+              {@const targets = app.kvmAttachTargets(n.id)}
+              {#if targets.length === 0}
+                <p class="kvm-empty">No machines of yours to attach to yet.</p>
+              {:else}
+                <div class="kvm-row">
+                  <select
+                    class="kvm-pick"
+                    title="Which machine this KVM controls"
+                    bind:value={kvmTarget}
+                  >
+                    {#each targets as t (t.id)}
+                      <option value={t.id}>{displayName(t)}</option>
+                    {/each}
+                  </select>
+                  <button
+                    class="kvm-act"
+                    disabled={!kvmTarget}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      if (!kvmTarget) return;
+                      void app.attachKVM(n.id, kvmTarget);
+                      kvmPickerOpen = false;
+                      app.kvmRevealed = null;
+                    }}
+                  >Set</button>
+                </div>
+              {/if}
+            {/if}
+          </div>
         {/if}
       </div>
     {/each}
@@ -1293,6 +1373,67 @@
     );
     background-size: 220% 100%;
     animation: drawer-drop 0.22s ease-out both, shimmer 1.6s linear 0.22s infinite;
+  }
+  /* The KVM quick drawer reuses the .node-drawer chrome (border, stem, drop
+     animation) but is a multi-button cluster rather than a single button, so
+     it overrides the button-only bits. */
+  .kvm-drawer {
+    display: flex;
+    flex-direction: column;
+    gap: 0.32rem;
+    cursor: default;
+  }
+  .kvm-drawer:hover {
+    background: var(--surface);
+  }
+  .kvm-row {
+    display: flex;
+    gap: 0.32rem;
+  }
+  .kvm-act {
+    flex: 1;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.3rem 0.4rem;
+    font-size: 0.74rem;
+    font-weight: 650;
+    font-family: inherit;
+    cursor: pointer;
+    background: var(--surface-2);
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .kvm-act:hover {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .kvm-act.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--bg);
+  }
+  .kvm-act.primary:hover {
+    background: var(--accent-ink);
+  }
+  .kvm-pick {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    padding: 0.26rem 0.3rem;
+    font-size: 0.74rem;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .kvm-act:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .kvm-empty {
+    margin: 0;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
   }
   @keyframes drawer-drop {
     from {
