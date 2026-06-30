@@ -30,7 +30,34 @@ path = "src/lib.rs"
 name = "allmystuff-serve"
 path = "src/bin/serve.rs"
 
+# Hardware video encode runs behind one frame-send-tested step-down ladder
+# (`video::make_h264_codec`) that falls to software openh264 when no hardware
+# encoder produces frames. On Windows the ladder uses Media Foundation (the
+# GPU's own H.264 MFT — NVENC/QSV/AMF — via the `windows` crate we already link
+# for DXGI capture, so no extra toolchain). The `hwenc` feature below adds the
+# FFmpeg vendor encoders for Linux/macOS hosts that opt in.
+[features]
+# FFmpeg-backed hardware encode (Linux `h264_nvenc`/`h264_vaapi`/`h264_qsv`,
+# macOS `h264_videotoolbox`), OFF by default. Requires FFmpeg dev libs +
+# pkg-config at build time (Linux: `apt install` the libav* -dev packages;
+# macOS: `brew install ffmpeg pkgconf`). It is intentionally NOT on `just
+# dev`/`just serve`: a plain build, a viewer-only box, or a Windows host
+# (which uses Media Foundation) shouldn't have to install FFmpeg at all.
+# Linux/macOS hosts that want vendor HW encode build `--features hwenc`.
+#
+# The pinned `ffmpeg-next` major must match the FFmpeg the build/runtime machine
+# carries — bump it alongside a platform's bundled FFmpeg (the encode code
+# itself is version-agnostic). At runtime the ladder still falls back to
+# openh264 when no hardware encoder produces frames.
+default = []
+hwenc = ["dep:ffmpeg-next"]
+
 [dependencies]
+# Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one
+# API — `h264_nvenc` is real NVENC, plus AMF/QSV/VideoToolbox/VA-API. Optional
+# so a software-only build needs no FFmpeg toolchain; see the `hwenc` feature.
+ffmpeg-next = { version = "6.1", optional = true }
+
 # Async runtime — control-socket client + the media-plane tasks. "process"
 # backs the daemon self-update the spawner runs when the installed myownmesh
 # is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
@@ -133,6 +160,15 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # Media Foundation: the hardware H.264 encoder path (mediafoundation.rs).
+    # Drives the GPU's own H.264 MFT (NVENC/QSV/AMF) with no FFmpeg toolchain —
+    # MF ships inside Windows itself. Com/Variant back the MFT activation and
+    # the ICodecAPI low-latency/force-keyframe knobs.
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
 ] }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",

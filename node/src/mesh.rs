@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use crate::UiSink;
 
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
+use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     AppControl, ClientId, ControlMessage, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl,
     Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
@@ -41,7 +42,7 @@ use allmystuff_session::{
 
 use crate::audio::{AudioBridge, CaptureSource};
 use crate::clipboard::{ClipboardService, LocalClip};
-use crate::control_client::{ControlClient, MediaPipe};
+use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
 use crate::ownership::Ownership;
@@ -56,6 +57,9 @@ pub struct Mesh {
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
     media_pipe: MediaPipe,
+    /// The binary lane for H.264/Opus track sends (no base64); MJPEG, PCM and
+    /// route signalling stay on `media_pipe`.
+    media_track_pipe: MediaTrackPipe,
     /// Where node events surface. The GUI wires this to Tauri's event bus
     /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
     /// sink — the events are all front-end concerns, so a node with no UI
@@ -239,6 +243,14 @@ pub struct Mesh {
     /// How many media lanes the local daemon provisions per peer (from
     /// Status `media_lanes`); 1 means a pre-pool daemon.
     daemon_lanes: std::sync::atomic::AtomicU8,
+    /// Whether the local daemon speaks the **binary media pipes**
+    /// (`media_track_pipe` / `media_source_pipe`, from Status `media_pipes`).
+    /// The version pin can't gate this — the feature predates a release — so
+    /// it's a capability flag. While false, H.264/Opus ride the legacy base64
+    /// `video_send`/`audio_send` ops and inbound arrives as base64 events, so
+    /// an older daemon on the socket still streams (just with the base64 tax)
+    /// instead of a black screen.
+    daemon_media_pipes: std::sync::atomic::AtomicBool,
     /// **Host side:** the RTP video track lane pinned to each route we
     /// stream, by route id. Assigned once (lowest free in the peer's pool)
     /// when the stream starts and held until teardown, so an unrelated route
@@ -379,6 +391,7 @@ impl Mesh {
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
+            media_track_pipe: MediaTrackPipe::new(client.clone()),
             sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
@@ -430,6 +443,7 @@ impl Mesh {
             audio_decoders: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
+            daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
             video_lane_pins: Mutex::new(HashMap::new()),
             video_lane_binds: Mutex::new(HashMap::new()),
         })
@@ -569,8 +583,8 @@ impl Mesh {
             .map_err(|e| e.to_string())
     }
 
-    /// Send one H.264 access unit to `peer` over the daemon's video
-    /// track lane (base64 on the control socket, RTP on the wire).
+    /// Send one H.264 access unit to `peer` over the daemon's video track
+    /// lane — raw binary on the control socket (no base64), RTP on the wire.
     async fn send_video_track(
         &self,
         peer: &str,
@@ -578,39 +592,61 @@ impl Mesh {
         data: Vec<u8>,
         duration_us: u64,
     ) -> Result<(), String> {
-        use base64::Engine as _;
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        self.media_pipe
-            .send(&Request::VideoSend {
-                network,
-                peer: pubkey_part(peer).to_string(),
-                stream: lane,
-                duration_us,
-                data: base64::engine::general_purpose::STANDARD.encode(&data),
-            })
-            .await
-            .map_err(|e| e.to_string())
+        // Binary media pipe when the daemon speaks it; otherwise the legacy
+        // base64 video_send op (so an older daemon still streams).
+        if self.daemon_media_pipes.load(Ordering::SeqCst) {
+            self.media_track_pipe
+                .send_video(&network, pubkey_part(peer), lane, duration_us, &data)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            use base64::Engine as _;
+            self.media_pipe
+                .send(&Request::VideoSend {
+                    network,
+                    peer: pubkey_part(peer).to_string(),
+                    stream: lane,
+                    duration_us,
+                    data: base64::engine::general_purpose::STANDARD.encode(&data),
+                })
+                .await
+                .map_err(|e| e.to_string())
+        }
     }
 
-    /// Send one encoded Opus frame to `peer` over the daemon's audio
-    /// track lane (base64 on the control socket, RTP on the wire).
+    /// Send one encoded Opus frame to `peer` over the daemon's audio track
+    /// lane — binary media pipe when supported, else legacy base64.
     async fn send_audio_track(&self, peer: &str, lane: u8, data: Vec<u8>) -> Result<(), String> {
-        use base64::Engine as _;
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        self.media_pipe
-            .send(&Request::AudioSend {
-                network,
-                peer: pubkey_part(peer).to_string(),
-                stream: lane,
-                duration_us: crate::audio::OPUS_FRAME_US,
-                data: base64::engine::general_purpose::STANDARD.encode(&data),
-            })
-            .await
-            .map_err(|e| e.to_string())
+        if self.daemon_media_pipes.load(Ordering::SeqCst) {
+            self.media_track_pipe
+                .send_audio(
+                    &network,
+                    pubkey_part(peer),
+                    lane,
+                    crate::audio::OPUS_FRAME_US,
+                    &data,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            use base64::Engine as _;
+            self.media_pipe
+                .send(&Request::AudioSend {
+                    network,
+                    peer: pubkey_part(peer).to_string(),
+                    stream: lane,
+                    duration_us: crate::audio::OPUS_FRAME_US,
+                    data: base64::engine::general_purpose::STANDARD.encode(&data),
+                })
+                .await
+                .map_err(|e| e.to_string())
+        }
     }
 
     /// The network to reach `peer` on: the one we last saw them on (an inbound
@@ -738,6 +774,71 @@ impl Mesh {
             st.profile = Some(profile.clone());
             st.network = primary.clone();
             st.networks = networks.clone();
+        }
+
+        // Probe the daemon's binary-media-pipe capability up front (the version
+        // pin can't gate it — the feature predates a release). This gates the
+        // inbound source pipe below and the outbound sends in
+        // `send_video_track`/`send_audio_track`. A daemon without it (an older
+        // build still on the socket) keeps streaming over the base64 path.
+        let media_pipes = self
+            .client
+            .request(&Request::Status)
+            .await
+            .ok()
+            .and_then(|r| r.data)
+            .and_then(|d| d.get("media_pipes").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        self.daemon_media_pipes.store(media_pipes, Ordering::SeqCst);
+
+        // Inbound media (H.264/Opus from peers) rides a dedicated binary pipe —
+        // no base64 — instead of the JSON event socket. Open it for our event
+        // `client_id` before subscribing video/audio, so the daemon has the
+        // sink registered when its pumps start. When the daemon doesn't speak it,
+        // skip the pipe entirely — its pumps then emit base64
+        // `video_inbound`/`audio_inbound` events, which the value dispatcher
+        // below still decodes and handles.
+        if media_pipes {
+            let (media_tx, mut media_rx) = mpsc::channel::<InboundFrame>(256);
+            match self
+                .client
+                .subscribe_media_source(client_id, media_tx)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "binary media pipes active — H.264/Opus carry raw over the IPC (no base64) in both directions"
+                    );
+                    let mesh = self.clone();
+                    crate::spawn(async move {
+                        while let Some(f) = media_rx.recv().await {
+                            match f.kind {
+                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound(
+                                    &f.from,
+                                    f.stream,
+                                    f.rtp_timestamp,
+                                    f.key,
+                                    f.data,
+                                ),
+                                MEDIA_KIND_AUDIO => {
+                                    mesh.handle_audio_inbound(&f.from, f.stream, f.data)
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    // Registered nothing daemon-side, so its pumps stay on base64
+                    // events — still handled below.
+                    tracing::warn!("mesh: media-source pipe unavailable, using base64 events: {e}");
+                    self.daemon_media_pipes.store(false, Ordering::SeqCst);
+                }
+            }
+        } else {
+            tracing::info!(
+                "daemon has no binary media pipes — inbound video/audio arrive as base64 events (rebuild myownmesh from this branch to enable the binary pipes)"
+            );
         }
 
         if networks.is_empty() {
@@ -1152,6 +1253,12 @@ impl Mesh {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                // Base64 fallback path (a daemon without the binary media-source
+                // pipe): decode here so the handler always gets raw bytes.
+                use base64::Engine as _;
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    return;
+                };
                 self.handle_video_inbound(from, stream, rtp_timestamp, key, data);
             }
             "audio_inbound" => {
@@ -1160,6 +1267,10 @@ impl Mesh {
                     return;
                 };
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                use base64::Engine as _;
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    return;
+                };
                 self.handle_audio_inbound(from, stream, data);
             }
             "event" => {
@@ -1560,8 +1671,7 @@ impl Mesh {
     /// gated exactly like every other media frame (route live, sinks here,
     /// sender is the route's peer) — then decodes straight into the
     /// route's playback ring.
-    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data_b64: &str) {
-        use base64::Engine as _;
+    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data: Vec<u8>) {
         let Some(route_id) = self.audio_route_for_lane(from, stream) else {
             // The audio twin of the video lane's "no route for it" warn
             // (rate-limited the same way): Opus arriving with nowhere to
@@ -1579,9 +1689,6 @@ impl Mesh {
             tracing::debug!("audio frame for {route_id} refused (route not live here)");
             return;
         }
-        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
-            return;
-        };
         // Up to 120 ms per packet is legal Opus; ours are 20 ms.
         let mut pcm = vec![0i16; crate::audio::OPUS_FRAME_SAMPLES * 6];
         let decoded = {
@@ -1659,9 +1766,8 @@ impl Mesh {
         stream: u8,
         rtp_timestamp: u32,
         key: bool,
-        data_b64: &str,
+        data: Vec<u8>,
     ) {
-        use base64::Engine as _;
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_route_for_lane(from, stream) else {
             // The sender is streaming the track lane at us but no route
@@ -1685,9 +1791,6 @@ impl Mesh {
             }
             return;
         }
-        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
-            return;
-        };
         // The arrival side of the sender's "route active — streaming"
         // line: one INFO per stream, so a healthy hop is attributable
         // from this end too (the MJPEG path has logged its first frame
@@ -3937,17 +4040,31 @@ impl Mesh {
                 Ok(resp) if resp.ok => {
                     self.daemon_video.store(true, Ordering::SeqCst);
                     // Learn the daemon's media-lane pool size, so we know how many
-                    // simultaneous streams to one peer can ride separate lanes.
-                    if let Some(n) = self
+                    // simultaneous streams to one peer can ride separate lanes,
+                    // and whether it speaks the binary media pipes (a capability
+                    // flag, since the feature predates a release and the version
+                    // pin can't gate it). Both come off the same Status.
+                    if let Some(d) = self
                         .client
                         .request(&Request::Status)
                         .await
                         .ok()
                         .and_then(|r| r.data)
-                        .and_then(|d| d.get("media_lanes").and_then(|v| v.as_u64()))
                     {
-                        self.daemon_lanes
-                            .store(n.clamp(1, 255) as u8, Ordering::SeqCst);
+                        if let Some(n) = d.get("media_lanes").and_then(|v| v.as_u64()) {
+                            self.daemon_lanes
+                                .store(n.clamp(1, 255) as u8, Ordering::SeqCst);
+                        }
+                        let pipes = d
+                            .get("media_pipes")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        self.daemon_media_pipes.store(pipes, Ordering::SeqCst);
+                        if !pipes {
+                            tracing::info!(
+                                "daemon has no binary media pipes — H.264/Opus ride the base64 video_send/audio_send path (rebuild myownmesh from this branch to enable the binary pipes)"
+                            );
+                        }
                     }
                 }
                 _ => {
@@ -6328,9 +6445,13 @@ impl Mesh {
         {
             let mut asks = self.refresh_asks.lock();
             let now = std::time::Instant::now();
+            // 300 ms floor: a re-key is the recovery from visible corruption, so
+            // it must turn around fast (was 600 ms). Still throttled so a viewer
+            // failing every frame can't trigger a keyframe storm — at most a few
+            // re-keys/s while it's actually broken.
             if asks
                 .get(&route_id)
-                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(600))
+                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_millis(300))
             {
                 return Ok(());
             }

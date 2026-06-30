@@ -471,9 +471,25 @@ Tauri 2 + Svelte 5, a client of the daemon.
    — see below); when the peer's lane is free — a lane whose holding route
    already ended is taken over, and the console serializes its tab switches
    so the teardown precedes the next offer — frames ride **MyOwnMesh's
-   H.264 video track lane**: openh264 in screen-content mode at native
-   resolution up to 4K, bitrate budgeted from the monitor's true pixel
-   count (~0.16 bpp, 8–40 Mbps), real RTP, no JSON/base64/64 KiB ceiling.
+   H.264 video track lane**: a hardware encoder where one is present —
+   NVENC/QuickSync/AMD via **Media Foundation** on Windows (the GPU's own H.264
+   MFT, no FFmpeg toolchain — `mediafoundation.rs`), NVENC/VA-API/QuickSync
+   (Linux) and VideoToolbox (macOS) via the FFmpeg `hwenc` feature
+   (`hwenc.rs`) — chosen by a frame-send-tested step-down ladder
+   (`make_h264_codec`) that falls to software **openh264** as the floor —
+   in screen-content mode at native resolution up to 4K (capture RGBA is
+   converted straight to I420 in one fused pass — no RGB intermediate, no
+   separate RGB→YUV walk), bitrate
+   budgeted from the monitor's true pixel count (~0.16 bpp, 8–40 Mbps), real
+   RTP on the wire. When the local daemon advertises the binary media pipes
+   (Status `media_pipes` — a capability flag, since the feature predates a
+   release and the `.myownmesh-rev` pin can't gate it), access units reach (and
+   return from) it over a **dedicated binary media pipe** — `MediaTrackPipe`
+   outbound, `MediaSourcePipe` inbound — with no base64 or per-frame JSON on the
+   IPC and no 64 KiB ceiling. An older daemon on the socket keeps the legacy
+   base64 `video_send`/`video_inbound` ops, so it still streams (just with the
+   base64 tax) instead of a black screen. (MJPEG, PCM and route signalling keep
+   the JSON control pipe regardless.)
    Otherwise they fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA`
    (1280 edge, chunked JPEGs), so any version skew degrades to working
    video. Either way the console window renders packets it *pulls* per

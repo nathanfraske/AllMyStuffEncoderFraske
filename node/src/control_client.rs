@@ -23,9 +23,13 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use allmystuff_protocol::control::{
+    decode_inbound_frame, encode_media_frame, InboundFrame, MAX_MEDIA_FRAME_BYTES,
+    MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
+};
 pub use allmystuff_protocol::{Request, Response};
 
 /// Where the daemon's control socket lives. Recomputed locally (via the
@@ -157,6 +161,82 @@ impl ControlClient {
         Ok(client_id)
     }
 
+    /// Open a dedicated binary **media-source** pipe for `client_id` (the id
+    /// from [`subscribe_events`]). After the handshake the daemon pushes
+    /// length-prefixed inbound media frames (`[u32 len][body]`) for everything
+    /// that client subscribed to; this reads them and forwards each decoded
+    /// [`InboundFrame`] to `tx`. Inbound H.264/Opus then carries no base64.
+    /// The spawned reader ends when the daemon closes the pipe or `tx` is
+    /// dropped; the caller can reconnect on the next session.
+    ///
+    /// [`subscribe_events`]: ControlClient::subscribe_events
+    pub async fn subscribe_media_source(
+        &self,
+        client_id: allmystuff_protocol::ClientId,
+        tx: mpsc::Sender<InboundFrame>,
+    ) -> Result<()> {
+        let stream = self.connect().await?;
+        let (reader, mut writer) = stream.split();
+        let mut reader = BufReader::new(reader);
+
+        let line = serde_json::to_string(&Request::MediaSourcePipe { client_id })? + "\n";
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("write media-source handshake")?;
+        writer
+            .flush()
+            .await
+            .context("flush media-source handshake")?;
+
+        let mut ack = String::new();
+        let n = reader
+            .read_line(&mut ack)
+            .await
+            .context("read media-source ack")?;
+        if n == 0 {
+            bail!("daemon closed the connection before the media-source ack");
+        }
+        let parsed: Response = serde_json::from_str(ack.trim())
+            .with_context(|| format!("parse media-source ack: {ack}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "media-source rejected: {}",
+                parsed.error.unwrap_or_else(|| "(no error)".into())
+            ));
+        }
+
+        tokio::spawn(async move {
+            // Hold the writer half open for the lifetime of the read loop
+            // (dropping it would half-close the pipe).
+            let _writer_keepalive = writer;
+            loop {
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len > MAX_MEDIA_FRAME_BYTES {
+                    tracing::warn!("media-source frame too large ({len} bytes) — closing pipe");
+                    break;
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+                let Some(frame) = decode_inbound_frame(&body) else {
+                    tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
+                    continue;
+                };
+                if tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     async fn connect(&self) -> Result<LocalSocketStream> {
         let name = match &self.addr {
             #[cfg(unix)]
@@ -224,6 +304,99 @@ impl MediaPipe {
         if let Err(e) = w.flush().await {
             *writer = None;
             return Err(anyhow!("media pipe flush: {e}"));
+        }
+        Ok(())
+    }
+}
+
+/// A persistent connection dedicated to **binary** media-track sends — the
+/// H.264 and Opus lanes. The first send converts the connection with a single
+/// [`Request::MediaTrackPipe`] line; everything after is length-prefixed binary
+/// frames (`[u32 len][body]`, see `allmystuff_protocol::encode_media_frame`) —
+/// no base64 (+33% and a CPU pass) and no per-frame JSON of a multi-KB string.
+/// MJPEG, PCM and route signalling stay on the JSON [`MediaPipe`], untouched.
+/// Backpressure and reconnect match [`MediaPipe`]: a full socket awaits, a
+/// failed write drops the connection and the next send reconnects.
+pub struct MediaTrackPipe {
+    client: Arc<ControlClient>,
+    writer: tokio::sync::Mutex<Option<interprocess::local_socket::tokio::SendHalf>>,
+}
+
+impl MediaTrackPipe {
+    pub fn new(client: Arc<ControlClient>) -> Self {
+        MediaTrackPipe {
+            client,
+            writer: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Stream one H.264 access unit to `peer`'s video lane `stream`.
+    pub async fn send_video(
+        &self,
+        network: &str,
+        peer: &str,
+        stream: u8,
+        duration_us: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.send_frame(MEDIA_KIND_VIDEO, network, peer, stream, duration_us, data)
+            .await
+    }
+
+    /// Stream one Opus frame to `peer`'s audio lane `stream`.
+    pub async fn send_audio(
+        &self,
+        network: &str,
+        peer: &str,
+        stream: u8,
+        duration_us: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.send_frame(MEDIA_KIND_AUDIO, network, peer, stream, duration_us, data)
+            .await
+    }
+
+    async fn send_frame(
+        &self,
+        kind: u8,
+        network: &str,
+        peer: &str,
+        stream: u8,
+        duration_us: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let body = encode_media_frame(kind, stream, duration_us, network, peer, data);
+        let mut writer = self.writer.lock().await;
+        if writer.is_none() {
+            let conn = self.client.connect().await?;
+            let (reader, mut send_half) = conn.split();
+            spawn_response_drain(reader);
+            // Convert the fresh connection to the binary media-track protocol.
+            let line = serde_json::to_string(&Request::MediaTrackPipe)? + "\n";
+            send_half
+                .write_all(line.as_bytes())
+                .await
+                .context("media-track handshake")?;
+            send_half
+                .flush()
+                .await
+                .context("media-track handshake flush")?;
+            *writer = Some(send_half);
+        }
+        // Header and body go out under one lock so frames never interleave.
+        let w = writer.as_mut().expect("connected above");
+        let len = (body.len() as u32).to_le_bytes();
+        if let Err(e) = w.write_all(&len).await {
+            *writer = None;
+            return Err(anyhow!("media-track len: {e}"));
+        }
+        if let Err(e) = w.write_all(&body).await {
+            *writer = None;
+            return Err(anyhow!("media-track body: {e}"));
+        }
+        if let Err(e) = w.flush().await {
+            *writer = None;
+            return Err(anyhow!("media-track flush: {e}"));
         }
         Ok(())
     }

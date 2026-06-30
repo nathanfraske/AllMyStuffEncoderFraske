@@ -92,7 +92,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
-            libgbm-dev libudev-dev libgtk-3-dev libwayland-dev
+            libgbm-dev libudev-dev libgtk-3-dev libwayland-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev
       - name: rustfmt
         if: matrix.os == 'ubuntu-latest'
         working-directory: node
@@ -106,9 +108,21 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         working-directory: node
         run: cargo clippy --all-targets -- -D warnings
+      # Lint + build the hardware-encode path too (FFmpeg dev libs installed
+      # above). Linux is enough to verify the `hwenc` code; the per-OS encoder
+      # list is the only platform-specific part. The default build above stays
+      # software-only so the macOS/Windows jobs need no FFmpeg toolchain.
+      - name: clippy (hwenc)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: node
+        run: cargo clippy --all-targets --features hwenc -- -D warnings
       - name: test
         working-directory: node
         run: cargo test
+      - name: test (hwenc)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: node
+        run: cargo test --features hwenc
 
   # The Tauri backend (its own workspace): cpal audio bridge + mesh session
   # + control client. Compile-checked on all three platforms — this is what
