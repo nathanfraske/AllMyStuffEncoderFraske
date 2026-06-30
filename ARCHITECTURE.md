@@ -475,12 +475,15 @@ Tauri 2 + Svelte 5, a client of the daemon.
    resolution up to 4K (capture RGBA is converted straight to I420 in one
    fused pass — no RGB intermediate, no separate RGB→YUV walk), bitrate
    budgeted from the monitor's true pixel count (~0.16 bpp, 8–40 Mbps), real
-   RTP on the wire. Access units reach (and return from) the daemon over a
-   **dedicated binary media pipe** — `MediaTrackPipe` outbound,
-   `MediaSourcePipe` inbound — so there is no base64 or per-frame JSON on the
-   IPC either, and no 64 KiB ceiling. (MJPEG, PCM and route signalling keep the
-   JSON control pipe; the base64 `video_inbound`/`audio_inbound` event path
-   stays only as a version-skew fallback.)
+   RTP on the wire. When the local daemon advertises the binary media pipes
+   (Status `media_pipes` — a capability flag, since the feature predates a
+   release and the `.myownmesh-rev` pin can't gate it), access units reach (and
+   return from) it over a **dedicated binary media pipe** — `MediaTrackPipe`
+   outbound, `MediaSourcePipe` inbound — with no base64 or per-frame JSON on the
+   IPC and no 64 KiB ceiling. An older daemon on the socket keeps the legacy
+   base64 `video_send`/`video_inbound` ops, so it still streams (just with the
+   base64 tax) instead of a black screen. (MJPEG, PCM and route signalling keep
+   the JSON control pipe regardless.)
    Otherwise they fall back to the v1 **MJPEG stream** over `CHANNEL_MEDIA`
    (1280 edge, chunked JPEGs), so any version skew degrades to working
    video. Either way the console window renders packets it *pulls* per
