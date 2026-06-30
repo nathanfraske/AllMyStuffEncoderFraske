@@ -255,8 +255,12 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 /// the one-shot fallback runs at whatever the platform's screenshot path
 /// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
 pub(crate) fn target_fps() -> u32 {
+    // Default 60 — this is a Parsec-tier 4K60 stream; 30 made fast motion look
+    // choppy. It's a ceiling, not a promise (damage-driven backends produce
+    // less on quiet screens), and a constrained/WAN link can dial it back with
+    // ALLMYSTUFF_VIDEO_FPS until link-adaptive rate control lands.
     static FPS: std::sync::LazyLock<u32> =
-        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_FPS", 30).clamp(1, 120));
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_FPS", 60).clamp(1, 120));
     *FPS
 }
 
@@ -272,9 +276,12 @@ fn h264_max_edge() -> u32 {
 
 /// Target bitrate for one stream's encode, budgeted from what it actually
 /// carries: ~0.16 bits per pixel per frame — the density 1080p30 was
-/// tuned crisp at (10 Mbps) — clamped to 8–40 Mbps. A 4K30 desktop lands
-/// at the 40 Mbps cap: trivial on a LAN, where direct peers live;
-/// link-adaptive rate remains the follow-up for relayed/WAN paths.
+/// tuned crisp at (10 Mbps) — clamped to 8–80 Mbps. The cap is 80 Mbps so a
+/// 4K60 desktop (~80 Mbps at this density) and a 3440×1440@60 ultrawide
+/// (~48 Mbps) reach their budget instead of being pinned at the old 40 Mbps
+/// ceiling, which was *itself* the QP wall that blocked fast motion. Trivial on
+/// a LAN, where direct peers live; link-adaptive rate (BWE) remains the
+/// follow-up that makes the high cap safe on relayed/WAN paths.
 /// Override (a fixed bps for every stream): `ALLMYSTUFF_VIDEO_BITRATE`.
 fn h264_bitrate_for(w: u32, h: u32, fps: u32) -> u32 {
     static OVERRIDE: std::sync::LazyLock<u32> =
@@ -284,7 +291,7 @@ fn h264_bitrate_for(w: u32, h: u32, fps: u32) -> u32 {
     }
     let px = u64::from(w) * u64::from(h);
     let bps = px * u64::from(fps) * 16 / 100;
-    bps.clamp(8_000_000, 40_000_000) as u32
+    bps.clamp(8_000_000, 80_000_000) as u32
 }
 
 /// A `u32` env dial; `default` when unset or unparseable.
@@ -1492,6 +1499,12 @@ struct H264Stream {
     prev_size: (u32, u32),
     last_sent: Option<Instant>,
     last_idr: Option<Instant>,
+    /// Wall-clock instant of the last *emitted* access unit. The RTP duration of
+    /// the next unit is the real gap since this — not a nominal 1/fps — so the
+    /// 90 kHz clock tracks wall-clock across static-skip gaps (a 2 s idle then
+    /// motion gets a ~2 s duration, not 1/fps), instead of lagging and churning
+    /// the viewer's jitter buffer on motion onset.
+    last_emit: Option<Instant>,
     /// The route's one-shot "clean entry now" flag (a viewer asked).
     refresh: Arc<AtomicBool>,
     /// The current forced-IDR interval (ms), adapted from receiver feedback
@@ -1527,6 +1540,7 @@ impl H264Stream {
             prev_size: (0, 0),
             last_sent: None,
             last_idr: None,
+            last_emit: None,
             refresh,
             idr_ms,
         })
@@ -1596,10 +1610,20 @@ impl H264Stream {
             return Ok(None);
         }
         stats.bytes += data.len() as u64;
-        Ok(Some(VideoPacket::H264 {
-            data,
-            duration_us: 1_000_000u64 / u64::from(self.fps),
-        }))
+        // Duration = real wall-clock gap since the last emitted unit, so the RTP
+        // timestamp tracks wall-clock (a static-skip gap carries its full
+        // elapsed time forward). Clamped to [1/2fps, 5 s] so a paused/just-
+        // started route can't emit an absurd duration. First unit uses nominal.
+        let now = Instant::now();
+        let nominal = 1_000_000u64 / u64::from(self.fps.max(1));
+        let duration_us = match self.last_emit {
+            Some(prev) => {
+                (now.duration_since(prev).as_micros() as u64).clamp(nominal / 2, 5_000_000)
+            }
+            None => nominal,
+        };
+        self.last_emit = Some(now);
+        Ok(Some(VideoPacket::H264 { data, duration_us }))
     }
 }
 

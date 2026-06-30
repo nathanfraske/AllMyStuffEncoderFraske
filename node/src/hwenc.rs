@@ -49,7 +49,13 @@ pub struct FfmpegH264 {
 /// Low-latency option dictionary for a given FFmpeg encoder — no B-frames, no
 /// lookahead, headers in-band (so each forced IDR carries SPS/PPS), and the
 /// vendor's "ultra low latency / realtime" knobs.
-fn low_latency_opts(name: &str) -> ff::Dictionary<'static> {
+///
+/// `bitrate` is the *average* target; we also hand the vendor rate controllers a
+/// **peak (`maxrate`) and VBV (`bufsize`)** so a fast-motion / scene-change
+/// frame can spend ~2× the average byte budget instead of having its QP cranked
+/// into macroblocking. Without this headroom, VBR collapses toward the average
+/// and motion frames block — the "blocky on fast motion" symptom.
+fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
     let mut d = ff::Dictionary::new();
     match name {
         "h264_nvenc" => {
@@ -78,6 +84,15 @@ fn low_latency_opts(name: &str) -> ff::Dictionary<'static> {
             d.set("low_power", "1");
         }
         _ => {}
+    }
+    // Peak/VBV headroom for every rate-controlled vendor (generic AVOptions →
+    // rc_max_rate / rc_buffer_size; the hardware controllers honour them).
+    // VideoToolbox manages its own rate control and ignores these. maxrate =
+    // 2× average, bufsize ≈ 1 s so motion bursts can spike without starving.
+    if name != "h264_videotoolbox" {
+        let maxrate = u64::from(bitrate).saturating_mul(2);
+        d.set("maxrate", &maxrate.to_string());
+        d.set("bufsize", &bitrate.to_string());
     }
     d
 }
@@ -111,11 +126,13 @@ impl FfmpegH264 {
         video.set_frame_rate(Some(ff::Rational::new(fps.max(1) as i32, 1)));
         video.set_bit_rate(bitrate as usize);
         video.set_max_b_frames(0); // no reordering — latency
-                                   // A long GOP; we force IDRs ourselves on the adaptive cadence, so the
-                                   // encoder shouldn't insert its own on a fixed interval.
-        video.set_gop(fps.saturating_mul(10).max(1));
+                                   // GOP ≈ 4 s: we force IDRs ourselves on the adaptive cadence (2–8 s),
+                                   // so this is a backstop, not the primary keyframe source — short
+                                   // enough that a late joiner / lost-reference recovers without waiting
+                                   // the full relaxed interval, long enough not to spam keyframes.
+        video.set_gop(fps.saturating_mul(4).max(1));
         let encoder = video
-            .open_as_with(codec, low_latency_opts(name))
+            .open_as_with(codec, low_latency_opts(name, bitrate))
             .map_err(|e| format!("{name}: open: {e}"))?;
         Ok(Self {
             encoder,

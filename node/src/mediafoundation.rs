@@ -160,20 +160,28 @@ impl HwEncoder {
             .map_err(mferr(&name, "set in type"))?;
 
         // ICodecAPI knobs — all best-effort: the encoder works on defaults if a
-        // particular box doesn't expose one. We want CBR at our bitrate, a GOP
-        // matching the relaxed IDR ceiling (forced IDRs handle the tight
-        // cadence), and the ability to force a keyframe on a viewer's refresh.
+        // particular box doesn't expose one. The rate control is the crucial
+        // part: **peak-constrained VBR with a peak (MaxBitRate ≈ 2× average) and
+        // a ~1 s VBV (BufferSize)** so a fast-motion / scene-change frame can
+        // spend more than the average byte budget instead of having its QP
+        // cranked into macroblocking. Bare CBR with mean-rate-only (the old
+        // setting) starved exactly those frames — the "blocky on fast motion"
+        // symptom. GOP is a backstop (≈4 s); forced IDRs handle the tight
+        // recovery cadence. Plus the ability to force a keyframe on demand.
         let codecapi = transform.cast::<ICodecAPI>().ok();
         if let Some(api) = &codecapi {
+            let peak = bitrate.saturating_mul(2);
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
-                &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+                &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
             );
             let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(bitrate));
             let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &variant_bool(true));
             let _ = api.SetValue(
                 &CODECAPI_AVEncMPVGOPSize,
-                &variant_u32(fps.saturating_mul(10).max(1)),
+                &variant_u32(fps.saturating_mul(4).max(1)),
             );
         }
 

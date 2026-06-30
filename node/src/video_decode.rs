@@ -33,9 +33,11 @@ pub struct Au {
     pub data: Vec<u8>,
 }
 
-/// Pending AUs per route before the overflow dump — ~2 s at 30 fps, far
-/// more than a healthy decoder (a few ms per frame) ever queues.
-const MAX_PENDING: usize = 64;
+/// Pending AUs per route before the overflow dump. Kept short (~200 ms at
+/// 60 fps) so a decoder that stalls dumps to the next keyframe fast instead of
+/// playing seconds of stale, latency-inducing backlog — a healthy decoder (a
+/// few ms per frame) never queues anywhere near this.
+const MAX_PENDING: usize = 12;
 
 /// How often each decoder logs its dial-in line (matches the encode side).
 const STATS_EVERY: Duration = Duration::from_secs(5);
