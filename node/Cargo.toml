@@ -160,6 +160,15 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # Media Foundation: the hardware H.264 encoder path (mediafoundation.rs).
+    # Drives the GPU's own H.264 MFT (NVENC/QSV/AMF) with no FFmpeg toolchain —
+    # MF ships inside Windows itself. Com/Variant back the MFT activation and
+    # the ICodecAPI low-latency/force-keyframe knobs.
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
 ] }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",

@@ -37,12 +37,23 @@ code with `file:line` anchors so it can be picked up cold.
 
 - **Hardware H.264 encode with a frame-send-tested step-down ladder** (item 3, the headline win).
   A `H264Codec` trait (`node/src/video.rs`) sits behind `H264Stream`; `make_h264_codec` walks the
-  platform's hardware encoders best-first — **NVENC → AMF → QuickSync** (Windows), **VideoToolbox**
-  (macOS), **NVENC → VA-API → QuickSync** (Linux) — via FFmpeg (`node/src/hwenc.rs`, the `hwenc`
-  feature), opens each and **frame-send-tests it** (encode one grey frame), and the first that
-  actually emits an access unit wins. Anything that won't open or won't produce a frame is stepped
-  over, down to software **openh264** as the guaranteed floor. `h264_nvenc` is real NVENC. Built into
-  `just dev`/`just serve` (needs FFmpeg dev libs); a plain `cargo build` stays software-only.
+  platform's hardware encoders best-first, opens each and **frame-send-tests it** (encode one grey
+  frame), and the first that actually emits an access unit wins. Anything that won't open or won't
+  produce a frame is stepped over, down to software **openh264** as the guaranteed floor. The
+  hardware rung is split by platform so it ships to **any** config with **no extra build toolchain
+  where it matters**:
+  - **Windows — Media Foundation** (`node/src/mediafoundation.rs`): the GPU's own H.264 MFT
+    (**NVIDIA H.264 Encoder MFT** = real NVENC on our fleet, else Intel QuickSync / AMD VCE),
+    enumerated hardware-first by the OS and driven through the `windows` crate we already link for
+    DXGI capture. **No FFmpeg, no pkg-config, no vcpkg** — MF ships inside Windows. This is the
+    default HW path; it's always compiled on Windows and needs nothing added to `just dev`.
+  - **Linux / macOS — FFmpeg** (`node/src/hwenc.rs`, the `hwenc` feature): **NVENC → VA-API →
+    QuickSync** (Linux), **VideoToolbox** (macOS). Opt-in (`--features hwenc`, needs FFmpeg dev
+    libs + pkg-config), since a plain build / a viewer box shouldn't have to install FFmpeg.
+
+  Because hardware encode is no longer forced into `just dev`/`just serve`, a plain `cargo build`
+  (and every viewer machine) compiles software-only with zero media toolchain — which is what
+  unbroke the macOS and Windows builds that the forced FFmpeg dependency had wedged.
 - **Fused RGBA→I420 encode** (item 2 below, the CPU-pass half). `scale_rgba_to_i420`
   (`node/pixels/src/lib.rs`) does the downscale + BT.601 conversion in one pass straight to a
   contiguous I420 buffer, fed to openh264 via a borrowing `YUVSource` — the old RGB intermediate and

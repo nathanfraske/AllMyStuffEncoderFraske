@@ -472,9 +472,11 @@ Tauri 2 + Svelte 5, a client of the daemon.
    already ended is taken over, and the console serializes its tab switches
    so the teardown precedes the next offer — frames ride **MyOwnMesh's
    H.264 video track lane**: a hardware encoder where one is present —
-   NVENC/AMF/QuickSync (Windows), VideoToolbox (macOS), NVENC/VA-API (Linux),
-   chosen by a frame-send-tested step-down ladder (`make_h264_codec`, the
-   `hwenc` FFmpeg feature) that falls to software **openh264** as the floor —
+   NVENC/QuickSync/AMD via **Media Foundation** on Windows (the GPU's own H.264
+   MFT, no FFmpeg toolchain — `mediafoundation.rs`), NVENC/VA-API/QuickSync
+   (Linux) and VideoToolbox (macOS) via the FFmpeg `hwenc` feature
+   (`hwenc.rs`) — chosen by a frame-send-tested step-down ladder
+   (`make_h264_codec`) that falls to software **openh264** as the floor —
    in screen-content mode at native resolution up to 4K (capture RGBA is
    converted straight to I420 in one fused pass — no RGB intermediate, no
    separate RGB→YUV walk), bitrate

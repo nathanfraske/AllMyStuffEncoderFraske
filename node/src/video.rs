@@ -1475,9 +1475,10 @@ impl StreamEncoder {
 /// a decode entry point within seconds. A resolution change (monitor swap)
 /// re-initializes the encoder inside openh264; the next unit out is an IDR.
 struct H264Stream {
-    /// The active H.264 backend — a hardware encoder (NVENC/AMF/QSV/
-    /// VideoToolbox/VA-API via FFmpeg) when one passed the frame-send test, else
-    /// software openh264. Rebuilt (re-laddered) on a resize.
+    /// The active H.264 backend — a hardware encoder (Media Foundation's GPU
+    /// H.264 MFT on Windows; NVENC/AMF/QSV/VideoToolbox/VA-API via FFmpeg on
+    /// Linux/macOS) when one passed the frame-send test, else software openh264.
+    /// Rebuilt (re-laddered) on a resize.
     codec: Box<dyn H264Codec>,
     /// The fitted size the current encoder's bitrate was budgeted for.
     /// The first real frame (or a monitor swap) that fits to a different
@@ -1688,6 +1689,31 @@ impl H264Codec for OpenH264Codec {
     }
 }
 
+/// Media Foundation hardware backend (NVENC/QuickSync/AMD via the OS's H.264
+/// MFT) — the Windows hardware path, no FFmpeg toolchain. Thin wrapper so the
+/// inherent methods on `mediafoundation::MediaFoundationH264` don't clash with
+/// the trait.
+#[cfg(windows)]
+struct MfCodec(crate::mediafoundation::MediaFoundationH264);
+
+#[cfg(windows)]
+impl H264Codec for MfCodec {
+    fn encode_i420(
+        &mut self,
+        i420: &[u8],
+        _w: usize,
+        _h: usize,
+        force_idr: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        // The MFT is fixed to the size it was opened at — the same (dw, dh) the
+        // ladder built it for; `H264Stream` rebuilds on resize.
+        self.0.encode_i420(i420, force_idr)
+    }
+    fn label(&self) -> &str {
+        self.0.label()
+    }
+}
+
 /// FFmpeg hardware backend (NVENC/AMF/QSV/VideoToolbox/VA-API), behind the
 /// `hwenc` feature. Thin wrapper so the inherent methods on `hwenc::FfmpegH264`
 /// don't clash with the trait.
@@ -1717,7 +1743,41 @@ impl H264Codec for FfmpegCodec {
 /// the first that actually emits an access unit wins. Anything that won't open
 /// or won't produce a frame (no GPU, driver/permission/session-cap trouble) is
 /// stepped over, down to software openh264, which is the guaranteed floor.
+///
+/// The hardware rung is platform-split: Windows uses **Media Foundation** (the
+/// GPU's own H.264 MFT, no FFmpeg toolchain); Linux/macOS use the **FFmpeg**
+/// vendor encoders behind the `hwenc` feature.
 fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H264Codec>, String> {
+    // Windows: the GPU's hardware H.264 MFT via Media Foundation. Enumerated
+    // best-first by the OS; each is opened and frame-send-tested, stepping down
+    // to the next (then to software) on any failure. No extra build toolchain.
+    #[cfg(windows)]
+    {
+        let bitrate = tune
+            .bitrate
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .clamp(250_000, 80_000_000);
+        for hw in crate::mediafoundation::hardware_h264_mfts() {
+            match hw.open(bw, bh, fps, bitrate) {
+                Ok(enc) => {
+                    let mut codec = MfCodec(enc);
+                    if codec_emits_frame(&mut codec, bw, bh) {
+                        tracing::info!(
+                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps (Media Foundation)",
+                            codec.label(),
+                            bitrate as f64 / 1e6
+                        );
+                        return Ok(Box::new(codec));
+                    }
+                    tracing::info!(
+                        "H.264 encoder {} opened but produced no frame in the send test — stepping down",
+                        codec.label()
+                    );
+                }
+                Err(e) => tracing::debug!("Media Foundation H.264 MFT unavailable: {e}"),
+            }
+        }
+    }
     #[cfg(feature = "hwenc")]
     {
         let bitrate = tune
@@ -1759,7 +1819,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
 /// The frame-send test that drives the step-down: feed one neutral-grey I420
 /// and confirm the encoder emits an access unit within a few frames. A backend
 /// that opens but won't actually produce frames is stepped over.
-#[cfg(feature = "hwenc")]
+#[cfg(any(feature = "hwenc", windows))]
 fn codec_emits_frame(codec: &mut dyn H264Codec, w: u32, h: u32) -> bool {
     let (w, h) = (w as usize, h as usize);
     let grey = vec![128u8; w * h + 2 * ((w / 2) * (h / 2))];

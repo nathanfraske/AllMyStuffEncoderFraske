@@ -42,6 +42,12 @@ pub mod files;
 #[cfg(feature = "hwenc")]
 pub mod hwenc;
 pub mod input_inject;
+/// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
+/// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
+/// the encoder ladder in [`video`] enumerates and frame-send-tests it, falling
+/// to software openh264 when no hardware MFT produces frames.
+#[cfg(windows)]
+pub mod mediafoundation;
 pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
