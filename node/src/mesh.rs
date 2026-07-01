@@ -2949,14 +2949,20 @@ impl Mesh {
             version: self.ownership.fleet_version(),
             members,
         };
+        // "Owner" for the GUI is the **signed** owner role OR the structural
+        // key-holder — a device the founder granted the owner role is a full
+        // owner and must see owner actions (evict, promote, …), not be gated out
+        // as a second-class member.
+        let is_owner_flag = self.ownership.is_fleet_owner()
+            || match network.as_deref() {
+                Some(n) => self.is_fleet_owner_signed(n).await,
+                None => false,
+            };
         let mut value = serde_json::to_value(roster).unwrap_or_else(|_| empty_owned());
         if let Some(obj) = value.as_object_mut() {
-            // Tag whether *this* device is the fleet owner (the founder /
-            // key-holder), so the GUI can gate owner-only actions.
-            obj.insert(
-                "is_owner".into(),
-                Value::Bool(self.ownership.is_fleet_owner()),
-            );
+            // Whether this device may take owner actions (signed owner or the
+            // structural key-holder), so the GUI can gate owner-only controls.
+            obj.insert("is_owner".into(), Value::Bool(is_owner_flag));
             // The fleet's closed-network id, so the GUI can spot which mesh in
             // the list is the fleet mesh and lock it (you leave it by leaving
             // the fleet, not by removing the mesh). Empty for a keyless member
@@ -3281,14 +3287,17 @@ impl Mesh {
         // some unrelated network change happens to trigger a sync.
         self.sync_networks().await;
 
-        let is_owner = self.ownership.is_fleet_owner();
-        // A **manager** (controller) isn't the structural fleet owner, but the
-        // signed governance gives it authority to admit members. So it doesn't
-        // stop at the member path below — it skips founding (only the owner
-        // self-elects) and runs the admit loop too, signing members into the
-        // multi-writer member log even while the owner is offline. We read the
-        // *converged* signed role, so a freshly-promoted manager only starts
-        // admitting once it has adopted the owner's grant.
+        // "Owner" for admit purposes is the **signed** role, not just the
+        // structural key-holder: a device the founder granted the owner role is
+        // a full owner and admits members like any other. (Founding itself is
+        // still gated on `is_fleet_founder` below — only the key-minter elects
+        // the genesis — but every owner runs the admit loop.)
+        let is_owner =
+            self.ownership.is_fleet_owner() || self.is_fleet_owner_signed(&network).await;
+        // A **manager** (controller) isn't an owner but the signed governance
+        // gives it authority to admit members too, so it also runs the admit
+        // loop. We read the *converged* signed role, so a freshly-promoted
+        // manager/owner only starts admitting once it has adopted the grant.
         let is_manager = !is_owner && self.is_fleet_manager(&network).await;
         if !is_owner {
             // A non-owner pre-rosters its **owner**. Fleet membership is mutual
@@ -3584,16 +3593,15 @@ impl Mesh {
         }
     }
 
-    /// True if this device holds the **manager** (controller) role in
-    /// `network`'s signed governance — authority to admit members even though
-    /// it isn't the fleet owner. Reads the signed state; any error → false
-    /// (assume no authority). `me` is matched in bare-pubkey form, as the roles
-    /// map keys it.
-    async fn is_fleet_manager(self: &Arc<Self>, network: &str) -> bool {
-        let Some(me) = self.local_node_id() else {
-            return false;
-        };
-        let me = pubkey_part(&me).to_string();
+    /// This device's **signed** governance role in `network` — `"owner"`,
+    /// `"controller"`, or `"member"` — or `None` if it holds none / the state
+    /// can't be read. This is the authoritative answer for "what am I on the
+    /// fleet": a device the founder *granted* the owner role is an owner here,
+    /// even though it isn't the structural key-holder ([`Ownership::is_fleet_owner`]).
+    /// Owners are owners; there is no second-class owner. `me` is matched in
+    /// bare-pubkey form, as the roles map keys it.
+    async fn fleet_signed_role(self: &Arc<Self>, network: &str) -> Option<String> {
+        let me = pubkey_part(&self.local_node_id()?).to_string();
         let data = match self
             .client
             .request(&Request::GovernanceState {
@@ -3602,7 +3610,7 @@ impl Mesh {
             .await
         {
             Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
-            _ => return false,
+            _ => return None,
         };
         data.get("state")
             .and_then(|v| v.get("roles"))
@@ -3611,9 +3619,22 @@ impl Mesh {
                 roles
                     .iter()
                     .find(|(k, _)| pubkey_part(k) == me)
-                    .map(|(_, v)| v.as_str() == Some("controller"))
+                    .and_then(|(_, v)| v.as_str())
+                    .map(str::to_string)
             })
-            .unwrap_or(false)
+    }
+
+    /// True if this device is a **signed owner** of `network` — granted the
+    /// owner role in the governance log — regardless of whether it minted the
+    /// fleet key. Management authority (evict, admit, promote) keys on this, not
+    /// on the structural key-holder check, so a granted owner is a full owner.
+    async fn is_fleet_owner_signed(self: &Arc<Self>, network: &str) -> bool {
+        self.fleet_signed_role(network).await.as_deref() == Some("owner")
+    }
+
+    /// True if this device holds the **manager** (controller) role in `network`.
+    async fn is_fleet_manager(self: &Arc<Self>, network: &str) -> bool {
+        self.fleet_signed_role(network).await.as_deref() == Some("controller")
     }
 
     /// The device ids (bare pubkey form) that already hold *any* signed role in
@@ -3779,16 +3800,19 @@ impl Mesh {
             .ownership
             .fleet_network_id()
             .ok_or("this device isn't in a fleet")?;
-        // Authority mirrors the daemon's Evict quorum: the fleet owner *or* a
-        // manager (Controller) may evict a plain member. A manager isn't the
-        // structural owner but the signed governance grants it this — and the
-        // GUI already offers a manager the Evict button — so gating on
-        // owner-only here silently refused a legitimate op the daemon allows.
-        // The daemon is still the final arbiter (it rejects an under-powered
-        // Evict); this local check only spares us issuing a doomed request and
-        // gives a precise message. `is_fleet_manager` reads the signed role.
-        if !self.ownership.is_fleet_owner() && !self.is_fleet_manager(&network).await {
-            return Err("only the fleet owner or a manager can remove a device".into());
+        // Authority mirrors the daemon's Evict quorum, keyed on the **signed**
+        // role — not the structural key-holder. A signed owner (even one the
+        // founder granted, not the key-minter) may evict anyone; a manager may
+        // evict managers/members. Gating on the structural `is_fleet_owner`
+        // alone made a granted owner a second-class owner that couldn't evict.
+        // The daemon is the final arbiter (it rejects an under-powered evict);
+        // this local check just avoids a doomed request.
+        let structural_owner = self.ownership.is_fleet_owner();
+        if !structural_owner
+            && !self.is_fleet_owner_signed(&network).await
+            && !self.is_fleet_manager(&network).await
+        {
+            return Err("only a fleet owner or a manager can remove a device".into());
         }
         // Keep the owner's local re-admit list honest so a kicked device isn't
         // re-admitted next `ensure` — a no-op for a manager (empty list). The
