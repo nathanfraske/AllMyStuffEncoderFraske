@@ -3600,7 +3600,7 @@ impl Mesh {
     /// even though it isn't the structural key-holder ([`Ownership::is_fleet_owner`]).
     /// Owners are owners; there is no second-class owner. `me` is matched in
     /// bare-pubkey form, as the roles map keys it.
-    async fn fleet_signed_role(self: &Arc<Self>, network: &str) -> Option<String> {
+    async fn fleet_signed_role(&self, network: &str) -> Option<String> {
         let me = pubkey_part(&self.local_node_id()?).to_string();
         let data = match self
             .client
@@ -3628,12 +3628,12 @@ impl Mesh {
     /// owner role in the governance log — regardless of whether it minted the
     /// fleet key. Management authority (evict, admit, promote) keys on this, not
     /// on the structural key-holder check, so a granted owner is a full owner.
-    async fn is_fleet_owner_signed(self: &Arc<Self>, network: &str) -> bool {
+    async fn is_fleet_owner_signed(&self, network: &str) -> bool {
         self.fleet_signed_role(network).await.as_deref() == Some("owner")
     }
 
     /// True if this device holds the **manager** (controller) role in `network`.
-    async fn is_fleet_manager(self: &Arc<Self>, network: &str) -> bool {
+    async fn is_fleet_manager(&self, network: &str) -> bool {
         self.fleet_signed_role(network).await.as_deref() == Some("controller")
     }
 
