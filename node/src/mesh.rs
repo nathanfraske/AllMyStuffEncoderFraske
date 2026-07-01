@@ -3730,10 +3730,25 @@ impl Mesh {
         device: String,
         code: Option<String>,
     ) -> Result<(), String> {
-        if !self.ownership.is_fleet_owner() {
-            return Err("only the fleet owner can remove a device".into());
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("this device isn't in a fleet")?;
+        // Authority mirrors the daemon's Evict quorum: the fleet owner *or* a
+        // manager (Controller) may evict a plain member. A manager isn't the
+        // structural owner but the signed governance grants it this — and the
+        // GUI already offers a manager the Evict button — so gating on
+        // owner-only here silently refused a legitimate op the daemon allows.
+        // The daemon is still the final arbiter (it rejects an under-powered
+        // Evict); this local check only spares us issuing a doomed request and
+        // gives a precise message. `is_fleet_manager` reads the signed role.
+        if !self.ownership.is_fleet_owner() && !self.is_fleet_manager(&network).await {
+            return Err("only the fleet owner or a manager can remove a device".into());
         }
-        let network = self.ownership.kick_member(&device)?;
+        // Keep the owner's local re-admit list honest so a kicked device isn't
+        // re-admitted next `ensure` — a no-op for a manager (empty list). The
+        // returned id equals `network`; we keep the one from `fleet_network_id`.
+        self.ownership.kick_member(&device)?;
         let target = pubkey_part(&device).to_string();
         tracing::info!(
             "evicting {} from fleet network {network}",
