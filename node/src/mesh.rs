@@ -3316,13 +3316,34 @@ impl Mesh {
             }
         }
 
+        // Custody lock: if this device enrolled a per-network TOTP, the daemon
+        // requires a fresh code to *author* any governance transition — which
+        // this background loop can't supply. Firing silent `mfa_code: None`
+        // founds/admits would just be refused on every startup (and, pre-fix,
+        // looked like "the fleet roster silently stopped updating"). So when
+        // locked, skip the signed-governance steps here and let the owner author
+        // founding + admits interactively from the Governance UI (with a code) —
+        // which is the whole point of the lock. The local `RosterApprove` calls
+        // below are NOT custody-gated (they're roster ops, not governance
+        // authoring), so peer auto-approve still reflects members either way.
+        let custody_locked = self.fleet_mfa_enrolled(&network).await;
+        if custody_locked {
+            tracing::info!(
+                "fleet network {network} is custody-locked — skipping automatic \
+                 found/admit; author membership changes from the Governance UI"
+            );
+        }
+
         // Found the closed governance only if we're the genuine **founder** —
         // the device that MINTED the fleet key. A structural owner that merely
         // adopted a key must NOT self-elect a parallel genesis: the engine would
         // (correctly) refuse to merge it, leaving two split-brain fleets that
         // only a deliberate leave-and-rejoin can consolidate. A manager never
         // founds either. `is_fleet_founded` reads the signed state.
-        if self.ownership.is_fleet_founder() && !self.is_fleet_founded(&network).await {
+        if !custody_locked
+            && self.ownership.is_fleet_founder()
+            && !self.is_fleet_founded(&network).await
+        {
             match self
                 .client
                 .request(&Request::GovernanceProposeKindChange {
@@ -3372,7 +3393,7 @@ impl Mesh {
             if Some(&device_id) == me.as_ref() {
                 continue;
             }
-            if !already_signed.contains(&device_id) {
+            if !custody_locked && !already_signed.contains(&device_id) {
                 let _ = self
                     .client
                     .request(&Request::GovernanceProposeRoleGrant {
@@ -3537,6 +3558,30 @@ impl Mesh {
             })
             .unwrap_or(false);
         closed && i_am_owner
+    }
+
+    /// Whether this device holds a custody (TOTP) lock on `network`'s
+    /// governance. Once enrolled, the daemon refuses to *author* a governance
+    /// transition (found, admit, promote, evict) without a fresh second-factor
+    /// code — so this background found/admit loop, which has no code to give,
+    /// must not fire silent `mfa_code: None` proposals that the daemon will only
+    /// reject on every startup. Any daemon/parse error reads as *not* enrolled,
+    /// so the automatic path keeps working on the common (unlocked) fleet.
+    /// `enrolled` is the field [`Request::GovernanceMfaStatus`] returns.
+    async fn fleet_mfa_enrolled(self: &Arc<Self>, network: &str) -> bool {
+        match self
+            .client
+            .request(&Request::GovernanceMfaStatus {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r
+                .data
+                .and_then(|d| d.get("enrolled").and_then(|v| v.as_bool()))
+                .unwrap_or(false),
+            _ => false,
+        }
     }
 
     /// True if this device holds the **manager** (controller) role in
