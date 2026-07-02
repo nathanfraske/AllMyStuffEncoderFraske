@@ -89,6 +89,9 @@ fn main() {
             attached_to: Some("den-tower".into()),
             web: "tcp:80".into(),
         }),
+        // 0 = unstamped: keeps the pinned Go fixtures byte-identical (zero
+        // serializes without the key). Real sends stamp it per send.
+        sent_at: 0,
     };
     fixtures.insert("node_profile_kvm", to_value(&kvm_profile));
 

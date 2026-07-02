@@ -552,6 +552,7 @@ mod tests {
             fleet_name: String::new(),
             fleet_owner: String::new(),
             kvm: None,
+            sent_at: 0,
         }
     }
 

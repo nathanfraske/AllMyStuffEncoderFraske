@@ -52,6 +52,9 @@ pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
 pub mod ownership;
+/// OS-level reboot of this machine — behind the gear menu's "Restart this
+/// device" and the fleet's `RestartDevice` command.
+pub mod reboot;
 pub mod shares;
 pub mod sites;
 pub mod terminal;

@@ -156,6 +156,21 @@ fn restart_app(app: tauri::AppHandle) {
     app.restart()
 }
 
+/// Reboot a machine's whole OS — the gear menu's step past [`restart_node`].
+/// The node routes it: our own device hands straight to the OS, a fleet
+/// machine is asked over the mesh (owner/fleet enforced there, and the OS's
+/// own privilege rules after that). Its presence dropping and returning is
+/// the confirmation.
+#[tauri::command]
+async fn restart_device(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("restart_device", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Re-learn a node's details for the refresh control. `node` omitted = **this**
 /// device (re-scan + re-advertise its own profile); a peer id asks that node to
 /// re-send its profile (rate-limited on the far side) so our stored view of its
@@ -1928,6 +1943,7 @@ fn main() {
             upgrade_node,
             restart_node,
             restart_app,
+            restart_device,
             refresh_node,
             set_claimable,
             kvm_attach,

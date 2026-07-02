@@ -140,6 +140,16 @@ pub struct Mesh {
     /// the fleet-conscription takeover (AMS-01). Refreshed on ownership changes
     /// and on a periodic tick.
     fleet_authorized: Mutex<std::collections::HashSet<String>>,
+    /// Latest passive clock-skew sample per peer (ms; positive = the peer's
+    /// wall clock reads ahead of ours) with when it landed, from the
+    /// `sent_at` stamp presence adverts carry. Fed to the network verdict in
+    /// [`Mesh::note_peer_clock`]; stale entries age out of the vote rather
+    /// than an offline peer's old clock voting forever.
+    peer_clock_skew: Mutex<HashMap<String, (i64, std::time::Instant)>>,
+    /// Whether the "this device's clock is out of sync" warning is currently
+    /// raised — latched so it fires once per episode (and clears once), not
+    /// on every presence advert while the clock stays wrong.
+    clock_skew_warned: std::sync::atomic::AtomicBool,
     /// Last non-empty fleet roster we read from the closed network's signed
     /// roster (`fleet_roster_value`). A member-side resilience cache — the
     /// symmetric twin of the owner's durable `fleet_members()` fallback: the
@@ -420,6 +430,8 @@ impl Mesh {
             }),
             ownership: Arc::new(Ownership::load()),
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
+            peer_clock_skew: Mutex::new(HashMap::new()),
+            clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
@@ -1131,6 +1143,10 @@ impl Mesh {
             // An ordinary machine is not a KVM appliance — only a NanoKVM-class
             // device (its Go mesh bridge) ever fills this in. See FEATURE_KVM.
             kvm: None,
+            // Stamped per send (broadcast_presence / send_presence_to), not
+            // at build: a profile can sit in state for minutes between
+            // sends, and a stale stamp would read as clock skew.
+            sent_at: 0,
         }
     }
 
@@ -1207,7 +1223,10 @@ impl Mesh {
             let st = self.state.lock();
             (st.networks.clone(), st.profile.clone())
         };
-        let Some(profile) = profile else { return };
+        let Some(mut profile) = profile else { return };
+        // Stamp our wall clock at the moment of send — receivers read it as
+        // a passive clock-skew sample (see NodeProfile::sent_at).
+        profile.sent_at = unix_now_ms();
         let Ok(payload) = serde_json::to_value(&profile) else {
             return;
         };
@@ -1299,6 +1318,27 @@ impl Mesh {
                             });
                         }
                     }
+                    // The daemon's own clock diagnostic (its heartbeat-based
+                    // estimator, on daemons new enough to run one): surface
+                    // it on the same UI event the presence-based estimate
+                    // uses, so the front-end has one warning to render
+                    // whichever detector fired first.
+                    if event.get("event_kind").and_then(|v| v.as_str()) == Some("diag")
+                        && event.get("category").and_then(|v| v.as_str()) == Some("clock")
+                    {
+                        let warn = event.get("level").and_then(|v| v.as_str()) == Some("warn");
+                        let detail = event.get("detail").cloned().unwrap_or(Value::Null);
+                        self.sink.emit(
+                            "allmystuff://clock-skew",
+                            serde_json::json!({
+                                "state": if warn { "warn" } else { "clear" },
+                                "skew_ms": detail.get("skew_ms").cloned().unwrap_or(Value::Null),
+                                "peers": detail.get("peers").cloned().unwrap_or(Value::Null),
+                                "message": event.get("message").cloned().unwrap_or(Value::Null),
+                                "source": "daemon",
+                            }),
+                        );
+                    }
                     self.sink.emit("allmystuff://event", event.clone());
                 }
             }
@@ -1354,6 +1394,15 @@ impl Mesh {
                     let is_self = self
                         .local_node_id()
                         .is_some_and(|me| pubkey_part(&me) == canon);
+                    // A stamped advert is a free clock-skew sample: the
+                    // sender's wall clock at send vs ours at receipt
+                    // (delivery is one data-channel hop — milliseconds,
+                    // noise against the 10 s threshold). Absent (`0`) on
+                    // older senders; skipped, never guessed.
+                    if !is_self && profile.sent_at > 0 {
+                        let sample = profile.sent_at as i64 - unix_now_ms() as i64;
+                        self.note_peer_clock(&canon, sample);
+                    }
                     let new_boot = profile.boot != 0 && !is_self && {
                         let mut st = self.state.lock();
                         st.peer_boots.insert(canon, profile.boot) != Some(profile.boot)
@@ -1385,11 +1434,24 @@ impl Mesh {
                             .unwrap_or(false)
                     };
                     // Self-heal the fleet: if a device we still list as a fleet
-                    // member now advertises a *different* owner (or none — it
-                    // went unclaimed), it has left us or been re-claimed. Evict
-                    // it so the roster reflects reality even when the explicit
-                    // leave notification never arrived (it was offline, crashed,
-                    // or was claimed straight out from under us).
+                    // member now advertises a *positively different* owner, it
+                    // has been re-claimed — evict it so the roster reflects
+                    // reality even when the explicit leave notification never
+                    // arrived (it was offline, crashed, or was claimed straight
+                    // out from under us).
+                    //
+                    // An advert with *no* owner is not departure evidence: it's
+                    // ambiguous between "went unclaimed" and a merely-defaulted
+                    // field (an advert sent before the peer's ownership store
+                    // loaded, an older build, a foreign bridge like the KVM's).
+                    // Dropping on it authors a signed Evict tombstone that the
+                    // daemon's roster convergence then mirrors onto *every*
+                    // fleet device — permanently stripping the member from the
+                    // rosters that authorize remote control, which surfaced as
+                    // "video streams but keyboard/mouse are refused". A device
+                    // that truly went unclaimed keeps advertising ownerless and
+                    // claimable; evict it when it positively advertises its new
+                    // owner, or deliberately from the fleet UI.
                     if !is_self && self.ownership.is_fleet_owner() {
                         let me = self.local_node_id().map(|m| pubkey_part(&m).to_string());
                         let peer = pubkey_part(node_id.as_str()).to_string();
@@ -1400,7 +1462,9 @@ impl Mesh {
                             .any(|d| pubkey_part(d) == peer)
                             || self.fleet_authorized.lock().contains(&peer);
                         let still_ours = advertised_owner.as_deref() == me.as_deref();
-                        if in_my_fleet && !still_ours {
+                        if in_my_fleet
+                            && fleet_departure(advertised_owner.as_deref(), me.as_deref())
+                        {
                             tracing::info!(
                                 "fleet member {} now answers to a different owner — dropping",
                                 short_id(node_id.as_str())
@@ -1612,14 +1676,14 @@ impl Mesh {
                         // person the owner deliberately granted control to (the
                         // share path; without it a shared "Control" route
                         // activates but every event is dropped here).
-                        if self.inbound_media_ok(&ev.route, &from, MediaKind::Input)
-                            && self.sender_may_drive(&from, DrivePlane::Input)
-                        {
+                        let route_ok = self.inbound_media_ok(&ev.route, &from, MediaKind::Input);
+                        if route_ok && self.sender_may_drive(&from, DrivePlane::Input) {
                             self.injector.apply(&ev.route, ev.action);
                         } else {
-                            tracing::warn!(
-                                "dropped input event from {from}: not an authorized controller"
-                            );
+                            // Refusing silently is how "controls just stopped
+                            // working" went undiagnosable — say which gate
+                            // failed, tell the viewer, and tell our own UI.
+                            self.refuse_control_frame(&from, &ev.route, "input", route_ok);
                         }
                     }
                     MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
@@ -2428,6 +2492,27 @@ impl Mesh {
                     sink.restart();
                 });
             }
+            AppControl::RestartDevice => {
+                tracing::info!(
+                    "device reboot requested by {} — handing to the OS",
+                    short_id(from.as_str())
+                );
+                // Tell whoever is sitting at this machine why it's about to
+                // go down, then ask the OS off the inbound-frame task. The
+                // OS's own privilege rules still apply (see `crate::reboot`);
+                // a refusal is logged rather than silently swallowed.
+                self.sink.emit(
+                    "allmystuff://device-restart",
+                    serde_json::json!({ "from": from.as_str() }),
+                );
+                crate::spawn(async move {
+                    match tokio::task::spawn_blocking(crate::reboot::restart_device).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!("device reboot refused: {e}"),
+                        Err(e) => tracing::warn!("device reboot task failed: {e}"),
+                    }
+                });
+            }
             // An app command a newer build introduced that this one doesn't
             // implement (decoded as `Unknown` rather than failing the
             // control message) — nothing to act on.
@@ -3027,6 +3112,28 @@ impl Mesh {
     pub async fn request_restart(self: &Arc<Self>, node: String) -> Result<(), String> {
         tracing::info!("asking {} to restart its app", short_id(&node));
         let msg = ControlMessage::App(AppControl::Restart);
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: reboot a machine's whole OS — the recovery step
+    /// heavier than [`Mesh::request_restart`]. Our own device reboots
+    /// directly (no wire round-trip to ourselves); a peer is asked with
+    /// [`AppControl::RestartDevice`], gated owner/fleet on its side exactly
+    /// like the app restart. Its presence dropping and returning is the
+    /// confirmation. An older peer decodes the command as `Unknown` and
+    /// ignores it — the ask goes unanswered, never misread.
+    pub async fn request_restart_device(self: &Arc<Self>, node: String) -> Result<(), String> {
+        let is_self = self
+            .local_node_id()
+            .is_some_and(|me| pubkey_part(&node) == pubkey_part(&me));
+        if is_self {
+            tracing::info!("rebooting this device (asked from its own gear menu)");
+            return tokio::task::spawn_blocking(crate::reboot::restart_device)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tracing::info!("asking {} to reboot its device", short_id(&node));
+        let msg = ControlMessage::App(AppControl::RestartDevice);
         self.send_control(&node, &msg).await
     }
 
@@ -3692,12 +3799,84 @@ impl Mesh {
         *self.fleet_authorized.lock() = set;
     }
 
+    /// Fold one peer's passive clock-skew sample (from its presence advert's
+    /// `sent_at` stamp) into the network verdict, and raise / clear the
+    /// out-of-sync warning on the transitions.
+    ///
+    /// The estimate is the conservative median across peers with a fresh
+    /// sample, so one machine with a broken clock reads as *that peer's*
+    /// problem (its own node warns, against all of *its* peers) — only when
+    /// the majority of the network disagrees with us the same way does this
+    /// device conclude its own clock is off. Motivated by real damage: the
+    /// fleet's signed member-log converges last-writer-wins on wall-clock
+    /// stamps (a skewed clock can strand a device evicted — the "remote
+    /// control silently refused" failure), custody TOTP tolerates ±30 s,
+    /// and cross-device timestamps stop lining up. Entirely passive — built
+    /// from adverts that were flowing anyway, no extra calls to any node.
+    fn note_peer_clock(&self, peer: &str, sample_ms: i64) {
+        use std::sync::atomic::Ordering;
+        const SAMPLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let (estimate, peers) = {
+            let mut map = self.peer_clock_skew.lock();
+            map.insert(peer.to_string(), (sample_ms, std::time::Instant::now()));
+            map.retain(|_, (_, at)| at.elapsed() < SAMPLE_TTL);
+            let samples: Vec<i64> = map.values().map(|(s, _)| *s).collect();
+            (conservative_median(&samples), samples.len())
+        };
+        let Some(skew_ms) = estimate else { return };
+        let warned = self.clock_skew_warned.load(Ordering::SeqCst);
+        if !warned && skew_ms.abs() >= CLOCK_SKEW_WARN_MS {
+            self.clock_skew_warned.store(true, Ordering::SeqCst);
+            let secs = skew_ms.abs() as f64 / 1000.0;
+            let direction = if skew_ms > 0 { "behind" } else { "ahead of" };
+            let message = if peers >= 2 {
+                format!(
+                    "This device's clock is ~{secs:.0}s {direction} the rest of the network — \
+                     fleet roster updates and cross-device timestamps can misbehave. Sync this \
+                     machine's clock (NTP)."
+                )
+            } else {
+                format!(
+                    "This device's clock and its peer's disagree by ~{secs:.0}s — one of the \
+                     two is wrong. Sync both machines' clocks (NTP)."
+                )
+            };
+            tracing::warn!("{message} (skew {skew_ms} ms across {peers} peer(s))");
+            self.sink.emit(
+                "allmystuff://clock-skew",
+                serde_json::json!({
+                    "state": "warn",
+                    "skew_ms": skew_ms,
+                    "peers": peers,
+                    "message": message,
+                    "source": "presence",
+                }),
+            );
+        } else if warned && skew_ms.abs() <= CLOCK_SKEW_CLEAR_MS {
+            self.clock_skew_warned.store(false, Ordering::SeqCst);
+            tracing::info!("this device's clock is back in sync with the network");
+            self.sink.emit(
+                "allmystuff://clock-skew",
+                serde_json::json!({
+                    "state": "clear",
+                    "skew_ms": skew_ms,
+                    "peers": peers,
+                    "message": "This device's clock is back in sync with the network.",
+                    "source": "presence",
+                }),
+            );
+        }
+    }
+
     /// Send this node's presence profile straight to one peer — the
     /// targeted half of `broadcast_presence`, for a peer that just
     /// connected or restarted and so has never heard us.
     async fn send_presence_to(&self, peer: &str) {
         let profile = { self.state.lock().profile.clone() };
-        let Some(profile) = profile else { return };
+        let Some(mut profile) = profile else { return };
+        // Same send-time stamp as `broadcast_presence` — a passive
+        // clock-skew sample for the receiver.
+        profile.sent_at = unix_now_ms();
         let Some(network) = self.network_for_peer(peer) else {
             return;
         };
@@ -6516,6 +6695,22 @@ impl Mesh {
         if self.ownership.owner().as_deref().map(pubkey_part) == Some(canon) {
             return true;
         }
+        // The owner's own admit records are as authenticated as the signed
+        // roster: this device wrote them itself when it admitted (or claimed)
+        // the member — local state, never gossip, and already what
+        // `in_my_fleet` trusts when deciding evictions. Consulting them here
+        // keeps a member controlling its owner's machine working across the
+        // window where the daemon's converged roster is still healing (or
+        // briefly lost the member to a stale tombstone) — the gap that
+        // surfaced as "video streams but keyboard/mouse are refused".
+        if self
+            .ownership
+            .fleet_member_ids()
+            .iter()
+            .any(|d| pubkey_part(d) == canon)
+        {
+            return true;
+        }
         self.fleet_authorized.lock().contains(canon)
     }
 
@@ -6543,6 +6738,60 @@ impl Mesh {
             .out_grants_for(&person.id)
             .iter()
             .any(|g| grant_authorizes_plane(g, plane))
+    }
+
+    /// An inbound input/clipboard frame failed a gate. Historically this was
+    /// one rate-unlimited, cause-blind warn — which is exactly how "the mouse
+    /// stopped working" became undiagnosable: the viewer's console looked
+    /// connected (the route activates regardless) while every event died
+    /// here. Now, rate-limited per route: log *which* gate failed with the
+    /// route facts, surface it on this machine's own UI sink, and send a
+    /// `RouteControl::Reject` back so the viewer's console flips its toggle
+    /// off and shows the reason instead of typing into the void. (An old
+    /// viewer ignores a Reject for an active route — no worse than today.)
+    fn refuse_control_frame(
+        self: &Arc<Self>,
+        from: &str,
+        route_id: &str,
+        plane: &str,
+        route_ok: bool,
+    ) {
+        if !self.diag_ok(&format!("refuse:{plane}:{route_id}")) {
+            return;
+        }
+        let reason = if route_ok {
+            format!(
+                "{plane} refused: this machine doesn't recognize the controlling device as its \
+                 owner or a fleet member (and no {plane} share covers it) — check the fleet \
+                 roster / re-admit the device from Fleet settings"
+            )
+        } else {
+            format!(
+                "{plane} refused: no live {plane} route for it here ({}) — reconnect the console",
+                self.route_diag(route_id, from)
+            )
+        };
+        tracing::warn!("dropped {plane} event from {}: {reason}", short_id(from));
+        self.sink.emit(
+            "allmystuff://control-refused",
+            serde_json::json!({
+                "route": route_id,
+                "from": from,
+                "plane": plane,
+                "reason": reason,
+            }),
+        );
+        let mesh = self.clone();
+        let from = from.to_string();
+        let route_id = route_id.to_string();
+        crate::spawn(async move {
+            let _ = mesh
+                .send_control(
+                    &from,
+                    &ControlMessage::Route(RouteControl::Reject { route_id, reason }),
+                )
+                .await;
+        });
     }
 
     /// Ask the far end of an inbound display/camera route for a clean
@@ -6881,7 +7130,9 @@ impl Mesh {
 
         if sinks_here {
             if !self.sender_may_drive(from, DrivePlane::Clipboard) {
-                tracing::warn!("dropped clipboard from {from}: not an authorized controller");
+                // Same loud refusal as input: the route was live (checked
+                // above), so the failed gate is authorization.
+                self.refuse_control_frame(from, &frame.route, "clipboard", true);
                 return;
             }
             if let ClipboardEvent::Pull = frame.event {
@@ -7434,6 +7685,55 @@ fn grant_authorizes_plane(grant: &Grant, plane: DrivePlane) -> bool {
     }
 }
 
+/// |skew| at which the passive clock estimate warns (10 s: far beyond
+/// presence-delivery jitter, well inside the range where wall-clock
+/// last-writer-wins and TOTP windows start misbehaving).
+const CLOCK_SKEW_WARN_MS: i64 = 10_000;
+/// |skew| the estimate must fall back under before a raised warning clears —
+/// hysteresis so the warning doesn't flap at the threshold.
+const CLOCK_SKEW_CLEAR_MS: i64 = 5_000;
+
+/// Median of `samples` (odd length), or the **smaller-magnitude** middle
+/// (even length). The conservative even-length pick means a *strict
+/// majority* of peers must agree we're off before the network estimate
+/// crosses a threshold: two peers split [0 s, 60 s] verdicts 0 — it's that
+/// peer's clock that's wrong, and its own node warns against *its* peers.
+fn conservative_median(samples: &[i64]) -> Option<i64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    if n % 2 == 1 {
+        return Some(sorted[n / 2]);
+    }
+    let (a, b) = (sorted[n / 2 - 1], sorted[n / 2]);
+    Some(if a.abs() <= b.abs() { a } else { b })
+}
+
+/// This machine's wall clock as Unix-epoch milliseconds — the presence
+/// `sent_at` stamp.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether a fleet member's presence advert is evidence it left the fleet:
+/// only an owner it *positively names* that isn't us. `None` (no owner in the
+/// advert) is ambiguous — an early advert sent before its ownership store
+/// loaded, an older build, a foreign bridge — and must never author the
+/// eviction tombstone that roster convergence then propagates fleet-wide.
+/// Pure, because getting this wrong is how remote control silently died once.
+fn fleet_departure(advertised_owner: Option<&str>, me: Option<&str>) -> bool {
+    match advertised_owner {
+        Some(owner) => Some(owner) != me,
+        None => false,
+    }
+}
+
 /// Why an inbound terminal/files/site offer must be refused, if it must: it
 /// asks *this* machine to host a shell (or hand over its disk, or proxy a
 /// service) and the offerer is neither owner/fleet nor holds a share grant for
@@ -7680,6 +7980,45 @@ mod tests {
         fn restart(&self) -> ! {
             unreachable!("test sink never restarts")
         }
+    }
+
+    /// Regression guard for the silent fleet-wide loss of remote control: a
+    /// presence advert with *no* owner (early boot, older build, a foreign
+    /// bridge) must never read as "this member left the fleet" — the evict it
+    /// used to trigger authors a signed tombstone that roster convergence
+    /// mirrors onto every device, and input/clipboard are then refused
+    /// everywhere while video (ungated) keeps streaming. Only a positively
+    /// different advertised owner is departure.
+    #[test]
+    fn ownerless_adverts_are_not_fleet_departure() {
+        // A member that positively names another owner has left us.
+        assert!(fleet_departure(Some("pkB"), Some("pkA")));
+        // A member still naming us is ours.
+        assert!(!fleet_departure(Some("pkA"), Some("pkA")));
+        // No owner in the advert: ambiguous — never an eviction trigger.
+        assert!(!fleet_departure(None, Some("pkA")));
+        // Even when our own id is unknown (mesh not ready), an ownerless
+        // advert stays inert; a named one can only be "not us".
+        assert!(!fleet_departure(None, None));
+        assert!(fleet_departure(Some("pkB"), None));
+    }
+
+    /// The clock-skew estimate must blame *us* only when the majority of
+    /// peers agree: a two-way split verdicts the value nearer zero (that
+    /// peer's clock is wrong, not ours), and a lone peer's sample carries as
+    /// itself (the warning then words itself neutrally).
+    #[test]
+    fn clock_skew_median_is_conservative() {
+        assert_eq!(conservative_median(&[]), None);
+        assert_eq!(conservative_median(&[60_000]), Some(60_000));
+        // Split 2-peer network: verdict is the sane clock, no self-blame.
+        assert_eq!(conservative_median(&[0, 60_000]), Some(0));
+        // Both peers agree we're off: verdict says so.
+        assert_eq!(conservative_median(&[58_000, 60_000]), Some(58_000));
+        assert_eq!(
+            conservative_median(&[-60_000, -58_000, -59_000]),
+            Some(-59_000)
+        );
     }
 
     /// Regression guard for the GUI crash where `Mesh::new` spawned its media

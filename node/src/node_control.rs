@@ -781,6 +781,10 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_restart(node).await)
         }
+        "restart_device" => {
+            let node: String = try_arg!(arg(a, "node"));
+            json_result(mesh.request_restart_device(node).await)
+        }
         "refresh_node" => {
             // `node` omitted / null = this device (re-scan + re-advertise).
             let node = a.get("node").and_then(|v| v.as_str()).map(str::to_string);

@@ -292,6 +292,17 @@ export async function restartApp(): Promise<void> {
   await invoke("restart_app");
 }
 
+/** Reboot a machine's whole OS — the step past {@link restartNode} for the
+ *  wedge an app relaunch can't clear. Your own device hands straight to the
+ *  OS; a fleet machine is asked over the mesh (owner/fleet enforced there,
+ *  the OS's own privilege rules after that). Its presence dropping and
+ *  returning is the confirmation. No-op in web mode. */
+export async function restartDevice(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("restart_device", { node });
+}
+
 /** Re-learn a node's details. `node` omitted = *this* device (re-scan its
  *  hardware + re-advertise); a peer id = nudge it to re-sync ownership/sites.
  *  The GUI follows up by re-pulling the daemon's view. No-op in web mode. */
@@ -752,6 +763,51 @@ export async function onFileSaved(
     "allmystuff://file-saved",
     (e) => cb(e.payload),
   );
+}
+
+/** This machine refused an inbound input/clipboard event
+ *  (`allmystuff://control-refused`): the route was live but the sender isn't
+ *  an authorized controller (or the route wasn't live here at all). Rate
+ *  limited backend-side; the store toasts it so the refusal is visible on
+ *  the refusing machine too, not just in its log. */
+export async function onControlRefused(
+  cb: (e: { route: string; from: string; plane: string; reason: string }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ route: string; from: string; plane: string; reason: string }>(
+    "allmystuff://control-refused",
+    (e) => cb(e.payload),
+  );
+}
+
+/** The passive clock-skew verdict changed (`allmystuff://clock-skew`):
+ *  this machine's wall clock drifted well out of line with its peers'
+ *  (state "warn"), or came back (state "clear"). Estimated entirely from
+ *  traffic that was already flowing — presence stamps node-side, heartbeat
+ *  pings daemon-side — never from extra calls to other nodes. */
+export interface ClockSkewEvent {
+  state: "warn" | "clear";
+  skew_ms: number | null;
+  peers: number | null;
+  message: string | null;
+  source: string;
+}
+export async function onClockSkew(cb: (e: ClockSkewEvent) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<ClockSkewEvent>("allmystuff://clock-skew", (e) => cb(e.payload));
+}
+
+/** A fleet peer asked this machine to reboot (`allmystuff://device-restart`)
+ *  — the heads-up shown to whoever is sitting here just before the OS goes
+ *  down. */
+export async function onDeviceRestart(
+  cb: (e: { from: string }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ from: string }>("allmystuff://device-restart", (e) => cb(e.payload));
 }
 
 /** Progress of a registered download (`allmystuff://file-progress`),

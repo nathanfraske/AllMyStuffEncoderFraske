@@ -65,6 +65,9 @@ import {
   isTauri,
   kvmAttach,
   kvmDetach,
+  onClockSkew,
+  onControlRefused,
+  onDeviceRestart,
   onFileProgress,
   onFileSaved,
   openFilesWindow,
@@ -133,6 +136,7 @@ import {
   updateCheck,
   requestNodeRefresh,
   restartApp,
+  restartDevice,
   restartNode,
   updateLatestVersion,
   updateRelaunch,
@@ -444,6 +448,13 @@ class AppStore {
    *  by tapping it) — the same one-at-a-time reveal model as the claim drawer.
    *  Null = none showing. */
   kvmRevealed = $state<string | null>(null);
+  /** The latched clock-skew warning: this machine's wall clock is well out
+   *  of line with its peers' (estimated passively — no extra calls to any
+   *  node). Null = in sync (or nothing measurable). Drives the topbar pill;
+   *  set/cleared by the `allmystuff://clock-skew` transitions. */
+  clockSkew = $state<{ skewMs: number | null; peers: number | null; message: string } | null>(
+    null,
+  );
   toasts = $state<Toast[]>([]);
   /** Nodes with a refresh in flight — the card's refresh ring spins and its
    *  button is disabled until the data lands (the node's fingerprint changes on
@@ -1158,6 +1169,36 @@ class AppStore {
     // `:shared` downloads this store registered, so the two never collide.)
     await onFileProgress((e) => this.onSharedProgress(e));
     await onFileSaved((e) => this.onSharedSaved(e));
+    // This machine refused someone's input/clipboard (route live, sender not
+    // authorized): say so here too — the person at this desk is often the
+    // same person wondering why their other device's console stopped typing.
+    await onControlRefused((e) => {
+      const who = this.node(e.from)?.label ?? shortId(e.from);
+      this.toast("warn", `Refused ${e.plane} from ${who} — not on this machine's fleet roster`);
+    });
+    // A fleet peer asked this machine to reboot: tell whoever is sitting
+    // here why the OS is about to go down.
+    await onDeviceRestart((e) => {
+      const who = this.node(e.from)?.label ?? shortId(e.from);
+      this.toast("warn", `Restarting this device — asked by ${who}`);
+    });
+    // The passive clock-skew verdict (this machine's clock vs its peers',
+    // measured off traffic that was already flowing): keep the topbar pill
+    // in step and toast the transitions — a wrong clock quietly breaks
+    // fleet-roster convergence and cross-device timestamps.
+    await onClockSkew((e) => {
+      if (e.state === "warn") {
+        this.clockSkew = {
+          skewMs: e.skew_ms,
+          peers: e.peers,
+          message: e.message ?? "This device's clock is out of sync with the network.",
+        };
+        this.toast("warn", this.clockSkew.message);
+      } else {
+        this.clockSkew = null;
+        this.toast("ok", "This device's clock is back in sync with the network");
+      }
+    });
     await this.hydrateFromBackend();
     await this.loadIdentity();
     await this.refreshNetworks();
@@ -1762,6 +1803,33 @@ class AppStore {
     }
     this.routeStates = states;
     this.routeSessions = sessions;
+
+    // A console leg the far side REFUSED: the controlled machine rejects the
+    // control/clipboard route when our events fail its authorization gate
+    // (e.g. this device fell off its fleet roster). Flip the toggle off and
+    // say why — the old behaviour was a live-looking toggle typing into the
+    // void, which read as "controls just stopped working".
+    const refusal = (live: string | null): string | null => {
+      if (!live) return null;
+      const st = states[live];
+      return st?.state === "rejected" ? st.reason || "the far side refused it" : null;
+    };
+    const controlRefused = refusal(this.consoleControlLive);
+    if (controlRefused) {
+      this.toast("warn", `Keyboard & mouse ended: ${controlRefused}`);
+      if (this.consoleControlRouteId) void this.disconnect(this.consoleControlRouteId);
+      this.consoleControlRouteId = null;
+      this.consoleControlLive = null;
+      this.consoleControl = false;
+    }
+    const clipboardRefused = refusal(this.consoleClipboardLive);
+    if (clipboardRefused) {
+      this.toast("warn", `Clipboard passthrough ended: ${clipboardRefused}`);
+      if (this.consoleClipboardRouteId) void this.disconnect(this.consoleClipboardRouteId);
+      this.consoleClipboardRouteId = null;
+      this.consoleClipboardLive = null;
+      this.consoleClipboard = false;
+    }
 
     // Reconcile site mappings against what each host now advertises: a host
     // that's online but no longer lists a site we'd mapped has stopped
@@ -6427,6 +6495,40 @@ class AppStore {
       this.toast("warn", `Couldn't ask ${n.label} to restart: ${String(e)}`);
     });
     this.toast("info", `Asking ${n.label} to restart its app…`);
+  }
+
+  /** Whether "Restart device" is offerable for `node`: same owner/fleet rule
+   *  as {@link canRestartApp} (the far side gates the reboot identically, then
+   *  the OS's own privilege rules apply), plus the target must be a machine
+   *  running AllMyStuff new enough to know the command — an older build
+   *  ignores it, so offering the button would be a silent no-op there. */
+  canRestartDevice(node: MeshNode | null | undefined): boolean {
+    return this.canRestartApp(node);
+  }
+
+  /** Reboot a machine's whole OS — the gear menu's step past
+   *  {@link restartNodeApp}, for the wedge an app relaunch can't clear. Your
+   *  own device hands straight to the OS; a fleet machine is asked over the
+   *  mesh. Its presence dropping off the graph and returning is the
+   *  confirmation. */
+  restartNodeDevice(nodeId: string) {
+    const n = this.node(nodeId);
+    if (!n) return;
+    if (!this.backendConnected) {
+      this.toast("info", "Restarting a device needs the desktop app");
+      return;
+    }
+    if (!this.canRestartDevice(n)) {
+      this.toast("warn", `${n.label} isn't yours to restart`);
+      return;
+    }
+    restartDevice(nodeId).catch((e) => {
+      this.toast("warn", `Couldn't ask ${n.label} to reboot: ${String(e)}`);
+    });
+    this.toast(
+      "info",
+      this.isMe(nodeId) ? "Restarting this device…" : `Asking ${n.label} to restart the device…`,
+    );
   }
 
   /** A human one-liner for the last check's outcome, shown inline in the
