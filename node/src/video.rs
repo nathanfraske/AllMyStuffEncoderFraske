@@ -60,7 +60,7 @@
 //!    wordless black stage.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -417,6 +417,12 @@ struct RouteVideo {
     /// ([`note_feedback`] → [`adaptive_idr_ms`]); the encode thread reads it
     /// each frame. Default [`IDR_MS_TIGHT`] = today's fixed cadence.
     idr_ms: Arc<AtomicU64>,
+    /// The tune this capture was started with — the controller compares the
+    /// viewer's reported fps against its fps target.
+    tune: Tune,
+    /// The receiver-driven resolution cap (see [`AutoAdapt`]); fresh per
+    /// capture, so a manual retune resets it.
+    auto: Arc<AutoAdapt>,
 }
 
 impl Drop for RouteVideo {
@@ -437,6 +443,126 @@ pub struct RecvFeedback {
     pub decode_fails: u32,
     pub queue_depth: u32,
     pub at: Instant,
+}
+
+// ---- receiver-driven auto-adaptation ---------------------------------
+//
+// The viewer reports its decode health every couple of seconds
+// (`RouteControl::VideoFeedback`); [`adaptive_idr_ms`] already reads it for
+// the recovery cadence. This is the other half that was marked "auto-scaling
+// later": when the viewer demonstrably can't keep up — a 60 fps encode
+// arriving at 0–6 fps, the exact "console shows a slideshow" failure — the
+// sender steps its encode **resolution** down one rung, and steps back up
+// once the viewer has been healthy for a sustained stretch (fast down, slow
+// up, so the picture never oscillates).
+//
+// Resolution is the one dial that needs no capture restart: the encode path
+// fits every frame to the effective edge per frame, and a changed fit
+// re-inits the encoder through the existing budget-size rebuild (bitrate
+// re-budgets from the smaller frame automatically; the next unit out is an
+// IDR). A manual retune replaces the route and so resets the cap — the
+// viewer's new picks change the conditions, and the controller re-learns.
+
+/// The auto-cap rungs, descending. `0` (uncapped) sits above the first.
+const AUTO_EDGES: &[u32] = &[2560, 1920, 1280, 960];
+/// Consecutive struggling reports (~2 s apart) before a step down.
+const AUTO_BAD_STREAK: u32 = 3;
+/// Consecutive healthy reports before a step back up — deliberately long:
+/// stepping up too eagerly re-breaks the viewer and oscillates.
+const AUTO_GOOD_STREAK: u32 = 20;
+/// Settle time after any step before another *down* step — the encoder
+/// rebuild and the viewer's pipeline refill need a beat to show up in the
+/// feedback before it's evidence about the new rung.
+const AUTO_DOWN_HOLD: Duration = Duration::from_secs(8);
+/// Hold after any step before a step *up*.
+const AUTO_UP_HOLD: Duration = Duration::from_secs(30);
+
+/// One route's receiver-driven cap on the encode edge, shared between the
+/// feedback path (writer, via [`AutoAdapt::observe`]) and the encode thread
+/// (reader, via [`AutoAdapt::edge_cap`] each frame).
+pub(crate) struct AutoAdapt {
+    /// The current cap on the longest encode edge; `0` = uncapped.
+    edge: AtomicU32,
+    state: Mutex<AdaptState>,
+}
+
+#[derive(Default)]
+struct AdaptState {
+    bad: u32,
+    good: u32,
+    last_step: Option<Instant>,
+}
+
+impl AutoAdapt {
+    fn new() -> Arc<Self> {
+        Arc::new(AutoAdapt {
+            edge: AtomicU32::new(0),
+            state: Mutex::new(AdaptState::default()),
+        })
+    }
+
+    /// The cap the encode path applies (min with the tuned edge), if any.
+    fn edge_cap(&self) -> Option<u32> {
+        match self.edge.load(Ordering::Relaxed) {
+            0 => None,
+            e => Some(e),
+        }
+    }
+
+    /// Fold one feedback report in; returns `Some((from, to))` when the cap
+    /// stepped (0 = uncapped), for the caller to log. `now` is passed in so
+    /// the streak/hold logic is unit-testable.
+    fn observe(&self, fb: &RecvFeedback, fps_target: u32, now: Instant) -> Option<(u32, u32)> {
+        // Struggling: arriving at under a quarter of the encode rate (the
+        // field failure was 0–6 fps of 60), or a queue backing far up.
+        // Healthy: at least three quarters of it, decoding cleanly, queue
+        // drained. The band between counts as neither — streaks reset, no
+        // step. Decode failures alone are corruption, not overload — the
+        // adaptive IDR cadence owns those.
+        let bad = fb.recv_fps * 4 < fps_target || fb.queue_depth > 24;
+        let good = fb.recv_fps * 4 >= fps_target * 3 && fb.decode_fails == 0 && fb.queue_depth <= 8;
+        let mut st = self.state.lock();
+        if bad {
+            st.bad += 1;
+            st.good = 0;
+        } else if good {
+            st.good += 1;
+            st.bad = 0;
+        } else {
+            st.bad = 0;
+            st.good = 0;
+        }
+        let cur = self.edge.load(Ordering::Relaxed);
+        let held_for = |hold: Duration, st: &AdaptState| {
+            st.last_step.is_none_or(|t| now.duration_since(t) >= hold)
+        };
+        if st.bad >= AUTO_BAD_STREAK && held_for(AUTO_DOWN_HOLD, &st) {
+            // Next rung strictly below the current cap (uncapped → first).
+            let Some(next) = AUTO_EDGES.iter().copied().find(|&e| cur == 0 || e < cur) else {
+                st.bad = 0; // already at the floor — nothing left to give
+                return None;
+            };
+            self.edge.store(next, Ordering::Relaxed);
+            *st = AdaptState {
+                last_step: Some(now),
+                ..AdaptState::default()
+            };
+            return Some((cur, next));
+        }
+        if st.good >= AUTO_GOOD_STREAK && cur != 0 && held_for(AUTO_UP_HOLD, &st) {
+            let next = match AUTO_EDGES.iter().position(|&e| e == cur) {
+                Some(0) | None => 0,
+                Some(i) => AUTO_EDGES[i - 1],
+            };
+            self.edge.store(next, Ordering::Relaxed);
+            *st = AdaptState {
+                last_step: Some(now),
+                ..AdaptState::default()
+            };
+            return Some((cur, next));
+        }
+        None
+    }
 }
 
 #[derive(Default)]
@@ -504,10 +630,12 @@ impl VideoBridge {
         let stop = Arc::new(AtomicBool::new(false));
         let refresh = Arc::new(AtomicBool::new(false));
         let idr_ms = Arc::new(AtomicU64::new(IDR_MS_TIGHT));
-        let (stop_thread, refresh_thread, idr_thread, cb) = (
+        let auto = AutoAdapt::new();
+        let (stop_thread, refresh_thread, idr_thread, auto_thread, cb) = (
             stop.clone(),
             refresh.clone(),
             idr_ms.clone(),
+            auto.clone(),
             on_packet.clone(),
         );
         let status_cb = on_status.clone();
@@ -522,6 +650,7 @@ impl VideoBridge {
                 &stop_thread,
                 &refresh_thread,
                 &idr_thread,
+                &auto_thread,
                 &id,
                 mode,
                 &src,
@@ -545,6 +674,8 @@ impl VideoBridge {
                     on_status,
                     refresh,
                     idr_ms,
+                    tune,
+                    auto,
                 },
             )
         };
@@ -598,11 +729,36 @@ impl VideoBridge {
         // viewer is keeping up cleanly, tighten it the moment it isn't. The
         // encode thread reads the new value on its next frame.
         let want = adaptive_idr_ms(Some(fb));
-        if let Some(r) = self.routes.lock().get(route_id) {
+        let adapt = {
+            let routes = self.routes.lock();
+            let Some(r) = routes.get(route_id) else {
+                return;
+            };
             let was = r.idr_ms.swap(want, Ordering::Relaxed);
             if was != want {
                 tracing::debug!("video {route_id}: forced-IDR cadence {was}ms → {want}ms");
             }
+            (r.auto.clone(), r.tune)
+        };
+        // The auto-scale half: step the encode resolution down when the
+        // viewer demonstrably can't keep up, back up when it recovers
+        // (see [`AutoAdapt`]). Run outside the routes lock — the observe
+        // takes its own.
+        let (auto, tune) = adapt;
+        if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
+            let name = |e: u32| {
+                if e == 0 {
+                    "native".to_string()
+                } else {
+                    format!("≤{e}")
+                }
+            };
+            tracing::info!(
+                "video auto-adapt {route_id}: viewer at {recv_fps} fps of {} — encode edge {} → {}                  (bitrate re-budgets at the new size; next unit is an IDR)",
+                tune.fps(),
+                name(from),
+                name(to),
+            );
         }
     }
 
@@ -658,6 +814,7 @@ fn run_capture(
     stop: &AtomicBool,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
+    auto: &Arc<AutoAdapt>,
     route_id: &str,
     mode: VideoMode,
     source: &VideoSource,
@@ -680,7 +837,7 @@ fn run_capture(
         // on; the camera doesn't need the display lit).
         let _awake = wake::DisplayAwake::hold("hosting a camera stream");
         let fps = tune.fps();
-        let mut encoder = make_encoder(route_id, mode, (0, 0), tune, refresh, idr_ms)?;
+        let mut encoder = make_encoder(route_id, mode, (0, 0), tune, refresh, idr_ms, auto)?;
         let mut stats = StreamStats::new(route_id, encoder.mode());
         let (session, frames) = match crate::camera_capture::open(device, fps) {
             Ok(open) => open,
@@ -755,7 +912,7 @@ fn run_capture(
     // every other backend delivers the upright presentation image (rotation 0).
     // `source_hint` is the monitor's reported size — it only pre-budgets the
     // encoder's starting bitrate; the first real frame locks the true size.
-    let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms)?;
+    let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
     let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
 
@@ -1331,10 +1488,13 @@ struct FrameEncoder {
     quality: u8,
     /// The route's one-shot "resend now" flag (a viewer asked).
     refresh: Arc<AtomicBool>,
+    /// The receiver-driven resolution cap — read per frame, min'd with
+    /// `max_edge` (see [`AutoAdapt`]).
+    auto: Arc<AutoAdapt>,
 }
 
 impl FrameEncoder {
-    fn new(route_id: &str, tune: Tune, refresh: Arc<AtomicBool>) -> Self {
+    fn new(route_id: &str, tune: Tune, refresh: Arc<AtomicBool>, auto: Arc<AutoAdapt>) -> Self {
         FrameEncoder {
             route_id: route_id.to_string(),
             seq: 0,
@@ -1344,6 +1504,7 @@ impl FrameEncoder {
             max_edge: tune.mjpeg_edge(),
             quality: tune.jpeg_quality(),
             refresh,
+            auto,
         }
     }
 
@@ -1354,7 +1515,11 @@ impl FrameEncoder {
         sh: u32,
         stats: &mut StreamStats,
     ) -> Result<Option<VideoFrame>, String> {
-        let (dw, dh) = fit_within(sw, sh, self.max_edge);
+        let edge = match self.auto.edge_cap() {
+            Some(cap) => self.max_edge.min(cap),
+            None => self.max_edge,
+        };
+        let (dw, dh) = fit_within(sw, sh, edge);
         let t0 = Instant::now();
         let scaled = if (dw, dh) == (sw, sh) {
             rgba
@@ -1388,6 +1553,7 @@ impl FrameEncoder {
 /// One route's encoder for the negotiated transport — with the rule that
 /// an encoder that can't init (openh264 build/runtime trouble) must cost
 /// quality, not the stream: fall back to MJPEG and say so.
+#[allow(clippy::too_many_arguments)]
 fn make_encoder(
     route_id: &str,
     mode: VideoMode,
@@ -1395,8 +1561,9 @@ fn make_encoder(
     tune: Tune,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
+    auto: &Arc<AutoAdapt>,
 ) -> Result<StreamEncoder, String> {
-    match StreamEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms) {
+    match StreamEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms, auto) {
         Ok(enc) => Ok(enc),
         Err(e) => {
             tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
@@ -1407,6 +1574,7 @@ fn make_encoder(
                 tune,
                 refresh,
                 idr_ms,
+                auto,
             )
         }
     }
@@ -1433,6 +1601,7 @@ impl StreamEncoder {
     /// monitor's), which pre-budgets the H.264 bitrate; `(0, 0)` =
     /// unknown. The real budget locks to the first frame's true fitted
     /// size either way (logical-vs-physical monitor reports differ).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         route_id: &str,
         mode: VideoMode,
@@ -1440,6 +1609,7 @@ impl StreamEncoder {
         tune: Tune,
         refresh: &Arc<AtomicBool>,
         idr_ms: &Arc<AtomicU64>,
+        auto: &Arc<AutoAdapt>,
     ) -> Result<Self, String> {
         match mode {
             // MJPEG is stateless — no keyframes — so the adaptive IDR cadence
@@ -1448,12 +1618,14 @@ impl StreamEncoder {
                 route_id,
                 tune,
                 refresh.clone(),
+                auto.clone(),
             ))),
             VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new(
                 source_hint,
                 tune,
                 refresh.clone(),
                 idr_ms.clone(),
+                auto.clone(),
             )?))),
         }
     }
@@ -1511,6 +1683,10 @@ struct H264Stream {
     /// ([`VideoBridge::note_feedback`]). Read fresh each frame; default
     /// [`IDR_MS_TIGHT`].
     idr_ms: Arc<AtomicU64>,
+    /// The receiver-driven resolution cap ([`AutoAdapt`]), min'd with the
+    /// tuned edge per frame — a changed fit re-inits the encoder through the
+    /// budget-size rebuild below, no capture restart.
+    auto: Arc<AutoAdapt>,
 }
 
 impl H264Stream {
@@ -1519,16 +1695,21 @@ impl H264Stream {
         tune: Tune,
         refresh: Arc<AtomicBool>,
         idr_ms: Arc<AtomicU64>,
+        auto: Arc<AutoAdapt>,
     ) -> Result<Self, String> {
         let fps = tune.fps();
         // Pre-budget from the monitor's report fitted to the edge
         // ceiling (unknown → 1080p, the old fixed default's density);
         // the first real frame corrects it if the capture's true size
         // differs.
+        let auto_capped_edge = match auto.edge_cap() {
+            Some(cap) => tune.h264_edge().min(cap),
+            None => tune.h264_edge(),
+        };
         let (bw, bh) = if source_hint.0 == 0 || source_hint.1 == 0 {
             (1920, 1080)
         } else {
-            fit_within_even(source_hint.0, source_hint.1, tune.h264_edge())
+            fit_within_even(source_hint.0, source_hint.1, auto_capped_edge)
         };
         let codec = make_h264_codec(bw, bh, fps, tune)?;
         Ok(H264Stream {
@@ -1543,7 +1724,17 @@ impl H264Stream {
             last_emit: None,
             refresh,
             idr_ms,
+            auto,
         })
+    }
+
+    /// The edge this frame fits to: the tuned ceiling, capped by the
+    /// receiver-driven auto-adapt when it's active.
+    fn effective_edge(&self) -> u32 {
+        match self.auto.edge_cap() {
+            Some(cap) => self.tune.h264_edge().min(cap),
+            None => self.tune.h264_edge(),
+        }
     }
 
     fn encode(
@@ -1556,7 +1747,7 @@ impl H264Stream {
         if sw == 0 || sh == 0 {
             return Ok(None);
         }
-        let (dw, dh) = fit_within_even(sw, sh, self.tune.h264_edge());
+        let (dw, dh) = fit_within_even(sw, sh, self.effective_edge());
         // The real fitted size is known now — if it differs from what the
         // bitrate was budgeted for (HiDPI monitors *report* logical pixels
         // but *capture* physical ones), rebuild the encoder on a corrected
@@ -1738,6 +1929,30 @@ impl H264Codec for MfCodec {
     }
 }
 
+/// VideoToolbox hardware backend — the Mac's media engine, no FFmpeg
+/// toolchain (see `videotoolbox.rs`). Thin wrapper so the inherent methods
+/// don't clash with the trait.
+#[cfg(target_os = "macos")]
+struct VtCodec(crate::videotoolbox::VideoToolboxH264);
+
+#[cfg(target_os = "macos")]
+impl H264Codec for VtCodec {
+    fn encode_i420(
+        &mut self,
+        i420: &[u8],
+        _w: usize,
+        _h: usize,
+        force_idr: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        // The session is fixed to the size it was opened at — the same
+        // (dw, dh) the ladder built it for; `H264Stream` rebuilds on resize.
+        self.0.encode_i420(i420, force_idr)
+    }
+    fn label(&self) -> &str {
+        self.0.label()
+    }
+}
+
 /// FFmpeg hardware backend (NVENC/AMF/QSV/VideoToolbox/VA-API), behind the
 /// `hwenc` feature. Thin wrapper so the inherent methods on `hwenc::FfmpegH264`
 /// don't clash with the trait.
@@ -1802,6 +2017,34 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
             }
         }
     }
+    // macOS: the media engine via VideoToolbox — hardware required (its
+    // software fallback would just be a slower openh264), frame-send-tested
+    // like every rung. This is what takes a Retina Mac host off software
+    // openh264, the encoder the viewer experienced as a slideshow.
+    #[cfg(target_os = "macos")]
+    {
+        let bitrate = tune
+            .bitrate
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .clamp(250_000, 80_000_000);
+        match crate::videotoolbox::VideoToolboxH264::open(bw, bh, fps, bitrate) {
+            Ok(enc) => {
+                let mut codec = VtCodec(enc);
+                if codec_emits_frame(&mut codec, bw, bh) {
+                    tracing::info!(
+                        "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                        codec.label(),
+                        bitrate as f64 / 1e6
+                    );
+                    return Ok(Box::new(codec));
+                }
+                tracing::info!(
+                    "VideoToolbox opened but produced no frame in the send test — stepping down"
+                );
+            }
+            Err(e) => tracing::debug!("VideoToolbox H.264 unavailable: {e}"),
+        }
+    }
     #[cfg(feature = "hwenc")]
     {
         let bitrate = tune
@@ -1843,7 +2086,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
 /// The frame-send test that drives the step-down: feed one neutral-grey I420
 /// and confirm the encoder emits an access unit within a few frames. A backend
 /// that opens but won't actually produce frames is stepped over.
-#[cfg(any(feature = "hwenc", windows))]
+#[cfg(any(feature = "hwenc", windows, target_os = "macos"))]
 fn codec_emits_frame(codec: &mut dyn H264Codec, w: u32, h: u32) -> bool {
     let (w, h) = (w as usize, h as usize);
     let grey = vec![128u8; w * h + 2 * ((w / 2) * (h / 2))];
@@ -1925,6 +2168,88 @@ use allmystuff_pixels::{scale_rgba, scale_rgba_to_i420};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fb(recv_fps: u32, decode_fails: u32, queue_depth: u32) -> RecvFeedback {
+        RecvFeedback {
+            recv_fps,
+            decode_fails,
+            queue_depth,
+            at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn auto_adapt_steps_down_after_a_sustained_stall_and_holds_between_steps() {
+        // The field failure: a 60 fps encode arriving at 0–6 fps for tens of
+        // seconds while the sender kept pushing full resolution.
+        let auto = AutoAdapt::new();
+        let t0 = Instant::now();
+        // Two struggling reports: not yet a verdict.
+        assert_eq!(auto.observe(&fb(2, 2, 0), 60, t0), None);
+        assert_eq!(auto.observe(&fb(0, 1, 0), 60, t0), None);
+        assert!(auto.edge_cap().is_none());
+        // Third consecutive: step down one rung.
+        assert_eq!(auto.observe(&fb(4, 0, 0), 60, t0), Some((0, 2560)));
+        assert_eq!(auto.edge_cap(), Some(2560));
+        // Still struggling immediately after — held by the settle window,
+        // no second step until it has had time to show up in feedback.
+        for _ in 0..5 {
+            assert_eq!(auto.observe(&fb(0, 0, 0), 60, t0), None);
+        }
+        // Past the hold, the sustained stall steps again.
+        let t1 = t0 + AUTO_DOWN_HOLD;
+        assert_eq!(auto.observe(&fb(0, 0, 0), 60, t1), Some((2560, 1920)));
+        // A healthy report in a bad streak resets it — no flappy verdicts.
+        let t2 = t1 + AUTO_DOWN_HOLD;
+        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.observe(&fb(55, 0, 0), 60, t2), None); // healthy
+        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.edge_cap(), Some(1920), "reset streak must not step");
+    }
+
+    #[test]
+    fn auto_adapt_recovers_slowly_and_stops_at_the_floor() {
+        let auto = AutoAdapt::new();
+        let t0 = Instant::now();
+        // Drive it to the floor.
+        let mut t = t0;
+        for _ in 0..AUTO_EDGES.len() {
+            t += AUTO_DOWN_HOLD;
+            for _ in 0..AUTO_BAD_STREAK {
+                auto.observe(&fb(0, 0, 40), 60, t);
+            }
+        }
+        assert_eq!(auto.edge_cap(), Some(*AUTO_EDGES.last().unwrap()));
+        // Still bad at the floor: nothing further to give, no churn.
+        t += AUTO_DOWN_HOLD;
+        for _ in 0..10 {
+            assert_eq!(auto.observe(&fb(0, 0, 40), 60, t), None);
+        }
+        // Sustained health past the up-hold steps back up exactly one rung
+        // per streak — slow up, so the picture never oscillates.
+        t += AUTO_UP_HOLD;
+        let mut stepped = None;
+        for _ in 0..AUTO_GOOD_STREAK {
+            stepped = auto.observe(&fb(58, 0, 0), 60, t);
+        }
+        assert_eq!(stepped, Some((960, 1280)));
+        // And from the top rung, recovery lifts the cap entirely.
+        let auto = AutoAdapt::new();
+        let t1 = Instant::now();
+        for _ in 0..AUTO_BAD_STREAK {
+            auto.observe(&fb(0, 0, 0), 60, t1);
+        }
+        assert_eq!(auto.edge_cap(), Some(2560));
+        let t2 = t1 + AUTO_UP_HOLD;
+        let mut lifted = None;
+        for _ in 0..AUTO_GOOD_STREAK {
+            lifted = auto.observe(&fb(58, 0, 0), 60, t2);
+        }
+        assert_eq!(lifted, Some((2560, 0)));
+        assert!(auto.edge_cap().is_none());
+    }
 
     #[test]
     fn h264_ladder_picks_a_backend_that_emits_a_frame() {
@@ -2022,7 +2347,12 @@ mod tests {
     }
 
     fn test_frame_encoder() -> FrameEncoder {
-        FrameEncoder::new("r", Tune::default(), Arc::new(AtomicBool::new(false)))
+        FrameEncoder::new(
+            "r",
+            Tune::default(),
+            Arc::new(AtomicBool::new(false)),
+            AutoAdapt::new(),
+        )
     }
 
     #[test]
@@ -2065,7 +2395,7 @@ mod tests {
     fn a_refresh_ask_resends_an_unchanged_frame_immediately() {
         let mut stats = StreamStats::new("r", VideoMode::Mjpeg);
         let refresh = Arc::new(AtomicBool::new(false));
-        let mut enc = FrameEncoder::new("r", Tune::default(), refresh.clone());
+        let mut enc = FrameEncoder::new("r", Tune::default(), refresh.clone(), AutoAdapt::new());
         let a = vec![10u8; 8 * 8 * 4];
         enc.encode(a.clone(), 8, 8, &mut stats)
             .unwrap()
@@ -2206,6 +2536,7 @@ mod tests {
             Tune::default(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+            AutoAdapt::new(),
         )
         .expect("openh264 init");
         // A 64×64 solid frame → first unit out must be a key (IDR + SPS/PPS
