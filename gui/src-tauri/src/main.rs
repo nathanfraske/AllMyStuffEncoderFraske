@@ -156,6 +156,21 @@ fn restart_app(app: tauri::AppHandle) {
     app.restart()
 }
 
+/// Reboot a machine's whole OS — the gear menu's step past [`restart_node`].
+/// The node routes it: our own device hands straight to the OS, a fleet
+/// machine is asked over the mesh (owner/fleet enforced there, and the OS's
+/// own privilege rules after that). Its presence dropping and returning is
+/// the confirmation.
+#[tauri::command]
+async fn restart_device(state: State<'_, AppState>, node: String) -> Result<(), String> {
+    state
+        .node
+        .request("restart_device", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Re-learn a node's details for the refresh control. `node` omitted = **this**
 /// device (re-scan + re-advertise its own profile); a peer id asks that node to
 /// re-send its profile (rate-limited on the far side) so our stored view of its
@@ -1276,6 +1291,20 @@ async fn mesh_peers(state: State<'_, AppState>, network: String) -> Result<Value
         .map_err(|e| e.to_string())
 }
 
+/// The engine's daemon-link status as last emitted on
+/// `allmystuff://subscription` — the poll-safe truth for a front-end that
+/// subscribed after the one-shot event fired. Distinguishes "node socket
+/// answers" from "the mesh behind it is live". (`mesh_status` above is the
+/// raw daemon Status passthrough — a different question.)
+#[tauri::command]
+async fn link_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("link_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn mesh_network_add(state: State<'_, AppState>, config: Value) -> Result<Value, String> {
     state
@@ -1928,6 +1957,7 @@ fn main() {
             upgrade_node,
             restart_node,
             restart_app,
+            restart_device,
             refresh_node,
             set_claimable,
             kvm_attach,
@@ -1985,6 +2015,7 @@ fn main() {
             mesh_identity,
             mesh_networks,
             mesh_peers,
+            link_status,
             mesh_network_add,
             mesh_network_remove,
             mesh_network_update,

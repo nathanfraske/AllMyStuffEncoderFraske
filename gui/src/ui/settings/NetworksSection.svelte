@@ -59,10 +59,13 @@
     joinVenue = PUBLIC_VENUE_ID;
     mode = "none";
   }
-  async function copyHandle(handle: string) {
+  async function copyHandle(networkId: string) {
     try {
-      await navigator.clipboard.writeText(handle);
-      copied = handle;
+      // The invite carries the mesh's venue(s) when they aren't Public —
+      // two devices joining the same name on different relay sets never
+      // meet, with no error anywhere, so the handle alone isn't enough.
+      await navigator.clipboard.writeText(app.meshInvite(networkId));
+      copied = networkId;
       setTimeout(() => (copied = ""), 1500);
     } catch {
       app.toast("warn", "Couldn't copy — select it by hand");
@@ -143,7 +146,7 @@
         <div class="row">
           <input
             class="field"
-            placeholder="mesh name OR leave blank to generate one"
+            placeholder="mesh name or invite — or leave blank to generate one"
             bind:value={joinId}
             onkeydown={(e) => e.key === "Enter" && join()}
           />
@@ -154,7 +157,7 @@
           </select>
           <button class="btn small primary" onclick={join}>Join</button>
         </div>
-        <p class="hint">A mesh is just a name you agree on — anyone who uses the same name meets here. Leave it blank for a memorable generated one. The venue is where it calls out (Public by default).</p>
+        <p class="hint">A mesh is just a name you agree on — anyone who uses the same name <i>on the same venue</i> meets here. Paste an invite (Copy invite on the other device) and the venue comes with it; otherwise leave it blank for a memorable generated one and pick where it calls out (Public by default).</p>
       {/if}
 
       <ul class="nets">
@@ -181,7 +184,7 @@
                 <span class="net-name">{app.meshLabel(n)}{#if app.sessionNetwork === n.config_id}<span class="badge">active</span>{/if}</span>
                 <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
               </button>
-              <button class="btn small" title="Copy this mesh's handle to add a device" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy id"}</button>
+              <button class="btn small" title="Copy this mesh's invite to add a device — it carries the mesh's venue, so the other device lands on the same relays" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy invite"}</button>
               <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
               <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
               <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
@@ -209,8 +212,11 @@
       <h4>Add a device</h4>
       <p class="hint">
         Machines aren't added by hand — install AllMyStuff on the other device
-        and join this mesh with its handle (Copy id above). Meshes are open, so
-        it's admitted automatically and shows up here and on the graph on its own.
+        and join this mesh with its invite (Copy invite above). The invite
+        carries the mesh's venue when it isn't Public, so both devices call out
+        at the same relays — the usual reason two devices "never meet" is
+        joining the same name on different venues. Meshes are open, so it's
+        admitted automatically and shows up here and on the graph on its own.
       </p>
     </section>
 

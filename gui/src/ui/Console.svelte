@@ -117,6 +117,15 @@
   // placeholder before the first frame, and as a banner if the stream
   // stalls after one. Null = no condition reported (or it cleared).
   let hostStatus = $state<VideoHostStatus | null>(null);
+  // The video route was refused, or its offer expired unanswered (the far
+  // side's app isn't running, or it NACKed a route it no longer holds) —
+  // the reason replaces "Connecting…" so a dead stage explains itself.
+  const videoRefused = $derived.by(() => {
+    const live = app.consoleVideoLive;
+    if (!live) return null;
+    const st = app.routeStates[live];
+    return st?.state === "rejected" ? st.reason || "the far side refused the stream" : null;
+  });
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
@@ -900,7 +909,9 @@
           {#if hasFrame}
             <!-- the canvas above is the stage; a host-reported stall (the
                  remote display sleeping mid-session) banners over it. -->
-            {#if hostStatus}
+            {#if videoRefused}
+              <div class="host-status">{videoRefused}</div>
+            {:else if hostStatus}
               <div class="host-status">{hostStatusText(hostStatus)}</div>
             {/if}
           {:else if selected}
@@ -909,11 +920,13 @@
               <div class="screen-title">{selected.label}</div>
               {#if selected.media === "display"}
                 <div class="screen-note">
-                  {hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…"}
+                  {videoRefused ??
+                    (hostStatus ? hostStatusText(hostStatus) : "Connecting this machine's display…")}
                 </div>
               {:else if cameraSupported}
                 <div class="screen-note">
-                  {hostStatus ? hostStatusText(hostStatus) : "Connecting this camera…"}
+                  {videoRefused ??
+                    (hostStatus ? hostStatusText(hostStatus) : "Connecting this camera…")}
                 </div>
               {:else}
                 <div class="screen-note">

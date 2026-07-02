@@ -127,3 +127,39 @@ export async function fetchVenueServers(url: string): Promise<ServerSet> {
     })),
   };
 }
+
+// ---- mesh invites --------------------------------------------------------
+//
+// A mesh's shareable handle used to be the bare network id — but rendezvous
+// depends on both sides dialing the SAME signaling relays, so a handle joined
+// on the wrong venue simply never meets its mesh, with no error anywhere. A
+// compound invite (`handle#<venues>`) carries the venue(s) too, as base64url
+// of the very envelopes Export/Import already speak.
+
+/** Encode venues into an invite's `#` part. */
+export function encodeInviteVenues(venues: Venue[]): string {
+  const json = JSON.stringify(venues.map(exportVenue));
+  const bytes = new TextEncoder().encode(json);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+/** Decode an invite's `#` part back into venue envelopes. Null when the part
+ *  isn't ours (a stray `#` in a pasted string must not eat the join). */
+export function decodeInviteVenues(part: string): VenueExport[] | null {
+  try {
+    const b64 = part.replaceAll("-", "+").replaceAll("_", "/");
+    const pad = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (!Array.isArray(parsed)) return null;
+    // Normalize each entry through the same parser files go through.
+    const envs = parsed
+      .map((e) => tryParseVenue(JSON.stringify(e)))
+      .filter((e): e is VenueExport => !!e);
+    return envs.length === parsed.length && envs.length > 0 ? envs : null;
+  } catch {
+    return null;
+  }
+}

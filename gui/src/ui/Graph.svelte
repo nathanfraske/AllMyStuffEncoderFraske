@@ -577,10 +577,25 @@
   // anchored with `position: fixed` from the gear's on-screen rect.
   let nodeMenu = $state<{ id: string; left: number; top: number } | null>(null);
   const MENU_W = 216;
-  const MENU_H = 124;
+  // Per-item height + container padding for the flip math below — the menu's
+  // real height depends on which items this node offers.
+  const MENU_ITEM_H = 56;
+  const MENU_PAD = 12;
+
+  // "Restart this device" is destructive enough for the two-step arm the
+  // fleet's kick button uses: first click arms ("click again to confirm"),
+  // the second acts. Disarms itself, on any other menu, and with the menu.
+  let restartDeviceArmed = $state<string | null>(null);
+
+  function menuHeight(nodeId: string): number {
+    const mn = app.node(nodeId);
+    const items = 1 + (app.canRestartApp(mn) ? 1 : 0) + (app.canRestartDevice(mn) ? 1 : 0);
+    return MENU_PAD + items * MENU_ITEM_H;
+  }
 
   function openNodeMenu(e: MouseEvent, nodeId: string) {
     e.stopPropagation();
+    restartDeviceArmed = null;
     if (nodeMenu?.id === nodeId) {
       nodeMenu = null; // toggle closed
       return;
@@ -588,14 +603,15 @@
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    const menuH = menuHeight(nodeId);
     // Flip toward whichever side has room: open up when the gear is near the
     // bottom, and align to the right edge when it's near the right.
-    const openUp = r.bottom + MENU_H + 8 > vh;
+    const openUp = r.bottom + menuH + 8 > vh;
     const openLeft = r.left + MENU_W + 8 > vw;
     const left = openLeft
       ? Math.max(8, r.right - MENU_W)
       : Math.min(r.left, vw - MENU_W - 8);
-    const top = openUp ? Math.max(8, r.top - MENU_H - 6) : r.bottom + 6;
+    const top = openUp ? Math.max(8, r.top - menuH - 6) : r.bottom + 6;
     nodeMenu = { id: nodeId, left, top };
   }
 
@@ -785,6 +801,16 @@
             {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
             {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
             {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+            {#if n.needsTurn && !n.online}
+              <!-- The daemon's ICE watchdog verdict, surfaced: this link keeps
+                   failing with no relay in play. Without the chip the device
+                   is just… quiet, and nobody guesses "add a TURN server". -->
+              <span
+                class="tag blocked"
+                title="Direct connection keeps failing and no relay is configured — add a TURN server to this mesh's venue (mesh settings → Servers)"
+                >⛔ needs relay</span
+              >
+            {/if}
           </div>
           <button
             class="cbtn status-refresh"
@@ -1029,6 +1055,42 @@
           <span class="nm-label">{app.isMe(menuId) ? "Restart this app" : "Restart app"}</span>
           <span class="nm-sub"
             >{app.isMe(menuId) ? "relaunch AllMyStuff here" : "relaunch it on that machine"}</span
+          >
+        </span>
+      </button>
+    {/if}
+    {#if app.canRestartDevice(mn)}
+      <!-- The step past an app relaunch: reboot the whole machine. Two-step
+           arm (the fleet-kick pattern) — a reboot is disruptive enough that a
+           stray click must not fire it. -->
+      <button
+        class="nm-item"
+        class:armed={restartDeviceArmed === menuId}
+        role="menuitem"
+        onclick={() => {
+          if (restartDeviceArmed === menuId) {
+            restartDeviceArmed = null;
+            app.restartNodeDevice(menuId);
+            nodeMenu = null;
+          } else {
+            restartDeviceArmed = menuId;
+            setTimeout(() => {
+              if (restartDeviceArmed === menuId) restartDeviceArmed = null;
+            }, 3500);
+          }
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">⏻</span>
+        <span class="nm-text">
+          <span class="nm-label"
+            >{app.isMe(menuId) ? "Restart this device" : "Restart device"}</span
+          >
+          <span class="nm-sub"
+            >{restartDeviceArmed === menuId
+              ? "click again to confirm"
+              : app.isMe(menuId)
+                ? "reboot this whole machine"
+                : "reboot that whole machine"}</span
           >
         </span>
       </button>
@@ -1640,6 +1702,14 @@
   .nm-item:hover {
     background: var(--accent-soft);
   }
+  /* The armed half of the reboot's two-step confirm reads as the warning
+     it is. */
+  .nm-item.armed {
+    background: var(--danger-soft);
+  }
+  .nm-item.armed .nm-label {
+    color: var(--danger);
+  }
   .nm-icon {
     font-size: 0.95rem;
     width: 1.1rem;
@@ -1789,6 +1859,14 @@
     background: var(--accent-soft);
     color: var(--accent-ink);
     border: 1px solid var(--accent);
+    font-weight: 700;
+  }
+  /* The ICE watchdog's "this link needs a TURN relay" verdict — a warning,
+     not a decoration: it names the only fix. */
+  .tag.blocked {
+    background: var(--warn-soft);
+    color: var(--warn);
+    border: 1px solid var(--warn);
     font-weight: 700;
   }
   /* "Someone else's, not shared with me" — bronze keeps it distinct from a

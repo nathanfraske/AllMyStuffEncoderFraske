@@ -244,6 +244,21 @@ pub struct NodeProfile {
     /// so the presence shape an older receiver sees is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kvm: Option<KvmAdvert>,
+    /// The sender's **wall clock when this advert was stamped for send**
+    /// (Unix ms). A receiver reads it as a free clock-skew sample against
+    /// its own clock — the basis of the "this device's clock is out of sync
+    /// with the network" warning, built entirely from traffic that was
+    /// flowing anyway (no extra calls to any node). Stamped per send, never
+    /// persisted. `0` = an older sender (no sample); zero serializes
+    /// *without* the key, so an older receiver — and the KVM bridge's
+    /// pinned Go fixtures — sees exactly the presence shape it always did.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub sent_at: u64,
+}
+
+/// `skip_serializing_if` helper for additive numeric presence fields.
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// One site a node exposes — a TCP service it's listening on that it's
@@ -579,6 +594,15 @@ pub enum AppControl {
     /// gates it owner/fleet, exactly like [`AppControl::Upgrade`], and relaunches
     /// the same OS-aware way; its next presence advert is the confirmation.
     Restart,
+    /// "Reboot the machine you run on." The recovery step heavier than
+    /// [`AppControl::Restart`] — the whole OS goes down and back, for the
+    /// wedge an app relaunch can't clear (a hung compositor, a driver, a
+    /// machine that needs its updates applied). Gated owner/fleet exactly
+    /// like the app restart; the receiver hands it to the OS (`shutdown -r`
+    /// and kin), so the actual reboot also answers to the OS's own privilege
+    /// rules. Its presence dropping and returning is the confirmation. An
+    /// older receiver decodes this as [`AppControl::Unknown`] and ignores it.
+    RestartDevice,
     /// An app-level command a newer build introduced. Ignored here rather
     /// than failing the enclosing [`ControlMessage`].
     #[serde(other)]
@@ -908,10 +932,39 @@ mod tests {
             fleet_name: "Casey".into(),
             fleet_owner: "Casey".into(),
             kvm: None,
+            sent_at: 1_751_400_000_000,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn presence_sent_at_accepts_skew_both_ways() {
+        // An older peer's advert has no `sent_at` — it decodes as 0 ("no
+        // sample") rather than failing, so the node never vanishes and the
+        // skew estimator simply skips it.
+        let json = r#"{
+            "protocol": 1, "node": "old", "label": "Old", "hostname": "old",
+            "summary": {"os":"linux","cpu":"cpu","ram_bytes":1,"device_count":1}
+        }"#;
+        let p: NodeProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.sent_at, 0);
+
+        // Zero serializes *without* the key, so an older receiver — and the
+        // KVM bridge's pinned Go fixtures — sees the unchanged shape.
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("sent_at"));
+
+        // A populated stamp round-trips.
+        let p = NodeProfile {
+            sent_at: 1_751_400_000_000,
+            ..p
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"sent_at\":1751400000000"));
+        let back: NodeProfile = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.sent_at, 1_751_400_000_000);
     }
 
     #[test]

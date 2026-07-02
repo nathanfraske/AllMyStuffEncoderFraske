@@ -142,14 +142,18 @@
         >
           <span class="net-dot"></span>
           {!app.backendConnected
-            ? "demo mode"
-            : app.networks.length > 1
-              ? `${app.networks.length} meshes`
-              : app.activeNetwork
-                ? app.meshLabel(app.activeNetwork)
-                : app.disabledNets.length > 0
-                  ? "meshes off"
-                  : "no mesh"}
+            ? app.meshStatus === "disconnected"
+              ? "mesh reconnecting…"
+              : "demo mode"
+            : app.meshStatus === "disconnected"
+              ? "mesh reconnecting…"
+              : app.networks.length > 1
+                ? `${app.networks.length} meshes`
+                : app.activeNetwork
+                  ? app.meshLabel(app.activeNetwork)
+                  : app.disabledNets.length > 0
+                    ? "meshes off"
+                    : "no mesh"}
           {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
           <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
         </button>
@@ -188,6 +192,20 @@
     </div>
 
     <div class="actions">
+      <!-- The clock-skew warning: this machine's clock is well out of line
+           with its peers' (estimated passively from traffic that was already
+           flowing). Persistent while it holds — a wrong clock quietly breaks
+           fleet-roster convergence, custody codes and shared timestamps. -->
+      {#if app.clockSkew}
+        <button
+          class="nudge"
+          onclick={() => app.toast("warn", app.clockSkew?.message ?? "")}
+          title={app.clockSkew.message}
+        >
+          <span class="nudge-mark" aria-hidden="true">🕑</span>
+          clock out of sync
+        </button>
+      {/if}
       <!-- A device offering itself for adoption: the brand-accent claim nudge.
            (Meshes are fully open now — any node that joins is admitted
            automatically — so there's no "device wants in" approval nudge.) -->

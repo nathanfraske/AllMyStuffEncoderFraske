@@ -101,6 +101,15 @@ impl DaemonChild {
             pid,
         }
     }
+
+    /// Whether the supervised daemon has exited, without blocking — the
+    /// supervisor's poll. `Some(status)` once it's gone (respawn time),
+    /// `None` while it runs. A `try_wait` error reads as still-running:
+    /// the control-socket probe is the backstop, and killing a healthy
+    /// daemon over a transient wait error would be the worse mistake.
+    pub fn try_exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut()?.try_wait().ok().flatten()
+    }
 }
 
 impl Drop for DaemonChild {

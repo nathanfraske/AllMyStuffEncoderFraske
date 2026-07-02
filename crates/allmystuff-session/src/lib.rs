@@ -280,6 +280,27 @@ impl Session {
         }
     }
 
+    /// Expire an outbound offer nobody answered: transition it to
+    /// `Rejected` with a reason the UI can show, so "awaiting accept" is a
+    /// state with a deadline instead of a black screen forever (the far
+    /// side's app may not be running even though its daemon — and so its
+    /// presence — is). Returns whether anything changed; the caller times
+    /// the offers (this state machine is deliberately clock-free) and
+    /// refreshes its snapshot on `true`. No message to the peer: there's
+    /// nobody answering, and a late `Accept` still lands (the route just
+    /// reads rejected here; re-offering mints a fresh route id anyway).
+    pub fn expire_offer(&mut self, route_id: &str, reason: impl Into<String>) -> bool {
+        match self.routes.get_mut(route_id) {
+            Some(r) if r.origin == Origin::Outbound && r.state == RouteState::Offered => {
+                r.state = RouteState::Rejected {
+                    reason: reason.into(),
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Locally tear a route down. Returns the message to send the peer (if
     /// the route was known) so they stop too.
     pub fn teardown(&mut self, route_id: &str) -> Option<ControlMessage> {
@@ -426,8 +447,21 @@ impl Session {
                 Vec::new()
             }
             RouteControl::Reject { route_id, reason } => {
+                // Only the route's own peer may reject it — the same rule
+                // Refresh/Tune enforce; without it any node could kill
+                // others' routes by name. A reject can now also land on an
+                // *active* route (the far side refusing frames it no longer
+                // wants, or a receiver NACKing a route it doesn't hold), so
+                // an active outbound route stops its media too — otherwise
+                // the capture keeps encoding into the void.
                 if let Some(r) = self.routes.get_mut(&route_id) {
-                    r.state = RouteState::Rejected { reason };
+                    if r.peer == from {
+                        let stop = r.is_active() && r.origin == Origin::Outbound;
+                        r.state = RouteState::Rejected { reason };
+                        if stop {
+                            return vec![Effect::StopMedia(route_id)];
+                        }
+                    }
                 }
                 Vec::new()
             }
@@ -552,6 +586,7 @@ mod tests {
             fleet_name: String::new(),
             fleet_owner: String::new(),
             kvm: None,
+            sent_at: 0,
         }
     }
 
@@ -833,6 +868,71 @@ mod tests {
         let effects = s.drop_peer(&"this".into());
         assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
         assert!(s.peer(&"this".into()).is_none());
+    }
+
+    #[test]
+    fn reject_stops_media_on_an_active_outbound_route_and_only_from_its_peer() {
+        let mut s = Session::new("desk");
+        let _ = s.offer(route("r1"), "peer", Vec::new(), Vec::new());
+        let fx = s.handle(
+            "peer".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                session: None,
+            }),
+        );
+        assert!(matches!(fx.as_slice(), [Effect::StartMedia(_)]));
+        // A stranger's reject is ignored — any node could otherwise kill
+        // routes by name.
+        let fx = s.handle(
+            "mallory".into(),
+            ControlMessage::Route(RouteControl::Reject {
+                route_id: "r1".into(),
+                reason: "nope".into(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.route("r1").unwrap().is_active());
+        // The route's own peer refusing an *active* route stops the media —
+        // the receiver NACKing frames it can't place must halt the encoder,
+        // not leave it streaming into the void.
+        let fx = s.handle(
+            "peer".into(),
+            ControlMessage::Route(RouteControl::Reject {
+                route_id: "r1".into(),
+                reason: "route not live here".into(),
+            }),
+        );
+        assert!(matches!(fx.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            s.route("r1").unwrap().state,
+            RouteState::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn unanswered_offers_expire_to_rejected_with_a_reason() {
+        let mut s = Session::new("desk");
+        let _ = s.offer(route("r1"), "peer", Vec::new(), Vec::new());
+        assert!(s.expire_offer("r1", "no answer"));
+        match &s.route("r1").unwrap().state {
+            RouteState::Rejected { reason } => assert_eq!(reason, "no answer"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // Idempotent: an already-expired (or unknown) offer is a no-op…
+        assert!(!s.expire_offer("r1", "again"));
+        assert!(!s.expire_offer("r-unknown", "??"));
+        // …and an *answered* route can never expire.
+        let _ = s.offer(route("r2"), "peer", Vec::new(), Vec::new());
+        let _ = s.handle(
+            "peer".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r2".into(),
+                session: None,
+            }),
+        );
+        assert!(!s.expire_offer("r2", "too late"));
+        assert!(s.route("r2").unwrap().is_active());
     }
 
     #[test]
