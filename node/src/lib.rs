@@ -60,6 +60,11 @@ pub mod sites;
 pub mod terminal;
 pub mod video;
 pub mod video_decode;
+/// Hardware H.264 encode via VideoToolbox — the Mac's media engine, no
+/// FFmpeg toolchain; the encoder ladder in [`video`] frame-send-tests it and
+/// falls back to software openh264.
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 pub mod wake;
 // Windows screen capture (in-house DXGI). Declared on every target — the
 // module is internally `cfg`-gated to a stub off Windows, exactly as it was
