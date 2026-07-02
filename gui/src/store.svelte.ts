@@ -34,7 +34,12 @@ import {
   unionServers,
   type Venue,
 } from "./venues";
-import { fetchVenueServers } from "./venue-settings";
+import {
+  decodeInviteVenues,
+  encodeInviteVenues,
+  fetchVenueServers,
+  venueFromExport,
+} from "./venue-settings";
 import { canonicalNetworkId, generateNetworkPhrase } from "./network-phrase";
 import {
   buildNetworkConfig,
@@ -65,11 +70,13 @@ import {
   isTauri,
   kvmAttach,
   kvmDetach,
+  linkStatus,
   onClockSkew,
   onControlRefused,
   onDeviceRestart,
   onFileProgress,
   onFileSaved,
+  onMeshEvent,
   openFilesWindow,
   pickFilesToShare,
   roomShareFiles,
@@ -236,6 +243,15 @@ function errMsg(e: unknown): string {
 }
 
 /** A short, readable device id for labels when no friendly name is known. */
+/** Order-insensitive equality of two server lists — how an invite's venue
+ *  is matched against one already here, so re-joining doesn't mint dupes. */
+function sameServerSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((x, i) => x === sb[i]);
+}
+
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
 }
@@ -455,6 +471,17 @@ class AppStore {
   clockSkew = $state<{ skewMs: number | null; peers: number | null; message: string } | null>(
     null,
   );
+  /** The node's *mesh* status ("live" / "no_network" / "disconnected" /
+   *  "unknown") — distinct from `backendConnected`, which only says the node
+   *  socket answers. The node can be perfectly alive while its myownmesh
+   *  daemon is down (it reconnects on its own now); during that window the
+   *  header says "mesh reconnecting…" and the per-call error toasts stay
+   *  quiet (they'd all share this one cause). */
+  meshStatus = $state<string>("unknown");
+  /** Per-key latch for mesh-diagnostic toasts (the no-TURN hint), so a
+   *  watchdog that re-fires per ladder cycle warns once per peer, not on
+   *  every cycle. */
+  private meshAlerted = new Set<string>();
   toasts = $state<Toast[]>([]);
   /** Nodes with a refresh in flight — the card's refresh ring spins and its
    *  button is disabled until the data lands (the node's fingerprint changes on
@@ -1216,6 +1243,7 @@ class AppStore {
     this.startMeshPolling();
     await onSubscription((s) => {
       const live = s.status === "live";
+      this.meshStatus = s.status;
       // When the mesh comes up, re-scan + reload networks/identity: the first
       // pass at mount can run before the session is ready.
       if (live) {
@@ -1224,6 +1252,16 @@ class AppStore {
       }
       this.backendConnected = live;
     });
+    // The subscription event is one-shot per transition and this window may
+    // have subscribed after it fired — read the node's *current* verdict
+    // once, so `meshStatus` starts truthful instead of "unknown".
+    void linkStatus().then((s) => {
+      if (s?.status) this.meshStatus = s.status;
+    });
+    // The daemon's own diagnostics (forwarded verbatim by the node): map the
+    // load-bearing ones onto the graph instead of dropping them — the
+    // no-TURN verdict used to be invisible, a peer that was just… quiet.
+    await onMeshEvent((e) => this.handleMeshDiag(e));
     await onSession((snap) => this.applySessionSnapshot(snap));
     // (The rooms plane — invites, join/leave presence, chat, knocks — and
     // its same-device sibling bus are subscribed at the top of init, before
@@ -1297,6 +1335,30 @@ class AppStore {
     }, 3000);
   }
 
+  /** One engine diagnostic off the daemon's event stream. Today the
+   *  load-bearing mapping is the ICE watchdog's no-TURN verdict: mark the
+   *  peer's node (the "needs relay" chip) and say so once — the actionable
+   *  fix (add a TURN server to this mesh's venue) is nothing a user could
+   *  ever have guessed from a silently-offline card. */
+  private handleMeshDiag(e: Record<string, unknown>) {
+    if (e?.event_kind !== "diag") return;
+    const detail = (e.detail ?? {}) as Record<string, unknown>;
+    if (e.category === "ice" && detail.hint === "add_turn_server") {
+      const peer = typeof detail.peer === "string" ? detail.peer : null;
+      const node = peer ? this.nodeByCanonical(peer) : undefined;
+      if (node) node.needsTurn = true;
+      const key = `turn:${peer ?? "?"}`;
+      if (!this.meshAlerted.has(key)) {
+        this.meshAlerted.add(key);
+        const who = node?.label ?? (peer ? shortId(peer) : "a device");
+        this.toast(
+          "warn",
+          `Can't reach ${who} directly — this mesh needs a TURN relay (mesh settings → Servers)`,
+        );
+      }
+    }
+  }
+
   /** Re-pull everything that depends on a live mesh. Shared by the `live`
    *  subscription event and the poll-based recovery so the two can't drift. */
   private pullLiveState() {
@@ -1314,6 +1376,11 @@ class AppStore {
    *  then flips the flag and pulls the live state once. */
   private async recoverBackendConnection() {
     await this.hydrateFromBackend();
+    // Bring the mesh verdict current too: the node answering its socket
+    // (backendConnected) says nothing about the daemon behind it, and the
+    // header's "mesh reconnecting…" state reads from this.
+    const s = await linkStatus();
+    if (s?.status) this.meshStatus = s.status;
     if (this.backendConnected) this.pullLiveState();
   }
 
@@ -1336,6 +1403,7 @@ class AppStore {
         version?: string;
         summary?: InventorySummary;
         endpoints?: Capability[];
+        needsTurn?: boolean;
       }
     >();
     const rosterAll: RosterPeer[] = [];
@@ -1388,6 +1456,10 @@ class AppStore {
           version: undefined as string | undefined,
         };
         if (p.label?.trim()) e.label = p.label.trim();
+        // The daemon's ICE watchdog verdict: this link keeps failing with no
+        // relay in play. Any network reporting it marks the machine — the
+        // card's "needs relay" chip is how the block becomes visible.
+        if (p.needs_turn) e.needsTurn = true;
         // The reliable "on AllMyStuff" signal: a peer advertising the
         // `allmystuff` capability tag on the mesh is an app node, and its
         // remaining tags are the features it offers. This rides the handshake +
@@ -1490,10 +1562,14 @@ class AppStore {
           version: info.version,
           summary: info.summary,
           networks: nodeNets,
+          needsTurn: info.needsTurn ?? false,
         });
       } else {
         node.online = info.online;
         node.networks = nodeNets;
+        // Refreshed every sweep (not only widened) so the chip clears once
+        // the daemon's watchdog stands down after the link recovers.
+        node.needsTurn = info.needsTurn ?? false;
         if (!node.hostname && info.label) node.label = info.label;
         // The mesh marker can flip a node *on* (app node), but it never
         // downgrades one: presence may have already enriched it with richer
@@ -5346,7 +5422,11 @@ class AppStore {
       this.networks = (await meshNetworks()) ?? [];
       if (this.rosterNetwork) await this.refreshRoster(this.rosterNetwork);
     } catch (e) {
-      this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+      // One daemon outage would otherwise toast this from every poll — the
+      // header's "mesh reconnecting…" state already names the one cause.
+      if (this.meshStatus !== "disconnected") {
+        this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+      }
     }
   }
 
@@ -5370,8 +5450,66 @@ class AppStore {
    *  agree on (the signaling handle is a hash of it), so joining a name nobody
    *  else is on *is* creating it. Typed names are canonicalized (lowercased,
    *  spaces → hyphens) so "Beach House" and "beach-house" meet on the same one. */
+  /** The shareable invite for a mesh: the bare handle when it calls out at
+   *  the Public venue only, or `handle#<venues>` when private venue(s) are
+   *  in play — rendezvous needs both sides on the same relays, and a bare
+   *  handle joined against the wrong venue never meets its mesh, with no
+   *  error anywhere. The venue part is base64url of the same envelopes the
+   *  Export/Import files use (`decodeInviteVenues` on the way in). */
+  meshInvite(networkId: string): string {
+    const extra = this.venuesForNetwork(networkId).filter((v) => !v.builtin);
+    if (extra.length === 0) return networkId;
+    return `${networkId}#${encodeInviteVenues(extra)}`;
+  }
+
   async joinNetwork(rawName: string, venueIds: string[] = [PUBLIC_VENUE_ID]) {
-    const typed = rawName.trim();
+    let typed = rawName.trim();
+    // A compound invite carries the venue(s) the mesh calls out at: adopt
+    // them (deduped against venues already here), fetch any remote one so
+    // its servers are real before the join, and use exactly that venue set —
+    // the whole point is landing on the sender's relays, not the picker's.
+    const hash = typed.indexOf("#");
+    if (hash > 0) {
+      const envs = decodeInviteVenues(typed.slice(hash + 1));
+      if (envs) {
+        typed = typed.slice(0, hash).trim();
+        const ids: string[] = [];
+        const added: Venue[] = [];
+        for (const env of envs) {
+          const existing = this.venues.find((v) =>
+            env.url
+              ? v.url === env.url
+              : !v.url &&
+                sameServerSet(v.signaling, env.signaling_servers ?? []) &&
+                sameServerSet(v.stun, env.stun_servers ?? []) &&
+                sameServerSet(
+                  v.turn.map((t) => t.url),
+                  (env.turn_servers ?? []).map((t) => t.url),
+                ),
+          );
+          if (existing) {
+            ids.push(existing.id);
+            continue;
+          }
+          const v = venueFromExport(env);
+          added.push(v);
+          ids.push(v.id);
+        }
+        if (added.length) {
+          this.venues = [...this.venues, ...added];
+          this.persistVenues();
+          // A remote venue arrives as a pointer; fetch its servers now so
+          // the join below writes real relays into the daemon config.
+          for (const v of added) {
+            if (v.url) await this.refreshVenue(v.id);
+          }
+        }
+        venueIds = ids;
+      } else {
+        this.toast("warn", "That invite's venue part didn't parse — joining by name alone");
+        typed = typed.slice(0, hash).trim();
+      }
+    }
     const id = typed ? canonicalNetworkId(typed) : generateNetworkPhrase();
     if (id.length < 3 || id.length > 64) {
       this.toast("warn", "A mesh name needs 3–64 letters, digits or hyphens");
@@ -5512,7 +5650,9 @@ class AppStore {
       this.networks = nets ?? [];
       this.disabledNets = disabled ?? [];
     } catch (e) {
-      this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+      if (this.meshStatus !== "disconnected") {
+        this.toast("warn", `Couldn't load networks: ${errMsg(e)}`);
+      }
     }
     if (this.rosterNetwork) await this.refreshRoster(this.rosterNetwork);
   }
@@ -5675,7 +5815,9 @@ class AppStore {
         this.serversNetwork = this.networkConfigs[0].id;
       }
     } catch (e) {
-      this.toast("warn", `Couldn't load network settings: ${errMsg(e)}`);
+      if (this.meshStatus !== "disconnected") {
+        this.toast("warn", `Couldn't load network settings: ${errMsg(e)}`);
+      }
     }
   }
 

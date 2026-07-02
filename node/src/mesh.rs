@@ -150,6 +150,16 @@ pub struct Mesh {
     /// raised — latched so it fires once per episode (and clears once), not
     /// on every presence advert while the clock stays wrong.
     clock_skew_warned: std::sync::atomic::AtomicBool,
+    /// When each outbound route offer was first seen still-unanswered by the
+    /// reaper sweep ([`Mesh::spawn_offer_reaper`]). An offer has no deadline
+    /// in the wire protocol and the session is clock-free, so this is where
+    /// "awaiting accept" gets its timer; entries leave when the route stops
+    /// being an outbound `Offered`.
+    offer_first_seen: Mutex<HashMap<String, std::time::Instant>>,
+    /// The daemon-link status as last emitted on `allmystuff://subscription`
+    /// — answered back by [`Mesh::mesh_status`], because the emit itself is
+    /// one-shot and a late-subscribing GUI misses it.
+    last_status: Mutex<(String, Option<String>)>,
     /// Last non-empty fleet roster we read from the closed network's signed
     /// roster (`fleet_roster_value`). A member-side resilience cache — the
     /// symmetric twin of the owner's durable `fleet_members()` fallback: the
@@ -432,6 +442,8 @@ impl Mesh {
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
             peer_clock_skew: Mutex::new(HashMap::new()),
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
+            offer_first_seen: Mutex::new(HashMap::new()),
+            last_status: Mutex::new(("unknown".into(), None)),
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
@@ -742,8 +754,14 @@ impl Mesh {
         self.fetch_identity().await
     }
 
-    /// Bring the session online: identify, pick a network, subscribe, and
-    /// start pumping events. Safe to call once the daemon socket is up.
+    /// Bring the session online and keep it online: identify, pick a
+    /// network, subscribe, pump events — and when the daemon link drops
+    /// (daemon crashed, restarted, or wasn't up yet), reconnect on a capped
+    /// backoff and re-run the whole bring-up. Historically this was
+    /// fire-once: a failed first subscribe returned permanently and a dying
+    /// event stream just emitted "disconnected", leaving a running app
+    /// meshless until a full relaunch — despite two comments elsewhere
+    /// promising "the event pump will retry". Now it actually does.
     pub async fn start(self: Arc<Self>) {
         // Register the runtime we're on so the engine can spawn from any
         // thread — capture/audio callbacks run on their own OS threads, where
@@ -756,16 +774,62 @@ impl Mesh {
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
         self.spawn_media_forwarders();
 
-        let (tx, mut rx) = mpsc::channel::<Value>(512);
-        let client_id = match self.client.subscribe_events(tx).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("mesh: event subscribe failed: {e}");
-                self.emit_status("disconnected", Some(&e.to_string()));
-                return;
-            }
-        };
+        // Devices change under a running app; the watcher re-scans on a slow
+        // cadence and re-advertises when the picture changed. Once for the
+        // engine's life — it survives daemon-link drops untouched.
+        self.spawn_inventory_watch();
 
+        // Offers need a deadline: a route offered to a machine whose
+        // AllMyStuff app died (daemon still up, so it looks present) used to
+        // sit "awaiting accept" forever — a black console with no error.
+        self.spawn_offer_reaper();
+
+        // The daemon-link loop: subscribe → bring up → drain events → and on
+        // any end of the stream, around again with a fresh subscription and
+        // a full re-bring-up (fresh client_id, channel subscribes, media
+        // pipes, presence) — the daemon that comes back knows nothing about
+        // the old session. Backoff 1s → 8s while the socket stays dead, reset
+        // the moment a subscribe lands.
+        let mesh = self.clone();
+        crate::spawn(async move {
+            let mut backoff = std::time::Duration::from_secs(1);
+            loop {
+                let (tx, mut rx) = mpsc::channel::<Value>(512);
+                let client_id = match mesh.client.subscribe_events(tx).await {
+                    Ok(id) => {
+                        backoff = std::time::Duration::from_secs(1);
+                        id
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "mesh: event subscribe failed ({e}); retrying in {backoff:?}"
+                        );
+                        mesh.emit_status("disconnected", Some(&e.to_string()));
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(8));
+                        continue;
+                    }
+                };
+                mesh.bring_up(client_id).await;
+                while let Some(value) = rx.recv().await {
+                    mesh.handle_value(value).await;
+                }
+                // Stream ended: the daemon died or dropped the socket. Say
+                // so, then go re-subscribe — this loop *is* the retry.
+                tracing::warn!("mesh: daemon event stream ended — reconnecting");
+                mesh.emit_status("disconnected", None);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    /// One full session bring-up against a freshly-subscribed daemon link:
+    /// identity → profile → networks → media-pipe probe → channel
+    /// subscribes → ownership/presence. Runs on every (re)connect — after a
+    /// daemon restart nothing of the old session survives daemon-side, so
+    /// everything is re-established, and peers re-learn us from the fresh
+    /// presence broadcast.
+    async fn bring_up(self: &Arc<Self>, client_id: ClientId) {
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
@@ -888,21 +952,70 @@ impl Mesh {
         // boot id we haven't recorded (their app just started while the
         // daemon link stayed up) gets answered with our state directly. The
         // mesh carries traffic when something *happens*, not on a heartbeat.
-        //
-        // Devices, though, change under a running app — a monitor wakes (or
-        // deep-sleeps and *detaches*: DP monitors drop off the desktop), a
-        // mic gets plugged in — and the profile peers hold was scanned once
-        // at start. The watcher below re-scans on a slow cadence and counts
-        // as "something happened" only when the picture actually changed.
-        self.spawn_inventory_watch();
+        // (The inventory watcher lives in `start` — engine-lifetime, not
+        // per-connect.)
+    }
 
-        // Event loop.
-        let mesh = self.clone();
+    /// Sweep outbound route offers nobody has answered and expire them to
+    /// `Rejected` with a reason the UI can show. The wire has no offer
+    /// deadline and the session is deliberately clock-free, so the timer
+    /// lives here: the first sweep that sees an offer stamps it, and one
+    /// still `Offered` [`OFFER_TIMEOUT`] later flips to rejected — the
+    /// console then explains "no answer" instead of connecting forever. A
+    /// late `Accept` after expiry is harmless (the route reads rejected
+    /// here; re-connecting mints a fresh route id).
+    fn spawn_offer_reaper(self: &Arc<Self>) {
+        const SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+        const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let mesh = Arc::downgrade(self);
         crate::spawn(async move {
-            while let Some(value) = rx.recv().await {
-                mesh.handle_value(value).await;
+            loop {
+                tokio::time::sleep(SWEEP).await;
+                let Some(mesh) = mesh.upgrade() else { break };
+                let mut expired: Vec<String> = Vec::new();
+                {
+                    let mut seen = mesh.offer_first_seen.lock();
+                    let mut st = mesh.state.lock();
+                    let Some(session) = st.session.as_mut() else {
+                        seen.clear();
+                        continue;
+                    };
+                    let offered: Vec<String> = session
+                        .routes()
+                        .filter(|r| {
+                            r.origin == allmystuff_session::Origin::Outbound
+                                && r.state == allmystuff_session::RouteState::Offered
+                        })
+                        .map(|r| r.route.id.clone())
+                        .collect();
+                    // Anything no longer an unanswered outbound offer stops
+                    // being timed (accepted, rejected, torn down, gone).
+                    seen.retain(|id, _| offered.contains(id));
+                    let now = std::time::Instant::now();
+                    for id in offered {
+                        let first = *seen.entry(id.clone()).or_insert(now);
+                        if now.duration_since(first) >= OFFER_TIMEOUT
+                            && session.expire_offer(
+                                &id,
+                                "no answer from the far side — its AllMyStuff app may not be \
+                                 running (its mesh daemon can still advertise it)",
+                            )
+                        {
+                            seen.remove(&id);
+                            expired.push(id);
+                        }
+                    }
+                }
+                if !expired.is_empty() {
+                    for id in &expired {
+                        tracing::warn!(
+                            "route offer {id} went unanswered for {OFFER_TIMEOUT:?} — expired \
+                             (is the far side's AllMyStuff app running?)"
+                        );
+                    }
+                    mesh.emit_snapshot();
+                }
             }
-            mesh.emit_status("disconnected", None);
         });
     }
 
@@ -1624,6 +1737,7 @@ impl Mesh {
                                 frame.route,
                                 short_id(&from)
                             );
+                            self.nack_dead_route(&from, &frame.route);
                             return;
                         }
                         let full = { self.video_in.lock().push(frame) };
@@ -1754,6 +1868,7 @@ impl Mesh {
         };
         if !self.inbound_media_ok(&route_id, from, MediaKind::Audio) {
             tracing::debug!("audio frame for {route_id} refused (route not live here)");
+            self.nack_dead_route(from, &route_id);
             return;
         }
         // Up to 120 ms per packet is legal Opus; ours are 20 ms.
@@ -1856,6 +1971,7 @@ impl Mesh {
                     self.route_diag(&route_id, from)
                 );
             }
+            self.nack_dead_route(from, &route_id);
             return;
         }
         // The arrival side of the sender's "route active — streaming"
@@ -4303,14 +4419,61 @@ impl Mesh {
         ];
         for network in networks {
             for channel in channels {
-                let _ = self
-                    .client
-                    .request(&Request::ChannelSubscribe {
-                        client_id,
-                        network: network.clone(),
-                        channel: channel.to_string(),
-                    })
-                    .await;
+                // A failed subscribe used to be discarded (`let _ =`) —
+                // and one transient refusal meant presence/control/media on
+                // that network were dead for the whole session, silently:
+                // peers never appeared, offers to us were dropped
+                // daemon-side, nothing logged. Retry a couple of times with
+                // a beat between, and if it still fails, say exactly which
+                // network+channel is dark — a half-subscribed mesh must be
+                // diagnosable from the log.
+                let mut ok = false;
+                for attempt in 0..3u32 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    match self
+                        .client
+                        .request(&Request::ChannelSubscribe {
+                            client_id,
+                            network: network.clone(),
+                            channel: channel.to_string(),
+                        })
+                        .await
+                    {
+                        Ok(resp) if resp.ok => {
+                            ok = true;
+                            break;
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                network = %network,
+                                channel = %channel,
+                                "channel subscribe refused: {}",
+                                resp.error.as_deref().unwrap_or("(no error)")
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                network = %network,
+                                channel = %channel,
+                                "channel subscribe failed: {e}"
+                            );
+                        }
+                    }
+                }
+                if !ok {
+                    tracing::error!(
+                        network = %network,
+                        channel = %channel,
+                        "channel is DARK for this session — peers on this mesh won't see us \
+                         on it (presence/control/media affected); a daemon-link reconnect \
+                         will retry the full bring-up"
+                    );
+                }
             }
             // The video track lane's inbound side: assembled H.264
             // access units arrive as `video_inbound` events. The verdict
@@ -6740,6 +6903,34 @@ impl Mesh {
             .any(|g| grant_authorizes_plane(g, plane))
     }
 
+    /// Media keeps arriving for a route this side doesn't hold live — our
+    /// app restarted (fresh session, old routes gone), or the route tore
+    /// down here while the sender missed it. Tell the sender, rate-limited:
+    /// its session marks the route rejected and **stops the encoder**
+    /// (`Reject` on an active route now returns `StopMedia`), instead of
+    /// capturing + encoding into the void indefinitely. An older sender
+    /// ignores a Reject for an active route — exactly today's behaviour.
+    fn nack_dead_route(self: &Arc<Self>, from: &str, route_id: &str) {
+        if !self.diag_ok(&format!("nack:{route_id}")) {
+            return;
+        }
+        let mesh = self.clone();
+        let from = from.to_string();
+        let route_id = route_id.to_string();
+        crate::spawn(async move {
+            let _ = mesh
+                .send_control(
+                    &from,
+                    &ControlMessage::Route(RouteControl::Reject {
+                        route_id,
+                        reason: "route not live on the receiving side — re-offer to reconnect"
+                            .into(),
+                    }),
+                )
+                .await;
+        });
+    }
+
     /// An inbound input/clipboard frame failed a gate. Historically this was
     /// one rate-unlimited, cause-blind warn — which is exactly how "the mouse
     /// stopped working" became undiagnosable: the viewer's console looked
@@ -7354,10 +7545,22 @@ impl Mesh {
     }
 
     fn emit_status(&self, status: &str, error: Option<&str>) {
+        // Remember it: the emit is fire-and-forget (a GUI that subscribed
+        // late never hears it), so `mesh_status` answers with this instead
+        // of the front-end inferring liveness from unrelated calls.
+        *self.last_status.lock() = (status.to_string(), error.map(str::to_string));
         self.sink.emit(
             "allmystuff://subscription",
             json!({ "status": status, "error": error }),
         );
+    }
+
+    /// The daemon-link status as last emitted on `allmystuff://subscription`
+    /// (`live` / `no_network` / `disconnected`, plus the error that caused
+    /// it) — the front-end's poll-safe way to learn the *current* state
+    /// instead of hoping it caught a one-shot event.
+    pub fn link_status(&self) -> (String, Option<String>) {
+        self.last_status.lock().clone()
     }
 }
 

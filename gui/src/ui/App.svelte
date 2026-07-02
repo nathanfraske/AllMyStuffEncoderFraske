@@ -142,14 +142,18 @@
         >
           <span class="net-dot"></span>
           {!app.backendConnected
-            ? "demo mode"
-            : app.networks.length > 1
-              ? `${app.networks.length} meshes`
-              : app.activeNetwork
-                ? app.meshLabel(app.activeNetwork)
-                : app.disabledNets.length > 0
-                  ? "meshes off"
-                  : "no mesh"}
+            ? app.meshStatus === "disconnected"
+              ? "mesh reconnecting…"
+              : "demo mode"
+            : app.meshStatus === "disconnected"
+              ? "mesh reconnecting…"
+              : app.networks.length > 1
+                ? `${app.networks.length} meshes`
+                : app.activeNetwork
+                  ? app.meshLabel(app.activeNetwork)
+                  : app.disabledNets.length > 0
+                    ? "meshes off"
+                    : "no mesh"}
           {#if app.disabledNets.length > 0}<span class="net-off" title="{app.disabledNets.length} disabled">+{app.disabledNets.length} off</span>{/if}
           <span class="net-chevron" class:open={app.netMenuOpen} aria-hidden="true">▾</span>
         </button>

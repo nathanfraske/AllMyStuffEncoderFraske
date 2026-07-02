@@ -1291,6 +1291,20 @@ async fn mesh_peers(state: State<'_, AppState>, network: String) -> Result<Value
         .map_err(|e| e.to_string())
 }
 
+/// The engine's daemon-link status as last emitted on
+/// `allmystuff://subscription` — the poll-safe truth for a front-end that
+/// subscribed after the one-shot event fired. Distinguishes "node socket
+/// answers" from "the mesh behind it is live". (`mesh_status` above is the
+/// raw daemon Status passthrough — a different question.)
+#[tauri::command]
+async fn link_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("link_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn mesh_network_add(state: State<'_, AppState>, config: Value) -> Result<Value, String> {
     state
@@ -2001,6 +2015,7 @@ fn main() {
             mesh_identity,
             mesh_networks,
             mesh_peers,
+            link_status,
             mesh_network_add,
             mesh_network_remove,
             mesh_network_update,

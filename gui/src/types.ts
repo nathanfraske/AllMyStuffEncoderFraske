@@ -128,6 +128,11 @@ export interface MeshNode {
   /** App features this node advertises in presence ("terminal", …).
    *  Absent (an older peer) means none — the matching buttons stay hidden. */
   features?: string[];
+  /** Direct connectivity to this device keeps failing and no TURN relay is
+   *  in play — the daemon's ICE watchdog verdict (its `needs_turn`, or its
+   *  no-TURN diagnostic event). The card shows a "needs relay" chip so the
+   *  block is visible instead of the device just being quiet. */
+  needsTurn?: boolean;
   /** The sites this node exposes — TCP services it's willing to reverse-proxy
    *  over the mesh (from its presence advert). The owner curates this; absent
    *  means none. The Sites sidebar lists them per machine. */
@@ -400,6 +405,14 @@ export interface PeerInfo {
   device_id: string;
   label: string;
   status: string;
+  /** The daemon's ICE watchdog concluded direct connectivity to this peer
+   *  keeps failing with zero relay candidates — the link needs a TURN
+   *  server. Absent on older daemons. */
+  needs_turn?: boolean;
+  /** How far this peer's wall clock reads from ours (ms; positive = the
+   *  peer is ahead), the daemon's passive heartbeat estimate. Absent on
+   *  older daemons. */
+  clock_skew_ms?: number | null;
   device_suffix?: string;
   verification_code_received?: string | null;
   verification_code_sent?: string | null;

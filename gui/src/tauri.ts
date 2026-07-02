@@ -1493,6 +1493,31 @@ export async function meshPeers(network: string): Promise<PeerInfo[]> {
   return Array.isArray(r?.peers) ? r.peers : [];
 }
 
+/** The node's daemon-link status as last emitted on
+ *  `allmystuff://subscription` — poll-safe, for a window that subscribed
+ *  after the one-shot event fired. Distinguishes "the node socket answers"
+ *  (backend is up) from "the mesh behind it is live". */
+export async function linkStatus(): Promise<{ status: string; error?: string | null } | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return (await invoke("link_status")) as { status: string; error?: string | null };
+  } catch {
+    return null; // node socket itself unreachable
+  }
+}
+
+/** Raw daemon engine events (`allmystuff://event`) — the diagnostics the
+ *  mesh already produces (the no-TURN hint after repeated ICE failures,
+ *  relay/offline transitions). Forwarded verbatim by the node; the store
+ *  maps the load-bearing ones onto the graph instead of letting them fall
+ *  on the floor. */
+export async function onMeshEvent(cb: (e: Record<string, unknown>) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<Record<string, unknown>>("allmystuff://event", (e) => cb(e.payload));
+}
+
 // MyOwnMesh's semi-public reference servers — the defaults a new network
 // uses so two devices rendezvous on the *same* signaling relay (the usual
 // reason "nothing connects": peers scattered across different public relays)

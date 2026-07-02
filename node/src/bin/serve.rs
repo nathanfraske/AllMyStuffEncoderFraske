@@ -205,20 +205,29 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         }
     };
 
-    // Bring up the mesh daemon this node rides on. We supervise it: when this
-    // binary spawned it, dropping the handle on shutdown kills it too, so one
-    // service really does run both. An already-running daemon (someone else's,
-    // or the GUI's) is reused and left untouched.
-    let _daemon: Option<DaemonChild> = match daemon_spawn::ensure_daemon_running(&client).await {
-        Ok(child) => child,
-        Err(e) => {
-            tracing::warn!(
-                "couldn't start the myownmesh daemon ({e:#}); will try to use one if it appears. \
-                 Install it (so it's on PATH), set MYOWNMESH_BIN, or run `myownmesh serve` yourself."
-            );
-            None
-        }
-    };
+    // Bring up the mesh daemon this node rides on, and *keep* it up: the
+    // supervisor task below polls the spawned child and respawns it (capped
+    // backoff) if it dies — previously the handle was held but never
+    // watched, so a crashed daemon left a permanently meshless node behind a
+    // running service. An already-running daemon (someone else's, or the
+    // GUI's) is reused and left untouched — but if the socket later goes
+    // dead with nothing of ours to watch, the supervisor spawns our own.
+    // Ownership stays with `main` (the mutex) so shutdown still drops the
+    // child and one service unit really does run both.
+    let daemon: Arc<std::sync::Mutex<Option<DaemonChild>>> = Arc::new(std::sync::Mutex::new(
+        match daemon_spawn::ensure_daemon_running(&client).await {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!(
+                    "couldn't start the myownmesh daemon ({e:#}); will keep trying / use one if \
+                     it appears. Install it (so it's on PATH), set MYOWNMESH_BIN, or run \
+                     `myownmesh serve` yourself."
+                );
+                None
+            }
+        },
+    ));
+    tokio::spawn(supervise_daemon(daemon.clone(), client.clone()));
 
     // Wire the engine to a sink that both logs (the headless `LogSink`) and
     // broadcasts every event to clients of the node control socket — the seam
@@ -283,14 +292,79 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
     }
     tracing::info!("node is up — press Ctrl-C to stop");
 
-    // Run until asked to stop. Holding `mesh` and `_daemon` in scope keeps the
+    // Run until asked to stop. Holding `mesh` and `daemon` in scope keeps the
     // pump alive and the supervised daemon running for the node's whole life.
     shutdown.await;
     tracing::info!("shutdown requested — stopping");
 
-    // `_daemon` drops here, killing the daemon we spawned (if any).
+    // Take the child out of the supervisor's hands and drop it here, killing
+    // the daemon we spawned (if any) — the supervisor never respawns after
+    // this because the process is exiting.
+    drop(daemon.lock().ok().and_then(|mut d| d.take()));
     drop(mesh);
     ExitCode::SUCCESS
+}
+
+/// Keep the mesh daemon alive for the node's whole life. Two duties:
+///
+/// - **Our child died** → respawn it on a capped backoff (2s → 60s). The
+///   engine's daemon-link loop reconnects the moment the socket answers, so
+///   the node heals end to end with no restart.
+/// - **Nothing of ours to watch** (we reused someone else's daemon, or never
+///   managed to spawn one) → probe the control socket on a slow cadence and,
+///   when it stops answering, try to bring up our own. This covers "the
+///   GUI's daemon died after this service reused it" and "the binary
+///   appeared on PATH after we started".
+///
+/// The child lives in `slot` (owned by `main`), so shutdown still kills it.
+async fn supervise_daemon(
+    slot: Arc<std::sync::Mutex<Option<DaemonChild>>>,
+    client: Arc<ControlClient>,
+) {
+    use std::time::Duration;
+    const CHILD_POLL: Duration = Duration::from_secs(2);
+    const SOCKET_POLL: Duration = Duration::from_secs(30);
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        let have_child = { slot.lock().ok().and_then(|g| g.as_ref().map(|_| ())) }.is_some();
+        if have_child {
+            tokio::time::sleep(CHILD_POLL).await;
+            let exited = slot
+                .lock()
+                .ok()
+                .and_then(|mut g| g.as_mut().and_then(|d| d.try_exited()));
+            let Some(status) = exited else { continue };
+            tracing::warn!("myownmesh daemon exited ({status}) — respawning in {backoff:?}");
+            // Drop the dead handle now (its Drop is a no-op wait on a
+            // reaped child) so the slot honestly reads "nothing running".
+            if let Ok(mut g) = slot.lock() {
+                g.take();
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        } else {
+            tokio::time::sleep(SOCKET_POLL).await;
+            if daemon_spawn::probe(&client).await {
+                // A daemon (ours-before-us, the GUI's, a manual one) answers:
+                // healthy, nothing to do. A live socket also means any
+                // earlier spawn trouble is moot — reset the backoff.
+                backoff = Duration::from_secs(2);
+                continue;
+            }
+            tracing::warn!("no daemon answering the control socket — bringing one up");
+        }
+        match daemon_spawn::ensure_daemon_running(&client).await {
+            Ok(child) => {
+                if let Ok(mut g) = slot.lock() {
+                    *g = child;
+                }
+                backoff = Duration::from_secs(2);
+            }
+            Err(e) => {
+                tracing::warn!("daemon respawn failed ({e:#}); will retry");
+            }
+        }
+    }
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM (service stop), mirroring the daemon.

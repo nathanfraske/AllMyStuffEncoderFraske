@@ -801,6 +801,16 @@
             {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
             {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
             {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+            {#if n.needsTurn && !n.online}
+              <!-- The daemon's ICE watchdog verdict, surfaced: this link keeps
+                   failing with no relay in play. Without the chip the device
+                   is just… quiet, and nobody guesses "add a TURN server". -->
+              <span
+                class="tag blocked"
+                title="Direct connection keeps failing and no relay is configured — add a TURN server to this mesh's venue (mesh settings → Servers)"
+                >⛔ needs relay</span
+              >
+            {/if}
           </div>
           <button
             class="cbtn status-refresh"
@@ -1849,6 +1859,14 @@
     background: var(--accent-soft);
     color: var(--accent-ink);
     border: 1px solid var(--accent);
+    font-weight: 700;
+  }
+  /* The ICE watchdog's "this link needs a TURN relay" verdict — a warning,
+     not a decoration: it names the only fix. */
+  .tag.blocked {
+    background: var(--warn-soft);
+    color: var(--warn);
+    border: 1px solid var(--warn);
     font-weight: 700;
   }
   /* "Someone else's, not shared with me" — bronze keeps it distinct from a

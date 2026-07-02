@@ -785,6 +785,14 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.request_restart_device(node).await)
         }
+        "link_status" => {
+            // The engine's daemon-link status as last emitted — poll-safe
+            // truth for a GUI that missed the one-shot subscription event.
+            // (Distinct from "mesh_status" below, the raw daemon Status
+            // passthrough.)
+            let (status, error) = mesh.link_status();
+            DispatchOut::Json(serde_json::json!({ "status": status, "error": error }))
+        }
         "refresh_node" => {
             // `node` omitted / null = this device (re-scan + re-advertise).
             let node = a.get("node").and_then(|v| v.as_str()).map(str::to_string);
