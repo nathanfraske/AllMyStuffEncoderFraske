@@ -21,7 +21,7 @@
     return () => ro.disconnect();
   });
 
-  const NODE_W = 184;
+  const NODE_W = 214;
   const NODE_H = 86;
 
   type Placed = { node: MeshNode; x: number; y: number };
@@ -956,6 +956,7 @@
                 onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "reset"); }}>{@render cicon("reset")}</button>
             {/if}
           {/if}
+          <span class="cbtn-sep" aria-hidden="true"></span>
           <button
             class="cbtn node-gear"
             data-tip="Settings"
@@ -1747,10 +1748,10 @@
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
   /* The settings gear is a cbtn with a glyph face instead of an icon — sized a
-     touch larger than the console icons so it reads clearly — pinned to the
-     right of the bottom row. */
+     touch larger than the console icons so it reads clearly. It sits right of
+     the divider (which carries the flex slack), so it's pinned to the right of
+     the bottom row. */
   .node-gear {
-    margin-left: auto;
     font-size: 1.05rem;
     line-height: 1;
   }
@@ -1837,16 +1838,38 @@
      you can open on the device; clicking opens it. */
   .node-consoles {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 0.26rem;
     margin-top: 0.15rem;
+  }
+  /* A hairline divider that caps the action buttons and sets the gear apart —
+     it carries the flex slack (margin-left:auto), so the row reads
+     "actions … │ ⚙" with the rule sitting right against the gear. */
+  .cbtn-sep {
+    margin-left: auto;
+    align-self: stretch;
+    width: 1px;
+    min-height: 1.1rem;
+    background: var(--line-strong);
+    opacity: 0.7;
+  }
+  /* No action buttons before it (a bare self card, or a device with no
+     consoles): the divider would separate nothing — hide it and let the gear
+     carry the right-edge slack itself. */
+  .cbtn-sep:first-child {
+    display: none;
+  }
+  .cbtn-sep:first-child + .node-gear {
+    margin-left: auto;
   }
   .cbtn {
     position: relative;
     display: grid;
     place-items: center;
-    width: 1.55rem;
-    height: 1.55rem;
+    flex: none;
+    width: 1.42rem;
+    height: 1.42rem;
     border-radius: var(--r-sm);
     border: 1px solid var(--line-strong);
     background: var(--surface-2);
@@ -1884,8 +1907,8 @@
     }
   }
   .cbtn :global(svg) {
-    width: 0.95rem;
-    height: 0.95rem;
+    width: 0.9rem;
+    height: 0.9rem;
     /* the glyphs sit right of centre — nudge them left so the spare pixels
        land on the right. */
     transform: translateX(-3px);
