@@ -479,6 +479,11 @@ export interface OwnedRoster {
    *  fleet. Everything that asks "am I in a fleet" (the drawer, the settings
    *  pane, the leave control) reads this one flag so they can't disagree. */
   in_fleet?: boolean;
+  /** Whether **this device** participates in claiming over the public mesh
+   *  (claim-code rendezvous over remote signaling). Strictly device-local:
+   *  set only on this machine, never synced from the fleet, never settable
+   *  by a remote peer. Off (absent) = LAN-local claiming only — the default. */
+  public_claims?: boolean;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------

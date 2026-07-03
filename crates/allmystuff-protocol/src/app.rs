@@ -49,6 +49,81 @@ pub const CHANNEL_OWNED: &str = "allmystuff/owned/v1";
 /// sees the channel, so the whole plane is additive.
 pub const CHANNEL_ROOMS: &str = "allmystuff/rooms/v1";
 
+/// Well-known LAN-local claim-rendezvous network. Every AllMyStuff node
+/// joins it with daemon signaling `{strategy: "none", mdns: true}` — the
+/// network never touches remote infrastructure, so a claimable device
+/// and its claimer find each other on the local network only. Claimable
+/// presence is advertised here (and on a device's own claim-code
+/// network, see [`claim_code_network_id`]) and **nowhere else**; claims
+/// arriving via any other network are declined. Claimee devices (a
+/// NanoKVM's Go bridge mirrors this constant) join while claimable.
+/// FROZEN once shipped — both sides must derive the same room.
+pub const LOCAL_CLAIM_NETWORK_ID: &str = "allmystuff-local-claim-v1";
+
+/// Length in bytes of a freshly minted claim code (before base32).
+/// Minting itself lives with the ownership store (`node`) — this
+/// crate stays dependency-free and only defines the encoding.
+pub const CLAIM_CODE_BYTES: usize = 16;
+
+/// Encode claim-code bytes as lowercase RFC 4648 base32, no padding
+/// (16 bytes → 26 chars). Hand-rolled so this crate stays
+/// dependency-free; FROZEN — NanoKVM's Go bridge produces the same
+/// encoding with its stdlib base32.
+pub fn claim_code_from_bytes(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
+    for chunk in bytes.chunks(5) {
+        let mut buf = [0u8; 5];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        let v = u64::from(buf[0]) << 32
+            | u64::from(buf[1]) << 24
+            | u64::from(buf[2]) << 16
+            | u64::from(buf[3]) << 8
+            | u64::from(buf[4]);
+        // 8 output chars per 5 input bytes; truncate to what the
+        // partial chunk actually encodes (ceil(bits/5)).
+        let chars = match chunk.len() {
+            1 => 2,
+            2 => 4,
+            3 => 5,
+            4 => 7,
+            _ => 8,
+        };
+        for i in 0..chars {
+            let shift = 35 - 5 * i;
+            out.push(ALPHABET[((v >> shift) & 0x1f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Human display form of a claim code: dash groups of four
+/// (`xxxx-xxxx-…`), purely cosmetic.
+pub fn format_claim_code(code: &str) -> String {
+    code.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The randomized claim-rendezvous network a remote (WAN) claim rides:
+/// `amsclaim-<code>`. The claimee mints the code, joins this network
+/// (Nostr + mDNS signaling), and shows the code out-of-band (device web
+/// UI, console log); the claimer types it in and joins the same network
+/// just long enough to claim. Normalizes display formatting (dashes,
+/// case) so both sides derive the identical network id — and therefore
+/// the identical signaling room. FROZEN once shipped; NanoKVM's Go
+/// bridge mirrors this derivation.
+pub fn claim_code_network_id(code: &str) -> String {
+    let normalized: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    format!("amsclaim-{normalized}")
+}
+
 /// Capability tag this node advertises on the **mesh** capability matrix
 /// (MyOwnMesh `CapabilitiesSet`) — not the bespoke presence channel — to mark
 /// itself as a real AllMyStuff app node rather than a bare `myownmesh` daemon.
@@ -934,6 +1009,44 @@ pub enum OwnershipControl {
 mod tests {
     use super::*;
     use allmystuff_graph::{Flow, GrantRole, MediaKind};
+
+    /// RFC 4648 base32 vector ("hello" → NBSWY3DP), lowercased — the
+    /// hand-rolled encoder must match what NanoKVM's Go stdlib
+    /// produces for the same bytes. FROZEN.
+    #[test]
+    fn claim_code_encoding_matches_rfc4648() {
+        assert_eq!(claim_code_from_bytes(b"hello"), "nbswy3dp");
+        // A full-size code: 16 bytes → 26 chars, alphabet-only.
+        let code = claim_code_from_bytes(&[0xAB; CLAIM_CODE_BYTES]);
+        assert_eq!(code.len(), 26);
+        assert!(code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
+        // Deterministic.
+        assert_eq!(code, claim_code_from_bytes(&[0xAB; CLAIM_CODE_BYTES]));
+    }
+
+    /// Display formatting is cosmetic and must normalize away in the
+    /// network-id derivation — claimer types the dashed form, claimee
+    /// derived from the raw form, both land in the same room. FROZEN.
+    #[test]
+    fn claim_code_network_id_normalizes_display_forms() {
+        let code = claim_code_from_bytes(&[7; CLAIM_CODE_BYTES]);
+        let pretty = format_claim_code(&code);
+        assert!(pretty.contains('-'));
+        assert_eq!(claim_code_network_id(&pretty), claim_code_network_id(&code));
+        assert_eq!(
+            claim_code_network_id(&pretty.to_uppercase()),
+            format!("amsclaim-{code}")
+        );
+    }
+
+    #[test]
+    fn local_claim_network_id_is_frozen() {
+        // Load-bearing constant mirrored by NanoKVM's Go bridge —
+        // changing it strands shipped devices on the old rendezvous.
+        assert_eq!(LOCAL_CLAIM_NETWORK_ID, "allmystuff-local-claim-v1");
+    }
 
     #[test]
     fn node_profile_round_trips() {

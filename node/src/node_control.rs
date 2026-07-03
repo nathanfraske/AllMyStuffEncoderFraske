@@ -802,6 +802,18 @@ pub async fn dispatch(
             let claimable: bool = try_arg!(arg(a, "claimable"));
             json_result(mesh.set_claimable(claimable).await)
         }
+        "set_public_claims" => {
+            // This device's public-mesh claiming policy — strictly local
+            // (see `Mesh::set_public_claims`); there is deliberately no
+            // remote/fleet-synced path to flip it.
+            let on: bool = try_arg!(arg(a, "on"));
+            json_result(mesh.set_public_claims(on).await)
+        }
+        "claim_via_code" => {
+            // Remote claim by the code shown on the claimee device.
+            let code: String = try_arg!(arg(a, "code"));
+            json_result(mesh.claim_via_code(code).await)
+        }
         "kvm_attach" => {
             let node: String = try_arg!(arg(a, "node"));
             let target: String = try_arg!(arg(a, "target"));

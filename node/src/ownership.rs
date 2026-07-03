@@ -62,6 +62,22 @@ struct Persisted {
     /// membership from the signed roster itself. Not gossiped.
     #[serde(default)]
     fleet_members: Vec<OwnedMember>,
+    /// Whether this device participates in claiming **over the public
+    /// mesh** (claim-code rendezvous over remote signaling). Off by
+    /// default — claiming is LAN-local unless deliberately enabled.
+    /// STRICTLY DEVICE-LOCAL policy: set only here (or via the
+    /// `ALLMYSTUFF_PUBLIC_CLAIMS` env), never synced from the fleet and
+    /// never settable by a remote peer — a remote system must not be
+    /// able to open a device to public claiming.
+    #[serde(default)]
+    public_claims: bool,
+    /// The device's current claim code (claimee side): the random
+    /// rendezvous secret behind its `amsclaim-<code>` network while it
+    /// sits claimable with public claims enabled. Persisted so the code
+    /// an operator read off the device survives a restart; rotated
+    /// after every successful claim.
+    #[serde(default)]
+    claim_code: Option<String>,
 }
 
 /// Live state behind one lock, so a claim's check-and-set is atomic.
@@ -76,6 +92,8 @@ struct Inner {
     fleet_name: String,
     fleet_version: u64,
     fleet_members: Vec<OwnedMember>,
+    public_claims: bool,
+    claim_code: Option<String>,
 }
 
 /// The live ownership store. Cheap to share behind an `Arc`.
@@ -110,6 +128,8 @@ impl Ownership {
             fleet_name: persisted.fleet_name,
             fleet_version: persisted.fleet_version,
             fleet_members: persisted.fleet_members,
+            public_claims: persisted.public_claims,
+            claim_code: persisted.claim_code,
         };
         Ownership {
             path,
@@ -161,6 +181,69 @@ impl Ownership {
     pub fn set_claim_mode(&self, on: bool) {
         let mut i = self.inner.lock();
         i.claim_mode = on && i.owner.is_none() && i.fleet_key.is_none();
+    }
+
+    // ---- public-mesh claiming policy (strictly device-local) -------------
+    //
+    // Claiming is LAN-local by default: claimable presence and inbound
+    // claims ride the well-known mDNS-only claim network and nothing
+    // else. "Claims over the public mesh" — the claim-code rendezvous
+    // over remote signaling — must be deliberately enabled **on this
+    // device** (this setting, or `ALLMYSTUFF_PUBLIC_CLAIMS` for a
+    // headless box). It is never synced from a fleet and never settable
+    // by a remote peer: no remote system may open a device to public
+    // claiming.
+
+    /// The persisted device-local public-claims setting.
+    pub fn public_claims(&self) -> bool {
+        self.inner.lock().public_claims
+    }
+
+    /// Whether public-mesh claiming is allowed on this device right
+    /// now: the persisted setting, or the deploy-time env escape hatch
+    /// for headless claimees.
+    pub fn public_claims_allowed(&self) -> bool {
+        self.public_claims() || env_public_claims_flag()
+    }
+
+    /// Flip the device-local public-claims setting. Bumps the fleet
+    /// version so GUI snapshots refresh. Returns whether the durable
+    /// write succeeded.
+    pub fn set_public_claims(&self, on: bool) -> bool {
+        let mut i = self.inner.lock();
+        i.public_claims = on;
+        i.fleet_version = i.fleet_version.saturating_add(1);
+        persist(&self.path, &i)
+    }
+
+    /// The device's current claim code, if one has been minted.
+    pub fn claim_code(&self) -> Option<String> {
+        self.inner.lock().claim_code.clone()
+    }
+
+    /// The claim code, minting (and persisting) a fresh one if absent.
+    /// The code is the rendezvous secret behind the device's
+    /// `amsclaim-<code>` network while it sits claimable with public
+    /// claims enabled.
+    pub fn ensure_claim_code(&self) -> String {
+        let mut i = self.inner.lock();
+        if let Some(code) = &i.claim_code {
+            return code.clone();
+        }
+        let code = new_claim_code();
+        i.claim_code = Some(code.clone());
+        let _ = persist(&self.path, &i);
+        code
+    }
+
+    /// Discard the claim code so the next [`Self::ensure_claim_code`]
+    /// mints a fresh one. Called after a successful claim — a code that
+    /// has admitted someone is spent.
+    pub fn rotate_claim_code(&self) {
+        let mut i = self.inner.lock();
+        if i.claim_code.take().is_some() {
+            let _ = persist(&self.path, &i);
+        }
     }
 
     /// Accept a claim from `claimer` — but only if the device is currently
@@ -585,6 +668,8 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
         fleet_name: inner.fleet_name.clone(),
         fleet_version: inner.fleet_version,
         fleet_members: inner.fleet_members.clone(),
+        public_claims: inner.public_claims,
+        claim_code: inner.claim_code.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
         Ok(json) => write_private(path, json.as_bytes()),
@@ -634,7 +719,19 @@ fn store_path() -> Option<PathBuf> {
 
 /// The start-time claim flag: `ALLMYSTUFF_CLAIMABLE` set to a truthy value.
 fn env_claim_flag() -> bool {
-    std::env::var("ALLMYSTUFF_CLAIMABLE")
+    env_truthy("ALLMYSTUFF_CLAIMABLE")
+}
+
+/// The deploy-time public-claims escape hatch for headless claimees:
+/// `ALLMYSTUFF_PUBLIC_CLAIMS` set to a truthy value. Same parsing as
+/// [`env_claim_flag`]; a deployed-software setting, per the rule that
+/// public claiming is only ever enabled on the device itself.
+fn env_public_claims_flag() -> bool {
+    env_truthy("ALLMYSTUFF_PUBLIC_CLAIMS")
+}
+
+fn env_truthy(var: &str) -> bool {
+    std::env::var(var)
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -642,6 +739,14 @@ fn env_claim_flag() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Mint a fresh claim code: [`allmystuff_protocol::CLAIM_CODE_BYTES`]
+/// bytes of system randomness in the FROZEN base32 encoding.
+fn new_claim_code() -> String {
+    let mut bytes = [0u8; allmystuff_protocol::CLAIM_CODE_BYTES];
+    getrandom::getrandom(&mut bytes).expect("system RNG unavailable for claim code");
+    allmystuff_protocol::claim_code_from_bytes(&bytes)
 }
 
 #[cfg(test)]
@@ -655,6 +760,42 @@ mod tests {
             path: None,
             inner: Mutex::new(Inner::default()),
         }
+    }
+
+    /// Public-mesh claiming is off unless deliberately enabled on this
+    /// device — the load-bearing default.
+    #[test]
+    fn public_claims_defaults_off_and_flips_locally() {
+        let o = memory();
+        assert!(!o.public_claims());
+        assert!(o.set_public_claims(true));
+        assert!(o.public_claims());
+        assert!(o.set_public_claims(false));
+        assert!(!o.public_claims());
+    }
+
+    /// An old ownership file (no new fields) loads with the policy off
+    /// and no claim code.
+    #[test]
+    fn legacy_persisted_file_defaults_new_fields() {
+        let legacy: Persisted =
+            serde_json::from_str(r#"{"owner":"boss","fleet_key":"k"}"#).expect("legacy parses");
+        assert!(!legacy.public_claims);
+        assert!(legacy.claim_code.is_none());
+    }
+
+    /// The claim code is stable until rotated, then re-mints fresh.
+    #[test]
+    fn claim_code_mints_persists_and_rotates() {
+        let o = memory();
+        assert!(o.claim_code().is_none());
+        let first = o.ensure_claim_code();
+        assert_eq!(first.len(), 26, "16 bytes of base32");
+        assert_eq!(o.ensure_claim_code(), first, "stable until rotated");
+        o.rotate_claim_code();
+        assert!(o.claim_code().is_none());
+        let second = o.ensure_claim_code();
+        assert_ne!(second, first, "rotation mints a fresh secret");
     }
 
     /// AMS-08: the ownership file holds the plaintext fleet key, so `persist`

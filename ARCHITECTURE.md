@@ -126,6 +126,23 @@ rules, no I/O.
   was started in **claim mode** (the `ALLMYSTUFF_CLAIMABLE` flag, or its own
   "allow adoption" toggle) and is still unowned. The recorded owner is the
   authenticated claimer the mesh delivered, persisted next to the identity.
+- **Claiming is LAN-first.** Every node joins a well-known claim rendezvous
+  (`allmystuff-local-claim-v1`) whose daemon signaling is mDNS-only
+  (`strategy: "none", mdns: true`) — no relays, no STUN/TURN, clock-free —
+  and claimable presence is advertised **only** there by default. Claims
+  arriving over any other network are declined, and the claimer refuses to
+  send one, unless **claims over the public mesh** are enabled — a strictly
+  **device-local** setting (the Fleet pane's toggle, persisted in the
+  ownership store, or `ALLMYSTUFF_PUBLIC_CLAIMS` for a headless box). It is
+  never fleet-synced and no remote peer can flip it: nothing on the wire can
+  open a device to public claiming. With it on, the WAN path is a **claim
+  code**: the claimable device mints an unguessable code (`amsclaim-<code>`
+  rendezvous network over Nostr+mDNS signaling, `Ownership::ensure_claim_code`),
+  shows it out-of-band (service log; a device UI elsewhere), and the owner
+  types it into the Fleet pane (`Mesh::claim_via_code`) — the rendezvous is
+  private to the code-holders and is torn down (and the code rotated) once
+  the claim lands. The old wide-open "claimable on the public mesh" model is
+  gone.
 
 See `crates/allmystuff-graph/src/lib.rs` tests for the full behaviour,
 including the person-wide grant union and the endpoint auto-pick.

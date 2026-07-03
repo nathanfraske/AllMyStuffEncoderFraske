@@ -201,6 +201,31 @@ async fn set_claimable(state: State<'_, AppState>, claimable: bool) -> Result<bo
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
+/// Flip **this device's** claims-over-the-public-mesh setting (strictly
+/// device-local — never fleet-synced, never remotely settable). Returns the
+/// new value.
+#[tauri::command]
+async fn set_public_claims(state: State<'_, AppState>, on: bool) -> Result<bool, String> {
+    let v = state
+        .node
+        .request("set_public_claims", json!({ "on": on }))
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// Claim a remote device by the claim code its operator read off it. Joins
+/// the code's randomized rendezvous, claims, and tears it down again.
+#[tauri::command]
+async fn claim_via_code(state: State<'_, AppState>, code: String) -> Result<(), String> {
+    state
+        .node
+        .request("claim_via_code", json!({ "code": code }))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Point a KVM appliance (`node`) at the machine it controls (`target`). The
 /// KVM enforces owner/fleet before applying, then re-advertises its new
 /// binding — that presence is the confirmation, exactly as a claim confirms.
@@ -1999,6 +2024,8 @@ fn main() {
             restart_device,
             refresh_node,
             set_claimable,
+            set_public_claims,
+            claim_via_code,
             kvm_attach,
             kvm_detach,
             kvm_mesh_add,
