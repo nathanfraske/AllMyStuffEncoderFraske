@@ -35,7 +35,9 @@
       (c: NetworkConfigFull) => ({
         key: c.network_id || c.id,
         configId: c.id,
-        label: networkDisplayName(c),
+        // meshLabel so the parked local claiming mesh keeps its short display
+        // name ("Local claiming") instead of its wire label.
+        label: app.meshLabel(c) || networkDisplayName(c),
         on: false,
         live: null,
       }),
@@ -80,11 +82,18 @@
 
   {#each meshRows as m (m.key)}
     {@const fleetMesh = !!m.live && app.isFleetMesh(m.live)}
+    {@const claimMesh = app.isLocalClaimMesh({ network_id: m.key })}
     <div class="row" class:fleet={fleetMesh} class:off={!m.on}>
       <span class="row-dot" class:live={m.on}></span>
       <div class="row-main">
-        <div class="row-name">{m.label}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}</div>
-        <div class="row-sub">{m.on ? m.live?.network_id : "disabled — kept for later"}</div>
+        <div class="row-name">{m.label}{#if fleetMesh}<span class="fleet-tag">🔗 fleet</span>{/if}{#if claimMesh}<span class="local-tag" title="The built-in LAN-only mesh for claiming and local pairing — on/off only, never leaves your network">📡 local</span>{/if}</div>
+        <div class="row-sub">
+          {#if claimMesh}
+            {m.on ? "claiming & local pairing — this LAN only" : "off — not discoverable for claiming or pairing"}
+          {:else}
+            {m.on ? m.live?.network_id : "disabled — kept for later"}
+          {/if}
+        </div>
       </div>
       {#if fleetMesh}
         <!-- The fleet mesh can't be switched off here — it's the closed
@@ -248,6 +257,18 @@
     opacity: 0.75;
     cursor: not-allowed;
     padding: 0 0.2rem;
+  }
+  /* The local claiming mesh — tagged in the accent colour; its switch is the
+     one control it has (it can't be left or configured). */
+  .local-tag {
+    margin-left: 0.35rem;
+    font-size: 0.6rem;
+    font-weight: 700;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.35rem;
+    vertical-align: middle;
   }
   /* The fleet mesh — tagged in the fleet concept's green. */
   .fleet-tag {

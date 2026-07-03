@@ -244,6 +244,10 @@ async fn run<F: Future<Output = ()>>(as_service: bool, shutdown: F) -> ExitCode 
         event_tx,
     );
     let mesh = Mesh::new(client.clone(), Arc::new(sink));
+    // Share the park store with the mesh so a switched-off local claim
+    // network stays off across ownership checks (it can't be left, so the
+    // park store is its only off switch).
+    mesh.attach_disabled_networks(disabled.clone());
     mesh.clone().start().await;
 
     // Serve the node control + event socket (on the listener bound up front) so

@@ -25,9 +25,15 @@
   let saved = $state(false);
   let venueSaved = $state(false);
 
-  const configs = $derived(app.networkConfigs);
+  // The local claiming mesh never shows here: it has no venue — it's the
+  // LAN-only mDNS passthrough for claiming and local pairing, and the node
+  // refuses config edits to it anyway.
+  const configs = $derived(app.networkConfigs.filter((c) => !app.isLocalClaimMesh(c)));
   const selectedId = $derived(app.serversNetwork);
-  const selected = $derived(selectedId ? app.networkConfig(selectedId) : undefined);
+  const selected = $derived.by(() => {
+    const cfg = selectedId ? app.networkConfig(selectedId) : undefined;
+    return cfg && !app.isLocalClaimMesh(cfg) ? cfg : undefined;
+  });
   const venues = $derived(app.venues);
   // The venue(s) this mesh currently uses (by its wire id). Picking one is the
   // common case; until bridging ships, "current" is the first of them.

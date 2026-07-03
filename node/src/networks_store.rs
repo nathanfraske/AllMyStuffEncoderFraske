@@ -72,6 +72,15 @@ impl DisabledNetworks {
         }
     }
 
+    /// Whether a config is parked here. `key` matches either id, same as
+    /// [`DisabledNetworks::take`].
+    pub fn contains(&self, key: &str) -> bool {
+        self.inner.lock().disabled.iter().any(|c| {
+            let (id, net) = ids_of(c);
+            id == key || net == key
+        })
+    }
+
     /// Take a parked config back out (for re-enable). `key` may be either
     /// the local config id or the wire-level network id.
     pub fn take(&self, key: &str) -> Option<Value> {
@@ -148,6 +157,9 @@ mod tests {
         let cfg = json!({ "id": "net_1", "network_id": "home-abc", "label": "Home" });
         assert!(store.park(cfg.clone()));
         assert_eq!(store.list().len(), 1);
+        assert!(store.contains("net_1"));
+        assert!(store.contains("home-abc"));
+        assert!(!store.contains("elsewhere"));
 
         // Parking the same network again replaces, never duplicates.
         assert!(store.park(cfg.clone()));
