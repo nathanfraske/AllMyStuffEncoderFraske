@@ -587,8 +587,10 @@
     } else if (isAdoptable(n)) {
       // Tapping a claimable node drops an inline "Claim" button out from
       // under it (shimmer + slide) — the fast path to adopt, right on the
-      // graph — and opens the drawer for the full story.
+      // graph — and opens the drawer for the full story. Close any open KVM
+      // attach dropdown so only one drop-out ever shows at a time.
       claimRevealed = claimRevealed === n.id ? null : n.id;
+      app.kvmRevealed = null;
       app.selectNode(n.id);
     } else {
       claimRevealed = null;

@@ -3779,7 +3779,13 @@ class AppStore {
       const tlabel = this.node(target)?.label ?? "that machine";
       this.toast("info", `Pointing ${node.label} at ${tlabel}…`);
     } else {
+      // Demo/web: mirror BOTH the binding and the KVM-<label> rename (in live
+      // mode the device does the rename and the GUI learns it from the
+      // re-advertised presence — a mechanism the demo lacks), so requirement 7
+      // is visible in the preview.
+      const tlabel = this.node(target)?.label;
       node.kvm = { ...(node.kvm ?? {}), attachedTo: target };
+      if (tlabel) node.label = `KVM-${tlabel}`;
     }
   }
 
@@ -3799,7 +3805,10 @@ class AppStore {
       });
       this.toast("info", `Detaching ${node.label}…`);
     } else if (node.kvm) {
+      // Demo/web: clear the binding and revert the KVM-<label> rename back to
+      // the appliance's own name, matching the device's detach behavior.
       node.kvm = { ...node.kvm, attachedTo: undefined };
+      if (node.label.startsWith("KVM-")) node.label = "CEC-KVM";
     }
   }
 
@@ -3842,12 +3851,19 @@ class AppStore {
     return this.catalog.nodes.find((n) => sameMachine(n.id, target));
   }
 
-  /** Whether you may curate a KVM's mesh memberships / unclaim it — the
-   *  fleet-owner slice of {@link kvmAllowed}. The device itself obeys any
+  /** Whether you may curate THIS KVM's mesh memberships / unclaim it — an
+   *  owner-authority act on the KVM's own fleet. The device itself obeys any
    *  fleet co-member, but membership and adoption are the owner's calls, so
-   *  the UI offers them only to the owner. */
+   *  the UI offers them only when you actually own this device: either it's
+   *  directly yours (`owner` is me) or it's in your fleet and you're that
+   *  fleet's owner. A KVM merely *shared* with you never qualifies — offering
+   *  a shelf the device would refuse is just a confusing dead end. */
   kvmOwnerControls(node: MeshNode | undefined): boolean {
-    return this.kvmAllowed(node) && this.isFleetOwner;
+    if (!this.isKvm(node) || this.isMe(node!.id)) return false;
+    const ownerIsMe = !!node!.owner && this.isMe(node!.owner);
+    const coFleetAndIOwn =
+      this.isFleetMember(this.localId) && this.isFleetMember(node!.id) && this.isFleetOwner;
+    return ownerIsMe || coFleetAndIOwn;
   }
 
   /** Walk a KVM onto another mesh. The KVM validates, refuses its own fleet
@@ -3923,16 +3939,24 @@ class AppStore {
     }
     const where = node.kvm?.joiningMesh;
     if (this.backendConnected) {
-      await this.runFleetGov(`Unclaim ${displayName(node)}`, (code) => fleetKick(nodeId, code));
-      this.toast(
-        "info",
-        where
-          ? `${node.label} is resetting — it'll reappear claimable on ${where}`
-          : `${node.label} is resetting to its joining mesh`,
-      );
+      // The success toast rides INSIDE the governance action so it fires only
+      // when the eviction actually ran — not when runFleetGov merely opened
+      // the MFA prompt (user may cancel) or when fleetKick threw (runFleetGov
+      // warns on that). Otherwise "is resetting" would lie.
+      await this.runFleetGov(`Unclaim ${displayName(node)}`, async (code) => {
+        await fleetKick(nodeId, code);
+        this.toast(
+          "info",
+          where
+            ? `${node.label} is resetting — it'll reappear claimable on ${where}`
+            : `${node.label} is resetting to its joining mesh`,
+        );
+      });
       return;
     }
-    // Demo/web: mirror the reset on the demo graph.
+    // Demo/web: mirror the reset on the demo graph — including dropping it
+    // from the fleet roster (via the same helper the fleet-kick demo uses), so
+    // it actually reads as claimable afterward instead of staying "in fleet".
     node.owner = null;
     node.claimable = true;
     node.kvm = {
@@ -3940,6 +3964,14 @@ class AppStore {
       attachedTo: undefined,
       meshes: where ? [where] : undefined,
     };
+    if (this.ownedFleet) {
+      this.ownedFleet = {
+        ...this.ownedFleet,
+        version: this.ownedFleet.version + 1,
+        members: this.ownedFleet.members.filter((m) => !sameMachine(m.device, nodeId)),
+      };
+      this.reconcileFleetRelationships();
+    }
     this.toast("info", `${node.label} unclaimed — it's offering itself for adoption again`);
   }
 
@@ -4082,7 +4114,16 @@ class AppStore {
     const me = this.node(this.localId);
     if (me) add(me.id, me.label);
     add(node.id, node.label);
-    this.ownedFleet = { key, version: (this.ownedFleet?.version ?? 0) + 1, members };
+    // Preserve the roster's identity fields (name / is_owner / in_fleet /
+    // network_id) — rebuilding as a bare {key,version,members} would drop
+    // is_owner and network_id, silently killing the fleet-mesh lock and the
+    // Meshes/Unclaim shelves in web-demo mode after the first claim.
+    this.ownedFleet = {
+      ...(this.ownedFleet ?? { is_owner: true, in_fleet: true }),
+      key,
+      version: (this.ownedFleet?.version ?? 0) + 1,
+      members,
+    };
   }
 
   /** Demo/web only: seed the fleet from the machines already marked yours, so
