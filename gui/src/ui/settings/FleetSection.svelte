@@ -42,6 +42,27 @@
     if (nameDraft.trim() === app.fleetName) return;
     void app.setFleetName(nameDraft);
   }
+
+  // Remote claiming by code — the WAN path behind the public-claims toggle.
+  // Slow by nature (joins a randomized rendezvous network and waits for the
+  // device to appear), so it carries its own busy + error state.
+  let claimCode = $state("");
+  let claiming = $state(false);
+  let claimErr = $state<string | null>(null);
+  async function claimByCode() {
+    const code = claimCode.trim();
+    if (!code || claiming) return;
+    claiming = true;
+    claimErr = null;
+    try {
+      await app.claimRemoteByCode(code);
+      claimCode = "";
+    } catch (e) {
+      claimErr = String(e);
+    } finally {
+      claiming = false;
+    }
+  }
   // Two-step confirm: first click arms (shows "sure?"), second acts. The
   // armed id is the member's device (or "leave" for the leave button).
   let armed = $state<string | null>(null);
@@ -190,6 +211,60 @@
     gossiped between them as an “Owned” roster. Today the key groups your
     machines internally; later you'll be able to hand it to other things.
   </p>
+
+  {#snippet claimingBlock()}
+    <!-- Sits under the device list, per the claiming model: LAN-first,
+         public-mesh only by deliberate, device-local choice. -->
+    <section class="block">
+      <h4>🌐 Claiming over the public mesh</h4>
+      <label class="pc-row">
+        <input
+          type="checkbox"
+          checked={app.publicClaims}
+          onchange={(e) => void app.setPublicClaims(e.currentTarget.checked)}
+        />
+        <span>Allow claiming over the public mesh</span>
+      </label>
+      <p class="hint">
+        Applies to <b>this device only</b> — it's never synced and can't be
+        turned on remotely. <b>Off (default):</b> claiming works while this
+        machine and the device share a local network; discovery rides mDNS on
+        the LAN and touches no public infrastructure. <b>On:</b> this machine
+        can claim remote devices by <i>claim code</i> — and while itself
+        claimable it publishes a claim code of its own (see its log) instead
+        of sitting on a public meeting point anyone could watch.
+      </p>
+      {#if app.publicClaims}
+        <div class="claim-code-row">
+          <input
+            class="mfa-input code-input"
+            placeholder="Claim code from the device (xxxx-xxxx-…)"
+            bind:value={claimCode}
+            disabled={claiming}
+            onkeydown={(e) => {
+              if (e.key === "Enter") void claimByCode();
+            }}
+          />
+          <button
+            class="btn small primary"
+            disabled={claiming || !claimCode.trim()}
+            onclick={() => void claimByCode()}
+          >
+            {claiming ? "Claiming…" : "Claim a remote device"}
+          </button>
+        </div>
+        {#if claimErr}
+          <div class="mfa-status err" role="alert">⚠ {claimErr}</div>
+        {/if}
+        <p class="hint">
+          Enter the code shown on the device (its web page, screen, or service
+          log). The claim meets on a private, randomized rendezvous derived
+          from that code — unguessable to anyone who doesn't hold it — and the
+          rendezvous is torn down again as soon as the claim lands.
+        </p>
+      {/if}
+    </section>
+  {/snippet}
 
   {#if hasFleet}
     <!-- Whose fleet this is — the owning *person's* name, which leads. It's not
@@ -361,6 +436,8 @@
       {/if}
     </section>
 
+    {@render claimingBlock()}
+
     {#if selfIsMember}
       <section class="block mfa-block">
         <h4>🛡️ Fleet security · authenticator</h4>
@@ -464,6 +541,10 @@
         join the same fleet.
       </p>
     </section>
+
+    <!-- Claiming settings exist before the first claim too: founding a fleet
+         by claiming a remote device starts right here. -->
+    {@render claimingBlock()}
   {/if}
 </div>
 
@@ -773,6 +854,20 @@
     background: var(--danger-soft);
   }
   .mfa-disable {
+    margin-top: 0.5rem;
+  }
+  .pc-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    user-select: none;
+  }
+  .claim-code-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
     margin-top: 0.5rem;
   }
   .mfa-disable-row {

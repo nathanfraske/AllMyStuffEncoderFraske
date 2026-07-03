@@ -28,10 +28,10 @@ use crate::UiSink;
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
-    AppControl, ClientId, ControlMessage, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
-    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
-    SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_MEDIA,
-    CHANNEL_PRESENCE, CHANNEL_ROOMS, PROTOCOL_VERSION,
+    claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage, KvmControl,
+    NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request, RoomMessage, RouteControl,
+    ShareControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL,
+    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -839,6 +839,12 @@ impl Mesh {
             .unwrap_or_else(|| NodeId::this().to_string());
         let label = self.fetch_identity_label().await;
         let profile = self.build_profile(&me, label);
+        // Join the claim-rendezvous networks *before* listing networks, so
+        // the LAN claim network (and the claim-code network, when public
+        // claims are on) is in the set we subscribe below. This is what
+        // makes a fresh, otherwise-unconfigured box discoverable by a
+        // same-LAN claimer with zero setup.
+        self.ensure_claim_networks().await;
         // Every joined network; route control/media operate on the primary.
         let networks = self.fetch_networks().await;
         let primary = networks.first().cloned();
@@ -1340,19 +1346,37 @@ impl Mesh {
         // Stamp our wall clock at the moment of send — receivers read it as
         // a passive clock-skew sample (see NodeProfile::sent_at).
         profile.sent_at = unix_now_ms();
-        let Ok(payload) = serde_json::to_value(&profile) else {
-            return;
-        };
         for network in networks {
+            // Claimable presence is per-network: only the claim-rendezvous
+            // networks ever carry `claimable: true` (see
+            // `claimable_advertised_on`) — on every other mesh this device
+            // reads as a plain, unclaimable node, so it can't be discovered
+            // for claiming over the public mesh unless that's deliberately
+            // enabled here.
+            let mut scoped = profile.clone();
+            scoped.claimable = profile.claimable && self.claimable_advertised_on(&network);
+            let Ok(payload) = serde_json::to_value(&scoped) else {
+                continue;
+            };
             let _ = self
                 .client
                 .request(&Request::ChannelSendAll {
                     network,
                     channel: CHANNEL_PRESENCE.to_string(),
-                    payload: payload.clone(),
+                    payload,
                 })
                 .await;
         }
+    }
+
+    /// Whether `claimable: true` may be advertised on `network`: the LAN
+    /// claim network always; this device's own claim-code network while
+    /// public claims are enabled; and — for a legacy claimer that only
+    /// shares an ordinary mesh with us — anywhere, once public claims are
+    /// deliberately on. Mirrors [`Mesh::claim_network_allowed`], so we
+    /// never advertise somewhere we'd then decline.
+    fn claimable_advertised_on(&self, network: &str) -> bool {
+        self.claim_network_allowed(network)
     }
 
     async fn handle_value(self: &Arc<Self>, value: Value) {
@@ -1473,7 +1497,7 @@ impl Mesh {
             self.state
                 .lock()
                 .peer_networks
-                .insert(pubkey_part(&from).to_string(), network);
+                .insert(pubkey_part(&from).to_string(), network.clone());
         }
         match channel {
             CHANNEL_PRESENCE => {
@@ -1621,6 +1645,34 @@ impl Mesh {
             }
             CHANNEL_CONTROL => {
                 if let Ok(msg) = serde_json::from_value::<ControlMessage>(payload) {
+                    // Claims are gated **by arrival network** before the
+                    // session ever sees them (the network id is dropped at
+                    // the `Effect::Ownership` boundary, so this is the only
+                    // place that can enforce it): the LAN claim network is
+                    // always honored, anything else only when public claims
+                    // are deliberately enabled on this device. The decline
+                    // names the fix so the claimer's toast is actionable.
+                    if let ControlMessage::Ownership(OwnershipControl::Claim { .. }) = &msg {
+                        if !self.claim_network_allowed(&network) {
+                            tracing::warn!(
+                                "claim from {} over {network:?} refused — claims over the \
+                                 public mesh are disabled on this device",
+                                short_id(&from)
+                            );
+                            let _ = self
+                                .send_control(
+                                    &from,
+                                    &ControlMessage::Ownership(OwnershipControl::Declined {
+                                        reason: "claims over the public mesh are disabled on \
+                                                 this device — claim it from the same local \
+                                                 network instead"
+                                            .into(),
+                                    }),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
                     // Terminal and files offers are screened *before* the
                     // session sees them: the session auto-accepts (Accept +
                     // StartMedia in one step), and a shell — or this disk —
@@ -2781,6 +2833,10 @@ impl Mesh {
                         short_id(from.as_str())
                     );
                     self.ensure_fleet_network().await;
+                    // The handoff landed — the claim rendezvous has done its
+                    // job. Tear the claim-code network down and rotate the
+                    // (now spent) code.
+                    self.ensure_claim_networks().await;
                     self.refresh_fleet_authorization().await;
                     self.emit_owned().await;
                 }
@@ -3024,6 +3080,13 @@ impl Mesh {
             let mut v = empty_owned();
             if let Some(o) = v.as_object_mut() {
                 o.insert("in_fleet".into(), Value::Bool(false));
+                // The device-local public-claims setting rides the owned
+                // payload in both shapes — the toggle is usable before a
+                // fleet exists (it gates this machine's own claiming).
+                o.insert(
+                    "public_claims".into(),
+                    Value::Bool(self.ownership.public_claims()),
+                );
             }
             return v;
         }
@@ -3208,6 +3271,12 @@ impl Mesh {
             // when not in a fleet), so the GUI's "am I in a fleet" check is the
             // same regardless of whether we hold a key yet.
             obj.insert("in_fleet".into(), Value::Bool(in_fleet));
+            // This device's public-claims setting (device-local, never
+            // synced) — the Fleet pane's toggle reads it from here.
+            obj.insert(
+                "public_claims".into(),
+                Value::Bool(self.ownership.public_claims()),
+            );
             // Stamp each member with its governance role for the drawer's
             // grant/withdraw controls.
             if let Some(arr) = obj.get_mut("members").and_then(|v| v.as_array_mut()) {
@@ -3237,9 +3306,139 @@ impl Mesh {
     /// "asking…" hanging forever.
     pub async fn claim(self: &Arc<Self>, node: String) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
+        // Claimer-side mirror of the claimee's arrival-network gate: with
+        // public claims off (the default), a claim only goes out over the
+        // LAN claim rendezvous. The error names the fix — either walk the
+        // two machines onto one local network, or deliberately enable the
+        // public-mesh path on this device.
+        if !self.ownership.public_claims_allowed() {
+            let route = self.network_for_peer(&node);
+            if route.as_deref() != Some(LOCAL_CLAIM_NETWORK_ID) {
+                return Err(
+                    "this device was discovered over a public mesh — put both machines on \
+                     the same local network, or enable \"Allow claiming over the public \
+                     mesh\" in Fleet settings on this machine"
+                        .into(),
+                );
+            }
+        }
         tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
         self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: claim a **remote** device by the claim code its
+    /// operator read off it (device web UI, service log). Joins the code's
+    /// randomized rendezvous network — unguessable, so unlike the old
+    /// well-known public claim mesh nobody can lurk there — waits for the
+    /// device's claimable presence, sends the claim, waits for it to land
+    /// in the fleet, and tears the rendezvous down again either way.
+    pub async fn claim_via_code(self: &Arc<Self>, code: String) -> Result<(), String> {
+        if !self.ownership.public_claims_allowed() {
+            return Err(
+                "remote claiming is off on this device — enable \"Allow claiming over the \
+                 public mesh\" in Fleet settings first"
+                    .into(),
+            );
+        }
+        let network = claim_code_network_id(&code);
+        if network == claim_code_network_id("") {
+            return Err("enter the claim code shown on the device".into());
+        }
+        tracing::info!("remote claim: joining rendezvous {network}");
+        let _ = self
+            .client
+            .request(&Request::NetworkAdd {
+                config: json!({
+                    "id": network.as_str(),
+                    "network_id": network.as_str(),
+                    "label": "Remote claiming",
+                    "kind": "open",
+                    "auto_approve": true,
+                    "signaling": { "strategy": "nostr", "mdns": true },
+                }),
+            })
+            .await;
+        self.sync_networks().await;
+
+        let result = self.claim_via_code_inner(&network).await;
+
+        // Rendezvous down again, success or not — it existed for this one
+        // claim. `purge` drops its signed-state residue too.
+        let _ = self
+            .client
+            .request(&Request::NetworkRemove {
+                network: network.clone(),
+                purge: true,
+            })
+            .await;
+        self.sync_networks().await;
+        result
+    }
+
+    async fn claim_via_code_inner(self: &Arc<Self>, network: &str) -> Result<(), String> {
+        // Wait for the device's claimable presence on the rendezvous.
+        const DISCOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
+        const CLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let discover_by = std::time::Instant::now() + DISCOVER_DEADLINE;
+        let target = loop {
+            if let Some(node) = self.claimable_on_network(network) {
+                break node;
+            }
+            if std::time::Instant::now() > discover_by {
+                return Err(
+                    "no claimable device answered on that code — check the code, make sure \
+                     remote claiming is still enabled on the device, and that it is online"
+                        .into(),
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        };
+
+        tracing::info!(
+            "remote claim: found claimable device {} on the rendezvous",
+            short_id(&target)
+        );
+        self.claim(target.clone()).await?;
+
+        // The `Claimed` reply mints the fleet key and records the member —
+        // that's the durable signal the claim landed.
+        let claimed_by = std::time::Instant::now() + CLAIM_DEADLINE;
+        loop {
+            let claimed = self
+                .ownership
+                .fleet_member_ids()
+                .iter()
+                .any(|m| pubkey_part(m) == pubkey_part(&target));
+            if claimed {
+                return Ok(());
+            }
+            if std::time::Instant::now() > claimed_by {
+                return Err(
+                    "the device saw the claim but confirmation never arrived — it may have \
+                     declined (already owned, or claim mode off); check its screen or logs"
+                        .into(),
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// A claimable node whose last-seen network is `network`, if any.
+    fn claimable_on_network(&self, network: &str) -> Option<String> {
+        let st = self.state.lock();
+        let session = st.session.as_ref()?;
+        let mut claimables = session
+            .peers()
+            .filter(|p| p.claimable)
+            .map(|p| p.node.to_string());
+        claimables.find(|id| {
+            st.peer_networks
+                .get(pubkey_part(id))
+                .is_some_and(|net| net == network)
+        })
     }
 
     /// Front-end command: ask a fleet machine to update itself to the
@@ -3469,8 +3668,33 @@ impl Mesh {
     /// another of your machines can adopt it. Re-advertises immediately.
     pub async fn set_claimable(self: &Arc<Self>, on: bool) -> Result<bool, String> {
         self.ownership.set_claim_mode(on);
+        // Claim-rendezvous membership follows claim mode (the claim-code
+        // network only exists while claimable with public claims on).
+        self.ensure_claim_networks().await;
         self.refresh_profile_ownership().await;
         Ok(self.ownership.claimable())
+    }
+
+    /// Front-end command: flip **this device's** public-claims setting —
+    /// whether it participates in claiming over the public mesh, in either
+    /// role (offering itself via a claim code while claimable; claiming
+    /// remote devices by code as an owner). Strictly device-local: it is
+    /// never synced from a fleet and no remote peer can flip it. Off by
+    /// default; claiming stays LAN-only until someone at this machine turns
+    /// it on.
+    pub async fn set_public_claims(self: &Arc<Self>, on: bool) -> Result<bool, String> {
+        if !self.ownership.set_public_claims(on) {
+            return Err("couldn't persist the setting".into());
+        }
+        tracing::info!(
+            "claims over the public mesh {} on this device",
+            if on { "ENABLED" } else { "disabled" }
+        );
+        // Rendezvous membership and presence both follow the setting.
+        self.ensure_claim_networks().await;
+        self.refresh_profile_ownership().await;
+        self.emit_owned().await;
+        Ok(self.ownership.public_claims())
     }
 
     /// The closed network backing this device's fleet (derived from the fleet
@@ -3521,6 +3745,10 @@ impl Mesh {
         // refresh runs on every check.
         if peer.is_none() {
             self.ensure_fleet_network().await;
+            // Claim rendezvous follows claim state on the same cadence: the
+            // LAN claim network is (re)asserted, and the claim-code network
+            // comes up / goes down / rotates with claimability.
+            self.ensure_claim_networks().await;
             // Same cadence, opposite policy: every *non*-fleet mesh is made
             // fully open (auto-approve), so older meshes are migrated and any
             // newly joined one is reconciled — no mesh keeps a stale approval
@@ -3528,6 +3756,103 @@ impl Mesh {
             self.ensure_open_meshes_auto_approve().await;
         }
         self.refresh_fleet_authorization().await;
+    }
+
+    /// Keep the claim-rendezvous networks in step with this device's claim
+    /// state. Two networks, two scopes:
+    ///
+    ///  * the **local claim network** ([`LOCAL_CLAIM_NETWORK_ID`]) — always
+    ///    joined, LAN-only (daemon signaling `strategy:"none", mdns:true`,
+    ///    no STUN/TURN). Claimable presence lives here; a claimer discovers
+    ///    a claimable box here with zero configuration and zero public
+    ///    infrastructure. This is the default — and with public claims off,
+    ///    the only — claim path.
+    ///  * the **claim-code network** (`amsclaim-<code>`) — the WAN
+    ///    rendezvous, joined only while this device sits claimable *and*
+    ///    public claims are deliberately enabled on it (the device-local
+    ///    setting or `ALLMYSTUFF_PUBLIC_CLAIMS`). The code is unguessable
+    ///    and shown out-of-band (log line here; a device UI elsewhere), so
+    ///    strangers can't find — let alone race-claim — the box the way
+    ///    they could on a well-known open network. Kept joined through the
+    ///    claimed-but-keyless window so the `Claimed` reply and the
+    ///    `FleetKey` handoff can still ride it, then torn down, with the
+    ///    code rotated once the fleet key lands (a code that admitted an
+    ///    owner is spent).
+    async fn ensure_claim_networks(self: &Arc<Self>) {
+        // The always-on LAN rendezvous. Explicit empty STUN/TURN lists opt
+        // out of the daemon's public defaults — this network must touch no
+        // remote infrastructure at all. A duplicate NetworkAdd (already
+        // joined) returns an error we ignore, same as the fleet network.
+        let _ = self
+            .client
+            .request(&Request::NetworkAdd {
+                config: json!({
+                    "id": LOCAL_CLAIM_NETWORK_ID,
+                    "network_id": LOCAL_CLAIM_NETWORK_ID,
+                    "label": "Local claiming (this LAN)",
+                    "kind": "open",
+                    "auto_approve": true,
+                    "signaling": { "strategy": "none", "mdns": true },
+                    "stun_servers": [],
+                    "turn_servers": [],
+                }),
+            })
+            .await;
+
+        // The WAN rendezvous, tracking claim state.
+        let claimable = self.ownership.claimable();
+        let public_ok = self.ownership.public_claims_allowed();
+        let keyless_claimed =
+            self.ownership.owner().is_some() && self.ownership.fleet_key().is_none();
+        if claimable && public_ok {
+            let code = self.ownership.ensure_claim_code();
+            let network = claim_code_network_id(&code);
+            tracing::info!(
+                "remote claiming enabled — claim code: {}  (claim this device from \
+                 another machine's Fleet settings by entering that code)",
+                format_claim_code(&code)
+            );
+            let _ = self
+                .client
+                .request(&Request::NetworkAdd {
+                    config: json!({
+                        "id": network.as_str(),
+                        "network_id": network.as_str(),
+                        "label": "Remote claiming",
+                        "kind": "open",
+                        "auto_approve": true,
+                        "signaling": { "strategy": "nostr", "mdns": true },
+                    }),
+                })
+                .await;
+        } else if let Some(code) = self.ownership.claim_code() {
+            if !keyless_claimed {
+                // Not claimable and not waiting on a fleet-key handoff —
+                // the rendezvous has no business staying up.
+                let _ = self
+                    .client
+                    .request(&Request::NetworkRemove {
+                        network: claim_code_network_id(&code),
+                        purge: false,
+                    })
+                    .await;
+                if self.ownership.owner().is_some() {
+                    // Fully claimed (owner + fleet key): this code admitted
+                    // an owner and is spent.
+                    self.ownership.rotate_claim_code();
+                }
+            }
+        }
+        self.sync_networks().await;
+    }
+
+    /// Whether an inbound `Claim` arriving on `network` may be honored.
+    /// LAN-first policy: the local claim network always may; anything else
+    /// (the claim-code rendezvous, a shared public mesh from a legacy
+    /// claimer) only when public claims are deliberately enabled **on this
+    /// device**.
+    fn claim_network_allowed(&self, network: &str) -> bool {
+        network == LOCAL_CLAIM_NETWORK_ID || self.ownership.public_claims_allowed()
     }
 
     /// Make sure the fleet's closed network exists, is genuinely closed, and
@@ -4069,6 +4394,8 @@ impl Mesh {
         let Some(network) = self.network_for_peer(peer) else {
             return;
         };
+        // Same per-network claimable scoping as `broadcast_presence`.
+        profile.claimable = profile.claimable && self.claimable_advertised_on(&network);
         if let Ok(payload) = serde_json::to_value(&profile) {
             let _ = self
                 .client

@@ -139,6 +139,8 @@ import {
   serviceUninstall,
   sessionSnapshot,
   setClaimable,
+  setPublicClaims,
+  claimViaCode,
   setNetworkEnabled,
   networkReconnect,
   updateApply,
@@ -4208,6 +4210,49 @@ class AppStore {
       alex: ["Work"],
     };
     for (const n of this.catalog.nodes) if (assign[n.id]) n.networks = assign[n.id];
+  }
+
+  /** This device's claims-over-the-public-mesh setting, straight from the
+   *  owned payload. Device-local — never synced from a fleet. */
+  publicClaims = $derived.by(() => this.ownedFleet?.public_claims === true);
+
+  /** Flip this device's public-claims setting (the Fleet pane toggle).
+   *  Optimistic — the backend confirms via the owned payload it re-emits. */
+  async setPublicClaims(on: boolean) {
+    if (this.backendConnected) {
+      try {
+        const now = (await setPublicClaims(on)) ?? on;
+        if (this.ownedFleet) {
+          this.ownedFleet = { ...this.ownedFleet, public_claims: now };
+        }
+        this.toast(
+          now ? "info" : "ok",
+          now
+            ? "Claims over the public mesh are ON for this device"
+            : "Claiming is local-network only on this device again",
+        );
+      } catch (e) {
+        this.toast("warn", `Couldn't change the public-claims setting: ${errMsg(e)}`);
+      }
+      return;
+    }
+    // Demo/web: flip locally so the toggle behaves.
+    if (this.ownedFleet) {
+      this.ownedFleet = { ...this.ownedFleet, public_claims: on };
+    }
+  }
+
+  /** Claim a remote device by the claim code shown on it. Slow by nature
+   *  (joins a rendezvous network, waits for the device to appear) — the
+   *  caller shows its own progress state; this resolves or throws with an
+   *  actionable message. */
+  async claimRemoteByCode(code: string): Promise<void> {
+    if (!this.backendConnected) {
+      this.toast("warn", "Remote claiming needs the desktop app");
+      return;
+    }
+    await claimViaCode(code);
+    this.toast("ok", "Device claimed — it's joining your fleet now");
   }
 
   /** Put *this* device into (or out of) claim mode so another of your

@@ -319,6 +319,23 @@ export function setClaimable(claimable: boolean): Promise<boolean | null> {
   return tryInvoke<boolean>("set_claimable", { claimable });
 }
 
+/** Flip this device's claims-over-the-public-mesh setting. Strictly
+ *  device-local (never fleet-synced; no remote peer can flip it). Returns
+ *  the new value (null in web mode). */
+export function setPublicClaims(on: boolean): Promise<boolean | null> {
+  return tryInvoke<boolean>("set_public_claims", { on });
+}
+
+/** Claim a remote device by the claim code shown on it. Joins the code's
+ *  randomized rendezvous network, claims the device, and leaves again —
+ *  throws with an actionable message when nothing answered or the device
+ *  declined. No-op in web mode. */
+export async function claimViaCode(code: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("claim_via_code", { code });
+}
+
 /** Point a KVM appliance at the machine it controls — binds `node` (the KVM)
  *  to `target` (the graph node it's wired into). The KVM enforces owner/fleet
  *  before applying, then re-advertises presence with the new binding (the
