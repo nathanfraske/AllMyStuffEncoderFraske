@@ -66,9 +66,10 @@ export interface SessionSnapshot {
     sites?: SiteAdvert[];
     /** KVM-appliance binding (from the peer's `NodeProfile.kvm`), present
      *  only when it advertises `FEATURE_KVM`. The Rust struct's fields are
-     *  snake_case on the wire — `attached_to` / `web` — so the store maps
-     *  them onto the camelCase `MeshNode.kvm`. Absent on an ordinary peer. */
-    kvm?: { attached_to?: string; web?: string };
+     *  snake_case on the wire — `attached_to` / `web` / `joining_mesh` /
+     *  `meshes` — so the store maps them onto the camelCase `MeshNode.kvm`.
+     *  Absent on an ordinary peer. */
+    kvm?: { attached_to?: string; web?: string; joining_mesh?: string; meshes?: string[] };
     /** The AllMyStuff version the peer is running, from its advert. Absent
      *  from an older peer — "unknown". */
     version?: string;
@@ -336,6 +337,24 @@ export async function kvmDetach(node: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("kvm_detach", { node });
+}
+
+/** Walk a KVM appliance onto another mesh — the fleet owner's membership
+ *  tool. The KVM validates the id, refuses its own fleet mesh, joins, and
+ *  re-advertises its membership list (`kvm.meshes`) — the authoritative
+ *  confirmation, same model as {@link kvmAttach}. No-op in web mode. */
+export async function kvmMeshAdd(node: string, networkId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_mesh_add", { node, networkId });
+}
+
+/** Take a KVM appliance off a mesh (never its fleet mesh). Same
+ *  delivery/confirmation model as {@link kvmMeshAdd}. No-op in web mode. */
+export async function kvmMeshRemove(node: string, networkId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("kvm_mesh_remove", { node, networkId });
 }
 
 /** Ownership feedback from the mesh — a `claimed` / `declined` reply to a

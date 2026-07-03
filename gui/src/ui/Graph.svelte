@@ -21,7 +21,7 @@
     return () => ro.disconnect();
   });
 
-  const NODE_W = 184;
+  const NODE_W = 214;
   const NODE_H = 86;
 
   type Placed = { node: MeshNode; x: number; y: number };
@@ -249,6 +249,25 @@
         color: mediaColor(r.media as MediaKind),
         media: r.media as MediaKind,
       });
+    }
+    return out;
+  });
+
+  // KVM tethers: one per attached KVM, drawn from the KVM to the machine it
+  // physically controls (its advertised `kvm.attachedTo`). Not a media route —
+  // there's nothing flowing to color or animate — just the physical wiring
+  // made visible, so the graph reads "this KVM is plugged into that box".
+  type Tether = { id: string; x1: number; y1: number; x2: number; y2: number };
+  const kvmTethers = $derived.by((): Tether[] => {
+    const out: Tether[] = [];
+    for (const n of app.catalog.nodes) {
+      if (!app.isKvm(n)) continue;
+      const target = app.kvmTargetNode(n);
+      if (!target) continue;
+      const a = posOf.get(n.id);
+      const b = posOf.get(target.id);
+      if (!a || !b || a === b) continue;
+      out.push({ id: `kvm-tether:${n.id}`, x1: a.x, y1: a.y, x2: b.x, y2: b.y });
     }
     return out;
   });
@@ -521,16 +540,36 @@
    *  (revealed by tapping it). Null = none showing. */
   let claimRevealed = $state<string | null>(null);
 
-  /** Whether the KVM drawer's inline "attach target" picker is open (only one
-   *  KVM drawer shows at a time, so a single flag suffices). */
-  let kvmPickerOpen = $state(false);
   /** The picker's chosen target, defaulted to the KVM's owner when it opens. */
   let kvmTarget = $state("");
 
-  /** Open the attach picker for `kvmId`, defaulting the target to its owner. */
-  function openKvmPicker(kvmId: string) {
+  /** Toggle the attach dropdown for `kvmId` — the link button's drop-out.
+   *  Opening defaults the target to the KVM's owner; re-toggling (or opening
+   *  another KVM's) closes it, so a stale target never carries across. */
+  function toggleKvmAttach(kvmId: string) {
+    if (app.kvmRevealed === kvmId) {
+      app.kvmRevealed = null;
+      return;
+    }
     kvmTarget = app.kvmDefaultTarget(kvmId) ?? "";
-    kvmPickerOpen = true;
+    app.kvmRevealed = kvmId;
+    claimRevealed = null;
+  }
+
+  /** The KVM whose self-reboot button is armed (two-step confirm, like the
+   *  gear menu's Restart device). Disarms itself after a beat. */
+  let kvmRebootArmed = $state<string | null>(null);
+  let kvmRebootDisarm: ReturnType<typeof setTimeout> | undefined;
+  function kvmRebootClick(n: MeshNode) {
+    if (kvmRebootArmed !== n.id) {
+      kvmRebootArmed = n.id;
+      clearTimeout(kvmRebootDisarm);
+      kvmRebootDisarm = setTimeout(() => (kvmRebootArmed = null), 3000);
+      return;
+    }
+    clearTimeout(kvmRebootDisarm);
+    kvmRebootArmed = null;
+    app.restartNodeDevice(n.id);
   }
 
   function onNodeClick(n: MeshNode) {
@@ -548,17 +587,10 @@
     } else if (isAdoptable(n)) {
       // Tapping a claimable node drops an inline "Claim" button out from
       // under it (shimmer + slide) — the fast path to adopt, right on the
-      // graph — and opens the drawer for the full story.
+      // graph — and opens the drawer for the full story. Close any open KVM
+      // attach dropdown so only one drop-out ever shows at a time.
       claimRevealed = claimRevealed === n.id ? null : n.id;
-      app.selectNode(n.id);
-    } else if (app.kvmAllowed(n)) {
-      // Tapping a KVM you own drops its slide-out drawer (Open KVM + the
-      // quick feature buttons + Attach) — the same reveal model as Claim.
-      // Every (re)reveal starts with the picker closed, so switching KVMs
-      // never carries a stale target across.
-      app.kvmRevealed = app.kvmRevealed === n.id ? null : n.id;
-      kvmPickerOpen = false;
-      claimRevealed = null;
+      app.kvmRevealed = null;
       app.selectNode(n.id);
     } else {
       claimRevealed = null;
@@ -636,8 +668,10 @@
 </script>
 
 <!-- The small console glyphs for the card buttons: remote desktop, files,
-     terminal, sites. Stroke uses currentColor. -->
-{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites")}
+     terminal, sites, plus the KVM set (its web console, its self-reboot, the
+     attach link, and the attached machine's power/reset). Stroke uses
+     currentColor. -->
+{#snippet cicon(kind: "remote" | "files" | "terminal" | "sites" | "kvm" | "reboot" | "link" | "power" | "reset")}
   {#if kind === "remote"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8M12 17v3" />
@@ -649,6 +683,33 @@
   {:else if kind === "terminal"}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4.5" width="18" height="15" rx="2" /><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4" />
+    </svg>
+  {:else if kind === "kvm"}
+    <!-- The KVM's own web console: a monitor with the keyboard bar below —
+         distinct from "remote" (no stand), since this opens the appliance's
+         integrated UI, not an AllMyStuff console. -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="11" rx="2" /><rect x="5" y="18" width="14" height="3" rx="1" />
+    </svg>
+  {:else if kind === "reboot"}
+    <!-- Reboot the KVM itself: a restart loop with a power tick. -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20 12a8 8 0 1 1-3-6.2" /><polyline points="17 3 17 6.5 20.5 6.5" /><path d="M12 8.5v4" />
+    </svg>
+  {:else if kind === "link"}
+    <!-- Attach: the chain link that drops the target picker out. -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M10 13.5a4 4 0 0 0 6 .5l2.5-2.5a4 4 0 0 0-5.7-5.7L11.5 7" /><path d="M14 10.5a4 4 0 0 0-6-.5L5.5 12.5a4 4 0 0 0 5.7 5.7L12.5 17" />
+    </svg>
+  {:else if kind === "power"}
+    <!-- The attached machine's power button, driven through the KVM's GPIO. -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 3v8" /><path d="M6.6 6.6a8 8 0 1 0 10.8 0" />
+    </svg>
+  {:else if kind === "reset"}
+    <!-- The attached machine's reset line: a hard loop-around. -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="3 5 3 10 8 10" /><path d="M4.6 14a8 8 0 1 0 1.6-7.4L3 10" />
     </svg>
   {:else}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -681,6 +742,16 @@
     </defs>
     <rect x="0" y="0" {width} {height} fill="url(#dots)" />
     <g transform="translate({panX} {panY}) scale({zoom})">
+      {#each kvmTethers as tth (tth.id)}
+        <!-- The physical KVM↔machine wiring: a quiet dashed tether under the
+             live media wires, with a plug dot at the KVM end. -->
+        <path
+          class="wire-kvm"
+          d="M {tth.x1} {tth.y1} L {tth.x2} {tth.y2}"
+          fill="none"
+        />
+        <circle class="wire-kvm-plug" cx={tth.x1} cy={tth.y1} r="3.5" />
+      {/each}
       {#each edges as e (e.id)}
         <path
           class="wire"
@@ -853,6 +924,39 @@
             <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
               onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
           {/if}
+          {#if app.kvmAllowed(n)}
+            <!-- The KVM's own button set (it gets no Remote Control — its
+                 integrated web UI is the console): open that UI, reboot the
+                 KVM itself (two-step arm), and the attach link, which drops
+                 the target picker out under the card. -->
+            <button class="cbtn" data-tip="Open KVM" aria-label="Open {displayName(n)}'s web console"
+              onclick={(e) => { e.stopPropagation(); void app.openKVM(n.id); }}>{@render cicon("kvm")}</button>
+            {#if app.canRestartDevice(n)}
+              <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
+                data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
+                aria-label="Reboot {displayName(n)} (the KVM itself)"
+                onclick={(e) => { e.stopPropagation(); kvmRebootClick(n); }}>{@render cicon("reboot")}</button>
+            {/if}
+            <button class="cbtn" class:active={app.kvmRevealed === n.id}
+              data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
+              aria-expanded={app.kvmRevealed === n.id}
+              onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}</button>
+          {/if}
+          {#if !app.isKvm(n)}
+            {@const kvmHere = app.kvmAttachedTo(n.id)}
+            {#if kvmHere && app.kvmAllowed(kvmHere)}
+              <!-- This machine is wired into a KVM you control: its physical
+                   power and reset lines ride the KVM's GPIO, so they belong
+                   on THIS card — they act on this machine. -->
+              <button class="cbtn" data-tip="Power (via {displayName(kvmHere)})"
+                aria-label="Press {displayName(n)}'s power button via its KVM"
+                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "power"); }}>{@render cicon("power")}</button>
+              <button class="cbtn" data-tip="Reset (via {displayName(kvmHere)})"
+                aria-label="Hard-reset {displayName(n)} via its KVM"
+                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "reset"); }}>{@render cicon("reset")}</button>
+            {/if}
+          {/if}
+          <span class="cbtn-sep" aria-hidden="true"></span>
           <button
             class="cbtn node-gear"
             data-tip="Settings"
@@ -878,61 +982,39 @@
             onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
           >＋ Claim this device</button>
         {:else if app.kvmAllowed(n) && app.kvmRevealed === n.id}
-          <!-- A KVM you own, tapped: its quick drawer slides in — open its web
-               UI, fire the feature buttons, or point it at a machine. No Detach
-               here; that's the buried, confirm-gated action in the sidebar. -->
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          {@const targets = app.kvmAttachTargets(n.id)}
+          <!-- The attach picker, dropped out by the card's link button: pick
+               which machine this KVM is wired into and Set. Everything else
+               (Open KVM, reboot, power/reset) lives in the button bar now —
+               this drop-out exists only for the one action that needs a
+               choice. No Detach here; that's the buried, confirm-gated action
+               in the sidebar. -->
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
           <div class="node-drawer kvm-drawer" onclick={(e) => e.stopPropagation()}>
-            <button
-              class="kvm-act primary"
-              title="Open this KVM's own web console through the mesh"
-              onclick={(e) => { e.stopPropagation(); void app.openKVM(n.id); }}
-            >🖥 Open KVM</button>
-            <div class="kvm-row">
-              <button
-                class="kvm-act"
-                title="Power button — toggle the controlled machine's power"
-                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(n.id, "power"); }}
-              >⏻ Power</button>
-              <button
-                class="kvm-act"
-                title="Reset button — hard-reset the controlled machine"
-                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(n.id, "reset"); }}
-              >↻ Reset</button>
-              <button
-                class="kvm-act"
-                title="Point this KVM at the machine it controls"
-                onclick={(e) => { e.stopPropagation(); if (kvmPickerOpen) kvmPickerOpen = false; else openKvmPicker(n.id); }}
-              >🔗 Attach</button>
-            </div>
-            {#if kvmPickerOpen}
-              {@const targets = app.kvmAttachTargets(n.id)}
-              {#if targets.length === 0}
-                <p class="kvm-empty">No machines of yours to attach to yet.</p>
-              {:else}
-                <div class="kvm-row">
-                  <select
-                    class="kvm-pick"
-                    title="Which machine this KVM controls"
-                    bind:value={kvmTarget}
-                  >
-                    {#each targets as t (t.id)}
-                      <option value={t.id}>{displayName(t)}</option>
-                    {/each}
-                  </select>
-                  <button
-                    class="kvm-act"
-                    disabled={!kvmTarget}
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      if (!kvmTarget) return;
-                      void app.attachKVM(n.id, kvmTarget);
-                      kvmPickerOpen = false;
-                      app.kvmRevealed = null;
-                    }}
-                  >Set</button>
-                </div>
-              {/if}
+            {#if targets.length === 0}
+              <p class="kvm-empty">No machines of yours to attach to yet.</p>
+            {:else}
+              <div class="kvm-row">
+                <select
+                  class="kvm-pick"
+                  title="Which machine this KVM controls"
+                  bind:value={kvmTarget}
+                >
+                  {#each targets as t (t.id)}
+                    <option value={t.id}>{displayName(t)}</option>
+                  {/each}
+                </select>
+                <button
+                  class="kvm-act"
+                  disabled={!kvmTarget}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    if (!kvmTarget) return;
+                    void app.attachKVM(n.id, kvmTarget);
+                    app.kvmRevealed = null;
+                  }}
+                >Set</button>
+              </div>
             {/if}
           </div>
         {/if}
@@ -1186,6 +1268,22 @@
     stroke-width: 16;
     pointer-events: stroke;
     cursor: help;
+  }
+  /* The KVM↔machine tether: physical wiring, not a media route — quiet,
+     dashed, unanimated, under the live wires. The plug dot marks the KVM end
+     so the direction reads at a glance. */
+  .wire-kvm {
+    stroke: var(--ink-faint);
+    stroke-width: 1.6;
+    stroke-dasharray: 5 7;
+    stroke-linecap: round;
+    opacity: 0.7;
+  }
+  .wire-kvm-plug {
+    fill: var(--surface);
+    stroke: var(--ink-faint);
+    stroke-width: 1.6;
+    opacity: 0.8;
   }
   @keyframes flow {
     to {
@@ -1469,14 +1567,6 @@
     background: var(--accent-soft);
     border-color: var(--accent);
   }
-  .kvm-act.primary {
-    border-color: var(--accent);
-    background: var(--accent);
-    color: var(--bg);
-  }
-  .kvm-act.primary:hover {
-    background: var(--accent-ink);
-  }
   .kvm-pick {
     flex: 1;
     min-width: 0;
@@ -1658,10 +1748,10 @@
     box-shadow: 0 0 0 2px oklch(0.8 0.17 150 / 0.18);
   }
   /* The settings gear is a cbtn with a glyph face instead of an icon — sized a
-     touch larger than the console icons so it reads clearly — pinned to the
-     right of the bottom row. */
+     touch larger than the console icons so it reads clearly. It sits right of
+     the divider (which carries the flex slack), so it's pinned to the right of
+     the bottom row. */
   .node-gear {
-    margin-left: auto;
     font-size: 1.05rem;
     line-height: 1;
   }
@@ -1748,16 +1838,38 @@
      you can open on the device; clicking opens it. */
   .node-consoles {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 0.26rem;
     margin-top: 0.15rem;
+  }
+  /* A hairline divider that caps the action buttons and sets the gear apart —
+     it carries the flex slack (margin-left:auto), so the row reads
+     "actions … │ ⚙" with the rule sitting right against the gear. */
+  .cbtn-sep {
+    margin-left: auto;
+    align-self: stretch;
+    width: 1px;
+    min-height: 1.1rem;
+    background: var(--line-strong);
+    opacity: 0.7;
+  }
+  /* No action buttons before it (a bare self card, or a device with no
+     consoles): the divider would separate nothing — hide it and let the gear
+     carry the right-edge slack itself. */
+  .cbtn-sep:first-child {
+    display: none;
+  }
+  .cbtn-sep:first-child + .node-gear {
+    margin-left: auto;
   }
   .cbtn {
     position: relative;
     display: grid;
     place-items: center;
-    width: 1.55rem;
-    height: 1.55rem;
+    flex: none;
+    width: 1.42rem;
+    height: 1.42rem;
     border-radius: var(--r-sm);
     border: 1px solid var(--line-strong);
     background: var(--surface-2);
@@ -1774,9 +1886,29 @@
   .cbtn:active {
     transform: translateY(1px);
   }
+  /* The attach link button while its drop-out is open. */
+  .cbtn.active {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  /* The KVM self-reboot button, armed: one more click acts. Same red the
+     gear menu's armed Restart-device row uses. */
+  .cbtn.armed-danger {
+    border-color: var(--danger);
+    color: var(--danger);
+    background: var(--danger-soft);
+    animation: arm-pulse 0.9s ease-in-out infinite;
+  }
+  @keyframes arm-pulse {
+    50% {
+      background: var(--danger-soft);
+      opacity: 0.65;
+    }
+  }
   .cbtn :global(svg) {
-    width: 0.95rem;
-    height: 0.95rem;
+    width: 0.9rem;
+    height: 0.9rem;
     /* the glyphs sit right of centre — nudge them left so the spare pixels
        land on the right. */
     transform: translateX(-3px);

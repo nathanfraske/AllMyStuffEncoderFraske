@@ -142,9 +142,12 @@ export interface MeshNode {
    *  `NodeProfile.kvm` (a `KvmAdvert`). `attachedTo` is the graph node this
    *  KVM physically controls (absent = not bound to anything yet); `web` is
    *  the `SiteAdvert.id` serving the KVM's own web UI (absent = the UI falls
-   *  back to the first web-scheme site). Absent on an ordinary node or an
-   *  older peer. */
-  kvm?: { attachedTo?: string; web?: string };
+   *  back to the first web-scheme site); `joiningMesh` is the per-device
+   *  `cec-kvm-…` mesh the KVM returns to when unclaimed/reset (the same name
+   *  it shows on its screen); `meshes` is every mesh it's currently joined
+   *  to, fleet included — the list a fleet owner curates from the drawer.
+   *  Absent on an ordinary node or an older peer. */
+  kvm?: { attachedTo?: string; web?: string; joiningMesh?: string; meshes?: string[] };
   /** The AllMyStuff version this node is running, from its presence advert
    *  (e.g. "0.1.11"). Absent from an older peer (or the in-browser demo) —
    *  the upgrade affordance only appears once we know both this and the

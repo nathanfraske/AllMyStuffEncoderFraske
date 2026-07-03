@@ -811,6 +811,16 @@ pub async fn dispatch(
             let node: String = try_arg!(arg(a, "node"));
             json_result(mesh.kvm_detach(node).await)
         }
+        "kvm_mesh_add" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let network_id: String = try_arg!(arg(a, "network_id"));
+            json_result(mesh.kvm_mesh_add(node, network_id).await)
+        }
+        "kvm_mesh_remove" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let network_id: String = try_arg!(arg(a, "network_id"));
+            json_result(mesh.kvm_mesh_remove(node, network_id).await)
+        }
 
         // ---- shares ------------------------------------------------------
         "share_grant" => {

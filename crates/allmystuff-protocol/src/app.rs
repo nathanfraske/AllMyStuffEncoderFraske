@@ -632,14 +632,30 @@ pub struct KvmAdvert {
     /// web-scheme site. Empty serializes *without* the key.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub web: String,
+    /// The KVM's own **joining mesh** — the per-device `cec-kvm-xxxxx-xxxxx`
+    /// network it ships with and returns to whenever it's reset/unclaimed.
+    /// Derived deterministically from the device's identity, so it's the same
+    /// name the KVM shows on its screen and web UI. The UI surfaces it so an
+    /// owner always knows where a device will reappear after an unclaim —
+    /// nothing is printed on a box. Empty (older KVM firmware) serializes
+    /// *without* the key.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub joining_mesh: String,
+    /// Every mesh (network id) the KVM is currently joined to, fleet included —
+    /// the membership list a fleet owner curates with [`KvmControl::MeshAdd`] /
+    /// [`KvmControl::MeshRemove`]. The KVM is the source of truth and
+    /// re-advertises on every change, exactly like `attached_to`. Empty (older
+    /// firmware, or genuinely none known yet) serializes *without* the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meshes: Vec<String>,
 }
 
-/// Curating a KVM appliance's attachment — the "what does this KVM control?"
-/// binding surfaced in the KVM drawer. Authorized exactly like a terminal or
-/// a site route: only the device's owner or a fleet co-member is obeyed (the
-/// mesh authenticates the sender), so a stranger can't re-point your KVM. The
-/// KVM applies the change, persists it, and re-advertises presence with the
-/// new [`NodeProfile::kvm`] — that presence is the authoritative confirmation,
+/// Curating a KVM appliance — its attachment binding and its mesh membership.
+/// Authorized exactly like a terminal or a site route: only the device's owner
+/// or a fleet co-member is obeyed (the mesh authenticates the sender), so a
+/// stranger can't re-point your KVM or walk it onto a mesh. The KVM applies
+/// the change, persists it, and re-advertises presence with the new
+/// [`NodeProfile::kvm`] — that presence is the authoritative confirmation,
 /// exactly as a claim confirms by re-advertising its new owner. An older peer
 /// doesn't know the `kvm` tag and drops the whole [`ControlMessage`], so the
 /// command simply goes unanswered there — never misinterpreted.
@@ -648,12 +664,35 @@ pub struct KvmAdvert {
 pub enum KvmControl {
     /// "Point this KVM at `node`." Binds the KVM to the target machine it
     /// controls. Re-attaching to a different node just replaces the binding.
-    Attach { node: NodeId },
+    Attach {
+        node: NodeId,
+        /// The target's display label at attach time, so the KVM can rename
+        /// itself `KVM-<label>` on both its AllMyStuff presence and its
+        /// myownmesh identity — the graph then reads "KVM-den-tower controls
+        /// den-tower" without the viewer resolving ids. Best-effort and
+        /// cosmetic: empty (an older sender, or a target with no label yet)
+        /// serializes *without* the key and the KVM falls back to the target
+        /// node id. Refreshed on every re-attach, never live-tracked.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        label: String,
+    },
     /// "This KVM no longer represents anything." Clears the binding. This is
     /// the deliberately-buried, confirm-gated action in the UI — detaching a
     /// KVM strips a machine of its out-of-band screen/keyboard, so it never
     /// rides the quick graph drawer.
     Detach,
+    /// "Join this mesh too." Adds `network_id` to the KVM's mesh memberships
+    /// ([`KvmAdvert::meshes`]) — the fleet-owner tool for walking a device
+    /// onto another venue (a site mesh, a lab mesh) without touching its
+    /// console. The KVM normalizes and validates the id, refuses its own
+    /// fleet mesh (that membership is governed by the fleet key, never by
+    /// this command), and re-advertises the new list.
+    MeshAdd { network_id: String },
+    /// "Leave this mesh." Removes `network_id` from the KVM's memberships and
+    /// purges its local state for it. The fleet mesh is refused — evicting a
+    /// device from its fleet is [`OwnershipControl::Release`] + governance,
+    /// not a membership edit.
+    MeshRemove { network_id: String },
     /// A KVM-control kind a newer build introduced. Ignored here rather than
     /// failing the enclosing [`ControlMessage`].
     #[serde(other)]
@@ -1088,6 +1127,7 @@ mod tests {
         // the target node it binds the KVM to.
         let attach = ControlMessage::Kvm(KvmControl::Attach {
             node: "den-tower".into(),
+            label: String::new(),
         });
         let s = serde_json::to_string(&attach).unwrap();
         assert!(s.contains("\"t\":\"kvm\""));
@@ -1141,6 +1181,7 @@ mod tests {
             kvm: Some(KvmAdvert {
                 attached_to: Some("den-tower".into()),
                 web: "tcp:80".into(),
+                ..Default::default()
             }),
             ..p
         };
@@ -1153,16 +1194,86 @@ mod tests {
 
         // A freshly-claimed-but-unattached KVM omits `attached_to`.
         let p = NodeProfile {
-            kvm: Some(KvmAdvert {
-                attached_to: None,
-                web: String::new(),
-            }),
+            kvm: Some(KvmAdvert::default()),
             ..p
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"kvm\":{}"));
         let back: NodeProfile = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kvm.unwrap().attached_to, None);
+    }
+
+    #[test]
+    fn kvm_advert_joining_mesh_and_meshes_accept_skew_both_ways() {
+        // Older firmware's advert has neither field — both default (empty)
+        // rather than failing, and empties serialize *without* the keys so an
+        // older receiver sees the unchanged shape.
+        let old = serde_json::json!({ "web": "tcp:80" });
+        let a: KvmAdvert = serde_json::from_value(old).unwrap();
+        assert_eq!(a.joining_mesh, "");
+        assert!(a.meshes.is_empty());
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(!s.contains("joining_mesh"));
+        assert!(!s.contains("meshes"));
+
+        // New firmware's advert round-trips both.
+        let a = KvmAdvert {
+            joining_mesh: "cec-kvm-ab3de-fg7hj".into(),
+            meshes: vec!["amber-turing-x3k9q".into(), "cec-kvm-ab3de-fg7hj".into()],
+            ..a
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("\"joining_mesh\":\"cec-kvm-ab3de-fg7hj\""));
+        assert!(s.contains("\"meshes\":[\"amber-turing-x3k9q\",\"cec-kvm-ab3de-fg7hj\"]"));
+        let back: KvmAdvert = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn kvm_control_mesh_add_remove_round_trip_and_tag() {
+        // MeshAdd/MeshRemove ride the same `t: "kvm"` envelope as attach.
+        let add = ControlMessage::Kvm(KvmControl::MeshAdd {
+            network_id: "den-site-mesh".into(),
+        });
+        let s = serde_json::to_string(&add).unwrap();
+        assert!(s.contains("\"t\":\"kvm\""));
+        assert!(s.contains("\"kind\":\"mesh_add\""));
+        assert!(s.contains("\"network_id\":\"den-site-mesh\""));
+        assert_eq!(serde_json::from_str::<ControlMessage>(&s).unwrap(), add);
+
+        let remove = ControlMessage::Kvm(KvmControl::MeshRemove {
+            network_id: "den-site-mesh".into(),
+        });
+        let s = serde_json::to_string(&remove).unwrap();
+        assert!(s.contains("\"kind\":\"mesh_remove\""));
+        assert_eq!(serde_json::from_str::<ControlMessage>(&s).unwrap(), remove);
+    }
+
+    #[test]
+    fn kvm_control_attach_label_accepts_skew_both_ways() {
+        // An older sender's attach has no `label` — it decodes as empty
+        // rather than failing, and an empty label serializes *without* the
+        // key so an older KVM sees the exact attach shape it always did.
+        let old = serde_json::json!({ "t": "kvm", "kind": "attach", "node": "den-tower" });
+        let m: ControlMessage = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            m,
+            ControlMessage::Kvm(KvmControl::Attach {
+                node: "den-tower".into(),
+                label: String::new(),
+            })
+        );
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("label"));
+
+        // A labelled attach round-trips.
+        let m = ControlMessage::Kvm(KvmControl::Attach {
+            node: "den-tower".into(),
+            label: "Den Tower".into(),
+        });
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"label\":\"Den Tower\""));
+        assert_eq!(serde_json::from_str::<ControlMessage>(&s).unwrap(), m);
     }
 
     #[test]

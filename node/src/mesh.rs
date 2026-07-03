@@ -2862,6 +2862,38 @@ impl Mesh {
         }
     }
 
+    /// The display label to hand a KVM so it can name itself `KVM-<target>` —
+    /// the target's *real* advertised name, or empty when we don't know it.
+    /// Distinct from [`Self::peer_label`], which falls back to a truncated id:
+    /// here an unknown target must yield "" so the KVM falls back to the node
+    /// id itself rather than being named `KVM-abcd1234ef…` with a literal
+    /// ellipsis. The attach picker's default target is often *this* machine,
+    /// which is never a session peer, so that case is resolved from our own
+    /// presence profile.
+    fn attach_target_label(&self, target: &NodeId) -> String {
+        let canon = pubkey_part(target.as_str());
+        let st = self.state.lock();
+        // This machine (the picker's frequent default): our own profile label.
+        if let Some(p) = st.profile.as_ref() {
+            if target.is_this() || pubkey_part(p.node.as_str()) == canon {
+                let l = p.label.trim();
+                return if l.is_empty() {
+                    String::new()
+                } else {
+                    l.to_string()
+                };
+            }
+        }
+        if let Some(session) = st.session.as_ref() {
+            for p in session.peers() {
+                if pubkey_part(p.node.as_str()) == canon && !p.label.trim().is_empty() {
+                    return p.label.clone();
+                }
+            }
+        }
+        String::new()
+    }
+
     /// Hand a freshly-claimed device its fleet credential point-to-point: the
     /// shared key (so it derives the same closed-network id and joins it) and
     /// the fleet name. This replaces the old gossiped `OwnedRoster` — the
@@ -3377,8 +3409,14 @@ impl Mesh {
     /// surfaced so the UI can say so rather than leaving the ask hanging.
     pub async fn kvm_attach(self: &Arc<Self>, node: String, target: String) -> Result<(), String> {
         tracing::info!("pointing KVM {} at {}", short_id(&node), short_id(&target));
+        // Ride the target's display label along so the KVM can rename itself
+        // `KVM-<label>` — best-effort and cosmetic (empty when the target has
+        // no label we know; the KVM then falls back to the node id, never a
+        // truncated-id string).
+        let label = self.attach_target_label(&NodeId::from(target.clone()));
         let msg = ControlMessage::Kvm(KvmControl::Attach {
             node: target.into(),
+            label,
         });
         self.send_control(&node, &msg).await
     }
@@ -3389,6 +3427,41 @@ impl Mesh {
     pub async fn kvm_detach(self: &Arc<Self>, node: String) -> Result<(), String> {
         tracing::info!("detaching KVM {}", short_id(&node));
         let msg = ControlMessage::Kvm(KvmControl::Detach);
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: walk a KVM appliance onto another mesh — the fleet
+    /// owner's membership tool. The KVM validates the id, refuses its own
+    /// fleet mesh, joins, and re-advertises [`NodeProfile::kvm`] with the new
+    /// membership list — that presence is the authoritative confirmation.
+    pub async fn kvm_mesh_add(
+        self: &Arc<Self>,
+        node: String,
+        network_id: String,
+    ) -> Result<(), String> {
+        let network_id = network_id.trim().to_lowercase();
+        if network_id.is_empty() {
+            return Err("a mesh name is required".into());
+        }
+        tracing::info!("asking KVM {} to join mesh {network_id}", short_id(&node));
+        let msg = ControlMessage::Kvm(KvmControl::MeshAdd { network_id });
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: take a KVM appliance off a mesh. The KVM refuses
+    /// its fleet mesh (that membership is governed by the fleet key); same
+    /// presence-confirmation model as [`Mesh::kvm_mesh_add`].
+    pub async fn kvm_mesh_remove(
+        self: &Arc<Self>,
+        node: String,
+        network_id: String,
+    ) -> Result<(), String> {
+        let network_id = network_id.trim().to_lowercase();
+        if network_id.is_empty() {
+            return Err("a mesh name is required".into());
+        }
+        tracing::info!("asking KVM {} to leave mesh {network_id}", short_id(&node));
+        let msg = ControlMessage::Kvm(KvmControl::MeshRemove { network_id });
         self.send_control(&node, &msg).await
     }
 
@@ -4114,6 +4187,20 @@ impl Mesh {
         // returned id equals `network`; we keep the one from `fleet_network_id`.
         self.ownership.kick_member(&device)?;
         let target = pubkey_part(&device).to_string();
+        // Tell the device directly FIRST, while it's still a live peer on the
+        // fleet mesh. The `Evict` below ratifies synchronously on this daemon
+        // and drops the peer session, so a `Release` sent afterwards would
+        // find no delivery path — the device would be evicted from everyone's
+        // roster but never told to reset itself. Order matters for the KVM
+        // *unclaim*: a cooperative device must receive this to leave its
+        // meshes and return to claim mode. A lost/stolen device simply
+        // ignores it; the propagating `Evict` still does its job.
+        let _ = self
+            .send_control(
+                &device,
+                &ControlMessage::Ownership(OwnershipControl::Release),
+            )
+            .await;
         tracing::info!(
             "evicting {} from fleet network {network}",
             short_id(&device)
@@ -4135,13 +4222,6 @@ impl Mesh {
             }
             Err(e) => return Err(e.to_string()),
         }
-        // Tell the device directly too, so a cooperative one ejects at once.
-        let _ = self
-            .send_control(
-                &device,
-                &ControlMessage::Ownership(OwnershipControl::Release),
-            )
-            .await;
         self.refresh_fleet_authorization().await;
         self.emit_owned().await;
         Ok(())
