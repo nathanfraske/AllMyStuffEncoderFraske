@@ -85,10 +85,11 @@ impl Shares {
     /// no-op "ok"). The seam the tests use, and what [`Shares::load`] funnels
     /// through.
     fn load_at(path: Option<PathBuf>) -> Self {
-        let persisted = path
+        // Missing → blank; corrupt → quarantined + blank, loudly (silently
+        // blank would drop every standing share without a trace).
+        let persisted: Persisted = path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
+            .map(|p| crate::persist::load_json(p))
             .unwrap_or_default();
         Shares {
             path,
@@ -319,7 +320,7 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
         shares: inner.shares.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
-        Ok(json) => std::fs::write(path, json).is_ok(),
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
         Err(_) => false,
     }
 }

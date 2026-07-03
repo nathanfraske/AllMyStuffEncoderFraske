@@ -52,6 +52,7 @@ pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
 pub mod ownership;
+pub(crate) mod persist;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
 /// device" and the fleet's `RestartDevice` command.
 pub mod reboot;

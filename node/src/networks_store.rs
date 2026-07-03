@@ -35,13 +35,15 @@ pub struct DisabledNetworks {
 }
 
 impl DisabledNetworks {
-    /// Load the parked configs from disk (or start empty).
+    /// Load the parked configs from disk (or start empty). A corrupt file is
+    /// quarantined aside and loads empty, loudly — a silent empty here makes
+    /// every parked network vanish from the UI (and turns the local claiming
+    /// mesh back on, since "off" is exactly its presence in this store).
     pub fn load() -> Self {
         let path = store_path();
-        let inner = path
+        let inner: Persisted = path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
+            .map(|p| crate::persist::load_json(p))
             .unwrap_or_default();
         DisabledNetworks {
             path,
@@ -123,7 +125,7 @@ fn persist(path: &Option<PathBuf>, value: &Persisted) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(path, json).is_ok()
+    crate::persist::write_atomic(path, json.as_bytes()).is_ok()
 }
 
 /// Same home as the rest of AllMyStuff's persisted state (and the mesh

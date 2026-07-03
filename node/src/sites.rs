@@ -105,13 +105,13 @@ impl Default for SitesProxy {
 
 impl SitesProxy {
     /// Load the persisted exposed set from disk (empty when there's none).
+    /// A corrupt file is quarantined aside and loads empty, loudly — empty
+    /// is fail-safe here (nothing exposed), but it shouldn't be silent.
     pub fn load() -> Self {
         let path = store_path();
         let exposed = path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
-            .map(|p| p.exposed)
+            .map(|p| crate::persist::load_json::<Persisted>(p).exposed)
             .unwrap_or_default();
         SitesProxy {
             exposed: Mutex::new(exposed),
@@ -279,7 +279,7 @@ fn persist(path: &Option<PathBuf>, exposed: &BTreeMap<String, String>) -> bool {
         exposed: exposed.clone(),
     };
     match serde_json::to_string_pretty(&persisted) {
-        Ok(json) => std::fs::write(path, json).is_ok(),
+        Ok(json) => crate::persist::write_atomic(path, json.as_bytes()).is_ok(),
         Err(_) => false,
     }
 }
