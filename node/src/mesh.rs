@@ -283,6 +283,13 @@ pub struct Mesh {
     /// Empty for a peer that doesn't announce (older build): that peer's lanes
     /// fall back to the positional sort.
     video_lane_binds: Mutex<HashMap<String, HashMap<u8, String>>>,
+    /// The disabled-networks park store, when the embedding process shares
+    /// one (the node binary's `network_set_enabled` seam). Consulted by
+    /// [`Mesh::ensure_claim_networks`] so a deliberately switched-off local
+    /// claim network *stays* off across claim-state changes instead of
+    /// being silently re-joined — the network can't be left, so the park
+    /// store is the only "off" it has, and it has to stick.
+    disabled_networks: Mutex<Option<Arc<crate::networks_store::DisabledNetworks>>>,
 }
 
 /// One captured-audio packet headed for the forwarder, in whichever
@@ -470,7 +477,23 @@ impl Mesh {
             daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
             video_lane_pins: Mutex::new(HashMap::new()),
             video_lane_binds: Mutex::new(HashMap::new()),
+            disabled_networks: Mutex::new(None),
         })
+    }
+
+    /// Share the disabled-networks park store with this mesh (see the field
+    /// doc). Called once at assembly, before `start`.
+    pub fn attach_disabled_networks(&self, store: Arc<crate::networks_store::DisabledNetworks>) {
+        *self.disabled_networks.lock() = Some(store);
+    }
+
+    /// Whether `key` (config id or network id) sits parked in the shared
+    /// disabled-networks store. Without a store attached nothing is parked.
+    fn network_parked(&self, key: &str) -> bool {
+        self.disabled_networks
+            .lock()
+            .as_ref()
+            .is_some_and(|s| s.contains(key))
     }
 
     /// Spawn the media forwarders that drain captured frames out to peers on
@@ -3783,21 +3806,27 @@ impl Mesh {
         // out of the daemon's public defaults — this network must touch no
         // remote infrastructure at all. A duplicate NetworkAdd (already
         // joined) returns an error we ignore, same as the fleet network.
-        let _ = self
-            .client
-            .request(&Request::NetworkAdd {
-                config: json!({
-                    "id": LOCAL_CLAIM_NETWORK_ID,
-                    "network_id": LOCAL_CLAIM_NETWORK_ID,
-                    "label": "Local claiming (this LAN)",
-                    "kind": "open",
-                    "auto_approve": true,
-                    "signaling": { "strategy": "none", "mdns": true },
-                    "stun_servers": [],
-                    "turn_servers": [],
-                }),
-            })
-            .await;
+        // "Always-on" bows to one thing: the user flipping it *off* (the
+        // network can't be left, only toggled, so the park store is its
+        // only off switch) — re-joining here would make the toggle snap
+        // back on at the next claim-state change.
+        if !self.network_parked(LOCAL_CLAIM_NETWORK_ID) {
+            let _ = self
+                .client
+                .request(&Request::NetworkAdd {
+                    config: json!({
+                        "id": LOCAL_CLAIM_NETWORK_ID,
+                        "network_id": LOCAL_CLAIM_NETWORK_ID,
+                        "label": "Local claiming (this LAN)",
+                        "kind": "open",
+                        "auto_approve": true,
+                        "signaling": { "strategy": "none", "mdns": true },
+                        "stun_servers": [],
+                        "turn_servers": [],
+                    }),
+                })
+                .await;
+        }
 
         // The WAN rendezvous, tracking claim state.
         let claimable = self.ownership.claimable();

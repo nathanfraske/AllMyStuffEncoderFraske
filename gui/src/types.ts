@@ -342,6 +342,13 @@ export interface NetworkSummary {
   phase?: string;
 }
 
+/** The node-owned local claiming network (mirror of the Rust
+ *  `allmystuff_protocol::LOCAL_CLAIM_NETWORK_ID` — FROZEN). Every AllMyStuff
+ *  node joins this LAN-only mesh as the mDNS passthrough for claiming and
+ *  local pairing; the UI shows it as on/off only (no venue, no invites, no
+ *  leave). */
+export const LOCAL_CLAIM_NETWORK_ID = "allmystuff-local-claim-v1";
+
 /** Friendly name for a network: cosmetic label, else the joinable id, else
  *  the internal config id. */
 export function networkDisplayName(n: {

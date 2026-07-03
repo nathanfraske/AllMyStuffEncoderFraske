@@ -45,6 +45,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
 use allmystuff_graph::{Grant, NodeId, Person, PersonId};
+use allmystuff_protocol::LOCAL_CLAIM_NETWORK_ID;
 use allmystuff_session::{FileEvent, InputAction, TermEvent};
 
 use crate::control_client::{ControlClient, Request};
@@ -1100,6 +1101,16 @@ pub async fn dispatch(
                 .or_else(|| config.get("id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            // The local claim network has no settings — it's the fixed mDNS
+            // passthrough for claiming and local pairing (venue-less, LAN
+            // only). Its config is node-owned; an edit could only break it.
+            if target.as_deref() == Some(LOCAL_CLAIM_NETWORK_ID) {
+                return DispatchOut::Err(
+                    "the local claiming network has no settings to edit — it's the fixed \
+                     mDNS passthrough for claiming and local pairing"
+                        .into(),
+                );
+            }
             let out = sync_after(
                 mesh,
                 daemon_request(client, Request::NetworkUpdate { config }).await,
@@ -1119,6 +1130,15 @@ pub async fn dispatch(
         }
         "mesh_network_remove" => {
             let network: String = try_arg!(arg(a, "network"));
+            // The local claim network can't be left, only switched on and
+            // off (`network_set_enabled`) — a remove would be undone by the
+            // next ownership check anyway, since the node re-joins it
+            // whenever it isn't deliberately parked.
+            if network == LOCAL_CLAIM_NETWORK_ID {
+                return DispatchOut::Err(
+                    "the local claiming network can't be left — switch it off instead".into(),
+                );
+            }
             sync_after(
                 mesh,
                 daemon_request(

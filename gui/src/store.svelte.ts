@@ -172,6 +172,7 @@ import {
   FEATURE_TERMINAL,
   isAppNode,
   isOlderVersion,
+  LOCAL_CLAIM_NETWORK_ID,
   networkDisplayName,
   siteIsWeb,
   sitePort,
@@ -803,6 +804,14 @@ class AppStore {
     return !!id && !!net?.network_id && net.network_id === id;
   }
 
+  /** Whether a mesh in the list is the node-owned **local claiming** network
+   *  — the fixed mDNS passthrough for claiming and local pairing. It can't be
+   *  left or configured (no venue, no invites), only switched on and off; the
+   *  node re-joins it whenever it isn't deliberately disabled. */
+  isLocalClaimMesh(net: { network_id?: string } | null | undefined): boolean {
+    return net?.network_id === LOCAL_CLAIM_NETWORK_ID;
+  }
+
   /** The fleet owner's display name, read from the signed roster (the member
    *  whose role is "owner"). Lets every device — member, manager, owner — label
    *  the fleet mesh by its owner even without an explicit fleet name. Empty when
@@ -823,6 +832,7 @@ class AppStore {
       const name = this.fleetName || this.fleetOwnerName();
       if (name) return `${name}'s Fleet`;
     }
+    if (this.isLocalClaimMesh(net)) return "Local claiming";
     return networkDisplayName(net);
   }
 
@@ -5821,6 +5831,12 @@ class AppStore {
   }
 
   async leaveNetwork(configId: string) {
+    // The local claiming mesh can't be left, only switched off — the node
+    // refuses the remove too (and would re-join on the next ownership check).
+    if (this.isLocalClaimMesh({ network_id: configId })) {
+      this.toast("warn", "Local claiming can't be left — switch it off instead.");
+      return;
+    }
     try {
       await meshNetworkRemove(configId);
       if (this.rosterNetwork === configId) {
@@ -6060,6 +6076,13 @@ class AppStore {
       this.toast("warn", "The fleet's venue is set by the fleet owner — you ride the owner's choice.");
       return false;
     }
+    // The local claiming mesh has no servers to set — it's the LAN-only mDNS
+    // passthrough for claiming and local pairing. The node refuses the write
+    // too; refusing here keeps venue sweeps quiet instead of toasting errors.
+    if (this.isLocalClaimMesh(cfg)) {
+      this.toast("warn", "Local claiming has no venue — it's LAN-only by design.");
+      return false;
+    }
     const next: NetworkConfigFull = {
       ...cfg,
       signaling: {
@@ -6117,6 +6140,9 @@ class AppStore {
     const seen = new Set<string>();
     const out: Venue[] = [];
     for (const n of Array.isArray(this.networks) ? this.networks : []) {
+      // The local claiming mesh rides no venue (LAN-only) — don't let the
+      // unmapped-defaults-to-Public rule count Public on its behalf.
+      if (this.isLocalClaimMesh(n)) continue;
       for (const v of this.venuesForNetwork(n.network_id)) {
         if (!seen.has(v.id)) {
           seen.add(v.id);
@@ -6270,6 +6296,11 @@ class AppStore {
    *  but if that would leave the mesh with no servers at all, fall back to its
    *  full venue set rather than strand it offline. */
   private async applyNetworkVenuesByWireId(networkId: string) {
+    // The local claiming mesh rides no venue — every venue sweep (toggles,
+    // edits, drive-mesh reactivation) skips it silently. Without this, the
+    // unmapped-defaults-to-Public rule would try to write Public's servers
+    // onto it and the node would refuse with an error toast.
+    if (this.isLocalClaimMesh({ network_id: networkId })) return;
     const cfg = this.networkConfigs.find((c) => c.network_id === networkId);
     if (!cfg) return;
     const all = this.venuesForNetwork(networkId);

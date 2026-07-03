@@ -108,10 +108,13 @@ impl Ownership {
     /// while the device is still unowned.
     pub fn load() -> Self {
         let path = store_path();
-        let persisted = path
+        // Missing file → blank record; corrupt file → quarantined aside +
+        // blank, loudly (never silently: a blank record here means "unowned",
+        // and an owner forgotten without a trace is how a device ends up
+        // claimable by whoever's fastest).
+        let persisted: Persisted = path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
+            .map(|p| crate::persist::load_json(p))
             .unwrap_or_default();
         // Resolve `minted`, migrating a legacy file (no field): an existing
         // un-owned key-holder is assumed to be its own minter, so the real
@@ -679,33 +682,14 @@ fn persist(path: &Option<PathBuf>, inner: &Inner) -> bool {
 
 /// Write `bytes` to `path`, owner-only on Unix (mode 0600). This file holds the
 /// plaintext fleet key, so a secret at rest mustn't be left world-readable
-/// under the umask — the audit's AMS-08. The mode is tightened *before* the
-/// bytes are written (and an existing, looser file is tightened too, since a
-/// create-time mode doesn't apply to a file that already exists), so the key
-/// never lands in a file other local users can read. (A full at-rest fix wraps
-/// the key in the OS keychain; this is the cheap, always-on floor.)
+/// under the umask — the audit's AMS-08. The atomic writer creates its temp
+/// file 0600 from the start and replaces the old file wholesale via rename,
+/// so the key never lands in a file other local users can read *and* a power
+/// cut mid-write can't truncate the ownership record (which would load back
+/// as "unowned"). (A full at-rest fix wraps the key in the OS keychain; this
+/// is the cheap, always-on floor.)
 fn write_private(path: &Path, bytes: &[u8]) -> bool {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = match std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        f.write_all(bytes).is_ok()
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes).is_ok()
-    }
+    crate::persist::write_atomic(path, bytes).is_ok()
 }
 
 /// `~/.myownmesh/allmystuff-ownership.json`, honouring `MYOWNMESH_HOME` —
