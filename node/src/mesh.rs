@@ -3377,8 +3377,13 @@ impl Mesh {
     /// surfaced so the UI can say so rather than leaving the ask hanging.
     pub async fn kvm_attach(self: &Arc<Self>, node: String, target: String) -> Result<(), String> {
         tracing::info!("pointing KVM {} at {}", short_id(&node), short_id(&target));
+        // Ride the target's display label along so the KVM can rename itself
+        // `KVM-<label>` — best-effort and cosmetic (empty when the target has
+        // no label we know; the KVM then falls back to the node id).
+        let label = self.peer_label(&NodeId::from(target.clone()));
         let msg = ControlMessage::Kvm(KvmControl::Attach {
             node: target.into(),
+            label,
         });
         self.send_control(&node, &msg).await
     }
@@ -3389,6 +3394,41 @@ impl Mesh {
     pub async fn kvm_detach(self: &Arc<Self>, node: String) -> Result<(), String> {
         tracing::info!("detaching KVM {}", short_id(&node));
         let msg = ControlMessage::Kvm(KvmControl::Detach);
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: walk a KVM appliance onto another mesh — the fleet
+    /// owner's membership tool. The KVM validates the id, refuses its own
+    /// fleet mesh, joins, and re-advertises [`NodeProfile::kvm`] with the new
+    /// membership list — that presence is the authoritative confirmation.
+    pub async fn kvm_mesh_add(
+        self: &Arc<Self>,
+        node: String,
+        network_id: String,
+    ) -> Result<(), String> {
+        let network_id = network_id.trim().to_lowercase();
+        if network_id.is_empty() {
+            return Err("a mesh name is required".into());
+        }
+        tracing::info!("asking KVM {} to join mesh {network_id}", short_id(&node));
+        let msg = ControlMessage::Kvm(KvmControl::MeshAdd { network_id });
+        self.send_control(&node, &msg).await
+    }
+
+    /// Front-end command: take a KVM appliance off a mesh. The KVM refuses
+    /// its fleet mesh (that membership is governed by the fleet key); same
+    /// presence-confirmation model as [`Mesh::kvm_mesh_add`].
+    pub async fn kvm_mesh_remove(
+        self: &Arc<Self>,
+        node: String,
+        network_id: String,
+    ) -> Result<(), String> {
+        let network_id = network_id.trim().to_lowercase();
+        if network_id.is_empty() {
+            return Err("a mesh name is required".into());
+        }
+        tracing::info!("asking KVM {} to leave mesh {network_id}", short_id(&node));
+        let msg = ControlMessage::Kvm(KvmControl::MeshRemove { network_id });
         self.send_control(&node, &msg).await
     }
 

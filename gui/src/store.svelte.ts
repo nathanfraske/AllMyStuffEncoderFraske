@@ -70,6 +70,8 @@ import {
   isTauri,
   kvmAttach,
   kvmDetach,
+  kvmMeshAdd,
+  kvmMeshRemove,
   linkStatus,
   onClockSkew,
   onControlRefused,
@@ -159,6 +161,7 @@ import {
 } from "./tauri";
 import {
   CAP_TAG_ALLMYSTUFF,
+  displayName,
   FEATURE_CAMERA,
   FEATURE_FILES,
   FEATURE_KVM,
@@ -460,9 +463,9 @@ class AppStore {
    *  joining a network, so it gets the same prominence the join nudge has. */
   claimOpen = $state(false);
   manageShareNodeId = $state<string | null>(null);
-  /** The KVM node whose inline graph drawer is currently dropped out (revealed
-   *  by tapping it) — the same one-at-a-time reveal model as the claim drawer.
-   *  Null = none showing. */
+  /** The KVM node whose attach-target dropdown is currently dropped out
+   *  (opened from the link button in its card's button bar) — the same
+   *  one-at-a-time reveal model as the claim drawer. Null = none showing. */
   kvmRevealed = $state<string | null>(null);
   /** The latched clock-skew warning: this machine's wall clock is well out
    *  of line with its peers' (estimated passively — no extra calls to any
@@ -1816,11 +1819,17 @@ class AppStore {
       // advert, which presence re-sends on every change.
       node.sites = p.sites ?? [];
       // KVM-appliance binding (present only on a node advertising FEATURE_KVM)
-      // — what the KVM controls + which site is its web UI. The wire is
-      // snake_case (`attached_to`/`web`); map it onto the camelCase shape.
-      // Absent on an ordinary peer leaves it undefined (no KVM drawer).
+      // — what the KVM controls, which site is its web UI, its joining mesh,
+      // and its current mesh memberships. The wire is snake_case; map it onto
+      // the camelCase shape. Absent on an ordinary peer leaves it undefined
+      // (no KVM drawer).
       node.kvm = p.kvm
-        ? { attachedTo: p.kvm.attached_to || undefined, web: p.kvm.web || undefined }
+        ? {
+            attachedTo: p.kvm.attached_to || undefined,
+            web: p.kvm.web || undefined,
+            joiningMesh: p.kvm.joining_mesh || undefined,
+            meshes: p.kvm.meshes?.length ? p.kvm.meshes : undefined,
+          }
         : undefined;
       // The AllMyStuff version it's running — let it tell when the machine
       // is behind the channel and offer an upgrade. Absent (older peer) =
@@ -3372,6 +3381,10 @@ class AppStore {
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
     const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
+    // A KVM appliance carries its own integrated web console — "Open KVM" is
+    // its front door — so the generic remote/sites consoles never show for
+    // one: the card's KVM button set replaces them.
+    const kvm = this.isKvm(node);
     // A capability is *available on the console* only when the remote actually
     // exposes the endpoint AND you're authorized for it — so the console
     // activates with whatever subset was shared and hides the rest, instead of
@@ -3383,7 +3396,7 @@ class AppStore {
       !!matchEndpoint(this.catalog, node.id, media, flow);
     return {
       // You don't remote into yourself; otherwise your fleet, or a granted share.
-      remote: !self && (mineOrFleet || this.hasShareGrant(node, "remote")),
+      remote: !self && !kvm && (mineOrFleet || this.hasShareGrant(node, "remote")),
       files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
       terminal:
         this.terminalSupported(node) &&
@@ -3392,6 +3405,7 @@ class AppStore {
         this.sitesSupported(node) &&
         (node.sites?.length ?? 0) > 0 &&
         !self &&
+        !kvm &&
         (mineOrFleet || this.hasShareGrant(node, "sites")),
       // Audio passthrough: only when the machine has audio to send and you may
       // hear it.
@@ -3818,6 +3832,117 @@ class AppStore {
     );
   }
 
+  /** The catalog node a KVM's binding points at, resolved canonically —
+   *  `attachedTo` may be a bare pubkey while the catalog keys display ids,
+   *  so an exact `node()` lookup can miss. Drives the tether wire and the
+   *  drawer's "Controls X" line. */
+  kvmTargetNode(kvm: MeshNode | undefined): MeshNode | undefined {
+    const target = kvm?.kvm?.attachedTo;
+    if (!target) return undefined;
+    return this.catalog.nodes.find((n) => sameMachine(n.id, target));
+  }
+
+  /** Whether you may curate a KVM's mesh memberships / unclaim it — the
+   *  fleet-owner slice of {@link kvmAllowed}. The device itself obeys any
+   *  fleet co-member, but membership and adoption are the owner's calls, so
+   *  the UI offers them only to the owner. */
+  kvmOwnerControls(node: MeshNode | undefined): boolean {
+    return this.kvmAllowed(node) && this.isFleetOwner;
+  }
+
+  /** Walk a KVM onto another mesh. The KVM validates, refuses its own fleet
+   *  mesh, joins, and confirms by re-advertising `kvm.meshes` — same model as
+   *  attach. Simulated on the demo graph in web mode. */
+  async kvmAddMesh(nodeId: string, networkId: string) {
+    const node = this.node(nodeId);
+    if (!node || !this.isKvm(node)) return;
+    if (!this.kvmOwnerControls(node)) {
+      this.toast("warn", `Mesh membership is fleet-owner only — ${node.label} isn't yours to move`);
+      return;
+    }
+    const id = networkId.trim().toLowerCase();
+    if (id.length < 3 || id.length > 64 || !/^[a-z0-9-_]+$/.test(id)) {
+      this.toast("warn", "A mesh name is 3–64 letters, digits, hyphens or underscores");
+      return;
+    }
+    if (node.kvm?.meshes?.includes(id)) {
+      this.toast("info", `${node.label} is already on ${id}`);
+      return;
+    }
+    if (this.backendConnected) {
+      kvmMeshAdd(nodeId, id).catch((e) => {
+        this.toast("warn", `Couldn't add ${node.label} to ${id}: ${String(e)}`);
+      });
+      this.toast("info", `Asking ${node.label} to join ${id}…`);
+    } else {
+      node.kvm = { ...(node.kvm ?? {}), meshes: [...(node.kvm?.meshes ?? []), id].sort() };
+    }
+  }
+
+  /** Take a KVM off a mesh. The fleet mesh is refused here and on the device
+   *  (that membership is governed by the fleet key — unclaim is the way out). */
+  async kvmRemoveMesh(nodeId: string, networkId: string) {
+    const node = this.node(nodeId);
+    if (!node || !this.isKvm(node)) return;
+    if (!this.kvmOwnerControls(node)) {
+      this.toast("warn", `Mesh membership is fleet-owner only — ${node.label} isn't yours to move`);
+      return;
+    }
+    if (this.kvmMeshIsFleet(networkId)) {
+      this.toast("warn", "The fleet mesh can't be removed — unclaim the device instead");
+      return;
+    }
+    if (this.backendConnected) {
+      kvmMeshRemove(nodeId, networkId).catch((e) => {
+        this.toast("warn", `Couldn't remove ${node.label} from ${networkId}: ${String(e)}`);
+      });
+      this.toast("info", `Asking ${node.label} to leave ${networkId}…`);
+    } else if (node.kvm?.meshes) {
+      node.kvm = { ...node.kvm, meshes: node.kvm.meshes.filter((m) => m !== networkId) };
+    }
+  }
+
+  /** Whether a mesh id (from a KVM's advertised membership list) is your
+   *  fleet's own mesh — the one row that gets the "fleet" badge and no ✕. */
+  kvmMeshIsFleet(networkId: string): boolean {
+    return !!this.fleetNetworkId && this.fleetNetworkId === networkId;
+  }
+
+  /** Unclaim a KVM — the owner's factory reset of its mesh identity. Runs the
+   *  fleet eviction (signed governance + a direct Release), so the device
+   *  forgets its owner and fleet, returns to its own joining mesh
+   *  (`kvm.joiningMesh`, the name on its screen), and offers itself for
+   *  adoption again. Routed through the governance helper so an MFA-enrolled
+   *  fleet prompts for the custody code. */
+  async unclaimKVM(nodeId: string) {
+    const node = this.node(nodeId);
+    if (!node || !this.isKvm(node)) return;
+    if (!this.kvmOwnerControls(node)) {
+      this.toast("warn", `Unclaiming is fleet-owner only — ${node.label} isn't yours`);
+      return;
+    }
+    const where = node.kvm?.joiningMesh;
+    if (this.backendConnected) {
+      await this.runFleetGov(`Unclaim ${displayName(node)}`, (code) => fleetKick(nodeId, code));
+      this.toast(
+        "info",
+        where
+          ? `${node.label} is resetting — it'll reappear claimable on ${where}`
+          : `${node.label} is resetting to its joining mesh`,
+      );
+      return;
+    }
+    // Demo/web: mirror the reset on the demo graph.
+    node.owner = null;
+    node.claimable = true;
+    node.kvm = {
+      ...(node.kvm ?? {}),
+      attachedTo: undefined,
+      meshes: where ? [where] : undefined,
+    };
+    this.toast("info", `${node.label} unclaimed — it's offering itself for adoption again`);
+  }
+
   // ---- managing a device's exposure (this machine *or* a fleet member) ---
   //
   // The drawer's "Its sites" controls work the same on your own machine and a
@@ -3983,6 +4108,9 @@ class AppStore {
       members,
       is_owner: true,
       in_fleet: true,
+      // Matches the demo KVM's advertised membership so its Meshes shelf
+      // shows a locked "fleet" row, exactly like a real fleet would.
+      network_id: "amber-turing-x3k9q",
     };
   }
 

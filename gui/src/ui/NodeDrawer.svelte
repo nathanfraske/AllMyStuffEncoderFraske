@@ -134,15 +134,39 @@
   });
   /** Whether the "are you absolutely sure?" Detach confirmation is showing. */
   let detachConfirm = $state(false);
+  /** Whether the Unclaim confirmation is showing (same scrim/popup chrome). */
+  let unclaimConfirm = $state(false);
   $effect(() => {
-    // A fresh selection clears any half-finished detach confirmation.
+    // A fresh selection clears any half-finished confirmation.
     void node?.id;
     detachConfirm = false;
+    unclaimConfirm = false;
   });
   function doDetach() {
     if (!node) return;
     void app.detachKVM(node.id);
     detachConfirm = false;
+  }
+  function doUnclaim() {
+    if (!node) return;
+    void app.unclaimKVM(node.id);
+    unclaimConfirm = false;
+  }
+  /** Whether you hold the fleet-owner controls for this KVM (meshes,
+   *  unclaim) — the device obeys any co-member, but membership and adoption
+   *  are the owner's calls. */
+  const kvmOwner = $derived(!!node && app.kvmOwnerControls(node));
+  /** The mesh-name draft for the Meshes shelf's Add row. */
+  let meshDraft = $state("");
+  $effect(() => {
+    // A fresh selection clears the half-typed mesh name.
+    void node?.id;
+    meshDraft = "";
+  });
+  function addMesh() {
+    if (!node || !meshDraft.trim()) return;
+    void app.kvmAddMesh(node.id, meshDraft);
+    meshDraft = "";
   }
 
   // ---- sidebar sizing --------------------------------------------------
@@ -742,12 +766,19 @@
       <section class="block kvm-section">
         <h4>KVM</h4>
         {#if node.kvm?.attachedTo}
-          {@const target = app.node(node.kvm.attachedTo)}
+          {@const target = app.kvmTargetNode(node)}
           <p class="kvm-note">
             Controls <b>{target ? displayName(target) : "a machine"}</b>.
           </p>
         {:else}
           <p class="kvm-note">Not pointed at any machine yet.</p>
+        {/if}
+        {#if node.kvm?.joiningMesh}
+          <!-- The device's own joining mesh — where it reappears after an
+               unclaim/reset, and the same name it shows on its screen. -->
+          <p class="kvm-note">
+            Joining mesh: <code class="kvm-mesh-id">{node.kvm.joiningMesh}</code>
+          </p>
         {/if}
         <div class="kvm-actions">
           <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🖥 Open KVM</button>
@@ -769,9 +800,57 @@
             </div>
           {/if}
         </div>
-        <!-- Detach lives at the very bottom, behind an annoying confirm. -->
+        {#if kvmOwner}
+          <!-- Meshes shelf — the fleet owner's membership tool: every mesh
+               the KVM advertises it's on, with the fleet mesh locked (it's
+               governed by the fleet key) and the joining mesh tagged. -->
+          <div class="kvm-meshes">
+            <label class="kvm-attach-label" for="kvm-mesh-add">Meshes</label>
+            {#if node.kvm?.meshes?.length}
+              <ul class="kvm-mesh-list">
+                {#each node.kvm.meshes as m (m)}
+                  <li class="kvm-mesh-row">
+                    <code class="kvm-mesh-id">{m}</code>
+                    {#if app.kvmMeshIsFleet(m)}
+                      <span class="kvm-mesh-tag fleet" title="The fleet's own mesh — leave it by unclaiming the device">fleet</span>
+                    {:else}
+                      {#if m === node.kvm?.joiningMesh}
+                        <span class="kvm-mesh-tag" title="The device's own joining mesh">joining</span>
+                      {/if}
+                      <button
+                        class="kvm-mesh-x"
+                        title="Take this KVM off {m}"
+                        aria-label="Remove {displayName(node)} from {m}"
+                        onclick={() => app.kvmRemoveMesh(node.id, m)}
+                      >✕</button>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {:else}
+              <p class="kvm-note">No meshes reported yet — the device advertises its list.</p>
+            {/if}
+            <div class="kvm-attach-row">
+              <input
+                id="kvm-mesh-add"
+                class="kvm-select"
+                type="text"
+                placeholder="mesh name (e.g. den-site-mesh)"
+                bind:value={meshDraft}
+                onkeydown={(e) => e.key === "Enter" && addMesh()}
+              />
+              <button class="btn small" disabled={!meshDraft.trim()} onclick={addMesh}>＋ Add</button>
+            </div>
+          </div>
+        {/if}
+        <!-- Detach + Unclaim live at the very bottom, behind annoying
+             confirms. Unclaim is the bigger hammer: the device forgets its
+             owner and fleet and resets to its joining mesh in claim mode. -->
         <div class="kvm-detach">
           <button class="btn small danger" onclick={() => (detachConfirm = true)}>Detach</button>
+          {#if kvmOwner}
+            <button class="btn small danger" onclick={() => (unclaimConfirm = true)}>Unclaim…</button>
+          {/if}
         </div>
       </section>
     {/if}
@@ -800,6 +879,32 @@
         <footer class="kvm-modal-foot">
           <button class="btn small" onclick={() => (detachConfirm = false)}>Keep it attached</button>
           <button class="btn small danger" onclick={doDetach}>Yes, detach it</button>
+        </footer>
+      </div>
+    </div>
+  {/if}
+
+  {#if unclaimConfirm && node}
+    <div class="kvm-scrim">
+      <button class="kvm-backdrop" onclick={() => (unclaimConfirm = false)} aria-label="Cancel"></button>
+      <div class="kvm-popup" role="dialog" aria-modal="true" aria-label="Unclaim this KVM" tabindex="-1">
+        <header class="kvm-modal-head">
+          <span class="kvm-mark" aria-hidden="true">!</span>
+          <div class="kvm-modal-text">
+            <div class="kvm-modal-title">Unclaim this KVM?</div>
+            <div class="kvm-modal-sub">{displayName(node)}</div>
+          </div>
+        </header>
+        <p class="kvm-modal-lead">
+          It leaves your fleet and every mesh, forgets its owner and attachment,
+          and goes back into claim mode on its own joining mesh{node.kvm?.joiningMesh
+            ? ` (${node.kvm.joiningMesh} — also shown on the device's screen)`
+            : ""}. To use it again, join that mesh and claim it like a new
+          device.
+        </p>
+        <footer class="kvm-modal-foot">
+          <button class="btn small" onclick={() => (unclaimConfirm = false)}>Keep it claimed</button>
+          <button class="btn small danger" onclick={doUnclaim}>Yes, unclaim it</button>
         </footer>
       </div>
     </div>
@@ -1533,14 +1638,80 @@
     background: var(--surface);
     color: var(--ink);
   }
-  /* The buried Detach: pushed to the bottom of the section, set apart by a
-     hairline so it never sits flush with the everyday actions. */
+  /* The Meshes shelf: the fleet owner's membership list + add row. */
+  .kvm-meshes {
+    margin-top: 0.55rem;
+  }
+  .kvm-mesh-list {
+    list-style: none;
+    margin: 0 0 0.4rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.22rem;
+  }
+  .kvm-mesh-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+  .kvm-mesh-id {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 0.74rem;
+    color: var(--ink);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 0.12rem 0.35rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .kvm-mesh-tag {
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 0.05rem 0.4rem;
+    flex: none;
+  }
+  .kvm-mesh-tag.fleet {
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+  .kvm-mesh-x {
+    margin-left: auto;
+    flex: none;
+    width: 1.3rem;
+    height: 1.3rem;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink-faint);
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .kvm-mesh-x:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: var(--danger-soft);
+  }
+  /* The buried Detach + Unclaim: pushed to the bottom of the section, set
+     apart by a hairline so they never sit flush with the everyday actions. */
   .kvm-detach {
     margin-top: 0.7rem;
     padding-top: 0.55rem;
     border-top: 1px solid var(--line);
     display: flex;
     justify-content: flex-end;
+    gap: 0.35rem;
   }
 
   /* ---- detach confirmation modal (mirrors ClaimSheet's scrim/popup) --- */

@@ -230,6 +230,45 @@ async fn kvm_detach(state: State<'_, AppState>, node: String) -> Result<(), Stri
     Ok(())
 }
 
+/// Walk a KVM appliance onto another mesh — the fleet owner's membership
+/// tool. The KVM validates, refuses its own fleet mesh, joins, and
+/// re-advertises its membership list — that presence is the confirmation.
+#[tauri::command]
+async fn kvm_mesh_add(
+    state: State<'_, AppState>,
+    node: String,
+    network_id: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "kvm_mesh_add",
+            json!({ "node": node, "network_id": network_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Take a KVM appliance off a mesh (never its fleet mesh). Same enforcement
+/// + presence confirmation as [`kvm_mesh_add`].
+#[tauri::command]
+async fn kvm_mesh_remove(
+    state: State<'_, AppState>,
+    node: String,
+    network_id: String,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "kvm_mesh_remove",
+            json!({ "node": node, "network_id": network_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Persist an outbound grant to a person — what they may do with my stuff —
 /// so it survives a restart. The GUI resolves the person and the node the
 /// grant is recorded against; the node is the durable source of truth and the
@@ -1962,6 +2001,8 @@ fn main() {
             set_claimable,
             kvm_attach,
             kvm_detach,
+            kvm_mesh_add,
+            kvm_mesh_remove,
             share_grant,
             share_revoke,
             share_stop,

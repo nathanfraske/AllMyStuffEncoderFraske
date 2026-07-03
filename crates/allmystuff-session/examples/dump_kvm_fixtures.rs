@@ -88,6 +88,11 @@ fn main() {
         kvm: Some(KvmAdvert {
             attached_to: Some("den-tower".into()),
             web: "tcp:80".into(),
+            // The per-device joining mesh (derived on the KVM from its own
+            // identity; this value is just a well-formed example) plus the
+            // full membership list — fleet mesh included.
+            joining_mesh: "cec-kvm-ab3de-fg7hj".into(),
+            meshes: vec!["amber-turing-x3k9q".into(), "den-site-mesh".into()],
         }),
         // 0 = unstamped: keeps the pinned Go fixtures byte-identical (zero
         // serializes without the key). Real sends stamp it per send.
@@ -95,7 +100,8 @@ fn main() {
     };
     fixtures.insert("node_profile_kvm", to_value(&kvm_profile));
 
-    // A freshly-booted, unclaimed KVM: claimable, no owner, not yet attached.
+    // A freshly-booted, unclaimed KVM: claimable, no owner, not yet attached,
+    // sitting alone on its own joining mesh.
     let mut claimable = kvm_profile.clone();
     claimable.owner = None;
     claimable.claimable = true;
@@ -104,19 +110,34 @@ fn main() {
     claimable.kvm = Some(KvmAdvert {
         attached_to: None,
         web: "tcp:80".into(),
+        joining_mesh: "cec-kvm-ab3de-fg7hj".into(),
+        meshes: vec!["cec-kvm-ab3de-fg7hj".into()],
     });
     fixtures.insert("node_profile_kvm_claimable", to_value(&claimable));
 
-    // -- the KVM attach/detach control plane (CHANNEL_CONTROL) ----------
+    // -- the KVM control plane (CHANNEL_CONTROL) -------------------------
     fixtures.insert(
         "control_kvm_attach",
         to_value(&ControlMessage::Kvm(KvmControl::Attach {
             node: "den-tower".into(),
+            label: "Den Tower".into(),
         })),
     );
     fixtures.insert(
         "control_kvm_detach",
         to_value(&ControlMessage::Kvm(KvmControl::Detach)),
+    );
+    fixtures.insert(
+        "control_kvm_mesh_add",
+        to_value(&ControlMessage::Kvm(KvmControl::MeshAdd {
+            network_id: "den-site-mesh".into(),
+        })),
+    );
+    fixtures.insert(
+        "control_kvm_mesh_remove",
+        to_value(&ControlMessage::Kvm(KvmControl::MeshRemove {
+            network_id: "den-site-mesh".into(),
+        })),
     );
 
     // -- ownership / claim → fleet (CHANNEL_CONTROL) --------------------
@@ -279,8 +300,11 @@ fn main() {
             network: "cec-backend-client-mesh".into(),
             from: "den-tower".into(),
             channel: "allmystuff/control/v1".into(),
+            // Deliberately label-less: pins the pre-label attach shape an
+            // older sender still emits, so the Go side keeps accepting it.
             payload: to_value(&ControlMessage::Kvm(KvmControl::Attach {
                 node: "den-tower".into(),
+                label: String::new(),
             })),
         }),
     );
