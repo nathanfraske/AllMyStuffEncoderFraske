@@ -111,6 +111,33 @@ export function demoCatalog(): Catalog {
       },
     },
     {
+      // A NanoKVM-Pro appliance booted in claim mode — same KVM-class device,
+      // just a different SoC (AX630C / 1 GB instead of the NanoKVM's RV1106 /
+      // 256 MB). It advertises the identical wire shape (features kvm+sites, a
+      // kvm block with its joining mesh), so it drops into the graph and the
+      // claim sheet exactly like the NanoKVM above — nothing here is
+      // model-specific. Note the site scheme is "http" even though the Pro's own
+      // web UI defaults to https: the sites tunnel serves plaintext in-process
+      // HTTP, so the advertised scheme is what the viewer speaks to its local
+      // end of the tunnel.
+      id: "kvm-pro",
+      label: "NanoKVM-Pro",
+      kind: "machine",
+      relationship: { kind: "unclaimed" },
+      online: true,
+      app: true,
+      features: ["kvm", "sites"],
+      owner: null,
+      claimable: true,
+      summary: { os: "Linux", cpu: "AX630C", ram_bytes: 2 ** 30, device_count: 2 },
+      sites: [{ id: "tcp:443", label: "KVM web UI", port: 443, scheme: "http", loopback: false }],
+      kvm: {
+        web: "tcp:443",
+        joiningMesh: "cec-kvm-pk4wq-2n8vr",
+        meshes: ["cec-kvm-pk4wq-2n8vr"],
+      },
+    },
+    {
       // A spare box that was booted in claim mode — it's offering itself for
       // adoption, so it can be claimed (Task 4). Runs AllMyStuff (has caps).
       id: "nuc",
