@@ -3393,9 +3393,13 @@ class AppStore {
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
     const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
-    // A KVM appliance carries its own integrated web console — "Open KVM" is
-    // its front door — so the generic remote/sites consoles never show for
-    // one: the card's KVM button set replaces them.
+    // A KVM appliance advertises a native Display/Source "screen" capability
+    // (and an Input/Sink "control" one) as well as its own web UI. So it now
+    // gets the generic Remote Control console — rendered over the mesh's native
+    // video/control lanes, gated on that screen cap via `kvmHasNativeScreen` —
+    // AND the standard Sites/globe button, which opens its web UI through
+    // `openKVM`. A web-only KVM (no screen cap) keeps the old behavior: no
+    // native console, just its web UI behind the globe.
     const kvm = this.isKvm(node);
     // A capability is *available on the console* only when the remote actually
     // exposes the endpoint AND you're authorized for it — so the console
@@ -3407,17 +3411,24 @@ class AppStore {
     const exposes = (media: MediaKind, flow: "provide" | "consume") =>
       !!matchEndpoint(this.catalog, node.id, media, flow);
     return {
-      // You don't remote into yourself; otherwise your fleet, or a granted share.
-      remote: !self && !kvm && (mineOrFleet || this.hasShareGrant(node, "remote")),
+      // You don't remote into yourself; otherwise your fleet, or a granted
+      // share. A KVM only offers the native console when it advertises a
+      // screen capability (`kvmHasNativeScreen`); a web-only one stays hidden.
+      remote:
+        !self &&
+        (!kvm || this.kvmHasNativeScreen(node)) &&
+        (mineOrFleet || this.hasShareGrant(node, "remote")),
       files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
       terminal:
         this.terminalSupported(node) &&
         (self ? this.localTerminalAllowed : mineOrFleet || this.hasShareGrant(node, "terminal")),
       sites:
-        this.sitesSupported(node) &&
+        // A KVM may advertise only FEATURE_KVM (not FEATURE_SITES), yet its
+        // web UI still rides the sites proxy (see `mapSite`'s kvmAllowed
+        // bypass) — so `|| kvm` lets the standard globe show for it too.
+        (this.sitesSupported(node) || kvm) &&
         (node.sites?.length ?? 0) > 0 &&
         !self &&
-        !kvm &&
         (mineOrFleet || this.hasShareGrant(node, "sites")),
       // Audio passthrough: only when the machine has audio to send and you may
       // hear it.
@@ -3442,6 +3453,12 @@ class AppStore {
     else if (kind === "terminal") this.openTerminal(nodeId);
     else if (kind === "sites") {
       const n = this.node(nodeId);
+      // A KVM's globe opens its own web UI through the KVM front door, which
+      // picks the right web site (`kvmWebSite`) rather than just sites[0].
+      if (this.isKvm(n)) {
+        void this.openKVM(nodeId);
+        return;
+      }
       const site = n?.sites?.[0];
       if (site) void this.mapSite(nodeId, site);
     }
@@ -3700,6 +3717,21 @@ class AppStore {
    *  advertises `FEATURE_KVM` (an older build never does). */
   isKvm(node: MeshNode | undefined): boolean {
     return !!node && isAppNode(node) && (node.features ?? []).includes(FEATURE_KVM);
+  }
+
+  /** Whether a KVM exposes the *native* remote-control console — it advertises
+   *  a Display/Source "screen" graph capability (the firmware publishes one with
+   *  an id ending `:screen`, media `display`, flow `source`, alongside its
+   *  `:control` input sink). That capability is the console's video input, so
+   *  its presence is the signal a KVM supports the mesh-native console. A
+   *  web-only KVM has none, so its generic Remote Control stays hidden. */
+  kvmHasNativeScreen(node: MeshNode | undefined): boolean {
+    return (
+      this.isKvm(node) &&
+      this.capsOf(node!.id).some(
+        (c) => c.id.endsWith(":screen") || (c.media === "display" && canSource(c.flow)),
+      )
+    );
   }
 
   /** The site serving a KVM's own web UI: the one whose id matches

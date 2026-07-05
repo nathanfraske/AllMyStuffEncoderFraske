@@ -754,7 +754,7 @@
           keyboard reach this machine even when it's off or stuck.
         </p>
         <button class="btn small primary" onclick={() => controllingKvm && app.openKVM(controllingKvm.id)}>
-          🖥 Open KVM
+          🌐 Open KVM
         </button>
       </section>
     {/if}
@@ -781,7 +781,11 @@
           </p>
         {/if}
         <div class="kvm-actions">
-          <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🖥 Open KVM</button>
+          <!-- The KVM's web UI, over the sites proxy — the globe/Sites
+               affordance. Its native screen + keyboard console is the separate
+               "🖥 Remote Control" button above (the generic one every machine
+               gets), so this globe stays the web-UI front door. -->
+          <button class="btn small primary" onclick={() => app.openKVM(node.id)}>🌐 Open KVM</button>
           <button class="btn small" onclick={() => app.kvmFeature(node.id, "power")}>⏻ Power</button>
           <button class="btn small" onclick={() => app.kvmFeature(node.id, "reset")}>↻ Reset</button>
         </div>
