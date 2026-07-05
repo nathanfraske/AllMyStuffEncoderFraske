@@ -114,6 +114,14 @@ pub struct Mesh {
     /// Sequence for outbound site frames (one stream per app run, like the
     /// other media-plane sequences).
     site_seq: AtomicU64,
+    /// Client mappings currently being auto-re-mapped after a reject (keyed
+    /// `<pubkey>:<host_port>`), so a burst of rejects can't spawn a stampede of
+    /// competing heal tasks for the same tunnel.
+    site_remap_inflight: Mutex<std::collections::HashSet<String>>,
+    /// Per-route rate limit for the dead-site-route NACK (last send `Instant`),
+    /// so a peer draining a full pipe onto a route we no longer hold gets one
+    /// Reject, not one per frame.
+    site_nack_at: Mutex<HashMap<String, std::time::Instant>>,
     /// Viewer-side download sinks: a `(route, req)` whose `Chunk`s should
     /// stream straight to a local file (the Downloads folder) instead of
     /// the window's queue — registered by `file_download` *before* the
@@ -381,6 +389,17 @@ const TERM_INIT_ROWS: u16 = 24;
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Auto-re-map after a site route is rejected: how many times to retry, and the
+/// base backoff (grown by the attempt number). ~11s of retrying across 5 tries
+/// — enough to ride out a KVM reconnect, few enough to give up (not loop) if the
+/// host is genuinely refusing us.
+const SITE_REMAP_ATTEMPTS: u32 = 5;
+const SITE_REMAP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Per-route cooldown for the dead-site-route NACK, so a client draining a full
+/// pipe onto a route we no longer hold gets one Reject, not one per frame.
+const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct State {
     session: Option<Session>,
     /// Primary network — the fallback for route control/media when we don't
@@ -433,6 +452,8 @@ impl Mesh {
             file_seq: AtomicU64::new(0),
             sites: SitesProxy::load(),
             site_seq: AtomicU64::new(0),
+            site_remap_inflight: Mutex::new(std::collections::HashSet::new()),
+            site_nack_at: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             shared: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -1778,6 +1799,24 @@ impl Mesh {
                             self.send_presence_to(&from).await;
                         }
                         msg => {
+                            // A Reject landing on one of our client-side site
+                            // mappings is the host saying its route is gone (a
+                            // reconnect / network change tore it down). Grab the
+                            // mapping now — the session's StopMedia is about to
+                            // remove it — so we can auto-re-map it on the SAME
+                            // local port and heal the tunnel with no unmap/remap.
+                            // (A user-initiated unmap goes through disconnect(),
+                            // never an inbound Reject, so this never fights a
+                            // deliberate teardown.)
+                            let heal_site = match &msg {
+                                ControlMessage::Route(RouteControl::Reject {
+                                    route_id, ..
+                                }) => self
+                                    .sites
+                                    .mapping_details(route_id)
+                                    .map(|d| (route_id.clone(), d)),
+                                _ => None,
+                            };
                             let effects = {
                                 let mut st = self.state.lock();
                                 st.session
@@ -1786,6 +1825,24 @@ impl Mesh {
                                     .unwrap_or_default()
                             };
                             self.process_effects(effects).await;
+                            if let Some((old_route, (node, host_port, local_port))) = heal_site {
+                                // Guarantee the dead route is fully cleared — a
+                                // reject on a not-yet-active offer emits no
+                                // StopMedia, so its mapping/listener would
+                                // otherwise linger and block the re-map — then
+                                // heal on the same local port off the hot path.
+                                self.sites.stop_route(&old_route);
+                                {
+                                    let mut st = self.state.lock();
+                                    if let Some(s) = st.session.as_mut() {
+                                        let _ = s.teardown(&old_route);
+                                    }
+                                }
+                                let mesh = self.clone();
+                                crate::spawn(async move {
+                                    mesh.remap_site_route(node, host_port, local_port).await;
+                                });
+                            }
                             self.emit_snapshot();
                         }
                     }
@@ -6628,12 +6685,31 @@ impl Mesh {
         // Bind a local listener, preferring the same port number, then a free
         // one — the OS is the final arbiter, so retry on a lost race.
         let (listener, local_port) = self.bind_site_listener(port).await?;
+        self.establish_site_route(node, port, listener, local_port)
+            .await?;
+        Ok(local_port)
+    }
+
+    /// Offer a site route for `node`:`host_port` over an already-bound local
+    /// `listener` (on `local_port`), start its accept loop, and record the
+    /// mapping. The route is minted the same way every time — generic media,
+    /// source `<host>:site`, a per-mapping viewer sink — so both a fresh
+    /// [`Self::site_map`] and a post-reconnect [`Self::remap_site_route`] speak
+    /// the identical contract. Returns the minted route id.
+    async fn establish_site_route(
+        self: &Arc<Self>,
+        node: String,
+        host_port: u16,
+        listener: tokio::net::TcpListener,
+        local_port: u16,
+    ) -> Result<String, String> {
+        let me = self.local_node_id().ok_or("mesh not ready")?;
         // Mint the route: generic media, source `<host>:site`, sink a
         // per-mapping viewer endpoint (never a catalog capability — shape is
         // the contract, like terminal/files).
         let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
         let from = format!("{node}:site");
-        let to = format!("{me}:site-view:{}-{seq}", port);
+        let to = format!("{me}:site-view:{}-{seq}", host_port);
         let route_id = format!("route:{from}→{to}");
         // Offer the route through the session (drives offer→accept→active).
         let msg = {
@@ -6655,10 +6731,120 @@ impl Mesh {
             return Err(e);
         }
         // Start accepting local connections; each becomes one tunneled conn.
-        let accept = self.spawn_site_accept(route_id.clone(), node.clone(), port, listener);
-        self.sites
-            .add_mapping(route_id, ClientMapping::new(node, port, local_port, accept));
-        Ok(local_port)
+        let accept = self.spawn_site_accept(route_id.clone(), node.clone(), host_port, listener);
+        self.sites.add_mapping(
+            route_id.clone(),
+            ClientMapping::new(node, host_port, local_port, accept),
+        );
+        Ok(route_id)
+    }
+
+    /// Auto-re-map a site whose host just rejected its route — a KVM reconnect
+    /// or network change tore the old route down and the host NACKed a stray
+    /// frame. Re-offers a fresh route onto the *same* local port so an open
+    /// `localhost:<port>` keeps working with no manual unmap/remap. Bounded
+    /// retries with a growing backoff: enough to ride out a reconnect, few
+    /// enough to give up (rather than loop) if we've genuinely lost access and
+    /// the host keeps refusing.
+    async fn remap_site_route(self: &Arc<Self>, node: String, host_port: u16, local_port: u16) {
+        let key = format!("{}:{}", pubkey_part(&node), host_port);
+        if !self.site_remap_inflight.lock().insert(key.clone()) {
+            return; // already healing this mapping
+        }
+        for attempt in 0..SITE_REMAP_ATTEMPTS {
+            tokio::time::sleep(SITE_REMAP_BACKOFF.saturating_mul(attempt + 1)).await;
+            // A manual remap (or a prior attempt) already restored it.
+            if self.sites.route_for(&node, host_port).is_some() {
+                break;
+            }
+            let listener = match self.bind_exact_local_port(local_port).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!("site re-map bind :{local_port} failed: {e}");
+                    continue;
+                }
+            };
+            match self
+                .establish_site_route(node.clone(), host_port, listener, local_port)
+                .await
+            {
+                Ok(route_id) => {
+                    if self.await_route_active(&route_id).await {
+                        tracing::info!(
+                            "site {}:{} re-mapped on :{} after reconnect",
+                            short_id(&node),
+                            host_port,
+                            local_port
+                        );
+                        break;
+                    }
+                    // Host didn't accept in time — clear this attempt fully so
+                    // the next one re-binds cleanly, then retry.
+                    self.sites.stop_route(&route_id);
+                    let mut st = self.state.lock();
+                    if let Some(s) = st.session.as_mut() {
+                        let _ = s.teardown(&route_id);
+                    }
+                }
+                Err(e) => tracing::debug!("site re-map offer failed: {e}"),
+            }
+        }
+        self.site_remap_inflight.lock().remove(&key);
+    }
+
+    /// Bind a loopback listener on *exactly* `port`, retrying briefly — a
+    /// just-aborted accept loop may not have released the port yet. The re-map
+    /// path needs the identical local port an open tab is already on, so unlike
+    /// [`Self::bind_site_listener`] it never falls back to another number.
+    async fn bind_exact_local_port(&self, port: u16) -> Result<tokio::net::TcpListener, String> {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut last = String::new();
+        for _ in 0..20 {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => return Ok(l),
+                Err(e) => {
+                    last = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err(format!("local port :{port} still busy after 2s: {last}"))
+    }
+
+    /// NACK a site frame that arrived on a route we don't hold live — the
+    /// symmetric twin of the KVM bridge's `nackDeadRoute`: tell the sender its
+    /// route is gone so it re-offers (which [`Self::remap_site_route`] does),
+    /// instead of tunnelling into the void. Rate-limited per route so a client
+    /// draining a full pipe onto a dead route produces one Reject, not a flood.
+    fn nack_dead_site_route(self: &Arc<Self>, from: &str, route: &str) {
+        {
+            let now = std::time::Instant::now();
+            let mut at = self.site_nack_at.lock();
+            if let Some(t) = at.get(route) {
+                if now.duration_since(*t) < SITE_NACK_COOLDOWN {
+                    return;
+                }
+            }
+            // Bound the map across many short-lived route ids.
+            if at.len() > 128 {
+                at.retain(|_, t| now.duration_since(*t) < SITE_NACK_COOLDOWN * 4);
+            }
+            at.insert(route.to_string(), now);
+        }
+        let mesh = self.clone();
+        let (from, route) = (from.to_string(), route.to_string());
+        crate::spawn(async move {
+            let _ = mesh
+                .send_control(
+                    &from,
+                    &ControlMessage::Route(RouteControl::Reject {
+                        route_id: route,
+                        reason: "route not live on this device — re-offer to reconnect".into(),
+                    }),
+                )
+                .await;
+        });
     }
 
     /// Unmap a site: tear the route down (closing the listener + every
@@ -6860,25 +7046,32 @@ impl Mesh {
         let Some(me) = self.local_node_id() else {
             return;
         };
-        let (hosts_here, views_here) = {
+        let placement = {
             let st = self.state.lock();
-            let Some(r) = st.session.as_ref().and_then(|s| s.route(&frame.route)) else {
-                return;
-            };
-            if !(r.is_active()
-                && is_site_route(&r.route)
-                && pubkey_part(r.peer.as_str()) == pubkey_part(from))
-            {
-                tracing::debug!(
-                    "site frame for {} refused (route not live here)",
-                    frame.route
-                );
-                return;
+            match st.session.as_ref().and_then(|s| s.route(&frame.route)) {
+                Some(r)
+                    if r.is_active()
+                        && is_site_route(&r.route)
+                        && pubkey_part(r.peer.as_str()) == pubkey_part(from) =>
+                {
+                    Some((
+                        node_of(r.route.from.as_str()) == me,
+                        node_of(r.route.to.as_str()) == me,
+                    ))
+                }
+                _ => None,
             }
-            (
-                node_of(r.route.from.as_str()) == me,
-                node_of(r.route.to.as_str()) == me,
-            )
+        };
+        let Some((hosts_here, views_here)) = placement else {
+            tracing::debug!(
+                "site frame for {} refused (route not live here)",
+                frame.route
+            );
+            // Tell the sender its route is gone so it re-offers, instead of
+            // tunnelling into the void — the symmetric twin of the KVM bridge's
+            // nackDeadRoute. Rate-limited per route; sent off the state lock.
+            self.nack_dead_site_route(from, &frame.route);
+            return;
         };
 
         if hosts_here {

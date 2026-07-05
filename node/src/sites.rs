@@ -233,6 +233,18 @@ impl SitesProxy {
             .collect()
     }
 
+    /// The `(node, host_port, local_port)` of the client mapping on `route`, if
+    /// any. Captured before a teardown so a rejected route can be auto-re-mapped
+    /// onto the *same* local port — healing an open `localhost:<port>` tab
+    /// without a manual unmap/remap. Only client mappings live here, so a reject
+    /// on a host-side or non-site route reads as `None`.
+    pub fn mapping_details(&self, route: &str) -> Option<(String, u16, u16)> {
+        self.mappings
+            .lock()
+            .get(route)
+            .map(|m| (m.node.clone(), m.host_port, m.local_port))
+    }
+
     /// Tear a site route down completely: abort its accept loop (if any) and
     /// close every connection it carried. Safe on either side, idempotent —
     /// called on unmap and on route teardown.
