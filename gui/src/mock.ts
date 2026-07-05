@@ -101,7 +101,7 @@ export function demoCatalog(): Catalog {
       app: true,
       features: ["kvm", "sites"],
       owner: "this",
-      summary: { os: "Linux", cpu: "RV1106", ram_bytes: 256 * 2 ** 20, device_count: 2 },
+      summary: { os: "Linux", cpu: "SG2002", ram_bytes: 256 * 2 ** 20, device_count: 2 },
       sites: [{ id: "tcp:80", label: "KVM web UI", port: 80, scheme: "http", loopback: false }],
       kvm: {
         attachedTo: "desk",
@@ -112,7 +112,7 @@ export function demoCatalog(): Catalog {
     },
     {
       // A NanoKVM-Pro appliance booted in claim mode — same KVM-class device,
-      // just a different SoC (AX630C / 1 GB instead of the NanoKVM's RV1106 /
+      // just a different SoC (AX630C / 1 GB instead of the NanoKVM's SG2002 /
       // 256 MB). It advertises the identical wire shape (features kvm+sites, a
       // kvm block with its joining mesh), so it drops into the graph and the
       // claim sheet exactly like the NanoKVM above — nothing here is

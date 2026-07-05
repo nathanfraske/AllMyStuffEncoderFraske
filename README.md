@@ -33,11 +33,34 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   standalone command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
   you into a shell on any machine you own, right from your own terminal, and a
   bare `amst` opens one on this machine. It installs on its own (see below).
+- **Shared terminals.** A shell session more than one machine can attach to at
+  once, tmux-style — `amst <machine> -s` lists a machine's open shells, and
+  `-a <id>` joins one.
+- **Clipboard sync.** While controlling a machine, the clipboard follows you:
+  paste sends yours to the remote, copy brings the remote's back — text,
+  images, and files.
 - **File access.** Browse, preview, and transfer files between machines.
   Downloads land straight on your disk; nothing routes through a third party.
 - **Automatic discovery.** Each machine reports its hardware and attached
   devices — displays, cameras, microphones, disks — and they appear on the
-  graph, ready to connect.
+  graph, ready to connect. Claiming a new device is LAN-first: it offers
+  itself for adoption only over a local, mDNS-only rendezvous — never the
+  public mesh unless you switch that on at the device itself.
+- **Fleets.** Every device you claim joins your fleet: one identity across all
+  of them, linked by a shared fleet key, with cryptographically signed
+  membership in three tiers — owner, manager, member.
+- **Sharing with people.** Grant one capability — a screen, a camera, files —
+  to a person, not a machine: it works from whichever of their devices is
+  handy, and you can revoke it at any time.
+- **Virtual rooms.** Bring several machines into one call, with invites or
+  knock-to-join and a chat alongside; the media itself still flows directly
+  between members.
+- **Sites.** Open a machine's local web service in your browser — even one
+  bound to loopback — through a port mapped on the machine you're sitting at.
+  Only ports the host advertises are ever proxied.
+- **KVM appliances.** Point a NanoKVM-class device at a machine and you can
+  reach its screen and keyboard even when its OS is down — BIOS included —
+  with power and reset a click away; the KVM's own web UI opens through the mesh.
 - **Peer-to-peer and encrypted.** Traffic flows directly between your machines
   over an end-to-end encrypted mesh. There is no central server holding your
   data.
@@ -128,12 +151,11 @@ AllMyStuff is under active development. What works today:
 |---|---|---|
 | Device scanner | ✅ | Linux, macOS, and Windows; built and tested on all three in CI |
 | Desktop graph UI | ✅ | Interactive on both demo and live data |
-| Remote desktop | ✅ | H.264 up to 4K/30 fps with an MJPEG fallback; keyboard and mouse passthrough |
+| Remote desktop | ✅ | Hardware-encoded H.264 up to 4K (VideoToolbox on macOS, Media Foundation on Windows), with software and MJPEG fallbacks; keyboard and mouse passthrough |
 | Remote terminal | ✅ | A real PTY per tab over the mesh; no SSH daemon required |
-| File access | ✅ | Browse, preview, upload, download, rename, delete |
+| File access | ✅ | Browse, preview, upload, download, rename, delete; bulk transfers stream in chunks with backpressure, straight to disk |
 | Audio and camera | ✅ | Opus audio and H.264 camera over the same transport |
 | Discovery and routing | ✅ | Peers appear via presence; sessions negotiate and tear down cleanly |
-| File/disk streaming | 🚧 | Sessions set up; bulk transport is in progress |
 
 ## Building from source
 
