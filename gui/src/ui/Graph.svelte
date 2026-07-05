@@ -5,25 +5,33 @@
   import type { MeshNode } from "../types";
 
   // Viewport size tracked via ResizeObserver so the layout fits its container
-  // (same approach as the MyOwnMesh NodeMap). We measure the *scroll viewport*
-  // (`scroller`, declared below) rather than the outer canvas, so `width` is the
-  // space actually available inside any reserved scrollbar gutter — otherwise the
-  // grid would lay out to the full width and spill a stray horizontal scrollbar
-  // under a classic (non-overlay) vertical scrollbar. In radial the scroller has
-  // no scrollbar, so this is just the canvas size.
+  // (same approach as the MyOwnMesh NodeMap). We OBSERVE the outer canvas —
+  // whose size is fixed by the surrounding flex layout and never depends on the
+  // graph's own scroll content — so the observer can't feed back into itself.
+  // (Observing the inner scroller instead lets a sub-pixel horizontal-scrollbar
+  // toggle change the observed box and re-fire the observer inside its own
+  // delivery: "ResizeObserver loop completed with undelivered notifications".)
+  // We READ the scroll viewport's client box, though, so `width` is the space
+  // actually available inside any reserved scrollbar gutter and the grid never
+  // spills a stray horizontal scrollbar. Integers only (clientWidth/Height are
+  // integers; floor guards against a fractional fallback) so the stage lands
+  // exactly on the client width with no sub-pixel overflow.
   let width = $state(1000);
   let height = $state(700);
   let canvas = $state<HTMLDivElement | null>(null);
 
+  function measureViewport() {
+    const box = scroller ?? canvas;
+    if (!box) return;
+    width = Math.max(360, Math.floor(box.clientWidth));
+    height = Math.max(320, Math.floor(box.clientHeight));
+  }
+
   $effect(() => {
-    if (!scroller) return;
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) {
-        width = Math.max(360, e.contentRect.width);
-        height = Math.max(320, e.contentRect.height);
-      }
-    });
-    ro.observe(scroller);
+    if (!canvas) return;
+    const ro = new ResizeObserver(() => measureViewport());
+    ro.observe(canvas);
+    measureViewport();
     return () => ro.disconnect();
   });
 
@@ -143,9 +151,11 @@
     } catch {
       /* private mode — the toggle just doesn't persist */
     }
-    // The scroller only exists in grid mode; wait for it to render, then park
-    // it at the top so the new view starts from a clean position.
+    // Wait for the new view to render, then re-measure (the scrollbar gutter is
+    // reserved in grid but not radial, so the usable width changes) and park the
+    // scroller at the top so the new view starts from a clean position.
     await tick();
+    measureViewport();
     if (scroller) {
       scroller.scrollLeft = 0;
       scroller.scrollTop = 0;
