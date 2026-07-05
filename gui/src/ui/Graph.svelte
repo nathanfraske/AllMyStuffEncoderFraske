@@ -1,23 +1,29 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { app } from "../store.svelte";
   import { displayName, mediaColor, humanBytes, isAppNode, MEDIA, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
 
-  // Canvas size tracked via ResizeObserver so the layout fits its
-  // container (same approach as the MyOwnMesh NodeMap).
+  // Viewport size tracked via ResizeObserver so the layout fits its container
+  // (same approach as the MyOwnMesh NodeMap). We measure the *scroll viewport*
+  // (`scroller`, declared below) rather than the outer canvas, so `width` is the
+  // space actually available inside any reserved scrollbar gutter — otherwise the
+  // grid would lay out to the full width and spill a stray horizontal scrollbar
+  // under a classic (non-overlay) vertical scrollbar. In radial the scroller has
+  // no scrollbar, so this is just the canvas size.
   let width = $state(1000);
   let height = $state(700);
   let canvas = $state<HTMLDivElement | null>(null);
 
   $effect(() => {
-    if (!canvas) return;
+    if (!scroller) return;
     const ro = new ResizeObserver((entries) => {
       for (const e of entries) {
         width = Math.max(360, e.contentRect.width);
         height = Math.max(320, e.contentRect.height);
       }
     });
-    ro.observe(canvas);
+    ro.observe(scroller);
     return () => ro.disconnect();
   });
 
@@ -125,15 +131,24 @@
     }
   }
 
-  function setView(v: ViewMode) {
+  async function setView(v: ViewMode) {
     view = v;
     panX = 0;
     panY = 0;
     zoom = 1;
+    scrollLeft = 0;
+    scrollTop = 0;
     try {
       localStorage.setItem(VIEW_STORE_KEY, v);
     } catch {
       /* private mode — the toggle just doesn't persist */
+    }
+    // The scroller only exists in grid mode; wait for it to render, then park
+    // it at the top so the new view starts from a clean position.
+    await tick();
+    if (scroller) {
+      scroller.scrollLeft = 0;
+      scroller.scrollTop = 0;
     }
   }
 
@@ -147,7 +162,7 @@
 
   type Section = { key: string; label: string; x: number; y: number; w: number; h: number; count: number };
 
-  const gridLayout = $derived.by((): { placed: Placed[]; sections: Section[] } => {
+  const gridLayout = $derived.by((): { placed: Placed[]; sections: Section[]; height: number } => {
     const placed: Placed[] = [];
     const sections: Section[] = [];
     const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / CELL_W));
@@ -177,7 +192,9 @@
       });
       y += SECTION_HEAD + rows * CELL_H + SECTION_PAD + SECTION_GAP;
     }
-    return { placed, sections };
+    // A closing margin so the last section isn't flush against the scroll end,
+    // and so a drop-out drawer opening under a last-row card has room below it.
+    return { placed, sections, height: y + GRID_MARGIN };
   });
 
   // Radial layout: "this" in the middle, everything else on a ring seated
@@ -295,6 +312,95 @@
   let zoom = $state(1);
   const MIN_ZOOM = 0.4;
   const MAX_ZOOM = 2.2;
+  const clampZoom = (z: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+
+  // Grid view is navigated like a document — the wheel scrolls, and zoom is the
+  // deliberate Ctrl/⌘ gesture. Native scrolling on a real scroll container does
+  // the panning, so we track its offset here (mirrored into $state on `scroll`)
+  // and keep the pan/zoom transform only for the radial view. `isGrid` gates
+  // every place the two navigation models diverge.
+  const isGrid = $derived(view === "grid");
+  let scroller = $state<HTMLDivElement | null>(null);
+  let scrollLeft = $state(0);
+  let scrollTop = $state(0);
+  let hovering = $state(false);
+  function onScroll() {
+    if (!scroller) return;
+    scrollLeft = scroller.scrollLeft;
+    scrollTop = scroller.scrollTop;
+  }
+
+  // The scroll "stage": the grid is laid out at its natural width (the viewport
+  // width — sections centre themselves within it) and full height, then scaled
+  // by `zoom`. The stage element is sized to the *scaled* content so the browser
+  // gives it a real scrollbar; a short list still sits at the top. `centreX`
+  // re-centres a zoomed-out grid so it doesn't hug the left edge, matching the
+  // centred look at 100%. Radial keeps its viewport-sized, transform-panned stage.
+  const contentH = $derived(isGrid ? gridLayout.height : height);
+  const centreX = $derived(isGrid ? Math.max(0, (width - width * zoom) / 2) : 0);
+  const stageW = $derived(isGrid ? Math.max(width, width * zoom) : width);
+  const stageH = $derived(isGrid ? contentH * zoom : height);
+  // The on-screen offset of a laid-out point: `screenX = p.x * zoom + offX`.
+  // In grid that's the centring offset minus the scroll; in radial it's the pan.
+  const offX = $derived(isGrid ? centreX - scrollLeft : panX);
+  const offY = $derived(isGrid ? -scrollTop : panY);
+  // The transform on the node + wire layers. Grid never translates by pan (the
+  // scroller does that); it only centres and scales.
+  const layerTransformCss = $derived(
+    isGrid
+      ? `translate(${centreX}px, 0px) scale(${zoom})`
+      : `translate(${panX}px, ${panY}px) scale(${zoom})`,
+  );
+  const layerTransformSvg = $derived(
+    isGrid
+      ? `translate(${centreX} 0) scale(${zoom})`
+      : `translate(${panX} ${panY}) scale(${zoom})`,
+  );
+
+  const clampScroll = (v: number, max: number) => Math.max(0, Math.min(v, Math.max(0, max)));
+
+  /** Zoom toward a viewport point (px, py in canvas coordinates), keeping the
+   *  content under that point fixed. Radial nudges the pan; grid re-derives the
+   *  scroll offset after the stage has resized (hence the `tick`). */
+  async function applyZoom(px: number, py: number, target: number) {
+    const next = clampZoom(target);
+    if (next === zoom) return;
+    if (isGrid) {
+      const sc = scroller;
+      const prevLeft = sc?.scrollLeft ?? 0;
+      const prevTop = sc?.scrollTop ?? 0;
+      const prevCentre = Math.max(0, (width - width * zoom) / 2);
+      // The content-space point under the cursor, before the zoom change.
+      const cx = (px - prevCentre + prevLeft) / zoom;
+      const cy = (py + prevTop) / zoom;
+      zoom = next;
+      await tick();
+      if (sc) {
+        const nextCentre = Math.max(0, (width - width * next) / 2);
+        sc.scrollLeft = clampScroll(cx * next + nextCentre - px, sc.scrollWidth - sc.clientWidth);
+        sc.scrollTop = clampScroll(cy * next - py, sc.scrollHeight - sc.clientHeight);
+        onScroll();
+      }
+    } else {
+      const ratio = next / zoom;
+      panX = px - (px - panX) * ratio;
+      panY = py - (py - panY) * ratio;
+      zoom = next;
+    }
+  }
+
+  /** The zoombar's "reset" and Ctrl/⌘+0: back to 100% at the top-left/centre. */
+  async function resetView() {
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+    await tick();
+    if (scroller) {
+      scroller.scrollLeft = 0;
+      scroller.scrollTop = 0;
+      onScroll();
+    }
+  }
 
   // "Show me this device" from a settings list: when the store bumps a focus
   // request, pan the camera so the node sits at the canvas centre (at the
@@ -309,14 +415,50 @@
     lastFocusSeq = req.seq;
     const p = layout.find((pl) => pl.node.id === req.id);
     if (!p) return;
-    panX = width / 2 - p.x * zoom;
-    panY = height / 2 - p.y * zoom;
+    if (isGrid && scroller) {
+      // Scroll so the node lands in the middle of the viewport.
+      scroller.scrollLeft = clampScroll(
+        p.x * zoom + centreX - width / 2,
+        scroller.scrollWidth - scroller.clientWidth,
+      );
+      scroller.scrollTop = clampScroll(
+        p.y * zoom - height / 2,
+        scroller.scrollHeight - scroller.clientHeight,
+      );
+      onScroll();
+    } else {
+      panX = width / 2 - p.x * zoom;
+      panY = height / 2 - p.y * zoom;
+    }
+  });
+
+  // Ctrl/⌘ + '-' / '=' / '0' zoom the graph — but only while the pointer is over
+  // it, so the shortcut never fights the rest of the app (or the webview's own
+  // page zoom) when you're somewhere else. Anchored at the viewport centre.
+  $effect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!hovering || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        void applyZoom(width / 2, height / 2, zoom / 1.2);
+      } else if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        void applyZoom(width / 2, height / 2, zoom * 1.2);
+      } else if (e.key === "0") {
+        e.preventDefault();
+        void resetView();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
 
   // The active canvas gesture: panning (right-drag) or marqueeing (left-drag on
   // empty). Node drags are tracked separately, below.
   type Gesture =
-    | { kind: "pan"; x: number; y: number; panX: number; panY: number }
+    // `ox`/`oy` is the origin the drag moves from: the scroll offset in grid,
+    // the pan in radial. A right/middle-drag "pan" nudges whichever applies.
+    | { kind: "pan"; x: number; y: number; ox: number; oy: number }
     | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number };
   let gesture = $state<Gesture | null>(null);
   const panning = $derived(gesture?.kind === "pan");
@@ -338,8 +480,8 @@
     const y2 = Math.max(gesture.y0, gesture.y1);
     if (x2 - x1 < 4 && y2 - y1 < 4) return set;
     for (const p of layout) {
-      const sx = p.x * zoom + panX;
-      const sy = p.y * zoom + panY;
+      const sx = p.x * zoom + offX;
+      const sy = p.y * zoom + offY;
       if (sx >= x1 && sx <= x2 && sy >= y1 && sy <= y2) set.add(p.node.id);
     }
     return set;
@@ -372,18 +514,17 @@
   }
 
   function onWheel(e: WheelEvent) {
+    // Grid reads like a list: a bare wheel scrolls it (let the scroller do its
+    // thing — don't preventDefault), and zoom is the deliberate Ctrl/⌘ gesture.
+    // Radial has nothing to scroll, so the wheel keeps zooming there.
+    if (isGrid && !e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
     const rect = canvas?.getBoundingClientRect();
     if (!rect) return;
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     const factor = Math.exp(-e.deltaY * 0.0012);
-    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
-    if (next === zoom) return;
-    const ratio = next / zoom;
-    panX = px - (px - panX) * ratio;
-    panY = py - (py - panY) * ratio;
-    zoom = next;
+    void applyZoom(px, py, zoom * factor);
   }
 
   function onPointerDown(e: PointerEvent) {
@@ -398,8 +539,15 @@
     // Stop a drag from turning into a native text selection.
     e.preventDefault();
     if (e.button === 2 || e.button === 1) {
-      // Right (or middle) drag pans — the platform convention.
-      gesture = { kind: "pan", x: e.clientX, y: e.clientY, panX, panY };
+      // Right (or middle) drag pans — the platform convention. In grid it drags
+      // the scroll; in radial it drags the pan.
+      gesture = {
+        kind: "pan",
+        x: e.clientX,
+        y: e.clientY,
+        ox: isGrid ? (scroller?.scrollLeft ?? 0) : panX,
+        oy: isGrid ? (scroller?.scrollTop ?? 0) : panY,
+      };
       (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
     } else if (e.button === 0) {
       // Left drag on empty space marquee-selects. Without a modifier it starts
@@ -416,8 +564,14 @@
   function onPointerMove(e: PointerEvent) {
     if (!gesture) return;
     if (gesture.kind === "pan") {
-      panX = gesture.panX + (e.clientX - gesture.x);
-      panY = gesture.panY + (e.clientY - gesture.y);
+      if (isGrid && scroller) {
+        // Dragging right/down moves the content right/down — i.e. scroll left/up.
+        scroller.scrollLeft = gesture.ox - (e.clientX - gesture.x);
+        scroller.scrollTop = gesture.oy - (e.clientY - gesture.y);
+      } else {
+        panX = gesture.ox + (e.clientX - gesture.x);
+        panY = gesture.oy + (e.clientY - gesture.y);
+      }
     } else {
       const p = canvasPoint(e);
       gesture = { ...gesture, x1: p.x, y1: p.y };
@@ -729,20 +883,37 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  onpointerenter={() => (hovering = true)}
+  onpointerleave={() => (hovering = false)}
   oncontextmenu={onContextMenu}
   role="application"
   aria-label="Your stuff, as a graph"
 >
-  <!-- edge layer -->
-  <svg class="edges" {width} {height} aria-hidden="true">
+  <!-- The dot backdrop — a static viewport-sized layer that never pans or
+       scrolls, so the graph always reads against the same field of dots. -->
+  <svg class="dots" {width} {height} aria-hidden="true">
     <defs>
       <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
         <circle cx="1.5" cy="1.5" r="1.5" fill="oklch(0.62 0.20 292 / 0.16)" />
       </pattern>
     </defs>
     <rect x="0" y="0" {width} {height} fill="url(#dots)" />
-    <g transform="translate({panX} {panY}) scale({zoom})">
-      {#each kvmTethers as tth (tth.id)}
+  </svg>
+
+  <!-- The scroll viewport. Grid view scrolls it natively (mousewheel, drag,
+       scrollbar); radial keeps it pinned and pans via the transform. The
+       `.stage` is sized to the scaled content so the browser scrolls it. -->
+  <div
+    class="scroller"
+    class:scroll={isGrid}
+    bind:this={scroller}
+    onscroll={onScroll}
+  >
+    <div class="stage" style="width: {stageW}px; height: {stageH}px;">
+      <!-- edge layer -->
+      <svg class="edges" width={stageW} height={stageH} aria-hidden="true">
+        <g transform={layerTransformSvg}>
+          {#each kvmTethers as tth (tth.id)}
         <!-- The physical KVM↔machine wiring: a quiet dashed tether under the
              live media wires, with a plug dot at the KVM end. -->
         <path
@@ -782,7 +953,7 @@
   </svg>
 
   <!-- node layer (HTML, shares the same transform) -->
-  <div class="nodes" style="transform: translate({panX}px, {panY}px) scale({zoom});">
+  <div class="nodes" style="transform: {layerTransformCss};">
     {#each sections as s (s.key)}
       <!-- grid view only: one labelled band per fleet -->
       <div
@@ -1020,6 +1191,8 @@
         {/if}
       </div>
     {/each}
+      </div>
+    </div>
   </div>
 
   {#if gesture?.kind === "marquee"}
@@ -1092,9 +1265,9 @@
       onclick={() => setView("grid")}>⊞</button
     >
     <span class="zsep"></span>
-    <button class="zbtn" title="Zoom out" onclick={() => (zoom = Math.max(MIN_ZOOM, zoom / 1.2))}>−</button>
-    <button class="zbtn wide" title="Reset view" onclick={() => { panX = 0; panY = 0; zoom = 1; }}>{Math.round(zoom * 100)}%</button>
-    <button class="zbtn" title="Zoom in" onclick={() => (zoom = Math.min(MAX_ZOOM, zoom * 1.2))}>+</button>
+    <button class="zbtn" title="Zoom out (Ctrl/⌘ −)" onclick={() => applyZoom(width / 2, height / 2, zoom / 1.2)}>−</button>
+    <button class="zbtn wide" title="Reset view (Ctrl/⌘ 0)" onclick={resetView}>{Math.round(zoom * 100)}%</button>
+    <button class="zbtn" title="Zoom in (Ctrl/⌘ +)" onclick={() => applyZoom(width / 2, height / 2, zoom * 1.2)}>+</button>
   </div>
 </div>
 
@@ -1244,6 +1417,56 @@
     color: var(--c-share-ink);
     background: var(--c-share-soft);
   }
+  /* The static dot backdrop — pinned to the canvas, never scrolls or pans. */
+  .dots {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  /* The scroll viewport. Grid view scrolls it; radial keeps it clipped and
+     pans the layers inside via their transform. It fills the canvas, sitting
+     above the dot backdrop and below the floating overlays (zoombar, banners). */
+  .scroller {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+  }
+  .scroller.scroll {
+    overflow: auto;
+    overscroll-behavior: contain;
+    /* Reserve the scrollbar's space so `width` is stable whether or not the
+       vertical scrollbar is showing (no reflow jitter, no stray horizontal
+       scrollbar). No-op on overlay-scrollbar platforms like macOS. */
+    scrollbar-gutter: stable;
+  }
+  /* A quiet scrollbar that reads as part of the dark surface. */
+  .scroller.scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  .scroller.scroll::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  .scroller.scroll::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 8px;
+  }
+  .scroller.scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--ink-faint);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  .scroller.scroll::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  /* The scroll content: sized to the scaled layout so it gives a real scrollbar
+     (grid) or exactly fills the viewport (radial). */
+  .stage {
+    position: relative;
+  }
   .edges {
     position: absolute;
     inset: 0;
@@ -1376,9 +1599,15 @@
   .restart-sep.done {
     background: var(--ok);
   }
+  /* Zero-sized, top-left anchored: the node cards are absolutely positioned in
+     content coordinates, so the layer's own box must stay 0×0 — otherwise the
+     scaled box would balloon the scroll area past the actual content. */
   .nodes {
     position: absolute;
-    inset: 0;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 0;
     transform-origin: 0 0;
     pointer-events: none;
   }
