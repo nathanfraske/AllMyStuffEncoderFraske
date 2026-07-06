@@ -373,8 +373,10 @@
     frameW = 0;
     frameH = 0;
     // A new source may have a different (or no) letterbox — start from the full
-    // frame and let detection re-converge.
+    // frame, unlock, and let the one-shot detector re-measure and re-lock.
     activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+    detectLocked = false;
+    detectPrev = null;
     hostStatus = null;
     fps = 0;
     transport = "";
@@ -690,7 +692,7 @@
     const x = Math.min(1, Math.max(0, (fx - ar.x0) / (ar.x1 - ar.x0)));
     const y = Math.min(1, Math.max(0, (fy - ar.y0) / (ar.y1 - ar.y0)));
     // TEMP diagnostic: sent n, raw frame fraction, and the detected active box.
-    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · fx ${fx.toFixed(3)},${fy.toFixed(3)} · act x ${ar.x0.toFixed(3)}–${ar.x1.toFixed(3)} y ${ar.y0.toFixed(3)}–${ar.y1.toFixed(3)}`;
+    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · fx ${fx.toFixed(3)},${fy.toFixed(3)} · act x ${ar.x0.toFixed(3)}–${ar.x1.toFixed(3)} y ${ar.y0.toFixed(3)}–${ar.y1.toFixed(3)}${detectLocked ? " 🔒" : ""}`;
     return { x, y };
   }
 
@@ -699,13 +701,21 @@
   // The active region of the streamed frame in 0..1 fractions (the desktop
   // inside any baked-in black bars); the full frame until detection runs.
   let activeRegion = $state({ x0: 0, y0: 0, x1: 1, y1: 1 });
+  // The bars are baked pixels with no sidechannel (HDMI reports only the signal
+  // size, the SPS only the coded size), so they must be measured off the frame —
+  // but they're STATIC for a source mode, so this is a one-shot: it measures on
+  // the health tick only until two content-bearing frames agree, then LOCKS and
+  // stops sampling. Reset (unlock) on a stream re-wire.
+  let detectLocked = false;
+  let detectPrev: { x0: number; x1: number; y0: number; y1: number } | null = null;
 
-  // Sample the decoded canvas for symmetric black letterbox/pillarbox bars and
-  // set activeRegion. Cheap (a dozen 1px strips) and run about once a second —
-  // the bars don't move. Conservative: only crops when clear bars sit on BOTH
-  // opposite edges and are near-symmetric (a real letterbox), so ordinary dark
-  // content is never mistaken for a bar; otherwise it maps over the whole frame.
+  // Measure the frame's active region: sample the decoded canvas for symmetric
+  // black letterbox/pillarbox bars. Cheap (a dozen 1px strips), and it stops
+  // once locked. Conservative: only crops when clear bars sit on BOTH opposite
+  // edges and are near-symmetric (a real letterbox), so ordinary dark content is
+  // never mistaken for a bar; otherwise it maps over the whole frame.
   function detectActiveRegion() {
+    if (detectLocked) return;
     const c = canvasEl;
     if (!c || !c.width || !c.height || !hasFrame) return;
     const ctx = c.getContext("2d", { willReadFrequently: true });
@@ -721,6 +731,7 @@
     let x1 = w;
     let y0 = 0;
     let y1 = h;
+    let found = false; // did the frame carry real (non-black) content this pass?
     try {
       const L: number[] = [];
       const R: number[] = [];
@@ -750,6 +761,7 @@
           B.push(b);
         }
       }
+      found = L.length >= 4;
       if (L.length >= 4) {
         x0 = median(L);
         x1 = median(R) + 1;
@@ -762,18 +774,39 @@
       return; // canvas not readable this tick — keep the last region
     }
 
+    // A near-all-black frame (screensaver, dark boot screen) tells us nothing —
+    // don't measure or lock on it, just try again on the next tick.
+    if (!found) {
+      detectPrev = null;
+      return;
+    }
+
     const barL = x0;
     const barR = w - x1;
     const barT = y0;
     const barB = h - y1;
     const okX = Math.min(barL, barR) > w * 0.015 && Math.abs(barL - barR) < w * 0.02;
     const okY = Math.min(barT, barB) > h * 0.015 && Math.abs(barT - barB) < h * 0.02;
-    activeRegion = {
+    const next = {
       x0: okX ? x0 / w : 0,
       x1: okX ? x1 / w : 1,
       y0: okY ? y0 / h : 0,
       y1: okY ? y1 / h : 1,
     };
+    activeRegion = next;
+    // Lock once two consecutive content-bearing frames agree — then stop
+    // sampling entirely until the next re-wire resets it.
+    const near = (a: number, b: number) => Math.abs(a - b) < 0.005;
+    if (
+      detectPrev &&
+      near(detectPrev.x0, next.x0) &&
+      near(detectPrev.x1, next.x1) &&
+      near(detectPrev.y0, next.y0) &&
+      near(detectPrev.y1, next.y1)
+    ) {
+      detectLocked = true;
+    }
+    detectPrev = next;
   }
 
   // The KVM rule: with control live, the window under the mouse is the one
