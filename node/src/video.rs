@@ -463,6 +463,15 @@ pub struct RecvFeedback {
 // IDR). A manual retune replaces the route and so resets the cap — the
 // viewer's new picks change the conditions, and the controller re-learns.
 
+/// Master switch for the receiver-driven resolution auto-adaptation. **Off for
+/// now** — the manual Speed↔Quality slider (and the pills) are the quality
+/// control, and auto-stepping fought them (it re-tuned under the same feedback
+/// the user was reacting to). Deferred until it's a real, user-toggleable
+/// setting that yields to a manual tune; revisit with the perf roadmap's slider
+/// auto-traversal. The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a
+/// separate, benign recovery lever and stays on regardless.
+const AUTO_ADAPT_ENABLED: bool = false;
+
 /// The auto-cap rungs, descending. `0` (uncapped) sits above the first.
 const AUTO_EDGES: &[u32] = &[2560, 1920, 1280, 960];
 /// Consecutive struggling reports (~2 s apart) before a step down.
@@ -503,6 +512,9 @@ impl AutoAdapt {
 
     /// The cap the encode path applies (min with the tuned edge), if any.
     fn edge_cap(&self) -> Option<u32> {
+        if !AUTO_ADAPT_ENABLED {
+            return None;
+        }
         match self.edge.load(Ordering::Relaxed) {
             0 => None,
             e => Some(e),
@@ -513,6 +525,9 @@ impl AutoAdapt {
     /// stepped (0 = uncapped), for the caller to log. `now` is passed in so
     /// the streak/hold logic is unit-testable.
     fn observe(&self, fb: &RecvFeedback, fps_target: u32, now: Instant) -> Option<(u32, u32)> {
+        if !AUTO_ADAPT_ENABLED {
+            return None;
+        }
         // Struggling: arriving at under a quarter of the encode rate (the
         // field failure was 0–6 fps of 60), or a queue backing far up.
         // Healthy: at least three quarters of it, decoding cleanly, queue
