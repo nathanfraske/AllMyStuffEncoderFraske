@@ -225,11 +225,38 @@ to the existing desktop/`amst` behaviour:
 
 ---
 
-## 5. The FFI layer (`myownmesh-ffi`, to build)
+## 5. The engine bridge — `allmystuff-mesh` (built)
 
-The embedded engine is reached through a thin FFI crate, added on the
-**MyOwnMesh** side (the bindings belong with the dependency, and benefit any
-future embedder). Recommended shape:
+The phone reaches the embedded engine through one small crate:
+**`gui/mobile-mesh` (`allmystuff-mesh`)**, which backs `allmystuff-mobile-core`'s
+`MeshClient` seam with an in-process `myownmesh-core`.
+
+> **No UniFFI / C-ABI is needed.** The mobile app is **Tauri**, so its backend is
+> already Rust — `myownmesh-core` is a normal Cargo dependency and the app drives
+> it directly; there is no Swift/Kotlin language boundary to cross for the engine.
+> (A UniFFI `myownmesh-ffi` crate would only matter for a *pure-native* app, which
+> this isn't — so we skip it. The typed-surface sketch below is kept only as the
+> shape such a binding would take.) The single engine change this needed —
+> injecting a caller-supplied identity — landed as `Mesh::open_with_identity` in
+> MyOwnMesh (PR #88).
+
+**What shipped** (`EngineMesh`, owning a tokio runtime, implementing `MeshClient`):
+`open_and_join(seed, label, network_id, on_inbound)` opens the engine with
+`Mesh::open_with_identity` (the platform hands in the ed25519 seed from
+Keychain/Keystore) and attaches signaling; `advertise` broadcasts presence,
+`send_control`/`send_media` `send_to` one peer, `peers()` snapshots the connected
+set, and one pump task per channel feeds each `subscribe()` stream through
+`allmystuff_mobile_core::classify` into the host sink — a **1:1** map onto the
+engine's typed `Channel::<serde_json::Value>` API.
+
+**Verified on host:** `allmystuff-mesh` compiles against the real engine and its
+tests open an engine + join a network + exercise the `MeshClient` on x86_64
+(`ring` builds natively) — the wiring is proven in Rust before any device build.
+The engine's cross-compile to iOS/Android happens in `gui/mobile` (the original
+probe already type-checked the tree for `aarch64-linux-android`; it needs the
+NDK/Xcode toolchains, not a port).
+
+<details><summary>Fallback only — the UniFFI surface a <em>pure-native</em> (non-Tauri) app would use</summary>
 
 - **Crate:** `crates/myownmesh-ffi`, `crate-type = ["lib", "staticlib", "cdylib"]`,
   using **UniFFI** (proc-macro mode + `uniffi::setup_scaffolding!()`), with
@@ -263,6 +290,8 @@ future embedder). Recommended shape:
 
 This crate is the right size to build and verify on host first (UniFFI compiles
 on host), then wire into the cross-compile once the NDK/Xcode infra lands.
+
+</details>
 
 ---
 
@@ -338,9 +367,16 @@ hardest capture last.
   — fleet-machine admin (upgrade/restart/reboot), KVM curation + recognition,
   per-route video negotiation (`tune`/`refresh_video`/`video_feedback`), the
   shared-shell picker, and fleet-site management (`control.rs`).
+- ✅ Identity-injection seam: `Mesh::open_with_identity` in `myownmesh-core`
+  (MyOwnMesh PR #88) — lets the phone open the engine with a Keychain/Keystore key.
+- ✅ Engine bridge `allmystuff-mesh` (`gui/mobile-mesh`, §5): backs the
+  `MeshClient` seam with an embedded `myownmesh-core`; opens + joins + pumps the
+  five channels through `classify`. Verified on host (opens a real engine + joins
+  a network in tests) — no UniFFI needed, since the Tauri backend is Rust.
 - ⬜ Stand up the Android NDK + `cargo-ndk` and an iOS build host; cross-compile
   `myownmesh-core` clean on both (R1 finish).
-- ⬜ `myownmesh-ffi` (§5); prove `open → join → exchange one message` with a desktop peer.
+- ⬜ Wire `gui/mobile` to `allmystuff-mesh` (Tauri commands + Keychain seed +
+  inbound→UI events); prove `open → join → exchange one message` with a desktop peer.
 
 **Phase 1 — v1: Graph + Terminal (smallest shippable).**
 - ✅ Mobile entry point + Tauri shell as its own crate (`gui/mobile`), reusing
