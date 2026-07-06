@@ -466,10 +466,12 @@ pub struct RecvFeedback {
 /// Master switch for the receiver-driven resolution auto-adaptation. **Off for
 /// now** — the manual Speed↔Quality slider (and the pills) are the quality
 /// control, and auto-stepping fought them (it re-tuned under the same feedback
-/// the user was reacting to). Deferred until it's a real, user-toggleable
-/// setting that yields to a manual tune; revisit with the perf roadmap's slider
-/// auto-traversal. The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a
-/// separate, benign recovery lever and stays on regardless.
+/// the user was reacting to). Gated at the wiring (`note_feedback` skips the
+/// feedback→step call) so the [`AutoAdapt`] logic below stays intact and
+/// unit-tested for when this returns as a real, user-toggleable setting that
+/// yields to a manual tune (perf roadmap's slider auto-traversal). The adaptive
+/// **IDR cadence** ([`adaptive_idr_ms`]) is a separate, benign recovery lever
+/// and stays on regardless.
 const AUTO_ADAPT_ENABLED: bool = false;
 
 /// The auto-cap rungs, descending. `0` (uncapped) sits above the first.
@@ -512,9 +514,6 @@ impl AutoAdapt {
 
     /// The cap the encode path applies (min with the tuned edge), if any.
     fn edge_cap(&self) -> Option<u32> {
-        if !AUTO_ADAPT_ENABLED {
-            return None;
-        }
         match self.edge.load(Ordering::Relaxed) {
             0 => None,
             e => Some(e),
@@ -525,9 +524,6 @@ impl AutoAdapt {
     /// stepped (0 = uncapped), for the caller to log. `now` is passed in so
     /// the streak/hold logic is unit-testable.
     fn observe(&self, fb: &RecvFeedback, fps_target: u32, now: Instant) -> Option<(u32, u32)> {
-        if !AUTO_ADAPT_ENABLED {
-            return None;
-        }
         // Struggling: arriving at under a quarter of the encode rate (the
         // field failure was 0–6 fps of 60), or a queue backing far up.
         // Healthy: at least three quarters of it, decoding cleanly, queue
@@ -760,6 +756,12 @@ impl VideoBridge {
         // (see [`AutoAdapt`]). Run outside the routes lock — the observe
         // takes its own.
         let (auto, tune) = adapt;
+        // Auto-scale is gated off for now (see AUTO_ADAPT_ENABLED) — the manual
+        // slider owns quality. The AutoAdapt logic stays live + tested; this is
+        // the one line that keeps it from acting on a stream.
+        if !AUTO_ADAPT_ENABLED {
+            return;
+        }
         if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
             let name = |e: u32| {
                 if e == 0 {
