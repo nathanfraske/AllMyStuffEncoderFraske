@@ -133,10 +133,6 @@
   });
   let frameW = $state(0);
   let frameH = $state(0);
-  // TEMP mouse-mapping diagnostic: the last pointer's raw (unclamped) normalized
-  // coords plus the dims that feed the letterbox, so an edge-vs-center offset can
-  // be read off the stage. Remove once the skew is pinned.
-  let dbgMap = $state("");
   let fps = $state(0);
   let transport = $state("");
   let decodeFails = $state(0);
@@ -195,7 +191,36 @@
     { label: "H.264 · native decode", value: "native" },
     { label: "MJPEG", value: "mjpeg" },
   ];
-  let openPill = $state<"res" | "fps" | "rate" | "codec" | null>(null);
+  let openPill = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
+
+  // ---- source aspect (mouse letterbox correction) --------------------
+  //
+  // A machine whose native resolution isn't 16:9 gets letterboxed into the
+  // capture; the mouse must map over the desktop inside the bars. "Auto" reads
+  // the bars off the picture (detectActiveRegion); an explicit aspect computes
+  // the exact symmetric bars with no sampling — the confident manual path. Like
+  // the codec pill, this is a pills-only control (not driven by the slider).
+  const ASPECTS: Array<{ label: string; value: string; ratio: number | null }> = [
+    { label: "Auto", value: "auto", ratio: null },
+    { label: "16:9", value: "16:9", ratio: 16 / 9 },
+    { label: "16:10", value: "16:10", ratio: 16 / 10 },
+    { label: "3:2", value: "3:2", ratio: 3 / 2 },
+    { label: "4:3", value: "4:3", ratio: 4 / 3 },
+    { label: "21:9", value: "21:9", ratio: 21 / 9 },
+  ];
+  let aspectChoice = $state<string>(
+    (typeof localStorage !== "undefined" && localStorage.getItem("ams.consoleAspect")) || "auto",
+  );
+  function pickAspect(v: string) {
+    aspectChoice = v;
+    openPill = null;
+    try {
+      localStorage.setItem("ams.consoleAspect", v);
+    } catch {
+      // storage disabled — the pick still applies for this session
+    }
+  }
+  const aspectLabel = $derived(ASPECTS.find((a) => a.value === aspectChoice)?.label ?? "Auto");
   // The codec pill reflects the *selected source's* transport (per-source in
   // the store) plus this window's decode choice — so switching sources shows
   // that source's codec, and "native" stays a window-local decode preference.
@@ -315,9 +340,10 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
-      // Re-detect the frame's active region (letterbox bars) once a second, so
-      // the mouse maps over the desktop when a non-16:9 source is letterboxed.
-      if (stagePointerActive) detectActiveRegion();
+      // Auto aspect: measure the frame's active region (letterbox bars) until
+      // it locks, so the mouse maps over the desktop of a non-16:9 source. A
+      // manual Aspect pick owns the region instead (see the $effect).
+      if (stagePointerActive && aspectChoice === "auto") detectActiveRegion();
       // Every other tick, report our decode health back to the streamer so
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
@@ -691,8 +717,6 @@
     const ar = activeRegion;
     const x = Math.min(1, Math.max(0, (fx - ar.x0) / (ar.x1 - ar.x0)));
     const y = Math.min(1, Math.max(0, (fy - ar.y0) / (ar.y1 - ar.y0)));
-    // TEMP diagnostic: sent n, raw frame fraction, and the detected active box.
-    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · fx ${fx.toFixed(3)},${fy.toFixed(3)} · act x ${ar.x0.toFixed(3)}–${ar.x1.toFixed(3)} y ${ar.y0.toFixed(3)}–${ar.y1.toFixed(3)}${detectLocked ? " 🔒" : ""}`;
     return { x, y };
   }
 
@@ -808,6 +832,41 @@
     }
     detectPrev = next;
   }
+
+  // The exact symmetric active region for a known source aspect within the
+  // current frame: a source narrower than the frame pillarboxes (L/R bars),
+  // a wider one letterboxes (T/B bars).
+  function activeRegionForAspect(ratio: number, fw: number, fh: number) {
+    const frameRatio = fw / fh;
+    if (ratio < frameRatio - 1e-4) {
+      const x0 = (1 - ratio / frameRatio) / 2;
+      return { x0, x1: 1 - x0, y0: 0, y1: 1 };
+    }
+    if (ratio > frameRatio + 1e-4) {
+      const y0 = (1 - frameRatio / ratio) / 2;
+      return { x0: 0, x1: 1, y0, y1: 1 - y0 };
+    }
+    return { x0: 0, y0: 0, x1: 1, y1: 1 };
+  }
+
+  // Apply the Aspect pick: "Auto" hands the active region back to the one-shot
+  // pixel detector; an explicit aspect computes the exact bars and disables
+  // detection. Re-runs when the pick or the frame geometry changes.
+  $effect(() => {
+    const choice = aspectChoice;
+    const fw = frameW;
+    const fh = frameH;
+    const ratio = ASPECTS.find((a) => a.value === choice)?.ratio ?? null;
+    if (ratio == null) {
+      // Auto — unlock and let detectActiveRegion re-measure.
+      detectLocked = false;
+      detectPrev = null;
+      activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+      return;
+    }
+    detectLocked = true; // stop the detector; the aspect is authoritative
+    activeRegion = fw && fh ? activeRegionForAspect(ratio, fw, fh) : { x0: 0, y0: 0, x1: 1, y1: 1 };
+  });
 
   // The KVM rule: with control live, the window under the mouse is the one
   // your keyboard should reach — claim focus on hover, no click in between (a
@@ -1281,6 +1340,37 @@
                 </div>
               {/if}
                 </span>
+                {#if stagePointerActive}
+                  <span class="pill-wrap">
+                    <button
+                      class="pill"
+                      class:tuned={aspectChoice !== "auto"}
+                      title="Source aspect — corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        openPill = openPill === "aspect" ? null : "aspect";
+                      }}
+                    >
+                      Aspect · {aspectLabel} ▾
+                    </button>
+                    {#if openPill === "aspect"}
+                      <div class="pill-menu" role="menu">
+                        {#each ASPECTS as a (a.value)}
+                          <button
+                            class="pill-item"
+                            class:sel={aspectChoice === a.value}
+                            onclick={(e) => {
+                              e.stopPropagation();
+                              pickAspect(a.value);
+                            }}
+                          >
+                            {a.label}
+                          </button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </span>
+                {/if}
               </div>
             {/if}
             <button
@@ -1295,22 +1385,16 @@
         <div class="status">
           {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{decodeFails
-                ? ` · ${decodeFails} decode-err`
-                : ""}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{pipeDiag
+                ? ` · ⚠ ${pipeDiag}`
+                : ""}
             </span>
-          {/if}
-          {#if dbgMap}
-            <span class="chip" style="font-family: monospace; font-size: 0.62rem; opacity: 0.85">{dbgMap}</span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}
             <span class="chip" style="--mc: {mediaColor(r.media as MediaKind)}">
               <span class="chip-dot"></span>{MEDIA[r.media as MediaKind].label}
             </span>
           {/each}
-          {#if app.consoleSessionRoutes.length === 0}
-            <span class="muted">No active links yet</span>
-          {/if}
         </div>
 
         <button class="btn end" onclick={endSession}>End session</button>
@@ -1875,10 +1959,6 @@
     50% {
       opacity: 0.35;
     }
-  }
-  .muted {
-    color: #79739a;
-    font-size: 0.76rem;
   }
   .end {
     flex-shrink: 0;
