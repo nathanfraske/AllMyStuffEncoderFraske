@@ -133,6 +133,10 @@
   });
   let frameW = $state(0);
   let frameH = $state(0);
+  // TEMP mouse-mapping diagnostic: the last pointer's raw (unclamped) normalized
+  // coords plus the dims that feed the letterbox, so an edge-vs-center offset can
+  // be read off the stage. Remove once the skew is pinned.
+  let dbgMap = $state("");
   let fps = $state(0);
   let transport = $state("");
   let decodeFails = $state(0);
@@ -667,6 +671,10 @@
     const oy = r.top + (r.height - ch) / 2;
     const x = (e.clientX - ox) / cw;
     const y = (e.clientY - oy) / ch;
+    // TEMP diagnostic: raw norm + the dims feeding the letterbox. f = frame
+    // display dims (what normPoint uses), c = canvas backing store, r = element
+    // box, dpr = device pixel ratio, mode = decode path.
+    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · f ${frameW}×${frameH} · c ${img.width}×${img.height} · r ${Math.round(r.width)}×${Math.round(r.height)} · dpr ${window.devicePixelRatio} · ${nativeDecode ? "nat" : "wc"}`;
     if (x < 0 || x > 1 || y < 0 || y > 1) return null;
     return { x, y };
   }
@@ -1161,6 +1169,9 @@
                 ? ` · ${decodeFails} decode-err`
                 : ""}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
             </span>
+          {/if}
+          {#if dbgMap}
+            <span class="chip" style="font-family: monospace; font-size: 0.62rem; opacity: 0.85">{dbgMap}</span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}
             <span class="chip" style="--mc: {mediaColor(r.media as MediaKind)}">
