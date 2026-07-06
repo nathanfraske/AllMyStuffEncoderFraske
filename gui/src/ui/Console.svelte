@@ -315,6 +315,9 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // Re-detect the frame's active region (letterbox bars) once a second, so
+      // the mouse maps over the desktop when a non-16:9 source is letterboxed.
+      if (stagePointerActive) detectActiveRegion();
       // Every other tick, report our decode health back to the streamer so
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
@@ -369,6 +372,9 @@
     // hasFrame gate below then drops events until the first fresh frame repaints.
     frameW = 0;
     frameH = 0;
+    // A new source may have a different (or no) letterbox — start from the full
+    // frame and let detection re-converge.
+    activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
     hostStatus = null;
     fps = 0;
     transport = "";
@@ -669,15 +675,105 @@
     const ch = frameH * scale;
     const ox = r.left + (r.width - cw) / 2;
     const oy = r.top + (r.height - ch) / 2;
-    const x = (e.clientX - ox) / cw;
-    const y = (e.clientY - oy) / ch;
-    // TEMP diagnostic. r = the canvas element box; box = the content rect
-    // normPoint maps over; inset = the letterbox offset it subtracts. If the
-    // element is sized to the video, inset should be ~0,0 — a non-zero inset
-    // that equals the visible bars is the mouse-skew source.
-    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · f ${frameW}×${frameH} · r ${Math.round(r.width)}×${Math.round(r.height)} · box ${Math.round(cw)}×${Math.round(ch)} · inset ${Math.round(ox - r.left)},${Math.round(oy - r.top)}`;
-    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    // Fraction over the streamed FRAME.
+    const fx = (e.clientX - ox) / cw;
+    const fy = (e.clientY - oy) / ch;
+    if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+    // Remap over the ACTIVE region — inside any baked-in letterbox bars. A
+    // source whose native aspect ≠ the 16:9 capture (e.g. a 16:10 laptop output
+    // as 1080p) bakes black bars into the frame, and the remote's absolute
+    // pointer maps over its DESKTOP, not the whole frame — so mapping over the
+    // full frame lands the cursor off by the bar width. activeRegion is the
+    // detected desktop box (0..1), or the full frame when there are no clear,
+    // symmetric bars. Bar-hits clamp to the desktop edge.
+    const ar = activeRegion;
+    const x = Math.min(1, Math.max(0, (fx - ar.x0) / (ar.x1 - ar.x0)));
+    const y = Math.min(1, Math.max(0, (fy - ar.y0) / (ar.y1 - ar.y0)));
+    // TEMP diagnostic: sent n, raw frame fraction, and the detected active box.
+    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · fx ${fx.toFixed(3)},${fy.toFixed(3)} · act x ${ar.x0.toFixed(3)}–${ar.x1.toFixed(3)} y ${ar.y0.toFixed(3)}–${ar.y1.toFixed(3)}`;
     return { x, y };
+  }
+
+  // ---- letterbox / active-area detection -----------------------------
+  //
+  // The active region of the streamed frame in 0..1 fractions (the desktop
+  // inside any baked-in black bars); the full frame until detection runs.
+  let activeRegion = $state({ x0: 0, y0: 0, x1: 1, y1: 1 });
+
+  // Sample the decoded canvas for symmetric black letterbox/pillarbox bars and
+  // set activeRegion. Cheap (a dozen 1px strips) and run about once a second —
+  // the bars don't move. Conservative: only crops when clear bars sit on BOTH
+  // opposite edges and are near-symmetric (a real letterbox), so ordinary dark
+  // content is never mistaken for a bar; otherwise it maps over the whole frame.
+  function detectActiveRegion() {
+    const c = canvasEl;
+    if (!c || !c.width || !c.height || !hasFrame) return;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    const w = c.width;
+    const h = c.height;
+    const DARK = 24;
+    const bright = (d: Uint8ClampedArray, px: number) =>
+      d[px * 4] > DARK || d[px * 4 + 1] > DARK || d[px * 4 + 2] > DARK;
+    const median = (a: number[]) => a.slice().sort((p, q) => p - q)[a.length >> 1];
+
+    let x0 = 0;
+    let x1 = w;
+    let y0 = 0;
+    let y1 = h;
+    try {
+      const L: number[] = [];
+      const R: number[] = [];
+      for (let k = 1; k <= 6; k++) {
+        const y = Math.floor((h * k) / 7);
+        const row = ctx.getImageData(0, y, w, 1).data;
+        let l = 0;
+        while (l < w && !bright(row, l)) l++;
+        let rr = w - 1;
+        while (rr > l && !bright(row, rr)) rr--;
+        if (l < rr) {
+          L.push(l);
+          R.push(rr);
+        }
+      }
+      const T: number[] = [];
+      const B: number[] = [];
+      for (let k = 1; k <= 6; k++) {
+        const x = Math.floor((w * k) / 7);
+        const col = ctx.getImageData(x, 0, 1, h).data;
+        let t = 0;
+        while (t < h && !bright(col, t)) t++;
+        let b = h - 1;
+        while (b > t && !bright(col, b)) b--;
+        if (t < b) {
+          T.push(t);
+          B.push(b);
+        }
+      }
+      if (L.length >= 4) {
+        x0 = median(L);
+        x1 = median(R) + 1;
+      }
+      if (T.length >= 4) {
+        y0 = median(T);
+        y1 = median(B) + 1;
+      }
+    } catch {
+      return; // canvas not readable this tick — keep the last region
+    }
+
+    const barL = x0;
+    const barR = w - x1;
+    const barT = y0;
+    const barB = h - y1;
+    const okX = Math.min(barL, barR) > w * 0.015 && Math.abs(barL - barR) < w * 0.02;
+    const okY = Math.min(barT, barB) > h * 0.015 && Math.abs(barT - barB) < h * 0.02;
+    activeRegion = {
+      x0: okX ? x0 / w : 0,
+      x1: okX ? x1 / w : 1,
+      y0: okY ? y0 / h : 0,
+      y1: okY ? y1 / h : 1,
+    };
   }
 
   // The KVM rule: with control live, the window under the mouse is the one
