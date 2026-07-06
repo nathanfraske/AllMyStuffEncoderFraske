@@ -84,6 +84,10 @@
 
   async function flipFullscreen() {
     fullscreen = await toggleWindowFullscreen();
+    // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
+    // onblur); re-pin focus so keyboard forwarding resumes without a click back
+    // into the picture.
+    if (controlActive) stageEl?.focus({ preventScroll: true });
   }
 
   // ---- quality pills (streams this window owns) ----------------------
@@ -156,6 +160,10 @@
     const route = app.videoPopoutLive;
     void app.videoPopoutRewatch;
     hasFrame = false;
+    // Clear the prior stream's frame dims so `norm` can't letterbox pointer
+    // events against a stale aspect during a re-wire (see Console.svelte).
+    frameW = 0;
+    frameH = 0;
     hostStatus = null;
     fps = 0;
     transport = "";
@@ -235,7 +243,10 @@
   // the picture inside the letterbox — exactly like the console stage.
   function norm(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
     const c = canvasEl;
-    if (!c || !frameW || !frameH) return null;
+    // Gate on hasFrame: during a re-wire the canvas is `.waiting`
+    // (visibility:hidden; position:absolute) and frameW/frameH are cleared, so
+    // don't map pointer events until the first fresh frame lands.
+    if (!c || !hasFrame || !frameW || !frameH) return null;
     const r = c.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return null;
     const scale = Math.min(r.width / frameW, r.height / frameH);

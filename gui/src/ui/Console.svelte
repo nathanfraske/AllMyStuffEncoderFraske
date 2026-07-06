@@ -87,6 +87,11 @@
   async function flipTheater() {
     theater = !theater;
     if (windowed) await toggleWindowFullscreen();
+    // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
+    // onblur), and claimFocus won't re-pin once the window itself holds focus —
+    // so with control on, re-pin here or keyboard forwarding silently stops
+    // until the user clicks back into the picture ("controls stopped mapping").
+    if (app.consoleControl) stageEl?.focus({ preventScroll: true });
   }
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
@@ -353,6 +358,13 @@
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
     hasFrame = false;
+    // Clear the previous stream's frame dimensions too: normPoint letterboxes
+    // against frameW/frameH, so leaving them live would map pointer events onto
+    // the OLD source's aspect (and a hidden, repositioned canvas) during a
+    // re-wire — the "mouse doesn't map cleanly after a transition" report. The
+    // hasFrame gate below then drops events until the first fresh frame repaints.
+    frameW = 0;
+    frameH = 0;
     hostStatus = null;
     fps = 0;
     transport = "";
@@ -640,8 +652,14 @@
   // other's resolution.
   function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
     const img = canvasEl;
-    if (!img || !frameW || !frameH) return null;
+    // Gate on hasFrame, not just truthy frameW/frameH: during a re-wire the
+    // canvas is `.waiting` (visibility:hidden; position:absolute), so its rect
+    // has moved out of the centered grid cell — normalizing against it (or the
+    // stale prior dims) lands the remote cursor in the wrong place. Wait for the
+    // first fresh frame, then the live-rect letterbox math below maps cleanly.
+    if (!img || !hasFrame || !frameW || !frameH) return null;
     const r = img.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
     const scale = Math.min(r.width / frameW, r.height / frameH);
     const cw = frameW * scale;
     const ch = frameH * scale;
