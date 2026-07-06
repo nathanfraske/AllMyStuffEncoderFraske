@@ -46,6 +46,11 @@
 //! * [`node`] — assemble the phone's [`NodeProfile`] for presence.
 //! * [`connect`] — build the [`RouteControl::Offer`] for a screen / terminal /
 //!   files / audio route, validated through the receiver-side [`Catalog`].
+//! * [`control`] — the rest of the control surface a viewer/controller phone
+//!   drives: fleet-machine admin (upgrade / restart / reboot), KVM curation and
+//!   recognition, per-route video negotiation ([`control::tune`],
+//!   [`control::refresh_video`], [`control::video_feedback`]), the shared-shell
+//!   picker, and fleet-site management.
 //! * [`transport`] — the [`MeshClient`] seam and [`transport::classify`], which
 //!   turns a raw `(channel, payload)` off the mesh into a typed [`Inbound`].
 //! * [`media`] — the per-plane client pipelines (video, input, terminal,
@@ -54,12 +59,17 @@
 
 pub mod caps;
 pub mod connect;
+pub mod control;
 pub mod media;
 pub mod node;
 pub mod transport;
 
 pub use caps::{mobile_capabilities, MobileScope};
 pub use connect::{offer_files, offer_screen, offer_terminal, ConnectError as OfferError};
+pub use control::{
+    app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_web_site,
+    list_terminal_sessions, refresh_video, tune, video_feedback,
+};
 pub use node::{mobile_profile, MobileNodeConfig};
 pub use transport::{classify, Inbound, MeshClient, MeshError, MeshResult};
 
@@ -75,6 +85,10 @@ pub use transport::{classify, Inbound, MeshClient, MeshError, MeshResult};
 pub mod prelude {
     pub use crate::caps::{mobile_capabilities, MobileScope};
     pub use crate::connect::{offer_files, offer_screen, offer_terminal};
+    pub use crate::control::{
+        app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_web_site,
+        list_terminal_sessions, refresh_video, tune, video_feedback,
+    };
     pub use crate::media::{
         FileClient, FileReply, InputEncoder, TermPlane, VideoDecoder, VideoSink, VideoUpdate,
     };

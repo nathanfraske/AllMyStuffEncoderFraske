@@ -181,16 +181,23 @@ the network (Risk R6) and never depend on the webview's own codec.
 ## 4. What's in the repo today: `allmystuff-mobile-core`
 
 The transport-agnostic brain of the mobile client, pure Rust, fully unit
-tested. It is written entirely against one seam — `MeshClient` — so every path
-is exercised without a radio (an in-memory fake stands in for the embedded
-engine in tests).
+tested (43 tests + a doctest). It is written entirely against one seam —
+`MeshClient` — so every path is exercised without a radio (an in-memory fake
+stands in for the embedded engine in tests). It is kept current with the
+library crates it reuses: it tracks the model at **0.2.19** — the fleet
+(`fleet_name`/`fleet_owner`), KVM (`NodeProfile::kvm`), site, and clock-skew
+(`sent_at`) presence fields, and the viewer/controller half of the current
+control surface.
 
 ```
 crates/allmystuff-mobile-core/src/
 ├── lib.rs        crate docs + prelude
 ├── caps.rs       the phone's Capability set (viewer/controller; opt-in host) + advertised features
-├── node.rs       assemble the phone's NodeProfile for presence
+├── node.rs       assemble the phone's NodeProfile for presence (fleet/KVM/sent_at fields included)
 ├── connect.rs    build the RouteControl::Offer for screen / camera / audio / terminal / files
+├── control.rs    the rest of the control surface: fleet-machine admin (upgrade/restart/reboot),
+│                 KVM curation + recognition, video negotiation (tune/refresh/feedback), the
+│                 shared-shell picker, and fleet-site management — all matched to amst/GUI
 ├── transport.rs  the MeshClient seam + classify(channel,from,payload) -> typed Inbound
 └── media/
     ├── video.rs  VideoSink (MJPEG reassembly) + VideoDecoder seam + RgbaFrame/H264Au/JpegFrame
@@ -325,6 +332,11 @@ hardest capture last.
 **Phase 0 — De-risk & scaffold.**
 - ✅ Cross-compile probe (R1): pure-Rust tree checks for Android; only the NDK is missing.
 - ✅ `allmystuff-mobile-core` (this PR): the tested, transport-agnostic core.
+- ✅ Core brought current to the 0.2.19 model: the fleet/KVM/`sent_at` presence
+  fields, and the viewer/controller control surface at parity with the desktop
+  — fleet-machine admin (upgrade/restart/reboot), KVM curation + recognition,
+  per-route video negotiation (`tune`/`refresh_video`/`video_feedback`), the
+  shared-shell picker, and fleet-site management (`control.rs`).
 - ⬜ Stand up the Android NDK + `cargo-ndk` and an iOS build host; cross-compile
   `myownmesh-core` clean on both (R1 finish).
 - ⬜ `myownmesh-ffi` (§5); prove `open → join → exchange one message` with a desktop peer.
@@ -345,7 +357,9 @@ hardest capture last.
   fed Annex-B AUs; MJPEG fallback via `VideoSink`. Render to a `Console`-style canvas.
 - **Touch input forwarding**: rebuild `input-keys.ts` for touch → `InputEncoder`
   (tap→click, drag→move, pinch/scroll→wheel, soft keyboard→`Key`). Now the phone *controls*.
-- `tune_route` / `video_feedback` / `Refresh` for quality adaptation.
+- Quality adaptation: the wire builders (`tune` / `video_feedback` /
+  `refresh_video`) have landed in `control.rs`; what remains is wiring them to
+  the decoder's health counters and a mobile quality/data-saver control.
 - **Files**: `FileClient` + a touch file browser; downloads stream to phone storage.
 
 **Phase 3 — v3: Audio + Camera + Clipboard + Rooms (toward parity).**
