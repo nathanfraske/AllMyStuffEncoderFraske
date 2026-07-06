@@ -472,10 +472,12 @@
     /* Element sized to the video's own box (see Console.svelte .live): keeps
        the pointer normalizer (norm) free of an object-fit inset it could get
        wrong by a letterbox-width. */
+    display: block;
+    width: auto;
+    height: auto;
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
-    display: block;
     user-select: none;
     -webkit-user-drag: none;
   }

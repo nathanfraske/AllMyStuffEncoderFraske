@@ -671,10 +671,11 @@
     const oy = r.top + (r.height - ch) / 2;
     const x = (e.clientX - ox) / cw;
     const y = (e.clientY - oy) / ch;
-    // TEMP diagnostic: raw norm + the dims feeding the letterbox. f = frame
-    // display dims (what normPoint uses), c = canvas backing store, r = element
-    // box, dpr = device pixel ratio, mode = decode path.
-    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · f ${frameW}×${frameH} · c ${img.width}×${img.height} · r ${Math.round(r.width)}×${Math.round(r.height)} · dpr ${window.devicePixelRatio} · ${nativeDecode ? "nat" : "wc"}`;
+    // TEMP diagnostic. r = the canvas element box; box = the content rect
+    // normPoint maps over; inset = the letterbox offset it subtracts. If the
+    // element is sized to the video, inset should be ~0,0 — a non-zero inset
+    // that equals the visible bars is the mouse-skew source.
+    dbgMap = `n ${x.toFixed(3)},${y.toFixed(3)} · f ${frameW}×${frameH} · r ${Math.round(r.width)}×${Math.round(r.height)} · box ${Math.round(cw)}×${Math.round(ch)} · inset ${Math.round(ox - r.left)},${Math.round(oy - r.top)}`;
     if (x < 0 || x > 1 || y < 0 || y > 1) return null;
     return { x, y };
   }
@@ -1479,13 +1480,17 @@
   }
   .live {
     /* Size the element to the video's OWN box (its intrinsic backing store
-       scaled to fit the stage), centered by the stage's place-items. NOT
-       width/height:100% + object-fit — that makes the element the full cell
-       with the video letterboxed INSIDE it, and normPoint's computed inset
-       could drift from the browser's actual object-fit result by ~a bar width
-       (the "offset = letterbox size" skew). With the element == the content
-       box, normPoint normalizes over the element directly, no inset to get
-       wrong — matching how the KVM's own (accurate) web UI is laid out. */
+       scaled down to fit the stage), centered by the stage's place-items — the
+       standard responsive-replaced-element pattern (display:block + auto dims +
+       max caps). NOT width/height:100% + object-fit, which makes the element the
+       full cell with the video letterboxed INSIDE it: normPoint then has to
+       recompute that inset and it drifts by ~a bar width (the "offset = letterbox
+       size" skew). With the element == the content box, normPoint's inset is 0
+       and it normalizes over the element directly — like the KVM's accurate web
+       UI. */
+    display: block;
+    width: auto;
+    height: auto;
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
