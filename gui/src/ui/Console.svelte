@@ -1478,10 +1478,16 @@
     filter: brightness(1.12);
   }
   .live {
+    /* Size the element to the video's OWN box (its intrinsic backing store
+       scaled to fit the stage), centered by the stage's place-items. NOT
+       width/height:100% + object-fit — that makes the element the full cell
+       with the video letterboxed INSIDE it, and normPoint's computed inset
+       could drift from the browser's actual object-fit result by ~a bar width
+       (the "offset = letterbox size" skew). With the element == the content
+       box, normPoint normalizes over the element directly, no inset to get
+       wrong — matching how the KVM's own (accurate) web UI is laid out. */
     max-width: 100%;
     max-height: 100%;
-    width: 100%;
-    height: 100%;
     object-fit: contain;
     user-select: none;
     -webkit-user-drag: none;
