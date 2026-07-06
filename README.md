@@ -30,9 +30,9 @@ It's free, open source, and runs on macOS, Linux, and Windows.
   works as if you were sitting at it.
 - **Remote shell.** Open a real terminal on any of your machines. No SSH daemon,
   keys, or port forwarding to set up — it runs over the mesh. There's also a
-  standalone command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
+  command-line terminal, **AMSTerm** (`amst`): `amst <machine>` drops
   you into a shell on any machine you own, right from your own terminal, and a
-  bare `amst` opens one on this machine. It installs on its own (see below).
+  bare `amst` opens one on this machine. It comes with AllMyStuff (see below).
 - **Shared terminals.** A shell session more than one machine can attach to at
   once, tmux-style — `amst <machine> -s` lists a machine's open shells, and
   `-a <id>` joins one.
@@ -81,34 +81,21 @@ curl -fsSL https://allmystuff.works/install.sh | sh
 irm https://allmystuff.works/install.ps1 | iex
 ```
 
-The installer downloads the verified binaries, adds `allmystuff` and the
+The installer downloads the verified binaries, adds `allmystuff`, `amst`, and the
 desktop app to your `PATH`, and sets up the [MyOwnMesh](https://github.com/mrjeeves/MyOwnMesh)
 daemon the app runs on. Pre-built bundles (`.dmg`, `.msi`, `.deb`, `.AppImage`)
 and portable archives are on the
 [releases page](https://github.com/mrjeeves/AllMyStuff/releases).
 
-### AMSTerm (`amst`) — the terminal, on its own
+### AMSTerm (`amst`) — the terminal
 
-**AMSTerm** is the command-line terminal as a standalone program — a real shell
-on any machine you own, over the mesh. It installs separately (it's the same
-build, just its own small binary):
-
-```sh
-# macOS and Linux
-curl -fsSL https://allmystuff.works/install-amst.sh | sh
-```
-
-```powershell
-# Windows
-irm https://allmystuff.works/install-amst.ps1 | iex
-```
-
-This drops the `amst` command on your `PATH`, adds an **AMSTerm** app launcher
-(and, on Windows, a desktop + Start Menu shortcut and an **"AMSTerm here"**
-right-click menu on folders). `amst` is a client of this machine's AllMyStuff
+**AMSTerm** is the command-line terminal — a real shell on any machine you own,
+over the mesh. It **comes with AllMyStuff**: the installer above drops the `amst`
+command on your `PATH`, adds an **AMSTerm** app launcher (and, on Windows, a
+desktop + Start Menu shortcut and an **"AMSTerm here"** right-click menu on
+folders) — no separate install. `amst` is a client of this machine's AllMyStuff
 node; if none is running it opens the desktop app to bring one up (or, on a
-headless box, starts a headless node directly and says so) — so install
-AllMyStuff too.
+headless box, starts a headless node directly and says so).
 
 ## Getting started
 
