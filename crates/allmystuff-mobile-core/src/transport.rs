@@ -43,7 +43,10 @@ pub type MeshResult<T> = Result<T, MeshError>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
     /// A peer's presence advert (its [`NodeProfile`] carries its node id).
-    Presence(NodeProfile),
+    /// Boxed: `NodeProfile` is by far the largest inbound payload (full
+    /// capability + sites + fleet + KVM detail), so keeping it behind a pointer
+    /// stops it from bloating every other `Inbound` on the channel.
+    Presence(Box<NodeProfile>),
     /// A control message from `from` — route offers/accepts, share/ownership
     /// negotiation, app control.
     Control { from: String, msg: ControlMessage },
@@ -65,7 +68,9 @@ pub enum Inbound {
 /// (and is ignored downstream).
 pub fn classify(channel: &str, from: &str, payload: serde_json::Value) -> Option<Inbound> {
     match channel {
-        CHANNEL_PRESENCE => serde_json::from_value(payload).ok().map(Inbound::Presence),
+        CHANNEL_PRESENCE => serde_json::from_value(payload)
+            .ok()
+            .map(|p| Inbound::Presence(Box::new(p))),
         CHANNEL_CONTROL => serde_json::from_value(payload)
             .ok()
             .map(|msg| Inbound::Control {

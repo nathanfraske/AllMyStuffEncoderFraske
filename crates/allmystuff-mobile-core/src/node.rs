@@ -87,6 +87,17 @@ pub fn mobile_profile(
         // A phone exposes no reverse-proxied sites.
         sites: Vec::new(),
         version: version.into(),
+        // Fleet grouping is handed down on adoption into a fleet, not asserted
+        // by a fresh phone; empty until it joins one (then the platform fills
+        // these from the fleet it paired into, exactly like a desktop member).
+        fleet_name: String::new(),
+        fleet_owner: String::new(),
+        // A phone is a viewer/controller, never a KVM appliance.
+        kvm: None,
+        // Stamped per send by the presence path (like the desktop's
+        // `profile.sent_at = unix_now_ms()`), not at profile-build time — this
+        // crate has no clock.
+        sent_at: 0,
     }
 }
 
