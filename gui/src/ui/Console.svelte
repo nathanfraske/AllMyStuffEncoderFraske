@@ -87,6 +87,11 @@
   async function flipTheater() {
     theater = !theater;
     if (windowed) await toggleWindowFullscreen();
+    // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
+    // onblur), and claimFocus won't re-pin once the window itself holds focus —
+    // so with control on, re-pin here or keyboard forwarding silently stops
+    // until the user clicks back into the picture ("controls stopped mapping").
+    if (app.consoleControl) stageEl?.focus({ preventScroll: true });
   }
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
@@ -186,7 +191,36 @@
     { label: "H.264 · native decode", value: "native" },
     { label: "MJPEG", value: "mjpeg" },
   ];
-  let openPill = $state<"res" | "fps" | "rate" | "codec" | null>(null);
+  let openPill = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
+
+  // ---- source aspect (mouse letterbox correction) --------------------
+  //
+  // A machine whose native resolution isn't 16:9 gets letterboxed into the
+  // capture; the mouse must map over the desktop inside the bars. "Auto" reads
+  // the bars off the picture (detectActiveRegion); an explicit aspect computes
+  // the exact symmetric bars with no sampling — the confident manual path. Like
+  // the codec pill, this is a pills-only control (not driven by the slider).
+  const ASPECTS: Array<{ label: string; value: string; ratio: number | null }> = [
+    { label: "Auto", value: "auto", ratio: null },
+    { label: "16:9", value: "16:9", ratio: 16 / 9 },
+    { label: "16:10", value: "16:10", ratio: 16 / 10 },
+    { label: "3:2", value: "3:2", ratio: 3 / 2 },
+    { label: "4:3", value: "4:3", ratio: 4 / 3 },
+    { label: "21:9", value: "21:9", ratio: 21 / 9 },
+  ];
+  let aspectChoice = $state<string>(
+    (typeof localStorage !== "undefined" && localStorage.getItem("ams.consoleAspect")) || "auto",
+  );
+  function pickAspect(v: string) {
+    aspectChoice = v;
+    openPill = null;
+    try {
+      localStorage.setItem("ams.consoleAspect", v);
+    } catch {
+      // storage disabled — the pick still applies for this session
+    }
+  }
+  const aspectLabel = $derived(ASPECTS.find((a) => a.value === aspectChoice)?.label ?? "Auto");
   // The codec pill reflects the *selected source's* transport (per-source in
   // the store) plus this window's decode choice — so switching sources shows
   // that source's codec, and "native" stays a window-local decode preference.
@@ -306,6 +340,10 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      // Auto aspect: measure the frame's active region (letterbox bars) until
+      // it locks, so the mouse maps over the desktop of a non-16:9 source. A
+      // manual Aspect pick owns the region instead (see the $effect).
+      if (stagePointerActive && aspectChoice === "auto") detectActiveRegion();
       // Every other tick, report our decode health back to the streamer so
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
@@ -353,6 +391,18 @@
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
     hasFrame = false;
+    // Clear the previous stream's frame dimensions too: normPoint letterboxes
+    // against frameW/frameH, so leaving them live would map pointer events onto
+    // the OLD source's aspect (and a hidden, repositioned canvas) during a
+    // re-wire — the "mouse doesn't map cleanly after a transition" report. The
+    // hasFrame gate below then drops events until the first fresh frame repaints.
+    frameW = 0;
+    frameH = 0;
+    // A new source may have a different (or no) letterbox — start from the full
+    // frame, unlock, and let the one-shot detector re-measure and re-lock.
+    activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+    detectLocked = false;
+    detectPrev = null;
     hostStatus = null;
     fps = 0;
     transport = "";
@@ -640,18 +690,183 @@
   // other's resolution.
   function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
     const img = canvasEl;
-    if (!img || !frameW || !frameH) return null;
+    // Gate on hasFrame, not just truthy frameW/frameH: during a re-wire the
+    // canvas is `.waiting` (visibility:hidden; position:absolute), so its rect
+    // has moved out of the centered grid cell — normalizing against it (or the
+    // stale prior dims) lands the remote cursor in the wrong place. Wait for the
+    // first fresh frame, then the live-rect letterbox math below maps cleanly.
+    if (!img || !hasFrame || !frameW || !frameH) return null;
     const r = img.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
     const scale = Math.min(r.width / frameW, r.height / frameH);
     const cw = frameW * scale;
     const ch = frameH * scale;
     const ox = r.left + (r.width - cw) / 2;
     const oy = r.top + (r.height - ch) / 2;
-    const x = (e.clientX - ox) / cw;
-    const y = (e.clientY - oy) / ch;
-    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    // Fraction over the streamed FRAME.
+    const fx = (e.clientX - ox) / cw;
+    const fy = (e.clientY - oy) / ch;
+    if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+    // Remap over the ACTIVE region — inside any baked-in letterbox bars. A
+    // source whose native aspect ≠ the 16:9 capture (e.g. a 16:10 laptop output
+    // as 1080p) bakes black bars into the frame, and the remote's absolute
+    // pointer maps over its DESKTOP, not the whole frame — so mapping over the
+    // full frame lands the cursor off by the bar width. activeRegion is the
+    // detected desktop box (0..1), or the full frame when there are no clear,
+    // symmetric bars. Bar-hits clamp to the desktop edge.
+    const ar = activeRegion;
+    const x = Math.min(1, Math.max(0, (fx - ar.x0) / (ar.x1 - ar.x0)));
+    const y = Math.min(1, Math.max(0, (fy - ar.y0) / (ar.y1 - ar.y0)));
     return { x, y };
   }
+
+  // ---- letterbox / active-area detection -----------------------------
+  //
+  // The active region of the streamed frame in 0..1 fractions (the desktop
+  // inside any baked-in black bars); the full frame until detection runs.
+  let activeRegion = $state({ x0: 0, y0: 0, x1: 1, y1: 1 });
+  // The bars are baked pixels with no sidechannel (HDMI reports only the signal
+  // size, the SPS only the coded size), so they must be measured off the frame —
+  // but they're STATIC for a source mode, so this is a one-shot: it measures on
+  // the health tick only until two content-bearing frames agree, then LOCKS and
+  // stops sampling. Reset (unlock) on a stream re-wire.
+  let detectLocked = false;
+  let detectPrev: { x0: number; x1: number; y0: number; y1: number } | null = null;
+
+  // Measure the frame's active region: sample the decoded canvas for symmetric
+  // black letterbox/pillarbox bars. Cheap (a dozen 1px strips), and it stops
+  // once locked. Conservative: only crops when clear bars sit on BOTH opposite
+  // edges and are near-symmetric (a real letterbox), so ordinary dark content is
+  // never mistaken for a bar; otherwise it maps over the whole frame.
+  function detectActiveRegion() {
+    if (detectLocked) return;
+    const c = canvasEl;
+    if (!c || !c.width || !c.height || !hasFrame) return;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    const w = c.width;
+    const h = c.height;
+    const DARK = 24;
+    const bright = (d: Uint8ClampedArray, px: number) =>
+      d[px * 4] > DARK || d[px * 4 + 1] > DARK || d[px * 4 + 2] > DARK;
+    const median = (a: number[]) => a.slice().sort((p, q) => p - q)[a.length >> 1];
+
+    let x0 = 0;
+    let x1 = w;
+    let y0 = 0;
+    let y1 = h;
+    let found = false; // did the frame carry real (non-black) content this pass?
+    try {
+      const L: number[] = [];
+      const R: number[] = [];
+      for (let k = 1; k <= 6; k++) {
+        const y = Math.floor((h * k) / 7);
+        const row = ctx.getImageData(0, y, w, 1).data;
+        let l = 0;
+        while (l < w && !bright(row, l)) l++;
+        let rr = w - 1;
+        while (rr > l && !bright(row, rr)) rr--;
+        if (l < rr) {
+          L.push(l);
+          R.push(rr);
+        }
+      }
+      const T: number[] = [];
+      const B: number[] = [];
+      for (let k = 1; k <= 6; k++) {
+        const x = Math.floor((w * k) / 7);
+        const col = ctx.getImageData(x, 0, 1, h).data;
+        let t = 0;
+        while (t < h && !bright(col, t)) t++;
+        let b = h - 1;
+        while (b > t && !bright(col, b)) b--;
+        if (t < b) {
+          T.push(t);
+          B.push(b);
+        }
+      }
+      found = L.length >= 4;
+      if (L.length >= 4) {
+        x0 = median(L);
+        x1 = median(R) + 1;
+      }
+      if (T.length >= 4) {
+        y0 = median(T);
+        y1 = median(B) + 1;
+      }
+    } catch {
+      return; // canvas not readable this tick — keep the last region
+    }
+
+    // A near-all-black frame (screensaver, dark boot screen) tells us nothing —
+    // don't measure or lock on it, just try again on the next tick.
+    if (!found) {
+      detectPrev = null;
+      return;
+    }
+
+    const barL = x0;
+    const barR = w - x1;
+    const barT = y0;
+    const barB = h - y1;
+    const okX = Math.min(barL, barR) > w * 0.015 && Math.abs(barL - barR) < w * 0.02;
+    const okY = Math.min(barT, barB) > h * 0.015 && Math.abs(barT - barB) < h * 0.02;
+    const next = {
+      x0: okX ? x0 / w : 0,
+      x1: okX ? x1 / w : 1,
+      y0: okY ? y0 / h : 0,
+      y1: okY ? y1 / h : 1,
+    };
+    activeRegion = next;
+    // Lock once two consecutive content-bearing frames agree — then stop
+    // sampling entirely until the next re-wire resets it.
+    const near = (a: number, b: number) => Math.abs(a - b) < 0.005;
+    if (
+      detectPrev &&
+      near(detectPrev.x0, next.x0) &&
+      near(detectPrev.x1, next.x1) &&
+      near(detectPrev.y0, next.y0) &&
+      near(detectPrev.y1, next.y1)
+    ) {
+      detectLocked = true;
+    }
+    detectPrev = next;
+  }
+
+  // The exact symmetric active region for a known source aspect within the
+  // current frame: a source narrower than the frame pillarboxes (L/R bars),
+  // a wider one letterboxes (T/B bars).
+  function activeRegionForAspect(ratio: number, fw: number, fh: number) {
+    const frameRatio = fw / fh;
+    if (ratio < frameRatio - 1e-4) {
+      const x0 = (1 - ratio / frameRatio) / 2;
+      return { x0, x1: 1 - x0, y0: 0, y1: 1 };
+    }
+    if (ratio > frameRatio + 1e-4) {
+      const y0 = (1 - frameRatio / ratio) / 2;
+      return { x0: 0, x1: 1, y0, y1: 1 - y0 };
+    }
+    return { x0: 0, y0: 0, x1: 1, y1: 1 };
+  }
+
+  // Apply the Aspect pick: "Auto" hands the active region back to the one-shot
+  // pixel detector; an explicit aspect computes the exact bars and disables
+  // detection. Re-runs when the pick or the frame geometry changes.
+  $effect(() => {
+    const choice = aspectChoice;
+    const fw = frameW;
+    const fh = frameH;
+    const ratio = ASPECTS.find((a) => a.value === choice)?.ratio ?? null;
+    if (ratio == null) {
+      // Auto — unlock and let detectActiveRegion re-measure.
+      detectLocked = false;
+      detectPrev = null;
+      activeRegion = { x0: 0, y0: 0, x1: 1, y1: 1 };
+      return;
+    }
+    detectLocked = true; // stop the detector; the aspect is authoritative
+    activeRegion = fw && fh ? activeRegionForAspect(ratio, fw, fh) : { x0: 0, y0: 0, x1: 1, y1: 1 };
+  });
 
   // The KVM rule: with control live, the window under the mouse is the one
   // your keyboard should reach — claim focus on hover, no click in between (a
@@ -1125,6 +1340,37 @@
                 </div>
               {/if}
                 </span>
+                {#if stagePointerActive}
+                  <span class="pill-wrap">
+                    <button
+                      class="pill"
+                      class:tuned={aspectChoice !== "auto"}
+                      title="Source aspect — corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        openPill = openPill === "aspect" ? null : "aspect";
+                      }}
+                    >
+                      Aspect · {aspectLabel} ▾
+                    </button>
+                    {#if openPill === "aspect"}
+                      <div class="pill-menu" role="menu">
+                        {#each ASPECTS as a (a.value)}
+                          <button
+                            class="pill-item"
+                            class:sel={aspectChoice === a.value}
+                            onclick={(e) => {
+                              e.stopPropagation();
+                              pickAspect(a.value);
+                            }}
+                          >
+                            {a.label}
+                          </button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </span>
+                {/if}
               </div>
             {/if}
             <button
@@ -1139,9 +1385,9 @@
         <div class="status">
           {#if hasFrame}
             <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{decodeFails
-                ? ` · ${decodeFails} decode-err`
-                : ""}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
+              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{pipeDiag
+                ? ` · ⚠ ${pipeDiag}`
+                : ""}
             </span>
           {/if}
           {#each app.consoleSessionRoutes as r (r.id)}
@@ -1149,9 +1395,6 @@
               <span class="chip-dot"></span>{MEDIA[r.media as MediaKind].label}
             </span>
           {/each}
-          {#if app.consoleSessionRoutes.length === 0}
-            <span class="muted">No active links yet</span>
-          {/if}
         </div>
 
         <button class="btn end" onclick={endSession}>End session</button>
@@ -1449,10 +1692,20 @@
     filter: brightness(1.12);
   }
   .live {
+    /* Size the element to the video's OWN box (its intrinsic backing store
+       scaled down to fit the stage), centered by the stage's place-items — the
+       standard responsive-replaced-element pattern (display:block + auto dims +
+       max caps). NOT width/height:100% + object-fit, which makes the element the
+       full cell with the video letterboxed INSIDE it: normPoint then has to
+       recompute that inset and it drifts by ~a bar width (the "offset = letterbox
+       size" skew). With the element == the content box, normPoint's inset is 0
+       and it normalizes over the element directly — like the KVM's accurate web
+       UI. */
+    display: block;
+    width: auto;
+    height: auto;
     max-width: 100%;
     max-height: 100%;
-    width: 100%;
-    height: 100%;
     object-fit: contain;
     user-select: none;
     -webkit-user-drag: none;
@@ -1706,10 +1959,6 @@
     50% {
       opacity: 0.35;
     }
-  }
-  .muted {
-    color: #79739a;
-    font-size: 0.76rem;
   }
   .end {
     flex-shrink: 0;

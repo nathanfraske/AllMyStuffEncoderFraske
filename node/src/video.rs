@@ -463,6 +463,17 @@ pub struct RecvFeedback {
 // IDR). A manual retune replaces the route and so resets the cap — the
 // viewer's new picks change the conditions, and the controller re-learns.
 
+/// Master switch for the receiver-driven resolution auto-adaptation. **Off for
+/// now** — the manual Speed↔Quality slider (and the pills) are the quality
+/// control, and auto-stepping fought them (it re-tuned under the same feedback
+/// the user was reacting to). Gated at the wiring (`note_feedback` skips the
+/// feedback→step call) so the [`AutoAdapt`] logic below stays intact and
+/// unit-tested for when this returns as a real, user-toggleable setting that
+/// yields to a manual tune (perf roadmap's slider auto-traversal). The adaptive
+/// **IDR cadence** ([`adaptive_idr_ms`]) is a separate, benign recovery lever
+/// and stays on regardless.
+const AUTO_ADAPT_ENABLED: bool = false;
+
 /// The auto-cap rungs, descending. `0` (uncapped) sits above the first.
 const AUTO_EDGES: &[u32] = &[2560, 1920, 1280, 960];
 /// Consecutive struggling reports (~2 s apart) before a step down.
@@ -745,6 +756,12 @@ impl VideoBridge {
         // (see [`AutoAdapt`]). Run outside the routes lock — the observe
         // takes its own.
         let (auto, tune) = adapt;
+        // Auto-scale is gated off for now (see AUTO_ADAPT_ENABLED) — the manual
+        // slider owns quality. The AutoAdapt logic stays live + tested; this is
+        // the one line that keeps it from acting on a stream.
+        if !AUTO_ADAPT_ENABLED {
+            return;
+        }
         if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
             let name = |e: u32| {
                 if e == 0 {

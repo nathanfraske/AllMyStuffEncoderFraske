@@ -1106,12 +1106,12 @@
               onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
           {/if}
           {#if app.kvmAllowed(n)}
-            <!-- The KVM's own button set (it gets no Remote Control — its
-                 integrated web UI is the console): open that UI, reboot the
-                 KVM itself (two-step arm), and the attach link, which drops
-                 the target picker out under the card. -->
-            <button class="cbtn" data-tip="Open KVM" aria-label="Open {displayName(n)}'s web console"
-              onclick={(e) => { e.stopPropagation(); void app.openKVM(n.id); }}>{@render cicon("kvm")}</button>
+            <!-- A KVM's extra controls, alongside the generic Remote Control +
+                 Sites (globe) buttons every node gets now: reboot the KVM
+                 itself (two-step arm), and the attach link, which drops the
+                 target picker out under the card. Its web UI opens from the
+                 Sites globe (which routes through openKVM), so there's no
+                 separate "Open KVM" button. -->
             {#if app.canRestartDevice(n)}
               <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
                 data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
