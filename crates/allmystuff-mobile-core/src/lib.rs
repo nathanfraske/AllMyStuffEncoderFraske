@@ -44,8 +44,10 @@
 //!
 //! * [`caps`] — the phone's [`Capability`] set and advertised feature flags.
 //! * [`node`] — assemble the phone's [`NodeProfile`] for presence.
-//! * [`connect`] — build the [`RouteControl::Offer`] for a screen / terminal /
-//!   files / audio route, validated through the receiver-side [`Catalog`].
+//! * [`connect`] — build the [`RouteControl::Offer`] for a screen / camera /
+//!   audio / input / terminal / files route, validated through the
+//!   receiver-side [`Catalog`] (input is the outbound half of remote control:
+//!   the phone's `keyboard-mouse` source → the remote's `control` sink).
 //! * [`control`] — the rest of the control surface a viewer/controller phone
 //!   drives: fleet-machine admin (upgrade / restart / reboot), KVM curation and
 //!   recognition, per-route video negotiation ([`control::tune`],
@@ -64,14 +66,18 @@ pub mod media;
 pub mod node;
 pub mod transport;
 
-pub use caps::{mobile_capabilities, MobileScope};
-pub use connect::{offer_files, offer_screen, offer_terminal, ConnectError as OfferError};
+pub use caps::{mobile_capabilities, mobile_features, MobileScope};
+pub use connect::{
+    offer_audio, offer_camera, offer_files, offer_input, offer_screen, offer_terminal, teardown,
+    ConnectError as OfferError,
+};
 pub use control::{
-    app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_web_site,
-    list_terminal_sessions, refresh_video, tune, video_feedback,
+    app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_mesh_add,
+    kvm_mesh_remove, kvm_web_site, list_terminal_sessions, profile_request, refresh_video,
+    site_list, site_set_exposed, tune, video_feedback,
 };
 pub use node::{mobile_profile, MobileNodeConfig};
-pub use transport::{classify, Inbound, MeshClient, MeshError, MeshResult};
+pub use transport::{answer_profile_request, classify, Inbound, MeshClient, MeshError, MeshResult};
 
 /// A convenient single import for the types a mobile front end touches most.
 ///
@@ -83,17 +89,20 @@ pub use transport::{classify, Inbound, MeshClient, MeshError, MeshResult};
 /// assert!(caps.iter().any(|c| c.origin == "viewer"));
 /// ```
 pub mod prelude {
-    pub use crate::caps::{mobile_capabilities, MobileScope};
-    pub use crate::connect::{offer_files, offer_screen, offer_terminal};
+    pub use crate::caps::{mobile_capabilities, mobile_features, MobileScope};
+    pub use crate::connect::{
+        offer_audio, offer_camera, offer_files, offer_input, offer_screen, offer_terminal, teardown,
+    };
     pub use crate::control::{
-        app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_web_site,
-        list_terminal_sessions, refresh_video, tune, video_feedback,
+        app_restart, app_restart_device, app_upgrade, is_kvm, kvm_attach, kvm_detach, kvm_mesh_add,
+        kvm_mesh_remove, kvm_web_site, list_terminal_sessions, profile_request, refresh_video,
+        site_list, site_set_exposed, tune, video_feedback,
     };
     pub use crate::media::{
         FileClient, FileReply, InputEncoder, TermPlane, VideoDecoder, VideoSink, VideoUpdate,
     };
     pub use crate::node::{mobile_profile, MobileNodeConfig};
-    pub use crate::transport::{classify, Inbound, MeshClient};
+    pub use crate::transport::{answer_profile_request, classify, Inbound, MeshClient};
 
     pub use allmystuff_graph::{
         Capability, CapabilityId, Catalog, Flow, MediaKind, MeshNode, NodeId, NodeKind,

@@ -194,7 +194,8 @@ crates/allmystuff-mobile-core/src/
 ├── lib.rs        crate docs + prelude
 ├── caps.rs       the phone's Capability set (viewer/controller; opt-in host) + advertised features
 ├── node.rs       assemble the phone's NodeProfile for presence (fleet/KVM/sent_at fields included)
-├── connect.rs    build the RouteControl::Offer for screen / camera / audio / terminal / files
+├── connect.rs    build the RouteControl::Offer for screen / camera / audio / input / terminal / files
+│                 (input = the outbound half of control: phone keyboard-mouse → remote :control sink)
 ├── control.rs    the rest of the control surface: fleet-machine admin (upgrade/restart/reboot),
 │                 KVM curation + recognition, video negotiation (tune/refresh/feedback), the
 │                 shared-shell picker, and fleet-site management — all matched to amst/GUI

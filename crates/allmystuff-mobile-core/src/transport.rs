@@ -48,7 +48,11 @@ pub enum Inbound {
     /// stops it from bloating every other `Inbound` on the channel.
     Presence(Box<NodeProfile>),
     /// A control message from `from` — route offers/accepts, share/ownership
-    /// negotiation, app control.
+    /// negotiation, app control. One inbound control carries an *obligation*
+    /// even for a viewer: a [`ControlMessage::ProfileRequest`] must be answered
+    /// by re-advertising this phone's presence (see [`answer_profile_request`]),
+    /// or the phone can age out of a peer's graph when that peer forces a
+    /// refresh.
     Control { from: String, msg: ControlMessage },
     /// A media-channel frame from `from` — video/audio/input/terminal/files/
     /// clipboard/site. Feed it to the matching plane in [`crate::media`].
@@ -90,6 +94,19 @@ pub fn classify(channel: &str, from: &str, payload: serde_json::Value) -> Option
             }),
         _ => None,
     }
+}
+
+/// Answer an inbound [`ControlMessage::ProfileRequest`] by re-advertising this
+/// phone's presence — the guaranteed round-trip behind a peer's per-node
+/// refresh. A viewer must answer it even though it hosts nothing: the asker is
+/// re-learning the phone's card on the spot, and silence lets the phone look
+/// offline to anyone who pulls-to-refresh it. Pair it with the outbound
+/// [`profile_request`](crate::control::profile_request).
+pub fn answer_profile_request<M: MeshClient + ?Sized>(
+    mesh: &M,
+    profile: &NodeProfile,
+) -> MeshResult<()> {
+    mesh.advertise(profile)
 }
 
 /// The outbound mesh surface a phone needs — the small slice of
@@ -204,6 +221,38 @@ mod tests {
 
         // An unknown channel is dropped.
         assert!(classify("some/other/channel", "desk", serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn answering_a_profile_request_re_advertises_presence() {
+        use crate::node::{mobile_profile, MobileNodeConfig};
+        let me = NodeId::from("phone");
+        let mesh = FakeMesh {
+            id: "phone".into(),
+            ..Default::default()
+        };
+        let cfg = MobileNodeConfig::new("My Phone", "iOS 18");
+        let profile = mobile_profile(&me, &cfg, 7, "0.2.19");
+
+        // A peer's ProfileRequest arrives typed off the control channel...
+        let inbound = classify(
+            CHANNEL_CONTROL,
+            "peer",
+            serde_json::json!({ "t": "profile_request" }),
+        );
+        assert!(matches!(
+            inbound,
+            Some(Inbound::Control {
+                msg: ControlMessage::ProfileRequest,
+                ..
+            })
+        ));
+
+        // ...and answering it re-advertises exactly this phone's profile.
+        answer_profile_request(&mesh, &profile).unwrap();
+        let ads = mesh.advertised.lock().unwrap();
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0], profile);
     }
 
     #[test]

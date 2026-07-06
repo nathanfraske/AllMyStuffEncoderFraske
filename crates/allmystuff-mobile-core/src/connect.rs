@@ -117,6 +117,26 @@ pub fn offer_audio(
     offer_route(catalog, &from, &to, Vec::new(), codecs(AUDIO_CODECS))
 }
 
+/// **Drive** a remote from this phone: the phone's `keyboard-mouse` (an
+/// `Input` *source*) → the remote's `control` sink (an `Input` sink). This is
+/// the outbound half of remote control — the counterpart to [`offer_screen`],
+/// which only lands the *picture*. The [`InputEncoder`](crate::media::InputEncoder)
+/// then rides this route's id, normalizing pointer coordinates over the paired
+/// display's source screen.
+///
+/// Catalog-validated and authorized exactly like the media routes, so an
+/// unauthorized attempt to control a machine is refused here before anything
+/// hits the wire.
+pub fn offer_input(
+    catalog: &Catalog,
+    remote: &NodeId,
+    me: &NodeId,
+) -> Result<ControlMessage, ConnectError> {
+    let from = endpoint(catalog, me, MediaKind::Input, GrantRole::Provide)?;
+    let to = endpoint(catalog, remote, MediaKind::Input, GrantRole::Consume)?;
+    offer_route(catalog, &from, &to, Vec::new(), Vec::new())
+}
+
 /// Open a **terminal** on `host` from this phone (`me`).
 ///
 /// `attach` joins an already-running shell by its host-side session id
@@ -245,6 +265,16 @@ mod tests {
             Flow::Duplex,
             "system",
         ));
+        // The remote's keyboard/mouse injection sink — where a controller's
+        // input lands (mirrors the desktop's `<node>:control`).
+        cat.capabilities.push(Capability::new(
+            desk.clone(),
+            format!("{d}:control"),
+            "Keyboard & mouse",
+            MediaKind::Input,
+            Flow::Sink,
+            "control",
+        ));
         cat
     }
 
@@ -281,6 +311,37 @@ mod tests {
         assert_eq!(j["route"]["from"], "desk:webcam");
         assert_eq!(j["route"]["to"], "phone:video-in");
         assert_eq!(j["route"]["media"], "video");
+    }
+
+    #[test]
+    fn input_offer_wires_the_phones_control_source_to_the_remote_sink() {
+        let phone = NodeId::from("phone");
+        let desk = NodeId::from("desk");
+        let cat = fleet_catalog(&phone, &desk);
+
+        let j = offer(&offer_input(&cat, &desk, &phone).expect("authorized"));
+        assert_eq!(j["t"], "route");
+        assert_eq!(j["kind"], "offer");
+        // Phone drives (source) → remote injects (sink); Input media.
+        assert_eq!(j["route"]["from"], "phone:keyboard-mouse");
+        assert_eq!(j["route"]["to"], "desk:control");
+        assert_eq!(j["route"]["media"], "input");
+        // An input route carries no codec lists.
+        assert!(j["video"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        assert!(j["audio"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn input_offer_needs_a_remote_control_sink() {
+        let phone = NodeId::from("phone");
+        let desk = NodeId::from("desk");
+        // A catalog where the remote exposes no control sink.
+        let mut cat = Catalog::new();
+        for c in mobile_capabilities(&phone, MobileScope::ViewerController) {
+            cat.capabilities.push(c);
+        }
+        let err = offer_input(&cat, &desk, &phone).unwrap_err();
+        assert!(matches!(err, ConnectError::NoEndpoint { .. }));
     }
 
     #[test]
