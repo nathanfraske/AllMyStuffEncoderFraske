@@ -48,13 +48,31 @@ pub(crate) fn stats_to_info() -> bool {
     false
 }
 
+/// How a video route's path to its viewer flows — mirrored from
+/// [`crate::video::LinkClass`] so the shared LAN-gate call sites in
+/// `mesh.rs` (`link_class_of`, `seed_peer_links`, `Tune { link, .. }`)
+/// compile on a capture-less build. Inert here: nothing streams, so the
+/// class never governs a dial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinkClass {
+    /// The nominated candidate pair is host↔host — a direct local link.
+    Lan,
+    /// Reflexive or relayed — real internet between the ends.
+    Wan,
+    /// No nominated pair reported (yet). Conservative until known.
+    #[default]
+    Unknown,
+}
+
 /// One stream's viewer-requested overrides. Accepted and ignored — there is
-/// no encoder to re-tune.
+/// no encoder to re-tune. `link` carries the LAN-gate class for surface
+/// parity with the real [`crate::video::Tune`]; it governs nothing here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tune {
     pub max_edge: Option<u32>,
     pub bitrate: Option<u32>,
     pub fps: Option<u32>,
+    pub link: LinkClass,
 }
 
 /// The host side of a capture-status report: state + optional OS error text.
@@ -92,6 +110,7 @@ impl VideoBridge {
         route_id: String,
         _mode: VideoMode,
         _source: VideoSource,
+        _tune: Tune,
         _on_packet: F,
         on_status: S,
     ) where
@@ -106,6 +125,31 @@ impl VideoBridge {
     }
 
     pub fn force_idr(&self, _route_id: &str) {}
+
+    /// No capture routes exist on this build, so there are never any ids to
+    /// re-class. Present for surface parity with the real bridge (the LAN
+    /// gate sweeps this in `refresh_peer_networks`).
+    pub fn route_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The LAN gate learning a route's link class — a no-op with nothing
+    /// captured here. Returns `false` (no retune happened), the same
+    /// contract as the real bridge on an unchanged/absent route.
+    pub fn retune_link(&self, _route_id: &str, _link: LinkClass) -> bool {
+        false
+    }
+
+    /// A viewer's Tune against a stream this build can't produce — accepted
+    /// and ignored, matching the real bridge's signature.
+    pub fn retune_dials(
+        &self,
+        _route_id: &str,
+        _max_edge: Option<u32>,
+        _bitrate: Option<u32>,
+        _fps: Option<u32>,
+    ) {
+    }
 
     pub fn note_feedback(
         &self,
