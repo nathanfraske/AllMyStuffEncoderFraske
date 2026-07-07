@@ -1,30 +1,26 @@
-// Touch semantics for the console stage — the trackpad model, not the
-// pen model. A finger is a cursor, not a stylus: a one-finger drag GLIDES
-// the remote cursor (no button held), a quick tap clicks where it landed,
-// a second tap that stays down and drags is the click-hold-drag, and a
-// long-press is the right button (press-and-hold context menus and
-// right-drags both work). Two fingers leave the remote alone and belong
-// to the VIEW: a pinch zooms the picture (and pans it while zoomed), a
-// flat two-finger drag is the scroll wheel, and a two-finger tap is a
-// right click. Mice and pens never come through here — they keep the
-// direct mapping (down = button down at the point), because a real
-// pointer already distinguishes moving from pressing.
-//
-// The host owns the wire and the view: this module only decides WHAT a
-// touch means, never how coordinates normalize or where the transform
-// clamps. All positions handed back are client coordinates off the
-// original events.
+// Touch semantics for the console stage — the trackpad model, the
+// TeamViewer way. The finger is never a stylus pointing at pixels: the
+// remote cursor stays where it is, a one-finger drag STEERS it by
+// deltas, a quick tap clicks AT THE CURSOR (your finger never covers
+// the target you're aiming at), a second tap that stays down and drags
+// is the click-hold-drag, and a long-press is the right button
+// (press-and-hold context menus and right-drags both work). Two fingers
+// leave the remote alone and belong to the VIEW: a pinch zooms the
+// picture (and pans it while zoomed), a flat two-finger drag is the
+// scroll wheel, and a two-finger tap is a right click. Mice and pens
+// never come through here — a real pointer keeps the direct absolute
+// mapping. The host keeps the virtual cursor and the follow-camera;
+// this module only decides WHAT a touch means.
 
 export type ViewTransform = { scale: number; x: number; y: number };
-export type Point = { clientX: number; clientY: number };
 
 export interface TouchMouseHost {
   /** Pointer forwarding is live (control on, over a desktop picture). */
   active(): boolean;
-  /** Land the remote cursor at this client point. */
-  move(p: Point): void;
-  /** Press/release a remote button; with `p`, land the cursor there first. */
-  button(button: number, down: boolean, p?: Point): void;
+  /** Steer the remote cursor by this many CSS px of finger travel. */
+  moveBy(dx: number, dy: number): void;
+  /** Press/release a remote button at the cursor's current position. */
+  button(button: number, down: boolean): void;
   /** Remote scroll, in wheel lines. */
   wheel(dx: number, dy: number): void;
   /** The stage's current view transform (pinch zoom/pan). */
@@ -146,8 +142,10 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
       glided = false;
       clearLong();
       if (!host.active()) return; // view-only: a lone finger pans (see move)
-      // Tap-then-press within the window: this press IS the drag — button
-      // down where the finger landed, and every move from here drags.
+      // Tap-then-press within the window: this press IS the drag — the
+      // button goes down at the cursor, and every move from here drags.
+      // (The proximity check is between the two FINGER touches — the
+      // gesture must feel like one double-tap, wherever the cursor is.)
       if (
         lastTap &&
         downAt - lastTap.t < DOUBLE_MS &&
@@ -155,21 +153,17 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
       ) {
         lastTap = null;
         held = 0;
-        host.button(0, true, e);
+        host.button(0, true);
         return;
       }
-      // A fresh press: the cursor tracks the finger from touchdown (it's
-      // an absolute surface — the finger IS the cursor), and an unmoved
-      // hold becomes the right button.
-      host.move(e);
+      // A fresh press touches nothing yet — the cursor stays where it is
+      // (trackpad rule); an unmoved hold becomes the right button, at
+      // the cursor.
       longTimer = setTimeout(() => {
         longTimer = null;
         if (mode !== "single" || glided || held != null) return;
         held = 2;
-        // At the press point, so the host's over-the-picture gate applies
-        // — a hold on the letterbox bars must not right-click wherever
-        // the cursor last was.
-        host.button(2, true, { clientX: downX, clientY: downY });
+        host.button(2, true);
       }, LONG_MS);
       return;
     }
@@ -213,8 +207,9 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
         lastTap = null; // a glide breaks the tap→drag chain
       }
       if (host.active()) {
-        // Glide or drag — either way the cursor follows the finger.
-        host.move(e);
+        // Glide or drag — either way the finger's travel steers the
+        // cursor by deltas, trackpad-style.
+        host.moveBy(e.clientX - prevX, e.clientY - prevY);
       } else if (host.view().scale > 1.001) {
         // View-only and zoomed in: the lone finger pans the picture.
         const v = host.view();
@@ -289,16 +284,17 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
       const now = performance.now();
       if (host.active()) {
         if (held != null) {
-          // End of a drag (left) or a long-press (right) — release where
-          // the finger lifted, so a drag drops its payload there.
-          host.button(held, false, e);
+          // End of a drag (left) or a long-press (right) — the cursor is
+          // already where the steering left it; just let go.
+          host.button(held, false);
           held = null;
           lastTap = null;
         } else if (!glided && now - downAt < TAP_MS) {
-          // A clean tap: click where it landed. The tap is remembered so
-          // an immediate second press can become the drag.
-          host.button(0, true, e);
-          host.button(0, false, e);
+          // A clean tap: click at the cursor. The tap is remembered (by
+          // its FINGER position) so an immediate second press nearby can
+          // become the drag.
+          host.button(0, true);
+          host.button(0, false);
           lastTap = { x: e.clientX, y: e.clientY, t: now };
         } else {
           lastTap = null;
@@ -322,8 +318,8 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
         now - gStartAt < TWO_TAP_MS &&
         host.active()
       ) {
-        // Two-finger tap — the trackpad right click, at the pair's midpoint.
-        host.button(2, true, { clientX: gMidX0, clientY: gMidY0 });
+        // Two-finger tap — the trackpad right click, at the cursor.
+        host.button(2, true);
         host.button(2, false);
       }
       if (gKind === "zoom") {

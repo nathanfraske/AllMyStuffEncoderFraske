@@ -306,12 +306,13 @@
   // ---- the control bar ------------------------------------------------
   //
   // One floating toolbar carries the whole session (the KVM-console
-  // pattern): icon buttons for the toggles, and three drop-down menus —
-  // session (who/status/handles/End), screens (the input picker), video
+  // pattern): icon buttons for the toggles, and three menus — session
+  // (who/status/handles/End), screens (the input picker), video
   // (quality/zoom). One menu open at a time; a press anywhere else closes
-  // it. The bar drags by its grip, naps after a few idle seconds, and a
-  // slim handle at the top edge (or a hover near it) wakes it — so the
-  // picture is never permanently under chrome.
+  // it. The bar stands VERTICALLY on the right edge — under the thumb on
+  // a phone, clear of the top edge's system gestures — slides up and down
+  // by its grip, and hides/returns ONLY by its handle tab (no auto-hide
+  // in any mode: chrome that disappears on its own is chrome you chase).
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
@@ -345,22 +346,17 @@
     openMenu = null;
   }
 
-  // Keep the open menu on-screen: it centers under the bar, but a bar
-  // dragged toward an edge would push it off — measure, shift back, and
-  // flip it ABOVE the bar when the bar sits too low for it to fit below
-  // (the console clips its overflow; a menu past the bottom edge is
-  // simply gone).
+  // Keep the open menu on-screen: it opens to the LEFT of the bar,
+  // vertically centered on it — a bar slid toward the top or bottom
+  // would carry the menu past the pane edge, so measure and shift back.
   let menuShift = $state(0);
-  let menuUp = $state(false);
   $effect(() => {
     void openSub;
     void advOpen;
-    // Dragging the bar with a menu open must re-clamp the menu too.
-    void barPos.x;
-    void barPos.y;
+    // Sliding the bar with a menu open must re-clamp the menu too.
+    void barPos;
     if (!openMenu || !menuEl) {
       menuShift = 0;
-      menuUp = false;
       return;
     }
     const el = menuEl;
@@ -368,61 +364,41 @@
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
       const pad = 8;
-      if (r.left < pad) menuShift = pad - r.left;
-      else if (r.right > window.innerWidth - pad) menuShift = window.innerWidth - pad - r.right;
-      const box = consoleEl?.getBoundingClientRect();
-      const floor = Math.min(window.innerHeight, box?.bottom ?? Infinity) - pad;
-      if (!menuUp && r.bottom > floor && r.height + pad < (barWrapEl?.getBoundingClientRect().top ?? 0) - (box?.top ?? 0)) {
-        menuUp = true;
-      }
+      if (r.top < pad) menuShift = pad - r.top;
+      else if (r.bottom > window.innerHeight - pad) menuShift = window.innerHeight - pad - r.bottom;
     });
   });
 
-  // ---- bar drag (the grip) ----
-  let barPos = $state({ x: 0, y: 0 });
-  let barDragging = $state(false);
+  // ---- bar drag (the grip — vertical, along the right edge) ----
+  let barPos = $state(0); // offset from the bar's centered resting spot
   // A dragged bar must survive the pane shrinking (window resize, phone
   // rotation) — re-clamp it into the new bounds instead of stranding it
   // off-view.
-  function clampBarPos() {
-    if (barPos.x === 0 && barPos.y === 0) return;
+  function barSpan(): number {
     const c = consoleEl?.getBoundingClientRect();
     const b = barWrapEl?.getBoundingClientRect();
-    if (!c || !b) return;
-    const halfSpan = Math.max(0, (c.width - b.width) / 2 - 6);
-    const top0 = b.top - c.top - barPos.y;
-    const yMax = Math.max(0, c.height - top0 - b.height - 8);
-    barPos = {
-      x: Math.min(halfSpan, Math.max(-halfSpan, barPos.x)),
-      y: Math.min(yMax, Math.max(0, barPos.y)),
-    };
+    if (!c || !b) return 0;
+    return Math.max(0, (c.height - b.height) / 2 - 8);
+  }
+  function clampBarPos() {
+    if (barPos === 0) return;
+    const span = barSpan();
+    barPos = Math.min(span, Math.max(-span, barPos));
   }
   function onGripDown(e: PointerEvent) {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const grip = e.currentTarget as HTMLElement;
-    const c = consoleEl?.getBoundingClientRect();
-    const b = barWrapEl?.getBoundingClientRect();
-    if (!c || !b) return;
-    barDragging = true;
-    const sx = e.clientX - barPos.x;
-    const sy = e.clientY - barPos.y;
-    // The anchor's resting top edge, so the vertical clamp knows where 0 is.
-    const top0 = b.top - c.top - barPos.y;
-    const halfSpan = Math.max(0, (c.width - b.width) / 2 - 6);
-    const yMax = Math.max(0, c.height - top0 - b.height - 8);
+    const span = barSpan();
+    const sy = e.clientY - barPos;
     try {
       grip.setPointerCapture(e.pointerId);
     } catch {
       // synthetic pointer — capture is best-effort
     }
     const move = (ev: PointerEvent) => {
-      barPos = {
-        x: Math.min(halfSpan, Math.max(-halfSpan, ev.clientX - sx)),
-        y: Math.min(yMax, Math.max(0, ev.clientY - sy)),
-      };
+      barPos = Math.min(span, Math.max(-span, ev.clientY - sy));
     };
     const up = () => {
-      barDragging = false;
       grip.removeEventListener("pointermove", move);
       grip.removeEventListener("pointerup", up);
       grip.removeEventListener("pointercancel", up);
@@ -432,31 +408,16 @@
     grip.addEventListener("pointercancel", up);
   }
 
-  // ---- bar auto-hide ----
+  // ---- bar hide/show (manual only) ----
   //
-  // The bar sleeps after 4 idle seconds so the picture owns the pane —
-  // but only once there IS a picture, and never while it's being used
-  // (hovered, dragged, a menu or the soft keyboard open). Any of those
-  // changing wakes it and restarts the countdown; the reveal handle bumps
-  // `revealTick` for the same effect.
+  // The handle tab on the bar's outer edge is the ONE way the bar leaves
+  // or returns, in every mode — it slides off past the right edge and the
+  // tab stays put. No idle timer: chrome that disappears on its own is
+  // chrome you have to chase.
   let barHidden = $state(false);
-  let barHover = $state(false);
-  let revealTick = $state(0);
-  $effect(() => {
-    void openMenu;
-    void barHover;
-    void barDragging;
-    void hasFrame;
-    void keysOpen;
-    void revealTick;
-    barHidden = false;
-    const t = setTimeout(() => {
-      if (hasFrame && !openMenu && !barHover && !barDragging && !keysOpen) barHidden = true;
-    }, 4000);
-    return () => clearTimeout(t);
-  });
-  function revealBar() {
-    revealTick += 1;
+  function toggleBar() {
+    barHidden = !barHidden;
+    if (barHidden) openMenu = null;
   }
 
   // ---- soft keyboard ----
@@ -640,7 +601,10 @@
 
   // Follow the live video route: watch its packet channel while it's up,
   // and show the placeholder rather than a stale frame whenever it
-  // changes (input switch, session end).
+  // changes (input switch, session end). The effect ALSO re-runs on a
+  // decode-mode flip (same route, new watch) — `lastRoute` tells the two
+  // apart below.
+  let lastRoute: string | null = null;
   $effect(() => {
     const route = app.consoleVideoLive;
     // Reading this here makes the ladder's last rung re-run the effect:
@@ -666,11 +630,20 @@
     pipeDiag = "";
     frameCount = 0;
     inCount = 0;
-    // A new stream starts at its natural fit, and any touch gesture from
-    // the old one is over. Untracked: lifting a held button reads store
-    // state, and this effect must re-run on route changes only.
-    view = { scale: 1, x: 0, y: 0 };
-    untrack(() => touchMouse.reset());
+    // A new stream starts at its natural fit, with the trackpad cursor
+    // re-centered, and any touch gesture from the old one is over — but
+    // ONLY on an actual route change. The decode ladder re-runs this
+    // effect with the SAME route (nativeDecode flip); yanking the zoom
+    // to 1x and lifting a held drag there would punish the user for the
+    // decoder's stall. Untracked: lifting a held button reads store
+    // state, and this effect's deps are the route and decode mode only.
+    if (route !== lastRoute) {
+      lastRoute = route;
+      view = { scale: 1, x: 0, y: 0 };
+      virt.x = 0.5;
+      virt.y = 0.5;
+      untrack(() => touchMouse.reset());
+    }
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
@@ -1156,34 +1129,72 @@
   // ---- the touch machine ----------------------------------------------
   //
   // Touch pointers detour through console-touch.ts (trackpad semantics +
-  // the two-finger view gestures); its host callbacks land on the same
-  // wire helpers the mouse path uses, so `heldButtons` stays the single
-  // registry of what the remote believes is pressed.
+  // the two-finger view gestures). The trackpad needs a cursor that
+  // persists between touches — `virt`, in the same active-region
+  // normalized space the wire speaks. Finger deltas steer it (converted
+  // through the RENDERED frame size, so the cursor moves at finger speed
+  // on the glass at any zoom), taps and holds click at it, and the mouse
+  // path re-seats it on every absolute move so the two input families
+  // never disagree about where the cursor is. `heldButtons` stays the
+  // single registry of what the remote believes is pressed.
+  const virt = { x: 0.5, y: 0.5 };
+  function sendVirt() {
+    app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
+  }
+  // The TeamViewer camera: zoomed in, the viewport follows the cursor —
+  // steer it toward the edge of what's visible and the picture pans to
+  // keep it inside a comfortable margin. The whole desktop is reachable
+  // with one thumb, no pan gesture needed.
+  function followCursor() {
+    if (view.scale <= 1.001) return;
+    const c = canvasEl;
+    const s = stageEl;
+    if (!c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const box = s.getBoundingClientRect();
+    const ar = activeRegion;
+    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    const m = Math.min(56, box.width / 5, box.height / 5);
+    let dx = 0;
+    let dy = 0;
+    if (px < box.left + m) dx = box.left + m - px;
+    else if (px > box.right - m) dx = box.right - m - px;
+    if (py < box.top + m) dy = box.top + m - py;
+    else if (py > box.bottom - m) dy = box.bottom - m - py;
+    if (dx || dy) setView({ scale: view.scale, x: view.x + dx, y: view.y + dy });
+  }
   const touchMouse = makeTouchMouse({
     active: () => stagePointerActive,
-    move: (p) => {
+    moveBy: (dx, dy) => {
+      const c = canvasEl;
+      if (!c || !hasFrame) return;
+      // The transformed rect IS the rendered frame (element == content
+      // box), so dividing finger px by it — and by the active region's
+      // share — locks cursor speed to finger speed at any zoom.
+      const r = c.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const ar = activeRegion;
+      virt.x = Math.min(1, Math.max(0, virt.x + dx / (r.width * (ar.x1 - ar.x0))));
+      virt.y = Math.min(1, Math.max(0, virt.y + dy / (r.height * (ar.y1 - ar.y0))));
+      // Deltas accumulate on every event; only the (absolute) send is
+      // throttled, so nothing is ever lost to the rate cap.
       const now = performance.now();
-      if (now - lastMoveAt < 16) return;
-      const pt = normPoint(p);
-      if (!pt) return;
-      lastMoveAt = now;
-      app.sendConsoleInput({ kind: "mouse_move", ...pt, screen: controlScreen });
+      if (now - lastMoveAt >= 16) {
+        lastMoveAt = now;
+        sendVirt();
+      }
+      followCursor();
     },
-    button: (button, down, p) => {
+    button: (button, down) => {
       if (down) {
-        // Presses land the cursor first, exactly like a mouse click; a
-        // press outside the picture is nobody's click.
-        const pt = p ? normPoint(p) : null;
-        if (p && !pt) return;
-        if (pt) app.sendConsoleInput({ kind: "mouse_move", ...pt, screen: controlScreen });
+        // Land the cursor exactly where the trackpad believes it is,
+        // then press — the same order the mouse path uses.
+        sendVirt();
         app.sendConsoleInput({ kind: "mouse_button", button, down: true });
         heldButtons.add(button);
       } else {
-        // Releases always go out if the button is down — a drag that ends
-        // past the edge must still drop what it holds.
         if (!heldButtons.delete(button)) return;
-        const pt = p ? normPoint(p) : null;
-        if (pt) app.sendConsoleInput({ kind: "mouse_move", ...pt, screen: controlScreen });
         app.sendConsoleInput({ kind: "mouse_button", button, down: false });
       }
     },
@@ -1230,6 +1241,9 @@
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
+    // An absolute mouse move re-seats the trackpad's virtual cursor too.
+    virt.x = p.x;
+    virt.y = p.y;
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
@@ -1304,6 +1318,8 @@
     }
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
+    virt.x = p.x;
+    virt.y = p.y;
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -1469,6 +1485,25 @@
   function inputIcon(c: Capability): string {
     return originIcon(c.origin, c.media);
   }
+
+  // Files/Terminal from inside a console: on the desktop they open beside
+  // this window and the session keeps running — but the single-window
+  // shells (phone, web preview) stack overlays, and a console left
+  // streaming behind Files is a battery bill nobody asked for. Moving on
+  // ends the session; whatever surface closes last lands on the graph
+  // with nothing running underneath.
+  function launchFiles() {
+    if (!node) return;
+    const id = node.id;
+    if (!windowed) void endSession();
+    app.openFiles(id);
+  }
+  function launchTerminal() {
+    if (!node) return;
+    const id = node.id;
+    if (!windowed) void endSession();
+    app.openTerminal(id);
+  }
 </script>
 
 <svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} onresize={clampBarPos} />
@@ -1590,26 +1625,15 @@
         {/if}
       </div>
 
-      <!-- The reveal handle — the way back to a sleeping bar. A slim pill
-           at the top edge: hover wakes it on the desktop, a tap on touch. -->
-      {#if barHidden}
-        <button
-          class="bar-reveal"
-          aria-label="Show console controls"
-          onpointerenter={revealBar}
-          onclick={revealBar}><span class="reveal-pill"></span></button
-        >
-      {/if}
-
-      <!-- The control bar -->
+      <!-- The control bar — vertical, on the right edge. The handle tab
+           on its outer side is the one and only hide/show control; the
+           tab never moves, the bar slides out past the edge behind it. -->
       <div
         bind:this={barWrapEl}
         class="bar-anchor"
         role="group"
         aria-label="Console control bar"
-        style:transform={`translate(calc(-50% + ${barPos.x}px), ${barPos.y}px)`}
-        onpointerenter={() => (barHover = true)}
-        onpointerleave={() => (barHover = false)}
+        style:transform={`translateY(calc(-50% + ${barPos}px))`}
         onpointerdowncapture={(e) => {
           // With the soft keyboard up, bar taps must not steal focus from
           // its hidden input (a blur drops the OS keyboard mid-word) —
@@ -1617,6 +1641,12 @@
           if (keysOpen && (e.target as HTMLElement).closest("button")) e.preventDefault();
         }}
       >
+        <button
+          class="bar-tab"
+          title={barHidden ? "Show controls" : "Hide controls"}
+          aria-label={barHidden ? "Show console controls" : "Hide console controls"}
+          onclick={toggleBar}>{barHidden ? "‹" : "›"}</button
+        >
         <div class="kvmbar" class:asleep={barHidden} role="toolbar" aria-label="Console controls">
           <!-- svelte-ignore a11y_consider_explicit_label -->
           <button class="grip" title="Move the bar" onpointerdown={onGripDown}>⠿</button>
@@ -1631,15 +1661,13 @@
             🖥<span class="presence" class:on={node.online}></span>
           </button>
           <button
-            class="kbtn screens"
+            class="kbtn"
             class:open={openMenu === "screens"}
-            title="Screens & cameras"
+            title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
             aria-label="Screens and cameras menu"
             onclick={() => toggleMenu("screens")}
           >
-            <span class="kicon">{selected ? inputIcon(selected) : "🪟"}</span>
-            <span class="klabel">{selected?.label ?? "Screens"}</span>
-            <span class="kcaret">▾</span>
+            {selected ? inputIcon(selected) : "🪟"}
           </button>
           <span class="vsep"></span>
           {#if access.control}
@@ -1689,7 +1717,7 @@
                 class="kbtn slim"
                 title="Browse this machine's files over the mesh"
                 aria-label="Files"
-                onclick={() => app.openFiles(node.id)}>🗂</button
+                onclick={launchFiles}>🗂</button
               >
             {/if}
             {#if app.terminalAllowed(node)}
@@ -1697,7 +1725,7 @@
                 class="kbtn slim"
                 title="Open a shell on this machine over the mesh"
                 aria-label="Terminal"
-                onclick={() => app.openTerminal(node.id)}>📟</button
+                onclick={launchTerminal}>📟</button
               >
             {/if}
           {/if}
@@ -1710,26 +1738,29 @@
             aria-label="Video menu"
             onclick={() => toggleMenu("video")}>🎚</button
           >
-          <button
-            class="kbtn"
-            title={theater ? `Exit fullscreen${app.consoleControl ? "" : " (Esc)"}` : "Fullscreen"}
-            aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
-            onclick={() => void flipTheater()}>{theater ? "⤡" : "⛶"}</button
-          >
+          {#if !mobileShell}
+            <!-- The phone shell IS full-screen — a fullscreen button
+                 there is a knob with nothing behind it. -->
+            <button
+              class="kbtn"
+              title={theater ? `Exit fullscreen${app.consoleControl ? "" : " (Esc)"}` : "Fullscreen"}
+              aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
+              onclick={() => void flipTheater()}>{theater ? "⤡" : "⛶"}</button
+            >
+          {/if}
           <button class="kbtn end" title="End session" aria-label="End session" onclick={endSession}
             >✕</button
           >
         </div>
 
-        <!-- The bar's drop-down menu — one at a time, anchored under the
-             bar (and nudged back on-screen when the bar sits near an
-             edge, see menuShift). -->
+        <!-- The bar's menu — one at a time, opening to the LEFT of the
+             bar (and nudged back on-screen when the bar sits near the
+             top or bottom, see menuShift). -->
         {#if openMenu}
           <div
             bind:this={menuEl}
             class="kvmenu"
-            class:up={menuUp}
-            style:transform={`translateX(calc(-50% + ${menuShift}px))`}
+            style:transform={`translateY(calc(-50% + ${menuShift}px))`}
             role="menu"
           >
             {#if openMenu === "session"}
@@ -2155,35 +2186,66 @@
     background: rgba(0, 0, 0, 0.8);
   }
 
-  /* ---- the control bar ---- */
+  /* ---- the control bar — a vertical rail on the right edge ---- */
   .bar-anchor {
     position: absolute;
-    top: calc(0.6rem + env(safe-area-inset-top, 0px));
-    left: 50%;
-    /* Not shrink-to-fit: at left:50% the available width is only half the
-       pane, and the anchor would lay its bar out at min-content there. */
-    width: max-content;
+    top: 50%;
+    right: calc(0.5rem + env(safe-area-inset-right, 0px));
     z-index: 10;
   }
   .kvmbar {
     display: flex;
+    flex-direction: column;
     align-items: center;
     gap: 2px;
-    height: 2.7rem;
-    padding: 0 0.4rem 0 0.15rem;
+    width: 2.7rem;
+    /* Never taller than the pane — a landscape phone scrolls the rail
+       instead of clipping its ends. */
+    max-height: calc(100vh - 1.2rem);
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.15rem 0 0.4rem;
     border-radius: 12px;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
     background: oklch(0.19 0.028 285 / 0.86);
     backdrop-filter: blur(10px);
     box-shadow: var(--shadow-md);
     transition: transform 0.3s ease, opacity 0.3s ease;
+    scrollbar-width: none;
   }
-  /* Asleep: slid up out of the pane (safe-area included — it parks above
-     the notch, not under it), waiting on the reveal handle. */
+  .kvmbar::-webkit-scrollbar {
+    display: none;
+  }
+  /* Hidden: slid out past the right edge (safe-area included), leaving
+     only the handle tab. */
   .kvmbar.asleep {
-    transform: translateY(calc(-100% - 1.5rem - env(safe-area-inset-top, 0px)));
+    transform: translateX(calc(100% + 1.5rem + env(safe-area-inset-right, 0px)));
     opacity: 0;
     pointer-events: none;
+  }
+  /* The handle tab — the one and only hide/show control, pinned to the
+     anchor so it never travels with the sliding bar. */
+  .bar-tab {
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-right: 3px;
+    width: 1.15rem;
+    height: 3.4rem;
+    border: 1px solid oklch(0.3 0.035 285 / 0.8);
+    border-radius: 8px 0 0 8px;
+    background: oklch(0.19 0.028 285 / 0.8);
+    backdrop-filter: blur(10px);
+    color: #9a93b8;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+  }
+  .bar-tab:hover {
+    color: #fff;
+    background: oklch(0.24 0.03 285 / 0.9);
   }
   .grip {
     border: none;
@@ -2191,19 +2253,20 @@
     color: #6b6486;
     font-size: 0.9rem;
     line-height: 1;
-    padding: 0.5rem 0.3rem;
+    padding: 0.3rem 0.5rem;
     cursor: move;
     touch-action: none;
     border-radius: 8px;
+    flex-shrink: 0;
   }
   .grip:hover {
     color: #9a93b8;
   }
   .vsep {
-    width: 1px;
-    height: 1.3rem;
+    width: 1.3rem;
+    height: 1px;
     background: oklch(0.3 0.035 285 / 0.7);
-    margin: 0 0.2rem;
+    margin: 0.2rem 0;
     flex-shrink: 0;
   }
   .kbtn {
@@ -2235,9 +2298,9 @@
     box-shadow: inset 0 0 0 1px oklch(0.8 0.17 150 / 0.45);
   }
   .kbtn.end {
-    /* A hair of extra distance from ⛶ — the one destructive button on
-       the bar shouldn't share an edge with its neighbor under a thumb. */
-    margin-left: 0.25rem;
+    /* A hair of extra distance from its neighbor — the one destructive
+       button on the rail shouldn't share an edge under a thumb. */
+    margin-top: 0.25rem;
   }
   .kbtn.end:hover {
     background: oklch(0.25 0.07 14);
@@ -2266,67 +2329,15 @@
   .presence.on {
     background: var(--ok);
   }
-  .kbtn.screens {
-    max-width: 12rem;
-  }
-  .kicon {
-    font-size: 0.95rem;
-  }
-  .klabel {
-    font-size: 0.78rem;
-    font-weight: 650;
-    max-width: 7.5rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .kcaret {
-    font-size: 0.6rem;
-    color: #8b84a8;
-  }
-
-  /* The reveal handle — all that remains of a sleeping bar. */
-  .bar-reveal {
-    position: absolute;
-    top: 0;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 9;
-    width: min(16rem, 50%);
-    height: calc(1rem + env(safe-area-inset-top, 0px));
-    padding-top: env(safe-area-inset-top, 0px);
-    border: none;
-    background: transparent;
-    cursor: pointer;
-    display: grid;
-    place-items: center;
-  }
-  .reveal-pill {
-    width: 2.4rem;
-    height: 5px;
-    border-radius: 999px;
-    background: oklch(0.45 0.04 285 / 0.7);
-  }
-  .bar-reveal:hover .reveal-pill {
-    background: oklch(0.6 0.05 285 / 0.9);
-  }
-
-  /* ---- the drop-down menu ---- */
+  /* ---- the menu — opens to the LEFT of the rail ---- */
   .kvmenu {
     position: absolute;
-    top: calc(100% + 8px);
-    left: 50%;
-  }
-  /* Flipped above the bar when there's no room below (bar dragged low). */
-  .kvmenu.up {
-    top: auto;
-    bottom: calc(100% + 8px);
-  }
-  .kvmenu {
+    right: calc(100% + 1.5rem);
+    top: 50%;
     width: max-content;
     min-width: 15rem;
-    max-width: min(22rem, calc(100vw - 1rem));
-    max-height: min(26rem, 62vh);
+    max-width: min(22rem, calc(100vw - 5.5rem - env(safe-area-inset-right, 0px)));
+    max-height: min(26rem, calc(100vh - 1.5rem));
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -2659,58 +2670,13 @@
     padding: 0.15rem 0.55rem 0.4rem;
   }
 
-  /* A finger needs more than the desktop's hover strip to wake the bar —
-     any phone orientation gets a real touch target (the portrait block
-     below deepens it further for the notch). */
-  :global(html.is-mobile) .bar-reveal {
-    height: calc(2.2rem + env(safe-area-inset-top, 0px));
-    padding-top: env(safe-area-inset-top, 0px);
-  }
-
-  /* Last in the stylesheet on purpose: the phone overrides must
-     out-cascade the base rules above (a later `padding` shorthand at
-     equal specificity wipes the safe-area padding-top — exactly the
-     under-the-notch bug). */
-  @media (max-width: 700px) {
-    /* Secondary buttons leave the bar for the session menu — the bar must
-       fit a portrait phone with room to breathe. */
+  /* Small screens (portrait phones by width, landscape phones by
+     height): the secondary buttons leave the rail for the session menu,
+     so the rail always fits with air around it. */
+  @media (max-width: 700px), (max-height: 500px) {
     .kbtn.slim,
     .vsep.slim {
       display: none;
-    }
-    .klabel {
-      max-width: 5.5rem;
-    }
-    /* The bump clearance: this WKWebView doesn't always report the top
-       inset, so the floor is fixed and max()'d with it wherever it IS
-       reported. Gated on the real phone shell — a narrow desktop window
-       keeps the slim offset. */
-    :global(html.is-mobile) .bar-anchor {
-      top: calc(0.4rem + max(3.4rem, env(safe-area-inset-top, 0px)));
-    }
-    :global(html.is-mobile) .bar-reveal {
-      height: calc(1rem + max(3.4rem, env(safe-area-inset-top, 0px)));
-      padding-top: max(3rem, env(safe-area-inset-top, 0px));
-    }
-  }
-  /* The narrowest phones: the bar must never run past the pane edges —
-     tighten everything that isn't a hit target. */
-  @media (max-width: 400px) {
-    .klabel {
-      max-width: 3.6rem;
-    }
-    .kbtn {
-      min-width: 1.95rem;
-      padding: 0 0.22rem;
-    }
-    .kvmbar {
-      padding-right: 0.3rem;
-    }
-    .vsep {
-      margin: 0 0.1rem;
-    }
-    .grip {
-      padding: 0.5rem 0.2rem;
     }
   }
 </style>
