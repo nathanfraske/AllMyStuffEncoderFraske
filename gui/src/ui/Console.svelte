@@ -12,8 +12,10 @@
   //
   // Two skins, one component: the desktop renders it `windowed` — filling
   // a dedicated per-machine OS window (see ConsoleHost) so several
-  // consoles can be open at once — while the web preview keeps the
-  // in-page popover.
+  // consoles can be open at once — while the web preview and the phone
+  // run it in-page. Either way the console IS the viewport it's given:
+  // no modal card, no border padding — full size, respecting only the
+  // hardware (notch, home indicator) via safe-area insets.
   //
   // The stage is a live MJPEG sink: the backend pushes each inbound frame
   // for the watched route over a per-route IPC channel (raw JPEG bytes —
@@ -1473,9 +1475,6 @@
 
 {#if node}
   <div class="scrim" class:windowed>
-    {#if !windowed}
-      <button class="backdrop" aria-label="Close console" onclick={endSession}></button>
-    {/if}
     <div
       bind:this={consoleEl}
       class="console"
@@ -1969,58 +1968,28 @@
 {/if}
 
 <style>
+  /* The console IS its viewport — in-page or windowed, it takes every
+     pixel it's given (bumps and bars are handled with safe-area insets,
+     not margins). No modal card, no border gutter. */
   .scrim {
     position: fixed;
     inset: 0;
     z-index: 60;
-    display: grid;
-    place-items: center;
-    background: rgba(20, 18, 33, 0.55);
-    backdrop-filter: blur(3px);
-    padding: 1.5rem;
-  }
-  /* A dedicated console window: no overlay, the console *is* the window. */
-  .scrim.windowed {
     background: #14121f;
-    backdrop-filter: none;
     padding: 0;
-  }
-  .backdrop {
-    position: absolute;
-    inset: 0;
-    border: none;
-    background: transparent;
-    cursor: default;
   }
   .console {
     position: relative;
     z-index: 1;
-    width: min(60rem, 94vw);
-    height: min(40rem, 86vh);
+    width: 100%;
+    height: 100%;
     background: #14121f;
-    border: 1px solid #2c2740;
-    border-radius: var(--r-lg);
-    box-shadow: var(--shadow-lg);
     overflow: hidden;
     animation: rise 0.16s ease;
   }
+  /* A dedicated console window animates via the OS, not the DOM. */
   .windowed .console {
-    width: 100%;
-    height: 100%;
-    border: none;
-    border-radius: 0;
-    box-shadow: none;
     animation: none;
-  }
-  /* Fullscreen ("theater"): the in-page card grows to the whole viewport;
-     a windowed console already fills its (now OS-fullscreen) window. */
-  .console.theater {
-    position: fixed;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    border: none;
-    border-radius: 0;
   }
   @keyframes rise {
     from {
@@ -2690,32 +2659,18 @@
     padding: 0.15rem 0.55rem 0.4rem;
   }
 
-  /* Last in the stylesheet on purpose: the phone-fullscreen
-     overrides must out-cascade the base rules above (a later
-     `padding` shorthand at equal specificity wipes the safe-area
-     padding-top — exactly the under-the-notch bug). A landscape phone
-     is wider than the house 700px breakpoint but has no height to
-     spare — the max-height arm catches it for the full-bleed shell
-     (the bar keeps its full button set there; width isn't the
-     problem). */
-  @media (max-width: 700px), (max-height: 500px) {
-    .scrim {
-      padding: 0;
-    }
-    .console {
-      width: 100%;
-      height: 100%;
-      border: none;
-      border-radius: 0;
-    }
-    /* A finger needs more than the desktop's hover strip to wake the
-       bar — landscape phones land here (the portrait block below deepens
-       it further for the notch). */
-    :global(html.is-mobile) .bar-reveal {
-      height: calc(2.2rem + env(safe-area-inset-top, 0px));
-      padding-top: env(safe-area-inset-top, 0px);
-    }
+  /* A finger needs more than the desktop's hover strip to wake the bar —
+     any phone orientation gets a real touch target (the portrait block
+     below deepens it further for the notch). */
+  :global(html.is-mobile) .bar-reveal {
+    height: calc(2.2rem + env(safe-area-inset-top, 0px));
+    padding-top: env(safe-area-inset-top, 0px);
   }
+
+  /* Last in the stylesheet on purpose: the phone overrides must
+     out-cascade the base rules above (a later `padding` shorthand at
+     equal specificity wipes the safe-area padding-top — exactly the
+     under-the-notch bug). */
   @media (max-width: 700px) {
     /* Secondary buttons leave the bar for the session menu — the bar must
        fit a portrait phone with room to breathe. */
