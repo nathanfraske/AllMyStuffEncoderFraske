@@ -465,9 +465,16 @@ pnpm tauri android build         # -> .apk / .aab
 
 # iOS — needs macOS + Xcode + an Apple Developer signing identity:
 pnpm tauri ios init              # generates gen/apple (git-ignored)
+./patch-xcode-project.sh         # after EVERY init: sandboxing off + brand icon
 pnpm tauri ios dev               # run in the simulator / on device
 pnpm tauri ios build             # -> .ipa
 ```
+
+`patch-xcode-project.sh` re-applies what `tauri ios init` resets: it turns
+Xcode 16's user-script sandboxing off (Tauri's build phase writes outside the
+sandbox, so a sandboxed build dies with "Operation not permitted") and stamps
+the full-bleed brand icon (`gui/src-tauri/icons/icon-ios.png`) into the
+generated asset catalog, which init fills with the default Tauri icon.
 
 `tauri android/ios init` regenerates the native Gradle/Xcode projects under
 `gen/` from the shell + config, so they're intentionally **not** committed.

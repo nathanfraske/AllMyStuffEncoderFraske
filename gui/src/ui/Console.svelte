@@ -1,28 +1,38 @@
 <script lang="ts">
-  // The remote console — a pikvm-style session for another machine. A
-  // video-inputs tab bar across the top picks which of the remote's
-  // sources you're looking at (its screen, its cameras); the bar
-  // underneath is the handle for audio passthrough and keyboard/mouse
-  // control. It owns the real routes the session runs on, so toggles here
-  // actually wire (and unwire) the mesh.
+  // The remote console — a pikvm-style session for another machine,
+  // shaped like a KVM's web console: the picture takes the whole pane and
+  // one floating control bar rides over it, top-center. Every control
+  // lives on that bar — the screens/cameras drop-down, the keyboard &
+  // mouse / audio / clipboard toggles, the quality menu, fullscreen, and
+  // the way out — so the same layout works from a desktop window down to
+  // a phone held upright. The bar drags out of the way, sleeps after a
+  // few idle seconds, and comes back from a slim handle at the top edge.
+  // It owns the real routes the session runs on, so toggles here actually
+  // wire (and unwire) the mesh.
   //
   // Two skins, one component: the desktop renders it `windowed` — filling
   // a dedicated per-machine OS window (see ConsoleHost) so several
-  // consoles can be open at once — while the web preview keeps the in-page
-  // popover.
+  // consoles can be open at once — while the web preview and the phone
+  // run it in-page. Either way the console IS the viewport it's given:
+  // no modal card, no border padding — full size, respecting only the
+  // hardware (notch, home indicator) via safe-area insets.
   //
   // The stage is a live MJPEG sink: the backend pushes each inbound frame
   // for the watched route over a per-route IPC channel (raw JPEG bytes —
   // see `watchVideo`), and this component shows the latest one. When
   // "Keyboard & mouse" is on, the stage captures pointer/key events,
   // normalizes coordinates onto the streamed frame, and forwards them down
-  // the control route.
-  import { onMount } from "svelte";
+  // the control route. Touch input speaks the trackpad dialect instead of
+  // the pen one (see console-touch.ts): drags glide the cursor,
+  // tap-then-drag holds the button, and two fingers pinch-zoom the view.
+  import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
   import {
     closeThisWindow,
     focusThisWindow,
+    isMobile,
     isTauri,
     onThisWindowClose,
     refreshRoute,
@@ -38,8 +48,10 @@
     mediaColor,
     MEDIA,
     type Capability,
+    type InputAction,
     type MediaKind,
   } from "../types";
+  import ConsoleKeys from "./ConsoleKeys.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
 
@@ -77,21 +89,24 @@
   // (Keys keep the session rule: with control on they always belong to
   // the remote, whichever tab is showing.)
   const stagePointerActive = $derived(app.consoleControl && selected?.media === "display");
-  // Fullscreen ("theater"): the stage takes the whole window over (bars
-  // and tabs hidden), and — windowed — the OS window goes fullscreen too,
-  // so exactly this video fills the screen. Esc exits while control is
-  // off; with control on every key belongs to the remote, so the hover
-  // ⛶ is the way out.
+  // Fullscreen ("theater"): the stage takes the whole window over and —
+  // windowed — the OS window goes fullscreen too, so exactly this video
+  // fills the screen. The bar's ⛶ flips it both ways (no hover-only
+  // corner: on touch there is no hover), and Esc exits while control is
+  // off; with control on every key belongs to the remote.
   let theater = $state(false);
 
   async function flipTheater() {
     theater = !theater;
+    // The in-page card grows/shrinks to the viewport — a dragged bar must
+    // re-clamp into the new bounds (measured after the layout lands).
+    requestAnimationFrame(clampBarPos);
     if (windowed) await toggleWindowFullscreen();
     // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
     // onblur), and claimFocus won't re-pin once the window itself holds focus —
     // so with control on, re-pin here or keyboard forwarding silently stops
     // until the user clicks back into the picture ("controls stopped mapping").
-    if (app.consoleControl) stageEl?.focus({ preventScroll: true });
+    if (app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
   }
   // Which remote monitor the stage is showing (`<node>:screen:<id>`),
   // undefined for the primary `screen` (and for cameras) — rides every
@@ -155,10 +170,10 @@
   // once isn't owed a third chance.
   let nativeDecode = $state(typeof VideoDecoder === "undefined");
 
-  // ---- the quality pills ---------------------------------------------
+  // ---- the quality choices --------------------------------------------
   //
   // Resolution, frame rate, and bitrate ride a `Tune` ask to the machine
-  // being viewed (its capture restarts with the picks); the codec pill
+  // being viewed (its capture restarts with the picks); the codec choice
   // re-offers the route on the chosen transport and picks where H.264 is
   // decoded. Auto everywhere = exactly the automatic pipeline.
   type PillChoice = { label: string; value: number | null };
@@ -191,15 +206,13 @@
     { label: "H.264 · native decode", value: "native" },
     { label: "MJPEG", value: "mjpeg" },
   ];
-  let openPill = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
 
   // ---- source aspect (mouse letterbox correction) --------------------
   //
   // A machine whose native resolution isn't 16:9 gets letterboxed into the
   // capture; the mouse must map over the desktop inside the bars. "Auto" reads
   // the bars off the picture (detectActiveRegion); an explicit aspect computes
-  // the exact symmetric bars with no sampling — the confident manual path. Like
-  // the codec pill, this is a pills-only control (not driven by the slider).
+  // the exact symmetric bars with no sampling — the confident manual path.
   const ASPECTS: Array<{ label: string; value: string; ratio: number | null }> = [
     { label: "Auto", value: "auto", ratio: null },
     { label: "16:9", value: "16:9", ratio: 16 / 9 },
@@ -213,7 +226,7 @@
   );
   function pickAspect(v: string) {
     aspectChoice = v;
-    openPill = null;
+    openSub = null;
     try {
       localStorage.setItem("ams.consoleAspect", v);
     } catch {
@@ -221,7 +234,7 @@
     }
   }
   const aspectLabel = $derived(ASPECTS.find((a) => a.value === aspectChoice)?.label ?? "Auto");
-  // The codec pill reflects the *selected source's* transport (per-source in
+  // The codec row reflects the *selected source's* transport (per-source in
   // the store) plus this window's decode choice — so switching sources shows
   // that source's codec, and "native" stays a window-local decode preference.
   const codecChoice = $derived<CodecChoice>(
@@ -235,8 +248,9 @@
   );
 
   // The Speed↔Quality slider: one knob that snaps to a preset curve of
-  // res/fps/rate. Codec stays Auto here — forcing a codec is a pills-only
-  // choice. Each stop reuses the same values the pills offer.
+  // res/fps/rate. Codec stays Auto here — forcing a codec is an
+  // advanced-rows-only choice. Each stop reuses the same values the rows
+  // offer.
   const QUALITY_STOPS = [
     { label: "Speed", maxEdge: 1280, fps: 24, bitrate: 4_000_000 },
     { label: "Smooth", maxEdge: 1920, fps: 30, bitrate: 8_000_000 },
@@ -271,22 +285,225 @@
 
   function pickRes(v: number | null) {
     app.setConsoleTune({ maxEdge: v ?? undefined });
-    openPill = null;
+    openSub = null;
   }
   function pickFps(v: number | null) {
     app.setConsoleTune({ fps: v ?? undefined });
-    openPill = null;
+    openSub = null;
   }
   function pickRate(v: number | null) {
     app.setConsoleTune({ bitrate: v ?? undefined });
-    openPill = null;
+    openSub = null;
   }
   function pickCodec(v: CodecChoice) {
-    openPill = null;
+    openSub = null;
     // Where to decode is this window's choice; which transport to offer
     // is the store's (it re-offers the route when that part changes).
     nativeDecode = v === "native" || (v === "auto" && typeof VideoDecoder === "undefined");
     app.setConsoleCodec(v === "mjpeg" ? "mjpeg" : v === "auto" ? "auto" : "h264");
+  }
+
+  // ---- the control bar ------------------------------------------------
+  //
+  // One floating toolbar carries the whole session (the KVM-console
+  // pattern): icon buttons for the toggles, and three menus — session
+  // (who/status/handles/End), screens (the input picker), video
+  // (quality/zoom). One menu open at a time; a press anywhere else closes
+  // it. The bar stands VERTICALLY on the right edge — under the thumb on
+  // a phone, clear of the top edge's system gestures — slides up and down
+  // by its grip, and hides/returns ONLY by its handle tab (no auto-hide
+  // in any mode: chrome that disappears on its own is chrome you chase).
+  let consoleEl = $state<HTMLElement | null>(null);
+  let barWrapEl = $state<HTMLElement | null>(null);
+  let menuEl = $state<HTMLElement | null>(null);
+  type MenuKind = "session" | "screens" | "video";
+  let openMenu = $state<MenuKind | null>(null);
+  let openSub = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
+  // The advanced rows' disclosure remembers the old slider/pills toggle:
+  // whoever preferred the pills gets the rows open by default.
+  let advOpen = $state(app.consoleControlMode === "pills");
+  function toggleAdv() {
+    advOpen = !advOpen;
+    if (advOpen !== (app.consoleControlMode === "pills")) app.toggleConsoleControlMode();
+  }
+  // Whether this device can even produce a touch — the soft-keyboard
+  // button only earns bar space where a finger might need it.
+  const touchDevice = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
+  const mobileShell = isMobile();
+
+  function toggleMenu(m: MenuKind) {
+    openMenu = openMenu === m ? null : m;
+    openSub = null;
+  }
+
+  // A press outside the bar (stage, backdrop, anywhere) closes the open
+  // menu — pointerdown, not click, so a touch that becomes a drag still
+  // dismisses it.
+  function onWindowPointerDown(e: PointerEvent) {
+    if (!openMenu) return;
+    const t = e.target as Node | null;
+    if (t && barWrapEl?.contains(t)) return;
+    openMenu = null;
+  }
+
+  // Keep the open menu on-screen: it opens to the LEFT of the bar,
+  // vertically centered on it — a bar slid toward the top or bottom
+  // would carry the menu past the pane edge, so measure and shift back.
+  let menuShift = $state(0);
+  $effect(() => {
+    void openSub;
+    void advOpen;
+    // Sliding the bar with a menu open must re-clamp the menu too.
+    void barPos;
+    if (!openMenu || !menuEl) {
+      menuShift = 0;
+      return;
+    }
+    const el = menuEl;
+    menuShift = 0;
+    requestAnimationFrame(() => {
+      const r = el.getBoundingClientRect();
+      const pad = 8;
+      if (r.top < pad) menuShift = pad - r.top;
+      else if (r.bottom > window.innerHeight - pad) menuShift = window.innerHeight - pad - r.bottom;
+    });
+  });
+
+  // ---- bar drag (the grip — vertical, along the right edge) ----
+  let barPos = $state(0); // offset from the bar's centered resting spot
+  // A dragged bar must survive the pane shrinking (window resize, phone
+  // rotation) — re-clamp it into the new bounds instead of stranding it
+  // off-view.
+  function barSpan(): number {
+    const c = consoleEl?.getBoundingClientRect();
+    const b = barWrapEl?.getBoundingClientRect();
+    if (!c || !b) return 0;
+    return Math.max(0, (c.height - b.height) / 2 - 8);
+  }
+  function clampBarPos() {
+    if (barPos === 0) return;
+    const span = barSpan();
+    barPos = Math.min(span, Math.max(-span, barPos));
+  }
+  function onGripDown(e: PointerEvent) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const grip = e.currentTarget as HTMLElement;
+    const span = barSpan();
+    const sy = e.clientY - barPos;
+    try {
+      grip.setPointerCapture(e.pointerId);
+    } catch {
+      // synthetic pointer — capture is best-effort
+    }
+    const move = (ev: PointerEvent) => {
+      barPos = Math.min(span, Math.max(-span, ev.clientY - sy));
+    };
+    const up = () => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  }
+
+  // ---- bar hide/show (manual only) ----
+  //
+  // The handle tab on the bar's outer edge is the ONE way the bar leaves
+  // or returns, in every mode — it slides off past the right edge and the
+  // tab stays put. No idle timer: chrome that disappears on its own is
+  // chrome you have to chase.
+  let barHidden = $state(false);
+  function toggleBar() {
+    barHidden = !barHidden;
+    if (barHidden) openMenu = null;
+  }
+
+  // ---- soft keyboard ----
+  //
+  // The ⌨️ button summons the OS keyboard through ConsoleKeys. It needs a
+  // live control route, so pressing it with control off arms control on
+  // the way in; control dropping (refused route, remote revoked) takes
+  // the strip down with it.
+  let keysOpen = $state(false);
+  function toggleKeys() {
+    if (!keysOpen && !app.consoleControl) toggleControl();
+    keysOpen = !keysOpen;
+    // Mount the strip inside this very tap: iOS only raises its keyboard
+    // for a focus() that happens within a user gesture, and Svelte's
+    // batched flush would land the mount (and the focus) after it.
+    if (keysOpen) flushSync();
+  }
+  $effect(() => {
+    if (!app.consoleControl) keysOpen = false;
+  });
+  // What the strip is holding down on the remote (its one-shot modifiers
+  // go down on arm). The strip discharges them itself on unmount — but
+  // unmount runs AFTER endSession/toggle-off has torn the control route
+  // down, so those keyups would die on the floor and the remote would
+  // keep the modifier. This registry lets the release hygiene lift them
+  // while the route still carries (mirroring keys.releaseAll()).
+  const stripHeld = new Map<string, { key: string; code?: string }>();
+  function sendFromStrip(a: InputAction) {
+    if (a.kind === "key") {
+      const id = a.code || a.key;
+      if (a.down) stripHeld.set(id, { key: a.key, code: a.code });
+      else stripHeld.delete(id);
+    }
+    app.sendConsoleInput(a);
+  }
+  function releaseStrip() {
+    for (const [, k] of [...stripHeld].reverse()) {
+      app.sendConsoleInput({ kind: "key", key: k.key, code: k.code, down: false });
+    }
+    stripHeld.clear();
+  }
+
+  // ---- pinch zoom / pan (the view transform) ---------------------------
+  //
+  // The canvas wears a translate+scale transform, nothing else changes:
+  // normPoint reads the canvas's *transformed* rect off
+  // getBoundingClientRect, so pointer mapping keeps working at any zoom
+  // for free. Scale is clamped 1–8 and pan so the picture always covers
+  // the pane edge it exceeds — zooming out past fit snaps home.
+  let view = $state<ViewTransform>({ scale: 1, x: 0, y: 0 });
+  function clampView(t: ViewTransform): ViewTransform {
+    const scale = Math.min(8, Math.max(1, t.scale));
+    const c = canvasEl;
+    const s = stageEl;
+    if (!c || !s || scale === 1) return { scale, x: 0, y: 0 };
+    // offsetWidth/Height are the LAYOUT box — unaffected by the current
+    // transform, which is exactly what the clamp must scale from.
+    const mx = Math.max(0, (c.offsetWidth * scale - s.clientWidth) / 2);
+    const my = Math.max(0, (c.offsetHeight * scale - s.clientHeight) / 2);
+    return { scale, x: Math.min(mx, Math.max(-mx, t.x)), y: Math.min(my, Math.max(-my, t.y)) };
+  }
+  function setView(t: ViewTransform) {
+    view = clampView(t);
+  }
+  function stageCenter() {
+    const r = stageEl?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : { x: 0, y: 0 };
+  }
+  // Zoom keeping the content point at (cx, cy) pinned under (cx, cy).
+  // No snap-home here: a slow trackpad pinch arrives as many tiny
+  // ctrl+wheel steps, and snapping every sub-1.02 result back to 1 would
+  // eat them all — zoom could never leave 100%. clampView already zeroes
+  // the pan at exactly 1, and the touch machine snaps on gesture end.
+  function zoomAt(scale: number, cx: number, cy: number) {
+    const c = stageCenter();
+    const sc = Math.min(8, Math.max(1, scale));
+    const p0x = (cx - c.x - view.x) / view.scale;
+    const p0y = (cy - c.y - view.y) / view.scale;
+    setView({ scale: sc, x: cx - c.x - p0x * sc, y: cy - c.y - p0y * sc });
+  }
+  function zoomStep(dir: 1 | -1) {
+    const c = stageCenter();
+    zoomAt(view.scale * (dir > 0 ? 1.5 : 1 / 1.5), c.x, c.y);
+  }
+  function resetView() {
+    view = { scale: 1, x: 0, y: 0 };
   }
 
   // Decode errors ask the sender for a clean entry (rate-limited again
@@ -384,7 +601,10 @@
 
   // Follow the live video route: watch its packet channel while it's up,
   // and show the placeholder rather than a stale frame whenever it
-  // changes (input switch, session end).
+  // changes (input switch, session end). The effect ALSO re-runs on a
+  // decode-mode flip (same route, new watch) — `lastRoute` tells the two
+  // apart below.
+  let lastRoute: string | null = null;
   $effect(() => {
     const route = app.consoleVideoLive;
     // Reading this here makes the ladder's last rung re-run the effect:
@@ -410,6 +630,20 @@
     pipeDiag = "";
     frameCount = 0;
     inCount = 0;
+    // A new stream starts at its natural fit, with the trackpad cursor
+    // re-centered, and any touch gesture from the old one is over — but
+    // ONLY on an actual route change. The decode ladder re-runs this
+    // effect with the SAME route (nativeDecode flip); yanking the zoom
+    // to 1x and lifting a held drag there would punish the user for the
+    // decoder's stall. Untracked: lifting a held button reads store
+    // state, and this effect's deps are the route and decode mode only.
+    if (route !== lastRoute) {
+      lastRoute = route;
+      view = { scale: 1, x: 0, y: 0 };
+      virt.x = 0.5;
+      virt.y = 0.5;
+      untrack(() => touchMouse.reset());
+    }
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
@@ -669,8 +903,11 @@
     closing = true;
     // Keys still held ride out *before* the control route goes — closing
     // a console mid-chord (⌘W closes this very window) must not leave
-    // the remote holding the modifier.
+    // the remote holding the modifier. The strip's armed modifiers too:
+    // its own unmount discharge would fire after the route is gone.
     keys.releaseAll();
+    releaseStrip();
+    touchMouse.reset();
     // UI resets synchronously; the await is only so a console window's
     // teardown reaches the backend before the webview dies. Bounded — a
     // wedged daemon must never hold a closing window hostage.
@@ -687,8 +924,10 @@
   // Coordinates are normalized 0..1 over the *streamed frame's* content
   // box (the canvas is letterboxed with object-fit: contain), which the
   // remote denormalizes onto its own screen — neither side needs the
-  // other's resolution.
-  function normPoint(e: PointerEvent | WheelEvent): { x: number; y: number } | null {
+  // other's resolution. Only clientX/clientY are read, so the same math
+  // serves pointer events, wheel events, and the touch machine's
+  // synthesized points.
+  function normPoint(e: { clientX: number; clientY: number }): { x: number; y: number } | null {
     const img = canvasEl;
     // Gate on hasFrame, not just truthy frameW/frameH: during a re-wire the
     // canvas is `.waiting` (visibility:hidden; position:absolute), so its rect
@@ -696,6 +935,8 @@
     // stale prior dims) lands the remote cursor in the wrong place. Wait for the
     // first fresh frame, then the live-rect letterbox math below maps cleanly.
     if (!img || !hasFrame || !frameW || !frameH) return null;
+    // The rect reflects the pinch-zoom transform too — zoomed in, the same
+    // math maps over the enlarged (partly off-pane) picture unchanged.
     const r = img.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return null;
     const scale = Math.min(r.width / frameW, r.height / frameH);
@@ -875,37 +1116,188 @@
   // document focus into the webview on hover-without-click, so without the
   // element focus the key handlers (now on the stage) never fire in a
   // dedicated console window. Gated on the document not already holding focus
-  // so it never steals focus from an open pill menu once the window is active.
+  // so it never steals focus from an open bar menu once the window is active —
+  // and parked entirely while the soft keyboard types (its hidden input owns
+  // focus; stealing it drops the OS keyboard mid-word).
   function claimFocus() {
+    if (keysOpen) return;
     if (document.hasFocus()) return;
     void focusThisWindow();
     stageEl?.focus({ preventScroll: true });
   }
 
+  // ---- the touch machine ----------------------------------------------
+  //
+  // Touch pointers detour through console-touch.ts (trackpad semantics +
+  // the two-finger view gestures). The trackpad needs a cursor that
+  // persists between touches — `virt`, in the same active-region
+  // normalized space the wire speaks. Finger deltas steer it (converted
+  // through the RENDERED frame size, so the cursor moves at finger speed
+  // on the glass at any zoom), taps and holds click at it, and the mouse
+  // path re-seats it on every absolute move so the two input families
+  // never disagree about where the cursor is. `heldButtons` stays the
+  // single registry of what the remote believes is pressed.
+  const virt = { x: 0.5, y: 0.5 };
+  function sendVirt() {
+    app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
+  }
+  // The TeamViewer camera: zoomed in, the viewport follows the cursor —
+  // steer it toward the edge of what's visible and the picture pans to
+  // keep it inside a comfortable margin. The whole desktop is reachable
+  // with one thumb, no pan gesture needed.
+  function followCursor() {
+    if (view.scale <= 1.001) return;
+    const c = canvasEl;
+    const s = stageEl;
+    if (!c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const box = s.getBoundingClientRect();
+    const ar = activeRegion;
+    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    const m = Math.min(56, box.width / 5, box.height / 5);
+    let dx = 0;
+    let dy = 0;
+    if (px < box.left + m) dx = box.left + m - px;
+    else if (px > box.right - m) dx = box.right - m - px;
+    if (py < box.top + m) dy = box.top + m - py;
+    else if (py > box.bottom - m) dy = box.bottom - m - py;
+    if (dx || dy) setView({ scale: view.scale, x: view.x + dx, y: view.y + dy });
+  }
+  const touchMouse = makeTouchMouse({
+    active: () => stagePointerActive,
+    moveBy: (dx, dy) => {
+      const c = canvasEl;
+      if (!c || !hasFrame) return;
+      // The transformed rect IS the rendered frame (element == content
+      // box), so dividing finger px by it — and by the active region's
+      // share — locks cursor speed to finger speed at any zoom.
+      const r = c.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const ar = activeRegion;
+      virt.x = Math.min(1, Math.max(0, virt.x + dx / (r.width * (ar.x1 - ar.x0))));
+      virt.y = Math.min(1, Math.max(0, virt.y + dy / (r.height * (ar.y1 - ar.y0))));
+      // Deltas accumulate on every event; only the (absolute) send is
+      // throttled, so nothing is ever lost to the rate cap.
+      const now = performance.now();
+      if (now - lastMoveAt >= 16) {
+        lastMoveAt = now;
+        sendVirt();
+      }
+      followCursor();
+    },
+    button: (button, down) => {
+      if (down) {
+        // Land the cursor exactly where the trackpad believes it is,
+        // then press — the same order the mouse path uses.
+        sendVirt();
+        app.sendConsoleInput({ kind: "mouse_button", button, down: true });
+        heldButtons.add(button);
+      } else {
+        if (!heldButtons.delete(button)) return;
+        app.sendConsoleInput({ kind: "mouse_button", button, down: false });
+      }
+    },
+    wheel: (dx, dy) => app.sendConsoleInput({ kind: "wheel", dx, dy }),
+    view: () => view,
+    setView,
+    viewCenter: stageCenter,
+    onGesture: () => {
+      openMenu = null;
+    },
+  });
+  // Control dropping mid-gesture: whatever the fingers were holding lifts
+  // while the route can still carry it.
+  $effect(() => {
+    if (!app.consoleControl) untrack(() => touchMouse.reset());
+  });
+
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
+  // Mouse-drag panning of a zoomed picture while control is off — the
+  // only time a mouse drag means the VIEW and not the remote.
+  let panFrom: { x: number; y: number; vx: number; vy: number } | null = null;
   function onPointerMove(e: PointerEvent) {
+    if (e.pointerType === "touch") {
+      touchMouse.move(e);
+      return;
+    }
     // Keep keyboard focus on the stage whenever control is on (even over a
     // camera input, where pointer forwarding is off but typing still flows).
     if (app.consoleControl) claimFocus();
-    if (!stagePointerActive) return;
+    if (!stagePointerActive) {
+      if (panFrom && view.scale > 1.001) {
+        setView({
+          scale: view.scale,
+          x: panFrom.vx + (e.clientX - panFrom.x),
+          y: panFrom.vy + (e.clientY - panFrom.y),
+        });
+      }
+      return;
+    }
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
     const p = normPoint(e);
     if (!p) return;
     lastMoveAt = now;
+    // An absolute mouse move re-seats the trackpad's virtual cursor too.
+    virt.x = p.x;
+    virt.y = p.y;
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
-    // A click is the most reliable focus pin (whatever was last focused).
-    if (down && app.consoleControl) stageEl?.focus({ preventScroll: true });
-    if (!stagePointerActive) return;
+    // Real buttons living ON the stage ("Return video here") own their
+    // taps: capturing the pointer here would retarget the derived click
+    // onto the stage and the button would never fire.
+    if ((e.target as HTMLElement | null)?.closest?.("button")) return;
+    // The press that dismisses an open menu is spent on the dismissal —
+    // it must not also click the remote.
+    if (down && openMenu) {
+      openMenu = null;
+      return;
+    }
+    if (e.pointerType === "touch") {
+      // Hold every touch for its whole life — glides and pinches that
+      // wander off the element must keep streaming here.
+      if (down) {
+        // The touch counterpart of the mouse click-pin below: an iPad
+        // with a hardware keyboard needs the stage refocused after a bar
+        // tap stole it, or key forwarding silently stops.
+        if (app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
+        try {
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        } catch {
+          // a stale/synthetic pointer id — capture is best-effort
+        }
+        touchMouse.down(e);
+      } else {
+        touchMouse.up(e);
+      }
+      return;
+    }
+    // A click is the most reliable focus pin (whatever was last focused) —
+    // unless the soft keyboard holds it on purpose.
+    if (down && app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
+    if (!stagePointerActive) {
+      // View-only: a mouse drag pans the zoomed picture.
+      if (down && view.scale > 1.001) {
+        panFrom = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+        try {
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        } catch {
+          // best-effort
+        }
+      } else if (!down) {
+        panFrom = null;
+      }
+      return;
+    }
     if (down) {
-      // Hold the pointer for the whole press: a touch drag (or a mouse drag
-      // that wanders off the element) keeps streaming its moves here, and
-      // the matching up always lands — capture auto-releases on pointerup.
+      // Hold the pointer for the whole press: a mouse drag that wanders
+      // off the element keeps streaming its moves here, and the matching
+      // up always lands — capture auto-releases on pointerup.
       try {
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       } catch {
@@ -926,6 +1318,8 @@
     }
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
+    virt.x = p.x;
+    virt.y = p.y;
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -938,7 +1332,9 @@
   // never coming, and without this the remote is stranded mid-drag with a
   // button held.
   const heldButtons = new Set<number>();
-  function onPointerCancel() {
+  function onPointerCancel(e: PointerEvent) {
+    if (e.pointerType === "touch") touchMouse.cancel(e);
+    panFrom = null;
     for (const b of heldButtons) {
       app.sendConsoleInput({ kind: "mouse_button", button: b, down: false });
     }
@@ -949,14 +1345,18 @@
   // what drives the remote mouse above), but WebKit *also* synthesizes
   // compatibility mouse events and gesture defaults (double-tap zoom, the
   // long-press callout) off the raw touches. Cancelling touchstart's
-  // default while pointer forwarding is live keeps a tap exactly one click
-  // at its coordinates. Bound via an action, not `ontouchstart` — Svelte
-  // registers touch listeners passive, where preventDefault is a no-op.
-  // (Scroll/pan is already opted out with `touch-action: none` in CSS, so
-  // a drag streams pointermoves instead of being claimed as a pan.)
+  // default keeps a tap exactly one click (or one trackpad gesture) at its
+  // coordinates — except on the stage's real buttons ("Return video
+  // here"), which need their native taps. Bound via an action, not
+  // `ontouchstart` — Svelte registers touch listeners passive, where
+  // preventDefault is a no-op. (Scroll/pan is already opted out with
+  // `touch-action: none` in CSS, so a drag streams pointermoves instead of
+  // being claimed as a pan.)
   function touchGuard(el: HTMLElement) {
     const onTouchStart = (e: TouchEvent) => {
-      if (stagePointerActive) e.preventDefault();
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("button")) return;
+      if (stagePointerActive || hasFrame) e.preventDefault();
     };
     el.addEventListener("touchstart", onTouchStart, { passive: false });
     return {
@@ -967,7 +1367,16 @@
   }
 
   function onWheel(e: WheelEvent) {
-    if (!stagePointerActive || !normPoint(e)) return;
+    if (!stagePointerActive) {
+      // Trackpad pinches arrive as ctrl+wheel — zoom the view with them
+      // while control is off (with it on, the wheel belongs to the remote).
+      if (e.ctrlKey && hasFrame) {
+        e.preventDefault();
+        zoomAt(view.scale * Math.exp(-e.deltaY / 240), e.clientX, e.clientY);
+      }
+      return;
+    }
+    if (!normPoint(e)) return;
     e.preventDefault();
     // Normalize the browser's delta modes to wheel lines.
     const lines = e.deltaMode === 1 ? 1 : 1 / 40;
@@ -1005,19 +1414,24 @@
   const chordHandled = new Set<string>();
 
   // No-control keys ride the window, so Escape works without the stage being
-  // focused: it steps out of fullscreen first, then (the popover habit)
-  // closes the session; in a window it closes the window too.
+  // focused: it steps back through the console's layers — open menu first,
+  // fullscreen next, then (the popover habit) closes the session; in a
+  // window it closes the window too.
   function onWindowKey(e: KeyboardEvent) {
     if (!node || app.consoleControl) return;
     if (e.key === "Escape") {
+      if (openMenu) {
+        openMenu = null;
+        return;
+      }
       if (theater) void flipTheater();
       else endSession();
     }
   }
 
   // Control forwarding — bound to the focusable stage, so it fires only while
-  // the stage holds keyboard focus. With control on, *every* key belongs to
-  // the remote — including Escape and chords like Ctrl+W, exactly like sitting
+  // the stage holds focus. With control on, *every* key belongs to the
+  // remote — including Escape and chords like Ctrl+W, exactly like sitting
   // at the machine.
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!node || !app.consoleControl) return;
@@ -1053,85 +1467,57 @@
 
   function toggleControl() {
     // Turning control off mid-chord: lift what's held while the route
-    // can still carry the keyups.
-    if (app.consoleControl) keys.releaseAll();
+    // can still carry the keyups — the hardware keys, the strip's armed
+    // modifiers, and any touch-held button alike.
+    if (app.consoleControl) {
+      keys.releaseAll();
+      releaseStrip();
+      touchMouse.reset();
+    }
     app.toggleConsoleControl();
     // Turning it on: focus the stage so keys forward immediately, without
     // needing a click into the picture first (a `tabindex=-1` element is
     // still focusable programmatically, so this works before the reactive
     // tabindex flips to 0).
-    if (app.consoleControl) stageEl?.focus({ preventScroll: true });
+    if (app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
   }
 
   function inputIcon(c: Capability): string {
     return originIcon(c.origin, c.media);
   }
+
+  // Files/Terminal from inside a console: on the desktop they open beside
+  // this window and the session keeps running — but the single-window
+  // shells (phone, web preview) stack overlays, and a console left
+  // streaming behind Files is a battery bill nobody asked for. Moving on
+  // ends the session; whatever surface closes last lands on the graph
+  // with nothing running underneath.
+  function launchFiles() {
+    if (!node) return;
+    const id = node.id;
+    if (!windowed) void endSession();
+    app.openFiles(id);
+  }
+  function launchTerminal() {
+    if (!node) return;
+    const id = node.id;
+    if (!windowed) void endSession();
+    app.openTerminal(id);
+  }
 </script>
 
-<svelte:window onkeydown={onWindowKey} onclick={() => (openPill = null)} />
+<svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} onresize={clampBarPos} />
 
 {#if node}
   <div class="scrim" class:windowed>
-    {#if !windowed}
-      <button class="backdrop" aria-label="Close console" onclick={endSession}></button>
-    {/if}
     <div
+      bind:this={consoleEl}
       class="console"
       class:theater
       role="dialog"
       aria-modal={!windowed}
       aria-label="Console for {displayName(node)}"
     >
-      <!-- Title bar -->
-      <header class="bar">
-        <div class="who">
-          <span class="avatar">🖥</span>
-          <div class="id">
-            <div class="name">{displayName(node)}</div>
-            <div class="sub">
-              <span class="dot" class:on={node.online}></span>
-              {node.online ? "online" : "offline"} · remote console
-            </div>
-          </div>
-        </div>
-        <!-- Video inputs tab bar -->
-        <div class="inputs" role="tablist" aria-label="Video inputs">
-          {#each inputs as inp (inp.id)}
-            {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
-            <span class="tab-wrap" class:active={inp.id === selectedId}>
-              <button
-                class="tab"
-                class:active={inp.id === selectedId}
-                role="tab"
-                aria-selected={inp.id === selectedId}
-                title={inpPopped ? `${inp.label} — in its own window` : inp.label}
-                onclick={() => app.setConsoleInput(inp.id)}
-              >
-                <span class="tab-icon">{inputIcon(inp)}</span>
-                <span class="tab-label">{inp.label}</span>
-                {#if inp.default}<span class="tab-def" title="Default input">★</span>{/if}
-                {#if inpPopped}<span class="tab-out" title="In its own window">↗</span>{/if}
-              </button>
-              {#if isTauri() && !inpPopped}
-                <button
-                  class="tab-pop"
-                  title="Pop this video out into its own window"
-                  aria-label="Pop {inp.label} out into its own window"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    void app.popOutConsoleInput(inp.id);
-                  }}>⧉</button
-                >
-              {/if}
-            </span>
-          {/each}
-          {#if inputs.length === 0}
-            <span class="no-inputs">No video inputs advertised</span>
-          {/if}
-        </div>
-        <button class="x" onclick={endSession} aria-label="Close">✕</button>
-      </header>
-
       <!-- Video stage -->
       <!-- role=application: a remote-desktop surface — every pointer/key
            event belongs to the far machine while control is on. Focusable
@@ -1174,6 +1560,9 @@
               bind:this={canvasEl}
               class="live"
               class:waiting={!hasFrame}
+              style:transform={view.scale !== 1 || view.x !== 0 || view.y !== 0
+                ? `translate(${view.x}px, ${view.y}px) scale(${view.scale})`
+                : undefined}
               aria-label="Live {selected?.media === 'video' ? 'camera' : 'screen'} view of {displayName(
                 node,
               )}"
@@ -1186,6 +1575,23 @@
               <div class="host-status">{videoRefused}</div>
             {:else if hostStatus}
               <div class="host-status">{hostStatusText(hostStatus)}</div>
+            {/if}
+            {#if view.scale > 1.001}
+              <!-- Zoomed: say so, and offer the way back without a pinch.
+                   Pointer events stop here so control forwarding never
+                   mistakes the tap for a remote click. -->
+              <button
+                class="zoom-chip"
+                title="Reset zoom"
+                onpointerdown={(e) => e.stopPropagation()}
+                onpointerup={(e) => e.stopPropagation()}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  resetView();
+                }}
+              >
+                {Math.round(view.scale * 100)}% ✕
+              </button>
             {/if}
           {:else if selected}
             <div class="screen" style="--mc: {mediaColor(selected.media)}">
@@ -1211,477 +1617,433 @@
           {:else}
             <div class="screen empty">
               <div class="screen-glyph">🪟</div>
-              <div class="screen-note">Pick a video input above to view this machine.</div>
-            </div>
-          {/if}
-          <!-- The video player's corner: fullscreen where everyone looks
-               for it. Hover-revealed; clicks stop here so control
-               forwarding never sees them. -->
-          {#if app.consoleVideoLive}
-            <div class="corner">
-              <button
-                class="corner-btn"
-                title={theater
-                  ? `Exit fullscreen${app.consoleControl ? "" : " (Esc)"}`
-                  : "Fullscreen"}
-                aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
-                onpointerdown={(e) => e.stopPropagation()}
-                onpointerup={(e) => e.stopPropagation()}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  void flipTheater();
-                }}>{theater ? "⤡" : "⛶"}</button
-              >
+              <div class="screen-note">
+                Pick a video input from the Screens menu in the bar above.
+              </div>
             </div>
           {/if}
         {/if}
       </div>
 
-      <!-- Control / passthrough bar -->
-      {#snippet pillMenu(
-        key: "res" | "fps" | "rate",
-        name: string,
-        choices: PillChoice[],
-        current: number | null | undefined,
-        pick: (v: number | null) => void,
-      )}
-        <span class="pill-wrap">
+      <!-- The control bar — vertical, on the right edge. The handle tab
+           on its outer side is the one and only hide/show control; the
+           tab never moves, the bar slides out past the edge behind it. -->
+      <div
+        bind:this={barWrapEl}
+        class="bar-anchor"
+        role="group"
+        aria-label="Console control bar"
+        style:transform={`translateY(calc(-50% + ${barPos}px))`}
+        onpointerdowncapture={(e) => {
+          // With the soft keyboard up, bar taps must not steal focus from
+          // its hidden input (a blur drops the OS keyboard mid-word) —
+          // suppress the focus default; the click still fires.
+          if (keysOpen && (e.target as HTMLElement).closest("button")) e.preventDefault();
+        }}
+      >
+        <button
+          class="bar-tab"
+          title={barHidden ? "Show controls" : "Hide controls"}
+          aria-label={barHidden ? "Show console controls" : "Hide console controls"}
+          onclick={toggleBar}>{barHidden ? "‹" : "›"}</button
+        >
+        <div class="kvmbar" class:asleep={barHidden} role="toolbar" aria-label="Console controls">
+          <!-- svelte-ignore a11y_consider_explicit_label -->
+          <button class="grip" title="Move the bar" onpointerdown={onGripDown}>⠿</button>
+          <span class="vsep"></span>
           <button
-            class="pill"
-            class:tuned={(current ?? null) !== null}
-            onclick={(e) => {
-              e.stopPropagation();
-              openPill = openPill === key ? null : key;
-            }}
+            class="kbtn"
+            class:open={openMenu === "session"}
+            title="{displayName(node)} — session"
+            aria-label="Session menu"
+            onclick={() => toggleMenu("session")}
           >
-            {name} · {pillLabel(choices, current)} ▾
+            🖥<span class="presence" class:on={node.online}></span>
           </button>
-          {#if openPill === key}
-            <div class="pill-menu" role="menu">
-              {#each choices as c (c.label)}
-                <button
-                  class="pill-item"
-                  class:sel={(current ?? null) === c.value}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    pick(c.value);
-                  }}
-                >
-                  {c.label}
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </span>
-      {/snippet}
-      <footer class="controls">
-        <div class="toggles">
-          {#if access.audio}
-            <button
-              class="toggle"
-              class:on={app.consoleAudio}
-              onclick={() => app.toggleConsoleAudio()}
-              title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
-            >
-              <span class="t-icon">🔊</span>
-              Audio
-              <span class="pip" class:lit={app.consoleAudio}></span>
-            </button>
-          {/if}
+          <button
+            class="kbtn"
+            class:open={openMenu === "screens"}
+            title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
+            aria-label="Screens and cameras menu"
+            onclick={() => toggleMenu("screens")}
+          >
+            {selected ? inputIcon(selected) : "🪟"}
+          </button>
+          <span class="vsep"></span>
           {#if access.control}
             <button
-              class="toggle"
+              class="kbtn"
               class:on={app.consoleControl}
-              onclick={toggleControl}
               title="Send this machine's keyboard & mouse to the remote"
+              aria-label="Keyboard & mouse control"
+              aria-pressed={app.consoleControl}
+              onclick={toggleControl}>🕹</button
             >
-              <span class="t-icon">⌨️</span>
-              Control
-              <span class="pip" class:lit={app.consoleControl}></span>
-            </button>
+          {/if}
+          {#if access.control && touchDevice}
+            <button
+              class="kbtn"
+              class:on={keysOpen}
+              title="Type on the remote (soft keyboard)"
+              aria-label="Soft keyboard"
+              aria-pressed={keysOpen}
+              onclick={toggleKeys}>⌨️</button
+            >
+          {/if}
+          {#if access.audio}
+            <button
+              class="kbtn slim"
+              class:on={app.consoleAudio}
+              title="Play that machine's audio on this machine (listen-only — nothing is sent back)"
+              aria-label="Audio"
+              aria-pressed={app.consoleAudio}
+              onclick={() => app.toggleConsoleAudio()}>🔊</button
+            >
           {/if}
           {#if access.clipboard}
             <button
-              class="toggle"
+              class="kbtn slim"
               class:on={app.consoleClipboard}
-              onclick={() => app.toggleConsoleClipboard()}
-              title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote. Each machine keeps its own clipboard otherwise."
+              title="Share clipboard on paste — pasting here sends this machine's clipboard so it lands on the remote"
+              aria-label="Clipboard passthrough"
+              aria-pressed={app.consoleClipboard}
+              onclick={() => app.toggleConsoleClipboard()}>📋</button
             >
-              <span class="t-icon">📋</span>
-              Clipboard
-              <span class="pip" class:lit={app.consoleClipboard}></span>
-            </button>
           {/if}
-        </div>
-
-        <!-- Quick handles to the rest of this machine — its file manager
-             and a shell — so a console session doesn't send you back to
-             the graph drawer for them. Owner/fleet gated exactly like the
-             drawer's buttons (the far side enforces the rule again); on
-             the desktop each opens (or focuses) the machine's dedicated
-             window beside this one. -->
-        {#if app.filesAllowed(node) || app.terminalAllowed(node)}
-          <div class="quick">
+          {#if app.filesAllowed(node) || app.terminalAllowed(node)}
+            <span class="vsep slim"></span>
             {#if app.filesAllowed(node)}
               <button
-                class="launch"
-                onclick={() => app.openFiles(node.id)}
+                class="kbtn slim"
                 title="Browse this machine's files over the mesh"
+                aria-label="Files"
+                onclick={launchFiles}>🗂</button
               >
-                <span class="t-icon">🗂</span>
-                Files
-              </button>
             {/if}
             {#if app.terminalAllowed(node)}
               <button
-                class="launch"
-                onclick={() => app.openTerminal(node.id)}
+                class="kbtn slim"
                 title="Open a shell on this machine over the mesh"
+                aria-label="Terminal"
+                onclick={launchTerminal}>📟</button
               >
-                <span class="t-icon">📟</span>
-                Terminal
-              </button>
             {/if}
-          </div>
-        {/if}
+          {/if}
+          <span class="vsep"></span>
+          <button
+            class="kbtn"
+            class:open={openMenu === "video"}
+            class:warn={!!pipeDiag}
+            title="Stream quality & zoom"
+            aria-label="Video menu"
+            onclick={() => toggleMenu("video")}>🎚</button
+          >
+          {#if !mobileShell}
+            <!-- The phone shell IS full-screen — a fullscreen button
+                 there is a knob with nothing behind it. -->
+            <button
+              class="kbtn"
+              title={theater ? `Exit fullscreen${app.consoleControl ? "" : " (Esc)"}` : "Fullscreen"}
+              aria-label={theater ? "Exit fullscreen" : "Fullscreen"}
+              onclick={() => void flipTheater()}>{theater ? "⤡" : "⛶"}</button
+            >
+          {/if}
+          <button class="kbtn end" title="End session" aria-label="End session" onclick={endSession}
+            >✕</button
+          >
+        </div>
 
-        {#if app.consoleVideoLive}
-          <div class="quality">
-            {#if app.consoleControlMode === "slider"}
-              <!-- One Speed↔Quality knob (codec stays Auto) -->
-              <div class="slider-wrap" role="group" aria-label="Stream quality">
-                <span class="slider-end">Speed</span>
-                <input
-                  class="quality-slider"
-                  type="range"
-                  min="0"
-                  max={QUALITY_STOPS.length - 1}
-                  step="1"
-                  value={sliderPos}
-                  oninput={(e) => pickQuality(+e.currentTarget.value)}
-                  aria-label="Quality"
-                  title="Drag toward Speed (lighter, faster) or Quality (sharper, heavier)"
-                />
-                <span class="slider-end">Quality</span>
-                <span class="slider-now">{QUALITY_STOPS[sliderPos].label}</span>
+        <!-- The bar's menu — one at a time, opening to the LEFT of the
+             bar (and nudged back on-screen when the bar sits near the
+             top or bottom, see menuShift). -->
+        {#if openMenu}
+          <div
+            bind:this={menuEl}
+            class="kvmenu"
+            style:transform={`translateY(calc(-50% + ${menuShift}px))`}
+            role="menu"
+          >
+            {#if openMenu === "session"}
+              <div class="mhead">
+                <span class="mavatar">🖥</span>
+                <div class="mid">
+                  <div class="mname">{displayName(node)}</div>
+                  <div class="msub">
+                    <span class="dot" class:on={node.online}></span>
+                    {node.online ? "online" : "offline"} · remote console
+                  </div>
+                </div>
               </div>
-            {:else}
-              <div class="pills" role="group" aria-label="Stream quality">
-                {@render pillMenu("res", "Res", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
-                {@render pillMenu("fps", "FPS", FPS_CHOICES, app.consoleTune.fps, pickFps)}
-                {@render pillMenu("rate", "Rate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
-                <span class="pill-wrap">
-              <button
-                class="pill"
-                class:tuned={codecChoice !== "auto"}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  openPill = openPill === "codec" ? null : "codec";
-                }}
-              >
-                Codec · {CODEC_CHOICES.find((c) => c.value === codecChoice)?.label ?? "Auto"} ▾
-              </button>
-              {#if openPill === "codec"}
-                <div class="pill-menu" role="menu">
-                  {#each CODEC_CHOICES as c (c.value)}
-                    <button
-                      class="pill-item"
-                      class:sel={codecChoice === c.value}
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        pickCodec(c.value);
-                      }}
-                    >
-                      {c.label}
-                    </button>
+              {#if hasFrame || app.consoleSessionRoutes.length > 0}
+                <div class="mchips">
+                  {#if hasFrame}
+                    <span class="chip stream" title="Live stream — frame size · rate">
+                      <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}
+                    </span>
+                  {/if}
+                  {#each app.consoleSessionRoutes as r (r.id)}
+                    <span class="chip" style="--mc: {mediaColor(r.media as MediaKind)}">
+                      <span class="chip-dot"></span>{MEDIA[r.media as MediaKind].label}
+                    </span>
                   {/each}
                 </div>
               {/if}
-                </span>
-                {#if stagePointerActive}
-                  <span class="pill-wrap">
+              <div class="msep"></div>
+              {#if access.control}
+                <button class="mrow" onclick={toggleControl}>
+                  <span class="micon">🕹</span>Keyboard &amp; mouse
+                  <span class="pip" class:lit={app.consoleControl}></span>
+                </button>
+              {/if}
+              {#if access.audio}
+                <button class="mrow" onclick={() => app.toggleConsoleAudio()}>
+                  <span class="micon">🔊</span>Audio
+                  <span class="pip" class:lit={app.consoleAudio}></span>
+                </button>
+              {/if}
+              {#if access.clipboard}
+                <button class="mrow" onclick={() => app.toggleConsoleClipboard()}>
+                  <span class="micon">📋</span>Clipboard
+                  <span class="pip" class:lit={app.consoleClipboard}></span>
+                </button>
+              {/if}
+              {#if app.filesAllowed(node) || app.terminalAllowed(node)}
+                <div class="msep"></div>
+                {#if app.filesAllowed(node)}
+                  <button class="mrow" onclick={() => app.openFiles(node.id)}>
+                    <span class="micon">🗂</span>Files
+                  </button>
+                {/if}
+                {#if app.terminalAllowed(node)}
+                  <button class="mrow" onclick={() => app.openTerminal(node.id)}>
+                    <span class="micon">📟</span>Terminal
+                  </button>
+                {/if}
+              {/if}
+              <div class="msep"></div>
+              <button class="mrow danger" onclick={endSession}>
+                <span class="micon">⏻</span>End session
+              </button>
+            {:else if openMenu === "screens"}
+              {#each inputs as inp (inp.id)}
+                {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
+                <div class="mrow-wrap">
+                  <button
+                    class="mrow"
+                    class:sel={inp.id === selectedId}
+                    title={inpPopped ? `${inp.label} — in its own window` : inp.label}
+                    onclick={() => {
+                      app.setConsoleInput(inp.id);
+                      openMenu = null;
+                    }}
+                  >
+                    <span class="micon">{inputIcon(inp)}</span>
+                    <span class="mlabel">{inp.label}</span>
+                    {#if inp.default}<span class="mdef" title="Default input">★</span>{/if}
+                    {#if inpPopped}<span class="mout" title="In its own window">↗</span>{/if}
+                    <span class="mcheck">{inp.id === selectedId ? "✓" : ""}</span>
+                  </button>
+                  {#if inpPopped}
                     <button
-                      class="pill"
-                      class:tuned={aspectChoice !== "auto"}
-                      title="Source aspect — corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      class="mside"
+                      title="Return this video here"
+                      aria-label="Return {inp.label} here"
                       onclick={(e) => {
                         e.stopPropagation();
-                        openPill = openPill === "aspect" ? null : "aspect";
-                      }}
+                        app.askReturnVideo(`cap:${inp.id}`);
+                      }}>⤓</button
                     >
-                      Aspect · {aspectLabel} ▾
+                  {:else if isTauri() && !mobileShell}
+                    <button
+                      class="mside"
+                      title="Pop this video out into its own window"
+                      aria-label="Pop {inp.label} out into its own window"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        void app.popOutConsoleInput(inp.id);
+                      }}>⧉</button
+                    >
+                  {/if}
+                </div>
+              {/each}
+              {#if inputs.length === 0}
+                <div class="mempty">No video inputs advertised</div>
+              {/if}
+            {:else}
+              <!-- Video: the one knob, the advanced rows, the zoom. -->
+              {#if app.consoleVideoLive}
+                <div class="slider-row" role="group" aria-label="Stream quality">
+                  <span class="slider-end">Speed</span>
+                  <input
+                    class="quality-slider"
+                    type="range"
+                    min="0"
+                    max={QUALITY_STOPS.length - 1}
+                    step="1"
+                    value={sliderPos}
+                    oninput={(e) => pickQuality(+e.currentTarget.value)}
+                    aria-label="Quality"
+                    title="Drag toward Speed (lighter, faster) or Quality (sharper, heavier)"
+                  />
+                  <span class="slider-end">Quality</span>
+                  <span class="slider-now">{QUALITY_STOPS[sliderPos].label}</span>
+                </div>
+                <button class="mrow" onclick={toggleAdv}>
+                  <span class="micon">⚙</span>Advanced
+                  <span class="mcheck">{advOpen ? "▾" : "▸"}</span>
+                </button>
+                {#if advOpen}
+                  {#snippet valueRow(
+                    key: "res" | "fps" | "rate",
+                    name: string,
+                    choices: PillChoice[],
+                    current: number | null | undefined,
+                    pick: (v: number | null) => void,
+                  )}
+                    <button
+                      class="vrow"
+                      class:tuned={(current ?? null) !== null}
+                      onclick={() => (openSub = openSub === key ? null : key)}
+                    >
+                      <span>{name}</span>
+                      <span class="vval">{pillLabel(choices, current)}</span>
+                      <span class="vchev">{openSub === key ? "▾" : "▸"}</span>
                     </button>
-                    {#if openPill === "aspect"}
-                      <div class="pill-menu" role="menu">
-                        {#each ASPECTS as a (a.value)}
+                    {#if openSub === key}
+                      <div class="vopts">
+                        {#each choices as c (c.label)}
                           <button
-                            class="pill-item"
-                            class:sel={aspectChoice === a.value}
-                            onclick={(e) => {
-                              e.stopPropagation();
-                              pickAspect(a.value);
-                            }}
+                            class="vopt"
+                            class:sel={(current ?? null) === c.value}
+                            onclick={() => pick(c.value)}>{c.label}</button
                           >
-                            {a.label}
-                          </button>
                         {/each}
                       </div>
                     {/if}
-                  </span>
+                  {/snippet}
+                  {@render valueRow("res", "Resolution", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
+                  {@render valueRow("fps", "Frame rate", FPS_CHOICES, app.consoleTune.fps, pickFps)}
+                  {@render valueRow("rate", "Bitrate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
+                  <button
+                    class="vrow"
+                    class:tuned={codecChoice !== "auto"}
+                    onclick={() => (openSub = openSub === "codec" ? null : "codec")}
+                  >
+                    <span>Codec</span>
+                    <span class="vval"
+                      >{CODEC_CHOICES.find((c) => c.value === codecChoice)?.label ?? "Auto"}</span
+                    >
+                    <span class="vchev">{openSub === "codec" ? "▾" : "▸"}</span>
+                  </button>
+                  {#if openSub === "codec"}
+                    <div class="vopts">
+                      {#each CODEC_CHOICES as c (c.value)}
+                        <button
+                          class="vopt"
+                          class:sel={codecChoice === c.value}
+                          onclick={() => pickCodec(c.value)}>{c.label}</button
+                        >
+                      {/each}
+                    </div>
+                  {/if}
+                  {#if stagePointerActive}
+                    <button
+                      class="vrow"
+                      class:tuned={aspectChoice !== "auto"}
+                      title="Source aspect — corrects the mouse when a machine whose native resolution isn't 16:9 is letterboxed into the capture. Auto detects the bars from the picture."
+                      onclick={() => (openSub = openSub === "aspect" ? null : "aspect")}
+                    >
+                      <span>Aspect</span>
+                      <span class="vval">{aspectLabel}</span>
+                      <span class="vchev">{openSub === "aspect" ? "▾" : "▸"}</span>
+                    </button>
+                    {#if openSub === "aspect"}
+                      <div class="vopts">
+                        {#each ASPECTS as a (a.value)}
+                          <button
+                            class="vopt"
+                            class:sel={aspectChoice === a.value}
+                            onclick={() => pickAspect(a.value)}>{a.label}</button
+                          >
+                        {/each}
+                      </div>
+                    {/if}
+                  {/if}
+                {/if}
+                <div class="msep"></div>
+              {/if}
+              <div class="zoom-row" role="group" aria-label="Zoom">
+                <span class="zlabel">Zoom</span>
+                <button class="zbtn" aria-label="Zoom out" onclick={() => zoomStep(-1)}>−</button>
+                <span class="znow">{Math.round(view.scale * 100)}%</span>
+                <button class="zbtn" aria-label="Zoom in" onclick={() => zoomStep(1)}>+</button>
+                {#if view.scale > 1.001}
+                  <button class="zreset" onclick={resetView}>Reset</button>
                 {/if}
               </div>
+              {#if hasFrame}
+                <div class="mstats">
+                  {frameW}×{frameH} · {fps} fps · {transport}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
+                </div>
+              {/if}
             {/if}
-            <button
-              class="more"
-              title="Switch between the quality slider and the detailed controls"
-              aria-label="Toggle quality controls"
-              onclick={() => app.toggleConsoleControlMode()}>…</button
-            >
           </div>
         {/if}
+      </div>
 
-        <div class="status">
-          {#if hasFrame}
-            <span class="chip stream" title="Live stream — frame size · rate">
-              <span class="chip-dot live-dot"></span>{frameW}×{frameH} · {fps} fps · {transport}{pipeDiag
-                ? ` · ⚠ ${pipeDiag}`
-                : ""}
-            </span>
-          {/if}
-          {#each app.consoleSessionRoutes as r (r.id)}
-            <span class="chip" style="--mc: {mediaColor(r.media as MediaKind)}">
-              <span class="chip-dot"></span>{MEDIA[r.media as MediaKind].label}
-            </span>
-          {/each}
-        </div>
-
-        <button class="btn end" onclick={endSession}>End session</button>
-      </footer>
+      {#if keysOpen && app.consoleControl}
+        <ConsoleKeys send={sendFromStrip} onclose={() => (keysOpen = false)} />
+      {/if}
     </div>
   </div>
 {/if}
 
 <style>
+  /* The console IS its viewport — in-page or windowed, it takes every
+     pixel it's given (bumps and bars are handled with safe-area insets,
+     not margins). No modal card, no border gutter. */
   .scrim {
     position: fixed;
     inset: 0;
     z-index: 60;
-    display: grid;
-    place-items: center;
-    background: rgba(20, 18, 33, 0.55);
-    backdrop-filter: blur(3px);
-    padding: 1.5rem;
-  }
-  /* A dedicated console window: no overlay, the console *is* the window. */
-  .scrim.windowed {
     background: #14121f;
-    backdrop-filter: none;
     padding: 0;
-  }
-  .backdrop {
-    position: absolute;
-    inset: 0;
-    border: none;
-    background: transparent;
-    cursor: default;
   }
   .console {
     position: relative;
     z-index: 1;
-    width: min(60rem, 94vw);
-    height: min(40rem, 86vh);
-    display: flex;
-    flex-direction: column;
+    width: 100%;
+    height: 100%;
     background: #14121f;
-    border: 1px solid #2c2740;
-    border-radius: var(--r-lg);
-    box-shadow: var(--shadow-lg);
     overflow: hidden;
     animation: rise 0.16s ease;
   }
+  /* A dedicated console window animates via the OS, not the DOM. */
   .windowed .console {
-    width: 100%;
-    height: 100%;
-    border: none;
-    border-radius: 0;
-    box-shadow: none;
     animation: none;
   }
-  /* Phone-width: the in-page console takes the whole screen — closing it is
-     the way back to the graph. The scrim already sits above the header and
-     the portrait pill dock (z 60 > 30); safe-area padding keeps the title
-     bar (and its ✕) clear of the status bar, and the control bar clear of
-     the home indicator. Zero effect on desktop: env() is 0 there, and a
-     narrow *windowed* console is already 100%×100%. */
   @keyframes rise {
     from {
       transform: translateY(14px) scale(0.98);
       opacity: 0;
     }
   }
-  .bar {
-    display: flex;
-    align-items: center;
-    gap: 0.8rem;
-    padding: 0.5rem 0.6rem;
-    background: linear-gradient(180deg, #1c1830, #14121f);
-    border-bottom: 1px solid #2c2740;
-    flex-shrink: 0;
-  }
-  .who {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-shrink: 0;
-  }
-  .avatar {
-    font-size: 1.3rem;
-  }
-  .id .name {
-    font-weight: 700;
-    font-size: 0.92rem;
-    color: #f3f1fb;
-  }
-  .id .sub {
-    font-size: 0.7rem;
-    color: #9a93b8;
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-  }
-  .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #6b6486;
-  }
-  .dot.on {
-    background: var(--ok);
-    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
-  }
-  .inputs {
-    display: flex;
-    gap: 0.3rem;
-    flex: 1;
-    min-width: 0;
-    overflow-x: auto;
-    /* Bottom room inside the scroller for the tabs' pop-out button,
-       which hangs off the bottom corner (the scroll clip would eat an
-       overhang); the negative margin gives the space back so the bar
-       doesn't grow. */
-    padding: 0.1rem 0.1rem 0.55rem;
-    margin-bottom: -0.45rem;
-  }
-  .tab {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    flex-shrink: 0;
-    border: 1px solid #322c47;
-    background: #1a1730;
-    color: #c8c2e0;
-    border-radius: var(--r-pill);
-    padding: 0.32rem 0.6rem;
-    font-size: 0.76rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
-  }
-  .tab:hover {
-    border-color: var(--accent);
-  }
-  .tab.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  .tab-icon {
-    font-size: 0.95rem;
-  }
-  .tab-label {
-    max-width: 9rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .tab-def {
-    color: var(--warn);
-    font-size: 0.7rem;
-  }
-  .tab-out {
-    color: var(--accent-2, #9be3ff);
-    font-size: 0.7rem;
-  }
-  .tab.active .tab-out {
-    color: #fff;
-  }
-  /* The hover popout: lives on a wrapper (a button can't nest one),
-     revealed when the tab is hovered or it has keyboard focus. */
-  .tab-wrap {
-    position: relative;
-    display: inline-flex;
-    flex-shrink: 0;
-  }
-  .tab-pop {
-    position: absolute;
-    bottom: -0.45rem;
-    right: -0.3rem;
-    width: 1.25rem;
-    height: 1.25rem;
-    border-radius: 50%;
-    border: 1px solid #443d63;
-    background: #241f38;
-    color: #c8c2e0;
-    font-size: 0.66rem;
-    line-height: 1;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 120ms ease;
-  }
-  .tab-wrap:hover .tab-pop,
-  .tab-pop:focus-visible {
-    opacity: 1;
-  }
-  .tab-pop:hover {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  .no-inputs {
-    font-size: 0.76rem;
-    color: #8b84a8;
-    align-self: center;
-  }
-  .x {
-    flex-shrink: 0;
-    border: none;
-    background: #241f38;
-    color: #c8c2e0;
-    width: 1.9rem;
-    height: 1.9rem;
-    border-radius: 50%;
-    font-size: 0.8rem;
-    cursor: pointer;
-  }
-  .x:hover {
-    background: #322c47;
-    color: #fff;
-  }
+
+  /* ---- the stage — the whole pane ---- */
   .stage {
-    flex: 1;
-    min-height: 0;
-    /* Touch drives the remote pointer: opt out of the browser's own
-       gestures (scroll/pan, double-tap zoom) so a finger drag streams
-       pointermoves instead of being claimed — and pointercancelled — as a
-       pan. The stage never scrolls, and mouse input is unaffected. */
+    position: absolute;
+    inset: 0;
+    /* Touch drives the remote pointer (or a view gesture): opt out of the
+       browser's own gestures (scroll/pan, double-tap zoom) so a finger
+       drag streams pointermoves instead of being claimed — and
+       pointercancelled — as a pan. The stage never scrolls, and mouse
+       input is unaffected. */
     touch-action: none;
     /* And no long-press text-selection callout / magnifier over the
        picture — a held finger is a held mouse button, nothing more. */
     -webkit-user-select: none;
     user-select: none;
     -webkit-touch-callout: none;
-    /* Anchors the .host-status banner. */
-    position: relative;
     display: grid;
     /* The single track must be the stage's size, never the content's:
        an auto track grows to the canvas's intrinsic width (1920), which
@@ -1690,10 +2052,11 @@
     grid-template-rows: minmax(0, 1fr);
     grid-template-columns: minmax(0, 1fr);
     place-items: center;
-    padding: 1rem;
+    /* The pinch-zoomed canvas may exceed the pane — clip, don't scroll. */
+    overflow: hidden;
     background:
-      radial-gradient(1200px 400px at 50% -10%, oklch(0.62 0.2 292 / 0.12), transparent),
-      repeating-linear-gradient(0deg, #100e1a, #100e1a 2px, #12101c 2px, #12101c 4px);
+      radial-gradient(1200px 400px at 50% -10%, oklch(0.62 0.2 292 / 0.1), transparent),
+      #0c0b14;
   }
   .stage.grabbing {
     cursor: crosshair;
@@ -1704,66 +2067,12 @@
   .stage:focus-visible {
     outline: none;
   }
-  /* Fullscreen ("theater"): chrome away, the stage is the window. */
-  .console.theater > .bar,
-  .console.theater > .controls {
-    display: none;
-  }
-  .console.theater {
-    border: none;
-    border-radius: 0;
-  }
   .console.theater > .stage {
-    padding: 0;
     background: #000;
   }
   .console.theater .live {
     border-radius: 0;
     box-shadow: none;
-  }
-  /* The hover corner — the video player's bottom-right. */
-  .corner {
-    position: absolute;
-    right: 1.4rem;
-    bottom: 1.4rem;
-    display: inline-flex;
-    gap: 0.3rem;
-    opacity: 0;
-    transition: opacity 120ms ease;
-  }
-  .stage:hover .corner,
-  .corner:focus-within {
-    opacity: 1;
-  }
-  .corner-btn {
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(4px);
-    color: #fff;
-    border-radius: var(--r-sm);
-    width: 2.1rem;
-    height: 2.1rem;
-    font-size: 1.05rem;
-    line-height: 1;
-    cursor: pointer;
-  }
-  .corner-btn:hover {
-    background: rgba(0, 0, 0, 0.8);
-  }
-  /* The way home for a popped-out input. */
-  .return-btn {
-    margin-top: 0.4rem;
-    border: 1px solid var(--line-strong);
-    background: var(--accent);
-    color: #fff;
-    border-radius: var(--r-md);
-    padding: 0.75rem 1.3rem;
-    font-size: 1rem;
-    font-weight: 700;
-    cursor: pointer;
-  }
-  .return-btn:hover {
-    filter: brightness(1.12);
   }
   .live {
     /* Size the element to the video's OWN box (its intrinsic backing store
@@ -1774,7 +2083,8 @@
        recompute that inset and it drifts by ~a bar width (the "offset = letterbox
        size" skew). With the element == the content box, normPoint's inset is 0
        and it normalizes over the element directly — like the KVM's accurate web
-       UI. */
+       UI. The pinch-zoom transform scales this same box; getBoundingClientRect
+       keeps reporting the truth. */
     display: block;
     width: auto;
     height: auto;
@@ -1785,6 +2095,7 @@
     -webkit-user-drag: none;
     border-radius: 4px;
     box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
+    transform-origin: center center;
   }
   /* Mounted (so the first frame has somewhere to land) but invisible
      until it does — the placeholder shows through. */
@@ -1793,8 +2104,8 @@
     position: absolute;
   }
   .screen {
-    width: 100%;
-    height: 100%;
+    width: calc(100% - 1.6rem);
+    height: calc(100% - 1.6rem);
     border: 1px solid #2c2740;
     border-radius: var(--r-md);
     background: radial-gradient(900px 360px at 50% 30%, oklch(0.62 0.2 292 / 0.1), #0c0b14);
@@ -1821,13 +2132,29 @@
     font-size: 0.82rem;
     max-width: 28rem;
     line-height: 1.45;
+    padding: 0 1rem;
+  }
+  /* The way home for a popped-out input. */
+  .return-btn {
+    margin-top: 0.4rem;
+    border: 1px solid var(--line-strong);
+    background: var(--accent);
+    color: #fff;
+    border-radius: var(--r-md);
+    padding: 0.75rem 1.3rem;
+    font-size: 1rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .return-btn:hover {
+    filter: brightness(1.12);
   }
   /* The host's capture condition, bannered over a live stage when the
      stream stalls mid-session (display fell asleep, grabs failing). */
   .host-status {
     position: absolute;
     left: 50%;
-    bottom: 1.4rem;
+    bottom: calc(1.2rem + env(safe-area-inset-bottom, 0px));
     transform: translateX(-50%);
     max-width: min(34rem, 85%);
     padding: 0.45rem 0.85rem;
@@ -1840,180 +2167,250 @@
     text-align: center;
     pointer-events: none;
   }
-  /* The bar wraps instead of overflowing: on a narrow console the groups
-     fall onto extra rows rather than squashing the stage or clipping their
-     controls. */
-  .controls {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.5rem 0.7rem;
-    padding: 0.6rem 0.7rem;
-    background: #1a1730;
-    border-top: 1px solid #2c2740;
-    flex-shrink: 0;
-  }
-  .toggles,
-  .quick {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-  }
-  .toggle,
-  .launch {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    border: 1px solid #322c47;
-    background: #14121f;
-    color: #c8c2e0;
+  /* The zoomed badge — bottom-left, out of the picture's way. */
+  .zoom-chip {
+    position: absolute;
+    left: 0.7rem;
+    bottom: calc(0.7rem + env(safe-area-inset-bottom, 0px));
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    color: #fff;
     border-radius: var(--r-pill);
-    padding: 0.4rem 0.7rem;
-    font-size: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: border-color 0.12s ease, background 0.12s ease;
-  }
-  .toggle:hover,
-  .launch:hover {
-    border-color: var(--accent);
-  }
-  .toggle.on {
-    background: oklch(0.8 0.17 150 / 0.15);
-    border-color: var(--ok);
-    color: oklch(0.88 0.09 150);
-  }
-  .t-icon {
-    font-size: 0.95rem;
-  }
-  .quality {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-  .pills {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-  }
-  .slider-wrap {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-  }
-  .slider-end {
-    font-size: 0.72rem;
-    color: #8a83a6;
-  }
-  .quality-slider {
-    width: 8.5rem;
-    accent-color: #7c6cff;
-    cursor: pointer;
-  }
-  .slider-now {
-    min-width: 4.2rem;
+    padding: 0.28rem 0.6rem;
     font-size: 0.74rem;
-    color: #c8c2e0;
-  }
-  .more {
-    border: 1px solid #322c47;
-    background: #14121f;
-    color: #c8c2e0;
-    border-radius: var(--r-pill);
-    padding: 0 0.5rem;
-    line-height: 1.55rem;
-    cursor: pointer;
-    font-weight: 700;
-  }
-  .more:hover {
-    border-color: #4a4170;
-  }
-  .pill-wrap {
-    position: relative;
-    display: inline-flex;
-  }
-  .pill {
-    border: 1px solid #322c47;
-    background: #14121f;
-    color: #c8c2e0;
-    border-radius: var(--r-pill);
-    padding: 0.32rem 0.55rem;
-    font-size: 0.72rem;
     font-weight: 650;
     cursor: pointer;
-    white-space: nowrap;
-    transition: border-color 0.12s ease;
   }
-  .pill:hover {
-    border-color: var(--accent);
+  .zoom-chip:hover {
+    background: rgba(0, 0, 0, 0.8);
   }
-  /* A dial off Auto reads as deliberately set. */
-  .pill.tuned {
-    border-color: var(--accent);
-    color: #e6e1ff;
-  }
-  .pill-menu {
+
+  /* ---- the control bar — a vertical rail on the right edge ---- */
+  .bar-anchor {
     position: absolute;
-    bottom: calc(100% + 6px);
-    left: 0;
-    min-width: 100%;
+    top: 50%;
+    right: calc(0.5rem + env(safe-area-inset-right, 0px));
+    z-index: 10;
+  }
+  .kvmbar {
     display: flex;
     flex-direction: column;
-    background: #1a1730;
+    align-items: center;
+    gap: 2px;
+    width: 2.7rem;
+    /* Never taller than the pane — a landscape phone scrolls the rail
+       instead of clipping its ends. */
+    max-height: calc(100vh - 1.2rem);
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.15rem 0 0.4rem;
+    border-radius: 12px;
+    border: 1px solid oklch(0.3 0.035 285 / 0.8);
+    background: oklch(0.19 0.028 285 / 0.86);
+    backdrop-filter: blur(10px);
+    box-shadow: var(--shadow-md);
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    scrollbar-width: none;
+  }
+  .kvmbar::-webkit-scrollbar {
+    display: none;
+  }
+  /* Hidden: slid out past the right edge (safe-area included), leaving
+     only the handle tab. */
+  .kvmbar.asleep {
+    transform: translateX(calc(100% + 1.5rem + env(safe-area-inset-right, 0px)));
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* The handle tab — the one and only hide/show control, pinned to the
+     anchor so it never travels with the sliding bar. */
+  .bar-tab {
+    position: absolute;
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-right: 3px;
+    width: 1.15rem;
+    height: 3.4rem;
+    border: 1px solid oklch(0.3 0.035 285 / 0.8);
+    border-radius: 8px 0 0 8px;
+    background: oklch(0.19 0.028 285 / 0.8);
+    backdrop-filter: blur(10px);
+    color: #9a93b8;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+  }
+  .bar-tab:hover {
+    color: #fff;
+    background: oklch(0.24 0.03 285 / 0.9);
+  }
+  .grip {
+    border: none;
+    background: transparent;
+    color: #6b6486;
+    font-size: 0.9rem;
+    line-height: 1;
+    padding: 0.3rem 0.5rem;
+    cursor: move;
+    touch-action: none;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+  .grip:hover {
+    color: #9a93b8;
+  }
+  .vsep {
+    width: 1.3rem;
+    height: 1px;
+    background: oklch(0.3 0.035 285 / 0.7);
+    margin: 0.2rem 0;
+    flex-shrink: 0;
+  }
+  .kbtn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    height: 2.15rem;
+    min-width: 2.15rem;
+    padding: 0 0.3rem;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #c8c2e0;
+    font-size: 0.95rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.12s ease;
+  }
+  .kbtn:hover,
+  .kbtn.open {
+    background: oklch(0.27 0.032 285 / 0.9);
+  }
+  /* A toggle that's live wears the session green — same lamp as the old
+     footer toggles, one glance tells what's flowing. */
+  .kbtn.on {
+    background: oklch(0.8 0.17 150 / 0.16);
+    box-shadow: inset 0 0 0 1px oklch(0.8 0.17 150 / 0.45);
+  }
+  .kbtn.end {
+    /* A hair of extra distance from its neighbor — the one destructive
+       button on the rail shouldn't share an edge under a thumb. */
+    margin-top: 0.25rem;
+  }
+  .kbtn.end:hover {
+    background: oklch(0.25 0.07 14);
+    color: oklch(0.85 0.1 14);
+  }
+  .kbtn.warn::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+  .presence {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #6b6486;
+    border: 1px solid #14121f;
+  }
+  .presence.on {
+    background: var(--ok);
+  }
+  /* ---- the menu — opens to the LEFT of the rail ---- */
+  .kvmenu {
+    position: absolute;
+    right: calc(100% + 1.5rem);
+    top: 50%;
+    width: max-content;
+    min-width: 15rem;
+    max-width: min(22rem, calc(100vw - 5.5rem - env(safe-area-inset-right, 0px)));
+    max-height: min(26rem, calc(100vh - 1.5rem));
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: oklch(0.18 0.027 285 / 0.96);
+    backdrop-filter: blur(12px);
     border: 1px solid #322c47;
     border-radius: var(--r-md);
     box-shadow: var(--shadow-lg);
-    padding: 0.25rem;
-    z-index: 20;
+    padding: 0.35rem;
+    animation: drop 0.12s ease;
   }
-  .pill-item {
-    border: none;
-    background: transparent;
-    color: #c8c2e0;
-    text-align: left;
-    font-size: 0.76rem;
-    font-weight: 600;
-    padding: 0.32rem 0.6rem;
-    border-radius: var(--r-sm, 6px);
-    cursor: pointer;
+  @keyframes drop {
+    from {
+      opacity: 0;
+      translate: 0 -4px;
+    }
+  }
+  .mhead {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.5rem;
+  }
+  .mavatar {
+    font-size: 1.3rem;
+  }
+  .mid {
+    min-width: 0;
+  }
+  .mname {
+    font-weight: 700;
+    font-size: 0.92rem;
+    color: #f3f1fb;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .pill-item:hover {
-    background: #241f38;
-    color: #fff;
-  }
-  .pill-item.sel {
-    color: var(--accent);
-  }
-  .pip {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #4a4366;
-  }
-  .pip.lit {
-    background: var(--ok);
-    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
-  }
-  .status {
+  .msub {
+    font-size: 0.7rem;
+    color: #9a93b8;
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    flex: 1 1 10rem;
-    min-width: 0;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #6b6486;
+    flex-shrink: 0;
+  }
+  .dot.on {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
+  }
+  .mchips {
+    display: flex;
     flex-wrap: wrap;
+    gap: 0.3rem;
+    padding: 0.15rem 0.5rem 0.35rem;
   }
   .chip {
     display: inline-flex;
     align-items: center;
     gap: 0.3rem;
-    font-size: 0.72rem;
+    font-size: 0.7rem;
     font-weight: 650;
     color: #d7d2ec;
     background: #14121f;
     border: 1px solid #322c47;
     border-radius: var(--r-pill);
-    padding: 0.16rem 0.5rem;
+    padding: 0.14rem 0.5rem;
   }
   .chip-dot {
     width: 8px;
@@ -2034,36 +2431,252 @@
       opacity: 0.35;
     }
   }
-  .end {
+  .msep {
+    height: 1px;
+    background: #2c2740;
+    margin: 0.25rem 0.2rem;
     flex-shrink: 0;
-    margin-left: auto;
-    background: oklch(0.2 0.05 14);
-    border: 1px solid oklch(0.38 0.11 14);
+  }
+  .mrow {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: #c8c2e0;
+    text-align: left;
+    font-size: 0.84rem;
+    font-weight: 600;
+    padding: 0.5rem 0.55rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .mrow:hover {
+    background: #241f38;
+    color: #fff;
+  }
+  .mrow.sel {
+    color: var(--accent-ink);
+  }
+  .mrow.danger {
     color: oklch(0.82 0.1 14);
   }
-  .end:hover {
+  .mrow.danger:hover {
     background: oklch(0.25 0.07 14);
   }
+  .micon {
+    font-size: 1rem;
+    width: 1.4rem;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .mlabel {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mdef {
+    color: var(--warn);
+    font-size: 0.72rem;
+    flex-shrink: 0;
+  }
+  .mout {
+    color: var(--accent-2, #9be3ff);
+    font-size: 0.72rem;
+    flex-shrink: 0;
+  }
+  .mcheck {
+    margin-left: auto;
+    color: var(--accent-ink);
+    font-size: 0.8rem;
+    min-width: 1rem;
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .pip {
+    margin-left: auto;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4a4366;
+    flex-shrink: 0;
+  }
+  .pip.lit {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px oklch(0.8 0.17 150 / 0.25);
+  }
+  .mrow-wrap {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .mrow-wrap .mrow {
+    flex: 1;
+    min-width: 0;
+  }
+  .mside {
+    flex-shrink: 0;
+    width: 1.9rem;
+    height: 1.9rem;
+    border: 1px solid #443d63;
+    background: #241f38;
+    color: #c8c2e0;
+    border-radius: var(--r-sm);
+    font-size: 0.8rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .mside:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .mempty {
+    font-size: 0.8rem;
+    color: #8b84a8;
+    padding: 0.6rem 0.55rem;
+  }
 
-  /* Last in the stylesheet on purpose: the phone-fullscreen
-     overrides must out-cascade the base rules above (a later
-     `padding` shorthand at equal specificity wipes the safe-area
-     padding-top — exactly the under-the-notch bug). */
-  @media (max-width: 700px) {
-    .scrim {
-      padding: 0;
-    }
-    .console {
-      width: 100%;
-      height: 100%;
-      border: none;
-      border-radius: 0;
-    }
-    .bar {
-      padding-top: calc(0.5rem + max(3.4rem, env(safe-area-inset-top, 0px)));
-    }
-    .controls {
-      padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
+  /* ---- the video menu's guts ---- */
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.5rem 0.55rem 0.3rem;
+  }
+  .slider-end {
+    font-size: 0.72rem;
+    color: #8a83a6;
+    flex-shrink: 0;
+  }
+  .quality-slider {
+    flex: 1;
+    min-width: 6rem;
+    accent-color: #7c6cff;
+    cursor: pointer;
+  }
+  .slider-now {
+    min-width: 4.2rem;
+    font-size: 0.74rem;
+    color: #c8c2e0;
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .vrow {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: #c8c2e0;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-align: left;
+    padding: 0.42rem 0.55rem 0.42rem 2.45rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .vrow:hover {
+    background: #241f38;
+  }
+  /* A dial off Auto reads as deliberately set. */
+  .vrow.tuned .vval {
+    color: var(--accent-ink);
+  }
+  .vval {
+    margin-left: auto;
+    color: #9a93b8;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .vchev {
+    color: #6b6486;
+    font-size: 0.66rem;
+    flex-shrink: 0;
+  }
+  .vopts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    padding: 0.2rem 0.55rem 0.45rem 2.45rem;
+  }
+  .vopt {
+    border: 1px solid #322c47;
+    background: #14121f;
+    color: #c8c2e0;
+    border-radius: var(--r-pill);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .vopt:hover {
+    border-color: var(--accent);
+  }
+  .vopt.sel {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  .zoom-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.55rem;
+  }
+  .zlabel {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #c8c2e0;
+    margin-right: auto;
+  }
+  .zbtn {
+    width: 1.8rem;
+    height: 1.8rem;
+    border: 1px solid #322c47;
+    background: #14121f;
+    color: #c8c2e0;
+    border-radius: var(--r-sm);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .zbtn:hover {
+    border-color: var(--accent);
+  }
+  .znow {
+    min-width: 3rem;
+    text-align: center;
+    font-size: 0.78rem;
+    font-weight: 650;
+    color: #d7d2ec;
+  }
+  .zreset {
+    border: none;
+    background: transparent;
+    color: var(--accent-ink);
+    font-size: 0.76rem;
+    font-weight: 650;
+    cursor: pointer;
+    padding: 0.3rem 0.3rem;
+  }
+  .mstats {
+    font-size: 0.72rem;
+    color: oklch(0.88 0.09 150);
+    padding: 0.15rem 0.55rem 0.4rem;
+  }
+
+  /* Small screens (portrait phones by width, landscape phones by
+     height): the secondary buttons leave the rail for the session menu,
+     so the rail always fits with air around it. */
+  @media (max-width: 700px), (max-height: 500px) {
+    .kbtn.slim,
+    .vsep.slim {
+      display: none;
     }
   }
 </style>
