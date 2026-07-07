@@ -561,9 +561,7 @@
     }
     .summary .chip,
     .actions .chip {
-      max-width: 44vw;
-      min-width: 0;
-      flex-shrink: 1;
+      max-width: 46vw;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -614,18 +612,12 @@
       bottom: 0;
       margin-left: 0;
       justify-content: center;
-      /* One row, always — three capped chips wrapped into a double-height
-         bar; shrink-to-fit beats stacking on a phone's bottom edge. */
-      flex-wrap: nowrap;
-      min-width: 0;
+      flex-wrap: wrap;
       padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
       background: oklch(0.135 0.022 285 / 0.74);
       backdrop-filter: blur(14px) saturate(1.2);
       border-top: 1px solid var(--line);
       z-index: 30;
-    }
-    .summary .chip {
-      max-width: 31vw;
     }
   }
 </style>
