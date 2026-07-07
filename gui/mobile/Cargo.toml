@@ -94,3 +94,8 @@ data-encoding = { version = "2", optional = true }
 # Without a subscriber those diagnostics are dropped.
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
+
+# The engine-boot integration test drives the real embedded daemon + node
+# over the real control socket on the host; it needs its own runtime.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

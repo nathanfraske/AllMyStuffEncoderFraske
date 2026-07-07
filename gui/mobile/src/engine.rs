@@ -128,19 +128,59 @@ impl UiSink for TauriSink {
     }
 }
 
-/// Boot the piled-together stack: migrate any adapter-era state, start the
-/// embedded daemon, then bring the engine up against it. Mirrors
+/// Boot the piled-together stack from the app's sandbox layout. Thin
+/// wrapper over [`boot_at`] resolving the two paths iOS dictates:
+///
+/// * **State** cannot live at `$HOME/.myownmesh` — the container *root* is
+///   not app-writable (mkdir there is `EPERM`), only `Documents/`,
+///   `Library/`, `tmp/` are. So every engine store is re-homed under the
+///   app-data dir via `MYOWNMESH_HOME`.
+/// * **The control socket** cannot live under either — container paths are
+///   so long they overrun the 104-byte `sun_path` limit for unix sockets.
+///   `$TMPDIR` is the one short-enough writable place; a socket is
+///   ephemeral by nature, so tmp's purge semantics cost nothing (it's
+///   re-bound every launch).
+pub async fn boot(app: AppHandle) -> Result<Arc<Engine>, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("resolve app data dir: {e}"))?;
+    boot_at(
+        data_dir.join("myownmesh"),
+        std::env::temp_dir().join("mom.sock"),
+        &data_dir,
+        Arc::new(TauriSink(app.clone())),
+    )
+    .await
+}
+
+/// Boot the stack with explicit paths: migrate any adapter-era state from
+/// `legacy_dir`, start the embedded daemon homed at `mom_home` and
+/// listening on `socket`, then bring the engine up against it. Mirrors
 /// `serve.rs`'s order with the spawns deleted. Must run on the Tauri async
 /// runtime — `Mesh::start` binds the engine's task spawner to the runtime
 /// it is started on.
-pub async fn boot(app: AppHandle) -> Result<Arc<Engine>, String> {
-    migrate_adapter_state(&app);
+async fn boot_at(
+    mom_home: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    legacy_dir: &std::path::Path,
+    sink: Arc<dyn UiSink>,
+) -> Result<Arc<Engine>, String> {
+    // Everything below — the daemon's config/identity/rosters, the node's
+    // park/ownership/shares stores — resolves through MYOWNMESH_HOME.
+    std::fs::create_dir_all(&mom_home).map_err(|e| format!("create {mom_home:?}: {e}"))?;
+    std::env::set_var("MYOWNMESH_HOME", &mom_home);
 
-    // The daemon, in-process. Config lives at `$HOME/.myownmesh/` — inside
-    // the app sandbox $HOME is the app container, so the daemon's socket,
-    // identity, and config land in app-private storage, and the engine's
-    // ControlClient (which resolves the same way) finds the same socket.
-    let cfg = myownmesh_core::MeshConfig::load().map_err(|e| format!("load mesh config: {e}"))?;
+    migrate_adapter_state(legacy_dir);
+
+    // The daemon, in-process, on an explicit short socket path (see
+    // [`boot`]). A stale socket file from the previous launch would fail
+    // the bind — the container persists files across runs, and no other
+    // process can be holding it (this app *is* the only process).
+    let _ = std::fs::remove_file(&socket);
+    let mut cfg =
+        myownmesh_core::MeshConfig::load().map_err(|e| format!("load mesh config: {e}"))?;
+    cfg.daemon.control_socket = Some(socket.clone());
     let daemon = myownmesh::embedded::start(cfg)
         .await
         .map_err(|e| format!("start embedded daemon: {e}"))?;
@@ -149,13 +189,14 @@ pub async fn boot(app: AppHandle) -> Result<Arc<Engine>, String> {
         "embedded daemon up"
     );
 
-    // The engine, exactly as serve.rs builds it: resolve the daemon socket,
-    // build the mesh with the front-end sink, share the park store, start
-    // the session pump (which registers the runtime and brings the node up:
-    // identity → profile → claim networks → subscriptions → presence).
-    let client = Arc::new(ControlClient::new().map_err(|e| format!("resolve daemon socket: {e}"))?);
+    // The engine, exactly as serve.rs builds it: point at the daemon
+    // socket, build the mesh with the front-end sink, share the park
+    // store, start the session pump (which registers the runtime and
+    // brings the node up: identity → profile → claim networks →
+    // subscriptions → presence).
+    let client = Arc::new(ControlClient::with_path(socket));
     let disabled = Arc::new(DisabledNetworks::load());
-    let mesh = Mesh::new(client.clone(), Arc::new(TauriSink(app)));
+    let mesh = Mesh::new(client.clone(), sink);
     mesh.attach_disabled_networks(disabled.clone());
     mesh.clone().start().await;
 
@@ -180,31 +221,67 @@ pub async fn boot(app: AppHandle) -> Result<Arc<Engine>, String> {
 const SEED_FILE: &str = "device-seed.bin";
 const SETTINGS_FILE: &str = "mesh-settings.json";
 
-fn migrate_adapter_state(app: &AppHandle) {
-    let Ok(dir) = app.path().app_data_dir() else {
-        return;
-    };
+/// A legacy file to migrate: the live name, or — if a previous migration
+/// attempt renamed it before failing (an early build did exactly that when
+/// the engine stores weren't writable yet) — the `.migrated` copy. The
+/// rename happens only after a *successful* carry-over, so a failed run
+/// retries from the same bytes next launch instead of orphaning them.
+fn legacy_source(dir: &std::path::Path, name: &str) -> Option<(std::path::PathBuf, bool)> {
+    let live = dir.join(name);
+    if live.exists() {
+        return Some((live, false));
+    }
+    let renamed = dir.join(format!("{name}.migrated"));
+    if renamed.exists() {
+        return Some((renamed, true));
+    }
+    None
+}
 
-    let seed_path = dir.join(SEED_FILE);
-    if seed_path.exists() {
+fn migrate_adapter_state(dir: &std::path::Path) {
+    if let Some((seed_path, was_renamed)) = legacy_source(dir, SEED_FILE) {
         match migrate_identity(&seed_path, &dir.join(SETTINGS_FILE)) {
-            Ok(true) => tracing::info!("identity migrated from the adapter-era device seed"),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("identity migration failed (a fresh id will be minted): {e}"),
+            Ok(true) => {
+                tracing::info!("identity migrated from the adapter-era device seed");
+                if !was_renamed {
+                    let _ = std::fs::rename(&seed_path, dir.join(format!("{SEED_FILE}.migrated")));
+                }
+            }
+            // An anchor already exists — the seed's job is done either way.
+            Ok(false) => {
+                if !was_renamed {
+                    let _ = std::fs::rename(&seed_path, dir.join(format!("{SEED_FILE}.migrated")));
+                }
+            }
+            Err(e) => tracing::warn!("identity migration failed (will retry next launch): {e}"),
         }
-        let _ = std::fs::rename(&seed_path, dir.join(format!("{SEED_FILE}.migrated")));
     }
 
-    let settings_path = dir.join(SETTINGS_FILE);
-    if settings_path.exists() {
-        match migrate_settings(&settings_path) {
-            Ok(()) => tracing::info!("network settings migrated into the daemon config"),
-            Err(e) => tracing::warn!("settings migration failed (re-add networks by hand): {e}"),
+    if let Some((settings_path, was_renamed)) = legacy_source(dir, SETTINGS_FILE) {
+        // A `.migrated` file is only a *retry* source while the daemon
+        // config is still virgin — once networks exist there, the rename
+        // marks completed work (re-applying would re-park networks the
+        // user has since unparked).
+        if was_renamed {
+            let done = myownmesh_core::MeshConfig::load()
+                .map(|c| !c.networks.is_empty())
+                .unwrap_or(false);
+            if done {
+                return;
+            }
         }
-        let _ = std::fs::rename(
-            &settings_path,
-            dir.join(format!("{SETTINGS_FILE}.migrated")),
-        );
+        match migrate_settings(&settings_path) {
+            Ok(()) => {
+                tracing::info!("network settings migrated into the daemon config");
+                if !was_renamed {
+                    let _ = std::fs::rename(
+                        &settings_path,
+                        dir.join(format!("{SETTINGS_FILE}.migrated")),
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("settings migration failed (will retry next launch): {e}"),
+        }
     }
 }
 
@@ -322,11 +399,81 @@ fn migrate_settings(settings_path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// One test fn on purpose: the migration resolves every store through
-    /// `MYOWNMESH_HOME`, and env vars are process-global — parallel test fns
-    /// would race the variable.
+    /// `MYOWNMESH_HOME` is process-global; every test that touches the
+    /// engine stores serializes on this.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct NoopSink;
+    impl UiSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+        fn restart(&self) -> ! {
+            unreachable!("no restart in tests")
+        }
+    }
+
+    /// The whole piled-together stack on the host: a legacy seed migrates,
+    /// the embedded daemon boots homed in a temp dir with its socket in
+    /// tmp, the node engine comes up against it, and a command dispatched
+    /// through the real `node_control::dispatch` crosses the real control
+    /// socket and comes back carrying the *migrated* identity — the exact
+    /// path the phone takes at launch.
+    #[test]
+    fn boot_migrates_and_answers_dispatch_end_to_end() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("ams-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let legacy = base.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let seed = [42u8; 32];
+        std::fs::write(legacy.join(SEED_FILE), seed).unwrap();
+        let expect_pub = data_encoding::BASE32_NOPAD
+            .encode(
+                ed25519_dalek::SigningKey::from_bytes(&seed)
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .to_lowercase();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let engine = boot_at(
+                base.join("home"),
+                base.join("s.sock"),
+                &legacy,
+                Arc::new(NoopSink),
+            )
+            .await
+            .expect("boot the in-process stack");
+
+            // The control listener is spawned, not awaited — poll until the
+            // socket answers (or the test times out loudly).
+            let mut last_err = String::new();
+            for _ in 0..100 {
+                match engine.request("mesh_identity", json!({})).await {
+                    Ok(v) => {
+                        assert!(
+                            v.to_string().contains(&expect_pub),
+                            "daemon identity should be the migrated seed's: {v}"
+                        );
+                        // The migration marker landed only after success.
+                        assert!(legacy.join(format!("{SEED_FILE}.migrated")).exists());
+                        return;
+                    }
+                    Err(e) => last_err = e,
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            panic!("daemon never answered mesh_identity: {last_err}");
+        });
+
+        std::env::remove_var("MYOWNMESH_HOME");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn adapter_state_migrates_into_the_engine_stores() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!("ams-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();

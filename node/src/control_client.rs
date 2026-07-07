@@ -65,6 +65,18 @@ impl ControlClient {
         }
     }
 
+    /// A client for a daemon listening on an explicit socket path, for the
+    /// one host that can't use the default: the mobile shell, whose sandbox
+    /// forbids `$HOME`-root writes and whose container paths overrun the
+    /// 104-byte `sun_path` limit — it parks the socket under the short
+    /// `$TMPDIR` and hands the same path to the embedded daemon's config.
+    #[cfg(unix)]
+    pub fn with_path(path: std::path::PathBuf) -> Self {
+        Self {
+            addr: SocketAddr::Path(path),
+        }
+    }
+
     /// One-shot request → response. Opens a socket, writes one JSON line,
     /// reads one back, closes. No pooling (a local round trip is cheap and
     /// pooling muddies daemon-restart semantics).
