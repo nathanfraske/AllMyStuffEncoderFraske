@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AllMyStuff",
-  "version": "0.2.4",
+  "version": "0.2.19",
   "identifier": "works.allmystuff.mobile",
   "build": {
     "frontendDist": "../dist",
@@ -23,6 +23,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "iOS": {
+      "frameworks": ["AudioToolbox", "CoreAudio"]
+    },
     "icon": [
       "../src-tauri/icons/32x32.png",
       "../src-tauri/icons/128x128.png",

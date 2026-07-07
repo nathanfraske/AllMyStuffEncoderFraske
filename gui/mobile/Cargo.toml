@@ -12,7 +12,7 @@
 
 [package]
 name = "allmystuff-mobile"
-version = "0.2.4"
+version = "0.2.19"
 description = "AllMyStuff mobile (iOS/Android) — a Tauri 2 shell around the shared Svelte UI, backed by the phone's embedded viewer/controller core."
 authors = ["Chris Paul"]
 license = "MIT"
@@ -34,6 +34,24 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# `mesh` (on by default) links the embedded `myownmesh-core` engine so the app
+# is a real mesh peer. It's a feature so the `gui-mobile` CI job can build the
+# shell `--no-default-features` and keep type-checking for android without the
+# NDK — the engine pulls `ring` (a C build) which the NDK-free CI can't compile.
+# On-device builds (`tauri ios/android`) use the default, so they get the mesh.
+default = ["mesh"]
+mesh = [
+    "dep:allmystuff-node",
+    "dep:allmystuff-protocol",
+    "dep:myownmesh",
+    "dep:myownmesh-core",
+    "dep:ed25519-dalek",
+    "dep:data-encoding",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
 [dependencies]
 # No `tray-icon` / `autostart` / `single-instance` here — those are desktop
 # concerns with no mobile story. `shell` stays for opening external links.
@@ -46,6 +64,45 @@ serde_json = "1"
 # The phone's transport-agnostic brain: its capability model and the
 # client-side media planes. Pure Rust, no native deps — it gives us a real
 # phone `NodeProfile` (identity + viewer/controller capabilities) to put on
-# the graph today, and the `MeshClient` seam the embedded engine fills in
-# next. Pulled by path; it inherits its versions from the main workspace.
+# the graph today, and the `MeshClient` seam the embedded engine fills in.
 allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }
+# The hardware scanner behind `scan_full` — same GUI-side call as desktop.
+allmystuff-inventory = { path = "../../crates/allmystuff-inventory" }
+
+# The real engine — the same crate the desktop's `allmystuff-serve` daemon
+# runs — linked in-process (behind `mesh`), capture-less: with
+# `default-features = false` the capture/inject planes swap for stubs and the
+# phone is a pure viewer/controller node. See node/Cargo.toml's `host`
+# feature.
+allmystuff-node = { path = "../../node", default-features = false, features = [
+    # The one capture plane iOS can run for real: cpal speaks CoreAudio, so
+    # inbound streams *play* and the mic can source a route. Everything
+    # else stays stubbed (see node/Cargo.toml).
+    "audio-io",
+], optional = true }
+# The wire constants the migration shares with the node (the local-claim
+# network id); already in the tree via mobile-core.
+allmystuff-protocol = { path = "../../crates/allmystuff-protocol", optional = true }
+# The mesh daemon itself, also in-process (`embedded::start`) — iOS forbids
+# spawning it as the child process every other platform uses. Same control
+# socket, same wire protocol, inside the app sandbox. Pinned to the merge
+# that exposed the daemon as a library (which sits atop the system-DNS-SD
+# discovery backend the phone rides).
+myownmesh = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "07598b28b50b95c7b2e57232a8dd4a153510af6f", optional = true }
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "07598b28b50b95c7b2e57232a8dd4a153510af6f", optional = true }
+# One-time identity migration: derive the public key from the adapter-era
+# `device-seed.bin` and write it as the daemon's anchor file, so the phone
+# keeps its device id across the engine swap.
+ed25519-dalek = { version = "2", optional = true }
+data-encoding = { version = "2", optional = true }
+# Surface the embedded engine's `tracing` output (mDNS attach failures, peer
+# connects) on the device console (Xcode / idevicesyslog / adb logcat) *and*
+# an on-phone log file the Files app can reach — see `src/logging.rs`.
+# Without a subscriber those diagnostics are dropped.
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+# The engine-boot integration test drives the real embedded daemon + node
+# over the real control socket on the host; it needs its own runtime.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

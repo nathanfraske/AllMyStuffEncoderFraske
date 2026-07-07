@@ -213,6 +213,11 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm build
-      - name: cargo check mobile shell (android target)
+      # Build without the `mesh` feature so this stays NDK-free: the embedded
+      # engine (enabled by default for on-device builds) pulls `ring`, a C build
+      # that needs the Android NDK. This job type-checks the shell + the pure
+      # frontend embed; the engine cross-compile is exercised on the device
+      # build (and covered by `allmystuff-mesh`'s host tests).
+      - name: cargo check mobile shell (android target, no engine)
         working-directory: gui/mobile
-        run: cargo check --target aarch64-linux-android
+        run: cargo check --no-default-features --target aarch64-linux-android

@@ -1,6 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
+  import { isMobile } from "../tauri";
+
+  // Runtime mobile tag on the root element: CSS can then target the real
+  // phone shell (fixed notch clearances) without catching narrow desktop
+  // windows, which share the width media queries.
+  if (typeof document !== "undefined" && isMobile()) {
+    document.documentElement.classList.add("is-mobile");
+  }
   import {
     appVersion,
     consoleWindowTarget,
@@ -161,9 +169,14 @@
           <NetworkMenu />
         {/if}
       </span>
+    </div>
+
+    <div class="actions">
       <!-- The venues pill: the sibling of the meshes pill, for the venues your
            meshes call out at. Same dropdown-with-switches shape; it shimmers
-           when driving a mesh just turned a venue back on. -->
+           when driving a mesh just turned a venue back on. It lives with the
+           header controls (not the status pills) so portrait phones keep it
+           up top when the pills dock along the bottom edge. -->
       <span class="net-anchor">
         <button
           class="chip venue"
@@ -189,9 +202,6 @@
           <VenueMenu />
         {/if}
       </span>
-    </div>
-
-    <div class="actions">
       <!-- The clock-skew warning: this machine's clock is well out of line
            with its peers' (estimated passively from traffic that was already
            flowing). Persistent while it holds — a wrong clock quietly breaks
@@ -540,5 +550,89 @@
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+
+  /* The webview runs edge-to-edge under the camera bump, and this WKWebView
+     does not report safe-area insets — clear the bump with a fixed floor,
+     max()'d with the inset wherever it IS reported. */
+  :global(html.is-mobile) .topbar {
+    padding-top: calc(0.4rem + max(3.4rem, env(safe-area-inset-top, 0px)));
+  }
+
+  /* Phone-width windows: compact the header — no tagline, tighter gaps,
+     safe-area padding so it stays out from under the notch / status bar
+     (zero everywhere that has neither). Chips get an ellipsis cap so a
+     long fleet or mesh name can't push the row off-screen. */
+  @media (max-width: 700px) {
+    .topbar {
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      row-gap: 0.4rem;
+      padding: 0.5rem 0.75rem;
+      padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
+    }
+    .tag {
+      display: none;
+    }
+    .summary .chip,
+    .actions .chip {
+      max-width: 46vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .actions {
+      margin-left: auto;
+    }
+  }
+
+  /* Landscape phones: the pills wrap onto a second header row. */
+  @media (max-width: 700px) and (orientation: landscape) {
+    .summary {
+      order: 3;
+      flex: 1 1 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+  }
+
+  /* Portrait phones: the header splits — the status pills leave it and
+     dock along the bottom edge, inside the thumb's reach, over the stage.
+     The stage keeps its full height (the dock overlays it; the graph pans,
+     and the drawers already float at this width). */
+  /* Phone header: the version tag is noise there — About in Settings
+     owns it (and the App Store owns updates). */
+  @media (max-width: 700px) {
+    .ver {
+      display: none;
+    }
+  }
+
+  @media (max-width: 700px) and (orientation: portrait) {
+    /* The dock is position:fixed INSIDE the header — and the header's
+       backdrop-filter would make itself the containing block for fixed
+       descendants, pinning the dock to the header's own bottom edge (on
+       top of the controls) instead of the viewport's. Portrait drops the
+       header blur (near-opaque paint instead) so the dock escapes to the
+       real bottom of the screen. */
+    .topbar {
+      backdrop-filter: none;
+      background: oklch(0.135 0.022 285 / 0.95);
+    }
+    .summary {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      margin-left: 0;
+      justify-content: center;
+      flex-wrap: wrap;
+      padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
+      background: oklch(0.135 0.022 285 / 0.74);
+      backdrop-filter: blur(14px) saturate(1.2);
+      border-top: 1px solid var(--line);
+      z-index: 30;
+    }
   }
 </style>

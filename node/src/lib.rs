@@ -29,9 +29,30 @@
 //! latter, with a Tauri-backed sink — but that put two nodes under one identity
 //! on an Always-On machine, and then nothing could connect.)
 
+// The capture/inject planes live behind the default-on `host` feature: real
+// on every desktop/server build, swapped for same-API no-op stubs (see
+// `stubs/`) on a capture-less build — iOS, whose sandbox has no PTY, screen
+// grab, input injection, or OS clipboard to offer. The stub keeps the
+// module's exact public surface so `mesh.rs` (and everything else) compiles
+// identically either way; only what a route *does* changes (capture routes
+// report failure, inject/clipboard writes drop). Viewer planes —
+// `video_decode`, the terminal output queues, opus decode — are NOT gated:
+// watching other machines is the whole point of a capture-less node.
+// Audio is gated separately (`audio-io`, included in `host`): it's the one
+// capture plane iOS can genuinely run — cpal speaks CoreAudio there — so
+// the phone builds it real while the rest stay stubs.
+#[cfg(feature = "audio-io")]
+pub mod audio;
+#[cfg(not(feature = "audio-io"))]
+#[path = "stubs/audio.rs"]
 pub mod audio;
 pub mod byte_queues;
+#[cfg(feature = "host")]
 pub mod camera_capture;
+#[cfg(feature = "host")]
+pub mod clipboard;
+#[cfg(not(feature = "host"))]
+#[path = "stubs/clipboard.rs"]
 pub mod clipboard;
 pub mod control_client;
 pub mod daemon_spawn;
@@ -41,6 +62,10 @@ pub mod files;
 /// it otherwise and runs software openh264.
 #[cfg(feature = "hwenc")]
 pub mod hwenc;
+#[cfg(feature = "host")]
+pub mod input_inject;
+#[cfg(not(feature = "host"))]
+#[path = "stubs/input_inject.rs"]
 pub mod input_inject;
 /// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
 /// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
@@ -58,7 +83,15 @@ pub(crate) mod persist;
 pub mod reboot;
 pub mod shares;
 pub mod sites;
+#[cfg(feature = "host")]
 pub mod terminal;
+#[cfg(not(feature = "host"))]
+#[path = "stubs/terminal.rs"]
+pub mod terminal;
+#[cfg(feature = "host")]
+pub mod video;
+#[cfg(not(feature = "host"))]
+#[path = "stubs/video.rs"]
 pub mod video;
 pub mod video_decode;
 /// Hardware H.264 encode via VideoToolbox — the Mac's media engine, no
@@ -66,13 +99,14 @@ pub mod video_decode;
 /// falls back to software openh264.
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
+#[cfg(feature = "host")]
 pub mod wake;
 // Windows screen capture (in-house DXGI). Declared on every target — the
 // module is internally `cfg`-gated to a stub off Windows, exactly as it was
 // when it lived in the GUI binary.
 pub mod win_capture;
 // Wayland screen capture via the ScreenCast portal — Linux only.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "host"))]
 pub mod wayland_capture;
 
 /// Where the node surfaces events. Every variant the engine emits

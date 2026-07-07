@@ -507,6 +507,21 @@ where
     run_capture_cpal(stop, route_id, false, on_frame)
 }
 
+/// Everywhere else with the audio plane built (iOS today; any BSD
+/// tomorrow): no loopback API at all, so the same honest degradation as
+/// macOS — the default input, named in the log.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn run_system_capture<F>(stop: &AtomicBool, route_id: &str, on_frame: Arc<F>) -> Result<(), String>
+where
+    F: Fn(Vec<i16>, u32) + Send + Sync + 'static,
+{
+    tracing::warn!(
+        "system-audio capture isn't available on this platform — capturing the default \
+         input for {route_id} instead"
+    );
+    run_capture_cpal(stop, route_id, false, on_frame)
+}
+
 fn run_capture_cpal<F>(
     stop: &AtomicBool,
     route_id: &str,

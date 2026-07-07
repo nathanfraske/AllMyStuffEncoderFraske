@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the generated gen/apple Info.plist by `tauri ios init/build`.
+
+     iOS gates all local-network traffic behind a user permission prompt, and
+     the prompt only appears (rather than a silent deny) when these keys are
+     present. The mesh needs them twice over: mDNS/DNS-SD discovery of peers,
+     and WebRTC ICE connecting directly to peers' LAN addresses.
+
+     Note this covers the *permission* layer only. Raw multicast sockets (the
+     engine's pure-Rust mDNS, `mdns-sd`) additionally require Apple's managed
+     `com.apple.developer.networking.multicast` entitlement on iOS 14+ — see
+     docs/MOBILE.md. -->
+<plist version="1.0">
+<dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AllMyStuff discovers your devices and connects to them directly over your local network — no cloud, no account.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_myownmesh._tcp</string>
+  </array>
+  <!-- The audio plane is real on iOS (cpal → CoreAudio). Playback needs no
+       permission, but if a route ever sources this phone's microphone, iOS
+       kills the app outright unless this string exists. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AllMyStuff uses the microphone only when you start an audio stream from this phone to one of your own devices.</string>
+  <!-- Surface the app's Documents folder — where `allmystuff.log` is written
+       (see src/logging.rs) — in the Files app (On My iPhone → AllMyStuff)
+       and in Finder's device pane, so logs are reachable without Xcode. -->
+  <key>UIFileSharingEnabled</key>
+  <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key>
+  <true/>
+</dict>
+</plist>

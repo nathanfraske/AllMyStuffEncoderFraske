@@ -67,6 +67,7 @@ import {
   fleetGrantRole,
   fleetRevokeRole,
   fleetMfaStatus,
+  isMobile,
   isTauri,
   kvmAttach,
   kvmDetach,
@@ -1741,6 +1742,26 @@ class AppStore {
       ...scan.capabilities,
       ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
+    // The phone/tablet shell: a mobile OS offers no display enumeration, so
+    // the scan reports no display *sink* — and with no local sink endpoint the
+    // console's video leg has nowhere to land and silently never wires (audio,
+    // control and clipboard all ride synthetic machine capabilities and come
+    // up fine, which is exactly the "session with no picture" a phone console
+    // showed). The webview itself is where inbound screen video renders, so
+    // "can show a screen" is a property of the running app — the same
+    // rationale as the backend's own synthetic `video-in` camera sink. Mint
+    // the sink the scan couldn't see; a desktop scan reports its real
+    // monitors and never takes this branch.
+    if (isMobile() && !matchEndpoint(this.catalog, newId, "display", "consume")) {
+      this.catalog.capabilities.push({
+        id: `${newId}:display-view`,
+        node: newId,
+        label: "Screen view",
+        media: "display",
+        flow: "sink",
+        origin: "viewer",
+      });
+    }
     // A console window scans too (it needs the local sinks to wire routes).
     // No toast — the refresh panel (and the repopulated graph) is the feedback.
   }
@@ -2471,7 +2492,7 @@ class AppStore {
   openConsole(nodeId: string) {
     const node = this.node(nodeId);
     if (!this.consoleAllowed(node, nodeId)) return;
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openConsoleWindow(nodeId);
       return;
     }
@@ -2504,7 +2525,7 @@ class AppStore {
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodecBySource = {};
     this.consoleTuneBySource = {};
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
       // onto an input that already lives in its own window shows "Return
@@ -2516,6 +2537,9 @@ class AppStore {
         void this.wireConsoleFirstVideo();
       }, 180);
     } else {
+      // The web preview and the phone shell are single-window (popouts
+      // can't exist — `popOutConsoleInput` refuses there), so there's no
+      // census to wait on: wire the picture now.
       void this.wireConsoleFirstVideo();
     }
   }
@@ -2951,7 +2975,7 @@ class AppStore {
    *  on the wire — the same ordering the console's tab switches keep, so
    *  the popout takes the H.264 lane over instead of racing it). */
   async popOutConsoleInput(capId: string) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     const cap = this.capability(capId);
     if (!cap) return;
     const key = `cap:${capId}`;
@@ -2970,7 +2994,7 @@ class AppStore {
    *  *watches* the route (the sender owns it), so nothing re-negotiates —
    *  the frames simply land in the new window instead of the tile. */
   popOutRoomShare(route: Route, member: MeshNode) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     const key = `share:${route.id}`;
     this.poppedVideos = { ...this.poppedVideos, [key]: true };
     const who = this.roomWho(member.id);
@@ -3164,7 +3188,7 @@ class AppStore {
         return;
       }
     }
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openTerminalWindow(nodeId);
       return;
     }
@@ -3185,7 +3209,7 @@ class AppStore {
    *  scrollback) carries straight on in the new window. Desktop only — a
    *  popped-out window is an OS window, which the web preview can't open. */
   popOutTerminal(hostNodeId: string, session: string) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     void openTerminalWindow(hostNodeId, session);
   }
 
@@ -3265,7 +3289,7 @@ class AppStore {
       this.toast("warn", `Files are owner/fleet only — ${node.label} isn't yours`);
       return;
     }
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openFilesWindow(nodeId);
       return;
     }
@@ -4681,7 +4705,7 @@ class AppStore {
    *  [`AppStore.joinRoomHere`]) keep the call in-page. */
   joinRoom(roomId: string) {
     if (!this.rooms.some((r) => r.id === roomId)) return;
-    if (isTauri() && !roomWindowTarget()) {
+    if (isTauri() && !isMobile() && !roomWindowTarget()) {
       void openRoomWindow(roomId);
       return;
     }
@@ -6526,7 +6550,10 @@ class AppStore {
   }
 
   async loadUpdateStatus() {
-    if (!isTauri()) return;
+    // The self-updater is desktop-only: on the phone/tablet the App Store
+    // owns updates and the updater commands aren't registered, so never
+    // invoke them there (the Settings pane shows a plain About instead).
+    if (!isTauri() || isMobile()) return;
     try {
       this.updateInfo = await updateStatus();
     } catch (e) {

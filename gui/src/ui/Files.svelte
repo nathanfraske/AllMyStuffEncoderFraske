@@ -797,6 +797,11 @@
     border-radius: 0;
     box-shadow: none;
   }
+  /* Phone-width: the in-page file manager takes the whole screen (the scrim
+     is already above the header + portrait pill dock at z 60). Safe-area
+     padding keeps the header's ✕ out from under the status bar. Zero effect
+     on desktop: env() is 0 there, and a narrow *windowed* files view is
+     already full-size. */
   @keyframes rise {
     from {
       transform: translateY(12px) scale(0.98);
@@ -1125,5 +1130,22 @@
     color: var(--accent-ink);
     font-size: 0.72rem;
     cursor: pointer;
+  }
+
+  /* Last in the stylesheet on purpose: the phone-fullscreen
+     overrides must out-cascade the base rules above (a later
+     `padding` shorthand at equal specificity wipes the safe-area
+     padding-top — exactly the under-the-notch bug). */
+  @media (max-width: 700px) {
+    .files {
+      width: 100%;
+      max-width: 100%;
+      height: 100%;
+      max-height: 100%;
+      border-radius: 0;
+    }
+    .head {
+      padding-top: calc(0.6rem + max(3.4rem, env(safe-area-inset-top, 0px)));
+    }
   }
 </style>
