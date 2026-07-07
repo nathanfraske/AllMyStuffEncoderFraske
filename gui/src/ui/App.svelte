@@ -561,7 +561,9 @@
     }
     .summary .chip,
     .actions .chip {
-      max-width: 46vw;
+      max-width: 44vw;
+      min-width: 0;
+      flex-shrink: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -586,6 +588,14 @@
      dock along the bottom edge, inside the thumb's reach, over the stage.
      The stage keeps its full height (the dock overlays it; the graph pans,
      and the drawers already float at this width). */
+  /* Phone header: the version tag is noise there — About in Settings
+     owns it (and the App Store owns updates). */
+  @media (max-width: 700px) {
+    .ver {
+      display: none;
+    }
+  }
+
   @media (max-width: 700px) and (orientation: portrait) {
     /* The dock is position:fixed INSIDE the header — and the header's
        backdrop-filter would make itself the containing block for fixed
@@ -604,12 +614,18 @@
       bottom: 0;
       margin-left: 0;
       justify-content: center;
-      flex-wrap: wrap;
+      /* One row, always — three capped chips wrapped into a double-height
+         bar; shrink-to-fit beats stacking on a phone's bottom edge. */
+      flex-wrap: nowrap;
+      min-width: 0;
       padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
       background: oklch(0.135 0.022 285 / 0.74);
       backdrop-filter: blur(14px) saturate(1.2);
       border-top: 1px solid var(--line);
       z-index: 30;
+    }
+    .summary .chip {
+      max-width: 31vw;
     }
   }
 </style>
