@@ -41,7 +41,16 @@ tauri-build = { version = "2", features = [] }
 # NDK — the engine pulls `ring` (a C build) which the NDK-free CI can't compile.
 # On-device builds (`tauri ios/android`) use the default, so they get the mesh.
 default = ["mesh"]
-mesh = ["dep:allmystuff-mesh", "dep:getrandom", "dep:tracing", "dep:tracing-subscriber"]
+mesh = [
+    "dep:allmystuff-node",
+    "dep:allmystuff-protocol",
+    "dep:myownmesh",
+    "dep:myownmesh-core",
+    "dep:ed25519-dalek",
+    "dep:data-encoding",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
 
 [dependencies]
 # No `tray-icon` / `autostart` / `single-instance` here — those are desktop
@@ -58,11 +67,27 @@ serde_json = "1"
 # the graph today, and the `MeshClient` seam the embedded engine fills in.
 allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }
 
-# The embedded engine adapter (behind `mesh`): backs the MeshClient seam with an
-# in-process myownmesh-core, so the phone joins the LAN mesh and discovers peers.
-allmystuff-mesh = { path = "../mobile-mesh", optional = true }
-# OS randomness for minting the device seed on first run (behind `mesh`).
-getrandom = { version = "0.2", optional = true }
+# The real engine — the same crate the desktop's `allmystuff-serve` daemon
+# runs — linked in-process (behind `mesh`), capture-less: with
+# `default-features = false` the capture/inject planes swap for stubs and the
+# phone is a pure viewer/controller node. See node/Cargo.toml's `host`
+# feature.
+allmystuff-node = { path = "../../node", default-features = false, optional = true }
+# The wire constants the migration shares with the node (the local-claim
+# network id); already in the tree via mobile-core.
+allmystuff-protocol = { path = "../../crates/allmystuff-protocol", optional = true }
+# The mesh daemon itself, also in-process (`embedded::start`) — iOS forbids
+# spawning it as the child process every other platform uses. Same control
+# socket, same wire protocol, inside the app sandbox. Pinned to the merge
+# that exposed the daemon as a library (which sits atop the system-DNS-SD
+# discovery backend the phone rides).
+myownmesh = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "07598b28b50b95c7b2e57232a8dd4a153510af6f", optional = true }
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "07598b28b50b95c7b2e57232a8dd4a153510af6f", optional = true }
+# One-time identity migration: derive the public key from the adapter-era
+# `device-seed.bin` and write it as the daemon's anchor file, so the phone
+# keeps its device id across the engine swap.
+ed25519-dalek = { version = "2", optional = true }
+data-encoding = { version = "2", optional = true }
 # Surface the embedded engine's `tracing` output (mDNS attach failures, peer
 # connects) on the device console (Xcode / idevicesyslog / adb logcat) *and*
 # an on-phone log file the Files app can reach — see `src/logging.rs`.

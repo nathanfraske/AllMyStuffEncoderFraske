@@ -25,14 +25,22 @@
 
 use allmystuff_mobile_core::prelude::*;
 use serde_json::{json, Value};
+#[cfg(feature = "mesh")]
+use tauri::Manager as _;
 
-// The real in-process mesh node (LAN discovery, presence → graph). Behind the
-// default `mesh` feature so the NDK-free android CI check can build the shell
-// with `--no-default-features` (the engine's C deps need the NDK on device).
+// The real stack, in-process (behind the default `mesh` feature so the
+// NDK-free android CI check can build the shell with `--no-default-features`
+// — the engine's C deps need the NDK on device): the embedded myownmesh
+// daemon + the same `allmystuff-node` engine the desktop's serve binary
+// runs, built capture-less, plus the desktop's command surface dispatching
+// straight into it. See `engine.rs` for why the phone piles the three
+// processes every other platform separates into one.
+#[cfg(feature = "mesh")]
+mod commands;
+#[cfg(feature = "mesh")]
+pub mod engine;
 #[cfg(feature = "mesh")]
 mod logging;
-#[cfg(feature = "mesh")]
-mod mesh;
 
 /// A friendly host-OS string for the node card — "Android", "iOS", or the
 /// raw target name on a desktop smoke-test build.
@@ -84,17 +92,23 @@ fn scan_self_impl(node_id: String) -> Result<Value, String> {
     }))
 }
 
+/// With the engine up, the node's own `scan_self` answers (real inventory,
+/// real device id — the same reply a desktop gives). Before it's up — and if
+/// the node scan ever fails — fall back to the mobile-core profile under the
+/// `"this"` placeholder id, which the store already re-homes when the real
+/// id arrives.
 #[cfg(feature = "mesh")]
 #[tauri::command]
-fn scan_self(state: tauri::State<'_, mesh::MeshState>) -> Result<Value, String> {
-    let node_id = state
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|m| m.device_id().to_string())
-        .unwrap_or_else(|| "this".to_string());
-    scan_self_impl(node_id)
+async fn scan_self(state: tauri::State<'_, engine::EngineState>) -> Result<Value, String> {
+    if let Ok(eng) = state.engine() {
+        if let Ok(v) = eng.request("scan_self", serde_json::json!({})).await {
+            return Ok(v);
+        }
+        if let Some(id) = eng.device_id().await {
+            return scan_self_impl(id);
+        }
+    }
+    scan_self_impl("this".to_string())
 }
 
 #[cfg(not(feature = "mesh"))]
@@ -122,28 +136,31 @@ fn client_log(line: String) {
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
 
-    // With the mesh engine: manage its state, auto-join the LAN mesh on a
-    // background thread (so the UI comes up immediately), and answer the
-    // discovery/graph commands from the live node.
+    // With the engine: boot the whole piled-together stack (embedded daemon
+    // → node engine → presence) on a background task so the UI comes up
+    // immediately, and answer the desktop's full command surface from it.
     #[cfg(feature = "mesh")]
     let builder = builder
-        .manage(mesh::MeshState::default())
+        .manage(engine::EngineState::default())
         .setup(|app| {
-            // Route the embedded engine's `tracing` diagnostics (mDNS attach
-            // failures, peer connects/drops) to the device console *and* an
-            // on-phone log file (see [`logging`]). Without a subscriber they
-            // are dropped — and "why is discovery dark" becomes undebuggable
-            // on a phone.
+            // Route the stack's `tracing` diagnostics (daemon bring-up, mDNS
+            // attach failures, peer connects/drops, route lifecycles) to the
+            // device console *and* an on-phone log file (see [`logging`]).
+            // Without a subscriber they are dropped — and "why is discovery
+            // dark" becomes undebuggable on a phone.
             match logging::init(app.handle()) {
                 Some(path) => tracing::info!("logging to {}", path.display()),
                 None => tracing::warn!("file log unavailable; stderr only"),
             }
             let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                tracing::info!("[mesh] opening the embedded engine (LAN mDNS discovery)…");
-                match mesh::join(&handle) {
-                    Ok(id) => tracing::info!("[mesh] joined the LAN mesh as {id}"),
-                    Err(e) => tracing::error!("[mesh] join failed: {e}"),
+            tauri::async_runtime::spawn(async move {
+                tracing::info!("[boot] starting the in-process stack (daemon + node engine)…");
+                match engine::boot(handle.clone()).await {
+                    Ok(eng) => {
+                        *handle.state::<engine::EngineState>().0.lock().unwrap() = Some(eng);
+                        tracing::info!("[boot] node engine up");
+                    }
+                    Err(e) => tracing::error!("[boot] engine failed to start: {e}"),
                 }
             });
             Ok(())
@@ -151,22 +168,81 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_self,
             client_log,
-            mesh::session_snapshot,
-            mesh::mesh_networks,
-            mesh::mesh_peers,
-            mesh::mesh_roster_list,
-            mesh::mesh_identity,
-            mesh::mesh_identity_set_label,
-            mesh::mesh_network_add,
-            mesh::mesh_network_remove,
-            mesh::mesh_network_update,
-            mesh::network_reconnect,
-            mesh::network_set_enabled,
-            mesh::disabled_networks,
-            mesh::mesh_network_id_generate,
-            mesh::mesh_status,
-            mesh::mesh_config_show,
-            mesh::refresh_node,
+            commands::connect_route,
+            commands::disconnect_route,
+            commands::claim_node,
+            commands::upgrade_node,
+            commands::restart_node,
+            commands::restart_device,
+            commands::refresh_node,
+            commands::set_claimable,
+            commands::set_public_claims,
+            commands::claim_via_code,
+            commands::kvm_attach,
+            commands::kvm_detach,
+            commands::kvm_mesh_add,
+            commands::kvm_mesh_remove,
+            commands::share_grant,
+            commands::share_revoke,
+            commands::share_stop,
+            commands::send_input,
+            commands::clipboard_paste,
+            commands::clipboard_pull,
+            commands::video_watch,
+            commands::video_poll,
+            commands::video_unwatch,
+            commands::video_refresh,
+            commands::video_feedback,
+            commands::tune_route,
+            commands::term_send,
+            commands::term_watch,
+            commands::term_poll,
+            commands::term_unwatch,
+            commands::terminal_sessions,
+            commands::file_send,
+            commands::file_watch,
+            commands::file_poll,
+            commands::file_unwatch,
+            commands::file_download,
+            commands::site_scan,
+            commands::site_exposed,
+            commands::site_set_exposed,
+            commands::site_map,
+            commands::site_unmap,
+            commands::site_mappings,
+            commands::site_remote_list,
+            commands::site_remote_set_exposed,
+            commands::session_snapshot,
+            commands::room_send,
+            commands::room_share_files,
+            commands::room_set_share_peers,
+            commands::room_unshare,
+            commands::owned_roster,
+            commands::fleet_leave,
+            commands::fleet_kick,
+            commands::fleet_set_name,
+            commands::fleet_grant_role,
+            commands::fleet_revoke_role,
+            commands::fleet_mfa_status,
+            commands::fleet_mfa_enroll,
+            commands::fleet_mfa_disable,
+            commands::mesh_status,
+            commands::mesh_identity,
+            commands::mesh_networks,
+            commands::mesh_peers,
+            commands::link_status,
+            commands::mesh_network_add,
+            commands::mesh_network_remove,
+            commands::mesh_network_update,
+            commands::disabled_networks,
+            commands::network_set_enabled,
+            commands::network_reconnect,
+            commands::mesh_config_show,
+            commands::mesh_network_id_generate,
+            commands::mesh_roster_approve,
+            commands::mesh_roster_remove,
+            commands::mesh_roster_list,
+            commands::mesh_identity_set_label,
         ]);
 
     // Without it (the NDK-free CI check): just the demo-capable shell commands.
