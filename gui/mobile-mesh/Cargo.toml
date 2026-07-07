@@ -37,8 +37,8 @@ ed25519-dalek = "2"
 serde_json = "1"
 thiserror = "1"
 # The engine is async; this crate owns a runtime and bridges to the sync
-# `MeshClient` surface.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+# `MeshClient` surface. `time` paces the peer-connect presence introduction.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

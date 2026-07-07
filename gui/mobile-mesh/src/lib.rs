@@ -43,7 +43,9 @@ use ed25519_dalek::SigningKey;
 use myownmesh_core::engine::attach_signaling;
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::SignalingDrivers;
-use myownmesh_core::{ChannelError, Identity, JoinedNetwork, Mesh, MeshConfig, MeshHandle};
+use myownmesh_core::{
+    ChannelError, Identity, JoinedNetwork, Mesh, MeshConfig, MeshEvent, MeshHandle, PeerEvent,
+};
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 
@@ -125,11 +127,20 @@ struct NetEntry {
     pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// A peer we've heard AllMyStuff presence from: which network it spoke on and
-/// its serialized [`NodeProfile`].
+/// A peer we've heard AllMyStuff presence from: which network it spoke on,
+/// its serialized [`NodeProfile`], and the boot id it last advertised (the
+/// event-driven gossip clock — see `NodeProfile::boot`).
 struct PeerSeen {
     network: String,
     profile: Value,
+    boot: u64,
+}
+
+/// The event-driven presence gossip: a boot id we haven't recorded for this
+/// peer means it (re)started and missed our earlier adverts — answer with our
+/// own presence directly. `0` = an older peer without the field.
+fn boot_is_new(prev: Option<u64>, boot: u64) -> bool {
+    boot != 0 && prev != Some(boot)
 }
 
 /// An embedded-engine mesh node, exposed to the phone as a [`MeshClient`] plus
@@ -139,11 +150,19 @@ pub struct EngineMesh {
     rt: Arc<Runtime>,
     handle: MeshHandle,
     device_id: String,
-    /// Joined networks by config id.
-    nets: Mutex<HashMap<String, NetEntry>>,
+    /// Joined networks by config id. `Arc` so the peer-connect introduction
+    /// task can reach the presence channels without borrowing `self`.
+    nets: Arc<Mutex<HashMap<String, NetEntry>>>,
     /// Peers heard via presence this session, across all networks. `Arc` so
     /// the per-network pump tasks hold it without borrowing `self`.
     roster: Arc<Mutex<HashMap<String, PeerSeen>>>,
+    /// The last [`NodeProfile`] the host advertised, kept so the node can
+    /// re-introduce itself on its own: to a peer that just connected, to a
+    /// [`ControlMessage::ProfileRequest`], and to an unseen boot id. Without
+    /// this the launch broadcast goes out once — to however many peers are
+    /// connected at that instant, usually zero — and the phone stays mute at
+    /// the AllMyStuff layer forever.
+    self_profile: Arc<Mutex<Option<Value>>>,
     sink: InboundSink,
 }
 
@@ -176,12 +195,73 @@ impl EngineMesh {
             .map_err(|e| EngineError::Open(e.to_string()))?;
         let device_id = handle.device_id();
 
+        let nets: Arc<Mutex<HashMap<String, NetEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let self_profile: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+        // Introduce ourselves to every peer that connects: the launch
+        // broadcast reaches only the peers connected at that instant (usually
+        // none), so without this a later-arriving desktop sees a healthy mesh
+        // peer that never speaks AllMyStuff. Mirrors the desktop node, which
+        // sends its presence directly to each newly authenticated peer.
+        {
+            let mut events = handle.events();
+            let nets = nets.clone();
+            let self_profile = self_profile.clone();
+            rt.spawn(async move {
+                loop {
+                    let ev = match events.recv().await {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return,
+                    };
+                    let MeshEvent::Peer(peer_ev) = ev else {
+                        continue;
+                    };
+                    let (network_id, peer) = match &peer_ev {
+                        PeerEvent::Authenticated {
+                            network_id,
+                            device_id,
+                            ..
+                        }
+                        | PeerEvent::Approved {
+                            network_id,
+                            device_id,
+                            ..
+                        }
+                        | PeerEvent::Unshelved {
+                            network_id,
+                            device_id,
+                            ..
+                        } => (network_id.clone(), device_id.clone()),
+                        _ => continue,
+                    };
+                    let Some(profile) = self_profile.lock().unwrap().clone() else {
+                        continue;
+                    };
+                    let chan = {
+                        let nets = nets.lock().unwrap();
+                        nets.values()
+                            .find(|e| e.net.network_id() == network_id)
+                            .map(|e| e.net.channel::<Value>(CHANNEL_PRESENCE))
+                    };
+                    let Some(chan) = chan else { continue };
+                    // Give the connection a beat to finish the approve
+                    // handshake and reach Active before the directed send.
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    if let Err(e) = chan.send_to(&peer, &profile).await {
+                        eprintln!("[mesh] presence intro to {peer} failed: {e}");
+                    }
+                }
+            });
+        }
+
         Ok(EngineMesh {
             rt,
             handle,
             device_id,
-            nets: Mutex::new(HashMap::new()),
+            nets,
             roster: Arc::new(Mutex::new(HashMap::new())),
+            self_profile,
             sink: on_inbound,
         })
     }
@@ -240,6 +320,11 @@ impl EngineMesh {
             let sink = self.sink.clone();
             let net_id = config.id.clone();
             let roster_map = self.roster.clone();
+            let self_profile = self.self_profile.clone();
+            // For the presence replies this pump owes: the gossip answer to an
+            // unseen boot id, and the answer to a ProfileRequest. Sent from
+            // inside the runtime (plain awaits — never the block_on wrappers).
+            let reply_chan = net.channel::<Value>(CHANNEL_PRESENCE);
             pumps.push(self.rt.spawn(async move {
                 loop {
                     match sub.recv().await {
@@ -247,15 +332,45 @@ impl EngineMesh {
                         // Unknown) — record presence, then hand it to the host.
                         Some(Ok(msg)) => {
                             if let Some(inbound) = classify(&chan, &msg.from, msg.body) {
-                                if let Inbound::Presence(profile) = &inbound {
-                                    if let Ok(value) = serde_json::to_value(profile.as_ref()) {
-                                        roster_map.lock().unwrap().insert(
-                                            profile.node.as_str().to_string(),
-                                            PeerSeen {
-                                                network: net_id.clone(),
-                                                profile: value,
-                                            },
-                                        );
+                                let mut reply_to: Option<String> = None;
+                                match &inbound {
+                                    Inbound::Presence(profile) => {
+                                        let peer = profile.node.as_str().to_string();
+                                        let prev =
+                                            roster_map.lock().unwrap().get(&peer).map(|s| s.boot);
+                                        // Event-driven gossip: an unseen boot id
+                                        // means the peer (re)started and missed
+                                        // our adverts — answer directly, like
+                                        // the desktop does.
+                                        if boot_is_new(prev, profile.boot) {
+                                            reply_to = Some(msg.from.clone());
+                                        }
+                                        if let Ok(value) = serde_json::to_value(profile.as_ref()) {
+                                            roster_map.lock().unwrap().insert(
+                                                peer,
+                                                PeerSeen {
+                                                    network: net_id.clone(),
+                                                    profile: value,
+                                                    boot: profile.boot,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    // "Re-send me your presence" — the peer's
+                                    // per-node refresh. A viewer must answer or
+                                    // it looks offline to anyone refreshing it.
+                                    Inbound::Control {
+                                        from,
+                                        msg: ControlMessage::ProfileRequest,
+                                    } => reply_to = Some(from.clone()),
+                                    _ => {}
+                                }
+                                if let Some(to) = reply_to {
+                                    let profile = self_profile.lock().unwrap().clone();
+                                    if let Some(profile) = profile {
+                                        if let Err(e) = reply_chan.send_to(&to, &profile).await {
+                                            eprintln!("[mesh] presence reply to {to} failed: {e}");
+                                        }
                                     }
                                 }
                                 sink(inbound);
@@ -508,6 +623,9 @@ impl MeshClient for EngineMesh {
 
     fn advertise(&self, profile: &NodeProfile) -> MeshResult<()> {
         let payload = serde_json::to_value(profile)?;
+        // Remember it: the engine re-introduces this profile on its own — to
+        // newly connected peers, ProfileRequests, and unseen boot ids.
+        *self.self_profile.lock().unwrap() = Some(payload.clone());
         let channels: Vec<_> = {
             let nets = self.nets.lock().unwrap();
             nets.values()

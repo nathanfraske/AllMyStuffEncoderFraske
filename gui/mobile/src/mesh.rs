@@ -124,7 +124,10 @@ fn advertise_self(mesh: &EngineMesh) {
         boot_id(),
         env!("CARGO_PKG_VERSION"),
     );
-    let _ = mesh.advertise(&profile);
+    match mesh.advertise(&profile) {
+        Ok(()) => eprintln!("[mesh] presence advertised as {id}"),
+        Err(e) => eprintln!("[mesh] presence advertise failed: {e}"),
+    }
 }
 
 fn emit_session(app: &AppHandle, mesh: &EngineMesh) {
