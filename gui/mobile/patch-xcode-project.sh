@@ -16,3 +16,13 @@ if ! grep -q "ENABLE_USER_SCRIPT_SANDBOXING" "$PBX"; then
 fi
 
 echo "user-script sandboxing off ($(grep -c 'ENABLE_USER_SCRIPT_SANDBOXING = NO' "$PBX") setting block(s))"
+
+# Stamp the brand mark into the generated asset catalog — init fills it
+# with the default Tauri icon. `tauri icon` regenerates every iOS slot
+# (and the desktop set, byte-identical) from the 512x512 source.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if command -v pnpm >/dev/null 2>&1; then
+  (cd "$DIR" && pnpm tauri icon ../src-tauri/icons/icon.png) \
+    && echo "app icon stamped into gen/apple" \
+    || echo "icon stamp failed — run: cd $DIR && pnpm tauri icon ../src-tauri/icons/icon.png" >&2
+fi
