@@ -132,12 +132,6 @@
   // window's keyboard reaches the remote (window-level setFocus alone doesn't
   // push document focus into the webview on hover).
   let stageEl = $state<HTMLElement | null>(null);
-  // The viewer-drawn remote cursor. We always render a cursor at the position
-  // we're commanding, because the captured video can't be relied on to carry
-  // one: Windows' DXGI duplication omits the OS cursor entirely, and a Mac
-  // hides its cursor when it's driven with no local pointer. Positioned
-  // imperatively (see updateCursorOverlay) since `virt` isn't reactive state.
-  let cursorEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
@@ -1279,36 +1273,6 @@
     const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
-  // Keep the remote cursor overlay pinned to the position we're commanding.
-  // Same client-space math as followCursor (getBoundingClientRect reflects the
-  // zoom transform), made relative to the stage so a windowed console's own
-  // transform can't offset it. `virt` isn't reactive, so callers invoke this
-  // wherever the cursor moves; the $effect below re-runs it on reactive view/
-  // region/frame changes (after the DOM applies them).
-  function updateCursorOverlay() {
-    const el = cursorEl;
-    const c = canvasEl;
-    const s = stageEl;
-    if (!el || !c || !s || !hasFrame) return;
-    const r = c.getBoundingClientRect();
-    const sb = s.getBoundingClientRect();
-    const ar = activeRegion;
-    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
-    el.style.transform = `translate(${x}px, ${y}px)`;
-  }
-  // Reactive refresh of the cursor overlay: the view transform, the letterbox
-  // region, the frame size, and control on/off all move it or (un)mount it.
-  $effect(() => {
-    void view;
-    void activeRegion;
-    void hasFrame;
-    void stagePointerActive;
-    void frameW;
-    void frameH;
-    void kbInset;
-    updateCursorOverlay();
-  });
   // The soft keyboard opening (or closing) recentres the cursor into the space
   // that's left, keeping the current zoom — so the field being typed into is
   // visible above the keys instead of behind them.
@@ -1340,7 +1304,6 @@
         sendVirt();
       }
       followCursor();
-      updateCursorOverlay();
     },
     button: (button, down) => {
       if (down) {
@@ -1400,7 +1363,6 @@
     // An absolute mouse move re-seats the trackpad's virtual cursor too.
     virt.x = p.x;
     virt.y = p.y;
-    updateCursorOverlay();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
@@ -1477,7 +1439,6 @@
     // Land the cursor exactly where the click happened, then click.
     virt.x = p.x;
     virt.y = p.y;
-    updateCursorOverlay();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -1725,22 +1686,6 @@
                 node,
               )}"
             ></canvas>
-          {/if}
-          {#if hasFrame && stagePointerActive}
-            <!-- The remote cursor, drawn here at the position we're
-                 commanding — the video itself can't be trusted to carry one
-                 (Windows DXGI omits it; a driven Mac hides its own). -->
-            <div class="remote-cursor" bind:this={cursorEl} aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 20 20">
-                <path
-                  d="M1 1 L1 15 L5 11.5 L7.6 18 L10.4 17 L7.9 10.7 L13.5 10.7 Z"
-                  fill="#fff"
-                  stroke="#000"
-                  stroke-width="1.4"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            </div>
           {/if}
           {#if hasFrame}
             <!-- the canvas above is the stage; a host-reported stall (the
@@ -2318,24 +2263,6 @@
   .live.waiting {
     visibility: hidden;
     position: absolute;
-  }
-  /* The viewer-drawn remote cursor. Absolutely placed within the stage (never
-     position:fixed — a windowed console's own transform would reparent that),
-     moved by a transform set imperatively. Its own tip is the hot point. */
-  .remote-cursor {
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 20px;
-    height: 20px;
-    pointer-events: none;
-    z-index: 8; /* over the video + host-status, under the zoom chip / bar */
-    will-change: transform;
-  }
-  .remote-cursor svg {
-    display: block;
-    /* Legible on any wallpaper without a second element. */
-    filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.55));
   }
   .screen {
     width: calc(100% - 1.6rem);
