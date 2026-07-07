@@ -447,6 +447,13 @@
   // the way in; control dropping (refused route, remote revoked) takes
   // the strip down with it.
   let keysOpen = $state(false);
+  // How many CSS px the OS keyboard (or any bottom overlay) is covering —
+  // `window.innerHeight - visualViewport.height - offsetTop`, the same
+  // measure ConsoleKeys uses to float its strip. Zero on desktop (the
+  // visual viewport equals the layout viewport). Drives the stage's bottom
+  // inset so the video recenters into the space ABOVE the keyboard instead
+  // of hiding behind it. Tracked in onMount.
+  let kbInset = $state(0);
   function toggleKeys() {
     if (!keysOpen && !app.consoleControl) toggleControl();
     keysOpen = !keysOpen;
@@ -577,10 +584,9 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
-      // Auto aspect: measure the frame's active region (letterbox bars) until
-      // it locks, so the mouse maps over the desktop of a non-16:9 source. A
-      // manual Aspect pick owns the region instead (see the $effect).
-      if (stagePointerActive && aspectChoice === "auto") detectActiveRegion();
+      // (Letterbox auto-detect no longer runs here — it samples the decoded
+      // frame from the paint path via maybeDetect(), so it never reads the
+      // live canvas and can't trigger Chromium's CPU-raster demotion.)
       // Every other tick, report our decode health back to the streamer so
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
@@ -595,9 +601,26 @@
       // close is held until they're on the wire (see onThisWindowClose).
       void onThisWindowClose(() => void endSession()).then((u) => (unlistenClose = u));
     }
+    // Track the keyboard's bite out of the viewport so the stage can
+    // recenter the video above it. `resize` fires when the OS keyboard
+    // shows/hides; `scroll` covers iOS shifting the visual viewport while
+    // it's up. No-op on desktop (vv.height === innerHeight → 0).
+    const vv = window.visualViewport;
+    const onViewport = () => {
+      kbInset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+    };
+    if (vv) {
+      vv.addEventListener("resize", onViewport);
+      vv.addEventListener("scroll", onViewport);
+      onViewport();
+    }
     return () => {
       unlistenClose?.();
       clearInterval(fpsTimer);
+      if (vv) {
+        vv.removeEventListener("resize", onViewport);
+        vv.removeEventListener("scroll", onViewport);
+      }
     };
   });
 
@@ -737,6 +760,9 @@
           paint(frame.displayWidth, frame.displayHeight, (ctx) =>
             ctx.drawImage(frame, 0, 0),
           );
+          // Letterbox detection samples this frame directly (never the live
+          // canvas). VideoFrame is a valid drawImage source.
+          maybeDetect(frame);
         }
       } finally {
         frame.close();
@@ -812,6 +838,7 @@
           try {
             const bmp = await createImageBitmap(blob);
             paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            maybeDetect(bmp); // sample this bitmap, not the live canvas
             bmp.close();
           } catch {
             // A torn frame decodes as nothing; the next one stands alone.
@@ -1029,31 +1056,38 @@
   const DETECT_W = 480;
   const DETECT_H = 270;
   let detectScratch: HTMLCanvasElement | null = null;
+  // Throttle for the frame-sourced detector below (~1 Hz, the old health-tick
+  // cadence) since it now runs from the paint path, which fires per frame.
+  let lastDetectAt = 0;
 
-  // Measure the frame's active region: mirror the decoded canvas into the
-  // small scratch surface and scan that for symmetric black
-  // letterbox/pillarbox bars. Cheap (one downscaled readback), and it stops
-  // once locked. Conservative: only crops when clear bars sit on BOTH opposite
-  // edges and are near-symmetric (a real letterbox), so ordinary dark content is
-  // never mistaken for a bar; otherwise it maps over the whole frame.
-  function detectActiveRegion() {
+  // A decoded frame just painted — maybe measure its letterbox. Runs from the
+  // paint path (not a canvas read) so the detector NEVER touches the live
+  // presentation canvas: Chromium permanently demotes an accelerated 2D
+  // canvas to CPU raster after just two getImageData readbacks when it wasn't
+  // created willReadFrequently (and ours can't be — paint() fixed its context
+  // to plain-GPU on the first frame). A demoted 4K canvas turns every
+  // subsequent drawImage of a hardware-decoded frame into a ~33 MB GPU→CPU
+  // copy — the exact "video is choppy and ~100 ms behind while the mouse is
+  // instant" regression. Sampling the frame we were handed sidesteps the
+  // canvas entirely. `src` is the VideoFrame / ImageBitmap that was painted.
+  function maybeDetect(src: CanvasImageSource) {
+    if (detectLocked || aspectChoice !== "auto" || !stagePointerActive) return;
+    const now = performance.now();
+    if (now - lastDetectAt < 1000) return;
+    lastDetectAt = now;
+    detectActiveRegion(src);
+  }
+
+  // Measure the frame's active region: mirror the decoded FRAME into the small
+  // CPU-side scratch surface (created once, willReadFrequently from birth) and
+  // scan that one downscaled readback for symmetric black letterbox/pillarbox
+  // bars. The live presentation canvas is never read or drawn-from, so it stays
+  // GPU-accelerated for the whole session. Conservative: only crops when clear
+  // bars sit on BOTH opposite edges and are near-symmetric (a real letterbox),
+  // so ordinary dark content is never mistaken for a bar; otherwise it maps
+  // over the whole frame.
+  function detectActiveRegion(src: CanvasImageSource) {
     if (detectLocked) return;
-    const c = canvasEl;
-    if (!c || !c.width || !c.height || !hasFrame) return;
-    // NEVER read pixels off the live presentation canvas. Chromium demotes
-    // an accelerated 2D canvas to CPU raster after just TWO readbacks
-    // (kFallbackToCPUAfterReadbacks) when it wasn't created with
-    // willReadFrequently — and ours can't be (paint() made its context
-    // plain-GPU on the first frame; context attributes are fixed then, so a
-    // willReadFrequently re-get here is silently ignored). The demotion is
-    // permanent for the element: every subsequent drawImage of a
-    // hardware-decoded 4K frame becomes a ~33 MB GPU→CPU copy per frame,
-    // which is exactly the "video is choppy and seconds behind while the
-    // mouse is instant" console. Instead, mirror the frame into a small
-    // CPU-side scratch canvas (created once, willReadFrequently from
-    // birth) and do ONE readback of that: canvas→canvas drawImage stays on
-    // the GPU, all outputs are 0..1 fractions so the ~0.2%-of-width
-    // precision loss is invisible to the pointer mapping.
     if (!detectScratch) {
       detectScratch = document.createElement("canvas");
       detectScratch.width = DETECT_W;
@@ -1072,7 +1106,7 @@
     let y1 = h;
     let found = false; // did the frame carry real (non-black) content this pass?
     try {
-      ctx.drawImage(c, 0, 0, w, h);
+      ctx.drawImage(src, 0, 0, w, h);
       const data = ctx.getImageData(0, 0, w, h).data;
       const bright = (x: number, y: number) => {
         const px = (y * w + x) * 4;
@@ -1219,28 +1253,19 @@
   function sendVirt() {
     app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
   }
-  // The TeamViewer camera: zoomed in, the viewport follows the cursor —
-  // steer it toward the edge of what's visible and the picture pans to
-  // keep it inside a comfortable margin. The whole desktop is reachable
-  // with one thumb, no pan gesture needed.
-  function followCursor() {
+  // The TeamViewer camera: zoomed in, a drag pulls the picture DIRECTLY.
+  // The view tracks the finger from the first pixel — it pans by exactly
+  // the cursor's on-screen travel (`dx`/`dy`, which in trackpad mode is
+  // 1:1 with the finger), which holds the cursor where it sits on screen
+  // while the desktop scrolls under it. No waiting for the cursor to reach
+  // a screen-edge margin first. `setView`'s clamp stops the pan at the
+  // content edges; there the view can't move, so the cursor covers the
+  // last stretch into the corner on its own — the whole desktop stays
+  // reachable with one thumb, exactly as before, just without the lag
+  // before the picture starts moving.
+  function followCursor(dx: number, dy: number) {
     if (view.scale <= 1.001) return;
-    const c = canvasEl;
-    const s = stageEl;
-    if (!c || !s || !hasFrame) return;
-    const r = c.getBoundingClientRect();
-    const box = s.getBoundingClientRect();
-    const ar = activeRegion;
-    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
-    const m = Math.min(56, box.width / 5, box.height / 5);
-    let dx = 0;
-    let dy = 0;
-    if (px < box.left + m) dx = box.left + m - px;
-    else if (px > box.right - m) dx = box.right - m - px;
-    if (py < box.top + m) dy = box.top + m - py;
-    else if (py > box.bottom - m) dy = box.bottom - m - py;
-    if (dx || dy) setView({ scale: view.scale, x: view.x + dx, y: view.y + dy });
+    setView({ scale: view.scale, x: view.x - dx, y: view.y - dy });
   }
   const touchMouse = makeTouchMouse({
     active: () => stagePointerActive,
@@ -1262,7 +1287,7 @@
         lastMoveAt = now;
         sendVirt();
       }
-      followCursor();
+      followCursor(dx, dy);
     },
     button: (button, down) => {
       if (down) {
@@ -1607,6 +1632,7 @@
         bind:this={stageEl}
         class="stage"
         class:grabbing={stagePointerActive}
+        style:bottom={kbInset > 0 ? `${kbInset}px` : undefined}
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
