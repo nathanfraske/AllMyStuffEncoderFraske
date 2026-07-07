@@ -472,9 +472,14 @@ pnpm tauri ios build             # -> .ipa
 
 `patch-xcode-project.sh` re-applies what `tauri ios init` resets: it turns
 Xcode 16's user-script sandboxing off (Tauri's build phase writes outside the
-sandbox, so a sandboxed build dies with "Operation not permitted") and stamps
+sandbox, so a sandboxed build dies with "Operation not permitted"), stamps
 the full-bleed brand icon (`gui/src-tauri/icons/icon-ios.png`) into the
-generated asset catalog, which init fills with the default Tauri icon.
+generated asset catalog, which init fills with the default Tauri icon, and
+copies `ios/HideKeyboardAccessory.m` into the generated `Sources/` folder — a
+self-installing `+load` swizzle that removes the keyboard's prev/next/Done
+accessory bar over WKWebView text fields. With Xcode 16 synchronized groups
+that's enough; on an older project layout, add the file to the app target once
+by hand (it appears under `gen/apple/Sources/`). Delete it to get the bar back.
 
 `tauri android/ios init` regenerates the native Gradle/Xcode projects under
 `gen/` from the shell + config, so they're intentionally **not** committed.
