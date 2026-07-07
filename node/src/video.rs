@@ -520,22 +520,20 @@ pub struct RecvFeedback {
 // viewer's new picks change the conditions, and the controller re-learns.
 
 /// Master switch for the receiver-driven resolution auto-adaptation:
-/// **on by default**, `ALLMYSTUFF_AUTO_ADAPT=0` kills it. It was off for a
-/// release ("fought the manual slider") — and that release is exactly when
-/// the fast-as-LAN console turned into a standing half-second-behind feed:
-/// this valve is the only thing that drains a viewer whose decoder can't
-/// hold the encode rate (the queue between them *is* the display delay),
-/// and with it gone the host kept pushing native 4K60 into the backlog
-/// forever. The slider fight is solved by scope, not by the kill switch:
-/// the controller only ever acts on a stream whose Res dial is **Auto**
-/// (`note_feedback` skips the feedback→step call when the viewer pinned
-/// `max_edge`), and a manual retune replaces the route — fresh
-/// [`AutoAdapt`], cap gone — so an explicit pick always wins outright.
-/// The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a separate,
-/// benign recovery lever and stays on regardless.
+/// **OFF by default** — set `ALLMYSTUFF_AUTO_ADAPT=1` to opt in. The stream
+/// runs at its full requested resolution and never silently steps itself
+/// down: the deal is native quality, and quality is the user's to pick (the
+/// Speed↔Quality slider / Res pills), not the stream's to quietly lower. The
+/// real cause of the "standing behind" feed was the viewer-side canvas
+/// demotion (fixed) and a too-aggressive decode-queue valve (removed), not
+/// the absence of this lever — so it earns its keep only as an explicit
+/// opt-in, never as a default that can soften a healthy 4K60. The
+/// [`AutoAdapt`] logic below stays intact and unit-tested for when it's
+/// turned on. The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a
+/// separate, benign recovery lever and stays on regardless.
 fn auto_adapt_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_AUTO_ADAPT", 1) != 0);
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_AUTO_ADAPT", 0) != 0);
     *ON
 }
 
