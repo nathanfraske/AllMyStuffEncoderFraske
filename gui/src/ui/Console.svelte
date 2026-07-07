@@ -797,11 +797,6 @@
     // VideoDecoder exist" test chose a decoder that can only die.
     let bornDeadDrops = 0;
 
-    // Latency valve: skipping deltas until the next key unit once the
-    // decode queue backs up (deltas chain — a compressed queue can only
-    // be abandoned wholesale, never thinned).
-    let dropUntilKey = false;
-
     const dropDecoder = (why: unknown) => {
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
@@ -855,33 +850,17 @@
         paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
         return;
       }
-      // H.264 — decode entry is a key unit; deltas before one wait.
+      // H.264 — decode entry is a key unit; deltas before one wait. Every
+      // access unit is fed straight to the decoder; the freshest decoded
+      // frame wins at paint time (output callback below supersedes any
+      // earlier pending frame, one rAF blits the newest). No compressed-queue
+      // valve here: a hardware decoder keeps up with 4K60 natively, and the
+      // one that tried to bound the queue by force-dropping to keyframes
+      // thrashed a normally-pipelined decoder down to ~15 fps (and could trip
+      // the software-decode fallback). If a decoder genuinely can't keep up,
+      // the stall ladder below steps it down, and the sender's auto-adapt
+      // drops resolution — neither needs per-frame keyframe forcing.
       inCount += 1;
-      // Latency valve: a standing decodeQueueSize IS display delay (16.7ms
-      // per queued frame at 60), and the stall ladder can't see it — paints
-      // stay plentiful while the queue just sits deep, or grows without
-      // bound whenever the decoder runs slightly under the arrival rate.
-      // Past ~4 queued AUs (>66ms), stop feeding: deltas reference each
-      // other, so skip everything up to the next key unit and pull an IDR
-      // forward (askRefresh rate-limits at 300ms and the backend throttles
-      // again). Display lag stays bounded at ~4 frames + one IDR round trip
-      // instead of accumulating for the rest of the session.
-      if (dropUntilKey) {
-        if (!f.key) {
-          askRefresh();
-          return;
-        }
-        dropUntilKey = false;
-      } else if (
-        !f.key &&
-        decoder &&
-        decoder.state !== "closed" &&
-        decoder.decodeQueueSize > 4
-      ) {
-        dropUntilKey = true;
-        askRefresh();
-        return;
-      }
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
         codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";
@@ -1253,19 +1232,30 @@
   function sendVirt() {
     app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
   }
-  // The TeamViewer camera: zoomed in, a drag pulls the picture DIRECTLY.
-  // The view tracks the finger from the first pixel — it pans by exactly
-  // the cursor's on-screen travel (`dx`/`dy`, which in trackpad mode is
-  // 1:1 with the finger), which holds the cursor where it sits on screen
-  // while the desktop scrolls under it. No waiting for the cursor to reach
-  // a screen-edge margin first. `setView`'s clamp stops the pan at the
-  // content edges; there the view can't move, so the cursor covers the
-  // last stretch into the corner on its own — the whole desktop stays
-  // reachable with one thumb, exactly as before, just without the lag
-  // before the picture starts moving.
-  function followCursor(dx: number, dy: number) {
+  // The TeamViewer camera: zoomed in, the view keeps the remote cursor
+  // CENTERED. Every steer pans the picture so the cursor slides back to the
+  // middle of the stage — from the first pixel of a drag, so the picture
+  // tracks the cursor directly instead of waiting for it to reach a
+  // screen-edge margin. `setView`'s clamp stops the pan at the content
+  // edges; there the picture can't scroll any further, so the cursor rides
+  // off-center into that edge/corner on its own — "centered as much as it
+  // can, until you reach the edges". The whole desktop stays reachable with
+  // one thumb.
+  function followCursor() {
     if (view.scale <= 1.001) return;
-    setView({ scale: view.scale, x: view.x - dx, y: view.y - dy });
+    const c = canvasEl;
+    const s = stageEl;
+    if (!c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const box = s.getBoundingClientRect();
+    const ar = activeRegion;
+    // Where the cursor sits on screen right now (through the active region
+    // and the current zoom), and where the stage centre is.
+    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
   const touchMouse = makeTouchMouse({
     active: () => stagePointerActive,
@@ -1287,7 +1277,7 @@
         lastMoveAt = now;
         sendVirt();
       }
-      followCursor(dx, dy);
+      followCursor();
     },
     button: (button, down) => {
       if (down) {
