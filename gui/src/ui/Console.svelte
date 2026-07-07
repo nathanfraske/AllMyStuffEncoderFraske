@@ -2235,8 +2235,7 @@
     left: 0.7rem;
     bottom: calc(0.7rem + env(safe-area-inset-bottom, 0px));
     border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(4px);
+    background: rgba(8, 8, 14, 0.85);
     color: #fff;
     border-radius: var(--r-pill);
     padding: 0.28rem 0.6rem;
@@ -2271,8 +2270,11 @@
     gap: 2px;
     border-radius: 12px;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
-    background: oklch(0.19 0.028 285 / 0.86);
-    backdrop-filter: blur(10px);
+    /* Near-opaque paint, NO backdrop-filter: the bar floats over a
+       canvas repainting at stream rate, and a blur here makes the
+       compositor re-blur that region every video frame — measured as a
+       real desktop cost. Opaque-ish paint composites once. */
+    background: oklch(0.19 0.028 285 / 0.96);
     box-shadow: var(--shadow-md);
     transition: transform 0.3s ease, opacity 0.3s ease;
     scrollbar-width: none;
@@ -2323,8 +2325,8 @@
   .bar-tab {
     position: absolute;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
-    background: oklch(0.19 0.028 285 / 0.8);
-    backdrop-filter: blur(10px);
+    /* Same rule as the bar: no per-frame compositor blur over live video. */
+    background: oklch(0.19 0.028 285 / 0.92);
     color: #9a93b8;
     font-size: 0.85rem;
     line-height: 1;
@@ -2493,8 +2495,7 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
-    background: oklch(0.18 0.027 285 / 0.96);
-    backdrop-filter: blur(12px);
+    background: oklch(0.18 0.027 285 / 0.98);
     border: 1px solid #322c47;
     border-radius: var(--r-md);
     box-shadow: var(--shadow-lg);
