@@ -6550,7 +6550,10 @@ class AppStore {
   }
 
   async loadUpdateStatus() {
-    if (!isTauri()) return;
+    // The self-updater is desktop-only: on the phone/tablet the App Store
+    // owns updates and the updater commands aren't registered, so never
+    // invoke them there (the Settings pane shows a plain About instead).
+    if (!isTauri() || isMobile()) return;
     try {
       this.updateInfo = await updateStatus();
     } catch (e) {

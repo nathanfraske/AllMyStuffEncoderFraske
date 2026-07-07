@@ -4,6 +4,7 @@
   // Updates and Fleet panes. A left tab rail, a content area on the right;
   // the top-bar gear opens it, the Networks button deep-links to a pane.
   import { app, type SettingsTab } from "../store.svelte";
+  import { isMobile } from "../tauri";
   import NetworksSection from "./settings/NetworksSection.svelte";
   import VenuesSection from "./settings/VenuesSection.svelte";
   import UpdatesSection from "./settings/UpdatesSection.svelte";
@@ -22,7 +23,9 @@
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "devices", label: "Devices", icon: "🖥" },
     { id: "always_on", label: "Always On", icon: "♾️" },
-    { id: "updates", label: "Updates", icon: "⬆️" },
+    // On the phone/tablet the App Store owns updates, so the pane is a plain
+    // "About" (see UpdatesSection) — the nav entry matches.
+    { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
   ];
 
   function close() {
@@ -169,5 +172,44 @@
     min-width: 0;
     overflow-y: auto;
     padding: 1.5rem 1.6rem;
+  }
+
+  /* Phone-width windows: the side rail would squeeze the section content
+     into a sliver, so the panel stacks — the rail becomes a horizontal,
+     scrollable tab strip across the top and the content takes the full
+     width below it. Same DOM, pure CSS. */
+  @media (max-width: 700px) {
+    .panel {
+      flex-direction: column;
+    }
+    .rail {
+      width: 100%;
+      flex-direction: row;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.55rem 0.6rem;
+      /* The ✕ floats in the panel's top-right corner — keep the strip's
+         tail from scrolling underneath it. */
+      padding-right: 3rem;
+      border-right: none;
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .rail-title {
+      display: none;
+    }
+    .tab {
+      flex-shrink: 0;
+      /* The active marker moves from the left edge to the bottom edge. */
+      border-left: none;
+      border-bottom: 2px solid transparent;
+    }
+    .tab.active {
+      border-bottom-color: var(--accent);
+    }
+    .content {
+      padding: 1rem 1rem 1.25rem;
+    }
   }
 </style>

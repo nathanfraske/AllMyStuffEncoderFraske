@@ -1507,6 +1507,29 @@
     box-shadow: none;
     animation: none;
   }
+  /* Phone-width: the in-page console takes the whole screen — closing it is
+     the way back to the graph. The scrim already sits above the header and
+     the portrait pill dock (z 60 > 30); safe-area padding keeps the title
+     bar (and its ✕) clear of the status bar, and the control bar clear of
+     the home indicator. Zero effect on desktop: env() is 0 there, and a
+     narrow *windowed* console is already 100%×100%. */
+  @media (max-width: 700px) {
+    .scrim {
+      padding: 0;
+    }
+    .console {
+      width: 100%;
+      height: 100%;
+      border: none;
+      border-radius: 0;
+    }
+    .bar {
+      padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
+    }
+    .controls {
+      padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
+    }
+  }
   @keyframes rise {
     from {
       transform: translateY(14px) scale(0.98);

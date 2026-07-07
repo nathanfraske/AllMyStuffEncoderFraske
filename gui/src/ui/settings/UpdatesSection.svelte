@@ -4,15 +4,25 @@
   // what's staged, and check / apply on demand.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
-  import { isTauri } from "../../tauri";
+  import { appVersion, isMobile, isTauri } from "../../tauri";
 
   const s = $derived(app.updateInfo);
   const pkg = $derived(s?.install_kind === "package_manager");
   const web = !isTauri();
+  // The phone/tablet shell: the App Store owns updates there, so this pane
+  // renders as a plain About — no updater controls, and no updater invokes
+  // (the commands aren't registered in the mobile crate).
+  const mobile = isMobile();
+  // The running build's version, for the mobile About line. (On the phone
+  // this reports the mobile crate's version.)
+  let version = $state<string | null>(null);
   // The result of the last "Check now", shown inline here instead of as a toast.
   const checkResult = $derived(app.checkOutcomeText(app.updateOutcome));
 
-  onMount(() => void app.loadUpdateStatus());
+  onMount(() => {
+    if (mobile) void appVersion().then((v) => (version = v));
+    else void app.loadUpdateStatus();
+  });
 
   function fmtWhen(at: number | null | undefined): string {
     if (!at) return "never";
@@ -22,9 +32,16 @@
 </script>
 
 <div class="section">
-  <h3>Updates</h3>
+  <h3>{mobile ? "About" : "Updates"}</h3>
 
-  {#if web}
+  {#if mobile}
+    <section class="block head">
+      <div>
+        <div class="ver">AllMyStuff {#if version}<b>{version}</b>{/if}</div>
+        <div class="hint">Updates are delivered through the App Store.</div>
+      </div>
+    </section>
+  {:else if web}
     <p class="hint">Update controls appear in the desktop app — this is the in-browser preview.</p>
   {:else if !s}
     <p class="hint">Reading update status…</p>
