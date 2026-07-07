@@ -197,13 +197,4 @@
     width: 100%;
     justify-content: center;
   }
-
-  /* Portrait phones dock the anchor pills along the *bottom* edge (see
-     App.svelte's .summary rules) — the menu flips to open upward. */
-  @media (max-width: 700px) and (orientation: portrait) {
-    .venue-menu {
-      top: auto;
-      bottom: calc(100% + 0.45rem);
-    }
-  }
 </style>

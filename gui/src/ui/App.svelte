@@ -161,9 +161,14 @@
           <NetworkMenu />
         {/if}
       </span>
+    </div>
+
+    <div class="actions">
       <!-- The venues pill: the sibling of the meshes pill, for the venues your
            meshes call out at. Same dropdown-with-switches shape; it shimmers
-           when driving a mesh just turned a venue back on. -->
+           when driving a mesh just turned a venue back on. It lives with the
+           header controls (not the status pills) so portrait phones keep it
+           up top when the pills dock along the bottom edge. -->
       <span class="net-anchor">
         <button
           class="chip venue"
@@ -189,9 +194,6 @@
           <VenueMenu />
         {/if}
       </span>
-    </div>
-
-    <div class="actions">
       <!-- The clock-skew warning: this machine's clock is well out of line
            with its peers' (estimated passively from traffic that was already
            flowing). Persistent while it holds — a wrong clock quietly breaks
@@ -557,7 +559,8 @@
     .tag {
       display: none;
     }
-    .summary .chip {
+    .summary .chip,
+    .actions .chip {
       max-width: 46vw;
       overflow: hidden;
       text-overflow: ellipsis;
