@@ -132,6 +132,13 @@
   // window's keyboard reaches the remote (window-level setFocus alone doesn't
   // push document focus into the webview on hover).
   let stageEl = $state<HTMLElement | null>(null);
+  // A thin aiming crosshair at the position we're COMMANDING (`virt`) — drawn
+  // instantly, with none of the video's latency, so you can line things up
+  // precisely instead of guessing where the cursor will land. It complements
+  // the real remote cursor in the video (which shows where the cursor actually
+  // is, a beat behind), rather than replacing it. Positioned imperatively (see
+  // updateCrosshair) since `virt` isn't reactive state.
+  let crosshairEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
@@ -1273,6 +1280,33 @@
     const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
+  // Pin the aiming crosshair to the commanded position. Same client-space math
+  // as followCursor (getBoundingClientRect reflects the zoom transform), made
+  // relative to the stage so a windowed console's own transform can't offset
+  // it. `virt` isn't reactive, so callers invoke this wherever the cursor
+  // moves; the $effect below re-runs it on reactive view/region/frame changes.
+  function updateCrosshair() {
+    const el = crosshairEl;
+    const c = canvasEl;
+    const s = stageEl;
+    if (!el || !c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const sb = s.getBoundingClientRect();
+    const ar = activeRegion;
+    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    el.style.transform = `translate(${x}px, ${y}px)`;
+  }
+  $effect(() => {
+    void view;
+    void activeRegion;
+    void hasFrame;
+    void stagePointerActive;
+    void frameW;
+    void frameH;
+    void kbInset;
+    updateCrosshair();
+  });
   // The soft keyboard opening (or closing) recentres the cursor into the space
   // that's left, keeping the current zoom — so the field being typed into is
   // visible above the keys instead of behind them.
@@ -1304,6 +1338,7 @@
         sendVirt();
       }
       followCursor();
+      updateCrosshair();
     },
     button: (button, down) => {
       if (down) {
@@ -1363,6 +1398,7 @@
     // An absolute mouse move re-seats the trackpad's virtual cursor too.
     virt.x = p.x;
     virt.y = p.y;
+    updateCrosshair();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
@@ -1439,6 +1475,7 @@
     // Land the cursor exactly where the click happened, then click.
     virt.x = p.x;
     virt.y = p.y;
+    updateCrosshair();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -1686,6 +1723,21 @@
                 node,
               )}"
             ></canvas>
+          {/if}
+          {#if hasFrame && stagePointerActive}
+            <!-- Thin aiming crosshair at the commanded position (crosshairEl):
+                 where the cursor SHOULD be, drawn with no video latency so you
+                 can line things up precisely. -->
+            <div class="crosshair" bind:this={crosshairEl} aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24">
+                <g stroke="#fff" stroke-width="1" shape-rendering="crispEdges">
+                  <line x1="12" y1="1.5" x2="12" y2="9" />
+                  <line x1="12" y1="15" x2="12" y2="22.5" />
+                  <line x1="1.5" y1="12" x2="9" y2="12" />
+                  <line x1="15" y1="12" x2="22.5" y2="12" />
+                </g>
+              </svg>
+            </div>
           {/if}
           {#if hasFrame}
             <!-- the canvas above is the stage; a host-reported stall (the
@@ -2263,6 +2315,28 @@
   .live.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* The aiming crosshair. Absolutely placed within the stage (never
+     position:fixed — a windowed console's own transform would reparent that),
+     centred on the aim point and moved by a transform set imperatively. Thin
+     white lines with a dark halo so they read on any wallpaper; a small centre
+     gap keeps the exact target pixel visible. */
+  .crosshair {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 24px;
+    height: 24px;
+    margin-left: -12px;
+    margin-top: -12px;
+    pointer-events: none;
+    z-index: 8; /* over the video + host-status, under the zoom chip / bar */
+    will-change: transform;
+  }
+  .crosshair svg {
+    display: block;
+    filter: drop-shadow(0 0 0.6px rgba(0, 0, 0, 0.9));
+    opacity: 0.85;
   }
   .screen {
     width: calc(100% - 1.6rem);
