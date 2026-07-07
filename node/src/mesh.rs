@@ -9236,7 +9236,11 @@ mod tests {
         assert_eq!(map.get("carol"), Some(&LinkClass::Wan));
         assert_eq!(map.get("dave"), None);
         assert_eq!(map.get("erin"), None);
-        assert_eq!(changed.len(), 3, "every first classification reports as a change");
+        assert_eq!(
+            changed.len(),
+            3,
+            "every first classification reports as a change"
+        );
 
         // A transient unknown (the daemon clears the pair on an ICE blip)
         // must KEEP the learned class — never downgrade a stream on a wobble.

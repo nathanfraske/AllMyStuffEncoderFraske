@@ -389,7 +389,9 @@ pub struct Tune {
 
 impl Tune {
     fn fps(&self) -> u32 {
-        self.fps.unwrap_or_else(|| target_fps(self.link)).clamp(1, 120)
+        self.fps
+            .unwrap_or_else(|| target_fps(self.link))
+            .clamp(1, 120)
     }
     fn h264_edge(&self) -> u32 {
         self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
@@ -2578,7 +2580,10 @@ mod tests {
         assert_eq!(lan.fps(), 60);
         assert_eq!(Tune::default().fps(), 30);
         assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Lan), 79_626_240);
-        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Unknown), 40_000_000);
+        assert_eq!(
+            h264_bitrate_for(3840, 2160, 60, LinkClass::Unknown),
+            40_000_000
+        );
         assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Wan), 40_000_000);
         // An explicit viewer Tune bypasses the gate on any link.
         let pinned = Tune {
