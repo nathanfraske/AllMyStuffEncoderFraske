@@ -1120,7 +1120,7 @@ dependencies = [
 [[package]]
 name = "myownmesh-core"
 version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=d468fca0f614a24a07f8dd2fe4fa4b316fdcb931#d468fca0f614a24a07f8dd2fe4fa4b316fdcb931"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=6a3db5b3c093648391e1e7a1b55614deabf0de18#6a3db5b3c093648391e1e7a1b55614deabf0de18"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1154,7 +1154,7 @@ dependencies = [
 [[package]]
 name = "myownmesh-signaling"
 version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=d468fca0f614a24a07f8dd2fe4fa4b316fdcb931#d468fca0f614a24a07f8dd2fe4fa4b316fdcb931"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=6a3db5b3c093648391e1e7a1b55614deabf0de18#6a3db5b3c093648391e1e7a1b55614deabf0de18"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1162,6 +1162,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "libc",
  "mdns-sd",
  "parking_lot",
  "rand",

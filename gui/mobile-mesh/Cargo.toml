@@ -25,8 +25,11 @@ allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }
 # The wire vocabulary: the five channel constants + NodeProfile / ControlMessage.
 allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
 # The mesh engine itself, embedded in-process. Pinned to the merge commit that
-# added `Mesh::open_with_identity` (the identity-injection seam a phone needs).
-myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "d468fca0f614a24a07f8dd2fe4fa4b316fdcb931" }
+# added the system DNS-SD discovery backend (MyOwnMesh #89) — on iOS the mDNS
+# signaling rides mDNSResponder via the dnssd API instead of raw multicast
+# sockets, which is what makes LAN discovery + local claiming reliable there.
+# (Also carries `Mesh::open_with_identity` from #88.)
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", rev = "6a3db5b3c093648391e1e7a1b55614deabf0de18" }
 
 # Same major as the engine's ed25519-dalek so `SigningKey` is the *same* type
 # and `Identity::from_signing_key` accepts the key we build from the seed.
