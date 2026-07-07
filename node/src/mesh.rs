@@ -1634,6 +1634,31 @@ impl Mesh {
                             .as_ref()
                             .is_some_and(|s| s.peer(&node_id).is_some())
                     };
+                    // A fresh boot id from a peer we already knew: every route
+                    // wired to its PREVIOUS incarnation is dead on its side —
+                    // but ours would keep capturing and encoding into the void
+                    // (the far end logs "no route maps to it" for as long as
+                    // the orphan lives, and its stale lane pin can shadow the
+                    // next session's stream). Reap them now; the fresh
+                    // incarnation is folded right back in below and re-offers
+                    // whatever it actually wants.
+                    if new_boot && known {
+                        let effects = {
+                            let mut st = self.state.lock();
+                            st.session
+                                .as_mut()
+                                .map(|s| s.reap_peer_routes(&node_id))
+                                .unwrap_or_default()
+                        };
+                        if !effects.is_empty() {
+                            tracing::info!(
+                                "peer {} restarted — reaping {} stale route(s) to its previous incarnation",
+                                short_id(&from),
+                                effects.len()
+                            );
+                            self.process_effects(effects).await;
+                        }
+                    }
                     let changed = {
                         let mut st = self.state.lock();
                         st.session

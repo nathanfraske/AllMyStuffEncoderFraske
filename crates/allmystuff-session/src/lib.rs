@@ -202,6 +202,16 @@ impl Session {
     /// Drop a peer that left, tearing down any routes with it.
     pub fn drop_peer(&mut self, id: &NodeId) -> Vec<Effect> {
         self.peers.remove(id);
+        self.reap_peer_routes(id)
+    }
+
+    /// Tear down a peer's active routes WITHOUT forgetting the peer — for
+    /// a peer that restarted: its fresh incarnation is alive and welcome,
+    /// but every route wired to its previous one is dead on its side, and
+    /// ours would keep capturing and encoding into the void indefinitely
+    /// (the orphaned-streamer failure: media warned as "no route maps to
+    /// it" on the far end for as long as the capture lives).
+    pub fn reap_peer_routes(&mut self, id: &NodeId) -> Vec<Effect> {
         let mut effects = Vec::new();
         let ids: Vec<String> = self
             .routes
@@ -868,6 +878,28 @@ mod tests {
         let effects = s.drop_peer(&"this".into());
         assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
         assert!(s.peer(&"this".into()).is_none());
+    }
+
+    #[test]
+    fn reaping_a_restarted_peers_routes_keeps_the_peer() {
+        // The restart case: the peer's fresh incarnation stays welcome
+        // (presence on file, ready to re-offer), only its stale routes go.
+        let mut s = Session::new("desk");
+        s.handle(
+            "this".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        let had_peer = s.peer(&"this".into()).is_some();
+        let effects = s.reap_peer_routes(&"this".into());
+        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert_eq!(s.peer(&"this".into()).is_some(), had_peer);
+        // A second reap finds nothing active — it never double-stops.
+        assert!(s.reap_peer_routes(&"this".into()).is_empty());
     }
 
     #[test]
