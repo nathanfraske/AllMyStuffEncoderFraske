@@ -250,18 +250,43 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 // fidelity": H.264 carries up to a native 4K frame at a rate budgeted
 // from its true pixel count.
 
+/// How the ICE-nominated path to the stream's viewer actually flows —
+/// the daemon's own LAN/STUN/TURN taxonomy (`PeerInfo.selected_pair`,
+/// host↔host = LAN), carried into the stream so the *automatic* dials
+/// can be generous exactly where generosity is free. Explicit viewer
+/// Tune fields and the env dials always win over this gate. `Unknown`
+/// (ICE not settled yet, or an old daemon that doesn't report the pair)
+/// is treated as WAN — start conservative, upgrade when the class lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LinkClass {
+    /// The nominated candidate pair is host↔host — a direct local link.
+    Lan,
+    /// Reflexive or relayed — real internet between the ends.
+    Wan,
+    /// No nominated pair reported (yet). Conservative until known.
+    #[default]
+    Unknown,
+}
+
 /// Capture cadence to aim for — a ceiling, not a promise. Session capture
 /// sustains it (damage-driven backends produce less on quiet screens);
 /// the one-shot fallback runs at whatever the platform's screenshot path
 /// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
-pub(crate) fn target_fps() -> u32 {
-    // Default 60 — this is a Parsec-tier 4K60 stream; 30 made fast motion look
-    // choppy. It's a ceiling, not a promise (damage-driven backends produce
-    // less on quiet screens), and a constrained/WAN link can dial it back with
-    // ALLMYSTUFF_VIDEO_FPS until link-adaptive rate control lands.
-    static FPS: std::sync::LazyLock<u32> =
-        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_FPS", 60).clamp(1, 120));
-    *FPS
+pub(crate) fn target_fps(link: LinkClass) -> u32 {
+    // 60 on a LAN — this is a Parsec-tier 4K60 stream; 30 made fast motion
+    // look choppy. It's a ceiling, not a promise (damage-driven backends
+    // produce less on quiet screens). Off-LAN (or before the path class is
+    // known) the automatic default steps back to 30: the transport is still
+    // open-loop (no pacer/BWE yet), and doubling the cadence there buys
+    // queueing latency, not smoothness. The env dial overrides the gate for
+    // every stream; an explicit viewer Tune never reaches this function.
+    static FPS: std::sync::LazyLock<Option<u32>> =
+        std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
+    FPS.unwrap_or(match link {
+        LinkClass::Lan => 60,
+        LinkClass::Wan | LinkClass::Unknown => 30,
+    })
+    .clamp(1, 120)
 }
 
 /// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
@@ -276,22 +301,47 @@ fn h264_max_edge() -> u32 {
 
 /// Target bitrate for one stream's encode, budgeted from what it actually
 /// carries: ~0.16 bits per pixel per frame — the density 1080p30 was
-/// tuned crisp at (10 Mbps) — clamped to 8–80 Mbps. The cap is 80 Mbps so a
-/// 4K60 desktop (~80 Mbps at this density) and a 3440×1440@60 ultrawide
-/// (~48 Mbps) reach their budget instead of being pinned at the old 40 Mbps
-/// ceiling, which was *itself* the QP wall that blocked fast motion. Trivial on
-/// a LAN, where direct peers live; link-adaptive rate (BWE) remains the
-/// follow-up that makes the high cap safe on relayed/WAN paths.
+/// tuned crisp at (10 Mbps) — clamped to 8 Mbps up to a cap the link
+/// class earns. On a LAN pair the cap is 80 Mbps, so a 4K60 desktop
+/// (~80 Mbps at this density) and a 3440×1440@60 ultrawide (~48 Mbps)
+/// reach their budget instead of being pinned at the old 40 Mbps
+/// ceiling, which was *itself* the QP wall that blocked fast motion.
+/// Off-LAN (and before the class is known) the cap stays 40 Mbps: the
+/// transport is open-loop, and the roadmap's own rule is to never ship
+/// the raised cap WAN-wide without BWE. Explicit viewer Tune bitrates
+/// bypass this entirely.
 /// Override (a fixed bps for every stream): `ALLMYSTUFF_VIDEO_BITRATE`.
-fn h264_bitrate_for(w: u32, h: u32, fps: u32) -> u32 {
+fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass) -> u32 {
     static OVERRIDE: std::sync::LazyLock<u32> =
         std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_VIDEO_BITRATE", 0));
     if *OVERRIDE > 0 {
         return *OVERRIDE;
     }
+    let cap = match link {
+        LinkClass::Lan => 80_000_000,
+        LinkClass::Wan | LinkClass::Unknown => 40_000_000,
+    };
     let px = u64::from(w) * u64::from(h);
     let bps = px * u64::from(fps) * 16 / 100;
-    bps.clamp(8_000_000, 80_000_000) as u32
+    bps.clamp(8_000_000, cap) as u32
+}
+
+/// A `u32` env dial with no default — `None` when unset/unparseable, so
+/// the caller can distinguish "operator pinned it" from "use the gate".
+fn env_u32_opt(key: &str) -> Option<u32> {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse() {
+            Ok(n) => {
+                tracing::info!("{key}={n} (override)");
+                Some(n)
+            }
+            Err(_) => {
+                tracing::warn!("{key}={v} isn't a number — using the automatic dial");
+                None
+            }
+        },
+        _ => None,
+    }
 }
 
 /// A `u32` env dial; `default` when unset or unparseable.
@@ -331,11 +381,15 @@ pub struct Tune {
     pub max_edge: Option<u32>,
     pub bitrate: Option<u32>,
     pub fps: Option<u32>,
+    /// How the path to this stream's viewer flows (host side fills it
+    /// from the daemon's nominated-pair class). Not a viewer dial: it
+    /// gates only what the AUTOMATIC fps/bitrate fall back to.
+    pub link: LinkClass,
 }
 
 impl Tune {
     fn fps(&self) -> u32 {
-        self.fps.unwrap_or_else(target_fps).clamp(1, 120)
+        self.fps.unwrap_or_else(|| target_fps(self.link)).clamp(1, 120)
     }
     fn h264_edge(&self) -> u32 {
         self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
@@ -600,6 +654,7 @@ impl VideoBridge {
         route_id: String,
         mode: VideoMode,
         source: VideoSource,
+        tune: Tune,
         on_packet: F,
         on_status: S,
     ) where
@@ -623,10 +678,63 @@ impl VideoBridge {
             route_id,
             mode,
             source,
-            Tune::default(),
+            tune,
             Arc::new(on_packet),
             Arc::new(on_status),
         );
+    }
+
+    /// The route ids with a live capture pump — for the mesh to sweep
+    /// when a peer's link class changes.
+    pub fn route_ids(&self) -> Vec<String> {
+        self.routes.lock().keys().cloned().collect()
+    }
+
+    /// A viewer's Tune (the console pills/slider): the dials change, the
+    /// link class the gate learned stays — a viewer retune must not
+    /// quietly reset a LAN stream to the conservative Unknown dials.
+    pub fn retune_dials(
+        &self,
+        route_id: &str,
+        max_edge: Option<u32>,
+        bitrate: Option<u32>,
+        fps: Option<u32>,
+    ) {
+        let link = self
+            .routes
+            .lock()
+            .get(route_id)
+            .map(|r| r.tune.link)
+            .unwrap_or_default();
+        self.retune(
+            route_id,
+            Tune {
+                max_edge,
+                bitrate,
+                fps,
+                link,
+            },
+        );
+    }
+
+    /// Re-class a live route's link (the LAN gate learning the truth after
+    /// the stream started): respawns the capture only when the class
+    /// actually changed AND no viewer dial pins the affected knobs — a
+    /// restart costs one IDR hiccup, so a no-op reclassification must cost
+    /// nothing. Returns whether a retune happened.
+    pub fn retune_link(&self, route_id: &str, link: LinkClass) -> bool {
+        let current = { self.routes.lock().get(route_id).map(|r| r.tune) };
+        let Some(t) = current else { return false };
+        if t.link == link {
+            return false;
+        }
+        // With BOTH automatic dials pinned by the viewer, the class change
+        // can't alter the stream — skip the restart entirely.
+        if t.fps.is_some() && t.bitrate.is_some() {
+            return false;
+        }
+        self.retune(route_id, Tune { link, ..t });
+        true
     }
 
     fn spawn_route(
@@ -2011,7 +2119,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     {
         let bitrate = tune
             .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
             .clamp(250_000, 80_000_000);
         for hw in crate::mediafoundation::hardware_h264_mfts() {
             match hw.open(bw, bh, fps, bitrate) {
@@ -2042,7 +2150,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     {
         let bitrate = tune
             .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
             .clamp(250_000, 80_000_000);
         match crate::videotoolbox::VideoToolboxH264::open(bw, bh, fps, bitrate) {
             Ok(enc) => {
@@ -2066,7 +2174,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     {
         let bitrate = tune
             .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
             .clamp(250_000, 80_000_000);
         for &name in crate::hwenc::candidates() {
             match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate) {
@@ -2093,7 +2201,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
         "H.264 software encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
         codec.label(),
         tune.bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
             .clamp(250_000, 80_000_000) as f64
             / 1e6
     );
@@ -2130,7 +2238,7 @@ fn make_h264_encoder(
     };
     let bitrate = tune
         .bitrate
-        .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps))
+        .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
         .clamp(250_000, 80_000_000);
     let config = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
@@ -2435,6 +2543,7 @@ mod tests {
             max_edge: Some(800),
             bitrate: Some(12_000_000),
             fps: Some(60),
+            link: LinkClass::default(),
         };
         assert_eq!(t.fps(), 60);
         assert_eq!(t.h264_edge(), 800);
@@ -2450,11 +2559,36 @@ mod tests {
         assert_eq!(big.h264_edge(), 3840);
         assert_eq!(big.mjpeg_edge(), 3840);
         let auto = Tune::default();
-        assert_eq!(auto.fps(), target_fps());
+        assert_eq!(auto.fps(), target_fps(LinkClass::Unknown));
         assert_eq!(auto.h264_edge(), h264_max_edge());
         // Untuned MJPEG defaults to HD, and untuned quality is neutral.
         assert_eq!(auto.mjpeg_edge(), mjpeg_max_edge());
         assert_eq!(auto.jpeg_quality(), JPEG_QUALITY);
+    }
+
+    #[test]
+    fn lan_gate_raises_only_the_automatic_dials() {
+        // A LAN link earns the 60 fps / 80 Mbps automatic dials; off-LAN
+        // (and unknown, i.e. ICE not settled or an old daemon) stays at
+        // the conservative 30 / 40 M — the open-loop-transport rule.
+        let lan = Tune {
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        assert_eq!(lan.fps(), 60);
+        assert_eq!(Tune::default().fps(), 30);
+        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Lan), 79_626_240);
+        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Unknown), 40_000_000);
+        assert_eq!(h264_bitrate_for(3840, 2160, 60, LinkClass::Wan), 40_000_000);
+        // An explicit viewer Tune bypasses the gate on any link.
+        let pinned = Tune {
+            fps: Some(48),
+            bitrate: Some(60_000_000),
+            link: LinkClass::Wan,
+            ..Tune::default()
+        };
+        assert_eq!(pinned.fps(), 48);
+        assert_eq!(pinned.bitrate, Some(60_000_000));
     }
 
     #[test]

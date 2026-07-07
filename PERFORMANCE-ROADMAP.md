@@ -58,6 +58,13 @@ code with `file:line` anchors so it can be picked up cold.
   (`node/pixels/src/lib.rs`) does the downscale + BT.601 conversion in one pass straight to a
   contiguous I420 buffer, fed to openh264 via a borrowing `YUVSource` — the old RGB intermediate and
   openh264's separate RGB→YUV walk are gone; the unchanged-frame compare runs on 1.5 B/px I420.
+- **The LAN gate on the raised automatic dials** (the item-4 correction). `LinkClass` rides
+  every stream's `Tune` (`node/src/video.rs`): the automatic 60 fps / 80 Mbps ceilings apply only
+  when the daemon's nominated ICE pair for the viewer is host↔host (`PeerInfo.selected_pair`,
+  seeded from `PeersList` into `peer_links`, `node/src/mesh.rs`); reflexive/relayed — and
+  not-yet-classified — links keep the open-loop-safe 30 fps / 40 Mbps until BWE (#6) lands.
+  Explicit viewer Tunes and the env dials bypass the gate; a class landing or flipping mid-life
+  re-gates live streams via `retune_link` (no-op unless the automatic dials actually change).
 - **Binary media IPC, both directions** (item 11 below). The base64+JSON per-frame tax on the
   node↔daemon socket is gone: H.264/Opus **sends** ride a dedicated binary `MediaTrackPipe`
   (`node/src/control_client.rs` ↔ MyOwnMesh `run_media_track_pipe`), and inbound H.264/Opus rides a

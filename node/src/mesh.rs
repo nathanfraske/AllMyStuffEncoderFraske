@@ -418,6 +418,12 @@ struct State {
     /// ride the media-lane pool — `FEATURE_MEDIA_LANES` present means both
     /// ends ship the lane-pool daemon and can split streams across lanes.
     peer_features: HashMap<String, Vec<String>>,
+    /// How each peer's nominated ICE pair actually flows (canonical pubkey →
+    /// LAN/WAN), from the daemon's `PeersList` `selected_pair` — the LAN
+    /// gate's signal for how generous the AUTOMATIC video dials may be.
+    /// A peer with no reported pair (ICE unsettled, old daemon) simply isn't
+    /// in the map: transient unknowns must never downgrade a learned class.
+    peer_links: HashMap<String, crate::video::LinkClass>,
     /// Last presence boot id seen per peer (canonical pubkey). A boot id we
     /// haven't recorded means the peer just (re)started and missed our
     /// adverts — we answer with our state directly. This is what lets
@@ -462,6 +468,7 @@ impl Mesh {
                 networks: Vec::new(),
                 peer_networks: HashMap::new(),
                 peer_features: HashMap::new(),
+                peer_links: HashMap::new(),
                 peer_boots: HashMap::new(),
                 client_id: None,
                 profile: None,
@@ -770,8 +777,30 @@ impl Mesh {
             else {
                 continue;
             };
-            let mut st = self.state.lock();
-            seed_peer_networks(&mut st.peer_networks, peers, &network);
+            let changed = {
+                let mut st = self.state.lock();
+                seed_peer_networks(&mut st.peer_networks, peers, &network);
+                seed_peer_links(&mut st.peer_links, peers)
+            };
+            // A peer's link class landing (or flipping — an ICE-restart
+            // handoff can move a link LAN→STUN mid-life) re-gates its live
+            // streams' automatic dials. retune_link is a no-op unless the
+            // class genuinely changes what the stream would do, so a
+            // steady-state refresh costs nothing.
+            for (peer, class) in changed {
+                for route_id in self.video.route_ids() {
+                    let owns = self
+                        .route_peer(&route_id)
+                        .is_some_and(|p| pubkey_part(&p) == peer);
+                    if owns && self.video.retune_link(&route_id, class) {
+                        tracing::info!(
+                            "link to {} classified {:?} — re-gating {route_id}'s automatic video dials",
+                            short_id(&peer),
+                            class,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2631,14 +2660,7 @@ impl Mesh {
                     max_edge,
                     bitrate,
                     fps,
-                } => self.video.retune(
-                    &route_id,
-                    crate::video::Tune {
-                        max_edge,
-                        bitrate,
-                        fps,
-                    },
-                ),
+                } => self.video.retune_dials(&route_id, max_edge, bitrate, fps),
                 Effect::VideoFeedback {
                     route_id,
                     recv_fps,
@@ -5638,10 +5660,39 @@ impl Mesh {
         let status_peer = peer.clone();
         let status_route = route.id.clone();
         let route_id = route.id.clone();
+        // The LAN gate: the automatic fps/bitrate dials open up only on a
+        // link the daemon has classified host↔host. Unknown (ICE not yet
+        // introspected) starts conservative; the nudge below upgrades the
+        // live stream as soon as the class lands.
+        let link = {
+            let st = self.state.lock();
+            st.peer_links
+                .get(pubkey_part(to_node))
+                .copied()
+                .unwrap_or_default()
+        };
+        if link == crate::video::LinkClass::Unknown {
+            // The class usually lands within a couple of seconds of ICE
+            // settling — poll the daemon shortly after the stream starts so
+            // a LAN viewer isn't stuck on the conservative dials until the
+            // next natural refresh (peer approval / snapshot).
+            let mesh = Arc::downgrade(self);
+            crate::spawn(async move {
+                for delay_ms in [2_000u64, 6_000] {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let Some(mesh) = mesh.upgrade() else { return };
+                    mesh.refresh_peer_networks().await;
+                }
+            });
+        }
         self.video.start_capture(
             route.id.clone(),
             mode,
             source,
+            crate::video::Tune {
+                link,
+                ..Default::default()
+            },
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
@@ -8670,6 +8721,55 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
     }
 }
 
+/// One peer row's link class off the daemon's `selected_pair` — the
+/// daemon's own LAN/STUN/TURN rule (host↔host = LAN, which already folds
+/// in its private-address override), reduced to the two classes the video
+/// gate cares about. No pair reported (ICE unsettled, or a daemon that
+/// predates the field) is `Unknown` — the caller must treat that as
+/// "don't know", never as a downgrade.
+fn link_class_of(peer: &Value) -> crate::video::LinkClass {
+    use crate::video::LinkClass;
+    let Some(pair) = peer.get("selected_pair").filter(|v| !v.is_null()) else {
+        return LinkClass::Unknown;
+    };
+    let kind = |k: &str| pair.get(k).and_then(|v| v.as_str());
+    match (kind("local"), kind("remote")) {
+        (Some("host"), Some("host")) => LinkClass::Lan,
+        (Some(_), Some(_)) => LinkClass::Wan,
+        _ => LinkClass::Unknown,
+    }
+}
+
+/// Seed `peer_links` from one network's peer list, returning the peers
+/// whose class actually CHANGED (Lan↔Wan, or first classification) — the
+/// callers retune live streams on those. `Unknown` never touches the map:
+/// the daemon clears `selected_pair` on a transient ICE Disconnected, and
+/// yanking a stream's dials on a blip would be the gate punishing
+/// recovery. Pure (no daemon, no lock), like [`seed_peer_networks`], so
+/// the keep-on-unknown rule is unit-tested.
+fn seed_peer_links(
+    map: &mut HashMap<String, crate::video::LinkClass>,
+    peers: &[Value],
+) -> Vec<(String, crate::video::LinkClass)> {
+    use crate::video::LinkClass;
+    let mut changed = Vec::new();
+    for p in peers {
+        let Some(id) = p.get("device_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let class = link_class_of(p);
+        if class == LinkClass::Unknown {
+            continue;
+        }
+        let key = pubkey_part(id).to_string();
+        if map.get(&key) != Some(&class) {
+            map.insert(key.clone(), class);
+            changed.push((key, class));
+        }
+    }
+    changed
+}
+
 /// A fresh opaque fetch token for one shared file — 16 random bytes as
 /// hex, so it can't be guessed and never leaks the path it stands for.
 fn fresh_share_token() -> String {
@@ -9110,6 +9210,48 @@ mod tests {
         // …and an unreachable peer claims no slot.
         assert_eq!(map.get("dave"), None);
         assert_eq!(map.get("erin"), None);
+    }
+
+    #[test]
+    fn seed_peer_links_classifies_and_keeps_on_unknown() {
+        use crate::video::LinkClass;
+        use serde_json::json;
+        let mut map: HashMap<String, LinkClass> = HashMap::new();
+        // First sighting: host↔host is LAN, anything reflexive/relayed is WAN.
+        let peers = vec![
+            json!({ "device_id": "alice-AB12C",
+                    "selected_pair": { "local": "host", "remote": "host" } }),
+            json!({ "device_id": "bob",
+                    "selected_pair": { "local": "host", "remote": "server_reflexive" } }),
+            json!({ "device_id": "carol",
+                    "selected_pair": { "local": "relay", "remote": "host" } }),
+            // ICE not settled (null pair) and an old daemon (field absent):
+            // both stay unclassified.
+            json!({ "device_id": "dave", "selected_pair": null }),
+            json!({ "device_id": "erin" }),
+        ];
+        let changed = seed_peer_links(&mut map, &peers);
+        assert_eq!(map.get("alice"), Some(&LinkClass::Lan));
+        assert_eq!(map.get("bob"), Some(&LinkClass::Wan));
+        assert_eq!(map.get("carol"), Some(&LinkClass::Wan));
+        assert_eq!(map.get("dave"), None);
+        assert_eq!(map.get("erin"), None);
+        assert_eq!(changed.len(), 3, "every first classification reports as a change");
+
+        // A transient unknown (the daemon clears the pair on an ICE blip)
+        // must KEEP the learned class — never downgrade a stream on a wobble.
+        let blip = vec![json!({ "device_id": "alice-AB12C", "selected_pair": null })];
+        let changed = seed_peer_links(&mut map, &blip);
+        assert!(changed.is_empty());
+        assert_eq!(map.get("alice"), Some(&LinkClass::Lan));
+
+        // A real reclassification (ICE-restart handoff LAN→STUN) reports the
+        // change exactly once; a steady-state repeat reports nothing.
+        let handoff = vec![json!({ "device_id": "alice-AB12C",
+                "selected_pair": { "local": "host", "remote": "peer_reflexive" } })];
+        let changed = seed_peer_links(&mut map, &handoff);
+        assert_eq!(changed, vec![("alice".to_string(), LinkClass::Wan)]);
+        assert!(seed_peer_links(&mut map, &handoff).is_empty());
     }
 
     #[test]
