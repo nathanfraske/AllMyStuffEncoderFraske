@@ -8925,7 +8925,7 @@ mod tests {
     /// single shared session. This drives the same [`TerminalHost::open`] the
     /// `start_terminal_host` pump uses (without needing a live daemon), so it
     /// guards the mesh's view of sharing end to end.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "host"))]
     #[test]
     fn two_routes_share_one_session_through_the_host() {
         use crate::terminal::OutMsg;

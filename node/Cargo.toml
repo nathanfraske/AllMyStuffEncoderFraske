@@ -49,8 +49,36 @@ path = "src/bin/serve.rs"
 # carries — bump it alongside a platform's bundled FFmpeg (the encode code
 # itself is version-agnostic). At runtime the ladder still falls back to
 # openh264 when no hardware encoder produces frames.
-default = []
-hwenc = ["dep:ffmpeg-next"]
+default = ["host"]
+hwenc = ["host", "dep:ffmpeg-next"]
+
+# The capture/inject planes — everything that touches THIS machine's screen,
+# camera, microphone, speakers, keyboard, PTYs, and OS clipboard. ON by
+# default: every desktop/server build wants them. The one build that turns
+# them off is iOS (the GUI links the engine `--no-default-features` there):
+# the app sandbox has none of these to give — no fork/exec for a PTY, no
+# screen grab, no input injection — so each plane module swaps for a same-API
+# stub (see `src/stubs/`) and the node becomes a pure *viewer* node. The
+# viewer planes (H.264/opus decode, the terminal output queues) are NOT here
+# — they stay in every build; watching other machines is the whole point of
+# a capture-less node.
+host = [
+    "dep:cpal",
+    "dep:portable-pty",
+    "dep:xcap",
+    "dep:jpeg-encoder",
+    "dep:enigo",
+    "dep:nokhwa",
+    "dep:clipboard-rs",
+    # …and the per-OS capture underpinnings (see the target tables below):
+    # PulseAudio loopback + the ScreenCast portal + DPMS on Linux, the
+    # IOKit display-sleep assertion on macOS.
+    "dep:libloading",
+    "dep:zbus",
+    "dep:pipewire",
+    "dep:xcb",
+    "dep:core-foundation",
+]
 
 [dependencies]
 # Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one
@@ -92,21 +120,21 @@ allmystuff-updater = { path = "../crates/allmystuff-updater" }
 
 # Cross-platform audio capture + playback for the media plane — CoreAudio
 # on macOS, WASAPI on Windows, ALSA on Linux.
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 # Cross-platform PTY for the mesh-native terminal — openpty on Unix, ConPTY
 # on Windows — so a terminal session behaves the same across the whole OS
 # matrix without an sshd anywhere.
-portable-pty = "0.9"
+portable-pty = { version = "0.9", optional = true }
 # Screen capture (PipeWire / AVFoundation; the in-house DXGI path on
 # Windows lives in win_capture.rs).
-xcap = "0.9"
+xcap = { version = "0.9", optional = true }
 # `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
 # speed on typical x86-64 desktops, plain safe Rust elsewhere.
-jpeg-encoder = { version = "0.7", features = ["simd"] }
+jpeg-encoder = { version = "0.7", features = ["simd"], optional = true }
 # Keyboard/mouse injection for inbound input/terminal control routes.
-enigo = "0.6"
+enigo = { version = "0.6", optional = true }
 # Camera capture for video routes — V4L2 / AVFoundation / Media Foundation.
-nokhwa = { version = "0.10", features = ["input-native"] }
+nokhwa = { version = "0.10", features = ["input-native"], optional = true }
 # H.264 encode/decode for the mesh's video track lane (Cisco's encoder,
 # built from source). MJPEG stays the fallback.
 openh264 = "0.9"
@@ -122,7 +150,7 @@ sysinfo = "0.38"
 # Cross-platform *rich* clipboard — text, image, and file lists — for the
 # clipboard plane. The clipboard-manager bits the GUI used are a webview
 # concern and stay in the GUI; this is the OS-clipboard side the node owns.
-clipboard-rs = "0.2"
+clipboard-rs = { version = "0.2", optional = true }
 # The per-pixel hot loops (frame downscale/strip), split out so dev builds
 # optimize them — see the crate's manifest.
 allmystuff-pixels = { path = "pixels" }
@@ -139,14 +167,14 @@ libc = "0.2"
 # (wake); pipewire consumes the portal's stream; xcb makes the DPMS
 # "light the panel" call.
 [target.'cfg(target_os = "linux")'.dependencies]
-libloading = "0.8"
-zbus = "5"
-pipewire = "0.9"
-xcb = { version = "1", features = ["dpms"] }
+libloading = { version = "0.8", optional = true }
+zbus = { version = "5", optional = true }
+pipewire = { version = "0.9", optional = true }
+xcb = { version = "1", features = ["dpms"], optional = true }
 
 # IOKit power assertions (NoDisplaySleep) while hosting a screen stream.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.10"
+core-foundation = { version = "0.10", optional = true }
 
 # In-house DXGI Output Duplication for screen capture, the virtual-desktop
 # absolute mouse move, and the job-object daemon lifetime tie.
