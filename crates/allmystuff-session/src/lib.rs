@@ -462,11 +462,16 @@ impl Session {
                 // others' routes by name. A reject can now also land on an
                 // *active* route (the far side refusing frames it no longer
                 // wants, or a receiver NACKing a route it doesn't hold), so
-                // an active outbound route stops its media too — otherwise
-                // the capture keeps encoding into the void.
+                // an active route stops its media too — otherwise the
+                // capture keeps encoding into the void. Origin-blind, like
+                // Teardown's stop: a **console host** holds the routes it
+                // streams as *inbound* (the viewer offered them), and the
+                // old `origin == Outbound` gate silently exempted exactly
+                // that side — the receiver's NACK marked the route rejected
+                // while the orphan capture streamed on regardless.
                 if let Some(r) = self.routes.get_mut(&route_id) {
                     if r.peer == from {
-                        let stop = r.is_active() && r.origin == Origin::Outbound;
+                        let stop = r.is_active();
                         r.state = RouteState::Rejected { reason };
                         if stop {
                             return vec![Effect::StopMedia(route_id)];
@@ -553,6 +558,13 @@ impl Session {
             // handled in the mesh before it reaches here, like the terminal
             // picker plane above. The session just ignores it.
             RouteControl::VideoLane { .. } => Vec::new(),
+            // The lane-shaped NACK is likewise the mesh's to translate: only
+            // the backend knows its lane→route pins, so it resolves the lane
+            // and feeds the result back through this state machine as a
+            // plain [`RouteControl::Reject`] — which is where the peer check
+            // and the StopMedia decision actually happen. Untranslated, the
+            // lane number means nothing to route state.
+            RouteControl::DeadLane { .. } => Vec::new(),
             // A route-control kind a newer peer introduced that this build
             // doesn't know (decoded as `Unknown` rather than failing the
             // whole control message): no state change.
@@ -930,6 +942,50 @@ mod tests {
         // not leave it streaming into the void.
         let fx = s.handle(
             "peer".into(),
+            ControlMessage::Route(RouteControl::Reject {
+                route_id: "r1".into(),
+                reason: "route not live here".into(),
+            }),
+        );
+        assert!(matches!(fx.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            s.route("r1").unwrap().state,
+            RouteState::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_stops_media_on_an_active_inbound_route_too() {
+        // The console-host topology: the VIEWER offers a display route, so
+        // the machine that captures and streams holds it as *inbound*. The
+        // viewer NACKing frames it can't place (its app restarted, its side
+        // of the route died) must stop that capture — the old
+        // origin==Outbound gate exempted exactly this side, so the orphan
+        // encoder streamed into the void while the route read "rejected".
+        let mut s = Session::new("host");
+        let fx = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        assert!(fx.iter().any(|e| matches!(e, Effect::StartMedia(_))));
+        // A stranger's reject still bounces off the peer check.
+        let fx = s.handle(
+            "mallory".into(),
+            ControlMessage::Route(RouteControl::Reject {
+                route_id: "r1".into(),
+                reason: "nope".into(),
+            }),
+        );
+        assert!(fx.is_empty());
+        assert!(s.route("r1").unwrap().is_active());
+        // The route's own viewer refusing the stream halts the capture.
+        let fx = s.handle(
+            "viewer".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
                 reason: "route not live here".into(),

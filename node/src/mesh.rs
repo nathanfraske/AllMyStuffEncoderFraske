@@ -254,6 +254,14 @@ pub struct Mesh {
     /// behind [`Self::diag_ok`], so a dead stream explains itself once per
     /// [`WARN_EVERY`] instead of at frame rate.
     video_diag_last: Mutex<HashMap<String, std::time::Instant>>,
+    /// When each inbound track lane was first seen carrying media that no
+    /// route here maps to (key `deadlane:<media>:<peer>:<lane>`), cleared
+    /// the moment the lane resolves. A lane-shaped NACK
+    /// ([`RouteControl::DeadLane`]) is sent only once the condition has
+    /// persisted a full [`WARN_EVERY`] — a stream's first samples can
+    /// legally outrun the Accept/VideoLane control messages at start, and
+    /// NACKing that instant would kill a healthy stream being born.
+    dead_lane_since: Mutex<HashMap<String, std::time::Instant>>,
     /// When each route last asked its sender for a clean decode entry —
     /// decode errors arrive at frame rate; the asks must not.
     refresh_asks: Mutex<HashMap<String, std::time::Instant>>,
@@ -497,6 +505,7 @@ impl Mesh {
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             video_in_stats: Mutex::new(HashMap::new()),
             video_diag_last: Mutex::new(HashMap::new()),
+            dead_lane_since: Mutex::new(HashMap::new()),
             refresh_asks: Mutex::new(HashMap::new()),
             profile_req: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
@@ -1839,6 +1848,14 @@ impl Mesh {
                             // the right console window by binding, not by guess.
                             self.record_video_lane(&from, &route_id, lane);
                         }
+                        ControlMessage::Route(RouteControl::DeadLane { media, lane }) => {
+                            // A receiver says our media on that lane has no
+                            // route on its side (it restarted and lost the
+                            // name). Resolve the lane back to the route we
+                            // pinned it to and fold it through the session as
+                            // that route's Reject — stopping the encoder.
+                            self.handle_dead_lane(&from, &media, lane).await;
+                        }
                         ControlMessage::ProfileRequest => {
                             // A peer's refresh asks us to re-announce — send our
                             // current presence straight back so it re-learns us
@@ -2048,8 +2065,10 @@ impl Mesh {
                     short_id(from)
                 );
             }
+            self.nack_dead_lane(from, "audio", stream);
             return;
         };
+        self.clear_dead_lane(from, "audio", stream);
         if !self.inbound_media_ok(&route_id, from, MediaKind::Audio) {
             tracing::debug!("audio frame for {route_id} refused (route not live here)");
             self.nack_dead_route(from, &route_id);
@@ -2146,8 +2165,10 @@ impl Mesh {
                     short_id(from)
                 );
             }
+            self.nack_dead_lane(from, "video", stream);
             return;
         };
+        self.clear_dead_lane(from, "video", stream);
         if !self.inbound_video_ok(&route_id, from) {
             if self.diag_ok(&format!("gate:{route_id}")) {
                 tracing::warn!(
@@ -7649,6 +7670,140 @@ impl Mesh {
                 )
                 .await;
         });
+    }
+
+    /// The lane-shaped twin of [`Self::nack_dead_route`], for the one case
+    /// a Reject can't reach: media keeps arriving on a track lane no route
+    /// here maps to. That's this app restarted (fresh session — same daemon,
+    /// same boot id, so the peer-restart reap never fires) or an orphan
+    /// stream shadowing a lane after its route was lost one-sided. We can't
+    /// name the dead route — the name is exactly what we lost — but the
+    /// sender's own pin still knows, so we report the *lane*
+    /// ([`RouteControl::DeadLane`]) and the sender resolves it into a
+    /// Reject of that route, stopping its encoder.
+    ///
+    /// Guarded twice: nothing is sent until the lane has stayed unmapped a
+    /// full [`WARN_EVERY`] (a stream's first samples can legally outrun the
+    /// Accept/VideoLane control messages at start — a NACK there would kill
+    /// a healthy stream being born; [`Self::clear_dead_lane`] wipes the
+    /// clock the moment the lane resolves), then rate-limited like every
+    /// other diagnostic while the condition persists. An older sender
+    /// doesn't know the message and drops it — it keeps streaming exactly
+    /// as today.
+    fn nack_dead_lane(self: &Arc<Self>, from: &str, media: &'static str, lane: u8) {
+        let key = format!("deadlane:{media}:{}:{lane}", pubkey_part(from));
+        {
+            let mut since = self.dead_lane_since.lock();
+            let now = std::time::Instant::now();
+            let first = *since.entry(key.clone()).or_insert(now);
+            if now.duration_since(first) < WARN_EVERY {
+                return;
+            }
+        }
+        if !self.diag_ok(&key) {
+            return;
+        }
+        tracing::warn!(
+            "asking {} to stop its unmapped {media} stream on lane {lane} (no route here maps to it)",
+            short_id(from)
+        );
+        let mesh = self.clone();
+        let from = from.to_string();
+        crate::spawn(async move {
+            let _ = mesh
+                .send_control(
+                    &from,
+                    &ControlMessage::Route(RouteControl::DeadLane {
+                        media: media.into(),
+                        lane,
+                    }),
+                )
+                .await;
+        });
+    }
+
+    /// The lane resolved to a route again — forget its "unmapped since"
+    /// mark so a later unmapped spell starts a fresh [`WARN_EVERY`] grace
+    /// instead of inheriting an old clock and NACKing instantly.
+    fn clear_dead_lane(&self, from: &str, media: &str, lane: u8) {
+        let key = format!("deadlane:{media}:{}:{lane}", pubkey_part(from));
+        self.dead_lane_since.lock().remove(&key);
+    }
+
+    /// A receiver told us media we're sending it on track `lane` has no
+    /// route on its side ([`RouteControl::DeadLane`]) — it can't name the
+    /// route (its app restarted; the name is what it lost), but our own
+    /// bookkeeping still can. Resolve the lane back to the route we're
+    /// streaming *to that peer* — video by the lane pin
+    /// ([`Self::assign_video_lane`]'s table), audio by the same positional
+    /// sort the outbound forwarder picks lanes with — and fold it through
+    /// the session as if the peer had rejected the route by name: the
+    /// session re-checks the sender is the route's peer (a spoofed or stale
+    /// lane can never kill someone else's stream) and `Reject` on an active
+    /// outbound route returns `StopMedia`, which stops the capture that was
+    /// encoding into the void. Resolving nothing is a quiet no-op — the
+    /// stream already stopped, or an earlier NACK already landed.
+    async fn handle_dead_lane(self: &Arc<Self>, from: &str, media: &str, lane: u8) {
+        let canon = pubkey_part(from).to_string();
+        let route_id = match media {
+            "video" => {
+                // The pin table is route→lane across all peers; two peers can
+                // each hold this lane number, so match the lane and then the
+                // peer (via the session, after dropping the pin lock).
+                let candidates: Vec<String> = {
+                    let pins = self.video_lane_pins.lock();
+                    pins.iter()
+                        .filter(|(_, l)| **l == lane)
+                        .map(|(r, _)| r.clone())
+                        .collect()
+                };
+                candidates.into_iter().find(|rid| {
+                    let st = self.state.lock();
+                    st.session
+                        .as_ref()
+                        .and_then(|s| s.route(rid))
+                        .is_some_and(|r| pubkey_part(r.peer.as_str()) == canon)
+                })
+            }
+            "audio" => self
+                .sorted_media_routes(from, true, "opus")
+                .into_iter()
+                .nth(lane as usize),
+            // A media kind a newer build introduced — nothing of ours to
+            // stop; ignore it exactly like an Unknown control message.
+            _ => None,
+        };
+        let Some(route_id) = route_id else {
+            tracing::debug!(
+                "dead-lane nack from {} for {media} lane {lane} matched no route here",
+                short_id(from)
+            );
+            return;
+        };
+        tracing::warn!(
+            "receiver {} reports our {media} on lane {lane} maps to no route on its side — \
+             stopping {route_id}",
+            short_id(from)
+        );
+        let effects = {
+            let mut st = self.state.lock();
+            st.session
+                .as_mut()
+                .map(|s| {
+                    s.handle(
+                        NodeId::from(from),
+                        ControlMessage::Route(RouteControl::Reject {
+                            route_id,
+                            reason: "no route on the receiving side maps to this stream's lane \
+                                     — re-offer to reconnect"
+                                .into(),
+                        }),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        self.process_effects(effects).await;
+        self.emit_snapshot();
     }
 
     /// An inbound input/clipboard frame failed a gate. Historically this was
