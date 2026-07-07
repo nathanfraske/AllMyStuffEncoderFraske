@@ -1091,11 +1091,7 @@ impl Mesh {
                     let inv = allmystuff_inventory::scan();
                     (
                         allmystuff_bridge::node_summary(&inv),
-                        allmystuff_bridge::capabilities_with_screens(
-                            &inv,
-                            &node,
-                            &crate::video::extra_screens(),
-                        ),
+                        Self::advertised_capabilities(&inv, &node),
                     )
                 })
                 .await;
@@ -1251,11 +1247,7 @@ impl Mesh {
             label: label.clone(),
             hostname,
             summary: allmystuff_bridge::node_summary(&inv),
-            capabilities: allmystuff_bridge::capabilities_with_screens(
-                &inv,
-                &node,
-                &crate::video::extra_screens(),
-            ),
+            capabilities: Self::advertised_capabilities(&inv, &node),
             // Tell peers who owns this device and whether it's up for
             // adoption, so they can't silently grab a box that's already
             // spoken for (or one that was never put into claim mode).
@@ -1274,12 +1266,18 @@ impl Mesh {
             // won't open at route time degrades in-band too (`vstat`).
             features: {
                 let mut f = vec![
-                    allmystuff_protocol::FEATURE_TERMINAL.to_string(),
                     allmystuff_protocol::FEATURE_FILES.to_string(),
                     allmystuff_protocol::FEATURE_ROOMS.to_string(),
-                    allmystuff_protocol::FEATURE_CAMERA.to_string(),
                     allmystuff_protocol::FEATURE_SITES.to_string(),
                 ];
+                // Hosting a shell or a camera stream needs the capture
+                // planes — a capture-less build (iOS) must not invite
+                // offers its stubs would refuse.
+                #[cfg(feature = "host")]
+                {
+                    f.push(allmystuff_protocol::FEATURE_TERMINAL.to_string());
+                    f.push(allmystuff_protocol::FEATURE_CAMERA.to_string());
+                }
                 if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
                     f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
                 }
@@ -5376,6 +5374,23 @@ impl Mesh {
     /// basis to active routes keeps the two ends agreeing on a stable lane for
     /// the whole life of each stream (both ends process Active/Teardown), so
     /// an unrelated route coming or going no longer reshuffles a live one.
+    /// The capability list this node advertises. On a `host` build it is the
+    /// bridge's list verbatim. A capture-less build (iOS) strips the sources
+    /// it cannot serve — the synthetic screen and any camera — so peers are
+    /// never invited to open a stream the stub planes would refuse. Sinks
+    /// (video-view, audio out) and the mic (real under `audio-io`) stay.
+    fn advertised_capabilities(
+        inv: &allmystuff_inventory::Inventory,
+        node: &allmystuff_graph::NodeId,
+    ) -> Vec<allmystuff_graph::Capability> {
+        #[allow(unused_mut)]
+        let mut caps =
+            allmystuff_bridge::capabilities_with_screens(inv, node, &crate::video::extra_screens());
+        #[cfg(not(feature = "host"))]
+        caps.retain(|c| c.origin != "screen" && c.origin != "camera");
+        caps
+    }
+
     fn sorted_media_routes(&self, peer: &str, outbound: bool, codec: &str) -> Vec<String> {
         let Some(me) = self.local_node_id() else {
             return Vec::new();
