@@ -587,6 +587,16 @@
      The stage keeps its full height (the dock overlays it; the graph pans,
      and the drawers already float at this width). */
   @media (max-width: 700px) and (orientation: portrait) {
+    /* The dock is position:fixed INSIDE the header — and the header's
+       backdrop-filter would make itself the containing block for fixed
+       descendants, pinning the dock to the header's own bottom edge (on
+       top of the controls) instead of the viewport's. Portrait drops the
+       header blur (near-opaque paint instead) so the dock escapes to the
+       real bottom of the screen. */
+    .topbar {
+      backdrop-filter: none;
+      background: oklch(0.135 0.022 285 / 0.95);
+    }
     .summary {
       position: fixed;
       left: 0;

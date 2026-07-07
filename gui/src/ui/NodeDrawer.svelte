@@ -203,13 +203,19 @@
   // the canvas → the drawer re-homes to this device) collapses the panel
   // instead — on a phone tapping away *is* the dismiss gesture, and a drawer
   // that springs back open after every dismissal is unusable.
+  // `explicit` is its own signal, not derivable from the id: tapping This
+  // Device selects the very node the drawer was already showing as its
+  // fallback — same id, but now a deliberate "open" gesture.
   let shownId = $state<string | null>(null);
+  let wasExplicit = $state(false);
   $effect(() => {
     const id = node?.id ?? null;
-    if (id !== shownId) {
+    const explicit = !!app.selectedNode;
+    if (id !== shownId || explicit !== wasExplicit) {
       shownId = id;
+      wasExplicit = explicit;
       if (isMobile()) {
-        collapsed = !app.selectedNode;
+        collapsed = !explicit;
       } else {
         collapsed = false;
       }
