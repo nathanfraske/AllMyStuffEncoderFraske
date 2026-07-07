@@ -63,7 +63,7 @@ hwenc = ["host", "dep:ffmpeg-next"]
 # — they stay in every build; watching other machines is the whole point of
 # a capture-less node.
 host = [
-    "dep:cpal",
+    "audio-io",
     "dep:portable-pty",
     "dep:xcap",
     "dep:jpeg-encoder",
@@ -71,14 +71,21 @@ host = [
     "dep:nokhwa",
     "dep:clipboard-rs",
     # …and the per-OS capture underpinnings (see the target tables below):
-    # PulseAudio loopback + the ScreenCast portal + DPMS on Linux, the
-    # IOKit display-sleep assertion on macOS.
-    "dep:libloading",
+    # the ScreenCast portal + DPMS on Linux, the IOKit display-sleep
+    # assertion on macOS.
     "dep:zbus",
     "dep:pipewire",
     "dep:xcb",
     "dep:core-foundation",
 ]
+
+# The audio plane alone — split out of `host` because it's the one capture
+# plane iOS *can* run: cpal has a CoreAudio backend there, so a capture-less
+# phone build adds `audio-io` and gets real playback of inbound streams (and
+# a working mic source) while every other plane stays stubbed. `host`
+# includes it, so desktop builds are unchanged. libloading rides along for
+# the Linux PulseAudio system-audio loopback (target-gated to Linux).
+audio-io = ["dep:cpal", "dep:libloading"]
 
 [dependencies]
 # Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one

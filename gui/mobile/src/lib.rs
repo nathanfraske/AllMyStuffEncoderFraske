@@ -117,6 +117,12 @@ fn scan_self() -> Result<Value, String> {
     scan_self_impl("this".to_string())
 }
 
+/// The deep hardware scan, GUI-side exactly like the desktop shell.
+#[tauri::command]
+fn scan_full() -> Result<Value, String> {
+    serde_json::to_value(allmystuff_inventory::scan()).map_err(|e| e.to_string())
+}
+
 /// Mirror one frontend diagnostic line into the app's log (the Xcode /
 /// logcat console *and* the on-phone `allmystuff.log` — see [`logging`]), so
 /// a call reads end to end — the mobile counterpart to the desktop's
@@ -167,6 +173,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_self,
+            scan_full,
             client_log,
             commands::connect_route,
             commands::disconnect_route,
@@ -247,7 +254,8 @@ pub fn run() {
 
     // Without it (the NDK-free CI check): just the demo-capable shell commands.
     #[cfg(not(feature = "mesh"))]
-    let builder = builder.invoke_handler(tauri::generate_handler![scan_self, client_log]);
+    let builder =
+        builder.invoke_handler(tauri::generate_handler![scan_self, scan_full, client_log]);
 
     builder
         .run(tauri::generate_context!())

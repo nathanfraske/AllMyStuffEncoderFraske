@@ -19,6 +19,11 @@
   <array>
     <string>_myownmesh._tcp</string>
   </array>
+  <!-- The audio plane is real on iOS (cpal → CoreAudio). Playback needs no
+       permission, but if a route ever sources this phone's microphone, iOS
+       kills the app outright unless this string exists. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AllMyStuff uses the microphone only when you start an audio stream from this phone to one of your own devices.</string>
   <!-- Surface the app's Documents folder — where `allmystuff.log` is written
        (see src/logging.rs) — in the Files app (On My iPhone → AllMyStuff)
        and in Finder's device pane, so logs are reachable without Xcode. -->
