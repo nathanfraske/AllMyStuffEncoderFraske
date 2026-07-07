@@ -843,7 +843,7 @@
       border-radius: 0;
     }
     .head {
-      padding-top: calc(0.45rem + env(safe-area-inset-top, 0px));
+      padding-top: calc(0.45rem + max(1.1rem, env(safe-area-inset-top, 0px)));
     }
   }
   .head {
