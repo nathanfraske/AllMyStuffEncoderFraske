@@ -67,6 +67,7 @@ import {
   fleetGrantRole,
   fleetRevokeRole,
   fleetMfaStatus,
+  isMobile,
   isTauri,
   kvmAttach,
   kvmDetach,
@@ -2471,7 +2472,7 @@ class AppStore {
   openConsole(nodeId: string) {
     const node = this.node(nodeId);
     if (!this.consoleAllowed(node, nodeId)) return;
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openConsoleWindow(nodeId);
       return;
     }
@@ -2951,7 +2952,7 @@ class AppStore {
    *  on the wire — the same ordering the console's tab switches keep, so
    *  the popout takes the H.264 lane over instead of racing it). */
   async popOutConsoleInput(capId: string) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     const cap = this.capability(capId);
     if (!cap) return;
     const key = `cap:${capId}`;
@@ -2970,7 +2971,7 @@ class AppStore {
    *  *watches* the route (the sender owns it), so nothing re-negotiates —
    *  the frames simply land in the new window instead of the tile. */
   popOutRoomShare(route: Route, member: MeshNode) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     const key = `share:${route.id}`;
     this.poppedVideos = { ...this.poppedVideos, [key]: true };
     const who = this.roomWho(member.id);
@@ -3164,7 +3165,7 @@ class AppStore {
         return;
       }
     }
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openTerminalWindow(nodeId);
       return;
     }
@@ -3185,7 +3186,7 @@ class AppStore {
    *  scrollback) carries straight on in the new window. Desktop only — a
    *  popped-out window is an OS window, which the web preview can't open. */
   popOutTerminal(hostNodeId: string, session: string) {
-    if (!isTauri()) return;
+    if (!isTauri() || isMobile()) return;
     void openTerminalWindow(hostNodeId, session);
   }
 
@@ -3265,7 +3266,7 @@ class AppStore {
       this.toast("warn", `Files are owner/fleet only — ${node.label} isn't yours`);
       return;
     }
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       void openFilesWindow(nodeId);
       return;
     }
@@ -4681,7 +4682,7 @@ class AppStore {
    *  [`AppStore.joinRoomHere`]) keep the call in-page. */
   joinRoom(roomId: string) {
     if (!this.rooms.some((r) => r.id === roomId)) return;
-    if (isTauri() && !roomWindowTarget()) {
+    if (isTauri() && !isMobile() && !roomWindowTarget()) {
       void openRoomWindow(roomId);
       return;
     }

@@ -541,4 +541,62 @@
     min-height: 0;
     display: flex;
   }
+
+  /* Phone-width windows: compact the header — no tagline, tighter gaps,
+     safe-area padding so it stays out from under the notch / status bar
+     (zero everywhere that has neither). Chips get an ellipsis cap so a
+     long fleet or mesh name can't push the row off-screen. */
+  @media (max-width: 700px) {
+    .topbar {
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      row-gap: 0.4rem;
+      padding: 0.5rem 0.75rem;
+      padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));
+    }
+    .tag {
+      display: none;
+    }
+    .summary .chip {
+      max-width: 46vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .actions {
+      margin-left: auto;
+    }
+  }
+
+  /* Landscape phones: the pills wrap onto a second header row. */
+  @media (max-width: 700px) and (orientation: landscape) {
+    .summary {
+      order: 3;
+      flex: 1 1 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+  }
+
+  /* Portrait phones: the header splits — the status pills leave it and
+     dock along the bottom edge, inside the thumb's reach, over the stage.
+     The stage keeps its full height (the dock overlays it; the graph pans,
+     and the drawers already float at this width). */
+  @media (max-width: 700px) and (orientation: portrait) {
+    .summary {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      margin-left: 0;
+      justify-content: center;
+      flex-wrap: wrap;
+      padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
+      background: oklch(0.135 0.022 285 / 0.74);
+      backdrop-filter: blur(14px) saturate(1.2);
+      border-top: 1px solid var(--line);
+      z-index: 30;
+    }
+  }
 </style>

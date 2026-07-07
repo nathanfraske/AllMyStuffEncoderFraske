@@ -1,5 +1,6 @@
 <script lang="ts">
   import { app } from "../store.svelte";
+  import { isMobile } from "../tauri";
   import {
     MEDIA,
     displayName,
@@ -190,18 +191,28 @@
   }
 
   let width = $state(loadWidth());
-  let collapsed = $state(false);
+  // A phone launches with the drawer tucked away — the graph is the screen.
+  let collapsed = $state(isMobile());
   let resizing = $state(false);
 
   // A fresh selection always re-opens the panel — you clicked a node to see
   // it. Tracked by id so a presence refresh (same node, new object) doesn't
   // keep springing a deliberately-collapsed panel back open.
+  //
+  // On mobile only *explicit* selections open it: the deselect fallback (tap
+  // the canvas → the drawer re-homes to this device) collapses the panel
+  // instead — on a phone tapping away *is* the dismiss gesture, and a drawer
+  // that springs back open after every dismissal is unusable.
   let shownId = $state<string | null>(null);
   $effect(() => {
     const id = node?.id ?? null;
     if (id !== shownId) {
       shownId = id;
-      collapsed = false;
+      if (isMobile()) {
+        collapsed = !app.selectedNode;
+      } else {
+        collapsed = false;
+      }
     }
   });
 
@@ -1014,6 +1025,21 @@
   }
   .drawer.collapsed {
     width: 2.75rem;
+  }
+  /* Phone-width stages: the open drawer floats over the graph instead of
+     crushing it into a sliver (the collapsed rail stays docked so the
+     handle is always reachable). !important beats the inline resize width,
+     which has no meaning when the panel spans the screen. */
+  @media (max-width: 700px) {
+    .drawer:not(.collapsed) {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      height: auto;
+      width: min(24rem, 92vw) !important;
+      z-index: 26;
+    }
   }
   .drawer.resizing {
     user-select: none;

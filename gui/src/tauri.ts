@@ -103,6 +103,21 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** Whether this build is the phone/tablet shell. The bundle is byte-identical
+ *  across desktop and mobile, so the split is a runtime check: mobile drives
+ *  one-window layouts (panels default closed, in-page views instead of
+ *  popout windows) while desktop keeps its multi-window habits. iPadOS
+ *  masquerades as a Mac in WKWebView user agents — the touch-point probe
+ *  catches it. */
+export function isMobile(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return (
+    /Android|iPhone|iPad|iPod/i.test(ua) ||
+    (/Macintosh/.test(ua) && navigator.maxTouchPoints > 2)
+  );
+}
+
 // ---- app metadata -----------------------------------------------------
 //
 // The running build's version, for showing in the UI like MyOwnMesh /
@@ -412,8 +427,7 @@ export function sessionSnapshot(): Promise<SessionSnapshot | null> {
  *  the web preview keeps its in-page console. */
 export async function openConsoleWindow(node: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_console_window", { node });
+  await tryInvoke("open_console_window", { node });
 }
 
 /** Which machine this window is a console for, when the window was opened
@@ -570,8 +584,7 @@ export async function watchVideoStatus(
  *  in-page terminal. */
 export async function openTerminalWindow(node: string, attach?: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_terminal_window", { node, attach: attach ?? null });
+  await tryInvoke("open_terminal_window", { node, attach: attach ?? null });
 }
 
 /** Which machine this window is a terminal for, when the window was opened
@@ -703,8 +716,7 @@ export async function onTerminalSessions(
  *  preview keeps an in-page popover. */
 export async function openFilesWindow(node: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_files_window", { node });
+  await tryInvoke("open_files_window", { node });
 }
 
 /** Which machine this window is a file manager for, when the window was
@@ -1087,8 +1099,7 @@ export async function onRoom(
  *  preview keeps the in-page panel. */
 export async function openRoomWindow(roomId: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_room_window", { room: roomId });
+  await tryInvoke("open_room_window", { room: roomId });
 }
 
 /** Which room this window is the call for, when the window was opened by
@@ -1166,8 +1177,7 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
  *  preview has no windows to pop into. */
 export async function openVideoWindow(key: string, title: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_video_window", { key, title });
+  await tryInvoke("open_video_window", { key, title });
 }
 
 /** Which stream this window is a popout for, when it was opened by

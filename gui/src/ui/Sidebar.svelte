@@ -6,6 +6,7 @@
   // its right edge and collapsible to a thin rail, so it never blocks the
   // graph. The tab strip carries live badges (room knocks, reachable sites).
   import { app } from "../store.svelte";
+  import { isMobile } from "../tauri";
   import RoomsTab from "./RoomsTab.svelte";
   import SitesTab from "./SitesTab.svelte";
 
@@ -26,10 +27,14 @@
     }
   }
   function loadCollapsed(): boolean {
+    // A phone starts with the panel as a rail — the graph is the whole
+    // screen's job there. The user's own toggle (persisted) still wins.
     try {
-      return localStorage.getItem(COLLAPSED_KEY) === "1";
+      const stored = localStorage.getItem(COLLAPSED_KEY);
+      if (stored !== null) return stored === "1";
+      return isMobile();
     } catch {
-      return false;
+      return isMobile();
     }
   }
 
@@ -187,6 +192,20 @@
   }
   .sidebar.collapsed {
     width: 2.75rem;
+  }
+  /* Phone-width stages: the open panel floats over the graph (see the
+     device drawer's twin rule). */
+  @media (max-width: 700px) {
+    .sidebar:not(.collapsed) {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      height: auto;
+      width: min(20rem, 88vw) !important;
+      z-index: 26;
+      box-shadow: var(--shadow-lg);
+    }
   }
   .sidebar.resizing {
     user-select: none;
