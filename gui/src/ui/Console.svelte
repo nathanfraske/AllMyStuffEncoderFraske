@@ -23,7 +23,7 @@
   // the control route. Touch input speaks the trackpad dialect instead of
   // the pen one (see console-touch.ts): drags glide the cursor,
   // tap-then-drag holds the button, and two fingers pinch-zoom the view.
-  import { flushSync, onMount } from "svelte";
+  import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
@@ -362,6 +362,22 @@
   // ---- bar drag (the grip) ----
   let barPos = $state({ x: 0, y: 0 });
   let barDragging = $state(false);
+  // A dragged bar must survive the pane shrinking (window resize, phone
+  // rotation) — re-clamp it into the new bounds instead of stranding it
+  // off-view.
+  function clampBarPos() {
+    if (barPos.x === 0 && barPos.y === 0) return;
+    const c = consoleEl?.getBoundingClientRect();
+    const b = barWrapEl?.getBoundingClientRect();
+    if (!c || !b) return;
+    const halfSpan = Math.max(0, (c.width - b.width) / 2 - 6);
+    const top0 = b.top - c.top - barPos.y;
+    const yMax = Math.max(0, c.height - top0 - b.height - 8);
+    barPos = {
+      x: Math.min(halfSpan, Math.max(-halfSpan, barPos.x)),
+      y: Math.min(yMax, Math.max(0, barPos.y)),
+    };
+  }
   function onGripDown(e: PointerEvent) {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const grip = e.currentTarget as HTMLElement;
@@ -608,9 +624,10 @@
     frameCount = 0;
     inCount = 0;
     // A new stream starts at its natural fit, and any touch gesture from
-    // the old one is over.
+    // the old one is over. Untracked: lifting a held button reads store
+    // state, and this effect must re-run on route changes only.
     view = { scale: 1, x: 0, y: 0 };
-    touchMouse.reset();
+    untrack(() => touchMouse.reset());
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
@@ -1136,7 +1153,7 @@
   // Control dropping mid-gesture: whatever the fingers were holding lifts
   // while the route can still carry it.
   $effect(() => {
-    if (!app.consoleControl) touchMouse.reset();
+    if (!app.consoleControl) untrack(() => touchMouse.reset());
   });
 
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
@@ -1393,7 +1410,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} />
+<svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} onresize={clampBarPos} />
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -1533,6 +1550,12 @@
         style:transform={`translate(calc(-50% + ${barPos.x}px), ${barPos.y}px)`}
         onpointerenter={() => (barHover = true)}
         onpointerleave={() => (barHover = false)}
+        onpointerdowncapture={(e) => {
+          // With the soft keyboard up, bar taps must not steal focus from
+          // its hidden input (a blur drops the OS keyboard mid-word) —
+          // suppress the focus default; the click still fires.
+          if (keysOpen && (e.target as HTMLElement).closest("button")) e.preventDefault();
+        }}
       >
         <div class="kvmbar" class:asleep={barHidden} role="toolbar" aria-label="Console controls">
           <!-- svelte-ignore a11y_consider_explicit_label -->
@@ -2593,8 +2616,12 @@
   /* Last in the stylesheet on purpose: the phone-fullscreen
      overrides must out-cascade the base rules above (a later
      `padding` shorthand at equal specificity wipes the safe-area
-     padding-top — exactly the under-the-notch bug). */
-  @media (max-width: 700px) {
+     padding-top — exactly the under-the-notch bug). A landscape phone
+     is wider than the house 700px breakpoint but has no height to
+     spare — the max-height arm catches it for the full-bleed shell
+     (the bar keeps its full button set there; width isn't the
+     problem). */
+  @media (max-width: 700px), (max-height: 500px) {
     .scrim {
       padding: 0;
     }
@@ -2604,6 +2631,8 @@
       border: none;
       border-radius: 0;
     }
+  }
+  @media (max-width: 700px) {
     /* Secondary buttons leave the bar for the session menu — the bar must
        fit a portrait phone with room to breathe. */
     .kbtn.slim,
