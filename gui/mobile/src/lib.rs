@@ -148,6 +148,18 @@ pub fn run() {
             mesh::mesh_networks,
             mesh::mesh_peers,
             mesh::mesh_roster_list,
+            mesh::mesh_identity,
+            mesh::mesh_identity_set_label,
+            mesh::mesh_network_add,
+            mesh::mesh_network_remove,
+            mesh::mesh_network_update,
+            mesh::network_reconnect,
+            mesh::network_set_enabled,
+            mesh::disabled_networks,
+            mesh::mesh_network_id_generate,
+            mesh::mesh_status,
+            mesh::mesh_config_show,
+            mesh::refresh_node,
         ]);
 
     // Without it (the NDK-free CI check): just the demo-capable shell commands.
