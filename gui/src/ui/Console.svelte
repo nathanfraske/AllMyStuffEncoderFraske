@@ -771,6 +771,11 @@
     // VideoDecoder exist" test chose a decoder that can only die.
     let bornDeadDrops = 0;
 
+    // Latency valve: skipping deltas until the next key unit once the
+    // decode queue backs up (deltas chain — a compressed queue can only
+    // be abandoned wholesale, never thinned).
+    let dropUntilKey = false;
+
     const dropDecoder = (why: unknown) => {
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
@@ -825,6 +830,31 @@
       }
       // H.264 — decode entry is a key unit; deltas before one wait.
       inCount += 1;
+      // Latency valve: a standing decodeQueueSize IS display delay (16.7ms
+      // per queued frame at 60), and the stall ladder can't see it — paints
+      // stay plentiful while the queue just sits deep, or grows without
+      // bound whenever the decoder runs slightly under the arrival rate.
+      // Past ~4 queued AUs (>66ms), stop feeding: deltas reference each
+      // other, so skip everything up to the next key unit and pull an IDR
+      // forward (askRefresh rate-limits at 300ms and the backend throttles
+      // again). Display lag stays bounded at ~4 frames + one IDR round trip
+      // instead of accumulating for the rest of the session.
+      if (dropUntilKey) {
+        if (!f.key) {
+          askRefresh();
+          return;
+        }
+        dropUntilKey = false;
+      } else if (
+        !f.key &&
+        decoder &&
+        decoder.state !== "closed" &&
+        decoder.decodeQueueSize > 4
+      ) {
+        dropUntilKey = true;
+        askRefresh();
+        return;
+      }
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
         codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";
@@ -993,9 +1023,16 @@
   // stops sampling. Reset (unlock) on a stream re-wire.
   let detectLocked = false;
   let detectPrev: { x0: number; x1: number; y0: number; y1: number } | null = null;
+  // The detector's CPU-side scratch surface (see detectActiveRegion for why
+  // the live canvas must never be read directly). Small on purpose: one
+  // ~500 KB readback per pass instead of twelve full-width strips of 4K.
+  const DETECT_W = 480;
+  const DETECT_H = 270;
+  let detectScratch: HTMLCanvasElement | null = null;
 
-  // Measure the frame's active region: sample the decoded canvas for symmetric
-  // black letterbox/pillarbox bars. Cheap (a dozen 1px strips), and it stops
+  // Measure the frame's active region: mirror the decoded canvas into the
+  // small scratch surface and scan that for symmetric black
+  // letterbox/pillarbox bars. Cheap (one downscaled readback), and it stops
   // once locked. Conservative: only crops when clear bars sit on BOTH opposite
   // edges and are near-symmetric (a real letterbox), so ordinary dark content is
   // never mistaken for a bar; otherwise it maps over the whole frame.
@@ -1003,13 +1040,30 @@
     if (detectLocked) return;
     const c = canvasEl;
     if (!c || !c.width || !c.height || !hasFrame) return;
-    const ctx = c.getContext("2d", { willReadFrequently: true });
+    // NEVER read pixels off the live presentation canvas. Chromium demotes
+    // an accelerated 2D canvas to CPU raster after just TWO readbacks
+    // (kFallbackToCPUAfterReadbacks) when it wasn't created with
+    // willReadFrequently — and ours can't be (paint() made its context
+    // plain-GPU on the first frame; context attributes are fixed then, so a
+    // willReadFrequently re-get here is silently ignored). The demotion is
+    // permanent for the element: every subsequent drawImage of a
+    // hardware-decoded 4K frame becomes a ~33 MB GPU→CPU copy per frame,
+    // which is exactly the "video is choppy and seconds behind while the
+    // mouse is instant" console. Instead, mirror the frame into a small
+    // CPU-side scratch canvas (created once, willReadFrequently from
+    // birth) and do ONE readback of that: canvas→canvas drawImage stays on
+    // the GPU, all outputs are 0..1 fractions so the ~0.2%-of-width
+    // precision loss is invisible to the pointer mapping.
+    if (!detectScratch) {
+      detectScratch = document.createElement("canvas");
+      detectScratch.width = DETECT_W;
+      detectScratch.height = DETECT_H;
+    }
+    const ctx = detectScratch.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
-    const w = c.width;
-    const h = c.height;
+    const w = DETECT_W;
+    const h = DETECT_H;
     const DARK = 24;
-    const bright = (d: Uint8ClampedArray, px: number) =>
-      d[px * 4] > DARK || d[px * 4 + 1] > DARK || d[px * 4 + 2] > DARK;
     const median = (a: number[]) => a.slice().sort((p, q) => p - q)[a.length >> 1];
 
     let x0 = 0;
@@ -1018,15 +1072,20 @@
     let y1 = h;
     let found = false; // did the frame carry real (non-black) content this pass?
     try {
+      ctx.drawImage(c, 0, 0, w, h);
+      const data = ctx.getImageData(0, 0, w, h).data;
+      const bright = (x: number, y: number) => {
+        const px = (y * w + x) * 4;
+        return data[px] > DARK || data[px + 1] > DARK || data[px + 2] > DARK;
+      };
       const L: number[] = [];
       const R: number[] = [];
       for (let k = 1; k <= 6; k++) {
         const y = Math.floor((h * k) / 7);
-        const row = ctx.getImageData(0, y, w, 1).data;
         let l = 0;
-        while (l < w && !bright(row, l)) l++;
+        while (l < w && !bright(l, y)) l++;
         let rr = w - 1;
-        while (rr > l && !bright(row, rr)) rr--;
+        while (rr > l && !bright(rr, y)) rr--;
         if (l < rr) {
           L.push(l);
           R.push(rr);
@@ -1036,11 +1095,10 @@
       const B: number[] = [];
       for (let k = 1; k <= 6; k++) {
         const x = Math.floor((w * k) / 7);
-        const col = ctx.getImageData(x, 0, 1, h).data;
         let t = 0;
-        while (t < h && !bright(col, t)) t++;
+        while (t < h && !bright(x, t)) t++;
         let b = h - 1;
-        while (b > t && !bright(col, b)) b--;
+        while (b > t && !bright(x, b)) b--;
         if (t < b) {
           T.push(t);
           B.push(b);
