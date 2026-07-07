@@ -27,22 +27,51 @@
 //! `MeshClient` methods must therefore be called from outside the runtime
 //! (they are — a Tauri command thread), never from within [`InboundSink`].
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use allmystuff_mobile_core::{classify, Inbound, MeshClient, MeshError, MeshResult};
 use allmystuff_protocol::{
     ControlMessage, NodeProfile, CHANNEL_CONTROL, CHANNEL_MEDIA, CHANNEL_OWNED, CHANNEL_PRESENCE,
-    CHANNEL_ROOMS,
+    CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID,
 };
 use ed25519_dalek::SigningKey;
 use myownmesh_core::engine::attach_signaling;
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::SignalingDrivers;
 use myownmesh_core::{
-    ChannelError, Identity, JoinedNetwork, Mesh, MeshConfig, MeshHandle, NetworkConfig,
+    CapabilityAdvert, ChannelError, Identity, JoinedNetwork, Mesh, MeshConfig, MeshHandle,
+    NetworkConfig,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::runtime::Runtime;
+
+/// A live roster of the peers we've heard presence from this session, keyed by
+/// device id, each value the peer's serialized [`NodeProfile`]. Filled by the
+/// presence pump; read back (intersected with the connected set) as the
+/// `session_snapshot` peers the shared frontend renders.
+type Roster = Arc<Mutex<HashMap<String, Value>>>;
+
+/// The always-on **LAN rendezvous** network config — mDNS/DNS-SD only, no
+/// remote signaling, no STUN/TURN — byte-for-byte the desktop's local-claim
+/// network (see `node`'s `ensure_claim_networks`). Peers on the same LAN
+/// discover each other here with **zero configuration and zero infrastructure**:
+/// no fleet, no account, no relay. Built as JSON (like the desktop's
+/// `NetworkAdd`) so it rides `NetworkConfig`'s `#[serde(default)]` and doesn't
+/// need the engine's private `SignalingConfig` type.
+pub fn lan_discovery_config() -> NetworkConfig {
+    serde_json::from_value(json!({
+        "id": LOCAL_CLAIM_NETWORK_ID,
+        "network_id": LOCAL_CLAIM_NETWORK_ID,
+        "label": "Local (this LAN)",
+        "kind": "open",
+        "auto_approve": true,
+        "signaling": { "strategy": "none", "mdns": true },
+        "stun_servers": [],
+        "turn_servers": [],
+    }))
+    .expect("the local-claim network config is a valid NetworkConfig")
+}
 
 /// The AllMyStuff channels the phone subscribes to for inbound traffic — the
 /// same set `allmystuff-mobile-core::classify` recognises.
@@ -84,6 +113,9 @@ pub struct EngineMesh {
     handle: MeshHandle,
     net: JoinedNetwork,
     device_id: String,
+    /// Peers heard via presence this session (device id → serialized profile),
+    /// filled by the pump and read back by [`EngineMesh::snapshot_peers`].
+    roster: Roster,
     /// Kept alive for the node's lifetime: dropping the signaling drivers stops
     /// peer discovery. `None` when signaling wasn't attached (hermetic tests).
     _signaling: Option<SignalingDrivers>,
@@ -91,23 +123,35 @@ pub struct EngineMesh {
 
 impl EngineMesh {
     /// Open the engine with a 32-byte ed25519 `seed` (from the platform
-    /// keystore), join `network_id`, and attach signaling so peers are
-    /// discovered. `label` is this device's display name. Every classified
-    /// inbound frame off the five AllMyStuff channels is delivered to
-    /// `on_inbound`.
+    /// keystore) and join the **LAN rendezvous** ([`lan_discovery_config`]) —
+    /// the zero-configuration path a phone uses to discover peers on the same
+    /// network over mDNS, with no fleet, account, or relay. `label` is this
+    /// device's display name; every classified inbound frame off the five
+    /// AllMyStuff channels is delivered to `on_inbound`.
+    pub fn open_lan(
+        seed: [u8; 32],
+        label: impl Into<String>,
+        on_inbound: InboundSink,
+    ) -> Result<Self, EngineError> {
+        Self::open_inner(seed, label, lan_discovery_config(), on_inbound, true)
+    }
+
+    /// Open the engine and join an explicit `network` (e.g. a fleet's closed
+    /// network once paired). Use [`open_lan`](Self::open_lan) for plain LAN
+    /// discovery.
     pub fn open_and_join(
         seed: [u8; 32],
         label: impl Into<String>,
-        network_id: impl Into<String>,
+        network: NetworkConfig,
         on_inbound: InboundSink,
     ) -> Result<Self, EngineError> {
-        Self::open_inner(seed, label, network_id, on_inbound, true)
+        Self::open_inner(seed, label, network, on_inbound, true)
     }
 
     fn open_inner(
         seed: [u8; 32],
         label: impl Into<String>,
-        network_id: impl Into<String>,
+        network: NetworkConfig,
         on_inbound: InboundSink,
         attach_sig: bool,
     ) -> Result<Self, EngineError> {
@@ -124,21 +168,26 @@ impl EngineMesh {
             SigningKey::from_bytes(&seed),
             label,
         ));
-        let network_id = network_id.into();
 
         let (handle, net, signaling) = rt.block_on(async {
             let handle = Mesh::open_with_identity(MeshConfig::default(), identity)
                 .await
                 .map_err(|e| EngineError::Open(e.to_string()))?;
-            // A phone joins a network whose config id and wire id are the same
-            // fleet handle; defaults carry the reference STUN/TURN + signaling.
             let net = handle
-                .join(NetworkConfig::from_network_id(
-                    network_id.clone(),
-                    network_id.clone(),
-                ))
+                .join(network)
                 .await
                 .map_err(|e| EngineError::Join(e.to_string()))?;
+            // Tag ourselves on the *myownmesh* capability layer (distinct from
+            // our AllMyStuff `NodeProfile` presence): peers' liveness poll reads
+            // this to mark us online + "on AllMyStuff", so the phone shows up as
+            // a real node on their graph rather than an anonymous mesh peer.
+            // Must run inside the runtime context (it drives the RPC engine).
+            net.advertise(CapabilityAdvert {
+                tags: vec!["allmystuff".to_string()],
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                max_connections: None,
+                extra: json!({}),
+            });
             let signaling = if attach_sig {
                 attach_signaling(&net.state())
             } else {
@@ -148,19 +197,30 @@ impl EngineMesh {
         })?;
 
         let device_id = handle.device_id();
+        let roster: Roster = Arc::new(Mutex::new(HashMap::new()));
 
-        // One pump task per channel: inbound `{from, body}` → classify → sink.
+        // One pump task per channel: inbound `{from, body}` → classify → sink,
+        // and presence adverts additionally land in the roster for snapshots.
         for chan in CHANNELS {
             let mut sub = net.channel::<Value>(chan).subscribe();
             let chan = chan.to_string();
             let sink = on_inbound.clone();
+            let roster = roster.clone();
             rt.spawn(async move {
                 loop {
                     match sub.recv().await {
                         // A frame this build understands (or an ignorable
-                        // Unknown) — hand the typed value to the host.
+                        // Unknown) — record presence, then hand it to the host.
                         Some(Ok(msg)) => {
                             if let Some(inbound) = classify(&chan, &msg.from, msg.body) {
+                                if let Inbound::Presence(profile) = &inbound {
+                                    if let Ok(value) = serde_json::to_value(profile.as_ref()) {
+                                        roster
+                                            .lock()
+                                            .unwrap()
+                                            .insert(profile.node.as_str().to_string(), value);
+                                    }
+                                }
                                 sink(inbound);
                             }
                         }
@@ -179,8 +239,64 @@ impl EngineMesh {
             handle,
             net,
             device_id,
+            roster,
             _signaling: signaling,
         })
+    }
+
+    /// The peers to render on the graph: every currently-connected peer we've
+    /// also heard a presence advert from, as its serialized [`NodeProfile`].
+    /// This is the `peers` array the shared frontend's `session_snapshot`
+    /// expects. Intersecting the connected set with the roster drops peers that
+    /// have gone offline since we last heard them.
+    pub fn snapshot_peers(&self) -> Vec<Value> {
+        let roster = self.roster.lock().unwrap();
+        self.peers()
+            .into_iter()
+            .filter_map(|id| roster.get(&id).cloned())
+            .collect()
+    }
+
+    /// The body of the frontend's **`session_snapshot`** command:
+    /// `{ready, me, network, peers, routes, shares}`. `peers` are the serialized
+    /// [`NodeProfile`]s from [`snapshot_peers`](Self::snapshot_peers); routes and
+    /// shares are empty until those planes are wired.
+    pub fn session_snapshot(&self) -> Value {
+        json!({
+            "ready": true,
+            "me": self.device_id,
+            "network": self.net.network_id(),
+            "peers": self.snapshot_peers(),
+            "routes": [],
+            "shares": [],
+        })
+    }
+
+    /// The body of the frontend's **`mesh_networks`** command — the single
+    /// network this phone is on.
+    pub fn networks(&self) -> Value {
+        let phase = serde_json::to_value(self.net.current_phase()).unwrap_or(Value::Null);
+        json!({ "networks": [{
+            "config_id": self.net.config_id(),
+            "network_id": self.net.network_id(),
+            "label": self.net.label(),
+            "phase": phase,
+        }]})
+    }
+
+    /// The body of the frontend's **`mesh_peers`** command — the connected peers
+    /// with their capability adverts (`status`, `tags`, `app_version`), which is
+    /// the liveness feed that marks a peer online + on-AllMyStuff. The engine's
+    /// `PeerInfo` serializes with the `device_id` / `label` / `status` /
+    /// `capabilities` fields the frontend reads (a superset is harmless).
+    pub fn mesh_peers(&self) -> Value {
+        let peers: Vec<Value> = self
+            .net
+            .peers()
+            .iter()
+            .filter_map(|p| serde_json::to_value(p).ok())
+            .collect();
+        json!({ "peers": peers })
     }
 
     /// This device's mesh id (bare ed25519 pubkey).
@@ -268,10 +384,12 @@ mod tests {
     /// is left off so the test is hermetic (no relay/network access).
     #[test]
     fn open_join_exposes_a_working_mesh_client() {
+        // Join the LAN rendezvous config, but with signaling off so the test is
+        // hermetic (no mDNS traffic, no relay/network access).
         let mesh = EngineMesh::open_inner(
             [9u8; 32],
             "test-phone",
-            "allmystuff-mesh-test-net",
+            lan_discovery_config(),
             noop_sink(),
             false,
         )
@@ -284,8 +402,9 @@ mod tests {
         assert_eq!(MeshClient::device_id(&mesh), want);
         assert_eq!(mesh.device_id(), want);
 
-        // No peers yet → empty snapshot.
+        // No peers yet → empty connected set and empty snapshot.
         assert!(mesh.peers().is_empty());
+        assert!(mesh.snapshot_peers().is_empty());
 
         // A send to an unknown peer is a typed error, not a panic.
         let err = mesh
@@ -295,6 +414,45 @@ mod tests {
             err,
             MeshError::NoSuchPeer(_) | MeshError::NotConnected
         ));
+    }
+
+    #[test]
+    fn command_bodies_match_the_frontend_contract() {
+        let mesh = EngineMesh::open_inner(
+            [3u8; 32],
+            "test-phone",
+            lan_discovery_config(),
+            noop_sink(),
+            false,
+        )
+        .expect("open + join");
+
+        // session_snapshot: ready, self id, the network, and an (empty) peers array.
+        let snap = mesh.session_snapshot();
+        assert_eq!(snap["ready"], true);
+        assert_eq!(snap["me"], mesh.device_id());
+        assert_eq!(snap["network"], LOCAL_CLAIM_NETWORK_ID);
+        assert!(snap["peers"].as_array().unwrap().is_empty());
+        assert!(snap["routes"].is_array());
+
+        // mesh_networks: the one LAN network, keyed as the frontend expects.
+        let nets = mesh.networks();
+        assert_eq!(nets["networks"][0]["network_id"], LOCAL_CLAIM_NETWORK_ID);
+        assert!(nets["networks"][0]["config_id"].is_string());
+
+        // mesh_peers: an array (empty with no peers connected).
+        assert!(mesh.mesh_peers()["peers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lan_discovery_config_is_mdns_only_no_infrastructure() {
+        let cfg = lan_discovery_config();
+        assert_eq!(cfg.network_id, LOCAL_CLAIM_NETWORK_ID);
+        assert_eq!(cfg.signaling.strategy, "none");
+        assert!(cfg.signaling.mdns);
+        assert!(cfg.stun_servers.is_empty());
+        assert!(cfg.turn_servers.is_empty());
+        assert!(cfg.auto_approve);
     }
 
     #[test]
