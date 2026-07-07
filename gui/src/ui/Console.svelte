@@ -1724,10 +1724,12 @@
               )}"
             ></canvas>
           {/if}
-          {#if hasFrame && stagePointerActive}
+          {#if hasFrame && stagePointerActive && mobileShell}
             <!-- Thin aiming crosshair at the commanded position (crosshairEl):
                  where the cursor SHOULD be, drawn with no video latency so you
-                 can line things up precisely. -->
+                 can line things up precisely. Mobile only — on desktop the real
+                 mouse already shows as a crosshair (`.stage.grabbing`), so
+                 drawing our own would be a second one on top of it. -->
             <div class="crosshair" bind:this={crosshairEl} aria-hidden="true">
               <svg width="24" height="24" viewBox="0 0 24 24">
                 <g stroke="#fff" stroke-width="1" shape-rendering="crispEdges">
