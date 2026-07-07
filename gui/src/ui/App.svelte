@@ -1,6 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app } from "../store.svelte";
+  import { isMobile } from "../tauri";
+
+  // Runtime mobile tag on the root element: CSS can then target the real
+  // phone shell (fixed notch clearances) without catching narrow desktop
+  // windows, which share the width media queries.
+  if (typeof document !== "undefined" && isMobile()) {
+    document.documentElement.classList.add("is-mobile");
+  }
   import {
     appVersion,
     consoleWindowTarget,
@@ -542,6 +550,13 @@
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+
+  /* The webview runs edge-to-edge under the camera bump, and this WKWebView
+     does not report safe-area insets — clear the bump with a fixed floor,
+     max()'d with the inset wherever it IS reported. */
+  :global(html.is-mobile) .topbar {
+    padding-top: calc(0.4rem + max(3.4rem, env(safe-area-inset-top, 0px)));
   }
 
   /* Phone-width windows: compact the header — no tagline, tighter gaps,

@@ -811,7 +811,7 @@
       border-radius: 0;
     }
     .head {
-      padding-top: calc(0.6rem + max(1.1rem, env(safe-area-inset-top, 0px)));
+      padding-top: calc(0.6rem + max(3.4rem, env(safe-area-inset-top, 0px)));
     }
   }
   @keyframes rise {

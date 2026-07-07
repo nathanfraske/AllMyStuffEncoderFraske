@@ -1524,7 +1524,7 @@
       border-radius: 0;
     }
     .bar {
-      padding-top: calc(0.5rem + max(1.1rem, env(safe-area-inset-top, 0px)));
+      padding-top: calc(0.5rem + max(3.4rem, env(safe-area-inset-top, 0px)));
     }
     .controls {
       padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
