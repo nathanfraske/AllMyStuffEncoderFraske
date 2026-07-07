@@ -1,8 +1,15 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { app } from "../store.svelte";
+  import { isMobile } from "../tauri";
   import { displayName, mediaColor, humanBytes, isAppNode, MEDIA, type MediaKind } from "../types";
   import type { MeshNode } from "../types";
+
+  // Phone/tablet shell: a finger drag only ever pans/scrolls the view — it
+  // never marquees and never starts the drag-to-share gesture. Taps still
+  // select (the device drawer opens from that). Everything below that touches
+  // pointer behaviour is gated on this so desktop stays exactly as it was.
+  const mobile = isMobile();
 
   // Viewport size tracked via ResizeObserver so the layout fits its container
   // (same approach as the MyOwnMesh NodeMap). We OBSERVE the outer canvas —
@@ -540,10 +547,31 @@
   function onPointerDown(e: PointerEvent) {
     const target = e.target as Element | null;
     // Let node clicks/drags and the floating controls handle themselves —
-    // capturing here would swallow their clicks.
-    if (target?.closest?.(".node, .zoombar, .arm-banner, .restart-panel")) return;
+    // capturing here would swallow their clicks. Exception: on a phone in
+    // radial view a drag that starts on a card must still pan (the node
+    // handlers are tap-only on mobile and don't stop propagation), so those
+    // fall through — unless connect mode is armed, where the node's own tap
+    // completes the wire.
+    if (target?.closest?.(".zoombar, .arm-banner, .restart-panel")) return;
+    if (
+      target?.closest?.(".node") &&
+      !(mobile && !isGrid && !app.dragFrom)
+    ) {
+      return;
+    }
     if (app.dragFrom) {
       app.cancelConnect();
+      return;
+    }
+    if (mobile) {
+      // A finger drag only pans/scrolls — never marquee, never share. Grid
+      // scrolls natively (the real scroller + touch-action: pan-y on the
+      // canvas); radial pans via this gesture. No preventDefault and no
+      // pointer capture here: either could retarget or suppress the tap's
+      // click, which is what selects a node.
+      if (!isGrid && e.isPrimary) {
+        gesture = { kind: "pan", x: e.clientX, y: e.clientY, ox: panX, oy: panY };
+      }
       return;
     }
     // Stop a drag from turning into a native text selection.
@@ -573,6 +601,9 @@
   }
   function onPointerMove(e: PointerEvent) {
     if (!gesture) return;
+    // Phone: the pan gesture belongs to the first finger — a second finger's
+    // moves would yank the origin around.
+    if (mobile && !e.isPrimary) return;
     if (gesture.kind === "pan") {
       if (isGrid && scroller) {
         // Dragging right/down moves the content right/down — i.e. scroll left/up.
@@ -612,6 +643,11 @@
 
   // ---- drag one device onto another → open the share builder ----------
   function onNodePointerDown(e: PointerEvent, n: MeshNode) {
+    // Phone: dragging is for scrolling/panning only — never a share. Selection
+    // rides the tap's `click` (see the node's onclick), so this handler must
+    // not capture the pointer or preventDefault, and it must let the event
+    // bubble so the canvas (radial) or the native scroller (grid) can pan.
+    if (mobile) return;
     if (e.button !== 0 || app.dragFrom) return; // left only; connect mode uses clicks
     // A press on an inline control (Claim, Make claimable…) is that button's —
     // don't hijack it into a node drag, or capturing the pointer eats its click.
@@ -643,6 +679,9 @@
     }
   }
   function onNodePointerUp(e: PointerEvent, n: MeshNode) {
+    // Phone: the tap's click event selects / completes connect — acting here
+    // too would double-fire it.
+    if (mobile) return;
     // Only act when this device actually started the gesture (a press that
     // began on an inline button left nodeDrag null — let that button win).
     if (app.dragFrom) {
@@ -882,19 +921,30 @@
   {/if}
 {/snippet}
 
+<!-- Phone grid reads like a list: let the browser own the vertical touch
+     scroll (pan-y; both axes once zoomed in, so nothing is unreachable).
+     Radial (and all of desktop) keeps the stylesheet's touch-action: none so
+     the JS pan gesture receives every move — `null` sets no inline style at
+     all, leaving desktop untouched. -->
 <div
   class="canvas"
   class:panning
   class:marqueeing={gesture?.kind === "marquee"}
   class:armed
   bind:this={canvas}
+  style:touch-action={mobile && isGrid ? (zoom > 1 ? "pan-x pan-y" : "pan-y") : null}
   onwheel={onWheel}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
   onpointerenter={() => (hovering = true)}
-  onpointerleave={() => (hovering = false)}
+  onpointerleave={() => {
+    hovering = false;
+    // The mobile radial pan runs uncaptured (capture would steal the tap's
+    // click from the node) — if the finger slides off the canvas, end it.
+    if (mobile) gesture = null;
+  }}
   oncontextmenu={onContextMenu}
   role="application"
   aria-label="Your stuff, as a graph"
@@ -1010,6 +1060,14 @@
         onpointermove={(e) => onNodePointerMove(e, n)}
         onpointerup={(e) => onNodePointerUp(e, n)}
         onpointercancel={(e) => onNodePointerUp(e, n)}
+        onclick={(e) => {
+          // Phone: select on the tap's click — a drag that scrolled/panned
+          // never fires one, so scrolling can't select. Desktop selects from
+          // pointerup above; running this too would double-fire.
+          if (!mobile) return;
+          if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
+          onNodeClick(n);
+        }}
         onkeydown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
