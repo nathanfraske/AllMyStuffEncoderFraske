@@ -56,17 +56,14 @@ pub(crate) fn boot_id() -> u64 {
 /// `ScanResult` shape (`{ node_id, label, hostname, summary, capabilities }`)
 /// so the store re-homes the local node with no mobile special case.
 ///
-/// `node_id` is `"this"` until the embedded engine assigns the phone its real
-/// ed25519 device id — exactly the placeholder the desktop uses for its
-/// offline/demo graph, which the store already understands. The capabilities,
-/// though, are real: the viewer/controller set every phone advertises, built
-/// by [`mobile_capabilities`] the same way a desktop's come from its hardware
-/// scan.
-#[tauri::command]
-fn scan_self() -> Result<Value, String> {
-    // "this" mirrors the desktop's offline-graph placeholder; the engine
-    // swaps in the real device id once it's up.
-    let node = NodeId::from("this");
+/// `node_id` is the engine's real ed25519 device id once the mesh is up, and
+/// `"this"` before then — exactly the placeholder the desktop uses for its
+/// offline/demo graph, which the store already understands (it re-homes the
+/// local node when the real id arrives). The capabilities are real either way:
+/// the viewer/controller set every phone advertises, built by
+/// [`mobile_capabilities`] the same way a desktop's come from its hardware scan.
+fn scan_self_impl(node_id: String) -> Result<Value, String> {
+    let node = NodeId::from(node_id.as_str());
     let cfg = MobileNodeConfig {
         label: "My Phone".to_string(),
         os: os_label().to_string(),
@@ -83,6 +80,25 @@ fn scan_self() -> Result<Value, String> {
         "summary": profile.summary,
         "capabilities": profile.capabilities,
     }))
+}
+
+#[cfg(feature = "mesh")]
+#[tauri::command]
+fn scan_self(state: tauri::State<'_, mesh::MeshState>) -> Result<Value, String> {
+    let node_id = state
+        .0
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.device_id().to_string())
+        .unwrap_or_else(|| "this".to_string());
+    scan_self_impl(node_id)
+}
+
+#[cfg(not(feature = "mesh"))]
+#[tauri::command]
+fn scan_self() -> Result<Value, String> {
+    scan_self_impl("this".to_string())
 }
 
 /// Mirror one frontend diagnostic line into the app's stderr log, so a
@@ -107,10 +123,20 @@ pub fn run() {
     let builder = builder
         .manage(mesh::MeshState::default())
         .setup(|app| {
+            // Route the embedded engine's `tracing` diagnostics (mDNS attach
+            // failures, peer connects/drops) to stderr, where the device
+            // console picks them up. Without a subscriber they are dropped —
+            // and "why is discovery dark" becomes undebuggable on a phone.
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_ansi(false)
+                .try_init();
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                if let Err(e) = mesh::join(&handle) {
-                    eprintln!("[mesh] join failed: {e}");
+                eprintln!("[mesh] opening the embedded engine (LAN mDNS discovery)…");
+                match mesh::join(&handle) {
+                    Ok(id) => eprintln!("[mesh] joined the LAN mesh as {id}"),
+                    Err(e) => eprintln!("[mesh] join failed: {e}"),
                 }
             });
             Ok(())

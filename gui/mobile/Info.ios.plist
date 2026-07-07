@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the generated gen/apple Info.plist by `tauri ios init/build`.
+
+     iOS gates all local-network traffic behind a user permission prompt, and
+     the prompt only appears (rather than a silent deny) when these keys are
+     present. The mesh needs them twice over: mDNS/DNS-SD discovery of peers,
+     and WebRTC ICE connecting directly to peers' LAN addresses.
+
+     Note this covers the *permission* layer only. Raw multicast sockets (the
+     engine's pure-Rust mDNS, `mdns-sd`) additionally require Apple's managed
+     `com.apple.developer.networking.multicast` entitlement on iOS 14+ — see
+     docs/MOBILE.md. -->
+<plist version="1.0">
+<dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AllMyStuff discovers your devices and connects to them directly over your local network — no cloud, no account.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_myownmesh._tcp</string>
+  </array>
+</dict>
+</plist>

@@ -100,7 +100,11 @@ pub fn join(app: &AppHandle) -> Result<String, String> {
     let mesh = EngineMesh::open_lan(seed, device_label(), sink).map_err(|e| e.to_string())?;
     let id = mesh.device_id().to_string();
     advertise_self(&mesh);
+    let snapshot = mesh.session_snapshot();
     *state.0.lock().unwrap() = Some(mesh);
+    // Flip the UI to the live (ready, real-id) state immediately — even with
+    // zero peers — rather than waiting for the first inbound presence advert.
+    let _ = app.emit("allmystuff://session", snapshot);
     Ok(id)
 }
 

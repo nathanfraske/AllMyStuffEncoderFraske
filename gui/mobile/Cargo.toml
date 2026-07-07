@@ -41,7 +41,7 @@ tauri-build = { version = "2", features = [] }
 # NDK — the engine pulls `ring` (a C build) which the NDK-free CI can't compile.
 # On-device builds (`tauri ios/android`) use the default, so they get the mesh.
 default = ["mesh"]
-mesh = ["dep:allmystuff-mesh", "dep:getrandom"]
+mesh = ["dep:allmystuff-mesh", "dep:getrandom", "dep:tracing-subscriber"]
 
 [dependencies]
 # No `tray-icon` / `autostart` / `single-instance` here — those are desktop
@@ -63,3 +63,7 @@ allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }
 allmystuff-mesh = { path = "../mobile-mesh", optional = true }
 # OS randomness for minting the device seed on first run (behind `mesh`).
 getrandom = { version = "0.2", optional = true }
+# Surface the embedded engine's `tracing` output (mDNS attach failures, peer
+# connects) on stderr, where the device console (Xcode / idevicesyslog / adb
+# logcat) picks it up — without a subscriber those diagnostics are dropped.
+tracing-subscriber = { version = "0.3", optional = true }
