@@ -1513,23 +1513,6 @@
      bar (and its ✕) clear of the status bar, and the control bar clear of
      the home indicator. Zero effect on desktop: env() is 0 there, and a
      narrow *windowed* console is already 100%×100%. */
-  @media (max-width: 700px) {
-    .scrim {
-      padding: 0;
-    }
-    .console {
-      width: 100%;
-      height: 100%;
-      border: none;
-      border-radius: 0;
-    }
-    .bar {
-      padding-top: calc(0.5rem + max(3.4rem, env(safe-area-inset-top, 0px)));
-    }
-    .controls {
-      padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
-    }
-  }
   @keyframes rise {
     from {
       transform: translateY(14px) scale(0.98);
@@ -2060,5 +2043,27 @@
   }
   .end:hover {
     background: oklch(0.25 0.07 14);
+  }
+
+  /* Last in the stylesheet on purpose: the phone-fullscreen
+     overrides must out-cascade the base rules above (a later
+     `padding` shorthand at equal specificity wipes the safe-area
+     padding-top — exactly the under-the-notch bug). */
+  @media (max-width: 700px) {
+    .scrim {
+      padding: 0;
+    }
+    .console {
+      width: 100%;
+      height: 100%;
+      border: none;
+      border-radius: 0;
+    }
+    .bar {
+      padding-top: calc(0.5rem + max(3.4rem, env(safe-area-inset-top, 0px)));
+    }
+    .controls {
+      padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
+    }
   }
 </style>

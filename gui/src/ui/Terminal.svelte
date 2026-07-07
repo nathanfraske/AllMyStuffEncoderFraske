@@ -835,17 +835,6 @@
      padding keeps the tab bar's ✕ out from under the status bar. Zero
      effect on desktop: env() is 0 there, and a narrow *windowed* terminal
      is already 100%×100%. */
-  @media (max-width: 700px) {
-    .terminal {
-      width: 100%;
-      height: 100%;
-      border: none;
-      border-radius: 0;
-    }
-    .head {
-      padding-top: calc(0.45rem + max(3.4rem, env(safe-area-inset-top, 0px)));
-    }
-  }
   .head {
     display: flex;
     align-items: center;
@@ -1182,5 +1171,21 @@
   .btn-restart:hover,
   .btn-close:hover {
     background: #322c55;
+  }
+
+  /* Last in the stylesheet on purpose: the phone-fullscreen
+     overrides must out-cascade the base rules above (a later
+     `padding` shorthand at equal specificity wipes the safe-area
+     padding-top — exactly the under-the-notch bug). */
+  @media (max-width: 700px) {
+    .terminal {
+      width: 100%;
+      height: 100%;
+      border: none;
+      border-radius: 0;
+    }
+    .head {
+      padding-top: calc(0.45rem + max(3.4rem, env(safe-area-inset-top, 0px)));
+    }
   }
 </style>
