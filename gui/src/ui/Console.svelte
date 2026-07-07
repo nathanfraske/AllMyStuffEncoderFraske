@@ -306,13 +306,20 @@
   // ---- the control bar ------------------------------------------------
   //
   // One floating toolbar carries the whole session (the KVM-console
-  // pattern): icon buttons for the toggles, and three menus — session
-  // (who/status/handles/End), screens (the input picker), video
-  // (quality/zoom). One menu open at a time; a press anywhere else closes
-  // it. The bar stands VERTICALLY on the right edge — under the thumb on
-  // a phone, clear of the top edge's system gestures — slides up and down
-  // by its grip, and hides/returns ONLY by its handle tab (no auto-hide
-  // in any mode: chrome that disappears on its own is chrome you chase).
+  // pattern), in two orientations for two worlds:
+  //
+  // - DESKTOP: a horizontal bar across the top, with every monitor and
+  //   camera as its own icon button (hover for the name; the active one
+  //   filled, a popped-out one hollow) plus a pop-out button for the
+  //   current screen — the mouse-and-hover world the old tab bar served.
+  // - PHONE: a vertical rail on the right edge — thumbable, clear of the
+  //   top edge's system gestures — with the inputs folded into a Screens
+  //   menu instead of a button row.
+  //
+  // Both slide along their edge by the grip, and hide/return ONLY by the
+  // handle tab on their outer side (no auto-hide in any mode: chrome that
+  // disappears on its own is chrome you chase). One menu open at a time;
+  // a press anywhere else closes it.
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
@@ -330,6 +337,9 @@
   // button only earns bar space where a finger might need it.
   const touchDevice = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
   const mobileShell = isMobile();
+  // The rail orientation: vertical on the phone shell, horizontal on top
+  // everywhere else.
+  const vertical = mobileShell;
 
   function toggleMenu(m: MenuKind) {
     openMenu = openMenu === m ? null : m;
@@ -346,9 +356,10 @@
     openMenu = null;
   }
 
-  // Keep the open menu on-screen: it opens to the LEFT of the bar,
-  // vertically centered on it — a bar slid toward the top or bottom
-  // would carry the menu past the pane edge, so measure and shift back.
+  // Keep the open menu on-screen: it opens off the bar's inner side
+  // (below a top bar, left of the right rail), centered on it — a bar
+  // slid toward an edge would carry the menu past the pane, so measure
+  // and shift back along the bar's axis.
   let menuShift = $state(0);
   $effect(() => {
     void openSub;
@@ -364,12 +375,18 @@
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
       const pad = 8;
-      if (r.top < pad) menuShift = pad - r.top;
-      else if (r.bottom > window.innerHeight - pad) menuShift = window.innerHeight - pad - r.bottom;
+      if (vertical) {
+        if (r.top < pad) menuShift = pad - r.top;
+        else if (r.bottom > window.innerHeight - pad)
+          menuShift = window.innerHeight - pad - r.bottom;
+      } else {
+        if (r.left < pad) menuShift = pad - r.left;
+        else if (r.right > window.innerWidth - pad) menuShift = window.innerWidth - pad - r.right;
+      }
     });
   });
 
-  // ---- bar drag (the grip — vertical, along the right edge) ----
+  // ---- bar drag (the grip — along the bar's own edge) ----
   let barPos = $state(0); // offset from the bar's centered resting spot
   // A dragged bar must survive the pane shrinking (window resize, phone
   // rotation) — re-clamp it into the new bounds instead of stranding it
@@ -378,7 +395,9 @@
     const c = consoleEl?.getBoundingClientRect();
     const b = barWrapEl?.getBoundingClientRect();
     if (!c || !b) return 0;
-    return Math.max(0, (c.height - b.height) / 2 - 8);
+    return vertical
+      ? Math.max(0, (c.height - b.height) / 2 - 8)
+      : Math.max(0, (c.width - b.width) / 2 - 8);
   }
   function clampBarPos() {
     if (barPos === 0) return;
@@ -389,14 +408,15 @@
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const grip = e.currentTarget as HTMLElement;
     const span = barSpan();
-    const sy = e.clientY - barPos;
+    const coord = (ev: PointerEvent) => (vertical ? ev.clientY : ev.clientX);
+    const s0 = coord(e) - barPos;
     try {
       grip.setPointerCapture(e.pointerId);
     } catch {
       // synthetic pointer — capture is best-effort
     }
     const move = (ev: PointerEvent) => {
-      barPos = Math.min(span, Math.max(-span, ev.clientY - sy));
+      barPos = Math.min(span, Math.max(-span, coord(ev) - s0));
     };
     const up = () => {
       grip.removeEventListener("pointermove", move);
@@ -411,8 +431,8 @@
   // ---- bar hide/show (manual only) ----
   //
   // The handle tab on the bar's outer edge is the ONE way the bar leaves
-  // or returns, in every mode — it slides off past the right edge and the
-  // tab stays put. No idle timer: chrome that disappears on its own is
+  // or returns, in every mode — it slides off past its edge and the tab
+  // stays put. No idle timer: chrome that disappears on its own is
   // chrome you have to chase.
   let barHidden = $state(false);
   function toggleBar() {
@@ -1625,15 +1645,20 @@
         {/if}
       </div>
 
-      <!-- The control bar — vertical, on the right edge. The handle tab
-           on its outer side is the one and only hide/show control; the
-           tab never moves, the bar slides out past the edge behind it. -->
+      <!-- The control bar — a horizontal bar across the top on desktop, a
+           vertical rail on the right on the phone. The handle tab on its
+           outer side is the one and only hide/show control; the tab never
+           moves, the bar slides out past its edge behind it. -->
       <div
         bind:this={barWrapEl}
         class="bar-anchor"
+        class:v={vertical}
+        class:h={!vertical}
         role="group"
         aria-label="Console control bar"
-        style:transform={`translateY(calc(-50% + ${barPos}px))`}
+        style:transform={vertical
+          ? `translateY(calc(-50% + ${barPos}px))`
+          : `translateX(calc(-50% + ${barPos}px))`}
         onpointerdowncapture={(e) => {
           // With the soft keyboard up, bar taps must not steal focus from
           // its hidden input (a blur drops the OS keyboard mid-word) —
@@ -1645,7 +1670,7 @@
           class="bar-tab"
           title={barHidden ? "Show controls" : "Hide controls"}
           aria-label={barHidden ? "Show console controls" : "Hide console controls"}
-          onclick={toggleBar}>{barHidden ? "‹" : "›"}</button
+          onclick={toggleBar}>{vertical ? (barHidden ? "‹" : "›") : barHidden ? "▾" : "▴"}</button
         >
         <div class="kvmbar" class:asleep={barHidden} role="toolbar" aria-label="Console controls">
           <!-- svelte-ignore a11y_consider_explicit_label -->
@@ -1660,15 +1685,49 @@
           >
             🖥<span class="presence" class:on={node.online}></span>
           </button>
-          <button
-            class="kbtn"
-            class:open={openMenu === "screens"}
-            title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
-            aria-label="Screens and cameras menu"
-            onclick={() => toggleMenu("screens")}
-          >
-            {selected ? inputIcon(selected) : "🪟"}
-          </button>
+          {#if vertical}
+            <!-- The phone folds the inputs into a menu… -->
+            <button
+              class="kbtn"
+              class:open={openMenu === "screens"}
+              title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
+              aria-label="Screens and cameras menu"
+              onclick={() => toggleMenu("screens")}
+            >
+              {selected ? inputIcon(selected) : "🪟"}
+            </button>
+          {:else}
+            <!-- …the desktop wears them on the bar: one icon per monitor
+                 and camera (hover for its name), the active one filled, a
+                 popped-out one hollow (click brings its video home), and
+                 a pop-out button for the screen being viewed. -->
+            <span class="vsep"></span>
+            {#each inputs as inp (inp.id)}
+              {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
+              <button
+                class="kbtn input"
+                class:active={inp.id === selectedId && !inpPopped}
+                class:hollow={inpPopped}
+                title={inpPopped
+                  ? `${inp.label} — in its own window (click to return it here)`
+                  : inp.label}
+                aria-label={inp.label}
+                onclick={() =>
+                  inpPopped ? app.askReturnVideo(`cap:${inp.id}`) : app.setConsoleInput(inp.id)}
+              >
+                {inputIcon(inp)}
+                {#if inp.default}<span class="kdef" title="Default input">★</span>{/if}
+              </button>
+            {/each}
+            {#if isTauri() && selected && !selectedPopped}
+              <button
+                class="kbtn"
+                title="Pop {selected.label} out into its own window"
+                aria-label="Pop {selected.label} out into its own window"
+                onclick={() => selectedId && void app.popOutConsoleInput(selectedId)}>⧉</button
+              >
+            {/if}
+          {/if}
           <span class="vsep"></span>
           {#if access.control}
             <button
@@ -1760,7 +1819,9 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
-            style:transform={`translateY(calc(-50% + ${menuShift}px))`}
+            style:transform={vertical
+              ? `translateY(calc(-50% + ${menuShift}px))`
+              : `translateX(calc(-50% + ${menuShift}px))`}
             role="menu"
           >
             {#if openMenu === "session"}
@@ -2186,25 +2247,25 @@
     background: rgba(0, 0, 0, 0.8);
   }
 
-  /* ---- the control bar — a vertical rail on the right edge ---- */
+  /* ---- the control bar — horizontal on top (desktop), a vertical
+     rail on the right (phone) ---- */
   .bar-anchor {
     position: absolute;
+    z-index: 10;
+  }
+  .bar-anchor.h {
+    top: calc(0.6rem + env(safe-area-inset-top, 0px));
+    left: 50%;
+    width: max-content;
+  }
+  .bar-anchor.v {
     top: 50%;
     right: calc(0.5rem + env(safe-area-inset-right, 0px));
-    z-index: 10;
   }
   .kvmbar {
     display: flex;
-    flex-direction: column;
     align-items: center;
     gap: 2px;
-    width: 2.7rem;
-    /* Never taller than the pane — a landscape phone scrolls the rail
-       instead of clipping its ends. */
-    max-height: calc(100vh - 1.2rem);
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 0.15rem 0 0.4rem;
     border-radius: 12px;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
     background: oklch(0.19 0.028 285 / 0.86);
@@ -2216,9 +2277,34 @@
   .kvmbar::-webkit-scrollbar {
     display: none;
   }
-  /* Hidden: slid out past the right edge (safe-area included), leaving
-     only the handle tab. */
-  .kvmbar.asleep {
+  .bar-anchor.h .kvmbar {
+    flex-direction: row;
+    height: 2.7rem;
+    padding: 0 0.4rem 0 0.15rem;
+    /* Many monitors on a narrow window: the bar scrolls sideways rather
+       than growing past the pane. */
+    max-width: calc(100vw - 2rem);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .bar-anchor.v .kvmbar {
+    flex-direction: column;
+    width: 2.7rem;
+    /* Never taller than the pane — a landscape phone scrolls the rail
+       instead of clipping its ends. */
+    max-height: calc(100vh - 1.2rem);
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.15rem 0 0.4rem;
+  }
+  /* Hidden: slid out past the bar's own edge (safe-area included),
+     leaving only the handle tab. */
+  .bar-anchor.h .kvmbar.asleep {
+    transform: translateY(calc(-100% - 1.5rem - env(safe-area-inset-top, 0px)));
+    opacity: 0;
+    pointer-events: none;
+  }
+  .bar-anchor.v .kvmbar.asleep {
     transform: translateX(calc(100% + 1.5rem + env(safe-area-inset-right, 0px)));
     opacity: 0;
     pointer-events: none;
@@ -2227,14 +2313,7 @@
      anchor so it never travels with the sliding bar. */
   .bar-tab {
     position: absolute;
-    right: 100%;
-    top: 50%;
-    transform: translateY(-50%);
-    margin-right: 3px;
-    width: 1.15rem;
-    height: 3.4rem;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
-    border-radius: 8px 0 0 8px;
     background: oklch(0.19 0.028 285 / 0.8);
     backdrop-filter: blur(10px);
     color: #9a93b8;
@@ -2242,6 +2321,24 @@
     line-height: 1;
     padding: 0;
     cursor: pointer;
+  }
+  .bar-anchor.h .bar-tab {
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 3px;
+    width: 3.4rem;
+    height: 1.15rem;
+    border-radius: 0 0 8px 8px;
+  }
+  .bar-anchor.v .bar-tab {
+    right: 100%;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-right: 3px;
+    width: 1.15rem;
+    height: 3.4rem;
+    border-radius: 8px 0 0 8px;
   }
   .bar-tab:hover {
     color: #fff;
@@ -2263,11 +2360,39 @@
     color: #9a93b8;
   }
   .vsep {
+    background: oklch(0.3 0.035 285 / 0.7);
+    flex-shrink: 0;
+  }
+  .bar-anchor.h .vsep {
+    width: 1px;
+    height: 1.3rem;
+    margin: 0 0.2rem;
+  }
+  .bar-anchor.v .vsep {
     width: 1.3rem;
     height: 1px;
-    background: oklch(0.3 0.035 285 / 0.7);
     margin: 0.2rem 0;
+  }
+  /* Desktop input buttons: the active source filled like the old tabs;
+     a popped-out one hollow — an outline where its picture used to be. */
+  .kbtn.input {
     flex-shrink: 0;
+  }
+  .kbtn.input.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .kbtn.input.hollow {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--accent);
+    opacity: 0.8;
+  }
+  .kdef {
+    position: absolute;
+    top: 0;
+    right: 1px;
+    font-size: 0.5rem;
+    color: var(--warn);
   }
   .kbtn {
     position: relative;
@@ -2329,11 +2454,17 @@
   .presence.on {
     background: var(--ok);
   }
-  /* ---- the menu — opens to the LEFT of the rail ---- */
-  .kvmenu {
-    position: absolute;
+  /* ---- the menu — below the top bar, or left of the right rail ---- */
+  .bar-anchor.h .kvmenu {
+    top: calc(100% + 8px);
+    left: 50%;
+  }
+  .bar-anchor.v .kvmenu {
     right: calc(100% + 1.5rem);
     top: 50%;
+  }
+  .kvmenu {
+    position: absolute;
     width: max-content;
     min-width: 15rem;
     max-width: min(22rem, calc(100vw - 5.5rem - env(safe-area-inset-right, 0px)));
