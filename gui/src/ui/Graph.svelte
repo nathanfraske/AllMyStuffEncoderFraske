@@ -2655,14 +2655,21 @@
   }
 
   /* The list fills the canvas as a flex column: a fixed search bar tucked
-     against the top edge, then the scrolling roster beneath it. */
+     against the top edge, then the scrolling roster beneath it.
+     `isolation: isolate` gives it its own stacking context — so the sticky
+     fleet headers (z-index) and the cards' drop-out drawers stay contained
+     inside the list — without pinning the whole overlay above the floating
+     controls: at z-index:auto it stacks by DOM order, so the later-in-markup
+     zoombar (and the connect-mode banner) still paint and receive clicks above
+     it. A positive z-index here instead would trap a desktop user in the list,
+     with the view toggles painted but un-clickable beneath the overlay. */
   .list-view {
     position: absolute;
     inset: 0;
     display: flex;
     flex-direction: column;
     min-height: 0;
-    z-index: 2;
+    isolation: isolate;
   }
 
   /* The search bar — hugging the top edge of the centre area, a hairline
