@@ -902,12 +902,68 @@
     // A click is the most reliable focus pin (whatever was last focused).
     if (down && app.consoleControl) stageEl?.focus({ preventScroll: true });
     if (!stagePointerActive) return;
+    if (down) {
+      // Hold the pointer for the whole press: a touch drag (or a mouse drag
+      // that wanders off the element) keeps streaming its moves here, and
+      // the matching up always lands — capture auto-releases on pointerup.
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // a stale/synthetic pointer id — capture is best-effort
+      }
+    }
     const p = normPoint(e);
-    if (!p) return;
+    if (!p) {
+      // A release outside the streamed frame (a captured drag that wandered
+      // onto the letterbox bars or past the edge before lifting): still lift
+      // the button we pressed, or the remote is stranded mid-drag. Presses
+      // outside the frame stay ignored, as ever.
+      if (!down && heldButtons.delete(e.button)) {
+        e.preventDefault();
+        app.sendConsoleInput({ kind: "mouse_button", button: e.button, down: false });
+      }
+      return;
+    }
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
+    if (down) heldButtons.add(e.button);
+    else heldButtons.delete(e.button);
+  }
+
+  // Buttons currently pressed on the remote, so a pointer that *cancels*
+  // (iOS reclaiming the touch for a system gesture, the OS eating the
+  // pointer mid-drag) can lift what it pressed — its matching pointerup is
+  // never coming, and without this the remote is stranded mid-drag with a
+  // button held.
+  const heldButtons = new Set<number>();
+  function onPointerCancel() {
+    for (const b of heldButtons) {
+      app.sendConsoleInput({ kind: "mouse_button", button: b, down: false });
+    }
+    heldButtons.clear();
+  }
+
+  // iPhone/iPad WebKit: touches already arrive as Pointer Events (that's
+  // what drives the remote mouse above), but WebKit *also* synthesizes
+  // compatibility mouse events and gesture defaults (double-tap zoom, the
+  // long-press callout) off the raw touches. Cancelling touchstart's
+  // default while pointer forwarding is live keeps a tap exactly one click
+  // at its coordinates. Bound via an action, not `ontouchstart` — Svelte
+  // registers touch listeners passive, where preventDefault is a no-op.
+  // (Scroll/pan is already opted out with `touch-action: none` in CSS, so
+  // a drag streams pointermoves instead of being claimed as a pan.)
+  function touchGuard(el: HTMLElement) {
+    const onTouchStart = (e: TouchEvent) => {
+      if (stagePointerActive) e.preventDefault();
+    };
+    el.addEventListener("touchstart", onTouchStart, { passive: false });
+    return {
+      destroy() {
+        el.removeEventListener("touchstart", onTouchStart);
+      },
+    };
   }
 
   function onWheel(e: WheelEvent) {
@@ -1090,9 +1146,11 @@
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
+        use:touchGuard
         onpointermove={onPointerMove}
         onpointerdown={(e) => onPointerButton(e, true)}
         onpointerup={(e) => onPointerButton(e, false)}
+        onpointercancel={onPointerCancel}
         onwheel={onWheel}
         onkeydown={(e) => onKey(e, true)}
         onkeyup={(e) => onKey(e, false)}
@@ -1606,6 +1664,16 @@
   .stage {
     flex: 1;
     min-height: 0;
+    /* Touch drives the remote pointer: opt out of the browser's own
+       gestures (scroll/pan, double-tap zoom) so a finger drag streams
+       pointermoves instead of being claimed — and pointercancelled — as a
+       pan. The stage never scrolls, and mouse input is unaffected. */
+    touch-action: none;
+    /* And no long-press text-selection callout / magnifier over the
+       picture — a held finger is a held mouse button, nothing more. */
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
     /* Anchors the .host-status banner. */
     position: relative;
     display: grid;

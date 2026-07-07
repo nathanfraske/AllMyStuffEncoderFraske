@@ -58,6 +58,14 @@ export function capabilityForDisplay(cat: Catalog, id: string): Capability | und
       flow: "sink",
       origin: "terminal-view",
     };
+  // The phone shell's minted display sink (its scan can't enumerate the
+  // panel; the store synthesizes `<node>:display-view` — see
+  // `hydrateFromBackend`). It IS a real catalog capability on the phone
+  // itself; this stand-in is for every *other* machine, whose view of the
+  // phone only carries the scan-advertised endpoints — so the machine being
+  // watched still draws/labels the console's video route.
+  if (tail === "display-view")
+    return { id, node, label: "Screen view", media: "display", flow: "sink", origin: "viewer" };
   if (tail === "files")
     return { id, node, label: "Files", media: "generic", flow: "source", origin: "files" };
   if (tail.startsWith("files-view"))

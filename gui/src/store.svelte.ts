@@ -1742,6 +1742,26 @@ class AppStore {
       ...scan.capabilities,
       ...this.catalog.capabilities.filter((c) => c.node !== newId && c.node !== prevId),
     ];
+    // The phone/tablet shell: a mobile OS offers no display enumeration, so
+    // the scan reports no display *sink* — and with no local sink endpoint the
+    // console's video leg has nowhere to land and silently never wires (audio,
+    // control and clipboard all ride synthetic machine capabilities and come
+    // up fine, which is exactly the "session with no picture" a phone console
+    // showed). The webview itself is where inbound screen video renders, so
+    // "can show a screen" is a property of the running app — the same
+    // rationale as the backend's own synthetic `video-in` camera sink. Mint
+    // the sink the scan couldn't see; a desktop scan reports its real
+    // monitors and never takes this branch.
+    if (isMobile() && !matchEndpoint(this.catalog, newId, "display", "consume")) {
+      this.catalog.capabilities.push({
+        id: `${newId}:display-view`,
+        node: newId,
+        label: "Screen view",
+        media: "display",
+        flow: "sink",
+        origin: "viewer",
+      });
+    }
     // A console window scans too (it needs the local sinks to wire routes).
     // No toast — the refresh panel (and the repopulated graph) is the feedback.
   }
@@ -2505,7 +2525,7 @@ class AppStore {
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodecBySource = {};
     this.consoleTuneBySource = {};
-    if (isTauri()) {
+    if (isTauri() && !isMobile()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
       // onto an input that already lives in its own window shows "Return
@@ -2517,6 +2537,9 @@ class AppStore {
         void this.wireConsoleFirstVideo();
       }, 180);
     } else {
+      // The web preview and the phone shell are single-window (popouts
+      // can't exist — `popOutConsoleInput` refuses there), so there's no
+      // census to wait on: wire the picture now.
       void this.wireConsoleFirstVideo();
     }
   }
