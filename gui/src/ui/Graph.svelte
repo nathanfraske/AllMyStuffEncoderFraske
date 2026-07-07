@@ -28,7 +28,11 @@
   let canvas = $state<HTMLDivElement | null>(null);
 
   function measureViewport() {
-    const box = scroller ?? canvas;
+    // In list mode the scroll viewport is display:none, so its client box reads
+    // 0 and would collapse the measurement to the floor — measure the canvas
+    // itself there (it's always laid out). Graph views keep reading the
+    // scroller so `width` accounts for any reserved scrollbar gutter.
+    const box = isList ? canvas : (scroller ?? canvas);
     if (!box) return;
     width = Math.max(360, Math.floor(box.clientWidth));
     height = Math.max(320, Math.floor(box.clientHeight));
@@ -104,27 +108,37 @@
     return { key: "unknown", label: "Unknown fleet" };
   }
 
-  const fleetGroups = $derived.by((): FleetGroup[] => {
+  // Bin every node into fleet groups: `keyOf` decides which group a node lands
+  // in (and how it's labelled), `groupRank` decides the group order. Within a
+  // group this device leads and the rest read alphabetically. Both the graph
+  // (grid bands + radial seating) and the list drive this, so their grouping
+  // and sort can't drift — only the two callbacks differ.
+  function buildFleetGroups(
+    keyOf: (n: MeshNode) => { key: string; label: string },
+    groupRank: (g: FleetGroup) => number,
+  ): FleetGroup[] {
     const groups = new Map<string, FleetGroup>();
     for (const n of app.catalog.nodes) {
-      const { key, label } = fleetKeyOf(n);
+      const { key, label } = keyOf(n);
       const g = groups.get(key) ?? { key, label, nodes: [] };
       g.nodes.push(n);
       groups.set(key, g);
     }
     for (const g of groups.values()) {
       g.nodes.sort((a, b) => {
-        // This device leads its fleet; the rest read alphabetically.
         const rank = (n: MeshNode) => (n.kind === "this" ? 0 : 1);
         return rank(a) - rank(b) || a.label.localeCompare(b.label);
       });
     }
-    // Your fleet first, named fleets alphabetically, the unknowns last.
-    const rank = (g: FleetGroup) => (g.key === "mine" ? 0 : g.key === "unknown" ? 2 : 1);
     return [...groups.values()].sort(
-      (a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label),
+      (a, b) => groupRank(a) - groupRank(b) || a.label.localeCompare(b.label),
     );
-  });
+  }
+
+  // Your fleet first, named fleets alphabetically, the unknowns last.
+  const fleetGroups = $derived.by((): FleetGroup[] =>
+    buildFleetGroups(fleetKeyOf, (g) => (g.key === "mine" ? 0 : g.key === "unknown" ? 2 : 1)),
+  );
 
   // ---- views ------------------------------------------------------------
   //
@@ -291,31 +305,19 @@
       .toLowerCase();
   }
 
-  // The list's fleet groups, claimables hoisted into their own pseudo-fleet.
-  const listGroups = $derived.by((): FleetGroup[] => {
-    const groups = new Map<string, FleetGroup>();
-    for (const n of app.catalog.nodes) {
-      const { key, label } = app.standingOf(n).claimable
-        ? { key: CLAIMABLE_KEY, label: "Ready to claim" }
-        : fleetKeyOf(n);
-      const g = groups.get(key) ?? { key, label, nodes: [] };
-      g.nodes.push(n);
-      groups.set(key, g);
-    }
-    for (const g of groups.values()) {
-      g.nodes.sort((a, b) => {
-        const rank = (n: MeshNode) => (n.kind === "this" ? 0 : 1);
-        return rank(a) - rank(b) || a.label.localeCompare(b.label);
-      });
-    }
-    // Your fleet first, the claimables right behind it, named fleets
-    // alphabetically, the unknowns last.
-    const rank = (g: FleetGroup) =>
-      g.key === "mine" ? 0 : g.key === CLAIMABLE_KEY ? 1 : g.key === "unknown" ? 3 : 2;
-    return [...groups.values()].sort(
-      (a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label),
-    );
-  });
+  // The list's fleet groups: the same grouping as the graph, but every
+  // claimable device is hoisted into a single "Ready to claim" pseudo-fleet
+  // that ranks right behind Your Fleet (claiming is the first thing you do with
+  // a new box), ahead of the named fleets, with the unknowns last.
+  const listGroups = $derived.by((): FleetGroup[] =>
+    buildFleetGroups(
+      (n) =>
+        app.standingOf(n).claimable
+          ? { key: CLAIMABLE_KEY, label: "Ready to claim" }
+          : fleetKeyOf(n),
+      (g) => (g.key === "mine" ? 0 : g.key === CLAIMABLE_KEY ? 1 : g.key === "unknown" ? 3 : 2),
+    ),
+  );
 
   // The groups after the search filter — still fully fleet-grouped: a group
   // whose *label* matches keeps all its devices (search "Alex" → all of Alex's
@@ -564,7 +566,9 @@
   // page zoom) when you're somewhere else. Anchored at the viewport centre.
   $effect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!hovering || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+      // The list scrolls, it doesn't scale — leave the zoom shortcut to the
+      // graph views (mirrors the `isList` bail-out in `onWheel`).
+      if (!hovering || isList || !(e.ctrlKey || e.metaKey) || e.altKey) return;
       if (e.key === "-" || e.key === "_") {
         e.preventDefault();
         void applyZoom(width / 2, height / 2, zoom / 1.2);
