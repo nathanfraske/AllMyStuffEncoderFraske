@@ -132,6 +132,12 @@
   // window's keyboard reaches the remote (window-level setFocus alone doesn't
   // push document focus into the webview on hover).
   let stageEl = $state<HTMLElement | null>(null);
+  // The viewer-drawn remote cursor. We always render a cursor at the position
+  // we're commanding, because the captured video can't be relied on to carry
+  // one: Windows' DXGI duplication omits the OS cursor entirely, and a Mac
+  // hides its cursor when it's driven with no local pointer. Positioned
+  // imperatively (see updateCursorOverlay) since `virt` isn't reactive state.
+  let cursorEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
@@ -499,12 +505,22 @@
     const scale = Math.min(8, Math.max(1, t.scale));
     const c = canvasEl;
     const s = stageEl;
-    if (!c || !s || scale === 1) return { scale, x: 0, y: 0 };
+    // At 1× with no keyboard there is nothing to pan; otherwise fall through so
+    // the keyboard's upward shift is allowed even un-zoomed.
+    if (!c || !s || (scale === 1 && kbInset <= 0)) return { scale, x: 0, y: 0 };
     // offsetWidth/Height are the LAYOUT box — unaffected by the current
     // transform, which is exactly what the clamp must scale from.
     const mx = Math.max(0, (c.offsetWidth * scale - s.clientWidth) / 2);
     const my = Math.max(0, (c.offsetHeight * scale - s.clientHeight) / 2);
-    return { scale, x: Math.min(mx, Math.max(-mx, t.x)), y: Math.min(my, Math.max(-my, t.y)) };
+    // The soft keyboard covers the bottom `kbInset` px; showing background
+    // there is invisible, so the picture may shift UP that much further to lift
+    // a text field above the keys. Only the upward (negative-y) room grows.
+    const yLo = -(my + Math.max(0, kbInset));
+    return {
+      scale,
+      x: Math.min(mx, Math.max(-mx, t.x)),
+      y: Math.min(my, Math.max(yLo, t.y)),
+    };
   }
   function setView(t: ViewTransform) {
     view = clampView(t);
@@ -1242,7 +1258,9 @@
   // can, until you reach the edges". The whole desktop stays reachable with
   // one thumb.
   function followCursor() {
-    if (view.scale <= 1.001) return;
+    // Runs when zoomed, and also at 1× while the keyboard is up (there the
+    // clamp permits a vertical shift to lift the cursor above the keys).
+    if (view.scale <= 1.001 && kbInset <= 0) return;
     const c = canvasEl;
     const s = stageEl;
     if (!c || !s || !hasFrame) return;
@@ -1253,10 +1271,54 @@
     // and the current zoom), and where the stage centre is.
     const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
     const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    // Centre of the VISIBLE area: when the soft keyboard has eaten the bottom
+    // `kbInset` px, the middle of what the user can still see sits that much
+    // higher — so a cursor centred here stays above the keyboard where they're
+    // typing, without reframing or dropping the zoom.
     const cx = box.left + box.width / 2;
-    const cy = box.top + box.height / 2;
+    const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
+  // Keep the remote cursor overlay pinned to the position we're commanding.
+  // Same client-space math as followCursor (getBoundingClientRect reflects the
+  // zoom transform), made relative to the stage so a windowed console's own
+  // transform can't offset it. `virt` isn't reactive, so callers invoke this
+  // wherever the cursor moves; the $effect below re-runs it on reactive view/
+  // region/frame changes (after the DOM applies them).
+  function updateCursorOverlay() {
+    const el = cursorEl;
+    const c = canvasEl;
+    const s = stageEl;
+    if (!el || !c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const sb = s.getBoundingClientRect();
+    const ar = activeRegion;
+    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    el.style.transform = `translate(${x}px, ${y}px)`;
+  }
+  // Reactive refresh of the cursor overlay: the view transform, the letterbox
+  // region, the frame size, and control on/off all move it or (un)mount it.
+  $effect(() => {
+    void view;
+    void activeRegion;
+    void hasFrame;
+    void stagePointerActive;
+    void frameW;
+    void frameH;
+    void kbInset;
+    updateCursorOverlay();
+  });
+  // The soft keyboard opening (or closing) recentres the cursor into the space
+  // that's left, keeping the current zoom — so the field being typed into is
+  // visible above the keys instead of behind them.
+  $effect(() => {
+    void kbInset;
+    untrack(() => {
+      followCursor(); // lift the cursor into the visible area (no-op at 1×/no-kb)
+      setView(view); // re-clamp — closing the keyboard removes the extra pan room
+    });
+  });
   const touchMouse = makeTouchMouse({
     active: () => stagePointerActive,
     moveBy: (dx, dy) => {
@@ -1278,6 +1340,7 @@
         sendVirt();
       }
       followCursor();
+      updateCursorOverlay();
     },
     button: (button, down) => {
       if (down) {
@@ -1337,6 +1400,7 @@
     // An absolute mouse move re-seats the trackpad's virtual cursor too.
     virt.x = p.x;
     virt.y = p.y;
+    updateCursorOverlay();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
@@ -1413,6 +1477,7 @@
     // Land the cursor exactly where the click happened, then click.
     virt.x = p.x;
     virt.y = p.y;
+    updateCursorOverlay();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -1622,7 +1687,6 @@
         bind:this={stageEl}
         class="stage"
         class:grabbing={stagePointerActive}
-        style:bottom={kbInset > 0 ? `${kbInset}px` : undefined}
         role="application"
         aria-label="Remote screen — input is forwarded while keyboard & mouse control is on"
         tabindex={app.consoleControl ? 0 : -1}
@@ -1661,6 +1725,22 @@
                 node,
               )}"
             ></canvas>
+          {/if}
+          {#if hasFrame && stagePointerActive}
+            <!-- The remote cursor, drawn here at the position we're
+                 commanding — the video itself can't be trusted to carry one
+                 (Windows DXGI omits it; a driven Mac hides its own). -->
+            <div class="remote-cursor" bind:this={cursorEl} aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 20 20">
+                <path
+                  d="M1 1 L1 15 L5 11.5 L7.6 18 L10.4 17 L7.9 10.7 L13.5 10.7 Z"
+                  fill="#fff"
+                  stroke="#000"
+                  stroke-width="1.4"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </div>
           {/if}
           {#if hasFrame}
             <!-- the canvas above is the stage; a host-reported stall (the
@@ -2238,6 +2318,24 @@
   .live.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* The viewer-drawn remote cursor. Absolutely placed within the stage (never
+     position:fixed — a windowed console's own transform would reparent that),
+     moved by a transform set imperatively. Its own tip is the hot point. */
+  .remote-cursor {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 20px;
+    height: 20px;
+    pointer-events: none;
+    z-index: 8; /* over the video + host-status, under the zoom chip / bar */
+    will-change: transform;
+  }
+  .remote-cursor svg {
+    display: block;
+    /* Legible on any wallpaper without a second element. */
+    filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.55));
   }
   .screen {
     width: calc(100% - 1.6rem);
