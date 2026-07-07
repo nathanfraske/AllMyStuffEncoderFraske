@@ -519,16 +519,25 @@ pub struct RecvFeedback {
 // IDR). A manual retune replaces the route and so resets the cap — the
 // viewer's new picks change the conditions, and the controller re-learns.
 
-/// Master switch for the receiver-driven resolution auto-adaptation. **Off for
-/// now** — the manual Speed↔Quality slider (and the pills) are the quality
-/// control, and auto-stepping fought them (it re-tuned under the same feedback
-/// the user was reacting to). Gated at the wiring (`note_feedback` skips the
-/// feedback→step call) so the [`AutoAdapt`] logic below stays intact and
-/// unit-tested for when this returns as a real, user-toggleable setting that
-/// yields to a manual tune (perf roadmap's slider auto-traversal). The adaptive
-/// **IDR cadence** ([`adaptive_idr_ms`]) is a separate, benign recovery lever
-/// and stays on regardless.
-const AUTO_ADAPT_ENABLED: bool = false;
+/// Master switch for the receiver-driven resolution auto-adaptation:
+/// **on by default**, `ALLMYSTUFF_AUTO_ADAPT=0` kills it. It was off for a
+/// release ("fought the manual slider") — and that release is exactly when
+/// the fast-as-LAN console turned into a standing half-second-behind feed:
+/// this valve is the only thing that drains a viewer whose decoder can't
+/// hold the encode rate (the queue between them *is* the display delay),
+/// and with it gone the host kept pushing native 4K60 into the backlog
+/// forever. The slider fight is solved by scope, not by the kill switch:
+/// the controller only ever acts on a stream whose Res dial is **Auto**
+/// (`note_feedback` skips the feedback→step call when the viewer pinned
+/// `max_edge`), and a manual retune replaces the route — fresh
+/// [`AutoAdapt`], cap gone — so an explicit pick always wins outright.
+/// The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a separate,
+/// benign recovery lever and stays on regardless.
+fn auto_adapt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_AUTO_ADAPT", 1) != 0);
+    *ON
+}
 
 /// The auto-cap rungs, descending. `0` (uncapped) sits above the first.
 const AUTO_EDGES: &[u32] = &[2560, 1920, 1280, 960];
@@ -866,10 +875,14 @@ impl VideoBridge {
         // (see [`AutoAdapt`]). Run outside the routes lock — the observe
         // takes its own.
         let (auto, tune) = adapt;
-        // Auto-scale is gated off for now (see AUTO_ADAPT_ENABLED) — the manual
-        // slider owns quality. The AutoAdapt logic stays live + tested; this is
-        // the one line that keeps it from acting on a stream.
-        if !AUTO_ADAPT_ENABLED {
+        // Auto-scale governs only the AUTOMATIC Res dial: a viewer that
+        // pinned `max_edge` (the slider / Res pill) said exactly what it
+        // wants, so the controller stands down for that stream instead of
+        // re-tuning under the user's hands — that fight is why this valve
+        // was once disabled outright (and the console's standing decode
+        // backlog is what disabling it cost). `auto_adapt_enabled` is the
+        // operator kill switch on top.
+        if !auto_adapt_enabled() || tune.max_edge.is_some() {
             return;
         }
         if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
