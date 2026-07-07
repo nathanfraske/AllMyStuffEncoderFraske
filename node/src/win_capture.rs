@@ -479,8 +479,11 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
                     if a == 0 {
                         continue;
                     }
-                    let (b, g, r) =
-                        (cur.buf[s] as u32, cur.buf[s + 1] as u32, cur.buf[s + 2] as u32);
+                    let (b, g, r) = (
+                        cur.buf[s] as u32,
+                        cur.buf[s + 1] as u32,
+                        cur.buf[s + 2] as u32,
+                    );
                     let d = (dy as usize * dw as usize + dx as usize) * 4;
                     dst[d] = ((r * a + dst[d] as u32 * (255 - a)) / 255) as u8;
                     dst[d + 1] = ((g * a + dst[d + 1] as u32 * (255 - a)) / 255) as u8;
@@ -506,8 +509,7 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
                     if s + 3 >= cur.buf.len() {
                         continue;
                     }
-                    let (b, g, r, a) =
-                        (cur.buf[s], cur.buf[s + 1], cur.buf[s + 2], cur.buf[s + 3]);
+                    let (b, g, r, a) = (cur.buf[s], cur.buf[s + 1], cur.buf[s + 2], cur.buf[s + 3]);
                     let d = (dy as usize * dw as usize + dx as usize) * 4;
                     if a == 0 {
                         dst[d] = r;
