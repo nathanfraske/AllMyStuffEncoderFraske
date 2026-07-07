@@ -110,6 +110,12 @@
       case "deleteContentForward":
         tapKey("Delete", "Delete");
         break;
+      default:
+        // Whatever else the IME says (word-deletes, keyboard-bar paste
+        // variants): deletes degrade to one Backspace, inserts send
+        // their text — swallowing them silently reads as a broken key.
+        if (e.inputType.startsWith("delete")) tapKey("Backspace", "Backspace");
+        else if (e.data) typed(e.data);
     }
   }
 

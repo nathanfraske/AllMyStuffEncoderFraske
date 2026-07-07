@@ -46,6 +46,7 @@
     mediaColor,
     MEDIA,
     type Capability,
+    type InputAction,
     type MediaKind,
   } from "../types";
   import ConsoleKeys from "./ConsoleKeys.svelte";
@@ -95,6 +96,9 @@
 
   async function flipTheater() {
     theater = !theater;
+    // The in-page card grows/shrinks to the viewport — a dragged bar must
+    // re-clamp into the new bounds (measured after the layout lands).
+    requestAnimationFrame(clampBarPos);
     if (windowed) await toggleWindowFullscreen();
     // The OS fullscreen transition blurs the stage (firing keys.releaseAll via
     // onblur), and claimFocus won't re-pin once the window itself holds focus —
@@ -340,13 +344,21 @@
   }
 
   // Keep the open menu on-screen: it centers under the bar, but a bar
-  // dragged toward an edge would push it off — measure and shift back.
+  // dragged toward an edge would push it off — measure, shift back, and
+  // flip it ABOVE the bar when the bar sits too low for it to fit below
+  // (the console clips its overflow; a menu past the bottom edge is
+  // simply gone).
   let menuShift = $state(0);
+  let menuUp = $state(false);
   $effect(() => {
     void openSub;
     void advOpen;
+    // Dragging the bar with a menu open must re-clamp the menu too.
+    void barPos.x;
+    void barPos.y;
     if (!openMenu || !menuEl) {
       menuShift = 0;
+      menuUp = false;
       return;
     }
     const el = menuEl;
@@ -356,6 +368,11 @@
       const pad = 8;
       if (r.left < pad) menuShift = pad - r.left;
       else if (r.right > window.innerWidth - pad) menuShift = window.innerWidth - pad - r.right;
+      const box = consoleEl?.getBoundingClientRect();
+      const floor = Math.min(window.innerHeight, box?.bottom ?? Infinity) - pad;
+      if (!menuUp && r.bottom > floor && r.height + pad < (barWrapEl?.getBoundingClientRect().top ?? 0) - (box?.top ?? 0)) {
+        menuUp = true;
+      }
     });
   });
 
@@ -458,6 +475,27 @@
   $effect(() => {
     if (!app.consoleControl) keysOpen = false;
   });
+  // What the strip is holding down on the remote (its one-shot modifiers
+  // go down on arm). The strip discharges them itself on unmount — but
+  // unmount runs AFTER endSession/toggle-off has torn the control route
+  // down, so those keyups would die on the floor and the remote would
+  // keep the modifier. This registry lets the release hygiene lift them
+  // while the route still carries (mirroring keys.releaseAll()).
+  const stripHeld = new Map<string, { key: string; code?: string }>();
+  function sendFromStrip(a: InputAction) {
+    if (a.kind === "key") {
+      const id = a.code || a.key;
+      if (a.down) stripHeld.set(id, { key: a.key, code: a.code });
+      else stripHeld.delete(id);
+    }
+    app.sendConsoleInput(a);
+  }
+  function releaseStrip() {
+    for (const [, k] of [...stripHeld].reverse()) {
+      app.sendConsoleInput({ kind: "key", key: k.key, code: k.code, down: false });
+    }
+    stripHeld.clear();
+  }
 
   // ---- pinch zoom / pan (the view transform) ---------------------------
   //
@@ -486,13 +524,16 @@
     return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : { x: 0, y: 0 };
   }
   // Zoom keeping the content point at (cx, cy) pinned under (cx, cy).
+  // No snap-home here: a slow trackpad pinch arrives as many tiny
+  // ctrl+wheel steps, and snapping every sub-1.02 result back to 1 would
+  // eat them all — zoom could never leave 100%. clampView already zeroes
+  // the pan at exactly 1, and the touch machine snaps on gesture end.
   function zoomAt(scale: number, cx: number, cy: number) {
     const c = stageCenter();
     const sc = Math.min(8, Math.max(1, scale));
     const p0x = (cx - c.x - view.x) / view.scale;
     const p0y = (cy - c.y - view.y) / view.scale;
     setView({ scale: sc, x: cx - c.x - p0x * sc, y: cy - c.y - p0y * sc });
-    if (view.scale < 1.02) view = { scale: 1, x: 0, y: 0 };
   }
   function zoomStep(dir: 1 | -1) {
     const c = stageCenter();
@@ -887,8 +928,10 @@
     closing = true;
     // Keys still held ride out *before* the control route goes — closing
     // a console mid-chord (⌘W closes this very window) must not leave
-    // the remote holding the modifier.
+    // the remote holding the modifier. The strip's armed modifiers too:
+    // its own unmount discharge would fire after the route is gone.
     keys.releaseAll();
+    releaseStrip();
     touchMouse.reset();
     // UI resets synchronously; the await is only so a console window's
     // teardown reaches the backend before the webview dies. Bounded — a
@@ -1189,10 +1232,24 @@
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
+    // Real buttons living ON the stage ("Return video here") own their
+    // taps: capturing the pointer here would retarget the derived click
+    // onto the stage and the button would never fire.
+    if ((e.target as HTMLElement | null)?.closest?.("button")) return;
+    // The press that dismisses an open menu is spent on the dismissal —
+    // it must not also click the remote.
+    if (down && openMenu) {
+      openMenu = null;
+      return;
+    }
     if (e.pointerType === "touch") {
       // Hold every touch for its whole life — glides and pinches that
       // wander off the element must keep streaming here.
       if (down) {
+        // The touch counterpart of the mouse click-pin below: an iPad
+        // with a hardware keyboard needs the stage refocused after a bar
+        // tap stole it, or key forwarding silently stops.
+        if (app.consoleControl && !keysOpen) stageEl?.focus({ preventScroll: true });
         try {
           (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
         } catch {
@@ -1392,9 +1449,11 @@
 
   function toggleControl() {
     // Turning control off mid-chord: lift what's held while the route
-    // can still carry the keyups.
+    // can still carry the keyups — the hardware keys, the strip's armed
+    // modifiers, and any touch-held button alike.
     if (app.consoleControl) {
       keys.releaseAll();
+      releaseStrip();
       touchMouse.reset();
     }
     app.toggleConsoleControl();
@@ -1524,7 +1583,9 @@
           {:else}
             <div class="screen empty">
               <div class="screen-glyph">🪟</div>
-              <div class="screen-note">Pick a video input from the 🖥 menu in the bar above.</div>
+              <div class="screen-note">
+                Pick a video input from the Screens menu in the bar above.
+              </div>
             </div>
           {/if}
         {/if}
@@ -1668,6 +1729,7 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
+            class:up={menuUp}
             style:transform={`translateX(calc(-50% + ${menuShift}px))`}
             role="menu"
           >
@@ -1900,7 +1962,7 @@
       </div>
 
       {#if keysOpen && app.consoleControl}
-        <ConsoleKeys send={(a) => app.sendConsoleInput(a)} onclose={() => (keysOpen = false)} />
+        <ConsoleKeys send={sendFromStrip} onclose={() => (keysOpen = false)} />
       {/if}
     </div>
   </div>
@@ -2129,13 +2191,16 @@
     position: absolute;
     top: calc(0.6rem + env(safe-area-inset-top, 0px));
     left: 50%;
+    /* Not shrink-to-fit: at left:50% the available width is only half the
+       pane, and the anchor would lay its bar out at min-content there. */
+    width: max-content;
     z-index: 10;
   }
   .kvmbar {
     display: flex;
     align-items: center;
     gap: 2px;
-    height: 2.5rem;
+    height: 2.7rem;
     padding: 0 0.4rem 0 0.15rem;
     border-radius: 12px;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
@@ -2178,8 +2243,8 @@
     align-items: center;
     justify-content: center;
     gap: 0.3rem;
-    height: 1.9rem;
-    min-width: 1.9rem;
+    height: 2.15rem;
+    min-width: 2.15rem;
     padding: 0 0.3rem;
     border: none;
     border-radius: 8px;
@@ -2199,6 +2264,11 @@
   .kbtn.on {
     background: oklch(0.8 0.17 150 / 0.16);
     box-shadow: inset 0 0 0 1px oklch(0.8 0.17 150 / 0.45);
+  }
+  .kbtn.end {
+    /* A hair of extra distance from ⛶ — the one destructive button on
+       the bar shouldn't share an edge with its neighbor under a thumb. */
+    margin-left: 0.25rem;
   }
   .kbtn.end:hover {
     background: oklch(0.25 0.07 14);
@@ -2277,6 +2347,13 @@
     position: absolute;
     top: calc(100% + 8px);
     left: 50%;
+  }
+  /* Flipped above the bar when there's no room below (bar dragged low). */
+  .kvmenu.up {
+    top: auto;
+    bottom: calc(100% + 8px);
+  }
+  .kvmenu {
     width: max-content;
     min-width: 15rem;
     max-width: min(22rem, calc(100vw - 1rem));
@@ -2631,6 +2708,13 @@
       border: none;
       border-radius: 0;
     }
+    /* A finger needs more than the desktop's hover strip to wake the
+       bar — landscape phones land here (the portrait block below deepens
+       it further for the notch). */
+    :global(html.is-mobile) .bar-reveal {
+      height: calc(2.2rem + env(safe-area-inset-top, 0px));
+      padding-top: env(safe-area-inset-top, 0px);
+    }
   }
   @media (max-width: 700px) {
     /* Secondary buttons leave the bar for the session menu — the bar must
@@ -2652,6 +2736,26 @@
     :global(html.is-mobile) .bar-reveal {
       height: calc(1rem + max(3.4rem, env(safe-area-inset-top, 0px)));
       padding-top: max(3rem, env(safe-area-inset-top, 0px));
+    }
+  }
+  /* The narrowest phones: the bar must never run past the pane edges —
+     tighten everything that isn't a hit target. */
+  @media (max-width: 400px) {
+    .klabel {
+      max-width: 3.6rem;
+    }
+    .kbtn {
+      min-width: 1.95rem;
+      padding: 0 0.22rem;
+    }
+    .kvmbar {
+      padding-right: 0.3rem;
+    }
+    .vsep {
+      margin: 0 0.1rem;
+    }
+    .grip {
+      padding: 0.5rem 0.2rem;
     }
   }
 </style>

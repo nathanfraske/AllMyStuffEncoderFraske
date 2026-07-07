@@ -101,6 +101,21 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
     }
   };
 
+  // Re-anchor a live gesture on the CURRENT pair — whenever the pair's
+  // membership changes (one of the first two lifted while a third stays),
+  // the old baselines describe fingers that no longer exist and the view
+  // would jump by their difference.
+  const rebaseline = () => {
+    const [a, b] = firstTwo();
+    if (!a || !b) return;
+    gDist0 = Math.max(1, dist(a.x, a.y, b.x, b.y));
+    gMidX0 = (a.x + b.x) / 2;
+    gMidY0 = (a.y + b.y) / 2;
+    gLastMidX = gMidX0;
+    gLastMidY = gMidY0;
+    gView0 = host.view();
+  };
+
   const dist = (ax: number, ay: number, bx: number, by: number) =>
     Math.hypot(ax - bx, ay - by);
 
@@ -151,7 +166,10 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
         longTimer = null;
         if (mode !== "single" || glided || held != null) return;
         held = 2;
-        host.button(2, true);
+        // At the press point, so the host's over-the-picture gate applies
+        // — a hold on the letterbox bars must not right-click wherever
+        // the cursor last was.
+        host.button(2, true, { clientX: downX, clientY: downY });
       }, LONG_MS);
       return;
     }
@@ -218,9 +236,11 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
       // distance flutter by one event's travel — ratio alone would read
       // that as a pinch and hijack the scroll.
       const pinching = Math.abs(Math.log(d / gDist0)) > PINCH_LOG && Math.abs(d - gDist0) > 16;
-      if (gView0.scale > 1.001 || pinching) {
-        // Already zoomed (any two-finger motion adjusts the view) or a
-        // real pinch: this gesture is zoom/pan.
+      // Zoomed in, any real two-finger motion adjusts the view — but only
+      // past a whisper of movement, so a two-finger TAP (fingers always
+      // wobble a px or two on glass) still reads as the right click.
+      const wiggle = midTravel > 4 || Math.abs(d - gDist0) > 4;
+      if ((gView0.scale > 1.001 && wiggle) || pinching) {
         gKind = "zoom";
       } else if (midTravel > PAN_START) {
         // Flat two-finger drag at 1:1 — the scroll wheel. Without
@@ -289,7 +309,12 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
     }
 
     if (mode === "gesture") {
-      if (touches.size >= 2) return; // a third finger lifted — ignore
+      if (touches.size >= 2) {
+        // A finger lifted but two remain — the driving pair may have
+        // changed members; re-anchor so the view doesn't jump.
+        rebaseline();
+        return;
+      }
       const now = performance.now();
       if (
         gKind === "pending" &&
@@ -333,7 +358,8 @@ export function makeTouchMouse(host: TouchMouseHost): TouchMouse {
     lastTap = null;
     mode = touches.size >= 2 ? "gesture" : touches.size === 1 ? "single" : "idle";
     if (mode === "single") glided = true; // survivors glide, never tap
-    if (mode !== "gesture") gKind = "pending";
+    if (mode === "gesture") rebaseline();
+    else gKind = "pending";
   }
 
   function reset() {
