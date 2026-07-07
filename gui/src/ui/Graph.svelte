@@ -128,25 +128,38 @@
 
   // ---- views ------------------------------------------------------------
   //
-  // Two layouts over the same nodes: the grouped grid (one labelled section
-  // per fleet — the default) and the radial ("this" centred, fleets seated
-  // together around the ring) — switched from the zoom controls.
+  // Three layouts over the same nodes: the grouped grid (one labelled section
+  // per fleet — the desktop default), the radial ("this" centred, fleets
+  // seated together around the ring), and the list (fleet-grouped rows with a
+  // search bar — the only view on phones, a third option on desktop). The
+  // graph views are switched from the zoom controls; the list from the same
+  // toggle bar (hidden on mobile, where it's the only view there is).
 
-  type ViewMode = "radial" | "grid";
+  type ViewMode = "radial" | "grid" | "list";
   const VIEW_STORE_KEY = "allmystuff.graphView.v1";
   let view = $state<ViewMode>(loadView());
+  // The list is the single, un-switchable view on the phone/tablet shell — a
+  // scrolling, fleet-grouped roster reads far better on a narrow touch screen
+  // than a pannable graph. Desktop keeps all three.
+  const isList = $derived(view === "list");
 
   function loadView(): ViewMode {
-    // Grid is the default now — only an explicit, stored "radial" choice opts
-    // back out, so a fresh install lands on the grouped view.
+    // Phones only ever get the list — it's the whole point of this view.
+    if (mobile) return "list";
+    // On desktop grid is the default; an explicit stored "radial"/"list" opts
+    // out, so a fresh install lands on the grouped grid.
     try {
-      return localStorage.getItem(VIEW_STORE_KEY) === "radial" ? "radial" : "grid";
+      const stored = localStorage.getItem(VIEW_STORE_KEY);
+      return stored === "radial" || stored === "list" ? stored : "grid";
     } catch {
       return "grid";
     }
   }
 
   async function setView(v: ViewMode) {
+    // The phone has no toggle, so this only ever runs on desktop — but guard
+    // anyway so mobile can never be knocked off the list.
+    if (mobile) return;
     view = v;
     panX = 0;
     panY = 0;
@@ -167,6 +180,7 @@
       scroller.scrollLeft = 0;
       scroller.scrollTop = 0;
     }
+    if (listScroll) listScroll.scrollTop = 0;
   }
 
   // The grid's geometry: one section per fleet, nodes wrapped into rows.
@@ -238,8 +252,90 @@
     return placed;
   });
 
-  const layout = $derived(view === "grid" ? gridLayout.placed : radialLayout);
+  // The list has no on-canvas geometry (it flows as real DOM rows), so both
+  // the placed-node layout and the fleet bands are empty there — no wires, no
+  // marquee, nothing to pan.
+  const layout = $derived(
+    view === "grid" ? gridLayout.placed : view === "radial" ? radialLayout : [],
+  );
   const sections = $derived(view === "grid" ? gridLayout.sections : []);
+
+  // ---- list view --------------------------------------------------------
+  //
+  // The same fleet groups as the graph, but rendered as scrolling rows with a
+  // search bar tucked against the top edge. Two things differ from the graph
+  // grouping: every claimable device is lifted into a single "Ready to claim"
+  // pseudo-fleet that always sits directly under Your Fleet (claiming is the
+  // first thing you do with a new box, so it rides up top), and the search
+  // narrows the rows while keeping every surviving device under its fleet.
+
+  const CLAIMABLE_KEY = "claimable";
+
+  let listQuery = $state("");
+  let listScroll = $state<HTMLDivElement | null>(null);
+  const listQueryNorm = $derived(listQuery.trim().toLowerCase());
+
+  /** The searchable text for one device — its name(s), OS/CPU, and the meshes
+   *  it's on — so a query matches what a person can actually see on the row. */
+  function nodeHaystack(n: MeshNode): string {
+    return [
+      n.label,
+      n.hostname,
+      displayName(n),
+      n.summary?.os,
+      n.summary?.cpu,
+      ...(n.networks ?? []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+  }
+
+  // The list's fleet groups, claimables hoisted into their own pseudo-fleet.
+  const listGroups = $derived.by((): FleetGroup[] => {
+    const groups = new Map<string, FleetGroup>();
+    for (const n of app.catalog.nodes) {
+      const { key, label } = app.standingOf(n).claimable
+        ? { key: CLAIMABLE_KEY, label: "Ready to claim" }
+        : fleetKeyOf(n);
+      const g = groups.get(key) ?? { key, label, nodes: [] };
+      g.nodes.push(n);
+      groups.set(key, g);
+    }
+    for (const g of groups.values()) {
+      g.nodes.sort((a, b) => {
+        const rank = (n: MeshNode) => (n.kind === "this" ? 0 : 1);
+        return rank(a) - rank(b) || a.label.localeCompare(b.label);
+      });
+    }
+    // Your fleet first, the claimables right behind it, named fleets
+    // alphabetically, the unknowns last.
+    const rank = (g: FleetGroup) =>
+      g.key === "mine" ? 0 : g.key === CLAIMABLE_KEY ? 1 : g.key === "unknown" ? 3 : 2;
+    return [...groups.values()].sort(
+      (a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label),
+    );
+  });
+
+  // The groups after the search filter — still fully fleet-grouped: a group
+  // whose *label* matches keeps all its devices (search "Alex" → all of Alex's
+  // fleet), otherwise only the matching devices survive, and empty groups drop
+  // out entirely. An empty query passes everything through untouched.
+  const filteredListGroups = $derived.by((): FleetGroup[] => {
+    const q = listQueryNorm;
+    if (!q) return listGroups;
+    const out: FleetGroup[] = [];
+    for (const g of listGroups) {
+      const labelHit = g.label.toLowerCase().includes(q);
+      const nodes = labelHit ? g.nodes : g.nodes.filter((n) => nodeHaystack(n).includes(q));
+      if (nodes.length > 0) out.push({ ...g, nodes });
+    }
+    return out;
+  });
+
+  function listGroupIcon(key: string): string {
+    return key === "mine" ? "🔗" : key === CLAIMABLE_KEY ? "＋" : key === "unknown" ? "❓" : "🧑";
+  }
 
   const posOf = $derived.by(() => {
     const m = new Map<string, Placed>();
@@ -430,6 +526,20 @@
     const req = app.focusRequest;
     if (!req || req.seq === lastFocusSeq) return;
     lastFocusSeq = req.seq;
+    if (isList) {
+      // The list has no camera — scroll the device's row into view instead.
+      // A cleared search could be hiding it, so drop the filter first, then
+      // wait a tick for the row to mount before scrolling to it.
+      if (listQueryNorm && !filteredListGroups.some((g) => g.nodes.some((n) => n.id === req.id))) {
+        listQuery = "";
+      }
+      void tick().then(() => {
+        listScroll
+          ?.querySelector(`.node[data-node-id="${CSS.escape(req.id)}"]`)
+          ?.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
+      return;
+    }
     const p = layout.find((pl) => pl.node.id === req.id);
     if (!p) return;
     if (isGrid && scroller) {
@@ -531,6 +641,8 @@
   }
 
   function onWheel(e: WheelEvent) {
+    // The list owns its own native scroll — the canvas never zooms there.
+    if (isList) return;
     // Grid reads like a list: a bare wheel scrolls it (let the scroller do its
     // thing — don't preventDefault), and zoom is the deliberate Ctrl/⌘ gesture.
     // Radial has nothing to scroll, so the wheel keeps zooming there.
@@ -545,6 +657,9 @@
   }
 
   function onPointerDown(e: PointerEvent) {
+    // The list is plain scrolling DOM — no marquee, no pan, no drag-share. Its
+    // rows select on click; empty space does nothing.
+    if (isList) return;
     const target = e.target as Element | null;
     // Let node clicks/drags and the floating controls handle themselves —
     // capturing here would swallow their clicks. Exception: on a phone in
@@ -647,7 +762,9 @@
     // rides the tap's `click` (see the node's onclick), so this handler must
     // not capture the pointer or preventDefault, and it must let the event
     // bubble so the canvas (radial) or the native scroller (grid) can pan.
-    if (mobile) return;
+    // The list is the same story on desktop — rows select on click, and a
+    // press must be free to become a scroll.
+    if (mobile || isList) return;
     if (e.button !== 0 || app.dragFrom) return; // left only; connect mode uses clicks
     // A press on an inline control (Claim, Make claimable…) is that button's —
     // don't hijack it into a node drag, or capturing the pointer eats its click.
@@ -679,9 +796,9 @@
     }
   }
   function onNodePointerUp(e: PointerEvent, n: MeshNode) {
-    // Phone: the tap's click event selects / completes connect — acting here
-    // too would double-fire it.
-    if (mobile) return;
+    // Phone and list: the tap's click event selects / completes connect —
+    // acting here too would double-fire it.
+    if (mobile || isList) return;
     // Only act when this device actually started the gesture (a press that
     // began on an inline button left nodeDrag null — let that button win).
     if (app.dragFrom) {
@@ -921,6 +1038,242 @@
   {/if}
 {/snippet}
 
+<!-- The device card, shared by the graph (placed on the canvas) and the list
+     (a flowing row). `placed` carries the graph coordinates; a null `placed`
+     renders the same card as a full-width list row instead. Declared at the
+     top level so both the graph's node layer and the list can render it — one
+     card body means the two views can never drift apart. -->
+{#snippet deviceCard(n: MeshNode, placed: Placed | null)}
+  <!-- One derived standing drives every visual + affordance, so the node
+       never shows contradictory state (e.g. "unclaimed" while wearing a
+       fleet badge). It recomputes live from the fleet roster + the device's
+       advert, so claiming or fleet changes reflect immediately. -->
+  {@const st = app.standingOf(n)}
+  {@const cons = app.consoleAccess(n)}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="node"
+    class:list={!placed}
+    class:self={st.self}
+    class:shared={st.kind === "shared"}
+    class:mine={st.mine && !st.self}
+    class:unclaimed={st.kind === "free" || st.kind === "theirs"}
+    class:claimable={st.claimable}
+    class:meshonly={!st.app}
+    class:selected={isSelected(n.id)}
+    class:armed={armed && targetable(n)}
+    class:dragover={dragOverId === n.id}
+    class:dragging-node={nodeDrag?.id === n.id && nodeDrag.moved}
+    class:grabbable={app.isMyDevice(n.id) && !isList}
+    class:offline={!n.online}
+    data-node-id={n.id}
+    style={placed
+      ? `left: ${placed.x - NODE_W / 2}px; top: ${placed.y - NODE_H / 2}px; width: ${NODE_W}px; min-height: ${NODE_H}px;`
+      : null}
+    onpointerdown={(e) => onNodePointerDown(e, n)}
+    onpointermove={(e) => onNodePointerMove(e, n)}
+    onpointerup={(e) => onNodePointerUp(e, n)}
+    onpointercancel={(e) => onNodePointerUp(e, n)}
+    onclick={(e) => {
+      // Phone + list: select on the tap's click — a drag that scrolled
+      // never fires one, so scrolling can't select. Desktop graph views
+      // select from pointerup above; running this too would double-fire.
+      if (!mobile && !isList) return;
+      if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
+      onNodeClick(n);
+    }}
+    onkeydown={(e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onNodeClick(n);
+      }
+    }}
+    role="button"
+    tabindex="0"
+    aria-label={displayName(n)}
+  >
+    {#if st.self}<span class="self-corner" aria-hidden="true">This device</span>{/if}
+    <div class="node-top">
+      <span class="avatar">{nodeAvatar(n)}</span>
+      <div class="node-id">
+        <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
+        <div class="node-sub">
+          {#if st.shared}
+            shared with {st.shared.name}
+          {:else if !st.app}
+            on the mesh · not running AllMyStuff
+          {:else if n.summary}
+            {n.summary.cpu}
+          {:else}
+            device
+          {/if}
+        </div>
+      </div>
+    </div>
+    <!-- Chips fill the row; the refresh control is pinned to its right. The
+         online dot ringed by refresh arrows; clicking re-learns this node.
+         It spins while a refresh is in flight and is disabled until the
+         details land (or the request times out). -->
+    <div class="node-meta-row">
+      <div class="node-meta">
+        {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
+        {:else if st.shared}<span class="tag guest">guest</span>
+        {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
+        {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
+        {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
+        {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
+        {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
+        {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
+        {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
+        {#if n.needsTurn && !n.online}
+          <!-- The daemon's ICE watchdog verdict, surfaced: this link keeps
+               failing with no relay in play. Without the chip the device
+               is just… quiet, and nobody guesses "add a TURN server". -->
+          <span
+            class="tag blocked"
+            title="Direct connection keeps failing and no relay is configured — add a TURN server to this mesh's venue (mesh settings → Servers)"
+            >⛔ needs relay</span
+          >
+        {/if}
+      </div>
+      <button
+        class="cbtn status-refresh"
+        class:online={n.online}
+        class:spinning={app.isRefreshing(n.id)}
+        data-tip="Refresh"
+        aria-label={`Refresh ${displayName(n)}`}
+        disabled={app.isRefreshing(n.id)}
+        onclick={(e) => {
+          e.stopPropagation();
+          void app.refreshNode(n.id);
+        }}
+      >
+        <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
+          <polyline points="22 5 22 10 17 10" />
+          <polyline points="2 19 2 14 7 14" />
+          <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
+          <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
+        </svg>
+        <span class="dot" class:on={n.online}></span>
+      </button>
+    </div>
+    <!-- Bottom button row: the consoles you can open on this device (your
+         own fleet's, or exactly what a fleet that shared it granted), with
+         the settings gear pinned to the right. -->
+    <div class="node-consoles">
+      {#if cons.remote}
+        <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
+      {/if}
+      {#if cons.files}
+        <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
+      {/if}
+      {#if cons.terminal}
+        <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
+      {/if}
+      {#if cons.sites}
+        <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
+          onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
+      {/if}
+      {#if app.kvmAllowed(n)}
+        <!-- A KVM's extra controls, alongside the generic Remote Control +
+             Sites (globe) buttons every node gets now: reboot the KVM
+             itself (two-step arm), and the attach link, which drops the
+             target picker out under the card. Its web UI opens from the
+             Sites globe (which routes through openKVM), so there's no
+             separate "Open KVM" button. -->
+        {#if app.canRestartDevice(n)}
+          <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
+            data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
+            aria-label="Reboot {displayName(n)} (the KVM itself)"
+            onclick={(e) => { e.stopPropagation(); kvmRebootClick(n); }}>{@render cicon("reboot")}</button>
+        {/if}
+        <button class="cbtn" class:active={app.kvmRevealed === n.id}
+          data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
+          aria-expanded={app.kvmRevealed === n.id}
+          onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}</button>
+      {/if}
+      {#if !app.isKvm(n)}
+        {@const kvmHere = app.kvmAttachedTo(n.id)}
+        {#if kvmHere && app.kvmAllowed(kvmHere)}
+          <!-- This machine is wired into a KVM you control: its physical
+               power and reset lines ride the KVM's GPIO, so they belong
+               on THIS card — they act on this machine. -->
+          <button class="cbtn" data-tip="Power (via {displayName(kvmHere)})"
+            aria-label="Press {displayName(n)}'s power button via its KVM"
+            onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "power"); }}>{@render cicon("power")}</button>
+          <button class="cbtn" data-tip="Reset (via {displayName(kvmHere)})"
+            aria-label="Hard-reset {displayName(n)} via its KVM"
+            onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "reset"); }}>{@render cicon("reset")}</button>
+        {/if}
+      {/if}
+      <span class="cbtn-sep" aria-hidden="true"></span>
+      <button
+        class="cbtn node-gear"
+        data-tip="Settings"
+        aria-label={`Settings for ${displayName(n)}`}
+        aria-haspopup="menu"
+        aria-expanded={nodeMenu?.id === n.id}
+        onclick={(e) => openNodeMenu(e, n.id)}
+      >⚙</button>
+    </div>
+    <!-- Claimable affordances drop out from *under* the node, floating
+         below it so they never disturb the graph's layout. -->
+    {#if st.self && st.app && !st.inFleet && !st.offering}
+      <!-- Your own device, not in a fleet: offer it for adoption. -->
+      <button
+        class="node-drawer make-claimable"
+        title="Offer this device so another of your machines can adopt it into a fleet"
+        onclick={(e) => { e.stopPropagation(); void app.setLocalClaimable(true); }}
+      >🔒 Make claimable</button>
+    {:else if st.claimable && claimRevealed === n.id}
+      <!-- A claimable device you tapped: the Claim button slides in. -->
+      <button
+        class="node-drawer claim-go"
+        onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
+      >＋ Claim this device</button>
+    {:else if app.kvmAllowed(n) && app.kvmRevealed === n.id}
+      {@const targets = app.kvmAttachTargets(n.id)}
+      <!-- The attach picker, dropped out by the card's link button: pick
+           which machine this KVM is wired into and Set. Everything else
+           (Open KVM, reboot, power/reset) lives in the button bar now —
+           this drop-out exists only for the one action that needs a
+           choice. No Detach here; that's the buried, confirm-gated action
+           in the sidebar. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+      <div class="node-drawer kvm-drawer" onclick={(e) => e.stopPropagation()}>
+        {#if targets.length === 0}
+          <p class="kvm-empty">No machines of yours to attach to yet.</p>
+        {:else}
+          <div class="kvm-row">
+            <select
+              class="kvm-pick"
+              title="Which machine this KVM controls"
+              bind:value={kvmTarget}
+            >
+              {#each targets as t (t.id)}
+                <option value={t.id}>{displayName(t)}</option>
+              {/each}
+            </select>
+            <button
+              class="kvm-act"
+              disabled={!kvmTarget}
+              onclick={(e) => {
+                e.stopPropagation();
+                if (!kvmTarget) return;
+                void app.attachKVM(n.id, kvmTarget);
+                app.kvmRevealed = null;
+              }}
+            >Set</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <!-- Phone grid reads like a list: let the browser own the vertical touch
      scroll (pan-y; both axes once zoomed in, so nothing is unreachable).
      Radial (and all of desktop) keeps the stylesheet's touch-action: none so
@@ -932,7 +1285,13 @@
   class:marqueeing={gesture?.kind === "marquee"}
   class:armed
   bind:this={canvas}
-  style:touch-action={mobile && isGrid ? (zoom > 1 ? "pan-x pan-y" : "pan-y") : null}
+  style:touch-action={isList
+    ? "pan-y"
+    : mobile && isGrid
+      ? zoom > 1
+        ? "pan-x pan-y"
+        : "pan-y"
+      : null}
   onwheel={onWheel}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
@@ -962,10 +1321,14 @@
 
   <!-- The scroll viewport. Grid view scrolls it natively (mousewheel, drag,
        scrollbar); radial keeps it pinned and pans via the transform. The
-       `.stage` is sized to the scaled content so the browser scrolls it. -->
+       `.stage` is sized to the scaled content so the browser scrolls it. The
+       list replaces this whole apparatus with plain flowing rows, below — so
+       it's hidden (not unmounted: the shared `deviceCard` snippet lives inside
+       it, and `layout` is empty in list mode, so nothing renders here anyway). -->
   <div
     class="scroller"
     class:scroll={isGrid}
+    class:hidden={isList}
     bind:this={scroller}
     onscroll={onScroll}
   >
@@ -1032,236 +1395,74 @@
       </div>
     {/each}
     {#each layout as p (p.node.id)}
-      {@const n = p.node}
-      <!-- One derived standing drives every visual + affordance, so the node
-           never shows contradictory state (e.g. "unclaimed" while wearing a
-           fleet badge). It recomputes live from the fleet roster + the device's
-           advert, so claiming or fleet changes reflect immediately. -->
-      {@const st = app.standingOf(n)}
-      {@const cons = app.consoleAccess(n)}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="node"
-        class:self={st.self}
-        class:shared={st.kind === "shared"}
-        class:mine={st.mine && !st.self}
-        class:unclaimed={st.kind === "free" || st.kind === "theirs"}
-        class:claimable={st.claimable}
-        class:meshonly={!st.app}
-        class:selected={isSelected(n.id)}
-        class:armed={armed && targetable(n)}
-        class:dragover={dragOverId === n.id}
-        class:dragging-node={nodeDrag?.id === n.id && nodeDrag.moved}
-        class:grabbable={app.isMyDevice(n.id)}
-        class:offline={!n.online}
-        data-node-id={n.id}
-        style="left: {p.x - NODE_W / 2}px; top: {p.y - NODE_H / 2}px; width: {NODE_W}px; min-height: {NODE_H}px;"
-        onpointerdown={(e) => onNodePointerDown(e, n)}
-        onpointermove={(e) => onNodePointerMove(e, n)}
-        onpointerup={(e) => onNodePointerUp(e, n)}
-        onpointercancel={(e) => onNodePointerUp(e, n)}
-        onclick={(e) => {
-          // Phone: select on the tap's click — a drag that scrolled/panned
-          // never fires one, so scrolling can't select. Desktop selects from
-          // pointerup above; running this too would double-fire.
-          if (!mobile) return;
-          if ((e.target as Element | null)?.closest?.("button, a, input, select, textarea")) return;
-          onNodeClick(n);
-        }}
-        onkeydown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onNodeClick(n);
-          }
-        }}
-        role="button"
-        tabindex="0"
-        aria-label={displayName(n)}
-      >
-        {#if st.self}<span class="self-corner" aria-hidden="true">This device</span>{/if}
-        <div class="node-top">
-          <span class="avatar">{nodeAvatar(n)}</span>
-          <div class="node-id">
-            <div class="node-label" title={displayName(n)}>{displayName(n)}</div>
-            <div class="node-sub">
-              {#if st.shared}
-                shared with {st.shared.name}
-              {:else if !st.app}
-                on the mesh · not running AllMyStuff
-              {:else if n.summary}
-                {n.summary.cpu}
-              {:else}
-                device
-              {/if}
-            </div>
-          </div>
-        </div>
-        <!-- Chips fill the row; the refresh control is pinned to its right. The
-             online dot ringed by refresh arrows; clicking re-learns this node.
-             It spins while a refresh is in flight and is disabled until the
-             details land (or the request times out). -->
-        <div class="node-meta-row">
-          <div class="node-meta">
-            {#if !st.app}<span class="tag meshonly">not on AllMyStuff</span>
-            {:else if st.shared}<span class="tag guest">guest</span>
-            {:else if st.kind === "claimable"}<span class="tag claimable">＋ claim</span>
-            {:else if st.kind === "theirs"}<span class="tag theirs">someone else's</span>
-            {:else if st.kind === "free"}<span class="tag unclaimed">unclaimed</span>
-            {:else if st.mine && !st.inFleet && !st.self}<span class="tag mine">yours</span>{/if}
-            {#if st.inFleet}<span class="tag fleet" class:owner={st.role === "owner"} class:manager={st.role === "manager"} title="In your fleet · {st.role}">{st.role === "owner" ? "★ owner" : st.role === "manager" ? "⚑ manager" : "🔗 fleet"}</span>{/if}
-            {#if n.summary}<span class="tag soft">{n.summary.device_count} things</span>{/if}
-            {#if n.summary}<span class="tag soft">{humanBytes(n.summary.ram_bytes)}</span>{/if}
-            {#if n.needsTurn && !n.online}
-              <!-- The daemon's ICE watchdog verdict, surfaced: this link keeps
-                   failing with no relay in play. Without the chip the device
-                   is just… quiet, and nobody guesses "add a TURN server". -->
-              <span
-                class="tag blocked"
-                title="Direct connection keeps failing and no relay is configured — add a TURN server to this mesh's venue (mesh settings → Servers)"
-                >⛔ needs relay</span
-              >
-            {/if}
-          </div>
-          <button
-            class="cbtn status-refresh"
-            class:online={n.online}
-            class:spinning={app.isRefreshing(n.id)}
-            data-tip="Refresh"
-            aria-label={`Refresh ${displayName(n)}`}
-            disabled={app.isRefreshing(n.id)}
-            onclick={(e) => {
-              e.stopPropagation();
-              void app.refreshNode(n.id);
-            }}
-          >
-            <svg class="refresh-ring" viewBox="0 0 24 24" aria-hidden="true">
-              <polyline points="22 5 22 10 17 10" />
-              <polyline points="2 19 2 14 7 14" />
-              <path d="M4.2 9.3a8 8 0 0 1 13.4-3L22 10" />
-              <path d="M19.8 14.7a8 8 0 0 1-13.4 3L2 14" />
-            </svg>
-            <span class="dot" class:on={n.online}></span>
-          </button>
-        </div>
-        <!-- Bottom button row: the consoles you can open on this device (your
-             own fleet's, or exactly what a fleet that shared it granted), with
-             the settings gear pinned to the right. -->
-        <div class="node-consoles">
-          {#if cons.remote}
-            <button class="cbtn" data-tip="Remote control" aria-label="Remote control {displayName(n)}"
-              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "remote"); }}>{@render cicon("remote")}</button>
-          {/if}
-          {#if cons.files}
-            <button class="cbtn" data-tip="Files" aria-label="Open files on {displayName(n)}"
-              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "files"); }}>{@render cicon("files")}</button>
-          {/if}
-          {#if cons.terminal}
-            <button class="cbtn" data-tip="Terminal" aria-label="Open terminal on {displayName(n)}"
-              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "terminal"); }}>{@render cicon("terminal")}</button>
-          {/if}
-          {#if cons.sites}
-            <button class="cbtn" data-tip="Sites" aria-label="Open sites on {displayName(n)}"
-              onclick={(e) => { e.stopPropagation(); app.openConsoleKind(n.id, "sites"); }}>{@render cicon("sites")}</button>
-          {/if}
-          {#if app.kvmAllowed(n)}
-            <!-- A KVM's extra controls, alongside the generic Remote Control +
-                 Sites (globe) buttons every node gets now: reboot the KVM
-                 itself (two-step arm), and the attach link, which drops the
-                 target picker out under the card. Its web UI opens from the
-                 Sites globe (which routes through openKVM), so there's no
-                 separate "Open KVM" button. -->
-            {#if app.canRestartDevice(n)}
-              <button class="cbtn" class:armed-danger={kvmRebootArmed === n.id}
-                data-tip={kvmRebootArmed === n.id ? "Click again to reboot the KVM" : "Reboot this KVM"}
-                aria-label="Reboot {displayName(n)} (the KVM itself)"
-                onclick={(e) => { e.stopPropagation(); kvmRebootClick(n); }}>{@render cicon("reboot")}</button>
-            {/if}
-            <button class="cbtn" class:active={app.kvmRevealed === n.id}
-              data-tip="Attach to a machine" aria-label="Point {displayName(n)} at a machine"
-              aria-expanded={app.kvmRevealed === n.id}
-              onclick={(e) => { e.stopPropagation(); toggleKvmAttach(n.id); }}>{@render cicon("link")}</button>
-          {/if}
-          {#if !app.isKvm(n)}
-            {@const kvmHere = app.kvmAttachedTo(n.id)}
-            {#if kvmHere && app.kvmAllowed(kvmHere)}
-              <!-- This machine is wired into a KVM you control: its physical
-                   power and reset lines ride the KVM's GPIO, so they belong
-                   on THIS card — they act on this machine. -->
-              <button class="cbtn" data-tip="Power (via {displayName(kvmHere)})"
-                aria-label="Press {displayName(n)}'s power button via its KVM"
-                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "power"); }}>{@render cicon("power")}</button>
-              <button class="cbtn" data-tip="Reset (via {displayName(kvmHere)})"
-                aria-label="Hard-reset {displayName(n)} via its KVM"
-                onclick={(e) => { e.stopPropagation(); void app.kvmFeature(kvmHere.id, "reset"); }}>{@render cicon("reset")}</button>
-            {/if}
-          {/if}
-          <span class="cbtn-sep" aria-hidden="true"></span>
-          <button
-            class="cbtn node-gear"
-            data-tip="Settings"
-            aria-label={`Settings for ${displayName(n)}`}
-            aria-haspopup="menu"
-            aria-expanded={nodeMenu?.id === n.id}
-            onclick={(e) => openNodeMenu(e, n.id)}
-          >⚙</button>
-        </div>
-        <!-- Claimable affordances drop out from *under* the node, floating
-             below it so they never disturb the graph's layout. -->
-        {#if st.self && st.app && !st.inFleet && !st.offering}
-          <!-- Your own device, not in a fleet: offer it for adoption. -->
-          <button
-            class="node-drawer make-claimable"
-            title="Offer this device so another of your machines can adopt it into a fleet"
-            onclick={(e) => { e.stopPropagation(); void app.setLocalClaimable(true); }}
-          >🔒 Make claimable</button>
-        {:else if st.claimable && claimRevealed === n.id}
-          <!-- A claimable device you tapped: the Claim button slides in. -->
-          <button
-            class="node-drawer claim-go"
-            onclick={(e) => { e.stopPropagation(); void app.claim(n.id); claimRevealed = null; }}
-          >＋ Claim this device</button>
-        {:else if app.kvmAllowed(n) && app.kvmRevealed === n.id}
-          {@const targets = app.kvmAttachTargets(n.id)}
-          <!-- The attach picker, dropped out by the card's link button: pick
-               which machine this KVM is wired into and Set. Everything else
-               (Open KVM, reboot, power/reset) lives in the button bar now —
-               this drop-out exists only for the one action that needs a
-               choice. No Detach here; that's the buried, confirm-gated action
-               in the sidebar. -->
-          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-          <div class="node-drawer kvm-drawer" onclick={(e) => e.stopPropagation()}>
-            {#if targets.length === 0}
-              <p class="kvm-empty">No machines of yours to attach to yet.</p>
-            {:else}
-              <div class="kvm-row">
-                <select
-                  class="kvm-pick"
-                  title="Which machine this KVM controls"
-                  bind:value={kvmTarget}
-                >
-                  {#each targets as t (t.id)}
-                    <option value={t.id}>{displayName(t)}</option>
-                  {/each}
-                </select>
-                <button
-                  class="kvm-act"
-                  disabled={!kvmTarget}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    if (!kvmTarget) return;
-                    void app.attachKVM(n.id, kvmTarget);
-                    app.kvmRevealed = null;
-                  }}
-                >Set</button>
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
+      {@render deviceCard(p.node, p)}
     {/each}
       </div>
     </div>
   </div>
+
+  {#if isList}
+    <!-- The list view: a search bar tucked against the top edge of the centre
+         area, then fleet-grouped rows scrolling beneath it. The only view on
+         phones, the third on desktop. -->
+    <div class="list-view">
+      <div class="list-search">
+        <div class="list-search-inner">
+          <svg class="list-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" /><path d="m20 20-3.2-3.2" />
+          </svg>
+          <input
+            class="list-search-field"
+            type="search"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="Search your stuff…"
+            aria-label="Search your stuff"
+            bind:value={listQuery}
+          />
+          {#if listQuery}
+            <button class="list-search-clear" aria-label="Clear search" onclick={() => (listQuery = "")}>✕</button>
+          {/if}
+        </div>
+      </div>
+      <div class="list-scroll" bind:this={listScroll}>
+        {#if filteredListGroups.length === 0}
+          <div class="list-noresults" aria-live="polite">
+            {#if app.catalog.nodes.length === 0}
+              <div class="list-noresults-orb">🧦</div>
+              <div class="list-noresults-title">Getting your stuff together…</div>
+              <div class="list-noresults-sub">Scanning this machine and waiting for peers to appear.</div>
+            {:else}
+              <div class="list-noresults-orb">🔍</div>
+              <div class="list-noresults-title">Nothing matches “{listQuery}”</div>
+              <div class="list-noresults-sub">Try a device name, an OS, a chip, or a mesh.</div>
+            {/if}
+          </div>
+        {:else}
+          {#each filteredListGroups as g (g.key)}
+            <section
+              class="list-group"
+              class:mine={g.key === "mine"}
+              class:claimable={g.key === CLAIMABLE_KEY}
+              class:unknown={g.key === "unknown"}
+            >
+              <header class="list-group-head">
+                <span class="lg-icon" aria-hidden="true">{listGroupIcon(g.key)}</span>
+                <span class="lg-label">{g.label}</span>
+                <span class="lg-count">{g.nodes.length}</span>
+              </header>
+              <div class="list-rows">
+                {#each g.nodes as n (n.id)}
+                  {@render deviceCard(n, null)}
+                {/each}
+              </div>
+            </section>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  {/if}
 
   {#if gesture?.kind === "marquee"}
     <div
@@ -1302,7 +1503,7 @@
     </div>
   {/if}
 
-  {#if app.catalog.nodes.length === 0}
+  {#if app.catalog.nodes.length === 0 && !isList}
     <div class="empty" aria-live="polite">
       <div class="empty-orb">🧦</div>
       <div class="empty-title">Getting your stuff together…</div>
@@ -1317,26 +1518,40 @@
     </div>
   {/if}
 
-  <div class="zoombar">
-    <button
-      class="zbtn"
-      class:active={view === "radial"}
-      title="Radial view — this device in the centre"
-      aria-label="Radial view"
-      onclick={() => setView("radial")}>◎</button
-    >
-    <button
-      class="zbtn"
-      class:active={view === "grid"}
-      title="Grid view — grouped by fleet"
-      aria-label="Grid view, grouped by fleet"
-      onclick={() => setView("grid")}>⊞</button
-    >
-    <span class="zsep"></span>
-    <button class="zbtn" title="Zoom out (Ctrl/⌘ −)" onclick={() => applyZoom(width / 2, height / 2, zoom / 1.2)}>−</button>
-    <button class="zbtn wide" title="Reset view (Ctrl/⌘ 0)" onclick={resetView}>{Math.round(zoom * 100)}%</button>
-    <button class="zbtn" title="Zoom in (Ctrl/⌘ +)" onclick={() => applyZoom(width / 2, height / 2, zoom * 1.2)}>+</button>
-  </div>
+  <!-- The view switcher + zoom. Hidden on the phone, where the list is the
+       only view (nothing to switch to, nothing to zoom). The zoom controls
+       drop away in the list too — it scrolls, it doesn't scale. -->
+  {#if !mobile}
+    <div class="zoombar">
+      <button
+        class="zbtn"
+        class:active={view === "radial"}
+        title="Radial view — this device in the centre"
+        aria-label="Radial view"
+        onclick={() => setView("radial")}>◎</button
+      >
+      <button
+        class="zbtn"
+        class:active={view === "grid"}
+        title="Grid view — grouped by fleet"
+        aria-label="Grid view, grouped by fleet"
+        onclick={() => setView("grid")}>⊞</button
+      >
+      <button
+        class="zbtn"
+        class:active={view === "list"}
+        title="List view — a searchable, fleet-grouped roster"
+        aria-label="List view, grouped by fleet"
+        onclick={() => setView("list")}>☰</button
+      >
+      {#if !isList}
+        <span class="zsep"></span>
+        <button class="zbtn" title="Zoom out (Ctrl/⌘ −)" onclick={() => applyZoom(width / 2, height / 2, zoom / 1.2)}>−</button>
+        <button class="zbtn wide" title="Reset view (Ctrl/⌘ 0)" onclick={resetView}>{Math.round(zoom * 100)}%</button>
+        <button class="zbtn" title="Zoom in (Ctrl/⌘ +)" onclick={() => applyZoom(width / 2, height / 2, zoom * 1.2)}>+</button>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <!-- The per-node actions menu, rendered at the component root (outside the
@@ -2425,5 +2640,257 @@
     height: 1.1rem;
     background: var(--line);
     margin: 0 0.1rem;
+  }
+
+  /* ---- list view ----------------------------------------------------- */
+
+  /* The graph scroller is kept mounted but hidden in list mode (the shared
+     device-card snippet lives inside it); the list draws over the same canvas. */
+  .scroller.hidden {
+    display: none;
+  }
+
+  /* The list fills the canvas as a flex column: a fixed search bar tucked
+     against the top edge, then the scrolling roster beneath it. */
+  .list-view {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    z-index: 2;
+  }
+
+  /* The search bar — hugging the top edge of the centre area, a hairline
+     dividing it from the rows that scroll under it. Translucent + blurred so
+     the canvas reads through it and it feels part of the surface, not bolted
+     on. */
+  .list-search {
+    flex-shrink: 0;
+    padding: 0.7rem 1rem;
+    background: oklch(0.135 0.022 285 / 0.72);
+    backdrop-filter: blur(14px) saturate(1.15);
+    border-bottom: 1px solid var(--line);
+  }
+  .list-search-inner {
+    position: relative;
+    display: flex;
+    align-items: center;
+    max-width: 680px;
+    margin: 0 auto;
+  }
+  .list-search-icon {
+    position: absolute;
+    left: 0.85rem;
+    width: 1.05rem;
+    height: 1.05rem;
+    color: var(--ink-faint);
+    pointer-events: none;
+  }
+  .list-search-field {
+    flex: 1;
+    min-width: 0;
+    font-family: inherit;
+    font-size: 0.92rem;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-pill);
+    padding: 0.62rem 2.4rem 0.62rem 2.5rem;
+    box-shadow: var(--shadow-sm), inset 0 1px 0 oklch(1 0 0 / 0.03);
+    transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+  }
+  .list-search-field::placeholder {
+    color: var(--ink-faint);
+  }
+  .list-search-field:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: var(--surface-2);
+    box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-sm);
+  }
+  /* Drop the WebKit search decorations — we supply our own clear button. */
+  .list-search-field::-webkit-search-decoration,
+  .list-search-field::-webkit-search-cancel-button {
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  .list-search-clear {
+    position: absolute;
+    right: 0.5rem;
+    display: grid;
+    place-items: center;
+    width: 1.6rem;
+    height: 1.6rem;
+    border: none;
+    border-radius: 50%;
+    background: var(--surface-2);
+    color: var(--ink-soft);
+    font-size: 0.8rem;
+    line-height: 1;
+  }
+  .list-search-clear:hover {
+    background: var(--line-strong);
+    color: var(--ink);
+  }
+
+  /* The scrolling roster. A quiet scrollbar matching the grid's. */
+  .list-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+    padding: 0.75rem 1rem 3rem;
+  }
+  .list-scroll::-webkit-scrollbar {
+    width: 12px;
+  }
+  .list-scroll::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 8px;
+  }
+  .list-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--ink-faint);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  /* One fleet per group, a centred column so the list reads as a column on a
+     wide desktop as cleanly as it fills a phone. */
+  .list-group {
+    max-width: 680px;
+    margin: 0 auto 1.4rem;
+  }
+  .list-group:last-child {
+    margin-bottom: 0;
+  }
+  /* The fleet header sticks under the search bar as its devices scroll past,
+     so you never lose which fleet you're looking at in a long roster. */
+  .list-group-head {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.5rem 0.15rem 0.55rem;
+    font-size: 0.82rem;
+    font-weight: 750;
+    letter-spacing: 0.01em;
+    color: var(--ink-soft);
+    background: linear-gradient(
+      180deg,
+      var(--bg) 55%,
+      oklch(0.135 0.022 285 / 0)
+    );
+  }
+  .lg-icon {
+    font-size: 0.9rem;
+    line-height: 1;
+  }
+  .lg-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .lg-count {
+    font-size: 0.66rem;
+    font-weight: 700;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    padding: 0.02rem 0.42rem;
+    color: var(--ink-faint);
+  }
+  /* Your fleet wears the fleet green; the claim shelf wears the brand accent —
+     the same concept colours the graph's bands use. */
+  .list-group.mine .lg-label {
+    color: var(--c-fleet-ink);
+  }
+  .list-group.claimable .lg-label {
+    color: var(--accent-ink);
+  }
+  .list-group.claimable .lg-icon {
+    color: var(--accent);
+    font-weight: 800;
+  }
+  .list-group.claimable .lg-count {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+
+  .list-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  /* The device card as a list row: a full-width card in normal flow (the graph
+     absolutely-positions and fixes its width; the list lets it breathe). */
+  .node.list {
+    position: relative;
+    width: 100%;
+  }
+  /* No pulsing halo in the claim shelf — a whole group of them would throb;
+     the accent border and the group header already say "claimable". */
+  .node.list.claimable {
+    animation: none;
+  }
+  /* The claim / KVM drop-outs flow in the row instead of floating under it, so
+     opening one grows the card and nudges the rows below rather than covering
+     them (there's no graph whitespace to drop into here). */
+  .node.list .node-drawer {
+    position: static;
+    left: auto;
+    right: auto;
+    margin-top: 0.5rem;
+    border: 1.5px solid var(--accent);
+    border-radius: var(--r-sm);
+    box-shadow: none;
+  }
+  .node.list .node-drawer::before {
+    display: none;
+  }
+
+  /* The empty / no-results panel, centred in the roster. */
+  .list-noresults {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    text-align: center;
+    padding: 3.5rem 1rem;
+    color: var(--ink-faint);
+  }
+  .list-noresults-orb {
+    font-size: 2.2rem;
+    filter: drop-shadow(0 3px 6px oklch(0.64 0.255 350 / 0.3));
+  }
+  .list-noresults-title {
+    font-weight: 750;
+    font-size: 1rem;
+    color: var(--ink);
+  }
+  .list-noresults-sub {
+    font-size: 0.82rem;
+    max-width: 22rem;
+  }
+
+  /* Phone: edge-to-edge rows, a touch more room for thumbs. */
+  @media (max-width: 700px) {
+    .list-search {
+      padding: 0.6rem 0.75rem;
+    }
+    .list-scroll {
+      padding: 0.6rem 0.75rem 3.5rem;
+    }
   }
 </style>
