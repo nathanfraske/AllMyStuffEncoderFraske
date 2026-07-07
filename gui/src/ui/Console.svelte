@@ -1668,6 +1668,7 @@
       >
         <button
           class="bar-tab"
+          class:hidden={barHidden}
           title={barHidden ? "Show controls" : "Hide controls"}
           aria-label={barHidden ? "Show console controls" : "Hide console controls"}
           onclick={toggleBar}>{vertical ? (barHidden ? "‹" : "›") : barHidden ? "▾" : "▴"}</button
@@ -1704,16 +1705,16 @@
             <span class="vsep"></span>
             {#each inputs as inp (inp.id)}
               {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
+              <!-- A popped-out input still SELECTS on click — the stage
+                   then shows its "in its own window" card with the
+                   Return-video-here button, the deliberate way home. -->
               <button
                 class="kbtn input"
                 class:active={inp.id === selectedId && !inpPopped}
                 class:hollow={inpPopped}
-                title={inpPopped
-                  ? `${inp.label} — in its own window (click to return it here)`
-                  : inp.label}
+                title={inpPopped ? `${inp.label} — in its own window` : inp.label}
                 aria-label={inp.label}
-                onclick={() =>
-                  inpPopped ? app.askReturnVideo(`cap:${inp.id}`) : app.setConsoleInput(inp.id)}
+                onclick={() => app.setConsoleInput(inp.id)}
               >
                 {inputIcon(inp)}
                 {#if inp.default}<span class="kdef" title="Default input">★</span>{/if}
@@ -2253,14 +2254,16 @@
     position: absolute;
     z-index: 10;
   }
+  /* Hugging the screen edge — the bar is a tray in the bezel, spending
+     the least picture real estate a bar can. */
   .bar-anchor.h {
-    top: calc(0.6rem + env(safe-area-inset-top, 0px));
+    top: env(safe-area-inset-top, 0px);
     left: 50%;
     width: max-content;
   }
   .bar-anchor.v {
     top: 50%;
-    right: calc(0.5rem + env(safe-area-inset-right, 0px));
+    right: env(safe-area-inset-right, 0px);
   }
   .kvmbar {
     display: flex;
@@ -2286,6 +2289,9 @@
     max-width: calc(100vw - 2rem);
     overflow-x: auto;
     overflow-y: hidden;
+    /* Flush against the top edge: square where it meets the bezel. */
+    border-top: none;
+    border-radius: 0 0 12px 12px;
   }
   .bar-anchor.v .kvmbar {
     flex-direction: column;
@@ -2296,6 +2302,9 @@
     overflow-y: auto;
     overflow-x: hidden;
     padding: 0.15rem 0 0.4rem;
+    /* Flush against the right edge. */
+    border-right: none;
+    border-radius: 12px 0 0 12px;
   }
   /* Hidden: slid out past the bar's own edge (safe-area included),
      leaving only the handle tab. */
@@ -2330,6 +2339,7 @@
     width: 3.4rem;
     height: 1.15rem;
     border-radius: 0 0 8px 8px;
+    transition: transform 0.3s ease, background 0.12s ease;
   }
   .bar-anchor.v .bar-tab {
     right: 100%;
@@ -2339,6 +2349,16 @@
     width: 1.15rem;
     height: 3.4rem;
     border-radius: 8px 0 0 8px;
+    transition: transform 0.3s ease, background 0.12s ease;
+  }
+  /* Hidden: the tab rides along to hug the screen edge the bar left
+     through — not float mid-air where the bar used to be. The offsets
+     retrace the bar's thickness + the tab's own margin. */
+  .bar-anchor.h .bar-tab.hidden {
+    transform: translateX(-50%) translateY(calc(-2.7rem - 3px - env(safe-area-inset-top, 0px)));
+  }
+  .bar-anchor.v .bar-tab.hidden {
+    transform: translateY(-50%) translateX(calc(2.7rem + 3px + env(safe-area-inset-right, 0px)));
   }
   .bar-tab:hover {
     color: #fff;
