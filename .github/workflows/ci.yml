@@ -116,6 +116,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         working-directory: node
         run: cargo clippy --all-targets --features hwenc -- -D warnings
+      # The capture-less path the iOS/Android app links: `mesh.rs` is shared
+      # with the mobile build, which compiles it against `stubs/video.rs` /
+      # `stubs/terminal.rs` instead of the real capture backends. Nothing else
+      # in CI builds that config (the desktop jobs use `host`; `gui-mobile`
+      # drops `mesh` to stay NDK-free), so stub drift — a new `video`/`terminal`
+      # API added to the host path but not the stub — used to surface only on
+      # the developer's `tauri ios` build. This check catches it in CI.
+      - name: check capture-less stub (mobile config)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: node
+        run: cargo check --no-default-features
       - name: test
         working-directory: node
         run: cargo test

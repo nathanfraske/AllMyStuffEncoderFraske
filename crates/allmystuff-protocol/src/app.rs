@@ -904,6 +904,20 @@ pub enum RouteControl {
     /// peers (decodes as [`RouteControl::Unknown`] and dropped): they fall back
     /// to the positional lane, exactly as before.
     VideoLane { route_id: String, lane: u8 },
+    /// "Your media keeps arriving on my track lane N but no route here maps
+    /// to it" — receiver → sender, the lane-shaped twin of a
+    /// [`Reject`](RouteControl::Reject). It exists for the one failure a
+    /// Reject can't express: the receiving app restarted (or otherwise lost
+    /// its route table), so it can't *name* the dead route — the name is
+    /// exactly what it lost — while the sender keeps capturing and encoding
+    /// into the void. Only the sender still knows which route it pinned to
+    /// that lane, so the receiver reports the lane and the sender resolves
+    /// it, then treats the result as a Reject of that route (stopping the
+    /// encoder). `media` is `"video"` (the H.264 track lanes) or `"audio"`
+    /// (the Opus lanes); other values are reserved and ignored. Unknown to
+    /// older peers (decodes as [`RouteControl::Unknown`] and dropped) — an
+    /// old sender keeps streaming exactly as today.
+    DeadLane { media: String, lane: u8 },
     /// "List your open terminal sessions" — a viewer asking a host (its
     /// owner/fleet, enforced host-side exactly like a terminal offer) which
     /// shells it already has running, so the picker can offer to *attach* to

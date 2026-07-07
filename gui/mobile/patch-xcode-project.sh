@@ -30,3 +30,20 @@ if command -v pnpm >/dev/null 2>&1; then
     && echo "app icon stamped into gen/apple" \
     || echo "icon stamp failed — run: cd $DIR && pnpm tauri icon ../src-tauri/icons/icon-ios.png" >&2
 fi
+
+# Drop the keyboard-accessory-bar suppressor into the generated Swift sources so
+# Xcode compiles it into the app — its Objective-C `+load` self-installs the
+# WKContentView swizzle, no wiring needed. With Xcode 16 synchronized groups the
+# Sources folder is auto-included; on an older layout, add the file to the
+# target once by hand. Deleting the file restores iOS's default prev/next/Done
+# bar. Best-effort: `|| true` so a missing folder never fails the patch.
+ACCESSORY_SRC="$DIR/ios/HideKeyboardAccessory.m"
+ACCESSORY_DEST="$(ls -d "$DIR"/gen/apple/Sources/*/ 2>/dev/null | head -1)"
+if [ -f "$ACCESSORY_SRC" ] && [ -n "$ACCESSORY_DEST" ]; then
+  cp "$ACCESSORY_SRC" "$ACCESSORY_DEST" \
+    && echo "keyboard accessory suppressor → $ACCESSORY_DEST" \
+    || echo "accessory suppressor copy failed" >&2
+else
+  echo "accessory suppressor not copied (no gen/apple/Sources/* — init first)" >&2
+fi
+true

@@ -41,6 +41,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// One captured desktop frame, already RGBA.
@@ -145,6 +146,22 @@ enum NextError {
     Fatal(String),
 }
 
+/// The mouse cursor as DXGI hands it over — the real OS pointer shape (arrow,
+/// I-beam, hand, resize, a custom app cursor). Desktop Duplication never draws
+/// it into the frame (that's a hardware overlay), so on Windows we composite it
+/// ourselves; macOS/Linux capture bakes their own cursor in already. Cached
+/// because the *shape* only changes when the pointer image does (a new
+/// `PointerShapeBufferSize`), while the *position* updates every mouse move.
+struct CursorShape {
+    /// `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`: 1 monochrome, 2 color (BGRA), 4
+    /// masked-color. Stored raw so no extra windows-crate import is needed.
+    kind: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    buf: Vec<u8>,
+}
+
 struct Duplication {
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -156,6 +173,23 @@ struct Duplication {
     /// kills the duplication with ACCESS_LOST and pump rebuilds it, so the
     /// rebuilt one re-reads the (possibly new) orientation for free.
     rotation_deg: u32,
+    /// Latest cursor bitmap (see [`CursorShape`]); `None` until the first
+    /// shape arrives.
+    cursor: Option<CursorShape>,
+    /// Cursor top-left on the desktop surface, and whether it's showing —
+    /// from `DXGI_OUTDUPL_FRAME_INFO.PointerPosition`, updated on every mouse
+    /// move (`LastMouseUpdateTime != 0`).
+    ptr_x: i32,
+    ptr_y: i32,
+    ptr_visible: bool,
+    /// The last frame's pixels WITHOUT the cursor drawn in, so a pointer-only
+    /// move (no desktop change — the common case while hovering) can be
+    /// re-emitted with the cursor at its new spot instead of freezing it.
+    last_clean: Option<Vec<u8>>,
+    last_dims: (u32, u32),
+    /// Rate limit for those cursor-only re-emits so a fast mouse can't spin the
+    /// pump faster than the capture cadence.
+    last_cursor_emit: Instant,
 }
 
 impl Duplication {
@@ -217,6 +251,13 @@ impl Duplication {
                     dup,
                     staging: None,
                     rotation_deg,
+                    cursor: None,
+                    ptr_x: 0,
+                    ptr_y: 0,
+                    ptr_visible: false,
+                    last_clean: None,
+                    last_dims: (0, 0),
+                    last_cursor_emit: Instant::now(),
                 });
             }
         }
@@ -239,11 +280,73 @@ impl Duplication {
                 };
             }
             // From here the frame is held; release it on every path or
-            // the next acquire can't proceed.
+            // the next acquire can't proceed. Pointer metadata must be read
+            // while the frame is held too, so do it before copy_out.
+            if info.PointerShapeBufferSize > 0 {
+                // A new pointer bitmap is available — cache it. Best-effort:
+                // a failed fetch keeps the previous shape, never breaks capture.
+                self.update_cursor_shape(info.PointerShapeBufferSize);
+            }
+            if info.LastMouseUpdateTime != 0 {
+                let p = info.PointerPosition;
+                self.ptr_x = p.Position.x;
+                self.ptr_y = p.Position.y;
+                self.ptr_visible = p.Visible.as_bool();
+            }
             let result = self.copy_out(info, resource);
             let _ = self.dup.ReleaseFrame();
             result.map_err(NextError::Fatal)
         }
+    }
+
+    /// Fetch and cache the current pointer bitmap (held-frame only). Silent on
+    /// failure — the cursor just keeps its last shape.
+    unsafe fn update_cursor_shape(&mut self, size: u32) {
+        let mut buf = vec![0u8; size as usize];
+        let mut required = 0u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        if self
+            .dup
+            .GetFramePointerShape(
+                size,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut required,
+                &mut info,
+            )
+            .is_ok()
+        {
+            self.cursor = Some(CursorShape {
+                kind: info.Type,
+                width: info.Width,
+                height: info.Height,
+                pitch: info.Pitch,
+                buf,
+            });
+        }
+    }
+
+    /// A pointer-only update (no desktop change): re-emit the last frame with
+    /// the cursor moved to its new spot, rate-limited to the capture cadence.
+    /// `None` when there's nothing to show or the limiter says wait.
+    fn cursor_only_frame(&mut self) -> Option<RawFrame> {
+        if !self.ptr_visible || self.cursor.is_none() || self.last_clean.is_none() {
+            return None;
+        }
+        if self.last_cursor_emit.elapsed() < Duration::from_millis(15) {
+            return None;
+        }
+        let (w, h) = self.last_dims;
+        let mut rgba = self.last_clean.as_ref().unwrap().clone();
+        if let Some(cur) = &self.cursor {
+            composite_cursor(&mut rgba, w, h, cur, self.ptr_x, self.ptr_y);
+        }
+        self.last_cursor_emit = Instant::now();
+        Some(RawFrame {
+            rgba,
+            width: w,
+            height: h,
+            rotation_deg: self.rotation_deg,
+        })
     }
 
     unsafe fn copy_out(
@@ -252,8 +355,10 @@ impl Duplication {
         resource: Option<IDXGIResource>,
     ) -> Result<Option<RawFrame>, String> {
         if info.LastPresentTime == 0 {
-            // Cursor moved, pixels didn't — nothing to encode.
-            return Ok(None);
+            // No desktop change. If only the pointer moved, re-emit the last
+            // frame with the cursor at its new spot so it doesn't freeze on a
+            // static screen; a bare timeout yields nothing.
+            return Ok(self.cursor_only_frame());
         }
         let resource = resource.ok_or("AcquireNextFrame returned no resource")?;
         let texture: ID3D11Texture2D = resource.cast().map_err(|e| e.to_string())?;
@@ -286,6 +391,22 @@ impl Duplication {
             }
         }
         self.context.Unmap(&staging, 0);
+        // Desktop Duplication delivers the desktop WITHOUT the cursor (it's a
+        // hardware overlay), so draw the real OS pointer shape in ourselves —
+        // matching what macOS/Linux capture already bakes in. Keep the
+        // cursor-free pixels first so a later pointer-only move can re-emit
+        // (see cursor_only_frame). Compositing runs on the pre-rotation buffer,
+        // so the cursor rotates with the frame downstream.
+        if self.ptr_visible && self.cursor.is_some() {
+            self.last_clean = Some(rgba.clone());
+            self.last_dims = (w, h);
+            if let Some(cur) = &self.cursor {
+                composite_cursor(&mut rgba, w, h, cur, self.ptr_x, self.ptr_y);
+            }
+            self.last_cursor_emit = Instant::now();
+        } else {
+            self.last_clean = None;
+        }
         Ok(Some(RawFrame {
             rgba,
             width: w,
@@ -324,5 +445,123 @@ impl Duplication {
         let tex = tex.ok_or("CreateTexture2D returned no texture")?;
         self.staging = Some((tex.clone(), w, h));
         Ok(tex)
+    }
+}
+
+/// Draw the DXGI cursor bitmap into an RGBA desktop frame with its top-left at
+/// `(px, py)`, clipped to the frame. Covers the three
+/// `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`s (color / masked-color / monochrome); an
+/// unknown type is skipped. Fully bounds-checked, so a malformed shape can only
+/// draw less, never out of bounds.
+fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32, py: i32) {
+    let dw = dw as i32;
+    let dh = dh as i32;
+    let pitch = cur.pitch as usize;
+    match cur.kind {
+        // Color: 32bpp BGRA, straight alpha — the usual modern cursor.
+        2 => {
+            let (cw, ch) = (cur.width as i32, cur.height as i32);
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= dh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= dw {
+                        continue;
+                    }
+                    let s = cy as usize * pitch + cx as usize * 4;
+                    if s + 3 >= cur.buf.len() {
+                        continue;
+                    }
+                    let a = cur.buf[s + 3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let (b, g, r) = (
+                        cur.buf[s] as u32,
+                        cur.buf[s + 1] as u32,
+                        cur.buf[s + 2] as u32,
+                    );
+                    let d = (dy as usize * dw as usize + dx as usize) * 4;
+                    dst[d] = ((r * a + dst[d] as u32 * (255 - a)) / 255) as u8;
+                    dst[d + 1] = ((g * a + dst[d + 1] as u32 * (255 - a)) / 255) as u8;
+                    dst[d + 2] = ((b * a + dst[d + 2] as u32 * (255 - a)) / 255) as u8;
+                }
+            }
+        }
+        // Masked color: 32bpp BGRA where the alpha byte is a 1-bit mask —
+        // 0 = paint the RGB opaque, 0xFF = XOR the RGB onto the screen.
+        4 => {
+            let (cw, ch) = (cur.width as i32, cur.height as i32);
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= dh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= dw {
+                        continue;
+                    }
+                    let s = cy as usize * pitch + cx as usize * 4;
+                    if s + 3 >= cur.buf.len() {
+                        continue;
+                    }
+                    let (b, g, r, a) = (cur.buf[s], cur.buf[s + 1], cur.buf[s + 2], cur.buf[s + 3]);
+                    let d = (dy as usize * dw as usize + dx as usize) * 4;
+                    if a == 0 {
+                        dst[d] = r;
+                        dst[d + 1] = g;
+                        dst[d + 2] = b;
+                    } else {
+                        dst[d] ^= r;
+                        dst[d + 1] ^= g;
+                        dst[d + 2] ^= b;
+                    }
+                }
+            }
+        }
+        // Monochrome: two stacked 1bpp masks (AND over XOR); the real height is
+        // half `Height`. AND=0 -> opaque (XOR selects black/white); AND=1,XOR=1
+        // -> invert the screen; AND=1,XOR=0 -> transparent.
+        1 => {
+            let cw = cur.width as i32;
+            let ch = (cur.height / 2) as i32;
+            for cy in 0..ch {
+                let dy = py + cy;
+                if dy < 0 || dy >= dh {
+                    continue;
+                }
+                for cx in 0..cw {
+                    let dx = px + cx;
+                    if dx < 0 || dx >= dw {
+                        continue;
+                    }
+                    let byte = cx as usize / 8;
+                    let bit = 7 - (cx as usize % 8);
+                    let and_at = cy as usize * pitch + byte;
+                    let xor_at = (cy + ch) as usize * pitch + byte;
+                    if and_at >= cur.buf.len() || xor_at >= cur.buf.len() {
+                        continue;
+                    }
+                    let and_bit = (cur.buf[and_at] >> bit) & 1;
+                    let xor_bit = (cur.buf[xor_at] >> bit) & 1;
+                    let d = (dy as usize * dw as usize + dx as usize) * 4;
+                    if and_bit == 0 {
+                        let v = if xor_bit == 1 { 255 } else { 0 };
+                        dst[d] = v;
+                        dst[d + 1] = v;
+                        dst[d + 2] = v;
+                    } else if xor_bit == 1 {
+                        dst[d] = 255 - dst[d];
+                        dst[d + 1] = 255 - dst[d + 1];
+                        dst[d + 2] = 255 - dst[d + 2];
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }

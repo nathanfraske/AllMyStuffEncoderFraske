@@ -132,6 +132,13 @@
   // window's keyboard reaches the remote (window-level setFocus alone doesn't
   // push document focus into the webview on hover).
   let stageEl = $state<HTMLElement | null>(null);
+  // A thin aiming crosshair at the position we're COMMANDING (`virt`) — drawn
+  // instantly, with none of the video's latency, so you can line things up
+  // precisely instead of guessing where the cursor will land. It complements
+  // the real remote cursor in the video (which shows where the cursor actually
+  // is, a beat behind), rather than replacing it. Positioned imperatively (see
+  // updateCrosshair) since `virt` isn't reactive state.
+  let crosshairEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
@@ -306,13 +313,20 @@
   // ---- the control bar ------------------------------------------------
   //
   // One floating toolbar carries the whole session (the KVM-console
-  // pattern): icon buttons for the toggles, and three menus — session
-  // (who/status/handles/End), screens (the input picker), video
-  // (quality/zoom). One menu open at a time; a press anywhere else closes
-  // it. The bar stands VERTICALLY on the right edge — under the thumb on
-  // a phone, clear of the top edge's system gestures — slides up and down
-  // by its grip, and hides/returns ONLY by its handle tab (no auto-hide
-  // in any mode: chrome that disappears on its own is chrome you chase).
+  // pattern), in two orientations for two worlds:
+  //
+  // - DESKTOP: a horizontal bar across the top, with every monitor and
+  //   camera as its own icon button (hover for the name; the active one
+  //   filled, a popped-out one hollow) plus a pop-out button for the
+  //   current screen — the mouse-and-hover world the old tab bar served.
+  // - PHONE: a vertical rail on the right edge — thumbable, clear of the
+  //   top edge's system gestures — with the inputs folded into a Screens
+  //   menu instead of a button row.
+  //
+  // Both slide along their edge by the grip, and hide/return ONLY by the
+  // handle tab on their outer side (no auto-hide in any mode: chrome that
+  // disappears on its own is chrome you chase). One menu open at a time;
+  // a press anywhere else closes it.
   let consoleEl = $state<HTMLElement | null>(null);
   let barWrapEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
@@ -330,6 +344,9 @@
   // button only earns bar space where a finger might need it.
   const touchDevice = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
   const mobileShell = isMobile();
+  // The rail orientation: vertical on the phone shell, horizontal on top
+  // everywhere else.
+  const vertical = mobileShell;
 
   function toggleMenu(m: MenuKind) {
     openMenu = openMenu === m ? null : m;
@@ -346,9 +363,10 @@
     openMenu = null;
   }
 
-  // Keep the open menu on-screen: it opens to the LEFT of the bar,
-  // vertically centered on it — a bar slid toward the top or bottom
-  // would carry the menu past the pane edge, so measure and shift back.
+  // Keep the open menu on-screen: it opens off the bar's inner side
+  // (below a top bar, left of the right rail), centered on it — a bar
+  // slid toward an edge would carry the menu past the pane, so measure
+  // and shift back along the bar's axis.
   let menuShift = $state(0);
   $effect(() => {
     void openSub;
@@ -364,12 +382,18 @@
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
       const pad = 8;
-      if (r.top < pad) menuShift = pad - r.top;
-      else if (r.bottom > window.innerHeight - pad) menuShift = window.innerHeight - pad - r.bottom;
+      if (vertical) {
+        if (r.top < pad) menuShift = pad - r.top;
+        else if (r.bottom > window.innerHeight - pad)
+          menuShift = window.innerHeight - pad - r.bottom;
+      } else {
+        if (r.left < pad) menuShift = pad - r.left;
+        else if (r.right > window.innerWidth - pad) menuShift = window.innerWidth - pad - r.right;
+      }
     });
   });
 
-  // ---- bar drag (the grip — vertical, along the right edge) ----
+  // ---- bar drag (the grip — along the bar's own edge) ----
   let barPos = $state(0); // offset from the bar's centered resting spot
   // A dragged bar must survive the pane shrinking (window resize, phone
   // rotation) — re-clamp it into the new bounds instead of stranding it
@@ -378,7 +402,9 @@
     const c = consoleEl?.getBoundingClientRect();
     const b = barWrapEl?.getBoundingClientRect();
     if (!c || !b) return 0;
-    return Math.max(0, (c.height - b.height) / 2 - 8);
+    return vertical
+      ? Math.max(0, (c.height - b.height) / 2 - 8)
+      : Math.max(0, (c.width - b.width) / 2 - 8);
   }
   function clampBarPos() {
     if (barPos === 0) return;
@@ -389,14 +415,15 @@
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const grip = e.currentTarget as HTMLElement;
     const span = barSpan();
-    const sy = e.clientY - barPos;
+    const coord = (ev: PointerEvent) => (vertical ? ev.clientY : ev.clientX);
+    const s0 = coord(e) - barPos;
     try {
       grip.setPointerCapture(e.pointerId);
     } catch {
       // synthetic pointer — capture is best-effort
     }
     const move = (ev: PointerEvent) => {
-      barPos = Math.min(span, Math.max(-span, ev.clientY - sy));
+      barPos = Math.min(span, Math.max(-span, coord(ev) - s0));
     };
     const up = () => {
       grip.removeEventListener("pointermove", move);
@@ -411,8 +438,8 @@
   // ---- bar hide/show (manual only) ----
   //
   // The handle tab on the bar's outer edge is the ONE way the bar leaves
-  // or returns, in every mode — it slides off past the right edge and the
-  // tab stays put. No idle timer: chrome that disappears on its own is
+  // or returns, in every mode — it slides off past its edge and the tab
+  // stays put. No idle timer: chrome that disappears on its own is
   // chrome you have to chase.
   let barHidden = $state(false);
   function toggleBar() {
@@ -427,6 +454,13 @@
   // the way in; control dropping (refused route, remote revoked) takes
   // the strip down with it.
   let keysOpen = $state(false);
+  // How many CSS px the OS keyboard (or any bottom overlay) is covering —
+  // `window.innerHeight - visualViewport.height - offsetTop`, the same
+  // measure ConsoleKeys uses to float its strip. Zero on desktop (the
+  // visual viewport equals the layout viewport). Drives the stage's bottom
+  // inset so the video recenters into the space ABOVE the keyboard instead
+  // of hiding behind it. Tracked in onMount.
+  let kbInset = $state(0);
   function toggleKeys() {
     if (!keysOpen && !app.consoleControl) toggleControl();
     keysOpen = !keysOpen;
@@ -472,12 +506,22 @@
     const scale = Math.min(8, Math.max(1, t.scale));
     const c = canvasEl;
     const s = stageEl;
-    if (!c || !s || scale === 1) return { scale, x: 0, y: 0 };
+    // At 1× with no keyboard there is nothing to pan; otherwise fall through so
+    // the keyboard's upward shift is allowed even un-zoomed.
+    if (!c || !s || (scale === 1 && kbInset <= 0)) return { scale, x: 0, y: 0 };
     // offsetWidth/Height are the LAYOUT box — unaffected by the current
     // transform, which is exactly what the clamp must scale from.
     const mx = Math.max(0, (c.offsetWidth * scale - s.clientWidth) / 2);
     const my = Math.max(0, (c.offsetHeight * scale - s.clientHeight) / 2);
-    return { scale, x: Math.min(mx, Math.max(-mx, t.x)), y: Math.min(my, Math.max(-my, t.y)) };
+    // The soft keyboard covers the bottom `kbInset` px; showing background
+    // there is invisible, so the picture may shift UP that much further to lift
+    // a text field above the keys. Only the upward (negative-y) room grows.
+    const yLo = -(my + Math.max(0, kbInset));
+    return {
+      scale,
+      x: Math.min(mx, Math.max(-mx, t.x)),
+      y: Math.min(my, Math.max(yLo, t.y)),
+    };
   }
   function setView(t: ViewTransform) {
     view = clampView(t);
@@ -557,10 +601,9 @@
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
       if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
-      // Auto aspect: measure the frame's active region (letterbox bars) until
-      // it locks, so the mouse maps over the desktop of a non-16:9 source. A
-      // manual Aspect pick owns the region instead (see the $effect).
-      if (stagePointerActive && aspectChoice === "auto") detectActiveRegion();
+      // (Letterbox auto-detect no longer runs here — it samples the decoded
+      // frame from the paint path via maybeDetect(), so it never reads the
+      // live canvas and can't trigger Chromium's CPU-raster demotion.)
       // Every other tick, report our decode health back to the streamer so
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
@@ -575,9 +618,26 @@
       // close is held until they're on the wire (see onThisWindowClose).
       void onThisWindowClose(() => void endSession()).then((u) => (unlistenClose = u));
     }
+    // Track the keyboard's bite out of the viewport so the stage can
+    // recenter the video above it. `resize` fires when the OS keyboard
+    // shows/hides; `scroll` covers iOS shifting the visual viewport while
+    // it's up. No-op on desktop (vv.height === innerHeight → 0).
+    const vv = window.visualViewport;
+    const onViewport = () => {
+      kbInset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+    };
+    if (vv) {
+      vv.addEventListener("resize", onViewport);
+      vv.addEventListener("scroll", onViewport);
+      onViewport();
+    }
     return () => {
       unlistenClose?.();
       clearInterval(fpsTimer);
+      if (vv) {
+        vv.removeEventListener("resize", onViewport);
+        vv.removeEventListener("scroll", onViewport);
+      }
     };
   });
 
@@ -717,6 +777,9 @@
           paint(frame.displayWidth, frame.displayHeight, (ctx) =>
             ctx.drawImage(frame, 0, 0),
           );
+          // Letterbox detection samples this frame directly (never the live
+          // canvas). VideoFrame is a valid drawImage source.
+          maybeDetect(frame);
         }
       } finally {
         frame.close();
@@ -787,6 +850,7 @@
           try {
             const bmp = await createImageBitmap(blob);
             paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            maybeDetect(bmp); // sample this bitmap, not the live canvas
             bmp.close();
           } catch {
             // A torn frame decodes as nothing; the next one stands alone.
@@ -803,7 +867,16 @@
         paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
         return;
       }
-      // H.264 — decode entry is a key unit; deltas before one wait.
+      // H.264 — decode entry is a key unit; deltas before one wait. Every
+      // access unit is fed straight to the decoder; the freshest decoded
+      // frame wins at paint time (output callback below supersedes any
+      // earlier pending frame, one rAF blits the newest). No compressed-queue
+      // valve here: a hardware decoder keeps up with 4K60 natively, and the
+      // one that tried to bound the queue by force-dropping to keyframes
+      // thrashed a normally-pipelined decoder down to ~15 fps (and could trip
+      // the software-decode fallback). If a decoder genuinely can't keep up,
+      // the stall ladder below steps it down, and the sender's auto-adapt
+      // drops resolution — neither needs per-frame keyframe forcing.
       inCount += 1;
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
@@ -973,23 +1046,54 @@
   // stops sampling. Reset (unlock) on a stream re-wire.
   let detectLocked = false;
   let detectPrev: { x0: number; x1: number; y0: number; y1: number } | null = null;
+  // The detector's CPU-side scratch surface (see detectActiveRegion for why
+  // the live canvas must never be read directly). Small on purpose: one
+  // ~500 KB readback per pass instead of twelve full-width strips of 4K.
+  const DETECT_W = 480;
+  const DETECT_H = 270;
+  let detectScratch: HTMLCanvasElement | null = null;
+  // Throttle for the frame-sourced detector below (~1 Hz, the old health-tick
+  // cadence) since it now runs from the paint path, which fires per frame.
+  let lastDetectAt = 0;
 
-  // Measure the frame's active region: sample the decoded canvas for symmetric
-  // black letterbox/pillarbox bars. Cheap (a dozen 1px strips), and it stops
-  // once locked. Conservative: only crops when clear bars sit on BOTH opposite
-  // edges and are near-symmetric (a real letterbox), so ordinary dark content is
-  // never mistaken for a bar; otherwise it maps over the whole frame.
-  function detectActiveRegion() {
+  // A decoded frame just painted — maybe measure its letterbox. Runs from the
+  // paint path (not a canvas read) so the detector NEVER touches the live
+  // presentation canvas: Chromium permanently demotes an accelerated 2D
+  // canvas to CPU raster after just two getImageData readbacks when it wasn't
+  // created willReadFrequently (and ours can't be — paint() fixed its context
+  // to plain-GPU on the first frame). A demoted 4K canvas turns every
+  // subsequent drawImage of a hardware-decoded frame into a ~33 MB GPU→CPU
+  // copy — the exact "video is choppy and ~100 ms behind while the mouse is
+  // instant" regression. Sampling the frame we were handed sidesteps the
+  // canvas entirely. `src` is the VideoFrame / ImageBitmap that was painted.
+  function maybeDetect(src: CanvasImageSource) {
+    if (detectLocked || aspectChoice !== "auto" || !stagePointerActive) return;
+    const now = performance.now();
+    if (now - lastDetectAt < 1000) return;
+    lastDetectAt = now;
+    detectActiveRegion(src);
+  }
+
+  // Measure the frame's active region: mirror the decoded FRAME into the small
+  // CPU-side scratch surface (created once, willReadFrequently from birth) and
+  // scan that one downscaled readback for symmetric black letterbox/pillarbox
+  // bars. The live presentation canvas is never read or drawn-from, so it stays
+  // GPU-accelerated for the whole session. Conservative: only crops when clear
+  // bars sit on BOTH opposite edges and are near-symmetric (a real letterbox),
+  // so ordinary dark content is never mistaken for a bar; otherwise it maps
+  // over the whole frame.
+  function detectActiveRegion(src: CanvasImageSource) {
     if (detectLocked) return;
-    const c = canvasEl;
-    if (!c || !c.width || !c.height || !hasFrame) return;
-    const ctx = c.getContext("2d", { willReadFrequently: true });
+    if (!detectScratch) {
+      detectScratch = document.createElement("canvas");
+      detectScratch.width = DETECT_W;
+      detectScratch.height = DETECT_H;
+    }
+    const ctx = detectScratch.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
-    const w = c.width;
-    const h = c.height;
+    const w = DETECT_W;
+    const h = DETECT_H;
     const DARK = 24;
-    const bright = (d: Uint8ClampedArray, px: number) =>
-      d[px * 4] > DARK || d[px * 4 + 1] > DARK || d[px * 4 + 2] > DARK;
     const median = (a: number[]) => a.slice().sort((p, q) => p - q)[a.length >> 1];
 
     let x0 = 0;
@@ -998,15 +1102,20 @@
     let y1 = h;
     let found = false; // did the frame carry real (non-black) content this pass?
     try {
+      ctx.drawImage(src, 0, 0, w, h);
+      const data = ctx.getImageData(0, 0, w, h).data;
+      const bright = (x: number, y: number) => {
+        const px = (y * w + x) * 4;
+        return data[px] > DARK || data[px + 1] > DARK || data[px + 2] > DARK;
+      };
       const L: number[] = [];
       const R: number[] = [];
       for (let k = 1; k <= 6; k++) {
         const y = Math.floor((h * k) / 7);
-        const row = ctx.getImageData(0, y, w, 1).data;
         let l = 0;
-        while (l < w && !bright(row, l)) l++;
+        while (l < w && !bright(l, y)) l++;
         let rr = w - 1;
-        while (rr > l && !bright(row, rr)) rr--;
+        while (rr > l && !bright(rr, y)) rr--;
         if (l < rr) {
           L.push(l);
           R.push(rr);
@@ -1016,11 +1125,10 @@
       const B: number[] = [];
       for (let k = 1; k <= 6; k++) {
         const x = Math.floor((w * k) / 7);
-        const col = ctx.getImageData(x, 0, 1, h).data;
         let t = 0;
-        while (t < h && !bright(col, t)) t++;
+        while (t < h && !bright(x, t)) t++;
         let b = h - 1;
-        while (b > t && !bright(col, b)) b--;
+        while (b > t && !bright(x, b)) b--;
         if (t < b) {
           T.push(t);
           B.push(b);
@@ -1141,29 +1249,74 @@
   function sendVirt() {
     app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
   }
-  // The TeamViewer camera: zoomed in, the viewport follows the cursor —
-  // steer it toward the edge of what's visible and the picture pans to
-  // keep it inside a comfortable margin. The whole desktop is reachable
-  // with one thumb, no pan gesture needed.
+  // The TeamViewer camera: zoomed in, the view keeps the remote cursor
+  // CENTERED. Every steer pans the picture so the cursor slides back to the
+  // middle of the stage — from the first pixel of a drag, so the picture
+  // tracks the cursor directly instead of waiting for it to reach a
+  // screen-edge margin. `setView`'s clamp stops the pan at the content
+  // edges; there the picture can't scroll any further, so the cursor rides
+  // off-center into that edge/corner on its own — "centered as much as it
+  // can, until you reach the edges". The whole desktop stays reachable with
+  // one thumb.
   function followCursor() {
-    if (view.scale <= 1.001) return;
+    // Runs when zoomed, and also at 1× while the keyboard is up (there the
+    // clamp permits a vertical shift to lift the cursor above the keys).
+    if (view.scale <= 1.001 && kbInset <= 0) return;
     const c = canvasEl;
     const s = stageEl;
     if (!c || !s || !hasFrame) return;
     const r = c.getBoundingClientRect();
     const box = s.getBoundingClientRect();
     const ar = activeRegion;
+    // Where the cursor sits on screen right now (through the active region
+    // and the current zoom), and where the stage centre is.
     const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
     const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
-    const m = Math.min(56, box.width / 5, box.height / 5);
-    let dx = 0;
-    let dy = 0;
-    if (px < box.left + m) dx = box.left + m - px;
-    else if (px > box.right - m) dx = box.right - m - px;
-    if (py < box.top + m) dy = box.top + m - py;
-    else if (py > box.bottom - m) dy = box.bottom - m - py;
-    if (dx || dy) setView({ scale: view.scale, x: view.x + dx, y: view.y + dy });
+    // Centre of the VISIBLE area: when the soft keyboard has eaten the bottom
+    // `kbInset` px, the middle of what the user can still see sits that much
+    // higher — so a cursor centred here stays above the keyboard where they're
+    // typing, without reframing or dropping the zoom.
+    const cx = box.left + box.width / 2;
+    const cy = box.top + (box.height - kbInset) / 2;
+    setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
+  // Pin the aiming crosshair to the commanded position. Same client-space math
+  // as followCursor (getBoundingClientRect reflects the zoom transform), made
+  // relative to the stage so a windowed console's own transform can't offset
+  // it. `virt` isn't reactive, so callers invoke this wherever the cursor
+  // moves; the $effect below re-runs it on reactive view/region/frame changes.
+  function updateCrosshair() {
+    const el = crosshairEl;
+    const c = canvasEl;
+    const s = stageEl;
+    if (!el || !c || !s || !hasFrame) return;
+    const r = c.getBoundingClientRect();
+    const sb = s.getBoundingClientRect();
+    const ar = activeRegion;
+    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
+    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    el.style.transform = `translate(${x}px, ${y}px)`;
+  }
+  $effect(() => {
+    void view;
+    void activeRegion;
+    void hasFrame;
+    void stagePointerActive;
+    void frameW;
+    void frameH;
+    void kbInset;
+    updateCrosshair();
+  });
+  // The soft keyboard opening (or closing) recentres the cursor into the space
+  // that's left, keeping the current zoom — so the field being typed into is
+  // visible above the keys instead of behind them.
+  $effect(() => {
+    void kbInset;
+    untrack(() => {
+      followCursor(); // lift the cursor into the visible area (no-op at 1×/no-kb)
+      setView(view); // re-clamp — closing the keyboard removes the extra pan room
+    });
+  });
   const touchMouse = makeTouchMouse({
     active: () => stagePointerActive,
     moveBy: (dx, dy) => {
@@ -1185,6 +1338,7 @@
         sendVirt();
       }
       followCursor();
+      updateCrosshair();
     },
     button: (button, down) => {
       if (down) {
@@ -1244,6 +1398,7 @@
     // An absolute mouse move re-seats the trackpad's virtual cursor too.
     virt.x = p.x;
     virt.y = p.y;
+    updateCrosshair();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
   }
 
@@ -1320,6 +1475,7 @@
     // Land the cursor exactly where the click happened, then click.
     virt.x = p.x;
     virt.y = p.y;
+    updateCrosshair();
     app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
     app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
     if (down) heldButtons.add(e.button);
@@ -1568,6 +1724,21 @@
               )}"
             ></canvas>
           {/if}
+          {#if hasFrame && stagePointerActive}
+            <!-- Thin aiming crosshair at the commanded position (crosshairEl):
+                 where the cursor SHOULD be, drawn with no video latency so you
+                 can line things up precisely. -->
+            <div class="crosshair" bind:this={crosshairEl} aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24">
+                <g stroke="#fff" stroke-width="1" shape-rendering="crispEdges">
+                  <line x1="12" y1="1.5" x2="12" y2="9" />
+                  <line x1="12" y1="15" x2="12" y2="22.5" />
+                  <line x1="1.5" y1="12" x2="9" y2="12" />
+                  <line x1="15" y1="12" x2="22.5" y2="12" />
+                </g>
+              </svg>
+            </div>
+          {/if}
           {#if hasFrame}
             <!-- the canvas above is the stage; a host-reported stall (the
                  remote display sleeping mid-session) banners over it. -->
@@ -1625,15 +1796,20 @@
         {/if}
       </div>
 
-      <!-- The control bar — vertical, on the right edge. The handle tab
-           on its outer side is the one and only hide/show control; the
-           tab never moves, the bar slides out past the edge behind it. -->
+      <!-- The control bar — a horizontal bar across the top on desktop, a
+           vertical rail on the right on the phone. The handle tab on its
+           outer side is the one and only hide/show control; the tab never
+           moves, the bar slides out past its edge behind it. -->
       <div
         bind:this={barWrapEl}
         class="bar-anchor"
+        class:v={vertical}
+        class:h={!vertical}
         role="group"
         aria-label="Console control bar"
-        style:transform={`translateY(calc(-50% + ${barPos}px))`}
+        style:transform={vertical
+          ? `translateY(calc(-50% + ${barPos}px))`
+          : `translateX(calc(-50% + ${barPos}px))`}
         onpointerdowncapture={(e) => {
           // With the soft keyboard up, bar taps must not steal focus from
           // its hidden input (a blur drops the OS keyboard mid-word) —
@@ -1643,9 +1819,10 @@
       >
         <button
           class="bar-tab"
+          class:hidden={barHidden}
           title={barHidden ? "Show controls" : "Hide controls"}
           aria-label={barHidden ? "Show console controls" : "Hide console controls"}
-          onclick={toggleBar}>{barHidden ? "‹" : "›"}</button
+          onclick={toggleBar}>{vertical ? (barHidden ? "‹" : "›") : barHidden ? "▾" : "▴"}</button
         >
         <div class="kvmbar" class:asleep={barHidden} role="toolbar" aria-label="Console controls">
           <!-- svelte-ignore a11y_consider_explicit_label -->
@@ -1660,15 +1837,49 @@
           >
             🖥<span class="presence" class:on={node.online}></span>
           </button>
-          <button
-            class="kbtn"
-            class:open={openMenu === "screens"}
-            title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
-            aria-label="Screens and cameras menu"
-            onclick={() => toggleMenu("screens")}
-          >
-            {selected ? inputIcon(selected) : "🪟"}
-          </button>
+          {#if vertical}
+            <!-- The phone folds the inputs into a menu… -->
+            <button
+              class="kbtn"
+              class:open={openMenu === "screens"}
+              title="Screens & cameras{selected ? ` — ${selected.label}` : ''}"
+              aria-label="Screens and cameras menu"
+              onclick={() => toggleMenu("screens")}
+            >
+              {selected ? inputIcon(selected) : "🪟"}
+            </button>
+          {:else}
+            <!-- …the desktop wears them on the bar: one icon per monitor
+                 and camera (hover for its name), the active one filled, a
+                 popped-out one hollow (click brings its video home), and
+                 a pop-out button for the screen being viewed. -->
+            <span class="vsep"></span>
+            {#each inputs as inp (inp.id)}
+              {@const inpPopped = app.isVideoPopped(`cap:${inp.id}`)}
+              <!-- A popped-out input still SELECTS on click — the stage
+                   then shows its "in its own window" card with the
+                   Return-video-here button, the deliberate way home. -->
+              <button
+                class="kbtn input"
+                class:active={inp.id === selectedId && !inpPopped}
+                class:hollow={inpPopped}
+                title={inpPopped ? `${inp.label} — in its own window` : inp.label}
+                aria-label={inp.label}
+                onclick={() => app.setConsoleInput(inp.id)}
+              >
+                {inputIcon(inp)}
+                {#if inp.default}<span class="kdef" title="Default input">★</span>{/if}
+              </button>
+            {/each}
+            {#if isTauri() && selected && !selectedPopped}
+              <button
+                class="kbtn"
+                title="Pop {selected.label} out into its own window"
+                aria-label="Pop {selected.label} out into its own window"
+                onclick={() => selectedId && void app.popOutConsoleInput(selectedId)}>⧉</button
+              >
+            {/if}
+          {/if}
           <span class="vsep"></span>
           {#if access.control}
             <button
@@ -1760,7 +1971,9 @@
           <div
             bind:this={menuEl}
             class="kvmenu"
-            style:transform={`translateY(calc(-50% + ${menuShift}px))`}
+            style:transform={vertical
+              ? `translateY(calc(-50% + ${menuShift}px))`
+              : `translateX(calc(-50% + ${menuShift}px))`}
             role="menu"
           >
             {#if openMenu === "session"}
@@ -2103,6 +2316,28 @@
     visibility: hidden;
     position: absolute;
   }
+  /* The aiming crosshair. Absolutely placed within the stage (never
+     position:fixed — a windowed console's own transform would reparent that),
+     centred on the aim point and moved by a transform set imperatively. Thin
+     white lines with a dark halo so they read on any wallpaper; a small centre
+     gap keeps the exact target pixel visible. */
+  .crosshair {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 24px;
+    height: 24px;
+    margin-left: -12px;
+    margin-top: -12px;
+    pointer-events: none;
+    z-index: 8; /* over the video + host-status, under the zoom chip / bar */
+    will-change: transform;
+  }
+  .crosshair svg {
+    display: block;
+    filter: drop-shadow(0 0 0.6px rgba(0, 0, 0, 0.9));
+    opacity: 0.85;
+  }
   .screen {
     width: calc(100% - 1.6rem);
     height: calc(100% - 1.6rem);
@@ -2173,8 +2408,7 @@
     left: 0.7rem;
     bottom: calc(0.7rem + env(safe-area-inset-bottom, 0px));
     border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(4px);
+    background: rgba(8, 8, 14, 0.85);
     color: #fff;
     border-radius: var(--r-pill);
     padding: 0.28rem 0.6rem;
@@ -2186,29 +2420,34 @@
     background: rgba(0, 0, 0, 0.8);
   }
 
-  /* ---- the control bar — a vertical rail on the right edge ---- */
+  /* ---- the control bar — horizontal on top (desktop), a vertical
+     rail on the right (phone) ---- */
   .bar-anchor {
     position: absolute;
-    top: 50%;
-    right: calc(0.5rem + env(safe-area-inset-right, 0px));
     z-index: 10;
+  }
+  /* Hugging the screen edge — the bar is a tray in the bezel, spending
+     the least picture real estate a bar can. */
+  .bar-anchor.h {
+    top: env(safe-area-inset-top, 0px);
+    left: 50%;
+    width: max-content;
+  }
+  .bar-anchor.v {
+    top: 50%;
+    right: env(safe-area-inset-right, 0px);
   }
   .kvmbar {
     display: flex;
-    flex-direction: column;
     align-items: center;
     gap: 2px;
-    width: 2.7rem;
-    /* Never taller than the pane — a landscape phone scrolls the rail
-       instead of clipping its ends. */
-    max-height: calc(100vh - 1.2rem);
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 0.15rem 0 0.4rem;
     border-radius: 12px;
     border: 1px solid oklch(0.3 0.035 285 / 0.8);
-    background: oklch(0.19 0.028 285 / 0.86);
-    backdrop-filter: blur(10px);
+    /* Near-opaque paint, NO backdrop-filter: the bar floats over a
+       canvas repainting at stream rate, and a blur here makes the
+       compositor re-blur that region every video frame — measured as a
+       real desktop cost. Opaque-ish paint composites once. */
+    background: oklch(0.19 0.028 285 / 0.96);
     box-shadow: var(--shadow-md);
     transition: transform 0.3s ease, opacity 0.3s ease;
     scrollbar-width: none;
@@ -2216,9 +2455,40 @@
   .kvmbar::-webkit-scrollbar {
     display: none;
   }
-  /* Hidden: slid out past the right edge (safe-area included), leaving
-     only the handle tab. */
-  .kvmbar.asleep {
+  .bar-anchor.h .kvmbar {
+    flex-direction: row;
+    height: 2.7rem;
+    padding: 0 0.4rem 0 0.15rem;
+    /* Many monitors on a narrow window: the bar scrolls sideways rather
+       than growing past the pane. */
+    max-width: calc(100vw - 2rem);
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* Flush against the top edge: square where it meets the bezel. */
+    border-top: none;
+    border-radius: 0 0 12px 12px;
+  }
+  .bar-anchor.v .kvmbar {
+    flex-direction: column;
+    width: 2.7rem;
+    /* Never taller than the pane — a landscape phone scrolls the rail
+       instead of clipping its ends. */
+    max-height: calc(100vh - 1.2rem);
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.15rem 0 0.4rem;
+    /* Flush against the right edge. */
+    border-right: none;
+    border-radius: 12px 0 0 12px;
+  }
+  /* Hidden: slid out past the bar's own edge (safe-area included),
+     leaving only the handle tab. */
+  .bar-anchor.h .kvmbar.asleep {
+    transform: translateY(calc(-100% - 1.5rem - env(safe-area-inset-top, 0px)));
+    opacity: 0;
+    pointer-events: none;
+  }
+  .bar-anchor.v .kvmbar.asleep {
     transform: translateX(calc(100% + 1.5rem + env(safe-area-inset-right, 0px)));
     opacity: 0;
     pointer-events: none;
@@ -2227,21 +2497,43 @@
      anchor so it never travels with the sliding bar. */
   .bar-tab {
     position: absolute;
+    border: 1px solid oklch(0.3 0.035 285 / 0.8);
+    /* Same rule as the bar: no per-frame compositor blur over live video. */
+    background: oklch(0.19 0.028 285 / 0.92);
+    color: #9a93b8;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+  }
+  .bar-anchor.h .bar-tab {
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 3px;
+    width: 3.4rem;
+    height: 1.15rem;
+    border-radius: 0 0 8px 8px;
+    transition: transform 0.3s ease, background 0.12s ease;
+  }
+  .bar-anchor.v .bar-tab {
     right: 100%;
     top: 50%;
     transform: translateY(-50%);
     margin-right: 3px;
     width: 1.15rem;
     height: 3.4rem;
-    border: 1px solid oklch(0.3 0.035 285 / 0.8);
     border-radius: 8px 0 0 8px;
-    background: oklch(0.19 0.028 285 / 0.8);
-    backdrop-filter: blur(10px);
-    color: #9a93b8;
-    font-size: 0.85rem;
-    line-height: 1;
-    padding: 0;
-    cursor: pointer;
+    transition: transform 0.3s ease, background 0.12s ease;
+  }
+  /* Hidden: the tab rides along to hug the screen edge the bar left
+     through — not float mid-air where the bar used to be. The offsets
+     retrace the bar's thickness + the tab's own margin. */
+  .bar-anchor.h .bar-tab.hidden {
+    transform: translateX(-50%) translateY(calc(-2.7rem - 3px - env(safe-area-inset-top, 0px)));
+  }
+  .bar-anchor.v .bar-tab.hidden {
+    transform: translateY(-50%) translateX(calc(2.7rem + 3px + env(safe-area-inset-right, 0px)));
   }
   .bar-tab:hover {
     color: #fff;
@@ -2263,11 +2555,39 @@
     color: #9a93b8;
   }
   .vsep {
+    background: oklch(0.3 0.035 285 / 0.7);
+    flex-shrink: 0;
+  }
+  .bar-anchor.h .vsep {
+    width: 1px;
+    height: 1.3rem;
+    margin: 0 0.2rem;
+  }
+  .bar-anchor.v .vsep {
     width: 1.3rem;
     height: 1px;
-    background: oklch(0.3 0.035 285 / 0.7);
     margin: 0.2rem 0;
+  }
+  /* Desktop input buttons: the active source filled like the old tabs;
+     a popped-out one hollow — an outline where its picture used to be. */
+  .kbtn.input {
     flex-shrink: 0;
+  }
+  .kbtn.input.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .kbtn.input.hollow {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--accent);
+    opacity: 0.8;
+  }
+  .kdef {
+    position: absolute;
+    top: 0;
+    right: 1px;
+    font-size: 0.5rem;
+    color: var(--warn);
   }
   .kbtn {
     position: relative;
@@ -2329,11 +2649,17 @@
   .presence.on {
     background: var(--ok);
   }
-  /* ---- the menu — opens to the LEFT of the rail ---- */
-  .kvmenu {
-    position: absolute;
+  /* ---- the menu — below the top bar, or left of the right rail ---- */
+  .bar-anchor.h .kvmenu {
+    top: calc(100% + 8px);
+    left: 50%;
+  }
+  .bar-anchor.v .kvmenu {
     right: calc(100% + 1.5rem);
     top: 50%;
+  }
+  .kvmenu {
+    position: absolute;
     width: max-content;
     min-width: 15rem;
     max-width: min(22rem, calc(100vw - 5.5rem - env(safe-area-inset-right, 0px)));
@@ -2342,8 +2668,7 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
-    background: oklch(0.18 0.027 285 / 0.96);
-    backdrop-filter: blur(12px);
+    background: oklch(0.18 0.027 285 / 0.98);
     border: 1px solid #322c47;
     border-radius: var(--r-md);
     box-shadow: var(--shadow-lg);
