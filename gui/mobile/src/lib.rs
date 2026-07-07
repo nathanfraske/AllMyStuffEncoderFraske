@@ -26,9 +26,15 @@
 use allmystuff_mobile_core::prelude::*;
 use serde_json::{json, Value};
 
+// The real in-process mesh node (LAN discovery, presence → graph). Behind the
+// default `mesh` feature so the NDK-free android CI check can build the shell
+// with `--no-default-features` (the engine's C deps need the NDK on device).
+#[cfg(feature = "mesh")]
+mod mesh;
+
 /// A friendly host-OS string for the node card — "Android", "iOS", or the
 /// raw target name on a desktop smoke-test build.
-fn os_label() -> &'static str {
+pub(crate) fn os_label() -> &'static str {
     match std::env::consts::OS {
         "android" => "Android",
         "ios" => "iOS",
@@ -39,7 +45,7 @@ fn os_label() -> &'static str {
 /// Seconds since the Unix epoch — the phone's per-run boot id. A peer that
 /// sees a new value knows the phone restarted, the same event-driven gossip
 /// the desktop uses.
-fn boot_id() -> u64 {
+pub(crate) fn boot_id() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -92,9 +98,37 @@ fn client_log(line: String) {
 /// build `main.rs` calls it directly.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![scan_self, client_log])
+    let builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
+
+    // With the mesh engine: manage its state, auto-join the LAN mesh on a
+    // background thread (so the UI comes up immediately), and answer the
+    // discovery/graph commands from the live node.
+    #[cfg(feature = "mesh")]
+    let builder = builder
+        .manage(mesh::MeshState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(e) = mesh::join(&handle) {
+                    eprintln!("[mesh] join failed: {e}");
+                }
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            scan_self,
+            client_log,
+            mesh::session_snapshot,
+            mesh::mesh_networks,
+            mesh::mesh_peers,
+            mesh::mesh_roster_list,
+        ]);
+
+    // Without it (the NDK-free CI check): just the demo-capable shell commands.
+    #[cfg(not(feature = "mesh"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![scan_self, client_log]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running the AllMyStuff mobile app");
 }

@@ -34,6 +34,15 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# `mesh` (on by default) links the embedded `myownmesh-core` engine so the app
+# is a real mesh peer. It's a feature so the `gui-mobile` CI job can build the
+# shell `--no-default-features` and keep type-checking for android without the
+# NDK — the engine pulls `ring` (a C build) which the NDK-free CI can't compile.
+# On-device builds (`tauri ios/android`) use the default, so they get the mesh.
+default = ["mesh"]
+mesh = ["dep:allmystuff-mesh", "dep:getrandom"]
+
 [dependencies]
 # No `tray-icon` / `autostart` / `single-instance` here — those are desktop
 # concerns with no mobile story. `shell` stays for opening external links.
@@ -46,6 +55,11 @@ serde_json = "1"
 # The phone's transport-agnostic brain: its capability model and the
 # client-side media planes. Pure Rust, no native deps — it gives us a real
 # phone `NodeProfile` (identity + viewer/controller capabilities) to put on
-# the graph today, and the `MeshClient` seam the embedded engine fills in
-# next. Pulled by path; it inherits its versions from the main workspace.
+# the graph today, and the `MeshClient` seam the embedded engine fills in.
 allmystuff-mobile-core = { path = "../../crates/allmystuff-mobile-core" }
+
+# The embedded engine adapter (behind `mesh`): backs the MeshClient seam with an
+# in-process myownmesh-core, so the phone joins the LAN mesh and discovers peers.
+allmystuff-mesh = { path = "../mobile-mesh", optional = true }
+# OS randomness for minting the device seed on first run (behind `mesh`).
+getrandom = { version = "0.2", optional = true }
