@@ -8,3 +8,7 @@
 
 # This package only carries the Tauri CLI; deps install on demand.
 /node_modules
+
+# Desktop-set byproduct of the `tauri icon` stamp in patch-xcode-project.sh;
+# only the gen/apple asset catalog it also writes is what the build uses.
+/icons

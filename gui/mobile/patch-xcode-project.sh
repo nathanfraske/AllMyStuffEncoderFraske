@@ -18,11 +18,15 @@ fi
 echo "user-script sandboxing off ($(grep -c 'ENABLE_USER_SCRIPT_SANDBOXING = NO' "$PBX") setting block(s))"
 
 # Stamp the brand mark into the generated asset catalog — init fills it
-# with the default Tauri icon. `tauri icon` regenerates every iOS slot
-# (and the desktop set, byte-identical) from the 512x512 source.
+# with the default Tauri icon. The source is the FULL-BLEED iOS variant
+# (icon-ios.png): iOS masks its own superellipse, so the desktop mark's
+# rounded square + transparent corners would come back as a magenta
+# tile floating on a white plate. `tauri icon` writes every iOS slot
+# into gen/apple; the desktop-set byproduct lands in ./icons (ignored),
+# never in ../src-tauri/icons.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 if command -v pnpm >/dev/null 2>&1; then
-  (cd "$DIR" && pnpm tauri icon ../src-tauri/icons/icon.png) \
+  (cd "$DIR" && pnpm tauri icon ../src-tauri/icons/icon-ios.png) \
     && echo "app icon stamped into gen/apple" \
-    || echo "icon stamp failed — run: cd $DIR && pnpm tauri icon ../src-tauri/icons/icon.png" >&2
+    || echo "icon stamp failed — run: cd $DIR && pnpm tauri icon ../src-tauri/icons/icon-ios.png" >&2
 fi
