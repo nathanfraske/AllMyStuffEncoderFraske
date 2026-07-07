@@ -19,5 +19,12 @@
   <array>
     <string>_myownmesh._tcp</string>
   </array>
+  <!-- Surface the app's Documents folder — where `allmystuff.log` is written
+       (see src/logging.rs) — in the Files app (On My iPhone → AllMyStuff)
+       and in Finder's device pane, so logs are reachable without Xcode. -->
+  <key>UIFileSharingEnabled</key>
+  <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key>
+  <true/>
 </dict>
 </plist>

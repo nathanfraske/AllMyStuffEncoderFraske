@@ -30,6 +30,8 @@ use serde_json::{json, Value};
 // default `mesh` feature so the NDK-free android CI check can build the shell
 // with `--no-default-features` (the engine's C deps need the NDK on device).
 #[cfg(feature = "mesh")]
+mod logging;
+#[cfg(feature = "mesh")]
 mod mesh;
 
 /// A friendly host-OS string for the node card — "Android", "iOS", or the
@@ -101,11 +103,15 @@ fn scan_self() -> Result<Value, String> {
     scan_self_impl("this".to_string())
 }
 
-/// Mirror one frontend diagnostic line into the app's stderr log, so a
-/// `adb logcat` / Xcode console reads a call end to end — the mobile
-/// counterpart to the desktop's `client_log`.
+/// Mirror one frontend diagnostic line into the app's log (the Xcode /
+/// logcat console *and* the on-phone `allmystuff.log` — see [`logging`]), so
+/// a call reads end to end — the mobile counterpart to the desktop's
+/// `client_log`.
 #[tauri::command]
 fn client_log(line: String) {
+    #[cfg(feature = "mesh")]
+    tracing::info!("[ui] {line}");
+    #[cfg(not(feature = "mesh"))]
     eprintln!("[ui] {line}");
 }
 
@@ -124,19 +130,20 @@ pub fn run() {
         .manage(mesh::MeshState::default())
         .setup(|app| {
             // Route the embedded engine's `tracing` diagnostics (mDNS attach
-            // failures, peer connects/drops) to stderr, where the device
-            // console picks them up. Without a subscriber they are dropped —
-            // and "why is discovery dark" becomes undebuggable on a phone.
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
-                .with_ansi(false)
-                .try_init();
+            // failures, peer connects/drops) to the device console *and* an
+            // on-phone log file (see [`logging`]). Without a subscriber they
+            // are dropped — and "why is discovery dark" becomes undebuggable
+            // on a phone.
+            match logging::init(app.handle()) {
+                Some(path) => tracing::info!("logging to {}", path.display()),
+                None => tracing::warn!("file log unavailable; stderr only"),
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                eprintln!("[mesh] opening the embedded engine (LAN mDNS discovery)…");
+                tracing::info!("[mesh] opening the embedded engine (LAN mDNS discovery)…");
                 match mesh::join(&handle) {
-                    Ok(id) => eprintln!("[mesh] joined the LAN mesh as {id}"),
-                    Err(e) => eprintln!("[mesh] join failed: {e}"),
+                    Ok(id) => tracing::info!("[mesh] joined the LAN mesh as {id}"),
+                    Err(e) => tracing::error!("[mesh] join failed: {e}"),
                 }
             });
             Ok(())

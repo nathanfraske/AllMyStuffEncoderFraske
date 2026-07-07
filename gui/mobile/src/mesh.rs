@@ -125,8 +125,8 @@ fn advertise_self(mesh: &EngineMesh) {
         env!("CARGO_PKG_VERSION"),
     );
     match mesh.advertise(&profile) {
-        Ok(()) => eprintln!("[mesh] presence advertised as {id}"),
-        Err(e) => eprintln!("[mesh] presence advertise failed: {e}"),
+        Ok(()) => tracing::info!("[mesh] presence advertised as {id}"),
+        Err(e) => tracing::warn!("[mesh] presence advertise failed: {e}"),
     }
 }
 
@@ -166,7 +166,7 @@ pub fn join(app: &AppHandle) -> Result<String, String> {
     let mesh = EngineMesh::open(seed, label, sink).map_err(|e| e.to_string())?;
     if !settings.lan_disabled {
         if let Err(e) = mesh.join_network(lan_discovery_config()) {
-            eprintln!("[mesh] LAN join failed: {e}");
+            tracing::warn!("[mesh] LAN join failed: {e}");
         }
     }
     // Rejoin every network the user added; a failure (bad stored config, no
@@ -176,10 +176,10 @@ pub fn join(app: &AppHandle) -> Result<String, String> {
             Ok(cfg) => {
                 let id = cfg.id.clone();
                 if let Err(e) = mesh.join_network(cfg) {
-                    eprintln!("[mesh] rejoin of {id} failed: {e}");
+                    tracing::warn!("[mesh] rejoin of {id} failed: {e}");
                 }
             }
-            Err(e) => eprintln!("[mesh] stored network config unreadable: {e}"),
+            Err(e) => tracing::warn!("[mesh] stored network config unreadable: {e}"),
         }
     }
 
