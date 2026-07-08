@@ -463,6 +463,13 @@ impl Cec {
             .sessions
             .insert(session_id.to_string(), state.to_string());
     }
+
+    /// The last recorded state for a session (`requested` / `active` / `denied`
+    /// / `ended`), if known. Lets the technician's dial loop stop re-sending the
+    /// connect-request once the customer has answered.
+    pub fn session_state(&self, session_id: &str) -> Option<String> {
+        self.inner.lock().sessions.get(session_id).cloned()
+    }
 }
 
 /// The customer-facing scope word for a grant (the `cec_grants` shape) —

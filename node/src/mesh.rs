@@ -2690,23 +2690,44 @@ impl Mesh {
         );
 
         // The connect handshake — the customer's node raises the 3-choice prompt
-        // from this.
+        // from this. `connect_peer` above only *initiates* the WebRTC connection;
+        // the `cec.control` message needs an established data channel to the
+        // customer, which lands a beat later — a single send fired here races the
+        // handshake and is dropped, so the customer never sees the prompt. Re-send
+        // the request on a short loop until the customer answers (they dedupe it
+        // by technician, so re-sends are harmless) or a deadline. This is what
+        // makes the approval prompt reliably appear.
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
-        let _ = self
-            .cec_send_control(
-                &network_id,
-                &canonical,
-                &allmystuff_cec_protocol::ControlMessage::Connect(
-                    allmystuff_cec_protocol::ConnectControl::Request {
-                        session_id: session_id.clone(),
-                        agent_name,
-                        want_control,
-                    },
-                ),
-            )
-            .await;
         self.cec.set_session(&session_id, "requested");
+        let request = allmystuff_cec_protocol::ControlMessage::Connect(
+            allmystuff_cec_protocol::ConnectControl::Request {
+                session_id: session_id.clone(),
+                agent_name,
+                want_control,
+            },
+        );
+        {
+            let mesh = self.clone();
+            let net = network_id.clone();
+            let peer = canonical.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+                loop {
+                    let _ = mesh.cec_send_control(&net, &peer, &request).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let answered = mesh
+                        .cec
+                        .session_state(&sid)
+                        .map(|s| s != "requested")
+                        .unwrap_or(false);
+                    if answered || std::time::Instant::now() > deadline {
+                        break;
+                    }
+                }
+            });
+        }
         self.sink.emit("cec://peer", record.to_value());
         self.sink.emit(
             "cec://session",
