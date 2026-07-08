@@ -239,6 +239,14 @@ import {
  *  the Meshes list, so they're filtered out of "Your meshes". */
 const CEC_NETWORK_PREFIX = "cec-";
 
+/** The bare digits of a customer's Support number — mirrors the node's
+ *  `normalize_input` (strip spaces/dashes) closely enough to rebuild the
+ *  `cec-<digits>` room id from a dialed customer's `number`, so the two can be
+ *  matched GUI-side. Support IDs are all-digit, so a plain digit strip suffices. */
+function cecSupportDigits(number: string | undefined): string {
+  return (number ?? "").replace(/\D/g, "");
+}
+
 /** Which pane the settings panel is showing. */
 export type SettingsTab =
   | "networks"
@@ -930,10 +938,35 @@ class AppStore {
     return !!net?.network_id && net.network_id.startsWith(CEC_NETWORK_PREFIX);
   }
 
-  /** Your meshes minus the CEC Support customer rooms — what the Meshes list
-   *  actually shows. Client rooms live in the (secret) CEC tab instead, so a
-   *  technician manages their client connections apart from their own meshes. */
-  normalNetworks = $derived.by(() => this.networks.filter((n) => !this.isCecMesh(n)));
+  /** The `cec-…` room ids that currently have a **live dialed customer** — i.e.
+   *  the client meshes actively managed in the CEC tab. Rebuilt from the dialed
+   *  list (`cecCustomers`) by mirroring the node's `network_id_for_number`
+   *  (`cec-` + the number's digits), since the dialed record doesn't carry its
+   *  room id over the wire. */
+  cecManagedNetworkIds = $derived.by(
+    () =>
+      new Set(
+        this.cecCustomers.map((c) => `${CEC_NETWORK_PREFIX}${cecSupportDigits(c.number)}`),
+      ),
+  );
+
+  /** A CEC customer room that's actively managed in the CEC tab (has a dialed
+   *  customer). Only these are hidden from the Meshes list. An **orphaned**
+   *  `cec-…` room — a leftover from a previous node session, with no dialed
+   *  record (the dialed list is in-memory and not rebuilt on restart, but the
+   *  daemon persists the room) — is deliberately NOT hidden, so it stays
+   *  removable via the normal Leave instead of becoming invisible-and-stuck. */
+  isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
+    return this.isCecMesh(net) && this.cecManagedNetworkIds.has(net!.network_id!);
+  }
+
+  /** Your meshes minus the CEC Support customer rooms you're actively managing
+   *  in the CEC tab — what the Meshes list actually shows. Active client rooms
+   *  live in the (secret) CEC tab instead; an orphaned `cec-…` room falls back
+   *  to this list so it can still be left. */
+  normalNetworks = $derived.by(() =>
+    this.networks.filter((n) => !this.isManagedCecMesh(n)),
+  );
 
   /** The fleet owner's display name, read from the signed roster (the member
    *  whose role is "owner"). Lets every device — member, manager, owner — label
