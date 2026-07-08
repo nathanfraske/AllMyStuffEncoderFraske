@@ -2060,7 +2060,7 @@ impl Mesh {
             // `CHANNEL_CONTROL` so CEC traffic never crosses into an ordinary
             // route negotiation.
             other if other == allmystuff_cec_protocol::CHANNEL_CONTROL => {
-                self.handle_cec_control(from, payload).await;
+                self.handle_cec_control(from, network, payload).await;
             }
             _ => {}
         }
@@ -3067,7 +3067,7 @@ impl Mesh {
     /// Handle one inbound CEC control message (the `cec.control` channel).
     /// Customer side: a `Request` raises the 3-choice prompt (`cec://request`);
     /// technician side: an `Approve`/`Deny`/`End` moves the session.
-    async fn handle_cec_control(self: &Arc<Self>, from: String, payload: Value) {
+    async fn handle_cec_control(self: &Arc<Self>, from: String, network: String, payload: Value) {
         let msg: allmystuff_cec_protocol::ControlMessage = match serde_json::from_value(payload) {
             Ok(m) => m,
             Err(e) => {
@@ -3082,25 +3082,84 @@ impl Mesh {
                     agent_name,
                     want_control,
                 } => {
-                    let verification_code = crate::cec::verification_code(&from, &session_id);
-                    let req = crate::cec::PendingRequest {
-                        tech: from.clone(),
-                        agent_name: agent_name.clone(),
-                        want_control,
-                        session_id: session_id.clone(),
-                        verification_code: verification_code.clone(),
-                    };
-                    self.cec.record_pending(req);
-                    self.sink.emit(
-                        "cec://request",
-                        json!({
-                            "tech": from,
-                            "agent_name": agent_name,
-                            "want_control": want_control,
-                            "session_id": session_id,
-                            "verification_code": verification_code,
-                        }),
-                    );
+                    // The technician retransmits its Request every 2s until it
+                    // sees an answer — because a single send can be dropped
+                    // before the data channel is up (the very race the Request
+                    // retransmit was added to beat). Our *reply* can be dropped
+                    // the same way, so each incoming beat is our cue to re-assert
+                    // our current decision, answered on the network it arrived
+                    // on. Without this, an approval whose one Approve was dropped
+                    // leaves the technician re-requesting forever (the customer
+                    // re-prompted every beat) and never seeing the session.
+                    match self.cec.session_state(&session_id).as_deref() {
+                        Some("active") => {
+                            // Already approved; re-send the Approve. The scope is
+                            // cosmetic to the technician (its Approve handler only
+                            // moves the session to active) — default it if the
+                            // grant is gone.
+                            let scope = self
+                                .cec
+                                .active_scope_for(&from)
+                                .unwrap_or(allmystuff_cec_protocol::ApprovalScope::Once);
+                            let _ = self
+                                .cec_send_control(
+                                    &network,
+                                    &from,
+                                    &allmystuff_cec_protocol::ControlMessage::Connect(
+                                        allmystuff_cec_protocol::ConnectControl::Approve {
+                                            session_id,
+                                            scope,
+                                        },
+                                    ),
+                                )
+                                .await;
+                        }
+                        Some("denied") => {
+                            // Already declined; re-send the Deny so the tech's
+                            // dial loop can stop instead of re-prompting us.
+                            let _ = self
+                                .cec_send_control(
+                                    &network,
+                                    &from,
+                                    &allmystuff_cec_protocol::ControlMessage::Connect(
+                                        allmystuff_cec_protocol::ConnectControl::Deny {
+                                            session_id,
+                                            reason: "declined".into(),
+                                        },
+                                    ),
+                                )
+                                .await;
+                        }
+                        _ => {
+                            // Undecided: raise the prompt on the first beat and
+                            // refresh the pending record on later ones — but
+                            // don't re-emit `cec://request`, or the customer's
+                            // approval dialog is spammed once every 2s.
+                            let already = self.cec.has_pending_session(&session_id);
+                            let verification_code =
+                                crate::cec::verification_code(&from, &session_id);
+                            let req = crate::cec::PendingRequest {
+                                tech: from.clone(),
+                                agent_name: agent_name.clone(),
+                                want_control,
+                                session_id: session_id.clone(),
+                                verification_code: verification_code.clone(),
+                            };
+                            self.cec.record_pending(req);
+                            if !already {
+                                self.sink.emit(
+                                    "cec://request",
+                                    json!({
+                                        "tech": from,
+                                        "agent_name": agent_name,
+                                        "want_control": want_control,
+                                        "session_id": session_id,
+                                        "verification_code": verification_code,
+                                    }),
+                                );
+                            }
+                        }
+                    }
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
                     self.cec.set_session(&session_id, "active");
