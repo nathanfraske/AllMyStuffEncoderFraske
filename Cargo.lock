@@ -18,6 +18,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-cec-consent"
+version = "0.2.19"
+dependencies = [
+ "allmystuff-cec-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "allmystuff-cec-protocol"
+version = "0.2.19"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "allmystuff-cli"
 version = "0.2.19"
 dependencies = [

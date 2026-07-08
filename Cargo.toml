@@ -11,6 +11,13 @@ members = [
     "crates/allmystuff-cli",
     "crates/allmystuff-term",
     "crates/allmystuff-mobile-core",
+    # The CEC Support layer: the pseudo-secret support mesh's wire contract and
+    # the customer's three-choice (Once / 3-hours / Forever) consent store. Both
+    # are light (serde only), so they live in this fast library workspace and are
+    # shared verbatim by the technician side (this app, joined to the support
+    # mesh) and by the standalone CEC Support client app.
+    "crates/allmystuff-cec-protocol",
+    "crates/allmystuff-cec-consent",
 ]
 # The Tauri desktop app (`gui/src-tauri`) and the headless mesh node
 # (`node/` — the `allmystuff-node` engine + the `allmystuff-serve` binary)
@@ -40,6 +47,8 @@ allmystuff-session = { path = "crates/allmystuff-session", version = "0.2.19" }
 allmystuff-updater = { path = "crates/allmystuff-updater", version = "0.2.19" }
 allmystuff-service = { path = "crates/allmystuff-service", version = "0.2.19" }
 allmystuff-mobile-core = { path = "crates/allmystuff-mobile-core", version = "0.2.19" }
+allmystuff-cec-protocol = { path = "crates/allmystuff-cec-protocol", version = "0.2.19" }
+allmystuff-cec-consent = { path = "crates/allmystuff-cec-consent", version = "0.2.19" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
