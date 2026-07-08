@@ -1,0 +1,18 @@
+[package]
+name = "allmystuff-cec-consent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The CEC Support consent store: a customer's per-technician approvals — Approve Once (in-memory), Auto-Approve for 3 hours (expiring), Auto-Approve Forever — with crash-safe persistence, expiry pruning, per-frame enforcement, and Forget-this-technician revocation."
+
+[dependencies]
+allmystuff-cec-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

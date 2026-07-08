@@ -86,7 +86,19 @@
       }
     });
   });
+
+  // The secret handshake that reveals the CEC Support technician tab:
+  // Ctrl+Alt+Shift+C. A hidden gesture keeps the help-desk surface out of an
+  // ordinary user's way while a technician can always summon it.
+  function secretUnlock(e: KeyboardEvent) {
+    if (e.ctrlKey && e.altKey && e.shiftKey && (e.key === "C" || e.key === "c")) {
+      e.preventDefault();
+      app.toggleCecTab();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={secretUnlock} />
 
 {#if videoTarget}
   <VideoPopoutHost target={videoTarget} />

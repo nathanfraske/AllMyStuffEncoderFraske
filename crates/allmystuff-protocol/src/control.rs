@@ -112,6 +112,22 @@ pub enum Request {
         #[serde(default)]
         peer: Option<String>,
     },
+    /// Deliberately dial **one** peer on a `Silent` network — the CEC Support
+    /// "connect to this customer" op. A `Silent` network auto-dials nobody and
+    /// never gossips a roster: its peers are merely *visible*
+    /// (`PeersList`/sighting) until someone names one to connect. This mirrors
+    /// the daemon's `JoinedNetwork::connect_peer(device_id)` — it opens a
+    /// signaling offer to `device_id` on `network` and answers inbound offers
+    /// as usual, without turning the network chatty. `peer` is the peer's
+    /// **bare pubkey** (`public_id`), like `ChannelSendTo`. The field name
+    /// `peer` matches the daemon's `network_connect_peer` op on the wire.
+    /// Additive: a daemon that predates the op replies with an "unknown op"
+    /// error, which the node surfaces as "this myownmesh build has no Silent
+    /// dial yet".
+    NetworkConnectPeer {
+        network: String,
+        peer: String,
+    },
 
     // ---- event stream ------------------------------------------------
     /// Upgrade this connection to a duplex event socket. After the ack,

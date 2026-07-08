@@ -1,0 +1,17 @@
+[package]
+name = "allmystuff-cec-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Wire types, mesh constants, and Support-ID derivation shared by every CEC Support component. Pure Rust — serde + a hash, no mesh or media dependencies, so the wire contract is verified the same way on every platform."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -82,6 +82,10 @@ export interface SessionSnapshot {
      *  the human who owns the fleet, not the owner device's hostname. Absent
      *  (an older peer, or unknown) — empty. */
     fleet_owner?: string;
+    /** The CEC Support fleet group ("CEC Support"), present only for a customer
+     *  this technician dialed — the node tags it in the snapshot from its dialed
+     *  CEC set. Absent on every ordinary peer. */
+    cecGroup?: string;
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -1069,6 +1073,170 @@ export async function fleetMfaDisable(code: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("fleet_mfa_disable", { code });
+}
+
+// ---- CEC Support (the technician-side remote help desk) -----------------
+//
+// CEC Support is AnyDesk-like remote support riding the same mesh engine.
+// This app is the *technician*: joined to the CEC ecosystem it grows a secret
+// settings tab where an agent enters their name and a customer's number, dials
+// them onto the graph (in the "CEC Support" fleet group), and drives the normal
+// screen/control features — gated by the customer's live consent grant. All of
+// these degrade to null/empty/no-op in web mode (no backend). The `cec://*`
+// events flow through the ordinary Tauri event bus (the node's event pump
+// forwards every emit by name).
+
+/** This node's CEC snapshot — its own support number + Silent room, its role,
+ *  and whether it's hosting. Null in web mode. */
+export interface CecStatus {
+  number: string;
+  network_id: string;
+  role: "client" | "technician";
+  hosting: boolean;
+}
+
+/** One inbound technician connect-request awaiting the customer's 3-choice
+ *  prompt (the shape of `cec_pending` rows and the `cec://request` event). */
+export interface CecPending {
+  tech: string;
+  agent_name: string;
+  want_control: boolean;
+  session_id: string;
+  verification_code: string;
+}
+
+/** A customer a technician has dialed onto the graph (the `cec_dial` result +
+ *  the `cec://peer` event). */
+export interface CecPeer {
+  node: string;
+  number: string;
+  label: string;
+  online: boolean;
+}
+
+/** One standing consent grant a customer holds (the `cec_grants` rows + the
+ *  `cec://grants` event). */
+export interface CecGrant {
+  technician: string;
+  agent_name: string;
+  scope: CecScope;
+  granted_at: number;
+  expires_at: number | null;
+  control: boolean;
+}
+
+/** The customer's three choices in the "*so-and-so* is trying to connect"
+ *  prompt. */
+export type CecScope = "once" | "three_hours" | "forever";
+
+/** This node's CEC status. Null in web mode. */
+export function cecStatus(): Promise<CecStatus | null> {
+  return tryInvoke<CecStatus>("cec_status");
+}
+
+/** Technician: dial a customer by the number they read out. Joins their secret
+ *  Silent mesh, connects to the one peer there, and drops it in the CEC Support
+ *  fleet group. Throws with the backend's reason when nothing answered. Returns
+ *  the customer's node id (null in web mode). */
+export async function cecDial(
+  number: string,
+  agentName: string,
+): Promise<{ node: string } | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("cec_dial", { number, agentName })) as { node: string };
+}
+
+/** Customer: start hosting on this device's own number-derived Silent mesh.
+ *  Returns the support number to read out. Null in web mode. */
+export function cecStartHosting(): Promise<{ number: string } | null> {
+  return tryInvoke<{ number: string }>("cec_start_hosting");
+}
+
+/** Customer: stop hosting (standing consent grants are kept). No-op in web. */
+export function cecStopHosting(): Promise<null> {
+  return tryInvoke("cec_stop_hosting");
+}
+
+/** Customer: the inbound technician connect-requests awaiting a choice. */
+export async function cecPending(): Promise<CecPending[]> {
+  const r = await tryInvoke<CecPending[]>("cec_pending");
+  return Array.isArray(r) ? r : [];
+}
+
+/** Customer: approve a technician at a scope (once / three hours / forever),
+ *  driving the session Active. Throws with the reason when refused (e.g. a
+ *  durable grant that couldn't be saved). */
+export async function cecApprove(
+  tech: string,
+  scope: CecScope,
+  sessionId: string,
+  wantControl: boolean,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_approve", { tech, scope, sessionId, wantControl });
+}
+
+/** Customer: decline a pending connect-request. No-op in web mode. */
+export async function cecDeny(tech: string, sessionId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_deny", { tech, sessionId });
+}
+
+/** Customer: "Forget this technician" — revoke every grant and tear down. The
+ *  revoke bites the next privileged frame even if the wire End is lost. */
+export async function cecRevoke(tech: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_revoke", { tech });
+}
+
+/** Customer: the live consent grants. */
+export async function cecGrants(): Promise<CecGrant[]> {
+  const r = await tryInvoke<CecGrant[]>("cec_grants");
+  return Array.isArray(r) ? r : [];
+}
+
+/** The per-node gear "Forget this node": drop it from the graph + roster, tear
+ *  its session down, and end any CEC session. No-op in web mode. */
+export async function forgetNode(node: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("forget_node", { node });
+}
+
+/** Customer: a technician is trying to connect (`cec://request`) — the nudge
+ *  that drives the 3-choice prompt. No-op listener in web mode. */
+export async function onCecRequest(cb: (r: CecPending) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CecPending>("cec://request", (e) => cb(e.payload));
+}
+
+/** Technician: a dialed customer's graph node updated (`cec://peer`). No-op in
+ *  web mode. */
+export async function onCecPeer(cb: (p: CecPeer) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<CecPeer>("cec://peer", (e) => cb(e.payload));
+}
+
+/** A CEC session changed state (`cec://session`). No-op in web mode. */
+export async function onCecSession(
+  cb: (s: { session_id: string; state: string }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ session_id: string; state: string }>("cec://session", (e) => cb(e.payload));
+}
+
+/** Customer: the grant list changed (`cec://grants`). No-op in web mode. */
+export async function onCecGrants(cb: (grants: CecGrant[]) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ grants: CecGrant[] }>("cec://grants", (e) => cb(e.payload.grants));
 }
 
 // ---- virtual rooms (the rooms plane) ------------------------------------

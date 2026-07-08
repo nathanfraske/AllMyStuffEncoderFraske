@@ -138,12 +138,28 @@
   let detachConfirm = $state(false);
   /** Whether the Unclaim confirmation is showing (same scrim/popup chrome). */
   let unclaimConfirm = $state(false);
+  /** Two-step arm for "Forget this node" — a second click confirms, so a
+   *  stray tap can't drop a device off the graph. */
+  let forgetArmed = $state(false);
   $effect(() => {
     // A fresh selection clears any half-finished confirmation.
     void node?.id;
     detachConfirm = false;
     unclaimConfirm = false;
+    forgetArmed = false;
   });
+  function forgetThisNode() {
+    if (!node || node.kind === "this") return;
+    if (forgetArmed) {
+      forgetArmed = false;
+      const id = node.id;
+      void app.forgetNode(id);
+      app.selectNode(null);
+    } else {
+      forgetArmed = true;
+      setTimeout(() => (forgetArmed = false), 3500);
+    }
+  }
   function doDetach() {
     if (!node) return;
     void app.detachKVM(node.id);
@@ -891,6 +907,22 @@
         </div>
       </section>
     {/if}
+    {/if}
+
+    <!-- Forget this node — in every node's gear. Drops it from the graph +
+         roster, tears its session/route down (and ends a CEC session on a CEC
+         customer). Two-step so a stray tap can't do it. Never on this device. -->
+    {#if node.kind !== "this"}
+      <div class="forget-node">
+        <button
+          class="btn small danger"
+          class:armed={forgetArmed}
+          onclick={forgetThisNode}
+          title="Remove this node from the graph and end its session"
+        >
+          {forgetArmed ? "Tap again to forget it" : "Forget this node"}
+        </button>
+      </div>
     {/if}
       </div>
     {/if}
@@ -1669,6 +1701,15 @@
     color: var(--danger);
     border-color: oklch(0.7 0.19 14 / 0.5);
     background: var(--danger-soft);
+  }
+  .btn.danger.armed {
+    background: var(--danger);
+    color: #fff;
+  }
+  .forget-node {
+    margin: 0.8rem 0 0.2rem;
+    display: flex;
+    justify-content: flex-start;
   }
   .kvm-note {
     margin: 0.2rem 0 0.4rem;
