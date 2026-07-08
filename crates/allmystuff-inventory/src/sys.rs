@@ -238,7 +238,10 @@ mod tests {
     fn default_device_name_is_never_the_placeholder() {
         let name = default_device_name();
         assert!(!name.is_empty());
-        assert!(is_real_hostname(&name), "the fallback must itself be usable");
+        assert!(
+            is_real_hostname(&name),
+            "the fallback must itself be usable"
+        );
     }
 
     #[test]
