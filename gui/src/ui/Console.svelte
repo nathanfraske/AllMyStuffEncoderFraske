@@ -2207,7 +2207,19 @@
       </div>
 
       {#if keysOpen && app.consoleControl}
-        <ConsoleKeys send={sendFromStrip} onclose={() => (keysOpen = false)} />
+        <!-- Hold the strip's right edge clear of the vertical control rail
+             (only the phone shell puts a rail on the right edge). The inset
+             spans the rail body (2.7rem — `.bar-anchor.v .kvmbar`) plus its
+             hide/show handle tab, which juts ~1.15rem further inward
+             (`.bar-anchor.v .bar-tab`), so the tray never covers that tab.
+             Desktop's rail sits on top, so the strip keeps full width there. -->
+        <ConsoleKeys
+          send={sendFromStrip}
+          onclose={() => (keysOpen = false)}
+          rightInset={vertical
+            ? "calc(2.7rem + 1.15rem + env(safe-area-inset-right, 0px) + 0.5rem)"
+            : "0px"}
+        />
       {/if}
     </div>
   </div>
