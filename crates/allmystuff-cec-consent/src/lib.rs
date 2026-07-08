@@ -249,7 +249,7 @@ impl ConsentStore {
             .filter(|g| g.is_live(now))
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.granted_at.cmp(&a.granted_at));
+        out.sort_by_key(|g| std::cmp::Reverse(g.granted_at));
         out
     }
 
