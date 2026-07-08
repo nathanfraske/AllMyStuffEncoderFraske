@@ -22,7 +22,7 @@ pub fn host_info() -> HostInfo {
     let (board, soc) = (None, None);
 
     HostInfo {
-        hostname: System::host_name().unwrap_or_else(|| "this device".into()),
+        hostname: device_hostname(),
         os: std::env::consts::OS.to_string(),
         os_version: System::os_version(),
         kernel_version: System::kernel_version(),
@@ -31,6 +31,47 @@ pub fn host_info() -> HostInfo {
         soc,
         uptime_secs: System::uptime(),
     }
+}
+
+/// The device's hostname for its node card and presence advert.
+///
+/// `sysinfo` reports the OS hostname, which is the right name on a desktop
+/// ("chris-mbp"). But phones have no meaningful hostname to give: iOS — and
+/// most modern Android — always answer the loopback placeholder "localhost".
+/// Left as-is, a fresh phone advertises itself to the whole mesh as
+/// "Localhost". Treat that (and an empty name) as "no hostname" and fall
+/// back to a friendly device-class name the user can still override from
+/// settings.
+fn device_hostname() -> String {
+    match System::host_name() {
+        Some(name) if is_real_hostname(&name) => name,
+        _ => default_device_name(),
+    }
+}
+
+/// Whether `name` is a real machine hostname rather than the loopback
+/// placeholder. Case and any trailing FQDN dot are ignored, and the loopback
+/// name is rejected in every form the platforms hand back — bare "localhost",
+/// "localhost.local", "localhost.localdomain".
+fn is_real_hostname(name: &str) -> bool {
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() {
+        return false;
+    }
+    let first_label = name.split('.').next().unwrap_or(name);
+    !first_label.eq_ignore_ascii_case("localhost")
+}
+
+/// Friendly stand-in when the OS reports no real hostname — named by device
+/// class where we know it (a phone), else the neutral "this device" the
+/// inventory has always used for the unnamed case.
+fn default_device_name() -> String {
+    match std::env::consts::OS {
+        "ios" => "iPhone",
+        "android" => "Android phone",
+        _ => "this device",
+    }
+    .to_string()
 }
 
 pub fn cpu(sys: &System) -> Cpu {
@@ -162,4 +203,48 @@ pub fn networks() -> Vec<NetworkInterface> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_placeholder_is_not_a_real_hostname() {
+        // The exact value iOS (and modern Android) hands back, plus the
+        // FQDN/casing variants seen in the wild.
+        assert!(!is_real_hostname("localhost"));
+        assert!(!is_real_hostname("LocalHost"));
+        assert!(!is_real_hostname("LOCALHOST"));
+        assert!(!is_real_hostname("localhost."));
+        assert!(!is_real_hostname("localhost.local"));
+        assert!(!is_real_hostname("localhost.localdomain"));
+        // Empty / whitespace-only is "no hostname" too.
+        assert!(!is_real_hostname(""));
+        assert!(!is_real_hostname("   "));
+    }
+
+    #[test]
+    fn genuine_hostnames_are_kept() {
+        assert!(is_real_hostname("chris-mbp"));
+        assert!(is_real_hostname("Studio.local"));
+        assert!(is_real_hostname("desk-pc.lan"));
+        // A host that merely *contains* "localhost" is still a real name.
+        assert!(is_real_hostname("localhost-2"));
+        assert!(is_real_hostname("my-localhost"));
+    }
+
+    #[test]
+    fn default_device_name_is_never_the_placeholder() {
+        let name = default_device_name();
+        assert!(!name.is_empty());
+        assert!(is_real_hostname(&name), "the fallback must itself be usable");
+    }
+
+    #[test]
+    fn scanned_hostname_is_never_the_loopback_placeholder() {
+        // Whatever the host running the test reports, the assembled hostname
+        // must never be the loopback placeholder — the bug this guards.
+        assert!(is_real_hostname(&host_info().hostname));
+    }
 }
