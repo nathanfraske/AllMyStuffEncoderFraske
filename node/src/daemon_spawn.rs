@@ -288,7 +288,7 @@ pub async fn probe(client: &ControlClient) -> bool {
 /// minor/patch fields compare as 0 (the installer's `version_ge` does
 /// the same). `None` when the major field isn't numeric — callers gate
 /// sha pins out themselves (they don't start with `v`).
-fn parse_semverish(s: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_semverish(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim();
     let s = s.strip_prefix('v').unwrap_or(s);
     let mut nums = [None::<u64>; 3];
@@ -302,11 +302,11 @@ fn parse_semverish(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// First line of `myownmesh --version` ("myownmesh 0.2.4") → `(0, 2, 4)`.
-fn parse_version_output(out: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version_output(out: &str) -> Option<(u64, u64, u64)> {
     parse_semverish(out.lines().next()?.split_whitespace().last()?)
 }
 
-fn fmt_ver((a, b, c): (u64, u64, u64)) -> String {
+pub(crate) fn fmt_ver((a, b, c): (u64, u64, u64)) -> String {
     format!("{a}.{b}.{c}")
 }
 

@@ -130,7 +130,7 @@
     <!-- Your networks (with add/join + per-network handle) -->
     <section class="block">
       <div class="sec-head">
-        <h4>Your meshes — joined {app.networks.length}</h4>
+        <h4>Your meshes — joined {app.normalNetworks.length}</h4>
         <div class="seg">
           <button class="btn small" class:on={mode === "join"} onclick={() => (mode = mode === "join" ? "none" : "join")}>⇲ Join</button>
           <button class="btn small" title="Add a network from a settings file another device exported" onclick={() => importInput?.click()}>↧ Import</button>
@@ -161,7 +161,10 @@
       {/if}
 
       <ul class="nets">
-        {#each app.networks as n (n.config_id)}
+        <!-- CEC Support customer rooms (`cec-…`) are filtered out here: they're
+             not ordinary meshes and are managed from the secret CEC tab, so a
+             technician keeps client connections separate from their own meshes. -->
+        {#each app.normalNetworks as n (n.config_id)}
           {#if app.isFleetMesh(n)}
             <!-- The fleet IS a closed mesh, but this program treats it as its
                  own thing: no device roster here, just a link to Fleet settings
@@ -218,7 +221,7 @@
             <button class="btn small primary" onclick={() => app.toggleNetworkEnabled(c.id, true)}>{app.isLocalClaimMesh(c) ? "Turn on" : "Enable"}</button>
           </li>
         {/each}
-        {#if app.networks.length === 0 && app.disabledNets.length === 0}
+        {#if app.normalNetworks.length === 0 && app.disabledNets.length === 0}
           <li class="empty">No networks yet — create one, or join with a handle from another device.</li>
         {/if}
       </ul>

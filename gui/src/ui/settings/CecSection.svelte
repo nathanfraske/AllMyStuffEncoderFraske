@@ -20,15 +20,73 @@
   const grants = $derived(app.cecGrantList);
 
   // The customers this technician has dialed — the live CEC connections, read
-  // from CEC state (`cec_dialed`). Each is an ordinary graph peer; there is no
-  // "fleet group" to filter the graph by (the CEC mesh is Silent, no roster).
-  const customers = $derived(app.cecCustomers);
+  // from CEC state (`cec_dialed`), most-recently-used first so active ones stay
+  // on top and stale ones sink to where they're easy to prune. Each is an
+  // ordinary graph peer; there is no "fleet group" to filter the graph by (the
+  // CEC mesh is Silent, no roster).
+  const customers = $derived(app.cecCustomersByRecent);
+
+  // Inline rename: which customer (by node id) is being labelled, and the draft.
+  let editingNode = $state<string | null>(null);
+  let aliasDraft = $state("");
+
+  function startRename(node: string, number: string) {
+    editingNode = node;
+    aliasDraft = app.cecAliases[number] ?? "";
+  }
+  function saveRename(number: string) {
+    app.setCecAlias(number, aliasDraft);
+    editingNode = null;
+    aliasDraft = "";
+  }
+  function cancelRename() {
+    editingNode = null;
+    aliasDraft = "";
+  }
 
   const scopeLabel: Record<CecScope, string> = {
     once: "Approve Once",
     three_hours: "Auto-Approve for 3 hours",
     forever: "Auto-Approve Forever",
   };
+
+  // A connection unused for this long reads as "stale" — the cleanup nudge. A
+  // technician keeps recent ones (they may reconnect) and disconnects the rest.
+  const STALE_AFTER_S = 7 * 24 * 60 * 60;
+
+  /** The customer's number as their mesh reads it — `123 456 789`, matching the
+   *  Silent room's label ("CEC Support …"). Falls back to the raw string if it
+   *  isn't the expected 9 digits. */
+  function groupNumber(n: string): string {
+    const d = (n || "").replace(/\D/g, "");
+    return d.length === 9 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : n || "—";
+  }
+
+  /** Seconds since a connection was last used (dialed, or its console session
+   *  went active). `last_used` is epoch seconds from the node. */
+  function idleSeconds(lastUsed: number): number {
+    return Math.max(0, Math.round(Date.now() / 1000 - (lastUsed || 0)));
+  }
+
+  /** "used just now" / "used 12m ago" / "used 3d ago" — the time-since-last-used
+   *  metric so a technician can tell active connections from stale ones. */
+  function lastUsedLabel(lastUsed: number): string {
+    if (!lastUsed) return "used recently";
+    const s = idleSeconds(lastUsed);
+    if (s < 45) return "used just now";
+    const m = Math.round(s / 60);
+    if (m < 60) return `used ${m}m ago`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `used ${h}h ago`;
+    const d = Math.round(h / 24);
+    return `used ${d}d ago`;
+  }
+
+  /** Whether a connection has gone stale (unused past the threshold) — surfaced
+   *  as a badge so the cleanup candidates stand out. */
+  function isStale(lastUsed: number): boolean {
+    return !!lastUsed && idleSeconds(lastUsed) > STALE_AFTER_S;
+  }
 
   function connect(e: SubmitEvent) {
     e.preventDefault();
@@ -93,23 +151,61 @@
     </form>
   </section>
 
-  <!-- Active CEC connections -->
+  <!-- Client meshes — the customers this technician has dialed. Each is the
+       customer's own private Silent mesh, kept here (and out of the Meshes tab)
+       so client connections are managed apart from your own. Sorted most-recent
+       first; a "stale" badge flags connections gone unused, and each can be
+       given a private label you'll recognise. -->
   <section class="block">
-    <div class="title">Active connections</div>
+    <div class="title">Client meshes</div>
     {#if customers.length === 0}
       <p class="notice">No customers connected. Dial a number above to start.</p>
     {:else}
+      <p class="hint">
+        Each customer you dial is their own private mesh, listed here — most
+        recently used first. Rename one to something you'll recognise, and
+        disconnect the stale ones you no longer need.
+      </p>
       <ul class="rows">
         {#each customers as c (c.node)}
-          <li class="row">
-            <span class="dot" class:on={c.online}></span>
-            <span class="who">
-              <b>{c.label || c.number || "Customer"}</b>
-              <span class="sub">{c.online ? "online" : "offline"}</span>
-            </span>
+          <li class="row col" class:stale={isStale(c.last_used)}>
+            <div class="row-top">
+              <span class="dot" class:on={c.online}></span>
+              <span class="who">
+                {#if editingNode === c.node}
+                  <!-- svelte-ignore a11y_autofocus -->
+                  <input
+                    class="field rename"
+                    type="text"
+                    autofocus
+                    placeholder={c.label || "Customer name"}
+                    bind:value={aliasDraft}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter") saveRename(c.number);
+                      else if (e.key === "Escape") cancelRename();
+                    }}
+                  />
+                {:else}
+                  <b>{app.cecCustomerName(c)}</b>
+                  <span class="sub">
+                    <span class="mesh" title={`Mesh cec-${c.number}`}>CEC Support {groupNumber(c.number)}</span>
+                    <span class="meta">
+                      · {c.online ? "online" : "offline"} · {lastUsedLabel(c.last_used)}
+                    </span>
+                    {#if isStale(c.last_used)}<span class="stale-tag">stale</span>{/if}
+                  </span>
+                {/if}
+              </span>
+            </div>
             <div class="row-actions">
-              <button class="btn small" onclick={() => app.openConsole(c.node)}>Open screen</button>
-              <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Disconnect</button>
+              {#if editingNode === c.node}
+                <button class="btn small primary" onclick={() => saveRename(c.number)}>Save</button>
+                <button class="btn small" onclick={cancelRename}>Cancel</button>
+              {:else}
+                <button class="btn small" onclick={() => app.openConsole(c.node)}>Open screen</button>
+                <button class="btn small" onclick={() => startRename(c.node, c.number)}>Rename</button>
+                <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Disconnect</button>
+              {/if}
             </div>
           </li>
         {/each}
@@ -315,6 +411,41 @@
   .who .sub {
     font-size: 0.75rem;
     color: var(--ink-soft);
+    line-height: 1.5;
+  }
+  .row-top {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .who .mesh {
+    font-weight: 600;
+    color: var(--ink-soft);
+  }
+  .who .meta {
+    color: var(--ink-faint);
+  }
+  .field.rename {
+    padding: 0.32rem 0.5rem;
+    font-size: 0.85rem;
+  }
+  /* The stale marker — a connection unused past the threshold, the cleanup
+     candidate. The row gets a dashed danger outline and a small badge. */
+  .stale-tag {
+    display: inline-block;
+    margin-left: 0.35rem;
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+    border-radius: var(--r-pill, 999px);
+    padding: 0.02rem 0.4rem;
+    vertical-align: middle;
+  }
+  .row.stale {
+    border: 1px dashed color-mix(in oklab, var(--danger) 45%, transparent);
   }
   .row-actions,
   .choices {
