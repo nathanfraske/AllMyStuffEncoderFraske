@@ -44,6 +44,13 @@ GUI_TAURI_LOCK="$ROOT/gui/src-tauri/Cargo.lock"
 GUI_PACKAGE_JSON="$ROOT/gui/package.json"
 NODE_TOML="$ROOT/node/Cargo.toml"
 NODE_LOCK="$ROOT/node/Cargo.lock"
+# The mobile app is a third, self-contained Tauri workspace (gui/mobile). It
+# doesn't inherit the root version either, and if it lags, tauri-action can
+# mis-resolve the desktop release to it — so keep it in lockstep here too.
+MOBILE_TOML="$ROOT/gui/mobile/Cargo.toml"
+MOBILE_LOCK="$ROOT/gui/mobile/Cargo.lock"
+MOBILE_TAURI="$ROOT/gui/mobile/tauri.conf.json"
+MOBILE_PACKAGE_JSON="$ROOT/gui/mobile/package.json"
 
 if [ ! -f "$WORKSPACE_TOML" ]; then
     echo "error: $WORKSPACE_TOML not found" >&2
@@ -209,6 +216,92 @@ else:
         f.write(new_content)
     print(f"bumped {path} -> {version}")
 PY
+fi
+
+# --- mobile sub-workspace (gui/mobile) ----------------------------------
+
+if [ -f "$MOBILE_TOML" ]; then
+    # gui/mobile/Cargo.toml — [package].version (its own workspace).
+    python3 - "$MOBILE_TOML" "$VERSION" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+pattern = re.compile(
+    r'(\[package\][^\[]*?\n\s*version\s*=\s*")[^"]*(")',
+    re.DOTALL,
+)
+new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
+if n != 1:
+    print(f"error: could not find [package].version in {path}", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+print(f"bumped {path} -> {version}")
+PY
+fi
+
+if [ -f "$MOBILE_LOCK" ]; then
+    # gui/mobile/Cargo.lock — the [[package]] entry named "allmystuff-mobile".
+    python3 - "$MOBILE_LOCK" "$VERSION" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+pattern = re.compile(
+    r'(name\s*=\s*"allmystuff-mobile"\s*\nversion\s*=\s*")[^"]*(")',
+)
+new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
+if n != 1:
+    print(f"warning: could not find allmystuff-mobile in {path} (skipping)", file=sys.stderr)
+else:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    print(f"bumped {path} -> {version}")
+PY
+fi
+
+if [ -f "$MOBILE_TAURI" ]; then
+    # gui/mobile/tauri.conf.json — this config sets an explicit top-level
+    # "version" (unlike gui/src-tauri, which derives it from Cargo.toml), so it
+    # has to be bumped or it goes stale. Targeted regex on the first "version"
+    # key so the rest of the file's formatting is left untouched.
+    python3 - "$MOBILE_TAURI" "$VERSION" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+pattern = re.compile(r'("version"\s*:\s*")[^"]*(")')
+new_content, n = pattern.subn(rf'\g<1>{version}\g<2>', content, count=1)
+if n != 1:
+    print(f"error: could not find \"version\" in {path}", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+print(f"bumped {path} -> {version}")
+PY
+fi
+
+if [ -f "$MOBILE_PACKAGE_JSON" ]; then
+    node -e '
+        const fs = require("fs");
+        const f = process.argv[1];
+        const j = JSON.parse(fs.readFileSync(f, "utf8"));
+        j.version = process.argv[2];
+        fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+        console.log(`bumped ${f} -> ${process.argv[2]}`);
+    ' "$MOBILE_PACKAGE_JSON" "$VERSION"
 fi
 
 if [ -f "$GUI_PACKAGE_JSON" ]; then

@@ -171,6 +171,20 @@ jobs:
       - name: Build node serve binary
         run: cargo build --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target ${{ matrix.platform.target }}
 
+      # Leave tauri-action a single, unambiguous app. `gui/mobile` is a second,
+      # self-contained Tauri project (its own `[workspace]`, its own
+      # tauri.conf.json) that shares `projectPath: gui`. tauri-action discovers
+      # it and mis-resolves the desktop bundle to it — reading its stale version
+      # and its empty `gui/mobile/target`, then failing "No artifacts were found"
+      # even though the desktop bundles built fine under gui/src-tauri (this is
+      # what broke every release after gui/mobile landed; v0.2.19 was the last
+      # green one, before it existed). The desktop release never builds mobile,
+      # and gui/src-tauri doesn't depend on it, so drop it from this ephemeral
+      # checkout. Runs after `pnpm install`, so nothing that needs it has run.
+      - name: Isolate the desktop app from the mobile Tauri project
+        shell: bash
+        run: rm -rf gui/mobile
+
       # Build the Tauri GUI bundle. tauri-action runs `pnpm tauri build`
       # under the hood and uploads the resulting installers (.deb /
       # .AppImage / .dmg / .msi / .exe) to the named release. `projectPath:
