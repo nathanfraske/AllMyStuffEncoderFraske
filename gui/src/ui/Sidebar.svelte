@@ -7,6 +7,7 @@
   // graph. The tab strip carries live badges (room knocks, reachable sites).
   import { app } from "../store.svelte";
   import { isMobile } from "../tauri";
+  import { swipeToClose } from "../swipe";
   import RoomsTab from "./RoomsTab.svelte";
   import SitesTab from "./SitesTab.svelte";
 
@@ -109,10 +110,22 @@
   class:resizing
   bind:this={el}
   style={collapsed ? "" : `width: ${width}px`}
+  use:swipeToClose={{
+    toward: "left",
+    onClose: () => setCollapsed(true),
+    enabled: () => isMobile() && !collapsed,
+  }}
 >
   {#if collapsed}
-    <!-- The thin rail: the two tab icons, click to expand into that tab. -->
+    <!-- The thin rail: tapping anywhere expands it (into the last-open tab);
+         the two icons expand straight into their own tab. -->
     <div class="rail">
+      <button
+        class="rail-open"
+        title="Open sites & rooms"
+        aria-label="Open sites and rooms"
+        onclick={() => setCollapsed(false)}
+      ></button>
       <button class="rail-btn" title="Sites" aria-label="Sites" onclick={() => select("sites")}>
         🌐
         {#if siteCount > 0}<span class="rail-count">{siteCount}</span>{/if}
@@ -352,14 +365,32 @@
   }
   /* Collapsed rail */
   .rail {
+    position: relative;
+    /* Full height so the tap-to-open overlay below covers the whole collapsed
+       column, not just the icons — tapping anywhere on the rail opens it. */
+    height: 100%;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 0.4rem;
     padding: 0.6rem 0;
   }
+  /* A transparent, full-rail button under the icons: tapping anywhere on the
+     collapsed rail expands it. The two icon buttons sit above and expand
+     straight into their own tab. */
+  .rail-open {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+    z-index: 0;
+  }
   .rail-btn {
     position: relative;
+    z-index: 1;
     border: none;
     background: transparent;
     font-size: 1.15rem;

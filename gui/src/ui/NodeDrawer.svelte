@@ -1,6 +1,7 @@
 <script lang="ts">
   import { app } from "../store.svelte";
   import { isMobile } from "../tauri";
+  import { swipeToClose } from "../swipe";
   import {
     MEDIA,
     displayName,
@@ -302,23 +303,38 @@
     class:resizing
     style={collapsed ? "" : `width: ${width}px`}
     aria-label="{displayName(node)} details"
+    use:swipeToClose={{
+      toward: "right",
+      onClose: () => (collapsed = true),
+      enabled: () => isMobile() && !collapsed,
+    }}
   >
     {#if collapsed}
       <!-- Collapsed: a thin rail that stays out of the graph's way while
-           keeping the selection — click to bring the detail back. -->
+           keeping the selection. Tapping anywhere on it brings the detail
+           back; the ✕ still deselects back to this device. -->
       <div class="rail">
+        <!-- The whole rail is one big "expand" target; the chevron is just its
+             visual cue (aria-hidden so the overlay is the single named
+             control). The ✕ sits above it and still deselects. -->
+        <button
+          class="rail-open"
+          onclick={() => (collapsed = false)}
+          title="Expand details"
+          aria-label="Expand details"
+        ></button>
         <button
           class="rail-btn"
           onclick={() => (collapsed = false)}
-          title="Expand details"
-          aria-label="Expand details">‹</button
+          tabindex="-1"
+          aria-hidden="true">‹</button
         >
         <span class="rail-avatar" aria-hidden="true"
           >{meshonly ? "📡" : shared ? "🧑" : node.kind === "this" ? "💻" : "🖥"}</span
         >
         {#if !isLocalFallback}
           <button
-            class="rail-btn"
+            class="rail-btn rail-btn-action"
             onclick={() => app.selectNode(null)}
             title="Back to this device"
             aria-label="Back to this device">✕</button
@@ -1119,6 +1135,7 @@
   }
   /* Collapsed: a thin rail with just the affordances to come back. */
   .rail {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1126,11 +1143,25 @@
     height: 100%;
     padding: 0.7rem 0;
   }
+  /* A transparent, full-rail button under the chips: tapping anywhere on the
+     collapsed rail expands it. The real controls (chevron, ✕) sit above. */
+  .rail-open {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+    z-index: 0;
+  }
   .rail-avatar {
     font-size: 1.35rem;
     line-height: 1;
   }
   .rail-btn {
+    position: relative;
+    z-index: 1;
     border: none;
     background: var(--surface-2);
     color: var(--ink-soft);
