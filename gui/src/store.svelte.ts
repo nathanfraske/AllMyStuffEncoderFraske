@@ -527,6 +527,10 @@ class AppStore {
    *  customer is an ordinary peer with no special grouping (the CEC mesh is
    *  Silent, so there is no roster to build a "fleet" from). */
   cecCustomers = $state<CecPeer[]>([]);
+  /** A customer just dialed, waiting for their approval: when their CEC session
+   *  goes active, the technician's remote-control console opens for them (the
+   *  AnyDesk-style "connect and you're in"). Cleared once opened. */
+  cecAutoOpenNode = $state<string | null>(null);
   /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
    *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
    *  Node CEC status/role deliberately does *not* auto-reveal it. */
@@ -1368,6 +1372,15 @@ class AppStore {
         { sessionId: s.session_id, state: s.state },
         ...this.cecSessions.filter((x) => x.sessionId !== s.session_id),
       ];
+      // The technician just got approval on a customer they dialed: open the
+      // remote-control console for them. A short beat lets the peer + its
+      // capabilities land in the catalog first (onCecPeer refreshes it), so the
+      // console can wire the screen route on open rather than to an empty node.
+      if (s.state === "active" && this.cecAutoOpenNode) {
+        const node = this.cecAutoOpenNode;
+        this.cecAutoOpenNode = null;
+        setTimeout(() => this.openConsole(node), 400);
+      }
     });
     await onCecGrants((grants) => {
       this.cecGrantList = grants;
@@ -2704,7 +2717,10 @@ class AppStore {
       this.toast("warn", `${node.label} isn't running AllMyStuff`);
       return false;
     }
-    if (node.relationship.kind === "unclaimed") {
+    if (node.relationship.kind === "unclaimed" && !this.isCecCustomer(node.id)) {
+      // A dialed CEC customer is never "claimed" by the technician — the
+      // customer's consent grant is the authorization — so the console opens on
+      // it directly; every other unclaimed node still needs a claim/share first.
       this.toast("warn", `Claim ${node.label} first, or mark it shared`);
       return false;
     }
@@ -3498,6 +3514,16 @@ class AppStore {
    *  every console it supports; a device a fleet shared with you gets exactly
    *  the ones their grant covers. One source of truth for the graph-card
    *  buttons and the drawer's buttons so they can't disagree. */
+  /** Whether `nodeId` is a CEC customer this technician has dialed. Its
+   *  authorization for the remote console is the customer's live consent grant
+   *  (they tapped Approve in the CEC Support app), not owner/fleet or an
+   *  AllMyStuff share — so the console legs and the open/reopen buttons key off
+   *  this, and the customer's node still enforces the grant per frame. */
+  isCecCustomer(nodeId: string | undefined): boolean {
+    if (!nodeId) return false;
+    return this.cecCustomers.some((c) => sameMachine(c.node, nodeId));
+  }
+
   consoleAccess(node: MeshNode | undefined): ConsoleAccess {
     const none: ConsoleAccess = {
       remote: false,
@@ -3513,6 +3539,12 @@ class AppStore {
     const ownerIsMe = !!node.owner && this.isMe(node.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node.id);
     const mineOrFleet = node.relationship.kind === "mine" || ownerIsMe || coFleet;
+    // A dialed CEC customer is authorized for the remote-control legs by its own
+    // consent grant, not by ownership/fleet — so screen view + control + audio +
+    // clipboard become available on it (the customer's node still gates each
+    // frame on the grant). Files/terminal/sites stay owner/fleet-only: the CEC
+    // consent model only covers screen + control, so those would just be denied.
+    const isCec = this.isCecCustomer(node.id);
     // A KVM appliance advertises a native Display/Source "screen" capability
     // (and an Input/Sink "control" one) as well as its own web UI. So it now
     // gets the generic Remote Control console — rendered over the mesh's native
@@ -3537,7 +3569,7 @@ class AppStore {
       remote:
         !self &&
         (!kvm || this.kvmHasNativeScreen(node)) &&
-        (mineOrFleet || this.hasShareGrant(node, "remote")),
+        (mineOrFleet || isCec || this.hasShareGrant(node, "remote")),
       files: this.filesSupported(node) && !self && (mineOrFleet || this.hasShareGrant(node, "files")),
       terminal:
         this.terminalSupported(node) &&
@@ -3553,16 +3585,20 @@ class AppStore {
       // Audio passthrough: only when the machine has audio to send and you may
       // hear it.
       audio:
-        !self && exposes("audio", "provide") && (mineOrFleet || this.hasShareGrant(node, "audio")),
+        !self &&
+        exposes("audio", "provide") &&
+        (mineOrFleet || isCec || this.hasShareGrant(node, "audio")),
       // Control (keyboard & mouse): the machine must accept control and you must
-      // be its fleet or hold a control grant.
+      // be its fleet, hold a control grant, or (CEC) have a live consent grant.
       control:
-        !self && exposes("input", "consume") && (mineOrFleet || this.hasShareGrant(node, "control")),
+        !self &&
+        exposes("input", "consume") &&
+        (mineOrFleet || isCec || this.hasShareGrant(node, "control")),
       // The clipboard rides with control (same grant), gated on the endpoint.
       clipboard:
         !self &&
         exposes("clipboard", "consume") &&
-        (mineOrFleet || this.hasShareGrant(node, "clipboard") || this.hasShareGrant(node, "control")),
+        (mineOrFleet || isCec || this.hasShareGrant(node, "clipboard") || this.hasShareGrant(node, "control")),
     };
   }
 
@@ -6601,6 +6637,9 @@ class AppStore {
       if (r?.node) {
         this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
         this.cecNumberDraft = "";
+        // Open the remote-control console for this customer the moment they
+        // approve (their session goes active) — see the onCecSession handler.
+        this.cecAutoOpenNode = r.node;
         void this.pullSessionSnapshot();
       } else {
         this.toast("ok", `Dialed ${number}`);
