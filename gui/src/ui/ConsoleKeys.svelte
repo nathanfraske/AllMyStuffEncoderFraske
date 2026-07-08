@@ -23,9 +23,15 @@
   let {
     send,
     onclose,
+    rightInset = "0px",
   }: {
     send: (a: InputAction) => void;
     onclose: () => void;
+    // How far to hold the strip's right edge off the pane's right side, so
+    // it clears the console's control rail (the phone's vertical bar lives
+    // there). A CSS length; "0px" on shells with no right-edge rail. The
+    // caller owns the rail's width, so the strip never guesses it.
+    rightInset?: string;
   } = $props();
 
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -176,7 +182,7 @@
   });
 </script>
 
-<div class="keys" style:bottom="{lift}px">
+<div class="keys" style:bottom="{lift}px" style:right={rightInset}>
   <button class="k" onpointerdown={keepFocus} onclick={() => tapKey("Escape", "Escape")}>esc</button>
   <button class="k" onpointerdown={keepFocus} onclick={() => tapKey("Tab", "Tab")}>tab</button>
   {#each MODS as m (m.code)}
@@ -213,15 +219,23 @@
   .keys {
     position: fixed;
     left: 0;
+    /* `right` is set inline (rightInset) so the strip stops short of the
+       control rail on the right edge instead of sliding under it. */
     right: 0;
     z-index: 70;
     display: flex;
     align-items: center;
     gap: 0.3rem;
-    padding: 0.45rem 0.5rem calc(0.45rem + env(safe-area-inset-bottom, 0px) * 0.4);
+    padding: 0.4rem 0.5rem calc(0.4rem + env(safe-area-inset-bottom, 0px) * 0.4) calc(0.5rem + env(safe-area-inset-left, 0px));
     background: oklch(0.17 0.026 285 / 0.94);
     backdrop-filter: blur(10px);
-    border-top: 1px solid var(--line);
+    /* A floating tray (rounded top, boxed on three sides) rather than a
+       full-bleed band — it reads as one control that leaves the picture
+       room, and its right edge sits clear of the rail. */
+    border: 1px solid var(--line-strong);
+    border-bottom: none;
+    border-radius: var(--r-md, 12px) var(--r-md, 12px) 0 0;
+    box-shadow: 0 -6px 16px -8px rgba(0, 0, 0, 0.6);
     overflow-x: auto;
   }
   .k {
