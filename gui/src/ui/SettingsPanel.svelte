@@ -22,7 +22,14 @@
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "devices", label: "Devices", icon: "🖥" },
-    { id: "always_on", label: "Always On", icon: "♾️" },
+    // "Always On" is desktop-only: it manages an OS background service
+    // (systemd / launchd / the Windows SCM) and window/tray behaviour, none of
+    // which exist on the phone/tablet — where the backend doesn't even register
+    // those commands. Until there's a mobile background service to offer, drop
+    // the whole tab there rather than show controls that can never answer.
+    ...(isMobile()
+      ? []
+      : [{ id: "always_on" as SettingsTab, label: "Always On", icon: "♾️" }]),
     // On the phone/tablet the App Store owns updates, so the pane is a plain
     // "About" (see UpdatesSection) — the nav entry matches.
     { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
@@ -71,7 +78,7 @@
         <SharingSection />
       {:else if app.settingsTab === "devices"}
         <DevicesSection />
-      {:else if app.settingsTab === "always_on"}
+      {:else if app.settingsTab === "always_on" && !isMobile()}
         <AlwaysOnSection />
       {:else if app.settingsTab === "updates"}
         <UpdatesSection />

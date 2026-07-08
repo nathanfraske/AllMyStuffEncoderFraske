@@ -803,10 +803,30 @@ fn parse_launchctl_list(exit_code: i32, stdout: &str) -> (bool, bool) {
 // process + filesystem helpers
 // ---------------------------------------------------------------------------
 
+/// Build the `Command` for one of our argv vectors, suppressing the console
+/// window Windows would otherwise flash for each spawn.
+///
+/// The desktop app drives this crate **in-process** — the "Always On" tab
+/// reads service status by calling straight into [`status_value`], which shells
+/// out to `sc.exe`. AllMyStuff is a windowed GUI with no console of its own, so
+/// without `CREATE_NO_WINDOW` every status read pops a stack of `sc.exe`
+/// console windows for a frame (the reported flicker). This mirrors the flag
+/// the inventory / terminal / node crates already set on their Windows spawns.
+/// A no-op off Windows — `systemctl` / `launchctl` never open a window.
+fn command(argv: &[String]) -> Command {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Run a command, surfacing its stdout/stderr, and fail if it does.
 fn run_checked(argv: &[String]) -> Result<()> {
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
+    let status = command(argv)
         .status()
         .map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
@@ -831,12 +851,12 @@ fn run_checked(argv: &[String]) -> Result<()> {
 /// Run a command, ignoring failure and output. For teardown steps that are
 /// fine to be no-ops (already stopped/unloaded).
 fn run_quiet(argv: &[String]) {
-    let _ = Command::new(&argv[0]).args(&argv[1..]).output();
+    let _ = command(argv).output();
 }
 
 /// Run a command and capture (exit code, stdout, stderr).
 fn capture(argv: &[String]) -> (i32, String, String) {
-    match Command::new(&argv[0]).args(&argv[1..]).output() {
+    match command(argv).output() {
         Ok(out) => (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),

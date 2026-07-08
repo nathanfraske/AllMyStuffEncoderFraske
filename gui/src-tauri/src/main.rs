@@ -1694,8 +1694,14 @@ fn service_mutate_blocking(verb: &str) -> Result<Value, String> {
          -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
          catch {{ exit 1223 }}"
     );
+    // CREATE_NO_WINDOW: the GUI has no console, so a bare `powershell` spawn
+    // would flash one for the frame it runs (the elevated child is already
+    // hidden via `-WindowStyle Hidden`). Matches the flag the service crate
+    // sets on its own Windows spawns.
+    use std::os::windows::process::CommandExt as _;
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .creation_flags(0x0800_0000)
         .output()
         .map_err(|e| format!("launching elevated AllMyStuff: {e}"))?;
     let code = out.status.code().unwrap_or(-1);
