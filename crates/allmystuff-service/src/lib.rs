@@ -826,18 +826,16 @@ fn command(argv: &[String]) -> Command {
 
 /// Run a command, surfacing its stdout/stderr, and fail if it does.
 fn run_checked(argv: &[String]) -> Result<()> {
-    let status = command(argv)
-        .status()
-        .map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                anyhow!(
-                    "`{}` not found — is it installed and on your PATH?",
-                    argv[0]
-                )
-            } else {
-                anyhow!("failed to run `{}`: {e}", argv.join(" "))
-            }
-        })?;
+    let status = command(argv).status().map_err(|e| {
+        if e.kind() == ErrorKind::NotFound {
+            anyhow!(
+                "`{}` not found — is it installed and on your PATH?",
+                argv[0]
+            )
+        } else {
+            anyhow!("failed to run `{}`: {e}", argv.join(" "))
+        }
+    })?;
     if !status.success() {
         bail!(
             "`{}` failed (exit {})",
