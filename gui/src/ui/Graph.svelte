@@ -70,13 +70,10 @@
         : "Your devices";
 
   function fleetKeyOf(n: MeshNode): { key: string; label: string } {
-    // CEC Support: a customer a technician dialed carries its own group name
-    // ("CEC Support") straight from the snapshot, so it seats there rather than
-    // under a fleet or "Unknown fleet". It's never one of the technician's own
-    // devices, so this short-circuit can't touch the "mine" grouping.
-    if (n.cecGroup) {
-      return { key: `cec:${n.cecGroup}`, label: n.cecGroup };
-    }
+    // A CEC customer a technician dialed is just an ordinary mesh peer here: the
+    // CEC mesh is Silent (no roster), so there is no "CEC Support" fleet to seat
+    // it under. It groups by its own standing like any other peer, and the CEC
+    // tab lists dialed customers from CEC state instead.
     // Group by the authoritative `standing()` — the same roster-driven verdict
     // the drawer and every claim/fleet button read — NOT the node's stored
     // `relationship.kind` or its self-advertised `owner`. Those are stale: an

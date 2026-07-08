@@ -1349,13 +1349,15 @@ pub async fn dispatch(
             json_result(mesh.cec_revoke(tech).await)
         }
         "cec_grants" => json_result(mesh.cec_grants().await),
-        // The per-node gear "Forget this node" — general (drops any node from
-        // the graph/roster + tears its session down) and CEC-aware (also ends a
-        // CEC session). Both names map to the same op so either client can call
-        // it.
-        "cec_forget_node" | "forget_node" => {
+        "cec_dialed" => json_result(mesh.cec_dialed().await),
+        // "Forget this node" is an app-wide feature on every node's gear (drops
+        // any node from the graph/roster + tears its session down). It lives on
+        // the general `forget_node` op; `cec_forget_node` is kept as an alias so
+        // the CEC client app's existing calls still resolve. The op itself layers
+        // CEC cleanup on only when the peer is actually a CEC customer/technician.
+        "forget_node" | "cec_forget_node" => {
             let node: String = try_arg!(arg(a, "node"));
-            json_result(mesh.cec_forget_node(node).await)
+            json_result(mesh.forget_node(node).await)
         }
 
         // ---- park store --------------------------------------------------

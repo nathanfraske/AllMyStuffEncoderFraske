@@ -166,11 +166,6 @@ export interface MeshNode {
    *  label "Casey's fleet" without resolving the owner device from the
    *  catalog. Absent means unknown. */
   fleetOwner?: string;
-  /** The graph "fleet" group this node is shown under when it isn't an
-   *  ordinary fleet — set to `"CEC Support"` for a customer a technician has
-   *  dialed via CEC Support (from the snapshot's `cecGroup`, itself derived
-   *  from the node's dialed CEC set). Absent on every ordinary node. */
-  cecGroup?: string;
 }
 
 /** The mesh capability tag that marks a node as a real AllMyStuff app node

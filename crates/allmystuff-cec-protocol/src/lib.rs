@@ -101,10 +101,6 @@ pub const ROLE_CLIENT_TAG: &str = "cec-client";
 /// Capability tag identifying a technician (help-desk) node.
 pub const ROLE_TECH_TAG: &str = "cec-tech";
 
-/// The graph "fleet" group a dialed customer is shown under on a technician's
-/// AllMyStuff device graph.
-pub const CEC_FLEET_GROUP: &str = "CEC Support";
-
 /// Seconds in the "Auto-Approve for 3 hours" window.
 pub const THREE_HOURS_SECS: u64 = 3 * 60 * 60;
 

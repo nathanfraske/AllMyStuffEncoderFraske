@@ -1256,7 +1256,8 @@ async fn cec_status(state: State<'_, AppState>) -> Result<Value, String> {
 }
 
 /// Technician: dial a customer by number, joining their secret Silent mesh and
-/// placing them in the CEC Support fleet group. Returns `{ node }`.
+/// connecting to the one peer there (which then shows as an ordinary graph
+/// peer). Returns `{ node }`.
 #[tauri::command]
 async fn cec_dial(
     state: State<'_, AppState>,

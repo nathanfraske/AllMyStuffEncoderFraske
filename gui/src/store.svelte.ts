@@ -164,6 +164,7 @@ import {
   cecDeny,
   cecRevoke,
   cecGrants,
+  cecDialed,
   forgetNode,
   onCecRequest,
   onCecPeer,
@@ -172,6 +173,7 @@ import {
   type CecStatus,
   type CecPending,
   type CecGrant,
+  type CecPeer,
   type CecScope,
   type ServiceActionResult,
   type ServiceStatus,
@@ -240,8 +242,8 @@ export type SettingsTab =
   | "sharing"
   | "always_on"
   | "updates"
-  // The secret CEC Support tab — only shown when this install is in the CEC
-  // technician context (see `App.cecRevealed`).
+  // The secret CEC Support tab — shown only when a technician reveals it with
+  // the hidden keyboard gesture (see `App.cecRevealed`).
   | "cec";
 
 /** Sub-pane within the Networks settings tab. The all-devices roster used to
@@ -501,11 +503,10 @@ class AppStore {
   settingsTab = $state<SettingsTab>("networks");
   // ---- CEC Support (technician-side remote help desk) --------------
   //
-  // The secret CEC tab and its state. The tab is revealed when this install is
-  // in the CEC technician context: either the user unlocked it (a persisted
-  // flag, toggled by the secret gesture in App.svelte) or the node already
-  // reports a CEC role/number. The Agent Name persists locally so it survives a
-  // restart and is sent with every dial.
+  // The secret CEC tab and its state. The tab is a purely manual show/hide,
+  // toggled by the hidden keyboard gesture (Ctrl+Alt+Shift+C in App.svelte) and
+  // persisted — the node's CEC role/number never auto-reveals it. The Agent Name
+  // persists locally so it survives a restart and is sent with every dial.
   cecEnabled = $state(loadCecEnabled());
   cecStatusInfo = $state<CecStatus | null>(null);
   /** The technician's Agent Name — what a customer sees in the connect prompt.
@@ -521,14 +522,15 @@ class AppStore {
   cecGrantList = $state<CecGrant[]>([]);
   /** Inbound technician requests awaiting this customer's choice. */
   cecRequests = $state<CecPending[]>([]);
-  /** Whether the secret CEC tab should show in Settings — the reveal
-   *  condition. True once unlocked, or once the node reports a CEC number/role.
-   */
-  cecRevealed = $derived(
-    this.cecEnabled ||
-      (this.cecStatusInfo?.role === "technician") ||
-      (!!this.cecStatusInfo?.number && this.cecStatusInfo.hosting),
-  );
+  /** Customers this technician has dialed — the CEC tab's "Active connections"
+   *  list. Read from CEC state (`cec_dialed`), not from the graph: a dialed
+   *  customer is an ordinary peer with no special grouping (the CEC mesh is
+   *  Silent, so there is no roster to build a "fleet" from). */
+  cecCustomers = $state<CecPeer[]>([]);
+  /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
+   *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
+   *  Node CEC status/role deliberately does *not* auto-reveal it. */
+  cecRevealed = $derived(this.cecEnabled);
   /** The "a new device wants to join" approval popup (the code-grid nudge). */
   approvalsOpen = $state(false);
   /** The "claim a device" sheet — the forefront adoption surface, opened from
@@ -1350,9 +1352,9 @@ class AppStore {
     await onSession((snap) => this.applySessionSnapshot(snap));
     // CEC Support: keep the tab's state live. A technician trying to connect
     // (customer side) queues a request + toasts; a dialed customer's node
-    // updating (technician side) refreshes the graph; a session/grant change
-    // keeps the tab in step. The reveal condition also reads the node's CEC
-    // status once, so a build already in the CEC context shows the tab.
+    // updating (technician side) refreshes the graph + the "Active connections"
+    // list; a session/grant change keeps the tab in step. (The tab's visibility
+    // is the manual keyboard-gesture reveal — it isn't driven by these events.)
     await onCecRequest((r) => {
       this.cecRequests = [r, ...this.cecRequests.filter((p) => p.tech !== r.tech)];
       this.toast("info", `${r.agent_name || "A technician"} is trying to connect (code ${r.verification_code})`);
@@ -1968,9 +1970,6 @@ class AppStore {
       // own. Absent (an older peer, or not in a fleet) leaves them undefined.
       node.fleetName = p.fleet_name || undefined;
       node.fleetOwner = p.fleet_owner || undefined;
-      // CEC Support: a customer this technician dialed carries the "CEC Support"
-      // fleet group, so the graph seats it there instead of "Unknown fleet".
-      node.cecGroup = p.cecGroup || undefined;
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -6575,16 +6574,17 @@ class AppStore {
     }
   }
 
-  /** Pull the node's CEC status + grants + pending requests. */
+  /** Pull the node's CEC status + grants + pending requests + dialed customers. */
   async loadCec() {
     this.cecStatusInfo = await cecStatus();
     this.cecGrantList = await cecGrants();
     this.cecRequests = await cecPending();
+    this.cecCustomers = await cecDialed();
   }
 
   /** Technician: dial a customer by the number they read out. On success the
-   *  customer appears on the graph in the CEC Support group; a toast reports
-   *  the outcome either way. */
+   *  customer appears on the graph as an ordinary peer and in the CEC tab's
+   *  "Active connections" list; a toast reports the outcome either way. */
   async dialCec() {
     const number = this.cecNumberDraft.trim();
     if (!number) {

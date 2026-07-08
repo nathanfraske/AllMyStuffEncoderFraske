@@ -2546,25 +2546,13 @@ impl Mesh {
         };
         let me = session.me().to_string();
         let network = st.network.clone();
-        // Peers as JSON, annotated with the CEC Support fleet group for any
-        // customer this node dialed — the graph reads `cecGroup` to seat the
-        // customer under "CEC Support" (see `gui/src/ui/Graph.svelte`). Absent
-        // on every ordinary peer, so nothing else changes.
+        // A CEC customer a technician dialed is an ordinary mesh peer here, with
+        // no special grouping: the CEC mesh is Silent (no roster), so there is no
+        // "fleet" to seat it under. The CEC tab lists dialed customers from CEC
+        // state (`cec_dialed`), not from the graph.
         let peers: Vec<Value> = session
             .peers()
-            .map(|p| {
-                let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
-                let canon = crate::cec::pubkey_part(p.node.as_str());
-                if self.cec.is_dialed(canon) {
-                    if let Value::Object(map) = &mut v {
-                        map.insert(
-                            "cecGroup".to_string(),
-                            json!(allmystuff_cec_protocol::CEC_FLEET_GROUP),
-                        );
-                    }
-                }
-                v
-            })
+            .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
             .collect();
         let routes: Vec<_> = session.routes().collect();
         // Durable shares (person + unioned grants) so the GUI reclassifies a
@@ -2592,14 +2580,15 @@ impl Mesh {
     // ---- CEC Support (technician + customer) --------------------------
     //
     // CEC Support rides this exact engine: the technician joins a customer's
-    // secret **Silent** mesh (named after the number), dials the one peer there
-    // with `connect_peer`, and drops it into the "CEC Support" fleet group on
-    // the graph; from then on it's an ordinary AllMyStuff peer with the normal
-    // screen/control features. The only substitution is trust — a CEC route is
-    // authorized by the customer's live consent grant ([`crate::cec`]) rather
-    // than owner/fleet, checked per frame in [`Self::sender_may_drive`] so a
-    // revoke bites mid-session. Every command mirrors the node-control surface
-    // the CEC client app and this app's CEC tab both depend on verbatim.
+    // secret **Silent** mesh (named after the number) and dials the one peer
+    // there with `connect_peer`; from then on that customer is an ordinary
+    // AllMyStuff graph peer with the normal screen/control features (no special
+    // grouping — a Silent mesh has no roster). The only substitution is trust —
+    // a CEC route is authorized by the customer's live consent grant
+    // ([`crate::cec`]) rather than owner/fleet, checked per frame in
+    // [`Self::sender_may_drive`] so a revoke bites mid-session. Every command
+    // mirrors the node-control surface the CEC client app and this app's CEC tab
+    // both depend on verbatim.
 
     /// `cec_status`: this node's CEC snapshot — its own support number + Silent
     /// room, its role (client/technician), and whether it's hosting.
@@ -2645,9 +2634,9 @@ impl Mesh {
     }
 
     /// `cec_dial` (technician): derive the customer's Silent room from `number`,
-    /// join it, discover the one customer peer, `connect_peer` to it, place it in
-    /// the CEC Support fleet group, and send the connect-request stamped with
-    /// `agent_name`. Returns `{ node }`.
+    /// join it, discover the one customer peer, `connect_peer` to it, record it
+    /// as a dialed customer (an ordinary graph peer — no fleet group), and send
+    /// the connect-request stamped with `agent_name`. Returns `{ node }`.
     pub async fn cec_dial(
         self: &Arc<Self>,
         number: String,
@@ -2821,7 +2810,7 @@ impl Mesh {
         }
         // Tear down any live routes with the technician, exactly like forgetting
         // a node.
-        self.cec_teardown_peer(&canonical).await;
+        self.teardown_and_drop_peer(&canonical).await;
         self.cec_emit_grants();
         Ok(json!({ "revoked": removed }))
     }
@@ -2831,21 +2820,46 @@ impl Mesh {
         Ok(Value::Array(self.cec.grants()))
     }
 
-    /// `cec_forget_node` / `forget_node` (general): drop `node` from the graph +
-    /// roster, tear its session/route down, and — when it's a CEC customer this
-    /// technician dialed, or a CEC technician this customer approved — end the
-    /// CEC session too.
-    pub async fn cec_forget_node(self: &Arc<Self>, node: String) -> Result<Value, String> {
+    /// `cec_dialed` (technician): the customers this node has dialed, for the
+    /// CEC tab's "Active connections" list. Dialed customers are ordinary graph
+    /// peers — this is CEC state, not a graph grouping.
+    pub async fn cec_dialed(&self) -> Result<Value, String> {
+        Ok(Value::Array(self.cec.dialed_list()))
+    }
+
+    /// `forget_node` — an **app-wide** feature on every node's gear, not a CEC
+    /// one: drop `node` from the graph + roster and tear its live routes down.
+    /// Any AllMyStuff node can forget any peer this way. When the peer happens to
+    /// be a CEC customer this technician dialed (or a CEC technician this
+    /// customer approved), [`Self::cec_forget_cleanup`] also unwinds that CEC
+    /// state — but the core teardown is identical for every node.
+    pub async fn forget_node(self: &Arc<Self>, node: String) -> Result<Value, String> {
         let canonical = crate::cec::pubkey_part(&node).to_string();
-        // CEC technician side: drop the dialed customer from the CEC group.
-        let was_dialed = self.cec.forget_dialed(&canonical);
-        // CEC customer side: a forget of a technician is also a revoke.
-        let _ = self.cec.revoke(&node);
-        self.cec_teardown_peer(&canonical).await;
-        // Best-effort: if the node lived only on a CEC Silent mesh, leave it so
-        // it stops re-appearing (a dial creates a per-customer room).
+        // App-wide: tear down live routes to the peer and drop it from the
+        // roster on whatever network it was reachable on.
+        self.teardown_and_drop_peer(&canonical).await;
+        // CEC add-on: a no-op for an ordinary node.
+        self.cec_forget_cleanup(&node, &canonical).await;
+        self.emit_snapshot();
+        Ok(json!({ "forgotten": node }))
+    }
+
+    // ---- CEC internals ------------------------------------------------
+
+    /// CEC-specific cleanup layered onto [`Self::forget_node`] — a no-op for an
+    /// ordinary (non-CEC) peer. Revokes any grant for `node` (customer side),
+    /// drops the dialed record (technician side), and leaves the customer's
+    /// per-number Silent room so it stops re-appearing. The room id is read
+    /// *before* the dialed record is dropped, since dropping it forgets the room.
+    async fn cec_forget_cleanup(self: &Arc<Self>, node: &str, canonical: &str) {
+        // Capture the customer's Silent room before `forget_dialed` removes the
+        // record it lives on.
+        let dialed_network = self.cec.dialed_network(canonical);
+        let was_dialed = self.cec.forget_dialed(canonical);
+        // Customer side: forgetting a technician is also a revoke.
+        let _ = self.cec.revoke(node);
         if was_dialed {
-            if let Some(network_id) = self.cec.dialed_network(&canonical) {
+            if let Some(network_id) = dialed_network {
                 let _ = self
                     .client
                     .request(&Request::NetworkRemove {
@@ -2857,11 +2871,7 @@ impl Mesh {
             }
         }
         self.cec_emit_grants();
-        self.emit_snapshot();
-        Ok(json!({ "forgotten": node }))
     }
-
-    // ---- CEC internals ------------------------------------------------
 
     /// Join a Silent mesh via the daemon and re-subscribe this session's
     /// channels onto it.
@@ -3000,8 +3010,8 @@ impl Mesh {
 
     /// Tear down every live route with a peer (by canonical id) and drop it from
     /// the daemon roster on whatever network it was reachable on — the shared
-    /// body of "Forget this node" and "Forget this technician".
-    async fn cec_teardown_peer(self: &Arc<Self>, canonical: &str) {
+    /// body of the app-wide "Forget this node" and CEC's "Forget this technician".
+    async fn teardown_and_drop_peer(self: &Arc<Self>, canonical: &str) {
         let route_ids: Vec<String> = {
             let st = self.state.lock();
             match st.session.as_ref() {
