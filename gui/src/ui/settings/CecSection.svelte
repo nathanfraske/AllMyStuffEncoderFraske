@@ -73,7 +73,7 @@
   <!-- Connect to a customer -->
   <section class="block">
     <div class="title">Connect to a customer</div>
-    <p class="hint">Type the number the customer read out (e.g. <code>XY40-0SHD</code>).</p>
+    <p class="hint">Type the number the customer read out (e.g. <code>123 456 789</code>).</p>
     <form class="dial" onsubmit={connect}>
       <input
         class="field mono"

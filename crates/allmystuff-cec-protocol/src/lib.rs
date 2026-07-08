@@ -56,7 +56,7 @@ pub use media::{
 pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, SupportPresence};
 
 /// Prefix for a customer's per-number `network_id`. The full id is
-/// [`network_id_for_number`]; e.g. number `XY400SHD` → `"cec-xy400shd"`. Every
+/// [`network_id_for_number`]; e.g. number `123456789` → `"cec-123456789"`. Every
 /// CEC mesh id starts with this so they're easy to recognise and never collide
 /// with a customer's own AllMyStuff fleet networks.
 pub const CEC_NETWORK_PREFIX: &str = "cec-";
