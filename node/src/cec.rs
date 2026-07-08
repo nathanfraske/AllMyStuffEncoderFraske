@@ -492,6 +492,34 @@ impl Cec {
     pub fn session_state(&self, session_id: &str) -> Option<String> {
         self.inner.lock().sessions.get(session_id).cloned()
     }
+
+    /// Whether a pending connect-request is already recorded for `session_id`.
+    /// The technician retransmits its Request every 2s until answered, so this
+    /// lets the customer refresh the pending record on each beat *without*
+    /// re-raising the approval prompt every time.
+    pub fn has_pending_session(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .pending
+            .iter()
+            .any(|p| p.session_id == session_id)
+    }
+
+    /// The scope of the customer's live grant for `tech`, if any — used to
+    /// re-send an Approve when a retransmitted Request shows the first one never
+    /// reached the technician. `None` only when no grant is held; the technician
+    /// ignores the scope on an Approve (it merely moves the session to active),
+    /// so the caller can default it.
+    pub fn active_scope_for(&self, tech: &str) -> Option<ApprovalScope> {
+        let inner = self.inner.lock();
+        let key = pubkey_part(tech);
+        inner
+            .consent
+            .active_grants(now_secs())
+            .into_iter()
+            .find(|g| pubkey_part(&g.technician) == key)
+            .map(|g| g.scope)
+    }
 }
 
 /// The customer-facing scope word for a grant (the `cec_grants` shape) —
