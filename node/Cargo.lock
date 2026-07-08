@@ -27,6 +27,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-cec-consent"
+version = "0.2.19"
+dependencies = [
+ "allmystuff-cec-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "allmystuff-cec-protocol"
+version = "0.2.19"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "allmystuff-graph"
 version = "0.2.19"
 dependencies = [
@@ -49,6 +68,8 @@ name = "allmystuff-node"
 version = "0.2.19"
 dependencies = [
  "allmystuff-bridge",
+ "allmystuff-cec-consent",
+ "allmystuff-cec-protocol",
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-pixels",

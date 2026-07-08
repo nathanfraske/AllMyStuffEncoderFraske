@@ -1314,6 +1314,50 @@ pub async fn dispatch(
             }
         }
 
+        // ---- CEC Support -------------------------------------------------
+        // The verbatim node-control surface the CEC Support client app and this
+        // app's CEC tab both depend on. Technician commands (`cec_dial`) and
+        // customer commands (`cec_start_hosting`, the approve/deny/revoke flow)
+        // share the one dispatch; the events (`cec://request|peer|session|
+        // grants`) ride the UiSink like every other engine event.
+        "cec_status" => json_result(mesh.cec_status().await),
+        "cec_start_hosting" => json_result(mesh.cec_start_hosting().await),
+        "cec_stop_hosting" => json_result(mesh.cec_stop_hosting().await),
+        "cec_dial" => {
+            let number: String = try_arg!(arg(a, "number"));
+            let agent_name: String = try_arg!(opt(a, "agent_name")).unwrap_or_default();
+            json_result(mesh.cec_dial(number, agent_name).await)
+        }
+        "cec_pending" => json_result(mesh.cec_pending().await),
+        "cec_approve" => {
+            let tech: String = try_arg!(arg(a, "tech"));
+            let scope: String = try_arg!(arg(a, "scope"));
+            let session_id: String = try_arg!(arg(a, "session_id"));
+            let want_control: bool = try_arg!(opt(a, "want_control")).unwrap_or(true);
+            json_result(
+                mesh.cec_approve(tech, scope, session_id, want_control)
+                    .await,
+            )
+        }
+        "cec_deny" => {
+            let tech: String = try_arg!(arg(a, "tech"));
+            let session_id: String = try_arg!(arg(a, "session_id"));
+            json_result(mesh.cec_deny(tech, session_id).await)
+        }
+        "cec_revoke" => {
+            let tech: String = try_arg!(arg(a, "tech"));
+            json_result(mesh.cec_revoke(tech).await)
+        }
+        "cec_grants" => json_result(mesh.cec_grants().await),
+        // The per-node gear "Forget this node" — general (drops any node from
+        // the graph/roster + tears its session down) and CEC-aware (also ends a
+        // CEC session). Both names map to the same op so either client can call
+        // it.
+        "cec_forget_node" | "forget_node" => {
+            let node: String = try_arg!(arg(a, "node"));
+            json_result(mesh.cec_forget_node(node).await)
+        }
+
         // ---- park store --------------------------------------------------
         "disabled_networks" => DispatchOut::Json(Value::Array(disabled.list())),
         "network_set_enabled" => {

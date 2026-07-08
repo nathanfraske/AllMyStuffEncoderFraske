@@ -1238,6 +1238,140 @@ async fn fleet_mfa_disable(state: State<'_, AppState>, code: String) -> Result<V
         .map_err(|e| e.to_string())
 }
 
+// ---- CEC Support -------------------------------------------------------
+//
+// Thin passthroughs to the node's `cec_*` control commands (the verbatim
+// surface the CEC Support client app and the CEC settings tab both use). The
+// `cec://*` events reach the frontend through the existing event pump, which
+// forwards every `UiSink::emit` by name.
+
+/// This node's CEC snapshot: its support number, Silent room, role, hosting.
+#[tauri::command]
+async fn cec_status(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_status", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Technician: dial a customer by number, joining their secret Silent mesh and
+/// placing them in the CEC Support fleet group. Returns `{ node }`.
+#[tauri::command]
+async fn cec_dial(
+    state: State<'_, AppState>,
+    number: String,
+    agent_name: Option<String>,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "cec_dial",
+            json!({ "number": number, "agent_name": agent_name }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: start hosting on this device's own number-derived Silent mesh.
+#[tauri::command]
+async fn cec_start_hosting(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_start_hosting", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: stop hosting (standing consent grants are kept).
+#[tauri::command]
+async fn cec_stop_hosting(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_stop_hosting", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: the inbound technician connect-requests awaiting a choice.
+#[tauri::command]
+async fn cec_pending(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_pending", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: approve a technician at a scope (once / three_hours / forever).
+#[tauri::command]
+async fn cec_approve(
+    state: State<'_, AppState>,
+    tech: String,
+    scope: String,
+    session_id: String,
+    want_control: bool,
+) -> Result<Value, String> {
+    state
+        .node
+        .request(
+            "cec_approve",
+            json!({
+                "tech": tech,
+                "scope": scope,
+                "session_id": session_id,
+                "want_control": want_control,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: decline a pending connect-request.
+#[tauri::command]
+async fn cec_deny(
+    state: State<'_, AppState>,
+    tech: String,
+    session_id: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_deny", json!({ "tech": tech, "session_id": session_id }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: "Forget this technician" — revoke every grant and tear down.
+#[tauri::command]
+async fn cec_revoke(state: State<'_, AppState>, tech: String) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_revoke", json!({ "tech": tech }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Customer: the live consent grants.
+#[tauri::command]
+async fn cec_grants(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_grants", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The per-node gear "Forget this node": drop it from the graph + roster, tear
+/// its session down, and end any CEC session.
+#[tauri::command]
+async fn forget_node(state: State<'_, AppState>, node: String) -> Result<Value, String> {
+    state
+        .node
+        .request("forget_node", json!({ "node": node }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Fan one room-plane message (invite / join / leave / chat) out to the
 /// given members. Best-effort per member; returns how many the daemon
 /// actually dispatched to, so the UI can say when a line reached nobody.
@@ -2085,6 +2219,16 @@ fn main() {
             fleet_mfa_status,
             fleet_mfa_enroll,
             fleet_mfa_disable,
+            cec_status,
+            cec_dial,
+            cec_start_hosting,
+            cec_stop_hosting,
+            cec_pending,
+            cec_approve,
+            cec_deny,
+            cec_revoke,
+            cec_grants,
+            forget_node,
             mesh_status,
             mesh_identity,
             mesh_networks,

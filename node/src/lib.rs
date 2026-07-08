@@ -49,6 +49,7 @@ pub mod audio;
 pub mod byte_queues;
 #[cfg(feature = "host")]
 pub mod camera_capture;
+pub mod cec;
 #[cfg(feature = "host")]
 pub mod clipboard;
 #[cfg(not(feature = "host"))]

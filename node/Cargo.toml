@@ -124,6 +124,11 @@ allmystuff-protocol = { path = "../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../crates/allmystuff-bridge" }
 allmystuff-session = { path = "../crates/allmystuff-session" }
 allmystuff-updater = { path = "../crates/allmystuff-updater" }
+# CEC Support: the wire contract (Support-ID derivation, Silent-mesh constants,
+# the connect/approve messages) and the customer's per-technician consent store
+# (Approve Once / 3 hours / Forever, with per-frame enforcement + revoke).
+allmystuff-cec-protocol = { path = "../crates/allmystuff-cec-protocol" }
+allmystuff-cec-consent = { path = "../crates/allmystuff-cec-consent" }
 
 # Cross-platform audio capture + playback for the media plane — CoreAudio
 # on macOS, WASAPI on Windows, ALSA on Linux.

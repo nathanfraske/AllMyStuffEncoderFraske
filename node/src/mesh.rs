@@ -306,6 +306,13 @@ pub struct Mesh {
     /// being silently re-joined — the network can't be left, so the park
     /// store is the only "off" it has, and it has to stick.
     disabled_networks: Mutex<Option<Arc<crate::networks_store::DisabledNetworks>>>,
+    /// CEC Support state — the technician's dialed customers + Agent Name, and
+    /// the customer's consent store + pending connect-requests. Empty and inert
+    /// on a node that never joins the CEC ecosystem; when it does, its per-frame
+    /// gate ([`Mesh::sender_may_drive`]) additively consults the consent store
+    /// so a dialed technician's screen/input rides the very same engine, trusted
+    /// by a live grant instead of owner/fleet. See [`crate::cec`].
+    cec: crate::cec::Cec,
 }
 
 /// One captured-audio packet headed for the forwarder, in whichever
@@ -515,6 +522,7 @@ impl Mesh {
             video_lane_pins: Mutex::new(HashMap::new()),
             video_lane_binds: Mutex::new(HashMap::new()),
             disabled_networks: Mutex::new(None),
+            cec: crate::cec::Cec::new(crate::cec::consent_store_path()),
         })
     }
 
@@ -1802,6 +1810,34 @@ impl Mesh {
                         // routes (`None` plane) are never refused here.
                         let authorized = route_drive_plane(route)
                             .is_none_or(|plane| self.sender_may_drive(&from, plane));
+                        // CEC screen gate: a customer only lets a dialed
+                        // technician view its screen while a live consent grant
+                        // covers it — the screen twin of the per-plane
+                        // `sender_may_drive` gate (an ordinary Display route is
+                        // `plane: None`, so it wouldn't otherwise be screened
+                        // here).
+                        if hosts_here
+                            && matches!(route.media, MediaKind::Display | MediaKind::Video)
+                            && self.cec_screen_offer_denied(&from)
+                        {
+                            tracing::warn!(
+                                "CEC screen offer {} from {} refused: no live consent grant",
+                                route.id,
+                                short_id(&from)
+                            );
+                            let _ = self
+                                .send_control(
+                                    &from,
+                                    &ControlMessage::Route(RouteControl::Reject {
+                                        route_id: route.id.clone(),
+                                        reason: "the customer hasn't approved screen sharing \
+                                                 for you (or revoked it)"
+                                            .into(),
+                                    }),
+                                )
+                                .await;
+                            return;
+                        }
                         if let Some(reason) =
                             privileged_offer_refusal(route, hosts_here, authorized)
                         {
@@ -2018,6 +2054,13 @@ impl Mesh {
                     self.sink
                         .emit("allmystuff://room", json!({ "from": from, "message": msg }));
                 }
+            }
+            // CEC Support's own control channel (`cec.control`) — the
+            // connect/approve/deny/end handshake. Distinct from AllMyStuff's
+            // `CHANNEL_CONTROL` so CEC traffic never crosses into an ordinary
+            // route negotiation.
+            other if other == allmystuff_cec_protocol::CHANNEL_CONTROL => {
+                self.handle_cec_control(from, payload).await;
             }
             _ => {}
         }
@@ -2503,7 +2546,26 @@ impl Mesh {
         };
         let me = session.me().to_string();
         let network = st.network.clone();
-        let peers: Vec<_> = session.peers().collect();
+        // Peers as JSON, annotated with the CEC Support fleet group for any
+        // customer this node dialed — the graph reads `cecGroup` to seat the
+        // customer under "CEC Support" (see `gui/src/ui/Graph.svelte`). Absent
+        // on every ordinary peer, so nothing else changes.
+        let peers: Vec<Value> = session
+            .peers()
+            .map(|p| {
+                let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+                let canon = crate::cec::pubkey_part(p.node.as_str());
+                if self.cec.is_dialed(canon) {
+                    if let Value::Object(map) = &mut v {
+                        map.insert(
+                            "cecGroup".to_string(),
+                            json!(allmystuff_cec_protocol::CEC_FLEET_GROUP),
+                        );
+                    }
+                }
+                v
+            })
+            .collect();
         let routes: Vec<_> = session.routes().collect();
         // Durable shares (person + unioned grants) so the GUI reclassifies a
         // peer as *shared* with its grants across a restart, rather than
@@ -2525,6 +2587,514 @@ impl Mesh {
             .session
             .as_ref()
             .and_then(|s| s.route(route_id).map(|r| r.peer.to_string()))
+    }
+
+    // ---- CEC Support (technician + customer) --------------------------
+    //
+    // CEC Support rides this exact engine: the technician joins a customer's
+    // secret **Silent** mesh (named after the number), dials the one peer there
+    // with `connect_peer`, and drops it into the "CEC Support" fleet group on
+    // the graph; from then on it's an ordinary AllMyStuff peer with the normal
+    // screen/control features. The only substitution is trust — a CEC route is
+    // authorized by the customer's live consent grant ([`crate::cec`]) rather
+    // than owner/fleet, checked per frame in [`Self::sender_may_drive`] so a
+    // revoke bites mid-session. Every command mirrors the node-control surface
+    // the CEC client app and this app's CEC tab both depend on verbatim.
+
+    /// `cec_status`: this node's CEC snapshot — its own support number + Silent
+    /// room, its role (client/technician), and whether it's hosting.
+    pub async fn cec_status(&self) -> Result<Value, String> {
+        let me = self.resolve_local_id().await;
+        Ok(self.cec.status(me.as_deref()))
+    }
+
+    /// `cec_start_hosting` (customer): join this device's own number-derived
+    /// Silent mesh, advertise a [`SupportPresence`], and listen for inbound
+    /// technician connect-requests. Returns `{ number }`.
+    pub async fn cec_start_hosting(self: &Arc<Self>) -> Result<Value, String> {
+        let me = self
+            .resolve_local_id()
+            .await
+            .ok_or_else(|| "this device has no mesh identity yet".to_string())?;
+        let number = self.cec.set_hosting(true, Some(&me));
+        let (network_id, config) = crate::cec::silent_network_config(&number);
+        self.cec_join_silent(&network_id, config).await?;
+        self.cec_broadcast_presence(&network_id, &me, crate::cec::pubkey_part(&me).to_string())
+            .await;
+        tracing::info!("CEC Support: hosting on {network_id} as number {number}");
+        Ok(json!({ "number": number }))
+    }
+
+    /// `cec_stop_hosting` (customer): stop advertising and leave the Silent
+    /// mesh, without dropping any standing consent grants.
+    pub async fn cec_stop_hosting(self: &Arc<Self>) -> Result<Value, String> {
+        let me = self.resolve_local_id().await;
+        self.cec.set_hosting(false, me.as_deref());
+        if let Some(me) = me {
+            let network_id = allmystuff_cec_protocol::network_id_for_device(&me);
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove {
+                    network: network_id,
+                    purge: false,
+                })
+                .await;
+            self.sync_networks().await;
+        }
+        Ok(Value::Null)
+    }
+
+    /// `cec_dial` (technician): derive the customer's Silent room from `number`,
+    /// join it, discover the one customer peer, `connect_peer` to it, place it in
+    /// the CEC Support fleet group, and send the connect-request stamped with
+    /// `agent_name`. Returns `{ node }`.
+    pub async fn cec_dial(
+        self: &Arc<Self>,
+        number: String,
+        agent_name: String,
+    ) -> Result<Value, String> {
+        if !agent_name.trim().is_empty() {
+            self.cec.set_agent_name(agent_name.clone());
+        }
+        let agent_name = if agent_name.trim().is_empty() {
+            self.cec.agent_name()
+        } else {
+            agent_name
+        };
+        let (network_id, config) = crate::cec::silent_network_config(&number);
+        self.cec.set_dialed_network(network_id.clone());
+        self.cec_join_silent(&network_id, config).await?;
+
+        // A Silent mesh auto-dials nobody, so the customer only *appears*
+        // (Sighted) — find it, then deliberately connect_peer.
+        let customer = self.cec_discover_customer(&network_id).await?;
+        let canonical = crate::cec::pubkey_part(&customer).to_string();
+        self.client
+            .request(&Request::NetworkConnectPeer {
+                network: network_id.clone(),
+                peer: canonical.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|resp| {
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(resp
+                        .error
+                        .unwrap_or_else(|| "connect_peer refused by the daemon".into()))
+                }
+            })?;
+
+        let label = self.cec_peer_label(&canonical).unwrap_or_default();
+        let record = self.cec.record_dialed(
+            &canonical,
+            customer.clone(),
+            number.clone(),
+            label,
+            true,
+            network_id.clone(),
+        );
+        tracing::info!(
+            "CEC Support: dialed customer {} on {network_id}",
+            short_id(&customer)
+        );
+
+        // The connect handshake — the customer's node raises the 3-choice prompt
+        // from this.
+        let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
+        let want_control = true;
+        let _ = self
+            .cec_send_control(
+                &network_id,
+                &canonical,
+                &allmystuff_cec_protocol::ControlMessage::Connect(
+                    allmystuff_cec_protocol::ConnectControl::Request {
+                        session_id: session_id.clone(),
+                        agent_name,
+                        want_control,
+                    },
+                ),
+            )
+            .await;
+        self.cec.set_session(&session_id, "requested");
+        self.sink.emit("cec://peer", record.to_value());
+        self.sink.emit(
+            "cec://session",
+            json!({ "session_id": session_id, "state": "requested" }),
+        );
+        self.emit_snapshot();
+        Ok(json!({ "node": customer }))
+    }
+
+    /// `cec_pending` (customer): the inbound connect-requests awaiting a choice.
+    pub async fn cec_pending(&self) -> Result<Value, String> {
+        Ok(Value::Array(self.cec.pending()))
+    }
+
+    /// `cec_approve` (customer): record the chosen `scope` grant for `tech` and
+    /// drive the mesh approval so the session goes Active. The grant is what the
+    /// per-frame gate then consults, so the technician's screen/input rides the
+    /// normal engine.
+    pub async fn cec_approve(
+        self: &Arc<Self>,
+        tech: String,
+        scope: String,
+        session_id: String,
+        want_control: bool,
+    ) -> Result<Value, String> {
+        let scope = crate::cec::parse_scope(&scope)?;
+        let agent_name = self.cec.pending_agent_name(&tech);
+        self.cec.approve(&tech, &agent_name, scope, want_control)?;
+        self.cec.set_session(&session_id, "active");
+        let canonical = crate::cec::pubkey_part(&tech).to_string();
+        if let Some(network_id) = self.network_for_peer(&tech) {
+            let _ = self
+                .cec_send_control(
+                    &network_id,
+                    &canonical,
+                    &allmystuff_cec_protocol::ControlMessage::Connect(
+                        allmystuff_cec_protocol::ConnectControl::Approve {
+                            session_id: session_id.clone(),
+                            scope,
+                        },
+                    ),
+                )
+                .await;
+        }
+        self.sink.emit(
+            "cec://session",
+            json!({ "session_id": session_id, "state": "active" }),
+        );
+        self.cec_emit_grants();
+        Ok(Value::Null)
+    }
+
+    /// `cec_deny` (customer): decline a pending request (no grant recorded).
+    pub async fn cec_deny(
+        self: &Arc<Self>,
+        tech: String,
+        session_id: String,
+    ) -> Result<Value, String> {
+        self.cec.deny(&tech);
+        self.cec.set_session(&session_id, "denied");
+        let canonical = crate::cec::pubkey_part(&tech).to_string();
+        if let Some(network_id) = self.network_for_peer(&tech) {
+            let _ = self
+                .cec_send_control(
+                    &network_id,
+                    &canonical,
+                    &allmystuff_cec_protocol::ControlMessage::Connect(
+                        allmystuff_cec_protocol::ConnectControl::Deny {
+                            session_id: session_id.clone(),
+                            reason: "declined".into(),
+                        },
+                    ),
+                )
+                .await;
+        }
+        self.sink.emit(
+            "cec://session",
+            json!({ "session_id": session_id, "state": "denied" }),
+        );
+        Ok(Value::Null)
+    }
+
+    /// `cec_revoke` (customer): "Forget this technician" — drop every grant and
+    /// tear the session down. The consent revoke bites the next privileged frame
+    /// even if this wire End is lost.
+    pub async fn cec_revoke(self: &Arc<Self>, tech: String) -> Result<Value, String> {
+        let removed = self.cec.revoke(&tech)?;
+        let canonical = crate::cec::pubkey_part(&tech).to_string();
+        if let Some(network_id) = self.network_for_peer(&tech) {
+            let _ = self
+                .cec_send_control(
+                    &network_id,
+                    &canonical,
+                    &allmystuff_cec_protocol::ControlMessage::Connect(
+                        allmystuff_cec_protocol::ConnectControl::End {
+                            session_id: String::new(),
+                        },
+                    ),
+                )
+                .await;
+        }
+        // Tear down any live routes with the technician, exactly like forgetting
+        // a node.
+        self.cec_teardown_peer(&canonical).await;
+        self.cec_emit_grants();
+        Ok(json!({ "revoked": removed }))
+    }
+
+    /// `cec_grants` (customer): the live consent grants.
+    pub async fn cec_grants(&self) -> Result<Value, String> {
+        Ok(Value::Array(self.cec.grants()))
+    }
+
+    /// `cec_forget_node` / `forget_node` (general): drop `node` from the graph +
+    /// roster, tear its session/route down, and — when it's a CEC customer this
+    /// technician dialed, or a CEC technician this customer approved — end the
+    /// CEC session too.
+    pub async fn cec_forget_node(self: &Arc<Self>, node: String) -> Result<Value, String> {
+        let canonical = crate::cec::pubkey_part(&node).to_string();
+        // CEC technician side: drop the dialed customer from the CEC group.
+        let was_dialed = self.cec.forget_dialed(&canonical);
+        // CEC customer side: a forget of a technician is also a revoke.
+        let _ = self.cec.revoke(&node);
+        self.cec_teardown_peer(&canonical).await;
+        // Best-effort: if the node lived only on a CEC Silent mesh, leave it so
+        // it stops re-appearing (a dial creates a per-customer room).
+        if was_dialed {
+            if let Some(network_id) = self.cec.dialed_network(&canonical) {
+                let _ = self
+                    .client
+                    .request(&Request::NetworkRemove {
+                        network: network_id,
+                        purge: true,
+                    })
+                    .await;
+                self.sync_networks().await;
+            }
+        }
+        self.cec_emit_grants();
+        self.emit_snapshot();
+        Ok(json!({ "forgotten": node }))
+    }
+
+    // ---- CEC internals ------------------------------------------------
+
+    /// Join a Silent mesh via the daemon and re-subscribe this session's
+    /// channels onto it.
+    async fn cec_join_silent(
+        self: &Arc<Self>,
+        network_id: &str,
+        config: Value,
+    ) -> Result<(), String> {
+        let resp = self
+            .client
+            .request(&Request::NetworkAdd { config })
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.ok {
+            return Err(resp
+                .error
+                .unwrap_or_else(|| format!("couldn't join the CEC mesh {network_id}")));
+        }
+        self.sync_networks().await;
+        Ok(())
+    }
+
+    /// Discover the single customer peer on a freshly-joined Silent mesh —
+    /// `Silent` makes peers *visible* (Sighted / `PeersList`) without a
+    /// connection, so we can pick the one there before dialing it.
+    async fn cec_discover_customer(self: &Arc<Self>, network_id: &str) -> Result<String, String> {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+        let me = self.resolve_local_id().await.unwrap_or_default();
+        let by = std::time::Instant::now() + DEADLINE;
+        loop {
+            if let Some(peer) = self.cec_first_peer(network_id, &me).await {
+                return Ok(peer);
+            }
+            if std::time::Instant::now() > by {
+                return Err(
+                    "no customer answered on that number — check the number, and that the \
+                     customer's CEC Support app is running and sharing"
+                        .into(),
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// The first non-self peer the daemon reports on `network_id` (bare pubkey).
+    async fn cec_first_peer(&self, network_id: &str, me: &str) -> Option<String> {
+        let resp = self
+            .client
+            .request(&Request::PeersList {
+                network: network_id.to_string(),
+            })
+            .await
+            .ok()?;
+        let peers = resp.data?.get("peers")?.as_array()?.clone();
+        let me_canon = crate::cec::pubkey_part(me);
+        peers.iter().find_map(|p| {
+            let id = p.get("device_id").and_then(|v| v.as_str())?;
+            if crate::cec::pubkey_part(id) == me_canon {
+                return None;
+            }
+            Some(id.to_string())
+        })
+    }
+
+    /// Send one CEC [`ControlMessage`](allmystuff_cec_protocol::ControlMessage)
+    /// on the `cec.control` channel to `peer` (bare pubkey) on `network`.
+    async fn cec_send_control(
+        &self,
+        network: &str,
+        peer: &str,
+        message: &allmystuff_cec_protocol::ControlMessage,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.to_string(),
+                channel: allmystuff_cec_protocol::CHANNEL_CONTROL.to_string(),
+                peer: crate::cec::pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp
+                .error
+                .unwrap_or_else(|| "cec control send failed".into()))
+        }
+    }
+
+    /// Advertise a [`SupportPresence`](allmystuff_cec_protocol::SupportPresence)
+    /// beacon on the CEC presence channel, so a technician on this room can find
+    /// this customer.
+    async fn cec_broadcast_presence(&self, network: &str, me: &str, _canonical: String) {
+        let mut presence = allmystuff_cec_protocol::SupportPresence::new(
+            me.to_string(),
+            allmystuff_cec_protocol::Role::Client,
+        );
+        presence.label = self
+            .state
+            .lock()
+            .profile
+            .as_ref()
+            .map(|p| p.label.clone())
+            .unwrap_or_default();
+        presence.hostname = allmystuff_inventory::scan().host.hostname;
+        presence.sent_at = unix_now_ms() / 1000;
+        let payload = match serde_json::to_value(&presence) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendAll {
+                network: network.to_string(),
+                channel: allmystuff_cec_protocol::CHANNEL_PRESENCE.to_string(),
+                payload,
+            })
+            .await;
+    }
+
+    /// The best-known label for a peer by canonical id, from the live session.
+    fn cec_peer_label(&self, canonical: &str) -> Option<String> {
+        let st = self.state.lock();
+        let session = st.session.as_ref()?;
+        let label = session
+            .peers()
+            .find(|p| crate::cec::pubkey_part(p.node.as_str()) == canonical)
+            .map(|p| p.label.clone())
+            .filter(|l| !l.is_empty());
+        label
+    }
+
+    /// Tear down every live route with a peer (by canonical id) and drop it from
+    /// the daemon roster on whatever network it was reachable on — the shared
+    /// body of "Forget this node" and "Forget this technician".
+    async fn cec_teardown_peer(self: &Arc<Self>, canonical: &str) {
+        let route_ids: Vec<String> = {
+            let st = self.state.lock();
+            match st.session.as_ref() {
+                Some(session) => session
+                    .routes()
+                    .filter(|r| crate::cec::pubkey_part(r.peer.as_str()) == canonical)
+                    .map(|r| r.route.id.clone())
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        for id in route_ids {
+            let _ = self.disconnect(id).await;
+        }
+        if let Some(network) = self.network_for_peer(canonical) {
+            let _ = self
+                .client
+                .request(&Request::RosterRemove {
+                    network,
+                    device_id: canonical.to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Emit the customer's current grant list (`cec://grants`).
+    fn cec_emit_grants(&self) {
+        self.sink
+            .emit("cec://grants", json!({ "grants": self.cec.grants() }));
+    }
+
+    /// Handle one inbound CEC control message (the `cec.control` channel).
+    /// Customer side: a `Request` raises the 3-choice prompt (`cec://request`);
+    /// technician side: an `Approve`/`Deny`/`End` moves the session.
+    async fn handle_cec_control(self: &Arc<Self>, from: String, payload: Value) {
+        let msg: allmystuff_cec_protocol::ControlMessage = match serde_json::from_value(payload) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("dropping CEC control from {}: {e}", short_id(&from));
+                return;
+            }
+        };
+        if let allmystuff_cec_protocol::ControlMessage::Connect(connect) = msg {
+            match connect {
+                allmystuff_cec_protocol::ConnectControl::Request {
+                    session_id,
+                    agent_name,
+                    want_control,
+                } => {
+                    let verification_code = crate::cec::verification_code(&from, &session_id);
+                    let req = crate::cec::PendingRequest {
+                        tech: from.clone(),
+                        agent_name: agent_name.clone(),
+                        want_control,
+                        session_id: session_id.clone(),
+                        verification_code: verification_code.clone(),
+                    };
+                    self.cec.record_pending(req);
+                    self.sink.emit(
+                        "cec://request",
+                        json!({
+                            "tech": from,
+                            "agent_name": agent_name,
+                            "want_control": want_control,
+                            "session_id": session_id,
+                            "verification_code": verification_code,
+                        }),
+                    );
+                }
+                allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
+                    self.cec.set_session(&session_id, "active");
+                    self.sink.emit(
+                        "cec://session",
+                        json!({ "session_id": session_id, "state": "active" }),
+                    );
+                }
+                allmystuff_cec_protocol::ConnectControl::Deny { session_id, .. } => {
+                    self.cec.set_session(&session_id, "denied");
+                    self.sink.emit(
+                        "cec://session",
+                        json!({ "session_id": session_id, "state": "denied" }),
+                    );
+                }
+                allmystuff_cec_protocol::ConnectControl::End { session_id } => {
+                    self.cec.set_session(&session_id, "ended");
+                    self.sink.emit(
+                        "cec://session",
+                        json!({ "session_id": session_id, "state": "ended" }),
+                    );
+                }
+                allmystuff_cec_protocol::ConnectControl::Unknown => {}
+            }
+        }
     }
 
     // ---- shares (durable, person-scoped grants) -----------------------
@@ -4975,6 +5545,12 @@ impl Mesh {
             CHANNEL_CONTROL,
             CHANNEL_MEDIA,
             CHANNEL_ROOMS,
+            // CEC Support rides the same engine on its own channels; subscribing
+            // everywhere is harmless (they're empty on non-CEC meshes) and means
+            // a CEC Silent mesh is live for connect-requests the moment it's
+            // joined.
+            allmystuff_cec_protocol::CHANNEL_CONTROL,
+            allmystuff_cec_protocol::CHANNEL_PRESENCE,
         ];
         for network in networks {
             for channel in channels {
@@ -7635,6 +8211,21 @@ impl Mesh {
         if self.sender_may_control(sender) {
             return true;
         }
+        // CEC Support: a dialed technician holds no fleet membership, so the
+        // owner/fleet check above fails for them. Instead the customer's **live
+        // consent grant** authorizes each privileged plane — the exact
+        // per-frame substitution the CEC design calls for. It only ever
+        // *widens* access (the owner/fleet path already ran and said no), and a
+        // revoke bites the next frame because `is_allowed` reads the store fresh
+        // against the clock. Every drive plane (input, terminal, files, sites,
+        // clipboard) maps to the `Control` capability; screen *viewing* is
+        // gated separately at the Display offer.
+        if self
+            .cec
+            .is_allowed(sender, allmystuff_cec_consent::Capability::Control)
+        {
+            return true;
+        }
         let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
             return false;
         };
@@ -7642,6 +8233,21 @@ impl Mesh {
             .out_grants_for(&person.id)
             .iter()
             .any(|g| grant_authorizes_plane(g, plane))
+    }
+
+    /// Whether a **screen-viewing** (`Display`/`Video`) offer from `sender` is
+    /// authorized under CEC. Returns `Some(false)` only when this node is a CEC
+    /// customer *and* `sender` is a CEC technician it hasn't granted screen
+    /// view — the one case a screen offer must be refused. `None` means CEC
+    /// doesn't apply (an ordinary AllMyStuff screen share), so the normal path
+    /// decides. This is the screen twin of the per-frame `Control` gate above:
+    /// a revoke closes it the next time an offer (or re-offer) is screened.
+    fn cec_screen_offer_denied(&self, sender: &str) -> bool {
+        self.cec.is_hosting()
+            && self.cec.knows_technician(sender)
+            && !self
+                .cec
+                .is_allowed(sender, allmystuff_cec_consent::Capability::ScreenView)
     }
 
     /// Media keeps arriving for a route this side doesn't hold live — our

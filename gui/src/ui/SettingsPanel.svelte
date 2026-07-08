@@ -12,16 +12,21 @@
   import SharingSection from "./settings/SharingSection.svelte";
   import DevicesSection from "./settings/DevicesSection.svelte";
   import AlwaysOnSection from "./settings/AlwaysOnSection.svelte";
+  import CecSection from "./settings/CecSection.svelte";
 
   // Ordered to match the model's flow — venue → mesh → fleet → sharing — the
   // same sequence the "How it connects" explainer teaches. Devices (the
   // all-machines roster) sits right under Sharing.
-  const tabs: { id: SettingsTab; label: string; icon: string }[] = [
+  const tabs = $derived<{ id: SettingsTab; label: string; icon: string }[]>([
     { id: "venues", label: "Venues", icon: "📡" },
     { id: "networks", label: "Meshes", icon: "🌐" },
     { id: "fleet", label: "Fleet", icon: "🔗" },
     { id: "sharing", label: "Sharing", icon: "🤝" },
     { id: "devices", label: "Devices", icon: "🖥" },
+    // The secret CEC Support tab — only present once this install is in the
+    // technician context (unlocked, or the node reports a CEC role). Placed
+    // near the end so it never crowds the everyday tabs.
+    ...(app.cecRevealed ? [{ id: "cec" as SettingsTab, label: "CEC Support", icon: "🛟" }] : []),
     // "Always On" is desktop-only: it manages an OS background service
     // (systemd / launchd / the Windows SCM) and window/tray behaviour, none of
     // which exist on the phone/tablet — where the backend doesn't even register
@@ -33,7 +38,7 @@
     // On the phone/tablet the App Store owns updates, so the pane is a plain
     // "About" (see UpdatesSection) — the nav entry matches.
     { id: "updates", label: isMobile() ? "About" : "Updates", icon: isMobile() ? "ℹ️" : "⬆️" },
-  ];
+  ]);
 
   function close() {
     app.settingsOpen = false;
@@ -42,6 +47,7 @@
     app.settingsTab = tab;
     if (tab === "updates") void app.loadUpdateStatus();
     if (tab === "fleet") void app.loadOwnedFleet();
+    if (tab === "cec") void app.loadCec();
     if (tab === "always_on") {
       void app.loadServiceStatus();
       void app.loadWindowBehavior();
@@ -78,6 +84,8 @@
         <SharingSection />
       {:else if app.settingsTab === "devices"}
         <DevicesSection />
+      {:else if app.settingsTab === "cec"}
+        <CecSection />
       {:else if app.settingsTab === "always_on" && !isMobile()}
         <AlwaysOnSection />
       {:else if app.settingsTab === "updates"}

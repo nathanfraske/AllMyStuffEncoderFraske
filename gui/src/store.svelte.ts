@@ -157,6 +157,22 @@ import {
   upgradeNode,
   windowBehaviorGet,
   windowBehaviorSet,
+  cecStatus,
+  cecDial,
+  cecPending,
+  cecApprove,
+  cecDeny,
+  cecRevoke,
+  cecGrants,
+  forgetNode,
+  onCecRequest,
+  onCecPeer,
+  onCecSession,
+  onCecGrants,
+  type CecStatus,
+  type CecPending,
+  type CecGrant,
+  type CecScope,
   type ServiceActionResult,
   type ServiceStatus,
   type SessionSnapshot,
@@ -223,7 +239,10 @@ export type SettingsTab =
   | "fleet"
   | "sharing"
   | "always_on"
-  | "updates";
+  | "updates"
+  // The secret CEC Support tab — only shown when this install is in the CEC
+  // technician context (see `App.cecRevealed`).
+  | "cec";
 
 /** Sub-pane within the Networks settings tab. The all-devices roster used to
  *  live here as a third "Devices" sub-tab; it's now a top-level Devices tab of
@@ -439,6 +458,26 @@ function loadConsoleControlMode(): "slider" | "pills" {
   }
 }
 
+/** Whether the secret CEC Support tab has been unlocked on this device
+ *  (persisted, toggled by the secret gesture in App.svelte). */
+function loadCecEnabled(): boolean {
+  try {
+    return localStorage.getItem("ams.cec.enabled") === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** The persisted technician Agent Name — the name a customer sees in the
+ *  connect prompt. */
+function loadCecAgentName(): string {
+  try {
+    return localStorage.getItem("ams.cec.agentName") ?? "";
+  } catch {
+    return "";
+  }
+}
+
 class AppStore {
   // Under the real app the graph is built entirely from the live scan + mesh
   // presence, so it starts empty and fills with *your* stuff. The demo
@@ -460,6 +499,36 @@ class AppStore {
    *  to the networks pane. */
   settingsOpen = $state(false);
   settingsTab = $state<SettingsTab>("networks");
+  // ---- CEC Support (technician-side remote help desk) --------------
+  //
+  // The secret CEC tab and its state. The tab is revealed when this install is
+  // in the CEC technician context: either the user unlocked it (a persisted
+  // flag, toggled by the secret gesture in App.svelte) or the node already
+  // reports a CEC role/number. The Agent Name persists locally so it survives a
+  // restart and is sent with every dial.
+  cecEnabled = $state(loadCecEnabled());
+  cecStatusInfo = $state<CecStatus | null>(null);
+  /** The technician's Agent Name — what a customer sees in the connect prompt.
+   *  Persisted in localStorage. */
+  cecAgentName = $state(loadCecAgentName());
+  /** Customer number the technician is about to dial (the tab's input). */
+  cecNumberDraft = $state("");
+  /** Whether a dial is in flight (disables the Connect button). */
+  cecDialing = $state(false);
+  /** Live CEC sessions this app is party to, newest first. */
+  cecSessions = $state<{ sessionId: string; state: string; node?: string }[]>([]);
+  /** The customer's live consent grants (populated when hosting). */
+  cecGrantList = $state<CecGrant[]>([]);
+  /** Inbound technician requests awaiting this customer's choice. */
+  cecRequests = $state<CecPending[]>([]);
+  /** Whether the secret CEC tab should show in Settings — the reveal
+   *  condition. True once unlocked, or once the node reports a CEC number/role.
+   */
+  cecRevealed = $derived(
+    this.cecEnabled ||
+      (this.cecStatusInfo?.role === "technician") ||
+      (!!this.cecStatusInfo?.number && this.cecStatusInfo.hosting),
+  );
   /** The "a new device wants to join" approval popup (the code-grid nudge). */
   approvalsOpen = $state(false);
   /** The "claim a device" sheet — the forefront adoption surface, opened from
@@ -1279,6 +1348,31 @@ class AppStore {
     // no-TURN verdict used to be invisible, a peer that was just… quiet.
     await onMeshEvent((e) => this.handleMeshDiag(e));
     await onSession((snap) => this.applySessionSnapshot(snap));
+    // CEC Support: keep the tab's state live. A technician trying to connect
+    // (customer side) queues a request + toasts; a dialed customer's node
+    // updating (technician side) refreshes the graph; a session/grant change
+    // keeps the tab in step. The reveal condition also reads the node's CEC
+    // status once, so a build already in the CEC context shows the tab.
+    await onCecRequest((r) => {
+      this.cecRequests = [r, ...this.cecRequests.filter((p) => p.tech !== r.tech)];
+      this.toast("info", `${r.agent_name || "A technician"} is trying to connect (code ${r.verification_code})`);
+    });
+    await onCecPeer(() => {
+      void this.pullSessionSnapshot();
+      void this.loadCec();
+    });
+    await onCecSession((s) => {
+      this.cecSessions = [
+        { sessionId: s.session_id, state: s.state },
+        ...this.cecSessions.filter((x) => x.sessionId !== s.session_id),
+      ];
+    });
+    await onCecGrants((grants) => {
+      this.cecGrantList = grants;
+    });
+    void cecStatus().then((s) => {
+      if (s) this.cecStatusInfo = s;
+    });
     // (The rooms plane — invites, join/leave presence, chat, knocks — and
     // its same-device sibling bus are subscribed at the top of init, before
     // the identity pull, so a room window can't join before onRoom listens.)
@@ -1874,6 +1968,9 @@ class AppStore {
       // own. Absent (an older peer, or not in a fleet) leaves them undefined.
       node.fleetName = p.fleet_name || undefined;
       node.fleetOwner = p.fleet_owner || undefined;
+      // CEC Support: a customer this technician dialed carries the "CEC Support"
+      // fleet group, so the graph seats it there instead of "Unknown fleet".
+      node.cecGroup = p.cecGroup || undefined;
       // A device that says *we* own it is ours; one owned by someone else
       // stays a guest/unclaimed (you can't flat-claim it). Never auto-flip a
       // relationship the user already set, and never auto-adopt.
@@ -6442,6 +6539,135 @@ class AppStore {
       void this.loadWindowBehavior();
       void this.loadAutostart();
     }
+    if (tab === "cec") void this.loadCec();
+  }
+
+  // ---- CEC Support -------------------------------------------------
+  //
+  // The technician side lives here (this app is the technician): dial a
+  // customer by number, list live sessions, disconnect. The customer-side
+  // approve/deny/revoke flow is wired too so a build hosting can answer the
+  // 3-choice prompt. All degrade to no-ops in web mode (the tauri helpers
+  // guard on `isTauri`), so the tab stays interactive in the browser preview.
+
+  /** Unlock (or re-lock) the secret CEC tab — the reveal gesture. Persists. */
+  toggleCecTab() {
+    this.cecEnabled = !this.cecEnabled;
+    try {
+      localStorage.setItem("ams.cec.enabled", this.cecEnabled ? "1" : "0");
+    } catch {
+      /* private mode — the unlock just doesn't persist */
+    }
+    if (this.cecEnabled) {
+      this.settingsTab = "cec";
+      this.settingsOpen = true;
+      void this.loadCec();
+    }
+  }
+
+  /** Persist the technician's Agent Name (sent with every dial). */
+  setCecAgentName(name: string) {
+    this.cecAgentName = name;
+    try {
+      localStorage.setItem("ams.cec.agentName", name);
+    } catch {
+      /* private mode — not persisted */
+    }
+  }
+
+  /** Pull the node's CEC status + grants + pending requests. */
+  async loadCec() {
+    this.cecStatusInfo = await cecStatus();
+    this.cecGrantList = await cecGrants();
+    this.cecRequests = await cecPending();
+  }
+
+  /** Technician: dial a customer by the number they read out. On success the
+   *  customer appears on the graph in the CEC Support group; a toast reports
+   *  the outcome either way. */
+  async dialCec() {
+    const number = this.cecNumberDraft.trim();
+    if (!number) {
+      this.toast("warn", "Enter the customer's number first");
+      return;
+    }
+    if (!this.cecAgentName.trim()) {
+      this.toast("warn", "Set your Agent Name first — the customer sees it");
+      return;
+    }
+    this.cecDialing = true;
+    try {
+      const r = await cecDial(number, this.cecAgentName.trim());
+      if (r?.node) {
+        this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
+        this.cecNumberDraft = "";
+        void this.pullSessionSnapshot();
+      } else {
+        this.toast("ok", `Dialed ${number}`);
+      }
+    } catch (e) {
+      this.toast("warn", `Couldn't reach ${number}: ${errMsg(e)}`);
+    } finally {
+      this.cecDialing = false;
+      void this.loadCec();
+    }
+  }
+
+  /** Customer: approve an inbound technician at a scope. */
+  async approveCecRequest(req: CecPending, scope: CecScope) {
+    try {
+      await cecApprove(req.tech, scope, req.session_id, req.want_control);
+      this.toast("ok", `Approved ${req.agent_name || "the technician"}`);
+    } catch (e) {
+      this.toast("warn", `Couldn't approve: ${errMsg(e)}`);
+    }
+    void this.loadCec();
+  }
+
+  /** Customer: decline an inbound technician. */
+  async denyCecRequest(req: CecPending) {
+    try {
+      await cecDeny(req.tech, req.session_id);
+    } catch (e) {
+      this.toast("warn", `Couldn't decline: ${errMsg(e)}`);
+    }
+    void this.loadCec();
+  }
+
+  /** Customer: "Forget this technician" — revoke every grant and tear down. */
+  async revokeCecTech(tech: string, agentName: string) {
+    try {
+      await cecRevoke(tech);
+      this.toast("ok", `Forgot ${agentName || "the technician"}`);
+    } catch (e) {
+      this.toast("warn", `Couldn't revoke: ${errMsg(e)}`);
+    }
+    void this.loadCec();
+  }
+
+  /** The per-node gear "Forget this node": drop it from the graph + roster,
+   *  tear its session down, end any CEC session. Removes it locally at once so
+   *  the graph reacts immediately; the next snapshot confirms. */
+  async forgetNode(nodeId: string) {
+    // Drop any live routes we hold to it, then the backend teardown.
+    const routes = this.catalog.routes.filter(
+      (r) => sameMachine(this.capNodeOf(r.from), nodeId) || sameMachine(this.capNodeOf(r.to), nodeId),
+    );
+    for (const r of routes) void this.disconnect(r.id);
+    try {
+      await forgetNode(nodeId);
+    } catch (e) {
+      this.toast("warn", `Couldn't forget it: ${errMsg(e)}`);
+      return;
+    }
+    // Drop it (and any other view of the same machine) from the local graph.
+    this.catalog.nodes = this.catalog.nodes.filter((n) => !sameMachine(n.id, nodeId));
+    this.catalog.capabilities = this.catalog.capabilities.filter(
+      (c) => !sameMachine(c.node, nodeId),
+    );
+    if (this.selectedNodeId && sameMachine(this.selectedNodeId, nodeId)) this.selectNode(null);
+    this.toast("ok", "Forgot this node");
+    void this.loadCec();
   }
 
   /** Open the "a new device wants to join" approval popup (the code grid). */
