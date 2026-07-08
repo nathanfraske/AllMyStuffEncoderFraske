@@ -497,14 +497,14 @@ pub fn parse_scope(s: &str) -> Result<ApprovalScope, String> {
 }
 
 /// A short, stable verification code for a connect attempt — the first 6
-/// Crockford symbols of the Support ID of the concatenated technician id and
-/// session id, so both ends compute the same code to read back out-of-band.
+/// digits of the Support ID of the concatenated technician id and session id,
+/// so both ends compute the same code to read back out-of-band.
 pub fn verification_code(tech: &str, session_id: &str) -> String {
     let code = support_id_from_device(&format!("{tech}:{session_id}"));
     code.chars().take(6).collect()
 }
 
-/// Grouped display of a support number, e.g. `XY40-0SHD` (cosmetic; the node
+/// Grouped display of a support number, e.g. `123 456 789` (cosmetic; the node
 /// derives rooms from the normalized form).
 pub fn grouped_number(number: &str) -> String {
     format_support_id(number)
@@ -601,13 +601,13 @@ mod tests {
         cec.record_dialed(
             canon,
             TECH.into(),
-            "XY400SHD".into(),
+            "123456789".into(),
             "Reception PC".into(),
             true,
-            "cec-xy400shd".into(),
+            "cec-123456789".into(),
         );
         assert!(cec.is_dialed(canon));
-        assert_eq!(cec.dialed_network(canon).as_deref(), Some("cec-xy400shd"));
+        assert_eq!(cec.dialed_network(canon).as_deref(), Some("cec-123456789"));
         assert!(cec.forget_dialed(canon));
         assert!(!cec.is_dialed(canon));
     }
