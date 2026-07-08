@@ -108,6 +108,11 @@ pub struct DialedCustomer {
     pub online: bool,
     /// The Silent mesh (`network_id_for_number`) the customer was dialed on.
     pub network_id: String,
+    /// Epoch seconds of the last time the technician actively used this
+    /// connection — a fresh dial, or the console session going active. Surfaced
+    /// to the CEC tab so a technician can spot (and clean up) connections gone
+    /// stale while keeping the ones they've reached for recently.
+    pub last_used: u64,
 }
 
 impl DialedCustomer {
@@ -118,6 +123,7 @@ impl DialedCustomer {
             "number": self.number,
             "label": self.label,
             "online": self.online,
+            "last_used": self.last_used,
         })
     }
 }
@@ -240,6 +246,7 @@ impl Cec {
         online: bool,
         network_id: String,
     ) -> DialedCustomer {
+        let now = now_secs();
         let mut inner = self.inner.lock();
         let entry = inner
             .dialed
@@ -250,6 +257,7 @@ impl Cec {
                 label: label.clone(),
                 online,
                 network_id: network_id.clone(),
+                last_used: now,
             });
         entry.node = node;
         entry.number = number;
@@ -258,6 +266,8 @@ impl Cec {
         }
         entry.online = online;
         entry.network_id = network_id;
+        // A (re)dial is a fresh use — keep the stale-connection metric honest.
+        entry.last_used = now;
         entry.clone()
     }
 
@@ -270,6 +280,18 @@ impl Cec {
             return None;
         }
         c.online = online;
+        Some(c.clone())
+    }
+
+    /// Stamp a dialed customer as just-used (`last_used = now`) — called when the
+    /// console session with them goes active, so the CEC tab's "last used"
+    /// reflects real activity, not just the original dial. Returns the updated
+    /// record (for a `cec://peer` re-emit); `None` for a customer we haven't
+    /// dialed.
+    pub fn touch_dialed(&self, canonical: &str) -> Option<DialedCustomer> {
+        let mut inner = self.inner.lock();
+        let c = inner.dialed.get_mut(canonical)?;
+        c.last_used = now_secs();
         Some(c.clone())
     }
 
@@ -615,6 +637,13 @@ mod tests {
         );
         assert!(cec.is_dialed(canon));
         assert_eq!(cec.dialed_network(canon).as_deref(), Some("cec-123456789"));
+        // The dial stamps a `last_used` the CEC tab renders as time-since — it's
+        // present, non-zero, and a `touch` refreshes the record for a re-emit.
+        let listed = cec.dialed_list();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0]["last_used"].as_u64().unwrap_or(0) > 0);
+        assert!(cec.touch_dialed(canon).is_some());
+        assert!(cec.touch_dialed("someone-we-never-dialed").is_none());
         assert!(cec.forget_dialed(canon));
         assert!(!cec.is_dialed(canon));
     }

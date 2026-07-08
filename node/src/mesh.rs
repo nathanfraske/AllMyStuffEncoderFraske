@@ -3104,6 +3104,13 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } => {
                     self.cec.set_session(&session_id, "active");
+                    // The customer just approved — this connection is now in
+                    // active use. Stamp its `last_used` (and re-emit the peer so
+                    // the CEC tab's time-since refreshes) so the technician's
+                    // stale-connection cleanup reflects real activity.
+                    if let Some(rec) = self.cec.touch_dialed(crate::cec::pubkey_part(&from)) {
+                        self.sink.emit("cec://peer", rec.to_value());
+                    }
                     self.sink.emit(
                         "cec://session",
                         json!({ "session_id": session_id, "state": "active" }),

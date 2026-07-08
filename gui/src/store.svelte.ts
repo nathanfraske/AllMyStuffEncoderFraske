@@ -233,6 +233,12 @@ import {
   type UpdateStatus,
 } from "./types";
 
+/** The `network_id` prefix every CEC Support customer room carries (mirrors the
+ *  node's `CEC_NETWORK_PREFIX` in allmystuff-cec-protocol). A technician joins
+ *  one of these per customer they dial; they're managed from the CEC tab, not
+ *  the Meshes list, so they're filtered out of "Your meshes". */
+const CEC_NETWORK_PREFIX = "cec-";
+
 /** Which pane the settings panel is showing. */
 export type SettingsTab =
   | "networks"
@@ -480,6 +486,23 @@ function loadCecAgentName(): string {
   }
 }
 
+/** localStorage key for the technician's private customer labels. */
+const CEC_ALIAS_STORE_KEY = "ams.cec.aliases";
+
+/** The technician's private customer labels (customer **number** → alias). Kept
+ *  GUI-side and keyed by the number (stable per customer) rather than the graph
+ *  node id, so a label survives a restart even though the dialed list — an
+ *  ephemeral, re-dialed-on-launch thing — does not. */
+function loadCecAliases(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(CEC_ALIAS_STORE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    return v && typeof v === "object" ? (v as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
 class AppStore {
   // Under the real app the graph is built entirely from the live scan + mesh
   // presence, so it starts empty and fills with *your* stuff. The demo
@@ -527,6 +550,16 @@ class AppStore {
    *  customer is an ordinary peer with no special grouping (the CEC mesh is
    *  Silent, so there is no roster to build a "fleet" from). */
   cecCustomers = $state<CecPeer[]>([]);
+  /** The technician's private customer labels (customer number → alias),
+   *  persisted GUI-side. Lets a tech name a customer something they'll remember
+   *  ("Dr Kim's front desk") independent of the machine's own hostname. */
+  cecAliases = $state<Record<string, string>>(loadCecAliases());
+  /** The dialed customers sorted most-recently-used first — the order the CEC
+   *  tab lists them in, so active connections stay at the top and stale ones
+   *  sink to where they're easy to prune. */
+  cecCustomersByRecent = $derived.by(() =>
+    [...this.cecCustomers].sort((a, b) => (b.last_used ?? 0) - (a.last_used ?? 0)),
+  );
   /** A customer just dialed, waiting for their approval: when their CEC session
    *  goes active, the technician's remote-control console opens for them (the
    *  AnyDesk-style "connect and you're in"). Cleared once opened. */
@@ -887,6 +920,20 @@ class AppStore {
   isLocalClaimMesh(net: { network_id?: string } | null | undefined): boolean {
     return net?.network_id === LOCAL_CLAIM_NETWORK_ID;
   }
+
+  /** Whether a mesh in the list is a **CEC Support customer room** — a
+   *  per-customer Silent mesh (`cec-…`) this technician joined by dialing a
+   *  number. These aren't ordinary meshes: they carry no roster, and you manage
+   *  them (open the console, disconnect) from the CEC tab, so the Meshes list
+   *  filters them out to keep client connections separate from your own meshes. */
+  isCecMesh(net: { network_id?: string } | null | undefined): boolean {
+    return !!net?.network_id && net.network_id.startsWith(CEC_NETWORK_PREFIX);
+  }
+
+  /** Your meshes minus the CEC Support customer rooms — what the Meshes list
+   *  actually shows. Client rooms live in the (secret) CEC tab instead, so a
+   *  technician manages their client connections apart from their own meshes. */
+  normalNetworks = $derived.by(() => this.networks.filter((n) => !this.isCecMesh(n)));
 
   /** The fleet owner's display name, read from the signed roster (the member
    *  whose role is "owner"). Lets every device — member, manager, owner — label
@@ -6605,6 +6652,28 @@ class AppStore {
     this.cecAgentName = name;
     try {
       localStorage.setItem("ams.cec.agentName", name);
+    } catch {
+      /* private mode — not persisted */
+    }
+  }
+
+  /** The name to show for a dialed customer: the technician's private alias if
+   *  they've set one, else the machine's own label, else a plain fallback. */
+  cecCustomerName(c: CecPeer): string {
+    const alias = this.cecAliases[c.number]?.trim();
+    return alias || c.label?.trim() || "Customer";
+  }
+
+  /** Set (or, with an empty string, clear) the technician's private label for a
+   *  customer, keyed by their number so it survives a restart. Persisted. */
+  setCecAlias(number: string, alias: string) {
+    const next = { ...this.cecAliases };
+    const trimmed = alias.trim();
+    if (trimmed) next[number] = trimmed;
+    else delete next[number];
+    this.cecAliases = next;
+    try {
+      localStorage.setItem(CEC_ALIAS_STORE_KEY, JSON.stringify(next));
     } catch {
       /* private mode — not persisted */
     }

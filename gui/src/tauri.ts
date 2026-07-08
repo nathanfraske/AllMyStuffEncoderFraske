@@ -1109,6 +1109,10 @@ export interface CecPeer {
   number: string;
   label: string;
   online: boolean;
+  /** Epoch **seconds** of the last time this connection was actively used (a
+   *  fresh dial, or the console session going active). The CEC tab renders it
+   *  as time-since so a technician can prune stale connections. */
+  last_used: number;
 }
 
 /** One standing consent grant a customer holds (the `cec_grants` rows + the
