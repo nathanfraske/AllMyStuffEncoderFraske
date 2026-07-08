@@ -185,8 +185,8 @@ check: fmt-check lint test node-check gui-check
 [doc("Cut a release: bump versions, commit, push, tag to trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
-    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock; then \
-        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock; \
+    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; then \
+        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json node/Cargo.toml node/Cargo.lock gui/mobile/Cargo.toml gui/mobile/Cargo.lock gui/mobile/tauri.conf.json gui/mobile/package.json; \
         git commit -m "chore(release): {{VERSION}}"; \
     fi
     @git push
