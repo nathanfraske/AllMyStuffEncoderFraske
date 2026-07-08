@@ -4,11 +4,12 @@
   //
   // The technician fills in their Agent Name (the name a customer sees in the
   // "*so-and-so* is trying to connect" prompt), types the number the customer
-  // read out, and connects — the customer then appears on the device graph in
-  // the "CEC Support" group with the normal screen/control features, gated by
-  // the customer approving this technician. The customer-side flow (answering
-  // the 3-choice prompt, the standing grant list) is shown too, so a build that
-  // hosts can drive it from here.
+  // read out, and connects — the customer then appears on the device graph as
+  // an ordinary peer with the normal screen/control features, gated by the
+  // customer approving this technician. The dialed customers are listed below
+  // from CEC state (not a graph group — the CEC mesh is Silent, no roster). The
+  // customer-side flow (answering the 3-choice prompt, the standing grant list)
+  // is shown too, so a build that hosts can drive it from here.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
   import { isTauri, type CecScope } from "../../tauri";
@@ -18,9 +19,10 @@
   const requests = $derived(app.cecRequests);
   const grants = $derived(app.cecGrantList);
 
-  // The customers this technician has dialed onto the graph — the live CEC
-  // connections, read straight from the CEC Support fleet group.
-  const customers = $derived(app.catalog.nodes.filter((n) => n.cecGroup));
+  // The customers this technician has dialed — the live CEC connections, read
+  // from CEC state (`cec_dialed`). Each is an ordinary graph peer; there is no
+  // "fleet group" to filter the graph by (the CEC mesh is Silent, no roster).
+  const customers = $derived(app.cecCustomers);
 
   const scopeLabel: Record<CecScope, string> = {
     once: "Approve Once",
@@ -42,8 +44,8 @@
   <h3>CEC Support</h3>
   <p class="lead">
     Remote help, one number at a time. Enter your agent name and the number the
-    customer read out — they appear on your device graph under
-    <b>CEC Support</b>, and you can view or control their screen once they approve.
+    customer read out — they appear on your device graph and in the list below,
+    and you can view or control their screen once they approve.
   </p>
 
   {#if web}
@@ -98,16 +100,16 @@
       <p class="notice">No customers connected. Dial a number above to start.</p>
     {:else}
       <ul class="rows">
-        {#each customers as c (c.id)}
+        {#each customers as c (c.node)}
           <li class="row">
             <span class="dot" class:on={c.online}></span>
             <span class="who">
-              <b>{c.label || c.hostname || "Customer"}</b>
+              <b>{c.label || c.number || "Customer"}</b>
               <span class="sub">{c.online ? "online" : "offline"}</span>
             </span>
             <div class="row-actions">
-              <button class="btn small" onclick={() => app.openConsole(c.id)}>Open screen</button>
-              <button class="btn small danger" onclick={() => app.forgetNode(c.id)}>Disconnect</button>
+              <button class="btn small" onclick={() => app.openConsole(c.node)}>Open screen</button>
+              <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Disconnect</button>
             </div>
           </li>
         {/each}

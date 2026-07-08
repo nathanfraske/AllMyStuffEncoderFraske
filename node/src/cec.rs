@@ -92,9 +92,10 @@ impl PendingRequest {
     }
 }
 
-/// One customer this technician has dialed and placed in the CEC Support fleet
-/// group on the graph (technician side). Keyed in [`CecInner::dialed`] by the
-/// customer's canonical (bare-pubkey) id.
+/// One customer this technician has dialed (technician side). Keyed in
+/// [`CecInner::dialed`] by the customer's canonical (bare-pubkey) id. A dialed
+/// customer is an ordinary mesh peer on the graph — the CEC tab lists these
+/// from CEC state ([`Cec::dialed_list`]), it is not a graph grouping.
 #[derive(Clone, Debug)]
 pub struct DialedCustomer {
     /// The customer's device id (as dialed).
@@ -153,8 +154,8 @@ struct CecInner {
     consent: ConsentStore,
     /// Inbound connect-requests awaiting the customer's decision.
     pending: Vec<PendingRequest>,
-    /// Customers this technician has dialed (canonical id → record) — the CEC
-    /// Support fleet group projected onto the graph.
+    /// Customers this technician has dialed (canonical id → record). Surfaced
+    /// to the CEC tab via [`Cec::dialed_list`]; each is a normal graph peer.
     dialed: HashMap<String, DialedCustomer>,
     /// Live session states by session id, for `cec://session`.
     sessions: HashMap<String, String>,
@@ -272,11 +273,24 @@ impl Cec {
         Some(c.clone())
     }
 
-    /// Whether `canonical` is a customer this technician has dialed — the graph
-    /// group predicate, so [`crate::mesh::Mesh::snapshot`] can tag the peer with
-    /// the CEC Support fleet group.
+    /// Whether `canonical` is a customer this technician has dialed. Used by
+    /// "Forget this node" to know a CEC customer needs its Silent room left too.
     pub fn is_dialed(&self, canonical: &str) -> bool {
         self.inner.lock().dialed.contains_key(canonical)
+    }
+
+    /// The customers this technician has dialed, projected for the CEC tab's
+    /// "Active connections" list (`cec_dialed`) — the same `{ node, number,
+    /// label, online }` shape as a `cec://peer` event. Each entry is an ordinary
+    /// mesh peer on the graph; the tab reads them from here rather than from any
+    /// graph grouping (there is none — the CEC mesh is Silent, with no roster).
+    pub fn dialed_list(&self) -> Vec<Value> {
+        self.inner
+            .lock()
+            .dialed
+            .values()
+            .map(DialedCustomer::to_value)
+            .collect()
     }
 
     /// The Silent mesh a dialed customer lives on, if any (for teardown).
@@ -288,8 +302,8 @@ impl Cec {
             .map(|c| c.network_id.clone())
     }
 
-    /// Drop a dialed customer from the CEC group ("Forget this node" on the
-    /// technician side). Returns `true` when one was actually removed.
+    /// Drop a customer this technician dialed (the CEC part of "Forget this
+    /// node"). Returns `true` when one was actually removed.
     pub fn forget_dialed(&self, canonical: &str) -> bool {
         self.inner.lock().dialed.remove(canonical).is_some()
     }

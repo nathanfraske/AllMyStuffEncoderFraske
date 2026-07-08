@@ -82,10 +82,6 @@ export interface SessionSnapshot {
      *  the human who owns the fleet, not the owner device's hostname. Absent
      *  (an older peer, or unknown) — empty. */
     fleet_owner?: string;
-    /** The CEC Support fleet group ("CEC Support"), present only for a customer
-     *  this technician dialed — the node tags it in the snapshot from its dialed
-     *  CEC set. Absent on every ordinary peer. */
-    cecGroup?: string;
   }>;
   routes?: Array<{
     route: { id: string; from: string; to: string; media: MediaKind };
@@ -1078,10 +1074,11 @@ export async function fleetMfaDisable(code: string): Promise<void> {
 // ---- CEC Support (the technician-side remote help desk) -----------------
 //
 // CEC Support is AnyDesk-like remote support riding the same mesh engine.
-// This app is the *technician*: joined to the CEC ecosystem it grows a secret
-// settings tab where an agent enters their name and a customer's number, dials
-// them onto the graph (in the "CEC Support" fleet group), and drives the normal
-// screen/control features — gated by the customer's live consent grant. All of
+// This app is the *technician*: after revealing the secret settings tab an
+// agent enters their name and a customer's number, dials them onto the graph
+// (as an ordinary peer — the CEC mesh is Silent, so there is no fleet group),
+// and drives the normal screen/control features — gated by the customer's live
+// consent grant. All of
 // these degrade to null/empty/no-op in web mode (no backend). The `cec://*`
 // events flow through the ordinary Tauri event bus (the node's event pump
 // forwards every emit by name).
@@ -1135,9 +1132,9 @@ export function cecStatus(): Promise<CecStatus | null> {
 }
 
 /** Technician: dial a customer by the number they read out. Joins their secret
- *  Silent mesh, connects to the one peer there, and drops it in the CEC Support
- *  fleet group. Throws with the backend's reason when nothing answered. Returns
- *  the customer's node id (null in web mode). */
+ *  Silent mesh and connects to the one peer there, which then shows on the graph
+ *  as an ordinary peer. Throws with the backend's reason when nothing answered.
+ *  Returns the customer's node id (null in web mode). */
 export async function cecDial(
   number: string,
   agentName: string,
@@ -1199,8 +1196,17 @@ export async function cecGrants(): Promise<CecGrant[]> {
   return Array.isArray(r) ? r : [];
 }
 
-/** The per-node gear "Forget this node": drop it from the graph + roster, tear
- *  its session down, and end any CEC session. No-op in web mode. */
+/** Technician: the customers this node has dialed — the CEC tab's "Active
+ *  connections" list. These are ordinary graph peers; the list comes from CEC
+ *  state, not from any graph grouping. Empty in web mode. */
+export async function cecDialed(): Promise<CecPeer[]> {
+  const r = await tryInvoke<CecPeer[]>("cec_dialed");
+  return Array.isArray(r) ? r : [];
+}
+
+/** "Forget this node" — an app-wide action on every node's gear: drop it from
+ *  the graph + roster and tear its session down (also ends a CEC session when
+ *  the node happens to be a CEC peer). No-op in web mode. */
 export async function forgetNode(node: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
