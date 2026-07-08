@@ -131,7 +131,85 @@ fn pick_relaunch(as_service: bool) -> fn() -> ! {
     reexec_self
 }
 
+/// One-shot CLI verbs `allmystuff-serve` answers *before* it would bind the
+/// control socket and become a node, keyed off the first argument:
+///
+///   * `--version` / `-V` — print `allmystuff-serve <version>`. A supervising
+///     app (e.g. the CEC Support app checking a reused node against its pinned
+///     AllMyStuff version) reads this the same way `daemon_spawn` reads
+///     `myownmesh --version`.
+///   * `update` — the self-updater: download the latest release and apply it in
+///     place, the same one-shot the fleet/`myownmesh update` path uses (this is
+///     what a below-pin `allmystuff-serve` is asked to run).
+///
+/// Returns `Some(code)` when a verb ran (main exits with it), `None` to carry on
+/// and run the node. `--service` / `--log` are flags, not verbs, so they fall
+/// through to the normal node path.
+fn run_cli_verb() -> Option<ExitCode> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => {
+            println!("allmystuff-serve {}", env!("CARGO_PKG_VERSION"));
+            Some(ExitCode::SUCCESS)
+        }
+        Some("update") => Some(run_update_now()),
+        _ => None,
+    }
+}
+
+/// Run `allmystuff_updater::update_now()` on a throwaway current-thread runtime
+/// and map the outcome to an exit code. Output goes to stdout so a supervising
+/// parent can fold it into its own log (the way `daemon_spawn::run_daemon_update`
+/// folds `myownmesh update`'s output).
+fn run_update_now() -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("allmystuff serve update: couldn't build a runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    rt.block_on(async {
+        match allmystuff_updater::update_now().await {
+            Ok(outcome) => {
+                println!("{}", render_update_now(&outcome));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("allmystuff serve update failed: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// A human line for an `update` outcome (also what the supervising parent logs).
+fn render_update_now(outcome: &allmystuff_updater::UpdateNowOutcome) -> String {
+    use allmystuff_updater::UpdateNowOutcome::*;
+    match outcome {
+        PackageManager => "installed by a package manager — update it through that".into(),
+        UpToDate { current, latest } => {
+            format!("already up to date (have {current}, latest {latest})")
+        }
+        Updated { to, components } => {
+            format!(
+                "updated to {to} ({}); restart to run it",
+                components.join(", ")
+            )
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // One-shot CLI verbs (`--version`, `update`) run before we touch logging or
+    // the control socket, and exit with their own code.
+    if let Some(code) = run_cli_verb() {
+        return code;
+    }
+
     // Windows registers this binary as `<exe> --service`; that flag is what
     // tells us to speak the SCM control protocol instead of running in the
     // foreground. Off Windows there's no such mode.

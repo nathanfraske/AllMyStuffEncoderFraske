@@ -26,7 +26,7 @@
 //! [`ControlClient::subscribe_events`]: crate::control_client::ControlClient::subscribe_events
 //! [`Mesh`]: crate::mesh::Mesh
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1576,7 +1576,7 @@ fn usable(p: &std::path::Path) -> bool {
 ///  5. `allmystuff-serve` on `$PATH` (an installed copy).
 ///
 /// Every candidate is checked with [`usable`] so a stub is skipped.
-fn find_node_binary() -> Option<PathBuf> {
+fn find_node_binary() -> Option<(PathBuf, NodeSource)> {
     let exe = format!("allmystuff-serve{}", std::env::consts::EXE_SUFFIX);
     let exe_triple = format!(
         "allmystuff-serve-{}{}",
@@ -1588,7 +1588,7 @@ fn find_node_binary() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("ALLMYSTUFF_SERVE_BIN") {
         let p = PathBuf::from(p);
         if usable(&p) {
-            return Some(p);
+            return Some((p, NodeSource::Override));
         }
     }
 
@@ -1597,17 +1597,22 @@ fn find_node_binary() -> Option<PathBuf> {
     for profile in ["release", "debug"] {
         let p = node_target.join(profile).join(&exe);
         if usable(&p) {
-            return Some(p);
+            return Some((p, NodeSource::DevBuild));
         }
     }
 
-    // 3. Bundled sidecar beside the running app binary (dev triple, then plain).
+    // 3. Bundled sidecar beside the running app binary. The triple-suffixed
+    //    name is Tauri's dev staging (a dev artifact); the plain name is the
+    //    production bundle an installed app ships — the one kind we keep current.
     if let Ok(cur) = std::env::current_exe() {
         if let Some(dir) = cur.parent() {
-            for name in [exe_triple.as_str(), exe.as_str()] {
+            for (name, source) in [
+                (exe_triple.as_str(), NodeSource::DevBuild),
+                (exe.as_str(), NodeSource::Installed),
+            ] {
                 let p = dir.join(name);
                 if usable(&p) {
-                    return Some(p);
+                    return Some((p, source));
                 }
             }
         }
@@ -1621,20 +1626,134 @@ fn find_node_binary() -> Option<PathBuf> {
             .join("binaries")
             .join(&exe_triple);
         if usable(&p) {
-            return Some(p);
+            return Some((p, NodeSource::DevBuild));
         }
     }
 
-    // 5. PATH.
+    // 5. PATH (an installed copy).
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(&exe);
             if usable(&candidate) {
-                return Some(candidate);
+                return Some((candidate, NodeSource::Installed));
             }
         }
     }
     None
+}
+
+/// Where [`find_node_binary`] found the `allmystuff-serve` node — decides
+/// whether it's ours to keep current against a caller's pin. Mirrors
+/// [`crate::daemon_spawn::DaemonSource`] for the node binary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NodeSource {
+    /// Explicit `ALLMYSTUFF_SERVE_BIN` override — deliberately pinned, never
+    /// touched.
+    Override,
+    /// An installed copy: the production bundle's sidecar beside the app, or an
+    /// `allmystuff-serve` on `$PATH`. The only kind we ask to self-update.
+    Installed,
+    /// A dev artifact (the sibling `node/target` build, the dev-staged sidecar,
+    /// the `build.rs` source slot) — never touched; self-updating one would
+    /// clobber a local build with a release download.
+    DevBuild,
+}
+
+/// `<bin> --version`, parsed to `(major, minor, patch)`. `None` when the binary
+/// won't answer or prints an unparseable line.
+async fn node_binary_version(bin: &Path) -> Option<(u64, u64, u64)> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    crate::daemon_spawn::parse_version_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `allmystuff-serve update` downloads a release binary — give it real time, but
+/// never wedge bring-up forever on a stalled network. Mirrors
+/// [`crate::daemon_spawn`]'s daemon-update budget.
+const NODE_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Run `<bin> update` (the node's own self-updater) and report whether the
+/// binary on disk now satisfies `want`. Output is folded into our log; failure
+/// never propagates (an old node still beats no node).
+async fn run_node_update(bin: &Path, want: (u64, u64, u64)) -> bool {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    match tokio::time::timeout(NODE_UPDATE_TIMEOUT, cmd.output()).await {
+        Err(_) => tracing::warn!(
+            "allmystuff-serve update didn't finish within {}s — continuing with what's on disk",
+            NODE_UPDATE_TIMEOUT.as_secs()
+        ),
+        Ok(Err(e)) => tracing::warn!("couldn't run allmystuff-serve update: {e}"),
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let said = stdout.trim();
+            if !said.is_empty() {
+                tracing::info!("allmystuff-serve update: {said}");
+            }
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!("allmystuff-serve update failed: {}", stderr.trim());
+            }
+        }
+    }
+    // The re-check decides — `update` may have been refused (package-managed),
+    // failed, or landed exactly the pin.
+    match node_binary_version(bin).await {
+        Some(have) => have >= want,
+        None => false,
+    }
+}
+
+/// When a caller pins a specific AllMyStuff version, make sure the node binary
+/// we're about to start meets it: an **Installed** `allmystuff-serve` reporting
+/// a version below the pin is asked to update itself (`allmystuff-serve update`)
+/// first. A dev/override binary is left alone, and a non-comparable pin (a
+/// sha/branch, not `vX.Y.Z`) is a no-op. This is the node-side twin of
+/// [`crate::daemon_spawn`]'s `ensure_daemon_current`.
+async fn ensure_node_current(bin: &Path, pin: &str) {
+    let Some(want) = crate::daemon_spawn::parse_semverish(pin) else {
+        return;
+    };
+    match node_binary_version(bin).await {
+        None => tracing::warn!(
+            "couldn't read {}'s version to compare against the {pin} pin",
+            bin.display()
+        ),
+        Some(have) if have >= want => {}
+        Some(have) => {
+            tracing::info!(
+                "allmystuff-serve at {} is v{} but this app pins {pin} — asking it to update itself (allmystuff-serve update)…",
+                bin.display(),
+                crate::daemon_spawn::fmt_ver(have)
+            );
+            if run_node_update(bin, want).await {
+                tracing::info!("allmystuff-serve is current — starting the updated node");
+            } else {
+                tracing::warn!(
+                    "couldn't bring allmystuff-serve up to {pin}; starting what's on disk — some pinned features may be unavailable. Update it by hand: allmystuff-serve update"
+                );
+            }
+        }
+    }
 }
 
 /// Make sure a node is running, spawning one if not. Returns `Ok(None)` when a
@@ -1643,17 +1762,60 @@ fn find_node_binary() -> Option<PathBuf> {
 /// [`crate::daemon_spawn::ensure_daemon_running`]'s shape; the GUI will call
 /// this in Phase B.
 pub async fn ensure_node_running() -> Result<Option<NodeChild>> {
+    ensure_node_running_pinned(None).await
+}
+
+/// Like [`ensure_node_running`], but the caller supplies the AllMyStuff version
+/// it was built against (its *pin*). A reused or about-to-be-spawned
+/// **Installed** `allmystuff-serve` older than that pin is asked to update
+/// itself first — the same "keep a sidecar you don't own current" move
+/// AllMyStuff makes for a reused `myownmesh` (see [`crate::daemon_spawn`]). The
+/// CEC Support app uses this so a separately-installed AllMyStuff node it reuses
+/// is brought up to the version CEC needs to work properly. `pin = None` is
+/// exactly [`ensure_node_running`]'s behaviour — no version check at all.
+pub async fn ensure_node_running_pinned(pin: Option<&str>) -> Result<Option<NodeChild>> {
     if NodeClient::probe().await {
         tracing::info!("existing allmystuff node found on the control socket");
+        // A node we didn't spawn is already serving. If the caller pins a
+        // version and the on-disk Installed binary is behind it, refresh it so
+        // the *next* start runs a current node — the running one keeps its
+        // version until it restarts (we can't restart a node we don't own).
+        if let Some(pin) = pin {
+            if let (Some((bin, NodeSource::Installed)), Some(want)) = (
+                find_node_binary(),
+                crate::daemon_spawn::parse_semverish(pin),
+            ) {
+                if node_binary_version(&bin)
+                    .await
+                    .map(|have| have < want)
+                    .unwrap_or(false)
+                {
+                    tracing::info!(
+                        "the reused allmystuff-serve is below the {pin} pin — updating it on disk for the next start…"
+                    );
+                    if run_node_update(&bin, want).await {
+                        tracing::warn!(
+                            "updated allmystuff-serve on disk, but the running node keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch to pick it up"
+                        );
+                    }
+                }
+            }
+        }
         return Ok(None);
     }
 
-    let bin = find_node_binary().ok_or_else(|| {
+    let (bin, source) = find_node_binary().ok_or_else(|| {
         anyhow!(
             "couldn't find the `allmystuff-serve` node binary — it normally ships beside \
              this app; put it on PATH or run `allmystuff serve` yourself"
         )
     })?;
+    // Keep an Installed node current against the caller's pin before starting
+    // it — a below-pin node answers the socket fine but silently lacks the
+    // features this app was built against.
+    if let (Some(pin), NodeSource::Installed) = (pin, source) {
+        ensure_node_current(&bin, pin).await;
+    }
     tracing::info!(?bin, "spawning allmystuff node");
 
     let mut cmd = Command::new(&bin);
