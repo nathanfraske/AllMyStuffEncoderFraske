@@ -2907,9 +2907,22 @@ impl Mesh {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.ok {
-            return Err(resp
-                .error
-                .unwrap_or_else(|| format!("couldn't join the CEC mesh {network_id}")));
+            let err = resp.error.unwrap_or_default();
+            // The daemon persists CEC rooms and auto-rejoins them at startup, so
+            // a re-host (or re-dial) hits "config id already in use" — that's
+            // success, not failure: we ARE on the room. Treating it as an error
+            // made `cec_start_hosting` bail before advertising presence (the
+            // customer then never shows up as a host) and blocked a re-dial from
+            // refreshing the room. Any *other* failure is still real.
+            if err.contains("already in use") || err.contains("already joined") {
+                self.sync_networks().await;
+                return Ok(());
+            }
+            return Err(if err.is_empty() {
+                format!("couldn't join the CEC mesh {network_id}")
+            } else {
+                err
+            });
         }
         self.sync_networks().await;
         Ok(())
