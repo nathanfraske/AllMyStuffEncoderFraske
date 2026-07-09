@@ -570,10 +570,10 @@ pub fn grouped_number(number: &str) -> String {
 /// Build the daemon `NetworkAdd` config for a CEC Support **Silent** mesh named
 /// after `number`. `Silent` auto-dials nobody and never gossips a roster — the
 /// customer is merely *discoverable* inside its own number-derived room, and the
-/// technician must `connect_peer` deliberately. The signaling app-id is forked
-/// ([`CEC_TRYSTERO_APP_ID`]) so CEC traffic never lands in an AllMyStuff room.
-///
-/// [`CEC_TRYSTERO_APP_ID`]: allmystuff_cec_protocol::CEC_TRYSTERO_APP_ID
+/// technician must `connect_peer` deliberately. The room is isolated by the
+/// per-number `network_id` (`cec-<number>`) alone: technician and customer both
+/// use the default signaling app-id, so they derive the same room handle and
+/// meet with no env override.
 pub fn silent_network_config(number: &str) -> (String, Value) {
     let network_id = network_id_for_number(number);
     let config = json!({
@@ -584,7 +584,6 @@ pub fn silent_network_config(number: &str) -> (String, Value) {
         // roster gossip — peers are only *visible* until `connect_peer`.
         "kind": "silent",
         "auto_approve": true,
-        "app_id": allmystuff_cec_protocol::CEC_TRYSTERO_APP_ID,
         "signaling": { "strategy": "nostr", "mdns": true },
     });
     (network_id, config)
