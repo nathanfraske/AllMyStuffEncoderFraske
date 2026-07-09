@@ -29,14 +29,14 @@
 //!
 //! ## Isolation from other MyOwnMesh ecosystems
 //!
-//! CEC Support forks the three MyOwnMesh interop constants so its traffic
-//! never lands in an AllMyStuff / MyOwnMesh / MyOwnLLM room and its signatures
-//! never cross-verify:
+//! CEC Support forks MyOwnMesh's signing tags and home dir so its signatures
+//! never cross-verify against an AllMyStuff / MyOwnMesh / MyOwnLLM mesh and its
+//! identity + state never collide with an existing install. It deliberately does
+//! *not* fork the signaling app-id: each support session is already isolated by
+//! its per-number `network_id` (`cec-<number>`), which seeds a distinct room
+//! handle, so technician and customer meet on the default app-id with no env
+//! override.
 //!
-//! - [`CEC_TRYSTERO_APP_ID`] (set as `MYOWNMESH_TRYSTERO_APP_ID`) — the
-//!   signaling app-id that seeds every room handle; a different app-id means
-//!   peers never meet. It is global to CEC (all customers share it), while the
-//!   `network_id` is per-customer, so each customer gets a distinct room.
 //! - [`CEC_SIGN_DOMAIN_TAG`] / [`CEC_SIGN_DOMAIN_TAG_STATE`] — domain-separated
 //!   signing tags.
 //! - [`CEC_HOME_ENV`] — a CEC-specific home dir (`MYOWNMESH_HOME` override) so
@@ -60,13 +60,6 @@ pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, 
 /// CEC mesh id starts with this so they're easy to recognise and never collide
 /// with a customer's own AllMyStuff fleet networks.
 pub const CEC_NETWORK_PREFIX: &str = "cec-";
-
-/// Signaling app-id — set as the `MYOWNMESH_TRYSTERO_APP_ID` env var before
-/// opening the mesh. Forked from MyOwnMesh's `myownmesh-cloud-mesh-v1` so CEC
-/// Support peers only ever meet other CEC Support peers. Global to CEC (all
-/// customers share it); the per-customer secrecy comes from the number-derived
-/// `network_id`, not the app-id.
-pub const CEC_TRYSTERO_APP_ID: &str = "cec-support-mesh-v1";
 
 /// Domain-separation tag for the per-peer ed25519 auth handshake. Forked from
 /// `myownmesh-mesh-auth-v1:` so a signature obtained on a CEC mesh cannot be
