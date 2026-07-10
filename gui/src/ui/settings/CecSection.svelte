@@ -11,7 +11,7 @@
   // customer-side flow (answering the 3-choice prompt, the standing grant list)
   // is shown too, so a build that hosts can drive it from here.
   import { onMount } from "svelte";
-  import { app } from "../../store.svelte";
+  import { app, CEC_STALE_AFTER_S } from "../../store.svelte";
   import { isTauri, type CecScope } from "../../tauri";
 
   const web = !isTauri();
@@ -50,10 +50,6 @@
     forever: "Auto-Approve Forever",
   };
 
-  // A connection unused for this long reads as "stale" — the cleanup nudge. A
-  // technician keeps recent ones (they may reconnect) and disconnects the rest.
-  const STALE_AFTER_S = 7 * 24 * 60 * 60;
-
   /** The customer's number as their mesh reads it — `123 456 789`, matching the
    *  Silent room's label ("CEC Support …"). Falls back to the raw string if it
    *  isn't the expected 9 digits. */
@@ -85,7 +81,7 @@
   /** Whether a connection has gone stale (unused past the threshold) — surfaced
    *  as a badge so the cleanup candidates stand out. */
   function isStale(lastUsed: number): boolean {
-    return !!lastUsed && idleSeconds(lastUsed) > STALE_AFTER_S;
+    return !!lastUsed && idleSeconds(lastUsed) > CEC_STALE_AFTER_S;
   }
 
   function connect(e: SubmitEvent) {
@@ -157,14 +153,25 @@
        first; a "stale" badge flags connections gone unused, and each can be
        given a private label you'll recognise. -->
   <section class="block">
-    <div class="title">Client meshes</div>
+    <div class="head">
+      <div class="title">Client meshes</div>
+      {#if app.cecStaleCount > 0}
+        <button class="btn small danger" onclick={() => void app.removeStaleCec()}>
+          Remove {app.cecStaleCount} stale
+        </button>
+      {/if}
+    </div>
     {#if customers.length === 0}
-      <p class="notice">No customers connected. Dial a number above to start.</p>
+      <p class="notice">
+        No machines yet. Dial a number above — the machines you connect to stay
+        here so you can reconnect with one tap.
+      </p>
     {:else}
       <p class="hint">
-        Each customer you dial is their own private mesh, listed here — most
-        recently used first. Rename one to something you'll recognise, and
-        disconnect the stale ones you no longer need.
+        Every machine you've connected to stays here, most recently used first.
+        <b>Connect</b> reopens a session — the customer re-approves only if their
+        access has lapsed. Rename one to something you'll recognise, and remove
+        the ones that have cycled out.
       </p>
       <ul class="rows">
         {#each customers as c (c.node)}
@@ -202,9 +209,15 @@
                 <button class="btn small primary" onclick={() => saveRename(c.number)}>Save</button>
                 <button class="btn small" onclick={cancelRename}>Cancel</button>
               {:else}
-                <button class="btn small" onclick={() => app.openConsole(c.node)}>Open screen</button>
+                <button
+                  class="btn small primary"
+                  disabled={app.cecDialing}
+                  onclick={() => void app.reconnectCec(c.number)}
+                >
+                  Connect
+                </button>
                 <button class="btn small" onclick={() => startRename(c.node, c.number)}>Rename</button>
-                <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Disconnect</button>
+                <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Remove</button>
               {/if}
             </div>
           </li>
@@ -298,6 +311,16 @@
     border-radius: var(--r-md, 0.6rem);
     padding: 0.9rem 1rem;
     margin-bottom: 0.9rem;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .head .title {
+    margin-bottom: 0;
   }
   .title {
     font-size: 0.72rem;

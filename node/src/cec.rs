@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
@@ -96,7 +97,7 @@ impl PendingRequest {
 /// [`CecInner::dialed`] by the customer's canonical (bare-pubkey) id. A dialed
 /// customer is an ordinary mesh peer on the graph — the CEC tab lists these
 /// from CEC state ([`Cec::dialed_list`]), it is not a graph grouping.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialedCustomer {
     /// The customer's device id (as dialed).
     pub node: String,
@@ -128,12 +129,39 @@ impl DialedCustomer {
     }
 }
 
+/// Load the persisted dialed-customer directory, keyed by each customer's
+/// canonical (bare-pubkey) id. `online` is reset to `false` — reachability is
+/// re-confirmed live (see the `cec_dialed` reconcile), never trusted from a
+/// prior run. A missing or corrupt file loads empty; it never bricks the node.
+fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let list: Vec<DialedCustomer> = serde_json::from_str(&text).unwrap_or_default();
+    list.into_iter()
+        .map(|mut c| {
+            c.online = false;
+            (pubkey_part(&c.node).to_string(), c)
+        })
+        .collect()
+}
+
 /// The CEC state a node carries — all behind one lock, since both the
 /// node-control commands and the mesh's per-frame gate reach it from many
 /// tasks. Cheap to hold: the enforcement (expiry, persistence) lives in the
 /// [`ConsentStore`], not here.
 pub struct Cec {
     inner: Mutex<CecInner>,
+    /// Where the technician's dialed-customer directory is mirrored, so it
+    /// survives a node restart. The customer's Silent mesh is persisted
+    /// daemon-side; this keeps the technician's view of every machine they've
+    /// serviced in step (independent of grant lifetime — an expired grant just
+    /// re-prompts the customer on the next connect). `None` for an in-memory
+    /// node (tests), where nothing is written.
+    dialed_path: Option<PathBuf>,
 }
 
 struct CecInner {
@@ -173,11 +201,19 @@ impl Cec {
     /// — a corrupt or absent file loads empty (it never bricks the node), and
     /// only `ThreeHours`/`Forever` grants are ever written.
     pub fn new(consent_path: Option<PathBuf>) -> Self {
+        // Mirror the dialed directory next to the consent store, under the same
+        // node home. A `None` consent path (tests) means no persistence.
+        let dialed_path = consent_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("cec-dialed.json"));
         let consent = match consent_path {
             Some(p) => ConsentStore::load(p),
             None => ConsentStore::in_memory(),
         };
+        let dialed = load_dialed(dialed_path.as_ref());
         Cec {
+            dialed_path,
             inner: Mutex::new(CecInner {
                 role: Role::Client,
                 hosting: false,
@@ -186,9 +222,29 @@ impl Cec {
                 agent_name: String::new(),
                 consent,
                 pending: Vec::new(),
-                dialed: HashMap::new(),
+                dialed,
                 sessions: HashMap::new(),
             }),
+        }
+    }
+
+    /// Mirror the dialed directory to disk. Best-effort: a write failure warns
+    /// and is dropped (an in-memory list still beats bricking on a read-only
+    /// disk). Called after every mutation of `dialed`.
+    fn persist_dialed(&self, list: Vec<DialedCustomer>) {
+        let Some(path) = &self.dialed_path else {
+            return;
+        };
+        match serde_json::to_string_pretty(&list) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    tracing::warn!(
+                        "couldn't persist CEC dialed customers to {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("couldn't serialize CEC dialed customers: {e}"),
         }
     }
 
@@ -268,12 +324,19 @@ impl Cec {
         entry.network_id = network_id;
         // A (re)dial is a fresh use — keep the stale-connection metric honest.
         entry.last_used = now;
-        entry.clone()
+        let record = entry.clone();
+        let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
+        drop(inner);
+        self.persist_dialed(snapshot);
+        record
     }
 
     /// Mark a dialed customer online/offline (from presence), returning its
     /// updated record when the flag actually changed.
     pub fn set_customer_online(&self, canonical: &str, online: bool) -> Option<DialedCustomer> {
+        // `online` is ephemeral — reconciled live and reset to false on load — so
+        // this stays in memory; only the durable fields (record/last_used) are
+        // ever written to disk.
         let mut inner = self.inner.lock();
         let c = inner.dialed.get_mut(canonical)?;
         if c.online == online {
@@ -292,7 +355,11 @@ impl Cec {
         let mut inner = self.inner.lock();
         let c = inner.dialed.get_mut(canonical)?;
         c.last_used = now_secs();
-        Some(c.clone())
+        let record = c.clone();
+        let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
+        drop(inner);
+        self.persist_dialed(snapshot);
+        Some(record)
     }
 
     /// Whether `canonical` is a customer this technician has dialed. Used by
@@ -315,6 +382,14 @@ impl Cec {
             .collect()
     }
 
+    /// The dialed customers as owned records (with `network_id`), for the async
+    /// `cec_dialed` projection that reconciles each one's live reachability
+    /// against the daemon's peer set. [`dialed_list`] returns the UI shape;
+    /// this keeps the fields that shape drops.
+    pub fn dialed_records(&self) -> Vec<DialedCustomer> {
+        self.inner.lock().dialed.values().cloned().collect()
+    }
+
     /// The Silent mesh a dialed customer lives on, if any (for teardown).
     pub fn dialed_network(&self, canonical: &str) -> Option<String> {
         self.inner
@@ -327,7 +402,14 @@ impl Cec {
     /// Drop a customer this technician dialed (the CEC part of "Forget this
     /// node"). Returns `true` when one was actually removed.
     pub fn forget_dialed(&self, canonical: &str) -> bool {
-        self.inner.lock().dialed.remove(canonical).is_some()
+        let mut inner = self.inner.lock();
+        let removed = inner.dialed.remove(canonical).is_some();
+        if removed {
+            let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
+            drop(inner);
+            self.persist_dialed(snapshot);
+        }
+        removed
     }
 
     // ---- customer (hosting + the 3-choice consent flow) -----------------
