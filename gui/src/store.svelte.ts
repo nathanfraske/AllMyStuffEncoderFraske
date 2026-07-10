@@ -552,6 +552,11 @@ class AppStore {
   cecNumberDraft = $state("");
   /** Whether a dial is in flight (disables the Connect button). */
   cecDialing = $state(false);
+
+  /** The number currently being dialed, while the dial RPC is in flight — the
+   *  CEC tab renders it as a live "Dialing…" row so a connect attempt is
+   *  visible from the first click (discovery alone can take up to ~45s). */
+  cecDialingNumber = $state<string | null>(null);
   /** Live CEC sessions this app is party to, newest first. */
   cecSessions = $state<{ sessionId: string; state: string; node?: string }[]>([]);
   /** The customer's live consent grants (populated when hosting). */
@@ -1465,6 +1470,14 @@ class AppStore {
         const node = this.cecAutoOpenNode;
         this.cecAutoOpenNode = null;
         setTimeout(() => this.openConsole(node), 400);
+      } else if ((s.state === "denied" || s.state === "ended") && this.cecAutoOpenNode) {
+        // A decline (or the session ending before approval) must disarm the
+        // auto-open — leaving it armed both hides the outcome from the
+        // technician and would pop a console on the wrong, later dial.
+        this.cecAutoOpenNode = null;
+        if (s.state === "denied") {
+          this.toast("warn", "The customer declined the connection");
+        }
       }
     });
     await onCecGrants((grants) => {
@@ -6755,6 +6768,7 @@ class AppStore {
       return false;
     }
     this.cecDialing = true;
+    this.cecDialingNumber = number;
     try {
       const r = await cecDial(number, this.cecAgentName.trim());
       if (r?.node) {
@@ -6770,6 +6784,7 @@ class AppStore {
       return false;
     } finally {
       this.cecDialing = false;
+      this.cecDialingNumber = null;
       void this.loadCec();
     }
   }

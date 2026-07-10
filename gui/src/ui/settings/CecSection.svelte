@@ -161,11 +161,24 @@
         </button>
       {/if}
     </div>
+    {#if app.cecDialingNumber}
+      <!-- The in-flight dial, visible from the first click: discovery alone can
+           take up to ~45s, and an invisible wait reads as "nothing happened". -->
+      <div class="row pending-row">
+        <span class="dot busy"></span>
+        <span class="who">
+          <b>Dialing {groupNumber(app.cecDialingNumber)}…</b>
+          <span class="sub">Finding the customer on their support mesh — this can take a moment.</span>
+        </span>
+      </div>
+    {/if}
     {#if customers.length === 0}
-      <p class="notice">
-        No machines yet. Dial a number above — the machines you connect to stay
-        here so you can reconnect with one tap.
-      </p>
+      {#if !app.cecDialingNumber}
+        <p class="notice">
+          No machines yet. Dial a number above — the machines you connect to stay
+          here so you can reconnect with one tap.
+        </p>
+      {/if}
     {:else}
       <p class="hint">
         Every machine you've connected to stays here, most recently used first.
@@ -199,6 +212,9 @@
                     <span class="meta">
                       · {c.online ? "online" : "offline"} · {lastUsedLabel(c.last_used)}
                     </span>
+                    {#if c.node === app.cecAutoOpenNode}
+                      <span class="pending-tag">waiting for approval</span>
+                    {/if}
                     {#if isStale(c.last_used)}<span class="stale-tag">stale</span>{/if}
                   </span>
                 {/if}
@@ -452,6 +468,28 @@
     padding: 0.32rem 0.5rem;
     font-size: 0.85rem;
   }
+  /* The in-flight dial row + waiting-for-approval badge — a connect attempt is
+     visible from the first click through to the customer's decision. */
+  .pending-row {
+    border: 1px dashed var(--accent);
+  }
+  .dot.busy {
+    background: var(--accent);
+  }
+  .pending-tag {
+    display: inline-block;
+    margin-left: 0.35rem;
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-pill, 999px);
+    padding: 0.02rem 0.4rem;
+    vertical-align: middle;
+  }
+
   /* The stale marker — a connection unused past the threshold, the cleanup
      candidate. The row gets a dashed danger outline and a small badge. */
   .stale-tag {
