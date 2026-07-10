@@ -26,21 +26,22 @@
   // CEC mesh is Silent, no roster).
   const customers = $derived(app.cecCustomersByRecent);
 
-  // Inline rename: which customer (by node id) is being labelled, and the draft.
-  let editingNode = $state<string | null>(null);
+  // Inline rename: which row (by number — stable even before a node id is
+  // discovered) is being labelled, and the draft.
+  let editingKey = $state<string | null>(null);
   let aliasDraft = $state("");
 
-  function startRename(node: string, number: string) {
-    editingNode = node;
+  function startRename(number: string) {
+    editingKey = number;
     aliasDraft = app.cecAliases[number] ?? "";
   }
   function saveRename(number: string) {
     app.setCecAlias(number, aliasDraft);
-    editingNode = null;
+    editingKey = null;
     aliasDraft = "";
   }
   function cancelRename() {
-    editingNode = null;
+    editingKey = null;
     aliasDraft = "";
   }
 
@@ -187,12 +188,12 @@
         the ones that have cycled out.
       </p>
       <ul class="rows">
-        {#each customers as c (c.node)}
+        {#each customers as c (c.number)}
           <li class="row col" class:stale={isStale(c.last_used)}>
             <div class="row-top">
               <span class="dot" class:on={c.online}></span>
               <span class="who">
-                {#if editingNode === c.node}
+                {#if editingKey === c.number}
                   <!-- svelte-ignore a11y_autofocus -->
                   <input
                     class="field rename"
@@ -210,7 +211,7 @@
                   <span class="sub">
                     <span class="mesh" title={`Mesh cec-${c.number}`}>CEC Support {groupNumber(c.number)}</span>
                     <span class="meta">
-                      · {c.online ? "online" : "offline"} · {lastUsedLabel(c.last_used)}
+                      · {c.node ? (c.online ? "online" : "offline") : "no answer yet"} · {lastUsedLabel(c.last_used)}
                     </span>
                     {#if c.node === app.cecAutoOpenNode}
                       <span class="pending-tag">waiting for approval</span>
@@ -221,7 +222,7 @@
               </span>
             </div>
             <div class="row-actions">
-              {#if editingNode === c.node}
+              {#if editingKey === c.number}
                 <button class="btn small primary" onclick={() => saveRename(c.number)}>Save</button>
                 <button class="btn small" onclick={cancelRename}>Cancel</button>
               {:else}
@@ -232,8 +233,13 @@
                 >
                   Connect
                 </button>
-                <button class="btn small" onclick={() => startRename(c.node, c.number)}>Rename</button>
-                <button class="btn small danger" onclick={() => app.forgetNode(c.node)}>Remove</button>
+                <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
+                <button
+                  class="btn small danger"
+                  onclick={() => (c.node ? void app.forgetNode(c.node) : void app.removeCecNumber(c.number))}
+                >
+                  Remove
+                </button>
               {/if}
             </div>
           </li>

@@ -1159,10 +1159,12 @@ export function cecStopHosting(): Promise<null> {
   return tryInvoke("cec_stop_hosting");
 }
 
-/** Customer: the inbound technician connect-requests awaiting a choice. */
-export async function cecPending(): Promise<CecPending[]> {
+/** Customer: the inbound technician connect-requests awaiting a choice.
+ *  `null` = couldn't fetch (web mode, or a transient RPC failure while the
+ *  node socket is busy) — callers keep their last snapshot rather than wiping. */
+export async function cecPending(): Promise<CecPending[] | null> {
   const r = await tryInvoke<CecPending[]>("cec_pending");
-  return Array.isArray(r) ? r : [];
+  return Array.isArray(r) ? r : null;
 }
 
 /** Customer: approve a technician at a scope (once / three hours / forever),
@@ -1194,18 +1196,27 @@ export async function cecRevoke(tech: string): Promise<void> {
   await invoke("cec_revoke", { tech });
 }
 
-/** Customer: the live consent grants. */
-export async function cecGrants(): Promise<CecGrant[]> {
+/** Customer: the live consent grants. `null` = couldn't fetch — keep the
+ *  last snapshot. */
+export async function cecGrants(): Promise<CecGrant[] | null> {
   const r = await tryInvoke<CecGrant[]>("cec_grants");
-  return Array.isArray(r) ? r : [];
+  return Array.isArray(r) ? r : null;
 }
 
 /** Technician: the customers this node has dialed — the CEC tab's "Active
  *  connections" list. These are ordinary graph peers; the list comes from CEC
  *  state, not from any graph grouping. Empty in web mode. */
-export async function cecDialed(): Promise<CecPeer[]> {
+export async function cecDialed(): Promise<CecPeer[] | null> {
   const r = await tryInvoke<CecPeer[]>("cec_dialed");
-  return Array.isArray(r) ? r : [];
+  return Array.isArray(r) ? r : null;
+}
+
+/** Technician: remove a directory row by its support number — the curation
+ *  path for an attempt row that never discovered a node. No-op in web mode. */
+export async function cecForgetNumber(number: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_forget_number", { number });
 }
 
 /** "Forget this node" — an app-wide action on every node's gear: drop it from

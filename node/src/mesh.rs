@@ -2652,6 +2652,13 @@ impl Mesh {
         };
         let (network_id, config) = crate::cec::silent_network_config(&number);
         self.cec.set_dialed_network(network_id.clone());
+        // The *attempt* is directory-worthy on its own: the permanent row
+        // exists (and persists) from the moment the technician dials — before
+        // discovery, before approval, whether or not the customer ever
+        // answers. Emitted immediately so the CEC tab shows it right away;
+        // a completed discovery merges the node id into this same row.
+        let attempt = self.cec.record_attempt(&number);
+        self.sink.emit("cec://peer", attempt.to_value());
         self.cec_join_silent(&network_id, config).await?;
 
         // A Silent mesh auto-dials nobody, so the customer only *appears*
@@ -2677,7 +2684,6 @@ impl Mesh {
 
         let label = self.cec_peer_label(&canonical).unwrap_or_default();
         let record = self.cec.record_dialed(
-            &canonical,
             customer.clone(),
             number.clone(),
             label,
@@ -2735,6 +2741,25 @@ impl Mesh {
         );
         self.emit_snapshot();
         Ok(json!({ "node": customer }))
+    }
+
+    /// `cec_forget_number` (technician): curate away a directory row by its
+    /// support number — the removal path for an attempt row whose discovery
+    /// never completed (it has no node id for `forget_node`). Also leaves the
+    /// number's Silent room. Idempotent: an unknown number is a no-op.
+    pub async fn cec_forget_number(self: &Arc<Self>, number: String) -> Result<Value, String> {
+        if let Some(rec) = self.cec.forget_number(&number) {
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove {
+                    network: rec.network_id,
+                    purge: false,
+                })
+                .await;
+            self.sync_networks().await;
+            self.emit_snapshot();
+        }
+        Ok(Value::Null)
     }
 
     /// `cec_pending` (customer): the inbound connect-requests awaiting a choice.
@@ -2853,6 +2878,13 @@ impl Mesh {
         let records = self.cec.dialed_records();
         let mut out = Vec::with_capacity(records.len());
         for r in records {
+            if r.node.is_empty() {
+                // An attempt row — no discovered node yet, nothing to probe.
+                let mut v = r.to_value();
+                v["online"] = json!(false);
+                out.push(v);
+                continue;
+            }
             let canonical = crate::cec::pubkey_part(&r.node).to_string();
             let online = self.cec_peer_reachable(&r.network_id, &canonical).await;
             if online != r.online {

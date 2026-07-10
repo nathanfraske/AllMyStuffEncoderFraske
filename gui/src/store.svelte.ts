@@ -165,6 +165,7 @@ import {
   cecRevoke,
   cecGrants,
   cecDialed,
+  cecForgetNumber,
   forgetNode,
   onCecRequest,
   onCecPeer,
@@ -6732,10 +6733,20 @@ class AppStore {
 
   /** Pull the node's CEC status + grants + pending requests + dialed customers. */
   async loadCec() {
-    this.cecStatusInfo = await cecStatus();
-    this.cecGrantList = await cecGrants();
-    this.cecRequests = await cecPending();
-    this.cecCustomers = await cecDialed();
+    // Each fetch can transiently fail while the node socket is busy (mid-dial,
+    // console bring-up) — and loadCec re-runs on every cec://* event, exactly
+    // those moments. A failed refresh keeps the last known snapshot: it must
+    // never read as "everything's gone" and wipe the rendered lists (that's
+    // what made a dialed customer's row vanish from the CEC tab mid-approval).
+    const status = await cecStatus();
+    if (status) this.cecStatusInfo = status;
+    const grants = await cecGrants();
+    if (grants) this.cecGrantList = grants;
+    const pending = await cecPending();
+    if (pending) this.cecRequests = pending;
+    const dialed = await cecDialed();
+    if (dialed) this.cecCustomers = dialed;
+    else clientLog("[cec] dialed-list fetch failed — keeping the last snapshot");
   }
 
   /** Technician: dial a customer by the number they read out. On success the
@@ -6769,17 +6780,31 @@ class AppStore {
     }
     this.cecDialing = true;
     this.cecDialingNumber = number;
+    clientLog(`[cec] dialing ${number}…`);
     try {
-      const r = await cecDial(number, this.cecAgentName.trim());
+      // Hard cap the wait. The node's own discovery deadline is 45s; if the
+      // socket request itself wedges past that, an un-timed await would leave
+      // cecDialing stuck true forever — every Connect button in the tab
+      // silently disabled (clicks do nothing, no Dialing row) until the app
+      // restarts. The UI must always get its state back.
+      const r = await Promise.race([
+        cecDial(number, this.cecAgentName.trim()),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("no answer from the node after 60s")), 60_000),
+        ),
+      ]);
       if (r?.node) {
+        clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
         this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
         this.cecAutoOpenNode = r.node;
         void this.pullSessionSnapshot();
       } else {
+        clientLog(`[cec] dial returned no node (web mode or empty reply)`);
         this.toast("ok", `Dialed ${number}`);
       }
       return true;
     } catch (e) {
+      clientLog(`[cec] dial FAILED — ${errMsg(e)}`);
       this.toast("warn", `Couldn't reach ${number}: ${errMsg(e)}`);
       return false;
     } finally {
@@ -6787,6 +6812,17 @@ class AppStore {
       this.cecDialingNumber = null;
       void this.loadCec();
     }
+  }
+
+  /** Remove a directory row by its number — the curation path for an attempt
+   *  row that never discovered a node (it has no node id for forgetNode). */
+  async removeCecNumber(number: string) {
+    try {
+      await cecForgetNumber(number);
+    } catch (e) {
+      this.toast("warn", `Couldn't remove it: ${errMsg(e)}`);
+    }
+    void this.loadCec();
   }
 
   /** How many stored customers have gone stale (unused past
@@ -6806,7 +6842,8 @@ class AppStore {
     if (stale.length === 0) return;
     for (const c of stale) {
       try {
-        await forgetNode(c.node);
+        if (c.node) await forgetNode(c.node);
+        else await cecForgetNumber(c.number);
       } catch {
         /* keep going — one failure shouldn't strand the rest */
       }

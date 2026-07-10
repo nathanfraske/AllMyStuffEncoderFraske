@@ -99,7 +99,8 @@ impl PendingRequest {
 /// from CEC state ([`Cec::dialed_list`]), it is not a graph grouping.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialedCustomer {
-    /// The customer's device id (as dialed).
+    /// The customer's device id — empty for an attempt whose discovery never
+    /// completed (the customer hasn't answered on this number yet).
     pub node: String,
     /// The support number the technician typed to reach them.
     pub number: String,
@@ -142,9 +143,10 @@ fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
     };
     let list: Vec<DialedCustomer> = serde_json::from_str(&text).unwrap_or_default();
     list.into_iter()
+        .filter(|c| !number_digits(&c.number).is_empty())
         .map(|mut c| {
             c.online = false;
-            (pubkey_part(&c.node).to_string(), c)
+            (number_digits(&c.number), c)
         })
         .collect()
 }
@@ -188,8 +190,11 @@ struct CecInner {
     consent: ConsentStore,
     /// Inbound connect-requests awaiting the customer's decision.
     pending: Vec<PendingRequest>,
-    /// Customers this technician has dialed (canonical id → record). Surfaced
-    /// to the CEC tab via [`Cec::dialed_list`]; each is a normal graph peer.
+    /// Every client machine this technician has *attempted* (number digits →
+    /// record) — a permanent directory row exists from the moment of the dial,
+    /// whether or not the customer ever answered. `node` is filled in once
+    /// discovery succeeds. Surfaced to the CEC tab via [`Cec::dialed_list`];
+    /// rows leave only via the explicit forget/curate actions.
     dialed: HashMap<String, DialedCustomer>,
     /// Live session states by session id, for `cec://session`.
     sessions: HashMap<String, String>,
@@ -295,7 +300,6 @@ impl Cec {
     /// stored record for the `cec://peer` emit.
     pub fn record_dialed(
         &self,
-        canonical: &str,
         node: String,
         number: String,
         label: String,
@@ -306,7 +310,7 @@ impl Cec {
         let mut inner = self.inner.lock();
         let entry = inner
             .dialed
-            .entry(canonical.to_string())
+            .entry(number_digits(&number))
             .or_insert_with(|| DialedCustomer {
                 node: node.clone(),
                 number: number.clone(),
@@ -331,6 +335,33 @@ impl Cec {
         record
     }
 
+    /// Record a dial *attempt* the moment the technician dials: the permanent
+    /// directory row exists (and persists) before discovery, before approval,
+    /// whether or not the customer ever answers. Re-dialing an existing number
+    /// just refreshes its recency. The node id stays empty until discovery
+    /// fills it via [`Cec::record_dialed`].
+    pub fn record_attempt(&self, number: &str) -> DialedCustomer {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        let entry = inner
+            .dialed
+            .entry(number_digits(number))
+            .or_insert_with(|| DialedCustomer {
+                node: String::new(),
+                number: number.to_string(),
+                label: String::new(),
+                online: false,
+                network_id: network_id_for_number(number),
+                last_used: now,
+            });
+        entry.last_used = now;
+        let record = entry.clone();
+        let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
+        drop(inner);
+        self.persist_dialed(snapshot);
+        record
+    }
+
     /// Mark a dialed customer online/offline (from presence), returning its
     /// updated record when the flag actually changed.
     pub fn set_customer_online(&self, canonical: &str, online: bool) -> Option<DialedCustomer> {
@@ -338,7 +369,10 @@ impl Cec {
         // this stays in memory; only the durable fields (record/last_used) are
         // ever written to disk.
         let mut inner = self.inner.lock();
-        let c = inner.dialed.get_mut(canonical)?;
+        let c = inner
+            .dialed
+            .values_mut()
+            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)?;
         if c.online == online {
             return None;
         }
@@ -353,7 +387,10 @@ impl Cec {
     /// dialed.
     pub fn touch_dialed(&self, canonical: &str) -> Option<DialedCustomer> {
         let mut inner = self.inner.lock();
-        let c = inner.dialed.get_mut(canonical)?;
+        let c = inner
+            .dialed
+            .values_mut()
+            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)?;
         c.last_used = now_secs();
         let record = c.clone();
         let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
@@ -365,7 +402,11 @@ impl Cec {
     /// Whether `canonical` is a customer this technician has dialed. Used by
     /// "Forget this node" to know a CEC customer needs its Silent room left too.
     pub fn is_dialed(&self, canonical: &str) -> bool {
-        self.inner.lock().dialed.contains_key(canonical)
+        self.inner
+            .lock()
+            .dialed
+            .values()
+            .any(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
     }
 
     /// The customers this technician has dialed, projected for the CEC tab's
@@ -395,7 +436,8 @@ impl Cec {
         self.inner
             .lock()
             .dialed
-            .get(canonical)
+            .values()
+            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
             .map(|c| c.network_id.clone())
     }
 
@@ -403,8 +445,28 @@ impl Cec {
     /// node"). Returns `true` when one was actually removed.
     pub fn forget_dialed(&self, canonical: &str) -> bool {
         let mut inner = self.inner.lock();
-        let removed = inner.dialed.remove(canonical).is_some();
+        let key = inner
+            .dialed
+            .iter()
+            .find(|(_, c)| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
+            .map(|(k, _)| k.clone());
+        let removed = key.and_then(|k| inner.dialed.remove(&k)).is_some();
         if removed {
+            let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
+            drop(inner);
+            self.persist_dialed(snapshot);
+        }
+        removed
+    }
+
+    /// Remove a directory row by its support number — the curation path for an
+    /// attempt row whose discovery never completed (it has no node id for the
+    /// canonical-keyed [`Cec::forget_dialed`]). Returns the removed record so
+    /// the caller can tear down its Silent room too.
+    pub fn forget_number(&self, number: &str) -> Option<DialedCustomer> {
+        let mut inner = self.inner.lock();
+        let removed = inner.dialed.remove(&number_digits(number));
+        if removed.is_some() {
             let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
             drop(inner);
             self.persist_dialed(snapshot);
@@ -675,6 +737,13 @@ pub fn silent_network_config(number: &str) -> (String, Value) {
 /// suffix strip the consent store and the mesh use, so a technician isn't seen
 /// as a new peer across a reconnect. Re-exported shape of
 /// [`allmystuff_cec_consent::pubkey_part`].
+/// The bare digits of a support number — the directory key. An attempt and a
+/// completed dial share one row per number: the number is the stable identity
+/// of a client machine (its node id is only learned once discovery succeeds).
+pub fn number_digits(number: &str) -> String {
+    number.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
 pub fn pubkey_part(id: &str) -> &str {
     allmystuff_cec_consent::pubkey_part(id)
 }
@@ -736,14 +805,19 @@ mod tests {
     fn dialed_customers_track_the_cec_group() {
         let cec = Cec::new(None);
         let canon = pubkey_part(TECH);
+        // An attempt is directory-worthy on its own: the row exists (nodeless)
+        // from the dial, and a completed discovery merges into the same row.
+        let attempt = cec.record_attempt("123 456 789");
+        assert!(attempt.node.is_empty());
+        assert_eq!(cec.dialed_list().len(), 1);
         cec.record_dialed(
-            canon,
             TECH.into(),
             "123456789".into(),
             "Reception PC".into(),
             true,
             "cec-123456789".into(),
         );
+        assert_eq!(cec.dialed_list().len(), 1, "attempt and dial share the row");
         assert!(cec.is_dialed(canon));
         assert_eq!(cec.dialed_network(canon).as_deref(), Some("cec-123456789"));
         // The dial stamps a `last_used` the CEC tab renders as time-since — it's
@@ -755,6 +829,11 @@ mod tests {
         assert!(cec.touch_dialed("someone-we-never-dialed").is_none());
         assert!(cec.forget_dialed(canon));
         assert!(!cec.is_dialed(canon));
+        // A nodeless attempt row is curated away by number.
+        cec.record_attempt("987654321");
+        assert_eq!(cec.dialed_list().len(), 1);
+        assert!(cec.forget_number("987 654 321").is_some());
+        assert!(cec.dialed_list().is_empty());
     }
 
     #[test]
