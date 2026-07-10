@@ -2034,8 +2034,22 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
         // The node may be *gone*, not just restarting — e.g. another client app
         // (CEC Support) spawned it and exited, taking the kill-on-close serve
         // with it. A client doesn't require whichever app brought the engine
-        // up: if nothing answers the socket, respawn it ourselves.
-        if !NodeClient::probe().await {
+        // up: if nothing answers the socket, respawn it ourselves. Probe with
+        // patience first — a serve that is *starting* (spawned, socket not
+        // bound yet) must not read as "gone": respawning over it would
+        // kill-on-drop the very child being waited on, and the stack would
+        // flap spawn/kill forever.
+        let mut gone = !NodeClient::probe().await;
+        if gone {
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if NodeClient::probe().await {
+                    gone = false;
+                    break;
+                }
+            }
+        }
+        if gone {
             tracing::info!("node is gone — bringing it back up");
             match ensure_node_running().await {
                 Ok(Some(child)) => {
