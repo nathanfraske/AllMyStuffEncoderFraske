@@ -6781,7 +6781,17 @@ class AppStore {
     this.cecDialingNumber = number;
     clientLog(`[cec] dialing ${number}…`);
     try {
-      const r = await cecDial(number, this.cecAgentName.trim());
+      // Hard cap the wait. The node's own discovery deadline is 45s; if the
+      // socket request itself wedges past that, an un-timed await would leave
+      // cecDialing stuck true forever — every Connect button in the tab
+      // silently disabled (clicks do nothing, no Dialing row) until the app
+      // restarts. The UI must always get its state back.
+      const r = await Promise.race([
+        cecDial(number, this.cecAgentName.trim()),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("no answer from the node after 60s")), 60_000),
+        ),
+      ]);
       if (r?.node) {
         clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
         this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
