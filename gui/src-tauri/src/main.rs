@@ -2031,6 +2031,20 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
 async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
     use tokio::sync::mpsc;
     loop {
+        // The node may be *gone*, not just restarting — e.g. another client app
+        // (CEC Support) spawned it and exited, taking the kill-on-close serve
+        // with it. A client doesn't require whichever app brought the engine
+        // up: if nothing answers the socket, respawn it ourselves.
+        if !NodeClient::probe().await {
+            tracing::info!("node is gone — bringing it back up");
+            match ensure_node_running().await {
+                Ok(Some(child)) => {
+                    app.state::<AppState>().node_child.lock().replace(child);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
+            }
+        }
         let (tx, mut rx) = mpsc::channel::<NodeEvent>(256);
         if let Err(e) = node.subscribe_events(tx).await {
             tracing::warn!("node event subscribe failed: {e:#}; retrying");
