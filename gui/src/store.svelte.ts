@@ -6732,10 +6732,19 @@ class AppStore {
 
   /** Pull the node's CEC status + grants + pending requests + dialed customers. */
   async loadCec() {
-    this.cecStatusInfo = await cecStatus();
-    this.cecGrantList = await cecGrants();
-    this.cecRequests = await cecPending();
-    this.cecCustomers = await cecDialed();
+    // Each fetch can transiently fail while the node socket is busy (mid-dial,
+    // console bring-up) — and loadCec re-runs on every cec://* event, exactly
+    // those moments. A failed refresh keeps the last known snapshot: it must
+    // never read as "everything's gone" and wipe the rendered lists (that's
+    // what made a dialed customer's row vanish from the CEC tab mid-approval).
+    const status = await cecStatus();
+    if (status) this.cecStatusInfo = status;
+    const grants = await cecGrants();
+    if (grants) this.cecGrantList = grants;
+    const pending = await cecPending();
+    if (pending) this.cecRequests = pending;
+    const dialed = await cecDialed();
+    if (dialed) this.cecCustomers = dialed;
   }
 
   /** Technician: dial a customer by the number they read out. On success the
