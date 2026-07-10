@@ -239,6 +239,11 @@ import {
  *  the Meshes list, so they're filtered out of "Your meshes". */
 const CEC_NETWORK_PREFIX = "cec-";
 
+/** A stored customer unused for this long reads as "stale" — the cleanup nudge
+ *  for a directory that grows as customers cycle out. Shared by the CEC tab's
+ *  per-row badge and the "Remove stale" bulk curate action. */
+export const CEC_STALE_AFTER_S = 7 * 24 * 60 * 60;
+
 /** The bare digits of a customer's Support number — mirrors the node's
  *  `normalize_input` (strip spaces/dashes) closely enough to rebuild the
  *  `cec-<digits>` room id from a dialed customer's `number`, so the two can be
@@ -6729,29 +6734,74 @@ class AppStore {
       this.toast("warn", "Enter the customer's number first");
       return;
     }
+    if (await this.dialCecNumber(number)) this.cecNumberDraft = "";
+  }
+
+  /** Reconnect to a machine already in the directory, by its number. Re-sends
+   *  the connect request, so an **expired** grant re-prompts the customer (a
+   *  still-valid one auto-approves) and the console opens on approval — the
+   *  one-click reuse the durable directory is for. */
+  async reconnectCec(number: string) {
+    await this.dialCecNumber(number);
+  }
+
+  /** Shared connect/reconnect: dial `number`, arm the console to open the
+   *  moment the customer approves (see the onCecSession handler), and refresh
+   *  the CEC lists. Returns whether the dial was accepted (so `dialCec` can
+   *  clear its input only on success). */
+  private async dialCecNumber(number: string): Promise<boolean> {
     if (!this.cecAgentName.trim()) {
       this.toast("warn", "Set your Agent Name first — the customer sees it");
-      return;
+      return false;
     }
     this.cecDialing = true;
     try {
       const r = await cecDial(number, this.cecAgentName.trim());
       if (r?.node) {
         this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
-        this.cecNumberDraft = "";
-        // Open the remote-control console for this customer the moment they
-        // approve (their session goes active) — see the onCecSession handler.
         this.cecAutoOpenNode = r.node;
         void this.pullSessionSnapshot();
       } else {
         this.toast("ok", `Dialed ${number}`);
       }
+      return true;
     } catch (e) {
       this.toast("warn", `Couldn't reach ${number}: ${errMsg(e)}`);
+      return false;
     } finally {
       this.cecDialing = false;
       void this.loadCec();
     }
+  }
+
+  /** How many stored customers have gone stale (unused past
+   *  {@link CEC_STALE_AFTER_S}) — the count on the "Remove stale" curate button. */
+  get cecStaleCount(): number {
+    const cutoff = Date.now() / 1000 - CEC_STALE_AFTER_S;
+    return this.cecCustomers.filter((c) => c.last_used && c.last_used < cutoff).length;
+  }
+
+  /** Curate the directory in one action: forget every customer that's cycled
+   *  out (gone stale), instead of picking them off one by one. Leaves each
+   *  customer's Silent mesh and drops it from the graph, same as a single
+   *  Remove. */
+  async removeStaleCec() {
+    const cutoff = Date.now() / 1000 - CEC_STALE_AFTER_S;
+    const stale = this.cecCustomers.filter((c) => c.last_used && c.last_used < cutoff);
+    if (stale.length === 0) return;
+    for (const c of stale) {
+      try {
+        await forgetNode(c.node);
+      } catch {
+        /* keep going — one failure shouldn't strand the rest */
+      }
+      this.catalog.nodes = this.catalog.nodes.filter((n) => !sameMachine(n.id, c.node));
+      this.catalog.capabilities = this.catalog.capabilities.filter(
+        (cap) => !sameMachine(cap.node, c.node),
+      );
+    }
+    this.toast("ok", `Removed ${stale.length} stale ${stale.length === 1 ? "connection" : "connections"}`);
+    void this.loadCec();
   }
 
   /** Customer: approve an inbound technician at a scope. */

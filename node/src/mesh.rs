@@ -2845,7 +2845,24 @@ impl Mesh {
     /// CEC tab's "Active connections" list. Dialed customers are ordinary graph
     /// peers — this is CEC state, not a graph grouping.
     pub async fn cec_dialed(&self) -> Result<Value, String> {
-        Ok(Value::Array(self.cec.dialed_list()))
+        // The dialed directory is durable — it survives node restarts and grant
+        // expiry, so a technician keeps every machine they've serviced. Reconcile
+        // each entry's `online` against the daemon's live peer set so the tab
+        // shows which stored machines are reachable right now (and can be
+        // reconnected — an expired grant just re-prompts the customer).
+        let records = self.cec.dialed_records();
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            let canonical = crate::cec::pubkey_part(&r.node).to_string();
+            let online = self.cec_peer_reachable(&r.network_id, &canonical).await;
+            if online != r.online {
+                self.cec.set_customer_online(&canonical, online);
+            }
+            let mut v = r.to_value();
+            v["online"] = json!(online);
+            out.push(v);
+        }
+        Ok(Value::Array(out))
     }
 
     /// `forget_node` — an **app-wide** feature on every node's gear, not a CEC
@@ -2968,6 +2985,36 @@ impl Mesh {
                 return None;
             }
             Some(id.to_string())
+        })
+    }
+
+    /// Whether `canonical` (bare pubkey) is currently a peer on `network_id`,
+    /// per the daemon's `PeersList` — the live-reachability check behind a stored
+    /// customer's online dot. A daemon error or a network we've left reads as
+    /// offline (best-effort; the row stays, it just shows unreachable).
+    async fn cec_peer_reachable(&self, network_id: &str, canonical: &str) -> bool {
+        let Ok(resp) = self
+            .client
+            .request(&Request::PeersList {
+                network: network_id.to_string(),
+            })
+            .await
+        else {
+            return false;
+        };
+        let Some(peers) = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("peers"))
+            .and_then(|p| p.as_array())
+        else {
+            return false;
+        };
+        peers.iter().any(|p| {
+            p.get("device_id")
+                .and_then(|v| v.as_str())
+                .map(|id| crate::cec::pubkey_part(id) == canonical)
+                .unwrap_or(false)
         })
     }
 
@@ -3144,32 +3191,65 @@ impl Mesh {
                                 .await;
                         }
                         _ => {
-                            // Undecided: raise the prompt on the first beat and
-                            // refresh the pending record on later ones — but
-                            // don't re-emit `cec://request`, or the customer's
-                            // approval dialog is spammed once every 2s.
-                            let already = self.cec.has_pending_session(&session_id);
-                            let verification_code =
-                                crate::cec::verification_code(&from, &session_id);
-                            let req = crate::cec::PendingRequest {
-                                tech: from.clone(),
-                                agent_name: agent_name.clone(),
-                                want_control,
-                                session_id: session_id.clone(),
-                                verification_code: verification_code.clone(),
-                            };
-                            self.cec.record_pending(req);
-                            if !already {
+                            // A still-valid standing grant (3-hours / Forever)
+                            // auto-approves the reconnect — the customer set it so
+                            // they wouldn't be re-asked, which is what lets a
+                            // technician reuse a connection without the customer
+                            // doing anything. An expired or absent grant (or an
+                            // "Once" that never persisted) falls through to the
+                            // prompt, so reconnecting to a lapsed machine pops the
+                            // box again, exactly like the first time.
+                            if let Some(scope) = self.cec.active_scope_for(&from) {
+                                self.cec.set_session(&session_id, "active");
+                                if let Some(rec) =
+                                    self.cec.touch_dialed(crate::cec::pubkey_part(&from))
+                                {
+                                    self.sink.emit("cec://peer", rec.to_value());
+                                }
                                 self.sink.emit(
-                                    "cec://request",
-                                    json!({
-                                        "tech": from,
-                                        "agent_name": agent_name,
-                                        "want_control": want_control,
-                                        "session_id": session_id,
-                                        "verification_code": verification_code,
-                                    }),
+                                    "cec://session",
+                                    json!({ "session_id": session_id.clone(), "state": "active" }),
                                 );
+                                let _ = self
+                                    .cec_send_control(
+                                        &network,
+                                        &from,
+                                        &allmystuff_cec_protocol::ControlMessage::Connect(
+                                            allmystuff_cec_protocol::ConnectControl::Approve {
+                                                session_id,
+                                                scope,
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                            } else {
+                                // Undecided: raise the prompt on the first beat and
+                                // refresh the pending record on later ones — but
+                                // don't re-emit `cec://request`, or the customer's
+                                // approval dialog is spammed once every 2s.
+                                let already = self.cec.has_pending_session(&session_id);
+                                let verification_code =
+                                    crate::cec::verification_code(&from, &session_id);
+                                let req = crate::cec::PendingRequest {
+                                    tech: from.clone(),
+                                    agent_name: agent_name.clone(),
+                                    want_control,
+                                    session_id: session_id.clone(),
+                                    verification_code: verification_code.clone(),
+                                };
+                                self.cec.record_pending(req);
+                                if !already {
+                                    self.sink.emit(
+                                        "cec://request",
+                                        json!({
+                                            "tech": from,
+                                            "agent_name": agent_name,
+                                            "want_control": want_control,
+                                            "session_id": session_id,
+                                            "verification_code": verification_code,
+                                        }),
+                                    );
+                                }
                             }
                         }
                     }
