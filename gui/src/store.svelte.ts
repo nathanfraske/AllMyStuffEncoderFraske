@@ -165,6 +165,7 @@ import {
   cecRevoke,
   cecGrants,
   cecDialed,
+  cecForgetNumber,
   forgetNode,
   onCecRequest,
   onCecPeer,
@@ -6813,6 +6814,17 @@ class AppStore {
     }
   }
 
+  /** Remove a directory row by its number — the curation path for an attempt
+   *  row that never discovered a node (it has no node id for forgetNode). */
+  async removeCecNumber(number: string) {
+    try {
+      await cecForgetNumber(number);
+    } catch (e) {
+      this.toast("warn", `Couldn't remove it: ${errMsg(e)}`);
+    }
+    void this.loadCec();
+  }
+
   /** How many stored customers have gone stale (unused past
    *  {@link CEC_STALE_AFTER_S}) — the count on the "Remove stale" curate button. */
   get cecStaleCount(): number {
@@ -6830,7 +6842,8 @@ class AppStore {
     if (stale.length === 0) return;
     for (const c of stale) {
       try {
-        await forgetNode(c.node);
+        if (c.node) await forgetNode(c.node);
+        else await cecForgetNumber(c.number);
       } catch {
         /* keep going — one failure shouldn't strand the rest */
       }

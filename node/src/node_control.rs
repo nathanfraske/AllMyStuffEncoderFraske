@@ -1350,6 +1350,10 @@ pub async fn dispatch(
         }
         "cec_grants" => json_result(mesh.cec_grants().await),
         "cec_dialed" => json_result(mesh.cec_dialed().await),
+        "cec_forget_number" => {
+            let number: String = try_arg!(arg(a, "number"));
+            json_result(mesh.cec_forget_number(number).await)
+        }
         // "Forget this node" is an app-wide feature on every node's gear (drops
         // any node from the graph/roster + tears its session down). It lives on
         // the general `forget_node` op; `cec_forget_node` is kept as an alias so
@@ -1489,6 +1493,20 @@ async fn network_set_enabled(
 /// kills the child (mirrors [`crate::daemon_spawn::DaemonChild`]).
 pub struct NodeChild {
     child: Option<Child>,
+}
+
+impl NodeChild {
+    /// Whether the spawned node process is still running (`false` for one that
+    /// exited, or a handle that never held a child). Lets a client tell "the
+    /// control socket is busy" apart from "the serve is gone": respawning over
+    /// a live serve spawns a bind-loser and then kills the live serve when the
+    /// old handle is dropped — the spawn/kill metronome. Check this first.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
 }
 
 impl Drop for NodeChild {

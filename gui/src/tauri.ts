@@ -1211,6 +1211,14 @@ export async function cecDialed(): Promise<CecPeer[] | null> {
   return Array.isArray(r) ? r : null;
 }
 
+/** Technician: remove a directory row by its support number — the curation
+ *  path for an attempt row that never discovered a node. No-op in web mode. */
+export async function cecForgetNumber(number: string): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_forget_number", { number });
+}
+
 /** "Forget this node" — an app-wide action on every node's gear: drop it from
  *  the graph + roster and tear its session down (also ends a CEC session when
  *  the node happens to be a CEC peer). No-op in web mode. */

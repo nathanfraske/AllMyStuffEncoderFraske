@@ -1294,6 +1294,29 @@ async fn cec_stop_hosting(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Technician: the dialed-customer directory — every machine *attempted*
+/// (nodeless until discovery succeeds), with live reachability. Drives the CEC
+/// tab's Client meshes list; without this command the list can never load.
+#[tauri::command]
+async fn cec_dialed(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_dialed", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Technician: curate away a directory row by its support number — the removal
+/// path for an attempt row that never discovered a node.
+#[tauri::command]
+async fn cec_forget_number(state: State<'_, AppState>, number: String) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_forget_number", json!({ "number": number }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Customer: the inbound technician connect-requests awaiting a choice.
 #[tauri::command]
 async fn cec_pending(state: State<'_, AppState>) -> Result<Value, String> {
@@ -1986,6 +2009,18 @@ fn reveal_main_window(app: &tauri::AppHandle) {
 fn heal_node(app: &tauri::AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Never heal over our own live serve — replacing its handle would
+        // kill it (see the pump's wedge handling).
+        if handle
+            .state::<AppState>()
+            .node_child
+            .lock()
+            .as_mut()
+            .map(|c| c.is_alive())
+            .unwrap_or(false)
+        {
+            return;
+        }
         match ensure_node_running().await {
             Ok(Some(child)) => {
                 handle.state::<AppState>().node_child.lock().replace(child);
@@ -2030,6 +2065,10 @@ fn apply_startup_behavior(app: &tauri::AppHandle) {
 /// in-process. Reconnects if the node restarts.
 async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
     use tokio::sync::mpsc;
+    // Consecutive grace windows the socket stayed dead while OUR child kept
+    // running — the wedged-not-gone state. Only a repeat offender earns a
+    // deliberate, owner-controlled restart.
+    let mut wedged_rounds: u32 = 0;
     loop {
         // The node may be *gone*, not just restarting — e.g. another client app
         // (CEC Support) spawned it and exited, taking the kill-on-close serve
@@ -2050,14 +2089,53 @@ async fn run_event_pump(app: tauri::AppHandle, node: Arc<NodeClient>) {
             }
         }
         if gone {
-            tracing::info!("node is gone — bringing it back up");
-            match ensure_node_running().await {
-                Ok(Some(child)) => {
-                    app.state::<AppState>().node_child.lock().replace(child);
+            // Socket dead through the grace window — but if OUR child is still
+            // running, the serve is alive behind a busy/wedged socket, not
+            // gone. Respawning then spawns a bind-loser and kills the live
+            // serve when the old handle is replaced: the spawn/kill metronome
+            // that made every peer connect/reconnect in a loop. Only respawn
+            // over a child we've confirmed dead; a serve that stays wedged for
+            // three straight windows gets a deliberate owner restart instead.
+            let own_alive = app
+                .state::<AppState>()
+                .node_child
+                .lock()
+                .as_mut()
+                .map(|c| c.is_alive())
+                .unwrap_or(false);
+            if own_alive {
+                wedged_rounds += 1;
+                if wedged_rounds >= 3 {
+                    tracing::warn!(
+                        "node socket dead across {wedged_rounds} grace windows with our serve alive — restarting it deliberately"
+                    );
+                    app.state::<AppState>().node_child.lock().take();
+                    wedged_rounds = 0;
+                    match ensure_node_running().await {
+                        Ok(Some(child)) => {
+                            app.state::<AppState>().node_child.lock().replace(child);
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
+                    }
+                } else {
+                    tracing::warn!(
+                        "node socket unresponsive but our serve is still running — not respawning over it ({wedged_rounds}/3)"
+                    );
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
+            } else {
+                wedged_rounds = 0;
+                tracing::info!("node is gone — bringing it back up");
+                match ensure_node_running().await {
+                    Ok(Some(child)) => {
+                        app.state::<AppState>().node_child.lock().replace(child);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("couldn't bring the node back up: {e:#}"),
+                }
             }
+        } else {
+            wedged_rounds = 0;
         }
         let (tx, mut rx) = mpsc::channel::<NodeEvent>(256);
         if let Err(e) = node.subscribe_events(tx).await {
@@ -2257,6 +2335,8 @@ fn main() {
             cec_deny,
             cec_revoke,
             cec_grants,
+            cec_dialed,
+            cec_forget_number,
             forget_node,
             mesh_status,
             mesh_identity,
