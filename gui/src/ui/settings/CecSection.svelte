@@ -171,6 +171,7 @@
           <b>Dialing {groupNumber(app.cecDialingNumber)}…</b>
           <span class="sub">Finding the customer on their support mesh — this can take a moment.</span>
         </span>
+        <button class="btn small danger" onclick={() => void app.cancelCecDial()}>Cancel</button>
       </div>
     {/if}
     {#if customers.length === 0}
@@ -226,13 +227,19 @@
                 <button class="btn small primary" onclick={() => saveRename(c.number)}>Save</button>
                 <button class="btn small" onclick={cancelRename}>Cancel</button>
               {:else}
-                <button
-                  class="btn small primary"
-                  disabled={app.cecDialing}
-                  onclick={() => void app.reconnectCec(c.number)}
-                >
-                  Connect
-                </button>
+                {#if c.node && c.node === app.cecAutoOpenNode}
+                  <button class="btn small danger" onclick={() => void app.stopCecWait()}>
+                    Stop
+                  </button>
+                {:else}
+                  <button
+                    class="btn small primary"
+                    disabled={app.cecDialing}
+                    onclick={() => void app.reconnectCec(c.number)}
+                  >
+                    Connect
+                  </button>
+                {/if}
                 <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
                 <button
                   class="btn small danger"

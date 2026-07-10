@@ -2659,11 +2659,12 @@ impl Mesh {
         // a completed discovery merges the node id into this same row.
         let attempt = self.cec.record_attempt(&number);
         self.sink.emit("cec://peer", attempt.to_value());
+        let cancel = self.cec.begin_dial();
         self.cec_join_silent(&network_id, config).await?;
 
         // A Silent mesh auto-dials nobody, so the customer only *appears*
         // (Sighted) — find it, then deliberately connect_peer.
-        let customer = self.cec_discover_customer(&network_id).await?;
+        let customer = self.cec_discover_customer(&network_id, &cancel).await?;
         let canonical = crate::cec::pubkey_part(&customer).to_string();
         self.client
             .request(&Request::NetworkConnectPeer {
@@ -2718,9 +2719,21 @@ impl Mesh {
             let net = network_id.clone();
             let peer = canonical.clone();
             let sid = session_id.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
                 loop {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        // "Stop trying" reaches the approval wait too: quit
+                        // re-asking and mark the session ended so the GUI's
+                        // waiting badge clears.
+                        mesh.cec.set_session(&sid, "ended");
+                        mesh.sink.emit(
+                            "cec://session",
+                            json!({ "session_id": sid, "state": "ended" }),
+                        );
+                        break;
+                    }
                     let _ = mesh.cec_send_control(&net, &peer, &request).await;
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let answered = mesh
@@ -2741,6 +2754,15 @@ impl Mesh {
         );
         self.emit_snapshot();
         Ok(json!({ "node": customer }))
+    }
+
+    /// `cec_cancel_dial` (technician): stop whatever the in-flight dial is
+    /// trying — the discovery poll and the connect-request re-send loop both
+    /// quit at the flag. The attempt row stays (the directory is permanent);
+    /// a no-dial-in-flight cancel is a harmless no-op.
+    pub async fn cec_cancel_dial(self: &Arc<Self>) -> Result<Value, String> {
+        self.cec.cancel_dial();
+        Ok(Value::Null)
     }
 
     /// `cec_forget_number` (technician): curate away a directory row by its
@@ -2980,12 +3002,19 @@ impl Mesh {
     /// Discover the single customer peer on a freshly-joined Silent mesh —
     /// `Silent` makes peers *visible* (Sighted / `PeersList`) without a
     /// connection, so we can pick the one there before dialing it.
-    async fn cec_discover_customer(self: &Arc<Self>, network_id: &str) -> Result<String, String> {
+    async fn cec_discover_customer(
+        self: &Arc<Self>,
+        network_id: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, String> {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
         const POLL: std::time::Duration = std::time::Duration::from_millis(500);
         let me = self.resolve_local_id().await.unwrap_or_default();
         let by = std::time::Instant::now() + DEADLINE;
         loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("dial cancelled".into());
+            }
             if let Some(peer) = self.cec_first_peer(network_id, &me).await {
                 return Ok(peer);
             }

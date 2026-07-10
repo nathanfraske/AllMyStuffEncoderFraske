@@ -1306,6 +1306,17 @@ async fn cec_dialed(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Technician: stop whatever the in-flight dial is trying (discovery poll +
+/// connect-request re-sends). The attempt row stays in the directory.
+#[tauri::command]
+async fn cec_cancel_dial(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_cancel_dial", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Technician: curate away a directory row by its support number — the removal
 /// path for an attempt row that never discovered a node.
 #[tauri::command]
@@ -2337,6 +2348,7 @@ fn main() {
             cec_grants,
             cec_dialed,
             cec_forget_number,
+            cec_cancel_dial,
             forget_node,
             mesh_status,
             mesh_identity,
