@@ -6745,6 +6745,7 @@ class AppStore {
     if (pending) this.cecRequests = pending;
     const dialed = await cecDialed();
     if (dialed) this.cecCustomers = dialed;
+    else clientLog("[cec] dialed-list fetch failed — keeping the last snapshot");
   }
 
   /** Technician: dial a customer by the number they read out. On success the
@@ -6778,17 +6779,21 @@ class AppStore {
     }
     this.cecDialing = true;
     this.cecDialingNumber = number;
+    clientLog(`[cec] dialing ${number}…`);
     try {
       const r = await cecDial(number, this.cecAgentName.trim());
       if (r?.node) {
+        clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
         this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
         this.cecAutoOpenNode = r.node;
         void this.pullSessionSnapshot();
       } else {
+        clientLog(`[cec] dial returned no node (web mode or empty reply)`);
         this.toast("ok", `Dialed ${number}`);
       }
       return true;
     } catch (e) {
+      clientLog(`[cec] dial FAILED — ${errMsg(e)}`);
       this.toast("warn", `Couldn't reach ${number}: ${errMsg(e)}`);
       return false;
     } finally {
