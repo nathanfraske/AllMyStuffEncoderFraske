@@ -144,6 +144,38 @@
     buildFleetGroups(fleetKeyOf, (g) => (g.key === "mine" ? 0 : g.key === "unknown" ? 2 : 1)),
   );
 
+  // ---- mesh sub-groups ----------------------------------------------------
+  //
+  // Within one fleet, the grid and the list seat devices by the mesh(es)
+  // they're on. A device can be on several meshes at once, so the sub-group
+  // key is the *combination*: devices sharing the same set sit together under
+  // one label ("Home + Work") rather than any device being drawn twice — a
+  // card exists once, keyed by its node id, and every view keeps that
+  // invariant. A fleet whose devices all share one identical mesh set gets no
+  // sub-bands at all (the header would only repeat itself), and devices whose
+  // meshes we don't know yet (an older peer, or presence still landing) gather
+  // at the end under "Mesh unknown" instead of polluting a real mesh's band.
+
+  type MeshSub = { key: string; label: string; nodes: MeshNode[] };
+  const NO_MESH_KEY = "~none";
+
+  function meshSubsOf(nodes: MeshNode[]): MeshSub[] {
+    const subs = new Map<string, MeshSub>();
+    for (const n of nodes) {
+      const meshes = [...new Set(n.networks ?? [])].sort((a, b) => a.localeCompare(b));
+      const key = meshes.length ? meshes.join(" ") : NO_MESH_KEY;
+      const label = meshes.length ? meshes.join(" + ") : "Mesh unknown";
+      const s = subs.get(key) ?? { key, label, nodes: [] };
+      s.nodes.push(n);
+      subs.set(key, s);
+    }
+    // Insertion preserved the group's own node order (this-device first, then
+    // alphabetical), so only the sub-bands themselves need sorting.
+    return [...subs.values()].sort((a, b) =>
+      a.key === NO_MESH_KEY ? 1 : b.key === NO_MESH_KEY ? -1 : a.label.localeCompare(b.label),
+    );
+  }
+
   // ---- views ------------------------------------------------------------
   //
   // Three layouts over the same nodes: the grouped grid (one labelled section
@@ -201,50 +233,66 @@
     if (listScroll) listScroll.scrollTop = 0;
   }
 
-  // The grid's geometry: one section per fleet, nodes wrapped into rows.
+  // The grid's geometry: one section per fleet, nodes wrapped into rows —
+  // sub-banded by mesh when the fleet spans more than one mesh combination.
   const GRID_MARGIN = 28;
   const CELL_W = NODE_W + 26;
   const CELL_H = NODE_H + 64; // node + meta rows + breathing room
   const SECTION_HEAD = 34;
+  const SECTION_SUBHEAD = 24; // one mesh sub-band label inside a section
   const SECTION_GAP = 26;
   const SECTION_PAD = 14;
 
   type Section = { key: string; label: string; x: number; y: number; w: number; h: number; count: number };
+  type SubHead = { key: string; label: string; x: number; y: number; w: number };
 
-  const gridLayout = $derived.by((): { placed: Placed[]; sections: Section[]; height: number } => {
-    const placed: Placed[] = [];
-    const sections: Section[] = [];
-    const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / CELL_W));
-    let y = GRID_MARGIN;
-    for (const g of fleetGroups) {
-      const useCols = Math.min(cols, Math.max(1, g.nodes.length));
-      const rows = Math.ceil(g.nodes.length / useCols);
-      const w = useCols * CELL_W + 2 * SECTION_PAD;
-      const x0 = Math.max(GRID_MARGIN, (width - w) / 2);
-      sections.push({
-        key: g.key,
-        label: g.label,
-        x: x0,
-        y,
-        w,
-        h: SECTION_HEAD + rows * CELL_H + SECTION_PAD,
-        count: g.nodes.length,
-      });
-      g.nodes.forEach((n, i) => {
-        const col = i % useCols;
-        const row = Math.floor(i / useCols);
-        placed.push({
-          node: n,
-          x: x0 + SECTION_PAD + col * CELL_W + CELL_W / 2,
-          y: y + SECTION_HEAD + row * CELL_H + CELL_H / 2 - 10,
-        });
-      });
-      y += SECTION_HEAD + rows * CELL_H + SECTION_PAD + SECTION_GAP;
-    }
-    // A closing margin so the last section isn't flush against the scroll end,
-    // and so a drop-out drawer opening under a last-row card has room below it.
-    return { placed, sections, height: y + GRID_MARGIN };
-  });
+  const gridLayout = $derived.by(
+    (): { placed: Placed[]; sections: Section[]; subheads: SubHead[]; height: number } => {
+      const placed: Placed[] = [];
+      const sections: Section[] = [];
+      const subheads: SubHead[] = [];
+      const cols = Math.max(1, Math.floor((width - 2 * GRID_MARGIN) / CELL_W));
+      let y = GRID_MARGIN;
+      for (const g of fleetGroups) {
+        // The section keeps one column count for the whole fleet, so the mesh
+        // sub-bands stay aligned instead of each re-fitting its own width.
+        const useCols = Math.min(cols, Math.max(1, g.nodes.length));
+        const w = useCols * CELL_W + 2 * SECTION_PAD;
+        const x0 = Math.max(GRID_MARGIN, (width - w) / 2);
+        const subs = meshSubsOf(g.nodes);
+        const showSubs = subs.length > 1;
+        let innerY = y + SECTION_HEAD;
+        for (const sub of subs) {
+          if (showSubs) {
+            subheads.push({
+              key: `${g.key}//${sub.key}`,
+              label: sub.label,
+              x: x0 + SECTION_PAD,
+              y: innerY,
+              w: w - 2 * SECTION_PAD,
+            });
+            innerY += SECTION_SUBHEAD;
+          }
+          sub.nodes.forEach((n, i) => {
+            const col = i % useCols;
+            const row = Math.floor(i / useCols);
+            placed.push({
+              node: n,
+              x: x0 + SECTION_PAD + col * CELL_W + CELL_W / 2,
+              y: innerY + row * CELL_H + CELL_H / 2 - 10,
+            });
+          });
+          innerY += Math.ceil(sub.nodes.length / useCols) * CELL_H;
+        }
+        const h = innerY - y + SECTION_PAD;
+        sections.push({ key: g.key, label: g.label, x: x0, y, w, h, count: g.nodes.length });
+        y += h + SECTION_GAP;
+      }
+      // A closing margin so the last section isn't flush against the scroll end,
+      // and so a drop-out drawer opening under a last-row card has room below it.
+      return { placed, sections, subheads, height: y + GRID_MARGIN };
+    },
+  );
 
   // Radial layout: "this" in the middle, everything else on a ring seated
   // by fleet — your devices first, then each named fleet, unknowns last —
@@ -277,6 +325,7 @@
     view === "grid" ? gridLayout.placed : view === "radial" ? radialLayout : [],
   );
   const sections = $derived(view === "grid" ? gridLayout.sections : []);
+  const subheads = $derived(view === "grid" ? gridLayout.subheads : []);
 
   // ---- list view --------------------------------------------------------
   //
@@ -1402,6 +1451,12 @@
         </div>
       </div>
     {/each}
+    {#each subheads as sh (sh.key)}
+      <!-- grid view only: a mesh sub-band inside a fleet that spans meshes -->
+      <div class="section-sub" style="left: {sh.x}px; top: {sh.y}px; width: {sh.w}px;">
+        <span class="section-sub-label">{sh.label}</span>
+      </div>
+    {/each}
     {#each layout as p (p.node.id)}
       {@render deviceCard(p.node, p)}
     {/each}
@@ -1449,6 +1504,7 @@
           </div>
         {:else}
           {#each filteredListGroups as g (g.key)}
+            {@const subs = meshSubsOf(g.nodes)}
             <section
               class="list-group"
               class:mine={g.key === "mine"}
@@ -1460,11 +1516,18 @@
                 <span class="lg-label">{g.label}</span>
                 <span class="lg-count">{g.nodes.length}</span>
               </header>
-              <div class="list-rows">
-                {#each g.nodes as n (n.id)}
-                  {@render deviceCard(n, null)}
-                {/each}
-              </div>
+              <!-- One run of rows per mesh combination; a fleet living on a
+                   single mesh set keeps today's flat list (no sub-header). -->
+              {#each subs as sub (sub.key)}
+                {#if subs.length > 1}
+                  <div class="list-mesh-head">{sub.label}</div>
+                {/if}
+                <div class="list-rows">
+                  {#each sub.nodes as n (n.id)}
+                    {@render deviceCard(n, null)}
+                  {/each}
+                </div>
+              {/each}
             </section>
           {/each}
         {/if}
@@ -1947,6 +2010,34 @@
     border-radius: var(--r-pill);
     padding: 0.02rem 0.4rem;
     color: var(--ink-faint);
+  }
+  /* A mesh sub-band inside a fleet section (grid view): a quiet ruled label
+     seating the devices below it on the mesh(es) it names. */
+  .section-sub {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    height: 24px;
+    box-sizing: border-box;
+    padding: 0 0.2rem;
+    pointer-events: none;
+  }
+  .section-sub::after {
+    content: "";
+    flex: 1;
+    border-top: 1px dashed var(--line);
+  }
+  .section-sub-label {
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
   }
   .node {
     position: absolute;
@@ -2845,6 +2936,25 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
+  }
+  /* A mesh sub-header inside a fleet's list group — same quiet ruled label as
+     the grid's sub-bands, in flow between the runs of rows. */
+  .list-mesh-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.55rem 0 0.4rem;
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .list-mesh-head::after {
+    content: "";
+    flex: 1;
+    border-top: 1px dashed var(--line);
   }
 
   /* The device card as a list row: a full-width card in normal flow (the graph
