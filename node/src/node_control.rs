@@ -754,6 +754,55 @@ pub async fn dispatch(
             }))
         }
 
+        // The CEC Support app's spec card: this machine's headline hardware
+        // (CPU / RAM / GPUs / disks) straight off a fresh scan — a slice, not
+        // the whole inventory, because the customer app needs a spec sheet,
+        // not the USB bus. Temps are deliberately absent: the scanner reads
+        // no sensors today, and the card must not invent them.
+        "machine_specs" => {
+            let inv = allmystuff_inventory::scan();
+            DispatchOut::Json(json!({
+                "hostname": inv.host.hostname,
+                "os": match &inv.host.os_version {
+                    Some(v) => format!("{} {}", inv.host.os, v),
+                    None => inv.host.os.clone(),
+                },
+                "cpu": {
+                    "brand": inv.cpu.brand,
+                    "cores": inv.cpu.physical_cores,
+                    "threads": inv.cpu.logical_cores,
+                    "max_mhz": inv.cpu.max_mhz,
+                },
+                "memory": {
+                    "total_bytes": inv.memory.total_bytes,
+                    "available_bytes": inv.memory.available_bytes,
+                },
+                "gpus": inv
+                    .gpus
+                    .iter()
+                    .map(|g| {
+                        json!({
+                            "name": g.name,
+                            "vram_bytes": g.vram_bytes,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "disks": inv
+                    .storage
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "mount": s.mount_point,
+                            "total_bytes": s.total_bytes,
+                            "available_bytes": s.available_bytes,
+                            "removable": s.removable,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }))
+        }
+
         // ---- live mesh (presence + routing) ------------------------------
         "connect_route" => {
             let from: String = try_arg!(arg(a, "from"));
