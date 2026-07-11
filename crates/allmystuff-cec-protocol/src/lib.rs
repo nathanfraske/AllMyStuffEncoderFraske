@@ -47,8 +47,8 @@ pub mod media;
 pub mod wire;
 
 pub use ids::{
-    format_support_id, network_id_for_device, network_id_for_number, support_id_from_device,
-    SupportId, SUPPORT_ID_LEN,
+    device_pubkey, format_support_id, network_id_for_device, network_id_for_number,
+    support_id_from_device, support_id_from_string, SupportId, SUPPORT_ID_LEN,
 };
 pub use media::{
     decode_media_frame, encode_media_frame, MediaFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,

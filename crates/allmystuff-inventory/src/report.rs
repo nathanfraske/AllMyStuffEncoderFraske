@@ -376,6 +376,7 @@ mod tests {
             inputs: vec![],
             usb: vec![],
             listening: vec![],
+            temps: vec![],
         };
         let out = render(&inv);
         assert!(out.contains("demo-box"));

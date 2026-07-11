@@ -57,9 +57,34 @@ impl std::fmt::Display for SupportId {
     }
 }
 
-/// Derive the 9-digit Support ID string for a device id. See [`SupportId`].
+/// The bare pubkey part of a device id: strips a trailing `-XXXXX` display
+/// suffix (dash + exactly 5 alphanumerics) if present. A device id reaches us
+/// in two forms — bare on the wire (`pubkey`), suffixed everywhere a human
+/// might see it (`pubkey-AB12C`) — and a Support ID derived from one form
+/// would never match one derived from the other: the customer would host a
+/// room no beacon points at. Every device-id derivation canonicalises through
+/// this. Matches MyOwnMesh's `signing::pubkey_part` and consent's.
+pub fn device_pubkey(device_id: &str) -> &str {
+    if let Some((head, tail)) = device_id.rsplit_once('-') {
+        if tail.len() == 5 && tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return head;
+        }
+    }
+    device_id
+}
+
+/// Derive the 9-digit Support ID string for a device id, in either bare or
+/// display-suffixed form — both yield the same ID. See [`SupportId`].
 pub fn support_id_from_device(device_id: &str) -> String {
-    let digest = Sha256::digest(device_id.as_bytes());
+    support_id_from_string(device_pubkey(device_id))
+}
+
+/// Reduce an arbitrary string to 9 decimal digits — the raw hash with **no**
+/// device-id canonicalisation. For inputs that aren't device ids (e.g. the
+/// session verification code); device ids go through
+/// [`support_id_from_device`].
+pub fn support_id_from_string(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
     // First 8 bytes = 64 bits, reduced modulo 1e9 to a 9-digit number. 2^64 is
     // ~1.8e10 × 1e9, so the modulo bias is negligible.
     let mut acc: u64 = 0;
@@ -135,8 +160,36 @@ mod tests {
     #[test]
     fn different_devices_differ() {
         assert_ne!(
-            support_id_from_device("device-alpha"),
-            support_id_from_device("device-beta")
+            support_id_from_device("k3m2pq7xabcdefghijklmnopqrstuvwxyz234567abcdefghijkl"),
+            support_id_from_device("zzz2pq7xabcdefghijklmnopqrstuvwxyz234567abcdefghijkl")
+        );
+    }
+
+    #[test]
+    fn suffixed_and_bare_forms_agree() {
+        // The wire sees the bare pubkey; humans (and local identity) see the
+        // display-suffixed form. Both must land on the same Support ID, or a
+        // technician answering a help beacon dials a room nobody hosts.
+        let bare = "dqbx4vwtyegzh47nsssg2zrqhev576jp7tkspvwr3mf4jk5wmmoa";
+        let suffixed = format!("{bare}-0A307");
+        assert_eq!(
+            support_id_from_device(bare),
+            support_id_from_device(&suffixed)
+        );
+        assert_eq!(
+            network_id_for_device(bare),
+            network_id_for_device(&suffixed)
+        );
+        // But a dash tail that isn't a 5-char display suffix is part of the
+        // id and must NOT be stripped.
+        assert_ne!(
+            support_id_from_device("device-alphabet"),
+            support_id_from_device("device")
+        );
+        // And the raw string hash never canonicalises.
+        assert_ne!(
+            support_id_from_string(&suffixed),
+            support_id_from_string(bare)
         );
     }
 

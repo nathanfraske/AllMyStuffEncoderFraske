@@ -755,10 +755,11 @@ pub async fn dispatch(
         }
 
         // The CEC Support app's spec card: this machine's headline hardware
-        // (CPU / RAM / GPUs / disks) straight off a fresh scan — a slice, not
-        // the whole inventory, because the customer app needs a spec sheet,
-        // not the USB bus. Temps are deliberately absent: the scanner reads
-        // no sensors today, and the card must not invent them.
+        // (CPU / RAM / GPUs / disks / temps) straight off a fresh scan — a
+        // slice, not the whole inventory, because the customer app needs a
+        // spec sheet, not the USB bus. Temps are whatever the OS exposes —
+        // often nothing on consumer Windows boards — and the card hides the
+        // row rather than invent readings.
         "machine_specs" => {
             let inv = allmystuff_inventory::scan();
             DispatchOut::Json(json!({
@@ -800,8 +801,33 @@ pub async fn dispatch(
                         })
                     })
                     .collect::<Vec<_>>(),
+                "temps": inv
+                    .temps
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "label": t.label,
+                            "celsius": t.celsius,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             }))
         }
+
+        // Temps alone, off the sensor read only — no PowerShell probes, no
+        // full scan — so a UI can keep the spec card's one moving number
+        // moving with a cheap poll while `machine_specs` stays one-shot.
+        "machine_temps" => DispatchOut::Json(json!({
+            "temps": allmystuff_inventory::temps()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "label": t.label,
+                        "celsius": t.celsius,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })),
 
         // ---- live mesh (presence + routing) ------------------------------
         "connect_route" => {
