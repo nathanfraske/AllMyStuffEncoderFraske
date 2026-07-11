@@ -3462,7 +3462,11 @@ impl Mesh {
                             // "Once" that never persisted) falls through to the
                             // prompt, so reconnecting to a lapsed machine pops the
                             // box again, exactly like the first time.
-                            if let Some(scope) = self.cec.active_scope_for(&from) {
+                            // Standing grants only: an "Approve Once" covers
+                            // exactly its own session, so a *new* dial from a
+                            // once-approved technician re-prompts instead of
+                            // silently reattaching off the leftover grant.
+                            if let Some(scope) = self.cec.standing_scope_for(&from) {
                                 // Each dial mints a fresh session id — end any
                                 // older live session with this same technician
                                 // first, so a re-dial supersedes rather than
@@ -3570,6 +3574,14 @@ impl Mesh {
                 }
                 allmystuff_cec_protocol::ConnectControl::End { session_id } => {
                     self.cec.set_session(&session_id, "ended");
+                    // The session an "Approve Once" covered is over — retire it
+                    // now, so a later console open or re-dial has to earn a
+                    // fresh approval instead of riding a leftover in-memory
+                    // grant. Standing grants (3h / Forever) survive: outliving
+                    // sessions is their whole point.
+                    if self.cec.retire_once(&from) {
+                        self.cec_emit_grants();
+                    }
                     self.sink.emit(
                         "cec://session",
                         json!({ "session_id": session_id, "state": "ended" }),
