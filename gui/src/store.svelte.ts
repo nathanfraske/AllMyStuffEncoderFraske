@@ -6939,9 +6939,18 @@ class AppStore {
 
   /** Flip the "Watch the help queue" opt-in, then re-read the node's status —
    *  membership is the saved state, so the toggle shows what actually took
-   *  (and keeps showing it after a restart, no local flag needed). */
+   *  (and keeps showing it after a restart, no local flag needed). A failure
+   *  says so out loud: a silent one leaves a checkbox that just snaps back,
+   *  which reads as haunted rather than broken. */
   async setCecHelpWatch(on: boolean) {
-    await cecHelpWatch(on);
+    try {
+      await cecHelpWatch(on);
+    } catch (e) {
+      this.toast(
+        "warn",
+        `Couldn't ${on ? "watch" : "stop watching"} the help queue: ${String(e)}`,
+      );
+    }
     const status = await cecStatus();
     if (status) this.cecStatusInfo = status;
     if (on) void this.loadCec();
