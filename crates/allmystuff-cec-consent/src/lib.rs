@@ -205,6 +205,21 @@ impl ConsentStore {
             .any(|g| g.technician == key && g.is_live(now) && g.covers(cap))
     }
 
+    /// Whether `technician` has **any** grant record here, live or lapsed.
+    /// This is recognition, not authorization — [`Self::is_allowed`] stays the
+    /// only enforcement check. It lets the node keep treating a peer as a CEC
+    /// technician *after* their grant expires: the screen-offer screen must
+    /// still apply to them (an expired technician is not a stranger the CEC
+    /// gate can ignore), and a refusal can name the real cause ("approval
+    /// lapsed") instead of pointing at fleet settings.
+    pub fn known(&self, technician: &str) -> bool {
+        let key = pubkey_part(technician);
+        self.persistent
+            .iter()
+            .chain(self.ephemeral.iter())
+            .any(|g| g.technician == key)
+    }
+
     /// Revoke every grant for `technician` — the "Forget this technician"
     /// action. Removes both the persisted and the in-memory grant and persists
     /// the change. Returns `true` if anything was actually removed.
@@ -320,6 +335,31 @@ mod tests {
         // Reload: the Once grant is gone.
         let reloaded = ConsentStore::load(&path);
         assert!(!reloaded.is_allowed(TECH, Capability::ScreenView, T0));
+    }
+
+    #[test]
+    fn known_recognises_lapsed_grants_but_never_authorises() {
+        let (_dir, mut s) = tempstore();
+        assert!(!s.known(TECH), "a stranger is not known");
+        s.approve(
+            TECH,
+            "Alex",
+            capabilities_for(true),
+            ApprovalScope::ThreeHours,
+            T0,
+        )
+        .unwrap();
+        // Live: known and allowed. Lapsed: still known — the CEC gates must
+        // keep screening an expired technician — but no longer allowed.
+        let display = format!("{TECH}-AB12C");
+        assert!(s.known(&display), "recognition canonicalises the id");
+        assert!(s.is_allowed(TECH, Capability::Control, T0 + 10));
+        let lapsed = T0 + THREE_HOURS_SECS + 1;
+        assert!(s.known(TECH), "expiry does not erase recognition");
+        assert!(!s.is_allowed(TECH, Capability::Control, lapsed));
+        // A revoke ("Forget this technician") erases recognition too.
+        assert!(s.revoke(TECH).unwrap());
+        assert!(!s.known(TECH));
     }
 
     #[test]

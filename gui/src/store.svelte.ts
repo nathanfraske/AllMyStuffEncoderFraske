@@ -3136,6 +3136,29 @@ class AppStore {
     to: string,
     codec?: "auto" | "h264" | "mjpeg",
   ): { id: string; created: boolean } | null {
+    // A dialed CEC customer never becomes "mine" or "shared" — the customer's
+    // live consent grant is the authorization, and *their* node enforces it
+    // (per offer for the screen, per frame for control). Routing these legs
+    // through `proposeRoute` would refuse them structurally ("isn't yours yet
+    // — claim it first" / a share prompt), because the client-side rules only
+    // know owner/fleet/share. So wire a CEC leg directly, the same way a
+    // popout continues an already-authorized stream: if the customer's grant
+    // doesn't actually cover it, their node rejects the route and the console
+    // surfaces that reason.
+    const cecLeg = [from, to].some((capId) => {
+      const cap = this.capability(capId);
+      return !!cap && !this.isMe(cap.node) && this.isCecCustomer(cap.node);
+    });
+    if (cecLeg) {
+      if (!this.capability(from) || !this.capability(to)) return null;
+      const id = `route:${from}→${to}`;
+      const existedBefore = this.catalog.routes.some((r) => r.id === id);
+      if (!existedBefore) {
+        this.addRoute(from, to);
+        this.fireBackendConnect(from, to, this.capability(from)!.media, codec);
+      }
+      return { id, created: !existedBefore };
+    }
     const id = `route:${from}→${to}`;
     const existedBefore = this.catalog.routes.some((r) => r.id === id);
     this.connect(from, to, codec);
@@ -6826,6 +6849,21 @@ class AppStore {
   async cancelCecDial() {
     clientLog("[cec] cancel requested");
     await cecCancelDial();
+  }
+
+  /** Open the remote-control console for a dialed customer straight from the
+   *  Support tab — the "Control" button on their row, so the whole support
+   *  flow (dial, approve, control) lives in the one tab. The customer must
+   *  currently be on the graph (their peer landed after a dial); their node
+   *  still enforces the consent grant on every leg, so this only opens the
+   *  window — it can't grant anything. */
+  openCecConsole(c: CecPeer) {
+    const node = c.node ? this.machineByAnyId(c.node) : undefined;
+    if (!node) {
+      this.toast("warn", "That customer isn't reachable right now — Connect first");
+      return;
+    }
+    this.openConsole(node.id);
   }
 
   /** Stop waiting on an unanswered approval: quit the connect-request

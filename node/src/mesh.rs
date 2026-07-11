@@ -8723,11 +8723,24 @@ impl Mesh {
             return;
         }
         let reason = if route_ok {
-            format!(
-                "{plane} refused: this machine doesn't recognize the controlling device as its \
-                 owner or a fleet member (and no {plane} share covers it) — check the fleet \
-                 roster / re-admit the device from Fleet settings"
-            )
+            if self.cec.knows_technician(from) {
+                // A CEC technician's authority is the customer's consent grant,
+                // not the fleet roster — when their frames die here it's the
+                // grant that lapsed (expired, revoked, or an "Approve Once"
+                // lost to an app restart). Say that, or the technician goes
+                // hunting through fleet settings that were never involved.
+                format!(
+                    "{plane} refused: the customer's approval no longer covers it \
+                     (expired, revoked, or their app restarted) — reconnect so they \
+                     can approve again"
+                )
+            } else {
+                format!(
+                    "{plane} refused: this machine doesn't recognize the controlling device as \
+                     its owner or a fleet member (and no {plane} share covers it) — check the \
+                     fleet roster / re-admit the device from Fleet settings"
+                )
+            }
         } else {
             format!(
                 "{plane} refused: no live {plane} route for it here ({}) — reconnect the console",

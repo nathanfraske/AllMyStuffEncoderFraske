@@ -240,6 +240,20 @@
                     Connect
                   </button>
                 {/if}
+                {#if c.node}
+                  <!-- The whole support flow from this one tab: once a dial has
+                       found their machine, Control (re)opens the remote console
+                       — no trip to the graph. Their node still enforces the
+                       consent grant on every leg. -->
+                  <button
+                    class="btn small"
+                    disabled={!c.online}
+                    title={c.online ? "Open the remote-control console" : "They're offline — Connect first"}
+                    onclick={() => app.openCecConsole(c)}
+                  >
+                    Control
+                  </button>
+                {/if}
                 <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
                 <button
                   class="btn small danger"
