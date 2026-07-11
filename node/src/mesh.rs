@@ -1760,8 +1760,7 @@ impl Mesh {
                                 let (help_net, _) = crate::cec::help_network_config();
                                 let reached =
                                     self.cec_broadcast_presence(&help_net, &me, true).await;
-                                self.sink
-                                    .emit("cec://help", json!({ "watchers": reached }));
+                                self.sink.emit("cec://help", json!({ "watchers": reached }));
                             }
                         }
                     }
@@ -2712,8 +2711,7 @@ impl Mesh {
             let (network_id, config) = crate::cec::help_network_config();
             self.cec_join_silent(&network_id, config).await?;
             let reached = self.cec_broadcast_presence(&network_id, &me, true).await;
-            self.sink
-                .emit("cec://help", json!({ "watchers": reached }));
+            self.sink.emit("cec://help", json!({ "watchers": reached }));
             tracing::info!("CEC Support: asking for help on {network_id} (reached {reached})");
             // The room is Open, so the daemon is already auto-dialing every
             // watcher it sights — but the broadcast above races those dials
@@ -2736,8 +2734,7 @@ impl Mesh {
                     }
                     let (network_id, _) = crate::cec::help_network_config();
                     let reached = mesh.cec_broadcast_presence(&network_id, &me, true).await;
-                    mesh.sink
-                        .emit("cec://help", json!({ "watchers": reached }));
+                    mesh.sink.emit("cec://help", json!({ "watchers": reached }));
                 }
             });
         } else {
