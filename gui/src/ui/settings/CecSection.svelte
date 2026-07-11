@@ -194,7 +194,11 @@
         stays off the shared help room entirely.
       </p>
     {:else if app.cecHelpWaiting.length === 0}
-      <p class="notice">No one is asking right now — you're watching.</p>
+      <p class="notice listening">
+        <span class="live-dot" aria-hidden="true"></span>
+        Listening — no one is asking right now. A raised hand lands here
+        within a couple of seconds.
+      </p>
     {:else}
       <p class="hint">
         These customers pressed <b>Ask for help</b> and are waiting right now.
@@ -557,6 +561,37 @@
   .who .host {
     font-weight: 400;
     color: var(--ink-soft);
+  }
+  /* The empty-queue "we're live" state: a breathing dot, calm not urgent —
+     shows the watch is real even when nobody's waving. */
+  .notice.listening {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .live-dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+    animation: live-breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes live-breathe {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.3);
+      opacity: 0.5;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot {
+      animation: none;
+    }
   }
   .row-top {
     display: flex;

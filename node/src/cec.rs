@@ -969,19 +969,23 @@ pub fn silent_network_config(number: &str) -> (String, Value) {
 }
 
 /// Build the daemon config for the **global help mesh** — the one well-known
-/// Silent room every CEC client shares
+/// room every CEC client shares
 /// ([`HELP_NETWORK_ID`](allmystuff_cec_protocol::HELP_NETWORK_ID)). A customer
 /// joins it only while asking for help and beacons a `SupportPresence` there;
-/// technicians sit on it and list the beacons. Silent again: the room carries
-/// *want*, never access — a session still goes through the customer's own
-/// number mesh and the consent handshake.
+/// technicians join it only while watching the queue. **Open, not Silent**:
+/// membership is already gated to exactly the peers who should connect (the
+/// asker's button, the watcher's toggle), so the daemon's native auto-dial IS
+/// the wiring — a raised hand connects to the watchers within a beat instead
+/// of hand-dialing before every beacon. The room still carries *want*, never
+/// access: a session goes through the customer's own (still Silent) number
+/// mesh and the consent handshake.
 pub fn help_network_config() -> (String, Value) {
     let network_id = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
     let config = json!({
         "id": network_id,
         "network_id": network_id,
         "label": "CEC Support — asking for help",
-        "kind": "silent",
+        "kind": "open",
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
     });

@@ -1750,6 +1750,20 @@ impl Mesh {
                             }
                         );
                         self.ownership_check(Some(&from)).await;
+                        // A peer just came up while our hand is raised —
+                        // beacon the help room right now instead of waiting
+                        // out the next keep-alive beat. Network-scoped, so it
+                        // only reaches help-room peers; harmless if the peer
+                        // was on some other room.
+                        if self.cec.asking_help() {
+                            if let Some(me) = self.resolve_local_id().await {
+                                let (help_net, _) = crate::cec::help_network_config();
+                                let reached =
+                                    self.cec_broadcast_presence(&help_net, &me, true).await;
+                                self.sink
+                                    .emit("cec://help", json!({ "watchers": reached }));
+                            }
+                        }
                     }
                     if changed {
                         self.emit_snapshot();
@@ -2697,29 +2711,33 @@ impl Mesh {
             let epoch = self.cec.help_epoch();
             let (network_id, config) = crate::cec::help_network_config();
             self.cec_join_silent(&network_id, config).await?;
-            // The room is Silent: without this, the beacon below broadcasts
-            // over zero connections and no technician ever hears the ask.
-            self.cec_connect_help_watchers(&network_id).await;
-            self.cec_broadcast_presence(&network_id, &me, true).await;
-            tracing::info!("CEC Support: asking for help on {network_id}");
-            // Keep the ask alive: technicians age a silent beacon out after
-            // HELP_TTL_SECS, so re-beacon on a shorter period. The epoch guard
-            // means a cancel + re-ask leaves exactly one loop beaconing. Each
-            // beat re-wires first, so a technician who started watching (or
-            // reconnected) mid-ask hears us within one period.
+            let reached = self.cec_broadcast_presence(&network_id, &me, true).await;
+            self.sink
+                .emit("cec://help", json!({ "watchers": reached }));
+            tracing::info!("CEC Support: asking for help on {network_id} (reached {reached})");
+            // The room is Open, so the daemon is already auto-dialing every
+            // watcher it sights — but the broadcast above races those dials
+            // (a mid-handshake peer receives nothing). Re-beacon on a fast
+            // burst (t=2,5,10,20s) so the hand is up within a couple of
+            // seconds of the first wire, then settle into the keep-alive
+            // cadence — technicians age a silent beacon out after
+            // HELP_TTL_SECS. Every beat reports how many watchers it actually
+            // reached, so the waiting card can say "raising your hand…" vs
+            // "CEC can see you" honestly. The epoch guard means a cancel +
+            // re-ask leaves exactly one loop beaconing.
             let mesh = self.clone();
             crate::spawn(async move {
+                let mut burst = [2u64, 3, 5, 10].into_iter();
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        crate::cec::HELP_BEACON_SECS,
-                    ))
-                    .await;
+                    let wait = burst.next().unwrap_or(crate::cec::HELP_BEACON_SECS);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     if !mesh.cec.asking_help() || mesh.cec.help_epoch() != epoch {
                         return;
                     }
                     let (network_id, _) = crate::cec::help_network_config();
-                    mesh.cec_connect_help_watchers(&network_id).await;
-                    mesh.cec_broadcast_presence(&network_id, &me, true).await;
+                    let reached = mesh.cec_broadcast_presence(&network_id, &me, true).await;
+                    mesh.sink
+                        .emit("cec://help", json!({ "watchers": reached }));
                 }
             });
         } else {
@@ -2728,70 +2746,18 @@ impl Mesh {
         Ok(json!({ "asking": on }))
     }
 
-    /// Wire the help room: connect to every peer currently sighted on it. A
-    /// Silent room makes peers *visible* without connections, and a channel
-    /// broadcast only travels over live connections — so an asking customer
-    /// dials whoever is watching before each beacon, or the beacon reaches
-    /// nobody (the "asking, but the technician's queue stays empty" leg,
-    /// caught live: both sides logged each other as sighted-not-dialing while
-    /// every beacon went into the void). Idempotent — an already-connected
-    /// peer is a no-op for the daemon — and everyone on this room is CEC by
-    /// construction (the watchers' opt-in, the askers' button), so connecting
-    /// to all of them is exactly the intent. The wire carries the beacon and
-    /// nothing else: access still lives on the customer's own number room
-    /// behind the consent handshake.
-    async fn cec_connect_help_watchers(&self, network_id: &str) {
-        let me = self.resolve_local_id().await.unwrap_or_default();
-        let me_canon = crate::cec::pubkey_part(&me).to_string();
-        let Ok(resp) = self
-            .client
-            .request(&Request::PeersList {
-                network: network_id.to_string(),
-            })
-            .await
-        else {
-            return;
-        };
-        let peers: Vec<String> = resp
-            .data
-            .as_ref()
-            .and_then(|d| d.get("peers"))
-            .and_then(|p| p.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.get("device_id").and_then(|v| v.as_str()))
-                    .map(|id| crate::cec::pubkey_part(id).to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for peer in peers {
-            if peer == me_canon {
-                continue;
-            }
-            let _ = self
-                .client
-                .request(&Request::NetworkConnectPeer {
-                    network: network_id.to_string(),
-                    peer,
-                })
-                .await;
-        }
-    }
-
     /// Withdraw the help ask: beacon `available: false` (so technician caches
     /// clear at once instead of waiting out the TTL), then leave the global
     /// room. Shared by the explicit cancel and the automatic clear when a
-    /// session gets approved — help arrived, stop asking for it.
+    /// session gets approved — help arrived, stop asking for it. The goodbye
+    /// rides the Open room's standing wires; watchers age us out via the TTL
+    /// if it misses.
     async fn cec_stop_asking_help(self: &Arc<Self>, me: &str) {
         if !self.cec.set_asking_help(false) {
             return;
         }
         let (network_id, _) = crate::cec::help_network_config();
-        // Re-wire before the withdrawal too — the goodbye also needs a live
-        // connection to travel over (watchers age us out via the TTL either
-        // way; this just clears their queues immediately).
-        self.cec_connect_help_watchers(&network_id).await;
-        self.cec_broadcast_presence(&network_id, me, false).await;
+        let _ = self.cec_broadcast_presence(&network_id, me, false).await;
         // Leave the room only when this node is purely a customer: on a
         // side-by-side machine the same node may be *watching* the queue as a
         // technician (`cec_help_watch`), and withdrawing the ask must not tear
@@ -3220,7 +3186,9 @@ impl Mesh {
     ) -> Result<(), String> {
         let resp = self
             .client
-            .request(&Request::NetworkAdd { config })
+            .request(&Request::NetworkAdd {
+                config: config.clone(),
+            })
             .await
             .map_err(|e| e.to_string())?;
         if !resp.ok {
@@ -3232,6 +3200,15 @@ impl Mesh {
             // customer then never shows up as a host) and blocked a re-dial from
             // refreshing the room. Any *other* failure is still real.
             if err.contains("already in use") || err.contains("already joined") {
+                // But a persisted room keeps its persisted *config* — a help
+                // room saved as Silent by an older build would still never
+                // auto-dial. Push the current config over it so kind changes
+                // (Silent -> Open) heal in place; a failed update degrades to
+                // the old behavior rather than failing the join.
+                let _ = self
+                    .client
+                    .request(&Request::NetworkUpdate { config })
+                    .await;
                 self.sync_networks().await;
                 return Ok(());
             }
@@ -3358,7 +3335,11 @@ impl Mesh {
     /// this customer. `available: false` is the explicit withdrawal — on the
     /// global help room it clears this customer from technician caches at once
     /// instead of waiting out the beacon TTL.
-    async fn cec_broadcast_presence(&self, network: &str, me: &str, available: bool) {
+    /// Broadcast this node's CEC presence on a room, returning how many live
+    /// peers the daemon actually dispatched it to — 0 means the beacon went
+    /// into the void (no wire up yet), which is exactly what the customer's
+    /// "raising your hand…" indicator needs to know.
+    async fn cec_broadcast_presence(&self, network: &str, me: &str, available: bool) -> usize {
         let mut presence = allmystuff_cec_protocol::SupportPresence::new(
             me.to_string(),
             allmystuff_cec_protocol::Role::Client,
@@ -3372,7 +3353,7 @@ impl Mesh {
             .map(|p| p.label.clone())
             .unwrap_or_default();
         // Cached: the hostname never changes within a run, and this fires on
-        // every 20s help re-beacon — a full scan() here meant a round of
+        // every help re-beacon — a full scan() here meant a round of
         // PowerShell probes per beacon on Windows.
         static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         presence.hostname = HOSTNAME
@@ -3381,16 +3362,25 @@ impl Mesh {
         presence.sent_at = unix_now_ms() / 1000;
         let payload = match serde_json::to_value(&presence) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return 0,
         };
-        let _ = self
+        match self
             .client
             .request(&Request::ChannelSendAll {
                 network: network.to_string(),
                 channel: allmystuff_cec_protocol::CHANNEL_PRESENCE.to_string(),
                 payload,
             })
-            .await;
+            .await
+        {
+            Ok(resp) => resp
+                .data
+                .as_ref()
+                .and_then(|d| d.get("dispatched_to"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            Err(_) => 0,
+        }
     }
 
     /// The best-known (label, hostname) for a peer by canonical id, from the
