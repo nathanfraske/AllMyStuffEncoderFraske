@@ -1348,9 +1348,13 @@ export async function cecHelpList(): Promise<CecHelpSeeker[] | null> {
 
 /** Technician: join (or leave) the global help room — the "Watch the help
  *  queue" toggle. Sticks across restarts (the daemon persists the room), and
- *  a default install never joins until this is explicitly turned on. */
+ *  a default install never joins until this is explicitly turned on.
+ *  Throws on failure: this exact call once failed silently for days (the
+ *  command wasn't registered) while the toggle looked merely stubborn. */
 export async function cecHelpWatch(on: boolean): Promise<void> {
-  await tryInvoke("cec_help_watch", { on });
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("cec_help_watch", { on });
 }
 
 /** The help queue changed (`cec://help`) — a fresh asker, a withdrawal, or
