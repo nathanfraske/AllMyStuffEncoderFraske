@@ -184,9 +184,9 @@
     {:else}
       <p class="hint">
         Every machine you've connected to stays here, most recently used first.
-        <b>Connect</b> reopens a session — the customer re-approves only if their
-        access has lapsed. Rename one to something you'll recognise, and remove
-        the ones that have cycled out.
+        <b>Control</b> does the whole thing — connects and opens their screen;
+        the customer re-approves only if their access has lapsed. Rename one to
+        something you'll recognise, and remove the ones that have cycled out.
       </p>
       <ul class="rows">
         {#each customers as c (c.number)}
@@ -232,24 +232,16 @@
                     Stop
                   </button>
                 {:else}
+                  <!-- One button, the whole flow: dial → approval → console.
+                       A valid standing grant auto-approves on the customer's
+                       side, so this goes straight to their screen; a lapsed
+                       one re-prompts them, and the console opens the moment
+                       they say yes. -->
                   <button
                     class="btn small primary"
                     disabled={app.cecDialing}
+                    title="Connect and open their screen — the customer approves unless their standing access still covers you"
                     onclick={() => void app.reconnectCec(c.number)}
-                  >
-                    Connect
-                  </button>
-                {/if}
-                {#if c.node}
-                  <!-- The whole support flow from this one tab: once a dial has
-                       found their machine, Control (re)opens the remote console
-                       — no trip to the graph. Their node still enforces the
-                       consent grant on every leg. -->
-                  <button
-                    class="btn small"
-                    disabled={!c.online}
-                    title={c.online ? "Open the remote-control console" : "They're offline — Connect first"}
-                    onclick={() => app.openCecConsole(c)}
                   >
                     Control
                   </button>

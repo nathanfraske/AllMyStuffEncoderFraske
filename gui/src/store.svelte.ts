@@ -1488,6 +1488,12 @@ class AppStore {
     void cecStatus().then((s) => {
       if (s) this.cecStatusInfo = s;
     });
+    // Load the CEC dialed directory in *every* window, not just where the
+    // Support tab mounted it: a dedicated console window boots its own store,
+    // and without `cecCustomers` it can't recognise its target as a CEC
+    // customer — its readiness gate then waits forever for a fleet
+    // relationship the customer will never have.
+    void this.loadCec();
     // (The rooms plane — invites, join/leave presence, chat, knocks — and
     // its same-device sibling bus are subscribed at the top of init, before
     // the identity pull, so a room window can't join before onRoom listens.)
@@ -6849,21 +6855,6 @@ class AppStore {
   async cancelCecDial() {
     clientLog("[cec] cancel requested");
     await cecCancelDial();
-  }
-
-  /** Open the remote-control console for a dialed customer straight from the
-   *  Support tab — the "Control" button on their row, so the whole support
-   *  flow (dial, approve, control) lives in the one tab. The customer must
-   *  currently be on the graph (their peer landed after a dial); their node
-   *  still enforces the consent grant on every leg, so this only opens the
-   *  window — it can't grant anything. */
-  openCecConsole(c: CecPeer) {
-    const node = c.node ? this.machineByAnyId(c.node) : undefined;
-    if (!node) {
-      this.toast("warn", "That customer isn't reachable right now — Connect first");
-      return;
-    }
-    this.openConsole(node.id);
   }
 
   /** Stop waiting on an unanswered approval: quit the connect-request
