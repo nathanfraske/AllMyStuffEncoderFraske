@@ -1211,6 +1211,39 @@ export async function cecDialed(): Promise<CecPeer[] | null> {
   return Array.isArray(r) ? r : null;
 }
 
+/** One customer waiting on the global help room (`cec_help_list` rows + the
+ *  `cec://help` event). `number` is derived node-side from the authenticated
+ *  beacon sender, so it's dialable as-is. */
+export interface CecHelpSeeker {
+  node: string;
+  number: string;
+  label: string;
+  /** Epoch seconds they first asked — the queue position. */
+  asked_at: number;
+  /** Epoch seconds of their latest beacon. */
+  last_seen: number;
+}
+
+/** Technician: the customers currently asking for help, longest-waiting
+ *  first. First call joins the global help room so beacons keep landing.
+ *  Null = fetch failed (keep the last snapshot); empty in web mode. */
+export async function cecHelpList(): Promise<CecHelpSeeker[] | null> {
+  const r = await tryInvoke<CecHelpSeeker[]>("cec_help_list");
+  return Array.isArray(r) ? r : null;
+}
+
+/** The help queue changed (`cec://help`) — a fresh asker, a withdrawal, or
+ *  (customer-side) our own ask being cleared. No-op in web mode. */
+export async function onCecHelp(
+  cb: (e: { waiting?: CecHelpSeeker[]; asking?: boolean }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ waiting?: CecHelpSeeker[]; asking?: boolean }>("cec://help", (e) =>
+    cb(e.payload),
+  );
+}
+
 /** Technician: stop whatever the in-flight dial is trying — discovery and the
  *  connect-request re-sends both quit at the node's cancel flag. No-op in web
  *  mode or when nothing is in flight. */

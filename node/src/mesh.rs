@@ -2063,6 +2063,37 @@ impl Mesh {
                 tracing::info!("cec control in from {} on {network}", short_id(&from));
                 self.handle_cec_control(from, network, payload).await;
             }
+            // CEC presence beacons. The only ones this node *acts* on are the
+            // global help room's: a Client beacon there IS the "I need help"
+            // signal (`available: false` withdraws it). Presence on a number
+            // room stays informational — dial discovery rides the daemon peer
+            // list, not this channel.
+            other
+                if other == allmystuff_cec_protocol::CHANNEL_PRESENCE
+                    && network == allmystuff_cec_protocol::HELP_NETWORK_ID =>
+            {
+                let Ok(p) =
+                    serde_json::from_value::<allmystuff_cec_protocol::SupportPresence>(payload)
+                else {
+                    return;
+                };
+                // The dialable number derives from the *authenticated* sender
+                // id — never the payload — so a beacon can't park someone
+                // else's number in the queue.
+                let number = allmystuff_cec_protocol::support_id_from_device(&from);
+                let changed = if p.available
+                    && matches!(p.role, allmystuff_cec_protocol::Role::Client)
+                {
+                    tracing::info!("cec help beacon from {} (number {number})", short_id(&from));
+                    self.cec.record_help_beacon(&from, &number, &p.label)
+                } else {
+                    self.cec.remove_help_beacon(&from)
+                };
+                if changed {
+                    self.sink
+                        .emit("cec://help", json!({ "waiting": self.cec.help_list() }));
+                }
+            }
             _ => {}
         }
     }
@@ -2609,8 +2640,19 @@ impl Mesh {
         let number = self.cec.set_hosting(true, Some(&me));
         let (network_id, config) = crate::cec::silent_network_config(&number);
         self.cec_join_silent(&network_id, config).await?;
-        self.cec_broadcast_presence(&network_id, &me, crate::cec::pubkey_part(&me).to_string())
-            .await;
+        self.cec_broadcast_presence(&network_id, &me, true).await;
+        // A stale help-room membership can outlive a crash mid-ask (the daemon
+        // persists CEC rooms): if we're not actually asking, quietly leave it
+        // so this customer isn't silently lurking on the global room.
+        if !self.cec.asking_help() {
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove {
+                    network: allmystuff_cec_protocol::HELP_NETWORK_ID.to_string(),
+                    purge: false,
+                })
+                .await;
+        }
         tracing::info!("CEC Support: hosting on {network_id} as number {number}");
         Ok(json!({ "number": number }))
     }
@@ -2632,6 +2674,82 @@ impl Mesh {
             self.sync_networks().await;
         }
         Ok(Value::Null)
+    }
+
+    /// `cec_ask_help { on }` (customer): join the one global help room and
+    /// beacon "I need help" there until a technician connects or the customer
+    /// cancels. Hosting is the other half of being helpable — the technician
+    /// answers a beacon by dialing this customer's *own* number room — so the
+    /// ask brings hosting up first. The room carries want, never access: a
+    /// session still takes the full consent handshake.
+    pub async fn cec_ask_help(self: &Arc<Self>, on: bool) -> Result<Value, String> {
+        let me = self
+            .resolve_local_id()
+            .await
+            .ok_or_else(|| "this device has no mesh identity yet".to_string())?;
+        if on {
+            let _ = self.cec_start_hosting().await;
+            self.cec.set_asking_help(true);
+            let epoch = self.cec.help_epoch();
+            let (network_id, config) = crate::cec::help_network_config();
+            self.cec_join_silent(&network_id, config).await?;
+            self.cec_broadcast_presence(&network_id, &me, true).await;
+            tracing::info!("CEC Support: asking for help on {network_id}");
+            // Keep the ask alive: technicians age a silent beacon out after
+            // HELP_TTL_SECS, so re-beacon on a shorter period. The epoch guard
+            // means a cancel + re-ask leaves exactly one loop beaconing.
+            let mesh = self.clone();
+            crate::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::cec::HELP_BEACON_SECS,
+                    ))
+                    .await;
+                    if !mesh.cec.asking_help() || mesh.cec.help_epoch() != epoch {
+                        return;
+                    }
+                    let (network_id, _) = crate::cec::help_network_config();
+                    mesh.cec_broadcast_presence(&network_id, &me, true).await;
+                }
+            });
+        } else {
+            self.cec_stop_asking_help(&me).await;
+        }
+        Ok(json!({ "asking": on }))
+    }
+
+    /// Withdraw the help ask: beacon `available: false` (so technician caches
+    /// clear at once instead of waiting out the TTL), then leave the global
+    /// room. Shared by the explicit cancel and the automatic clear when a
+    /// session gets approved — help arrived, stop asking for it.
+    async fn cec_stop_asking_help(self: &Arc<Self>, me: &str) {
+        if !self.cec.set_asking_help(false) {
+            return;
+        }
+        let (network_id, _) = crate::cec::help_network_config();
+        self.cec_broadcast_presence(&network_id, me, false).await;
+        let _ = self
+            .client
+            .request(&Request::NetworkRemove {
+                network: network_id,
+                purge: false,
+            })
+            .await;
+        self.sync_networks().await;
+        // Tell this customer's own UI (the CEC Support app's waiting card) —
+        // the automatic clear on approval otherwise leaves it looking armed.
+        self.sink.emit("cec://help", json!({ "asking": false }));
+        tracing::info!("CEC Support: no longer asking for help");
+    }
+
+    /// `cec_help_list` (technician): the customers currently waiting on the
+    /// global help room, longest-waiting first. Joins the room on first use —
+    /// the daemon persists CEC rooms, so from then on beacons land (and the
+    /// TTL cache stays warm) whether or not the tab is open.
+    pub async fn cec_help_list(self: &Arc<Self>) -> Result<Value, String> {
+        let (network_id, config) = crate::cec::help_network_config();
+        self.cec_join_silent(&network_id, config).await?;
+        Ok(Value::Array(self.cec.help_list()))
     }
 
     /// `cec_dial` (technician): derive the customer's Silent room from `number`,
@@ -2827,6 +2945,13 @@ impl Mesh {
             json!({ "session_id": session_id, "state": "active" }),
         );
         self.cec_emit_grants();
+        // Help arrived — an approved session withdraws the ask automatically,
+        // so the customer never has to remember they raised their hand.
+        if self.cec.asking_help() {
+            if let Some(me) = self.resolve_local_id().await {
+                self.cec_stop_asking_help(&me).await;
+            }
+        }
         Ok(Value::Null)
     }
 
@@ -3112,12 +3237,15 @@ impl Mesh {
 
     /// Advertise a [`SupportPresence`](allmystuff_cec_protocol::SupportPresence)
     /// beacon on the CEC presence channel, so a technician on this room can find
-    /// this customer.
-    async fn cec_broadcast_presence(&self, network: &str, me: &str, _canonical: String) {
+    /// this customer. `available: false` is the explicit withdrawal — on the
+    /// global help room it clears this customer from technician caches at once
+    /// instead of waiting out the beacon TTL.
+    async fn cec_broadcast_presence(&self, network: &str, me: &str, available: bool) {
         let mut presence = allmystuff_cec_protocol::SupportPresence::new(
             me.to_string(),
             allmystuff_cec_protocol::Role::Client,
         );
+        presence.available = available;
         presence.label = self
             .state
             .lock()
@@ -3322,6 +3450,14 @@ impl Mesh {
                                     .await
                                 {
                                     tracing::warn!("cec auto-approve reply failed to send: {e}");
+                                }
+                                // Help arrived (a standing grant answered the
+                                // beacon) — withdraw the ask, same as an
+                                // explicit approve does.
+                                if self.cec.asking_help() {
+                                    if let Some(me) = self.resolve_local_id().await {
+                                        self.cec_stop_asking_help(&me).await;
+                                    }
                                 }
                             } else {
                                 // Undecided: raise the prompt on the first beat and
