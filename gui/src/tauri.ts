@@ -1211,6 +1211,13 @@ export async function cecDialed(): Promise<CecPeer[] | null> {
   return Array.isArray(r) ? r : null;
 }
 
+/** Technician: stop whatever the in-flight dial is trying — discovery and the
+ *  connect-request re-sends both quit at the node's cancel flag. No-op in web
+ *  mode or when nothing is in flight. */
+export async function cecCancelDial(): Promise<void> {
+  await tryInvoke("cec_cancel_dial");
+}
+
 /** Technician: remove a directory row by its support number — the curation
  *  path for an attempt row that never discovered a node. No-op in web mode. */
 export async function cecForgetNumber(number: string): Promise<void> {

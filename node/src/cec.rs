@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -198,6 +200,11 @@ struct CecInner {
     dialed: HashMap<String, DialedCustomer>,
     /// Live session states by session id, for `cec://session`.
     sessions: HashMap<String, String>,
+    /// Cancellation flag for the in-flight dial (one at a time — the GUI
+    /// serializes dials). `begin_dial` mints a fresh flag; `cancel_dial` trips
+    /// it; the discovery poll and the connect-request re-send loop both honor
+    /// it, so "stop trying" actually stops everything being tried.
+    dial_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Cec {
@@ -229,6 +236,7 @@ impl Cec {
                 pending: Vec::new(),
                 dialed,
                 sessions: HashMap::new(),
+                dial_cancel: None,
             }),
         }
     }
@@ -333,6 +341,23 @@ impl Cec {
         drop(inner);
         self.persist_dialed(snapshot);
         record
+    }
+
+    /// Mint the cancellation flag for a new dial, replacing any stale one.
+    /// The returned flag is checked by every loop the dial runs.
+    pub fn begin_dial(&self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.inner.lock().dial_cancel = Some(flag.clone());
+        flag
+    }
+
+    /// Trip the in-flight dial's cancellation flag ("stop trying"). Harmless
+    /// when nothing is in flight — a completed dial's stale flag has no
+    /// readers left.
+    pub fn cancel_dial(&self) {
+        if let Some(f) = &self.inner.lock().dial_cancel {
+            f.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Record a dial *attempt* the moment the technician dials: the permanent

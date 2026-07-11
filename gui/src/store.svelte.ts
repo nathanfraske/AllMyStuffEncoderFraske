@@ -164,6 +164,7 @@ import {
   cecDeny,
   cecRevoke,
   cecGrants,
+  cecCancelDial,
   cecDialed,
   cecForgetNumber,
   forgetNode,
@@ -6804,14 +6805,36 @@ class AppStore {
       }
       return true;
     } catch (e) {
-      clientLog(`[cec] dial FAILED — ${errMsg(e)}`);
-      this.toast("warn", `Couldn't reach ${number}: ${errMsg(e)}`);
+      const msg = errMsg(e);
+      clientLog(`[cec] dial FAILED — ${msg}`);
+      if (msg.includes("cancelled") || msg.includes("canceled")) {
+        this.toast("ok", "Stopped dialing");
+      } else {
+        this.toast("warn", `Couldn't reach ${number}: ${msg}`);
+      }
       return false;
     } finally {
       this.cecDialing = false;
       this.cecDialingNumber = null;
       void this.loadCec();
     }
+  }
+
+  /** Stop the in-flight dial ("stop trying"): trips the node's cancel flag,
+   *  which ends the discovery poll — the awaited dial then returns and the
+   *  tab gets its state back. The attempt row stays in the directory. */
+  async cancelCecDial() {
+    clientLog("[cec] cancel requested");
+    await cecCancelDial();
+  }
+
+  /** Stop waiting on an unanswered approval: quit the connect-request
+   *  re-sends and disarm the console auto-open, so the row's badge clears. */
+  async stopCecWait() {
+    clientLog("[cec] stop-waiting requested");
+    this.cecAutoOpenNode = null;
+    await cecCancelDial();
+    void this.loadCec();
   }
 
   /** Remove a directory row by its number — the curation path for an attempt
