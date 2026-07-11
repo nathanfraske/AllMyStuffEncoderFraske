@@ -995,16 +995,24 @@
   // fleet's kick button uses: first click arms ("click again to confirm"),
   // the second acts. Disarms itself, on any other menu, and with the menu.
   let restartDeviceArmed = $state<string | null>(null);
+  /** Two-step arm for the gear menu's "Forget this node" — same pattern as
+   *  the reboot: a stray click must not drop a device off the graph. */
+  let forgetNodeArmed = $state<string | null>(null);
 
   function menuHeight(nodeId: string): number {
     const mn = app.node(nodeId);
-    const items = 1 + (app.canRestartApp(mn) ? 1 : 0) + (app.canRestartDevice(mn) ? 1 : 0);
+    const items =
+      1 +
+      (app.canRestartApp(mn) ? 1 : 0) +
+      (app.canRestartDevice(mn) ? 1 : 0) +
+      (mn && mn.kind !== "this" && !app.isMe(nodeId) ? 1 : 0); // Forget this node
     return MENU_PAD + items * MENU_ITEM_H;
   }
 
   function openNodeMenu(e: MouseEvent, nodeId: string) {
     e.stopPropagation();
     restartDeviceArmed = null;
+    forgetNodeArmed = null;
     if (nodeMenu?.id === nodeId) {
       nodeMenu = null; // toggle closed
       return;
@@ -1700,6 +1708,38 @@
               : app.isMe(menuId)
                 ? "reboot this whole machine"
                 : "reboot that whole machine"}</span
+          >
+        </span>
+      </button>
+    {/if}
+    {#if mn && mn.kind !== "this" && !app.isMe(menuId)}
+      <!-- Forget this node — the drawer's action, surfaced in the gear too.
+           Drops it from the graph + roster and tears its session down. Same
+           two-step arm as the reboot; never offered on this device. -->
+      <button
+        class="nm-item"
+        class:armed={forgetNodeArmed === menuId}
+        role="menuitem"
+        onclick={() => {
+          if (forgetNodeArmed === menuId) {
+            forgetNodeArmed = null;
+            void app.forgetNode(menuId);
+            nodeMenu = null;
+          } else {
+            forgetNodeArmed = menuId;
+            setTimeout(() => {
+              if (forgetNodeArmed === menuId) forgetNodeArmed = null;
+            }, 3500);
+          }
+        }}
+      >
+        <span class="nm-icon" aria-hidden="true">✕</span>
+        <span class="nm-text">
+          <span class="nm-label">Forget this node</span>
+          <span class="nm-sub"
+            >{forgetNodeArmed === menuId
+              ? "click again to confirm"
+              : "remove it from the graph and end its session"}</span
           >
         </span>
       </button>
