@@ -768,6 +768,10 @@ pub async fn dispatch(
                     Some(v) => format!("{} {}", inv.host.os, v),
                     None => inv.host.os.clone(),
                 },
+                // The DMI board / system label ("Dell Inc. XPS 15", a
+                // motherboard model on a custom build) — null when the
+                // firmware doesn't say.
+                "board": inv.host.board,
                 "cpu": {
                     "brand": inv.cpu.brand,
                     "cores": inv.cpu.physical_cores,
