@@ -2060,6 +2060,7 @@ impl Mesh {
             // `CHANNEL_CONTROL` so CEC traffic never crosses into an ordinary
             // route negotiation.
             other if other == allmystuff_cec_protocol::CHANNEL_CONTROL => {
+                tracing::info!("cec control in from {} on {network}", short_id(&from));
                 self.handle_cec_control(from, network, payload).await;
             }
             _ => {}
@@ -2734,7 +2735,9 @@ impl Mesh {
                         );
                         break;
                     }
-                    let _ = mesh.cec_send_control(&net, &peer, &request).await;
+                    if let Err(e) = mesh.cec_send_control(&net, &peer, &request).await {
+                        tracing::warn!("cec connect-request send failed (will retry): {e}");
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let answered = mesh
                         .cec
@@ -3197,6 +3200,21 @@ impl Mesh {
             }
         };
         if let allmystuff_cec_protocol::ControlMessage::Connect(connect) = msg {
+            tracing::info!(
+                "cec connect message from {}: {}",
+                short_id(&from),
+                match &connect {
+                    allmystuff_cec_protocol::ConnectControl::Request { session_id, .. } =>
+                        format!("Request session={session_id}"),
+                    allmystuff_cec_protocol::ConnectControl::Approve { session_id, .. } =>
+                        format!("Approve session={session_id}"),
+                    allmystuff_cec_protocol::ConnectControl::Deny { session_id, .. } =>
+                        format!("Deny session={session_id}"),
+                    allmystuff_cec_protocol::ConnectControl::End { session_id } =>
+                        format!("End session={session_id}"),
+                    other => format!("{other:?}"),
+                }
+            );
             match connect {
                 allmystuff_cec_protocol::ConnectControl::Request {
                     session_id,
@@ -3261,6 +3279,16 @@ impl Mesh {
                             // prompt, so reconnecting to a lapsed machine pops the
                             // box again, exactly like the first time.
                             if let Some(scope) = self.cec.active_scope_for(&from) {
+                                // Each dial mints a fresh session id — end any
+                                // older live session with this same technician
+                                // first, so a re-dial supersedes rather than
+                                // piling "X is viewing your screen" rows up.
+                                for stale in self.cec.end_other_sessions(&session_id) {
+                                    self.sink.emit(
+                                        "cec://session",
+                                        json!({ "session_id": stale, "state": "ended" }),
+                                    );
+                                }
                                 self.cec.set_session(&session_id, "active");
                                 if let Some(rec) =
                                     self.cec.touch_dialed(crate::cec::pubkey_part(&from))
@@ -3269,9 +3297,18 @@ impl Mesh {
                                 }
                                 self.sink.emit(
                                     "cec://session",
-                                    json!({ "session_id": session_id.clone(), "state": "active" }),
+                                    json!({
+                                        "session_id": session_id.clone(),
+                                        "state": "active",
+                                        "agent_name": agent_name.clone(),
+                                        "tech": from.clone(),
+                                    }),
                                 );
-                                let _ = self
+                                tracing::info!(
+                                    "cec auto-approve: standing grant covers {} — replying Approve session={session_id}",
+                                    short_id(&from)
+                                );
+                                if let Err(e) = self
                                     .cec_send_control(
                                         &network,
                                         &from,
@@ -3282,7 +3319,10 @@ impl Mesh {
                                             },
                                         ),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("cec auto-approve reply failed to send: {e}");
+                                }
                             } else {
                                 // Undecided: raise the prompt on the first beat and
                                 // refresh the pending record on later ones — but

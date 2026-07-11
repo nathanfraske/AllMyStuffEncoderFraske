@@ -343,6 +343,25 @@ impl Cec {
         record
     }
 
+    /// End every live session except `keep`, returning the ids that changed so
+    /// the caller can emit their `cec://session` transitions. The customer flow
+    /// is one live support session at a time: a technician's re-dial mints a
+    /// fresh session id, and without this the old rows stack up in the
+    /// customer's "viewing your screen" banner forever.
+    pub fn end_other_sessions(&self, keep: &str) -> Vec<String> {
+        let mut inner = self.inner.lock();
+        let ended: Vec<String> = inner
+            .sessions
+            .iter()
+            .filter(|(id, state)| id.as_str() != keep && state.as_str() == "active")
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ended {
+            inner.sessions.insert(id.clone(), "ended".to_string());
+        }
+        ended
+    }
+
     /// Mint the cancellation flag for a new dial, replacing any stale one.
     /// The returned flag is checked by every loop the dial runs.
     pub fn begin_dial(&self) -> Arc<AtomicBool> {
