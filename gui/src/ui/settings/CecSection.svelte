@@ -95,6 +95,16 @@
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
 
+  /** The "(HOSTNAME)" tail for a card's name — the match-up key: the
+   *  customer's waiting screen shows the same name (hostname) pair, so the
+   *  technician can pair a card with a caller word for word. Empty when the
+   *  hostname is unknown or would just repeat the shown name. */
+  function hostTail(shown: string, hostname?: string): string {
+    const h = hostname?.trim();
+    if (!h || h.toLowerCase() === shown.trim().toLowerCase()) return "";
+    return ` (${h})`;
+  }
+
   function connect(e: SubmitEvent) {
     e.preventDefault();
     void app.dialCec();
@@ -192,11 +202,12 @@
       </p>
       <ul class="rows">
         {#each app.cecHelpWaiting as w (w.node)}
+          {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
           <li class="row col asking">
             <div class="row-top">
               <span class="dot busy"></span>
               <span class="who">
-                <b>{app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}</b>
+                <b>{shownName}<span class="host">{hostTail(shownName, w.hostname)}</span></b>
                 <span class="sub">
                   <span class="mesh" title={`Number ${w.number}`}>CEC Support {groupNumber(w.number)}</span>
                   <span class="meta">· waiting {waitingLabel(w.asked_at)}</span>
@@ -279,7 +290,7 @@
                     }}
                   />
                 {:else}
-                  <b>{app.cecCustomerName(c)}</b>
+                  <b>{app.cecCustomerName(c)}<span class="host">{hostTail(app.cecCustomerName(c), c.hostname)}</span></b>
                   <span class="sub">
                     <span class="mesh" title={`Mesh cec-${c.number}`}>CEC Support {groupNumber(c.number)}</span>
                     <span class="meta">
@@ -541,6 +552,11 @@
     font-size: 0.75rem;
     color: var(--ink-soft);
     line-height: 1.5;
+  }
+  /* The "(HOSTNAME)" tail — quieter than the name it follows, same line. */
+  .who .host {
+    font-weight: 400;
+    color: var(--ink-soft);
   }
   .row-top {
     display: flex;

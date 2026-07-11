@@ -69,7 +69,12 @@ export interface SessionSnapshot {
      *  snake_case on the wire — `attached_to` / `web` / `joining_mesh` /
      *  `meshes` — so the store maps them onto the camelCase `MeshNode.kvm`.
      *  Absent on an ordinary peer. */
-    kvm?: { attached_to?: string; web?: string; joining_mesh?: string; meshes?: string[] };
+    kvm?: {
+      attached_to?: string;
+      web?: string;
+      joining_mesh?: string;
+      meshes?: string[];
+    };
     /** The AllMyStuff version the peer is running, from its advert. Absent
      *  from an older peer — "unknown". */
     version?: string;
@@ -150,7 +155,10 @@ export async function setWindowTitle(title: string): Promise<void> {
   }
 }
 
-async function tryInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
+async function tryInvoke<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T | null> {
   if (!isTauri()) return null;
   try {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -194,12 +202,21 @@ export function connectRoute(
   codec?: "auto" | "h264" | "mjpeg",
   session?: string | null,
 ): Promise<string | null> {
-  const video = (media === "display" || media === "video") && codec !== "mjpeg" ? ["h264"] : [];
+  const video =
+    (media === "display" || media === "video") && codec !== "mjpeg"
+      ? ["h264"]
+      : [];
   // `session` is the terminal multi-attach hook: a non-null id makes the
   // terminal Offer name an already-running host shell to attach to (shared,
   // tmux-style); null/undefined (and every non-terminal route) mints a fresh
   // one. Sent as null when absent so the backend's Option decodes cleanly.
-  return tryInvoke<string>("connect_route", { from, to, media, video, session: session ?? null });
+  return tryInvoke<string>("connect_route", {
+    from,
+    to,
+    media,
+    video,
+    session: session ?? null,
+  });
 }
 
 /** The console's quality picks for a stream it's watching — each absent
@@ -236,7 +253,12 @@ export function sendVideoFeedback(
   decodeFails: number,
   queueDepth: number,
 ): Promise<null> {
-  return tryInvoke("video_feedback", { routeId, recvFps, decodeFails, queueDepth });
+  return tryInvoke("video_feedback", {
+    routeId,
+    recvFps,
+    decodeFails,
+    queueDepth,
+  });
 }
 
 export function disconnectRoute(routeId: string): Promise<null> {
@@ -258,14 +280,21 @@ export async function claimNode(node: string): Promise<void> {
  *  they may do with my stuff. The node is the durable source of truth; the
  *  next session snapshot reflects it. No-op in web mode (the store keeps the
  *  grant in its in-memory catalog). */
-export async function shareGrant(person: Person, node: string, grant: Grant): Promise<void> {
+export async function shareGrant(
+  person: Person,
+  node: string,
+  grant: Grant,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("share_grant", { person, node, grant });
 }
 
 /** Revoke a grant by its (content-derived) id from a person's durable share. */
-export async function shareRevoke(person: string, grantId: string): Promise<void> {
+export async function shareRevoke(
+  person: string,
+  grantId: string,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("share_revoke", { person, grantId });
@@ -375,7 +404,10 @@ export async function kvmDetach(node: string): Promise<void> {
  *  tool. The KVM validates the id, refuses its own fleet mesh, joins, and
  *  re-advertises its membership list (`kvm.meshes`) — the authoritative
  *  confirmation, same model as {@link kvmAttach}. No-op in web mode. */
-export async function kvmMeshAdd(node: string, networkId: string): Promise<void> {
+export async function kvmMeshAdd(
+  node: string,
+  networkId: string,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("kvm_mesh_add", { node, networkId });
@@ -383,7 +415,10 @@ export async function kvmMeshAdd(node: string, networkId: string): Promise<void>
 
 /** Take a KVM appliance off a mesh (never its fleet mesh). Same
  *  delivery/confirmation model as {@link kvmMeshAdd}. No-op in web mode. */
-export async function kvmMeshRemove(node: string, networkId: string): Promise<void> {
+export async function kvmMeshRemove(
+  node: string,
+  networkId: string,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("kvm_mesh_remove", { node, networkId });
@@ -464,7 +499,11 @@ export function clipboardPull(routeId: string): Promise<null> {
 
 /** Decode one wire packet (28-byte little-endian header + payload) out
  *  of a poll batch. Returns null for shapes we don't recognize. */
-function parseVideoPacket(buf: ArrayBuffer, offset: number, len: number): VideoFrameMsg | null {
+function parseVideoPacket(
+  buf: ArrayBuffer,
+  offset: number,
+  len: number,
+): VideoFrameMsg | null {
   if (len < 28) return null;
   const head = new DataView(buf, offset, 28);
   const kindByte = head.getUint8(0);
@@ -569,9 +608,12 @@ export async function watchVideoStatus(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  const unlisten = await listen<VideoHostStatus>("allmystuff://video-status", (e) => {
-    if (e.payload.route === routeId) cb(e.payload);
-  });
+  const unlisten = await listen<VideoHostStatus>(
+    "allmystuff://video-status",
+    (e) => {
+      if (e.payload.route === routeId) cb(e.payload);
+    },
+  );
   return () => unlisten();
 }
 
@@ -582,7 +624,10 @@ export async function watchVideoStatus(
  *  *popped-out* window whose first tab joins that shared session (its own
  *  window, keyed by the session). Desktop only; the web preview keeps its
  *  in-page terminal. */
-export async function openTerminalWindow(node: string, attach?: string): Promise<void> {
+export async function openTerminalWindow(
+  node: string,
+  attach?: string,
+): Promise<void> {
   if (!isTauri()) return;
   await tryInvoke("open_terminal_window", { node, attach: attach ?? null });
 }
@@ -605,7 +650,10 @@ export function terminalAttachTarget(): string | null {
 /** Send keystrokes or a resize down an active terminal route (this window
  *  is the viewer; the far end feeds the PTY). Throws when the backend
  *  refuses, so a dead tab is told apart from a slow one. */
-export async function termSend(routeId: string, event: TermEvent): Promise<void> {
+export async function termSend(
+  routeId: string,
+  event: TermEvent,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("term_send", { routeId, event });
@@ -667,8 +715,9 @@ export async function onTermExit(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ route: string; code: number | null }>("allmystuff://term-exit", (e) =>
-    cb(e.payload),
+  return listen<{ route: string; code: number | null }>(
+    "allmystuff://term-exit",
+    (e) => cb(e.payload),
   );
 }
 
@@ -680,8 +729,9 @@ export async function onTermResize(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ route: string; cols: number; rows: number }>("allmystuff://term-resize", (e) =>
-    cb(e.payload),
+  return listen<{ route: string; cols: number; rows: number }>(
+    "allmystuff://term-resize",
+    (e) => cb(e.payload),
   );
 }
 
@@ -691,7 +741,9 @@ export async function onTermResize(
  *  asynchronously, returning null while the reply arrives via
  *  {@link onTerminalSessions}. Owner/fleet gated both ends; empty/null in
  *  web mode (no backend). */
-export async function terminalSessions(node: string): Promise<TerminalSessionInfo[] | null> {
+export async function terminalSessions(
+  node: string,
+): Promise<TerminalSessionInfo[] | null> {
   return tryInvoke<TerminalSessionInfo[] | null>("terminal_sessions", { node });
 }
 
@@ -729,7 +781,10 @@ export function filesWindowTarget(): string | null {
 
 /** Send one file request down an active files route (this window is the
  *  viewer; the far end owns the disk). Throws when the backend refuses. */
-export async function fileSend(routeId: string, event: FileEvent): Promise<void> {
+export async function fileSend(
+  routeId: string,
+  event: FileEvent,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("file_send", { routeId, event });
@@ -765,7 +820,11 @@ export async function watchFiles(
         offset += 4;
         if (len === 0 || offset + len > batch.byteLength) break;
         try {
-          cb(JSON.parse(decoder.decode(new Uint8Array(batch, offset, len))) as FileEvent);
+          cb(
+            JSON.parse(
+              decoder.decode(new Uint8Array(batch, offset, len)),
+            ) as FileEvent,
+          );
         } catch {
           // One unparseable frame; the stream's surviving frames stand.
         }
@@ -794,7 +853,11 @@ export async function watchFiles(
  *  Downloads folder. Returns the destination path; completion lands as
  *  `allmystuff://file-saved`. Call *before* `fileSend`-ing the read so
  *  the first chunk can't race the registration. */
-export async function fileDownload(routeId: string, req: number, name: string): Promise<string> {
+export async function fileDownload(
+  routeId: string,
+  req: number,
+  name: string,
+): Promise<string> {
   if (!isTauri()) throw new Error("Downloads need the desktop app");
   const { invoke } = await import("@tauri-apps/api/core");
   return (await invoke("file_download", { routeId, req, name })) as string;
@@ -803,14 +866,21 @@ export async function fileDownload(routeId: string, req: number, name: string): 
 /** A registered download finished (`allmystuff://file-saved`): where it
  *  landed, or the error that stopped it. */
 export async function onFileSaved(
-  cb: (e: { route: string; req: number; path: string | null; error: string | null }) => void,
+  cb: (e: {
+    route: string;
+    req: number;
+    path: string | null;
+    error: string | null;
+  }) => void,
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ route: string; req: number; path: string | null; error: string | null }>(
-    "allmystuff://file-saved",
-    (e) => cb(e.payload),
-  );
+  return listen<{
+    route: string;
+    req: number;
+    path: string | null;
+    error: string | null;
+  }>("allmystuff://file-saved", (e) => cb(e.payload));
 }
 
 /** This machine refused an inbound input/clipboard event
@@ -819,7 +889,12 @@ export async function onFileSaved(
  *  limited backend-side; the store toasts it so the refusal is visible on
  *  the refusing machine too, not just in its log. */
 export async function onControlRefused(
-  cb: (e: { route: string; from: string; plane: string; reason: string }) => void,
+  cb: (e: {
+    route: string;
+    from: string;
+    plane: string;
+    reason: string;
+  }) => void,
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
@@ -841,10 +916,14 @@ export interface ClockSkewEvent {
   message: string | null;
   source: string;
 }
-export async function onClockSkew(cb: (e: ClockSkewEvent) => void): Promise<() => void> {
+export async function onClockSkew(
+  cb: (e: ClockSkewEvent) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<ClockSkewEvent>("allmystuff://clock-skew", (e) => cb(e.payload));
+  return listen<ClockSkewEvent>("allmystuff://clock-skew", (e) =>
+    cb(e.payload),
+  );
 }
 
 /** A fleet peer asked this machine to reboot (`allmystuff://device-restart`)
@@ -855,13 +934,20 @@ export async function onDeviceRestart(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ from: string }>("allmystuff://device-restart", (e) => cb(e.payload));
+  return listen<{ from: string }>("allmystuff://device-restart", (e) =>
+    cb(e.payload),
+  );
 }
 
 /** Progress of a registered download (`allmystuff://file-progress`),
  *  throttled backend-side. */
 export async function onFileProgress(
-  cb: (e: { route: string; req: number; written: number; total: number }) => void,
+  cb: (e: {
+    route: string;
+    req: number;
+    written: number;
+    total: number;
+  }) => void,
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
@@ -888,13 +974,19 @@ export async function roomShareFiles(
   members: string[],
   paths: string[],
 ): Promise<SharedFileMeta[]> {
-  const r = await tryInvoke<SharedFileMeta[]>("room_share_files", { members, paths });
+  const r = await tryInvoke<SharedFileMeta[]>("room_share_files", {
+    members,
+    paths,
+  });
   return r ?? [];
 }
 
 /** Refresh which members may fetch a set of shared tokens (the room's
  *  roster changed while the files were on offer). No-op in web mode. */
-export function roomSetSharePeers(tokens: string[], members: string[]): Promise<null> {
+export function roomSetSharePeers(
+  tokens: string[],
+  members: string[],
+): Promise<null> {
   return tryInvoke("room_set_share_peers", { tokens, members });
 }
 
@@ -911,7 +1003,11 @@ export async function pickFilesToShare(): Promise<string[]> {
   if (!isTauri()) return [];
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const picked = await open({ multiple: true, directory: false, title: "Share files with the room" });
+    const picked = await open({
+      multiple: true,
+      directory: false,
+      title: "Share files with the room",
+    });
     if (picked == null) return [];
     return Array.isArray(picked) ? picked : [picked];
   } catch (e) {
@@ -983,7 +1079,9 @@ export function ownedRoster(): Promise<OwnedRoster | null> {
 
 /** Subscribe to live fleet-roster updates (after a claim, or when gossip
  *  converges). Returns an unlisten fn (no-op in web mode). */
-export async function onOwned(cb: (r: OwnedRoster) => void): Promise<() => void> {
+export async function onOwned(
+  cb: (r: OwnedRoster) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<OwnedRoster>("allmystuff://owned", (e) => cb(e.payload));
@@ -1032,7 +1130,10 @@ export async function fleetGrantRole(
 /** Withdraw a fleet member's role — back to a plain member. Owner-only; throws
  *  with the reason when refused. `code` is the custody second factor when
  *  fleet MFA is enrolled. */
-export async function fleetRevokeRole(device: string, code?: string): Promise<void> {
+export async function fleetRevokeRole(
+  device: string,
+  code?: string,
+): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("fleet_revoke_role", { device, code: code ?? null });
@@ -1113,6 +1214,10 @@ export interface CecPeer {
   node: string;
   number: string;
   label: string;
+  /** The machine's hostname — shown beside the name so the technician's card
+   *  and the customer's own app spell the same identity. Absent from an older
+   *  node. */
+  hostname?: string;
   online: boolean;
   /** Epoch **seconds** of the last time this connection was actively used (a
    *  fresh dial, or the console session going active). The CEC tab renders it
@@ -1223,6 +1328,9 @@ export interface CecHelpSeeker {
   node: string;
   number: string;
   label: string;
+  /** The machine's hostname, from the beacon — the match-up key beside the
+   *  name. Absent from an older node. */
+  hostname?: string;
   /** Epoch seconds they first asked — the queue position. */
   asked_at: number;
   /** Epoch seconds of their latest beacon. */
@@ -1252,8 +1360,9 @@ export async function onCecHelp(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ waiting?: CecHelpSeeker[]; asking?: boolean }>("cec://help", (e) =>
-    cb(e.payload),
+  return listen<{ waiting?: CecHelpSeeker[]; asking?: boolean }>(
+    "cec://help",
+    (e) => cb(e.payload),
   );
 }
 
@@ -1283,7 +1392,9 @@ export async function forgetNode(node: string): Promise<void> {
 
 /** Customer: a technician is trying to connect (`cec://request`) — the nudge
  *  that drives the 3-choice prompt. No-op listener in web mode. */
-export async function onCecRequest(cb: (r: CecPending) => void): Promise<() => void> {
+export async function onCecRequest(
+  cb: (r: CecPending) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<CecPending>("cec://request", (e) => cb(e.payload));
@@ -1303,14 +1414,20 @@ export async function onCecSession(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ session_id: string; state: string }>("cec://session", (e) => cb(e.payload));
+  return listen<{ session_id: string; state: string }>("cec://session", (e) =>
+    cb(e.payload),
+  );
 }
 
 /** Customer: the grant list changed (`cec://grants`). No-op in web mode. */
-export async function onCecGrants(cb: (grants: CecGrant[]) => void): Promise<() => void> {
+export async function onCecGrants(
+  cb: (grants: CecGrant[]) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ grants: CecGrant[] }>("cec://grants", (e) => cb(e.payload.grants));
+  return listen<{ grants: CecGrant[] }>("cec://grants", (e) =>
+    cb(e.payload.grants),
+  );
 }
 
 // ---- virtual rooms (the rooms plane) ------------------------------------
@@ -1319,7 +1436,10 @@ export async function onCecGrants(cb: (grants: CecGrant[]) => void): Promise<() 
  *  ids; self is skipped backend-side). Resolves to how many members the
  *  daemon actually dispatched to — 0 in web mode, where nothing can flow
  *  and the room is local-only. */
-export async function roomSend(members: string[], message: RoomWireMessage): Promise<number> {
+export async function roomSend(
+  members: string[],
+  message: RoomWireMessage,
+): Promise<number> {
   const n = await tryInvoke<number>("room_send", { members, message });
   return n ?? 0;
 }
@@ -1331,8 +1451,9 @@ export async function onRoom(
 ): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ from: string; message: RoomWireMessage }>("allmystuff://room", (e) =>
-    cb(e.payload),
+  return listen<{ from: string; message: RoomWireMessage }>(
+    "allmystuff://room",
+    (e) => cb(e.payload),
   );
 }
 
@@ -1377,10 +1498,14 @@ export async function emitRoomLocal(event: RoomLocalEvent): Promise<void> {
   await emit("allmystuff://room-local", event);
 }
 
-export async function onRoomLocal(cb: (e: RoomLocalEvent) => void): Promise<() => void> {
+export async function onRoomLocal(
+  cb: (e: RoomLocalEvent) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<RoomLocalEvent>("allmystuff://room-local", (e) => cb(e.payload));
+  return listen<RoomLocalEvent>("allmystuff://room-local", (e) =>
+    cb(e.payload),
+  );
 }
 
 /** Claim OS focus for this window — the KVM rule for control surfaces:
@@ -1417,7 +1542,10 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
  *  popout wires itself, `share:<route id>` for a room share it merely
  *  watches); `title` seeds the OS window title. Desktop only — the web
  *  preview has no windows to pop into. */
-export async function openVideoWindow(key: string, title: string): Promise<void> {
+export async function openVideoWindow(
+  key: string,
+  title: string,
+): Promise<void> {
   if (!isTauri()) return;
   await tryInvoke("open_video_window", { key, title });
 }
@@ -1451,10 +1579,14 @@ export async function emitVideoLocal(event: VideoLocalEvent): Promise<void> {
   await emit("allmystuff://video-local", event);
 }
 
-export async function onVideoLocal(cb: (e: VideoLocalEvent) => void): Promise<() => void> {
+export async function onVideoLocal(
+  cb: (e: VideoLocalEvent) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<VideoLocalEvent>("allmystuff://video-local", (e) => cb(e.payload));
+  return listen<VideoLocalEvent>("allmystuff://video-local", (e) =>
+    cb(e.payload),
+  );
 }
 
 // ---- sites (the reverse-proxy plane) -----------------------------------
@@ -1484,7 +1616,9 @@ export async function siteExposed(): Promise<Record<string, string>> {
 export async function siteSetExposed(
   exposed: Record<string, string>,
 ): Promise<Record<string, string>> {
-  const r = await tryInvoke<Record<string, string>>("site_set_exposed", { exposed });
+  const r = await tryInvoke<Record<string, string>>("site_set_exposed", {
+    exposed,
+  });
   return r && typeof r === "object" ? r : exposed;
 }
 
@@ -1499,7 +1633,10 @@ export interface SiteMappingInfo {
 /** Map a peer's site to a local port — sets up the reverse-proxy route and
  *  binds a local listener. Returns the bound local port (the same number
  *  when free, else a remapped one), or null in web mode. */
-export function siteMap(node: string, port: number): Promise<{ localPort: number } | null> {
+export function siteMap(
+  node: string,
+  port: number,
+): Promise<{ localPort: number } | null> {
   return tryInvoke<{ localPort: number }>("site_map", { node, port });
 }
 
@@ -1537,10 +1674,14 @@ export interface NodeSitesEvent {
 }
 
 /** Subscribe to fleet machines' site-list replies. No-op in web mode. */
-export async function onNodeSites(cb: (e: NodeSitesEvent) => void): Promise<() => void> {
+export async function onNodeSites(
+  cb: (e: NodeSitesEvent) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<NodeSitesEvent>("allmystuff://node-sites", (e) => cb(e.payload));
+  return listen<NodeSitesEvent>("allmystuff://node-sites", (e) =>
+    cb(e.payload),
+  );
 }
 
 // ---- self-update -------------------------------------------------------
@@ -1571,7 +1712,9 @@ export async function updateRelaunch(): Promise<void> {
   await invoke("update_relaunch");
 }
 
-export function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus | null> {
+export function updateSetPrefs(
+  prefs: UpdatePrefs,
+): Promise<UpdateStatus | null> {
   return tryInvoke<UpdateStatus>("update_set_prefs", { prefs });
 }
 
@@ -1621,7 +1764,11 @@ export function serviceStatus(): Promise<ServiceStatus | null> {
  *  `sc`/systemctl error) *throws* with its message instead of being swallowed
  *  to null — the caller surfaces it. No-op stub in web mode. */
 async function serviceAction(cmd: string): Promise<ServiceActionResult> {
-  if (!isTauri()) return { ok: false, output: "The background service needs the desktop app" };
+  if (!isTauri())
+    return {
+      ok: false,
+      output: "The background service needs the desktop app",
+    };
   const { invoke } = await import("@tauri-apps/api/core");
   return (await invoke(cmd)) as ServiceActionResult;
 }
@@ -1654,7 +1801,9 @@ export function windowBehaviorGet(): Promise<WindowBehavior | null> {
   return tryInvoke<WindowBehavior>("window_behavior_get");
 }
 
-export function windowBehaviorSet(b: WindowBehavior): Promise<WindowBehavior | null> {
+export function windowBehaviorSet(
+  b: WindowBehavior,
+): Promise<WindowBehavior | null> {
   return tryInvoke<WindowBehavior>("window_behavior_set", {
     closeToTray: b.close_to_tray,
     minimizeToTray: b.minimize_to_tray,
@@ -1679,16 +1828,22 @@ export async function autostartSet(enabled: boolean): Promise<boolean> {
 
 /** Subscribe to live session snapshots. Returns an unlisten fn (or a no-op
  *  in web mode). */
-export async function onSession(cb: (snap: SessionSnapshot) => void): Promise<() => void> {
+export async function onSession(
+  cb: (snap: SessionSnapshot) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen<SessionSnapshot>("allmystuff://session", (e) => cb(e.payload));
 }
 
-export async function onSubscription(cb: (s: { status: string }) => void): Promise<() => void> {
+export async function onSubscription(
+  cb: (s: { status: string }) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<{ status: string }>("allmystuff://subscription", (e) => cb(e.payload));
+  return listen<{ status: string }>("allmystuff://subscription", (e) =>
+    cb(e.payload),
+  );
 }
 
 // ---- networks · identity · roster -------------------------------------
@@ -1697,8 +1852,14 @@ export async function onSubscription(cb: (s: { status: string }) => void): Promi
 // require a real daemon — the Networks panel only renders under Tauri. They
 // throw on error so the UI can surface "couldn't create network", etc.
 
-async function invokeReq<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isTauri()) throw new Error("Networks need the desktop app (no backend in the browser).");
+async function invokeReq<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (!isTauri())
+    throw new Error(
+      "Networks need the desktop app (no backend in the browser).",
+    );
   const { invoke } = await import("@tauri-apps/api/core");
   return (await invoke(cmd, args)) as T;
 }
@@ -1752,7 +1913,9 @@ export const setNetworkEnabled = (network: string, enabled: boolean) =>
  *                      per-node refresh — the daemon resolves the network).
  *    - neither       → every joined mesh.
  *  `network` may be the config id or network id. No-op in web mode. */
-export const networkReconnect = (opts: { network?: string; peer?: string } = {}) =>
+export const networkReconnect = (
+  opts: { network?: string; peer?: string } = {},
+) =>
   invokeReq<unknown>("network_reconnect", {
     network: opts.network ?? null,
     peer: opts.peer ?? null,
@@ -1761,17 +1924,24 @@ export const networkReconnect = (opts: { network?: string; peer?: string } = {})
 /** The whole daemon config (every network with its full signaling/STUN/TURN).
  *  The Servers settings pane reads this to populate its editor. */
 export async function meshConfigShow(): Promise<NetworkConfigFull[]> {
-  const r = await invokeReq<{ config?: { networks?: NetworkConfigFull[] } }>("mesh_config_show");
+  const r = await invokeReq<{ config?: { networks?: NetworkConfigFull[] } }>(
+    "mesh_config_show",
+  );
   return Array.isArray(r?.config?.networks) ? r.config!.networks! : [];
 }
 
 export async function meshRosterList(network: string): Promise<RosterPeer[]> {
-  const r = await invokeReq<{ roster?: RosterPeer[] }>("mesh_roster_list", { network });
+  const r = await invokeReq<{ roster?: RosterPeer[] }>("mesh_roster_list", {
+    network,
+  });
   return Array.isArray(r?.roster) ? r.roster : [];
 }
 
-export const meshRosterApprove = (network: string, deviceId: string, label?: string) =>
-  invokeReq<unknown>("mesh_roster_approve", { network, deviceId, label });
+export const meshRosterApprove = (
+  network: string,
+  deviceId: string,
+  label?: string,
+) => invokeReq<unknown>("mesh_roster_approve", { network, deviceId, label });
 
 export const meshRosterRemove = (network: string, deviceId: string) =>
   invokeReq<unknown>("mesh_roster_remove", { network, deviceId });
@@ -1785,11 +1955,17 @@ export async function meshPeers(network: string): Promise<PeerInfo[]> {
  *  `allmystuff://subscription` — poll-safe, for a window that subscribed
  *  after the one-shot event fired. Distinguishes "the node socket answers"
  *  (backend is up) from "the mesh behind it is live". */
-export async function linkStatus(): Promise<{ status: string; error?: string | null } | null> {
+export async function linkStatus(): Promise<{
+  status: string;
+  error?: string | null;
+} | null> {
   if (!isTauri()) return null;
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    return (await invoke("link_status")) as { status: string; error?: string | null };
+    return (await invoke("link_status")) as {
+      status: string;
+      error?: string | null;
+    };
   } catch {
     return null; // node socket itself unreachable
   }
@@ -1800,10 +1976,14 @@ export async function linkStatus(): Promise<{ status: string; error?: string | n
  *  relay/offline transitions). Forwarded verbatim by the node; the store
  *  maps the load-bearing ones onto the graph instead of letting them fall
  *  on the floor. */
-export async function onMeshEvent(cb: (e: Record<string, unknown>) => void): Promise<() => void> {
+export async function onMeshEvent(
+  cb: (e: Record<string, unknown>) => void,
+): Promise<() => void> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<Record<string, unknown>>("allmystuff://event", (e) => cb(e.payload));
+  return listen<Record<string, unknown>>("allmystuff://event", (e) =>
+    cb(e.payload),
+  );
 }
 
 // MyOwnMesh's semi-public reference servers — the defaults a new network
@@ -1846,14 +2026,19 @@ export function buildNetworkConfig(args: {
   const signaling = args.signaling ?? [MYOWNMESH_SIGNALING];
   const stun = args.stun ?? [MYOWNMESH_STUN];
   const turn = args.turn ?? [
-    { url: MYOWNMESH_TURN_URL, username: MYOWNMESH_TURN_USER, credential: MYOWNMESH_TURN_PASS },
+    {
+      url: MYOWNMESH_TURN_URL,
+      username: MYOWNMESH_TURN_USER,
+      credential: MYOWNMESH_TURN_PASS,
+    },
   ];
   return {
     id: newNetworkInternalId(),
     network_id: args.networkId,
     label: args.label?.trim() || undefined,
     signaling: signaling.length > 0 ? { servers: signaling } : undefined,
-    stun_servers: stun.length > 0 ? stun.map((u) => ({ urls: [u] })) : undefined,
+    stun_servers:
+      stun.length > 0 ? stun.map((u) => ({ urls: [u] })) : undefined,
     turn_servers:
       turn.length > 0
         ? turn.map((t) => ({
@@ -1881,6 +2066,9 @@ export async function exportNetworkFile(
     filters: [{ name: "AllMyStuff network settings", extensions: ["json"] }],
   });
   if (!path) return null;
-  await invokeReq<unknown>("mesh_network_export_file", { path, config: envelope });
+  await invokeReq<unknown>("mesh_network_export_file", {
+    path,
+    config: envelope,
+  });
   return path;
 }
