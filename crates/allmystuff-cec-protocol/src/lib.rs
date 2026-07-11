@@ -61,6 +61,14 @@ pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, 
 /// with a customer's own AllMyStuff fleet networks.
 pub const CEC_NETWORK_PREFIX: &str = "cec-";
 
+/// The one well-known **global help mesh** every CEC client shares. A customer
+/// who taps "Ask for help" joins it and beacons a [`SupportPresence`] there —
+/// the beacon (its `support_id` is their dialable number) is the whole signal.
+/// Technicians sit on the room and list the beacons; an actual session still
+/// goes through the customer's own number mesh and the consent handshake, so
+/// this room carries *want*, never access.
+pub const HELP_NETWORK_ID: &str = "cecsupport-clients";
+
 /// Domain-separation tag for the per-peer ed25519 auth handshake. Forked from
 /// `myownmesh-mesh-auth-v1:` so a signature obtained on a CEC mesh cannot be
 /// replayed on any other MyOwnMesh network, and vice-versa.

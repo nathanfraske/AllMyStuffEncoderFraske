@@ -1351,6 +1351,11 @@ pub async fn dispatch(
         "cec_grants" => json_result(mesh.cec_grants().await),
         "cec_dialed" => json_result(mesh.cec_dialed().await),
         "cec_cancel_dial" => json_result(mesh.cec_cancel_dial().await),
+        "cec_ask_help" => {
+            let on: bool = try_arg!(opt(a, "on")).unwrap_or(true);
+            json_result(mesh.cec_ask_help(on).await)
+        }
+        "cec_help_list" => json_result(mesh.cec_help_list().await),
         "cec_forget_number" => {
             let number: String = try_arg!(arg(a, "number"));
             json_result(mesh.cec_forget_number(number).await)

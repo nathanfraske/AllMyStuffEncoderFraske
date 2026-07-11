@@ -85,6 +85,16 @@
     return !!lastUsed && idleSeconds(lastUsed) > CEC_STALE_AFTER_S;
   }
 
+  /** "just now" / "4m" / "1h 12m" — how long a help-asker has been waiting.
+   *  Kept short: it sits inline on the queue card. */
+  function waitingLabel(askedAt: number): string {
+    const s = Math.max(0, Math.round(Date.now() / 1000 - (askedAt || 0)));
+    if (s < 45) return "just now";
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+
   function connect(e: SubmitEvent) {
     e.preventDefault();
     void app.dialCec();
@@ -147,6 +157,48 @@
       </button>
     </form>
   </section>
+
+  <!-- Asking for help — customers waving on the global help room right now,
+       longest-waiting first (it's a queue). The same cards as Client meshes;
+       Control answers one by dialing their own number mesh, so the session
+       still takes the normal approval. Hidden while nobody's asking. -->
+  {#if app.cecHelpWaiting.length > 0}
+    <section class="block">
+      <div class="head">
+        <div class="title">Asking for help</div>
+      </div>
+      <p class="hint">
+        These customers pressed <b>Ask for help</b> and are waiting right now.
+        <b>Control</b> answers them — they approve you, then their screen opens.
+      </p>
+      <ul class="rows">
+        {#each app.cecHelpWaiting as w (w.node)}
+          <li class="row col asking">
+            <div class="row-top">
+              <span class="dot busy"></span>
+              <span class="who">
+                <b>{app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}</b>
+                <span class="sub">
+                  <span class="mesh" title={`Number ${w.number}`}>CEC Support {groupNumber(w.number)}</span>
+                  <span class="meta">· waiting {waitingLabel(w.asked_at)}</span>
+                </span>
+              </span>
+            </div>
+            <div class="row-actions">
+              <button
+                class="btn small primary"
+                disabled={app.cecDialing}
+                title="Answer them — connect and open their screen once they approve"
+                onclick={() => void app.reconnectCec(w.number)}
+              >
+                Control
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
 
   <!-- Client meshes — the customers this technician has dialed. Each is the
        customer's own private Silent mesh, kept here (and out of the Meshes tab)
@@ -491,6 +543,11 @@
      visible from the first click through to the customer's decision. */
   .pending-row {
     border: 1px dashed var(--accent);
+  }
+  /* A customer waving on the help room — accented like the pending dial (both
+     are "something live is waiting on a human"), solid to read as a queue. */
+  .row.asking {
+    border: 1px solid var(--accent);
   }
   .dot.busy {
     background: var(--accent);

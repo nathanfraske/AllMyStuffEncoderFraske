@@ -205,7 +205,42 @@ struct CecInner {
     /// it; the discovery poll and the connect-request re-send loop both honor
     /// it, so "stop trying" actually stops everything being tried.
     dial_cancel: Option<Arc<AtomicBool>>,
+    /// Customer: whether this node is currently asking for help on the global
+    /// help mesh. In-memory only — a restart simply stops the beacon and the
+    /// technicians' TTL caches age the entry out.
+    asking_help: bool,
+    /// Bumped on every asking-state transition, so the re-beacon loop can tell
+    /// "still the same ask" from "cancelled and re-asked" and exactly one loop
+    /// ever beacons.
+    help_epoch: u64,
+    /// Technician: the waiting customers heard on the global help mesh, keyed
+    /// by the sender's canonical id. Entries live [`HELP_TTL_SECS`] past their
+    /// last beacon; an `available: false` beacon (cancel / help arrived)
+    /// removes one immediately.
+    help_wanted: HashMap<String, HelpSeeker>,
 }
+
+/// One customer waiting on the global help mesh, as heard from their beacon.
+#[derive(Clone, Debug)]
+struct HelpSeeker {
+    /// Their dialable support number — derived from the *authenticated* sender
+    /// id, never read from the payload, so a beacon can't impersonate another
+    /// number.
+    number: String,
+    /// Their machine label (cosmetic, from the beacon).
+    label: String,
+    /// Unix seconds we first heard this ask — the queue position.
+    asked_at: u64,
+    /// Unix seconds of the latest beacon — the TTL clock.
+    last_seen: u64,
+}
+
+/// How long a technician keeps a help entry past its last beacon. The customer
+/// re-beacons every [`HELP_BEACON_SECS`], so this tolerates a few missed beats
+/// before a silent (crashed / offline) asker ages out.
+pub const HELP_TTL_SECS: u64 = 90;
+/// How often an asking customer re-beacons on the help mesh.
+pub const HELP_BEACON_SECS: u64 = 20;
 
 impl Cec {
     /// Build the CEC state, loading (or, with `None`, running an in-memory)
@@ -237,6 +272,9 @@ impl Cec {
                 dialed,
                 sessions: HashMap::new(),
                 dial_cancel: None,
+                asking_help: false,
+                help_epoch: 0,
+                help_wanted: HashMap::new(),
             }),
         }
     }
@@ -281,6 +319,7 @@ impl Cec {
             "network_id": inner.network_id,
             "role": role_str(inner.role),
             "hosting": inner.hosting,
+            "asking_help": inner.asking_help,
         })
     }
 
@@ -663,6 +702,96 @@ impl Cec {
         inner.pending.iter().any(|p| pubkey_part(&p.tech) == key) || inner.consent.known(tech)
     }
 
+    // ---- ask-for-help (customer beacon + technician cache) ---------------
+
+    /// Flip the customer's asking-for-help state. Returns whether it actually
+    /// changed (the callers' guard against double-withdrawals), bumping the
+    /// epoch on every real transition so exactly one re-beacon loop survives.
+    pub fn set_asking_help(&self, on: bool) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.asking_help == on {
+            return false;
+        }
+        inner.asking_help = on;
+        inner.help_epoch += 1;
+        true
+    }
+
+    /// Whether this customer is currently asking for help.
+    pub fn asking_help(&self) -> bool {
+        self.inner.lock().asking_help
+    }
+
+    /// The current asking-state epoch — the re-beacon loop's "is this still my
+    /// ask" check.
+    pub fn help_epoch(&self) -> u64 {
+        self.inner.lock().help_epoch
+    }
+
+    /// Technician: record (or refresh) a waiting customer heard on the help
+    /// mesh. `number` must come from the authenticated sender id, not the
+    /// payload. Returns whether the *membership* changed (a fresh asker, or a
+    /// changed label) — pure keep-alives refresh the TTL clock without
+    /// spamming an event.
+    pub fn record_help_beacon(&self, node: &str, number: &str, label: &str) -> bool {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        let key = pubkey_part(node).to_string();
+        match inner.help_wanted.get_mut(&key) {
+            Some(s) => {
+                s.last_seen = now;
+                if s.label != label {
+                    s.label = label.to_string();
+                    return true;
+                }
+                false
+            }
+            None => {
+                inner.help_wanted.insert(
+                    key,
+                    HelpSeeker {
+                        number: number.to_string(),
+                        label: label.to_string(),
+                        asked_at: now,
+                        last_seen: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Technician: drop a waiting customer (their `available: false` withdrawal
+    /// — cancelled, or help arrived). Returns whether anything was removed.
+    pub fn remove_help_beacon(&self, node: &str) -> bool {
+        let key = pubkey_part(node).to_string();
+        self.inner.lock().help_wanted.remove(&key).is_some()
+    }
+
+    /// Technician: the customers currently waiting for help, longest-waiting
+    /// first (it's a queue, not a feed). Prunes anything past its beacon TTL
+    /// on the way out, so a crashed asker disappears without a withdrawal.
+    pub fn help_list(&self) -> Vec<Value> {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        inner
+            .help_wanted
+            .retain(|_, s| s.last_seen.saturating_add(HELP_TTL_SECS) >= now);
+        let mut list: Vec<(&String, &HelpSeeker)> = inner.help_wanted.iter().collect();
+        list.sort_by_key(|(_, s)| s.asked_at);
+        list.into_iter()
+            .map(|(node, s)| {
+                json!({
+                    "node": node,
+                    "number": s.number,
+                    "label": s.label,
+                    "asked_at": s.asked_at,
+                    "last_seen": s.last_seen,
+                })
+            })
+            .collect()
+    }
+
     // ---- session state --------------------------------------------------
 
     /// Record a session's state, returning it for the `cec://session` emit.
@@ -769,6 +898,26 @@ pub fn silent_network_config(number: &str) -> (String, Value) {
         "label": format!("CEC Support {}", grouped_number(number)),
         // The Silent kind the sibling myownmesh change adds: no auto-dial, no
         // roster gossip — peers are only *visible* until `connect_peer`.
+        "kind": "silent",
+        "auto_approve": true,
+        "signaling": { "strategy": "nostr", "mdns": true },
+    });
+    (network_id, config)
+}
+
+/// Build the daemon config for the **global help mesh** — the one well-known
+/// Silent room every CEC client shares
+/// ([`HELP_NETWORK_ID`](allmystuff_cec_protocol::HELP_NETWORK_ID)). A customer
+/// joins it only while asking for help and beacons a `SupportPresence` there;
+/// technicians sit on it and list the beacons. Silent again: the room carries
+/// *want*, never access — a session still goes through the customer's own
+/// number mesh and the consent handshake.
+pub fn help_network_config() -> (String, Value) {
+    let network_id = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
+    let config = json!({
+        "id": network_id,
+        "network_id": network_id,
+        "label": "CEC Support — asking for help",
         "kind": "silent",
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
@@ -897,5 +1046,41 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 6);
         assert_ne!(a, verification_code(TECH, "s2"));
+    }
+
+    #[test]
+    fn help_queue_records_dedupes_and_withdraws() {
+        let cec = Cec::new(None);
+        // First beacon: a new asker — membership changed.
+        assert!(cec.record_help_beacon(ME, "123 456 789", "Reception PC"));
+        // Keep-alive with the same label: TTL refresh only, no event churn.
+        assert!(!cec.record_help_beacon(ME, "123 456 789", "Reception PC"));
+        // A renamed machine is worth re-announcing.
+        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk"));
+        // Display-suffix and bare forms are the same asker.
+        let display = format!("{ME}-AB12C");
+        assert!(!cec.record_help_beacon(&display, "123 456 789", "Front desk"));
+        let list = cec.help_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["number"], "123 456 789");
+        assert_eq!(list[0]["label"], "Front desk");
+        // Withdrawal (available:false / help arrived) empties the queue.
+        assert!(cec.remove_help_beacon(&display));
+        assert!(cec.help_list().is_empty());
+        assert!(!cec.remove_help_beacon(ME), "second withdrawal is a no-op");
+    }
+
+    #[test]
+    fn asking_help_transitions_bump_the_epoch_once() {
+        let cec = Cec::new(None);
+        assert!(!cec.asking_help());
+        let e0 = cec.help_epoch();
+        assert!(cec.set_asking_help(true));
+        assert!(!cec.set_asking_help(true), "re-ask while asking is a no-op");
+        let e1 = cec.help_epoch();
+        assert_eq!(e1, e0 + 1, "one transition, one epoch bump");
+        assert!(cec.set_asking_help(false));
+        assert!(!cec.set_asking_help(false));
+        assert_eq!(cec.help_epoch(), e1 + 1);
     }
 }

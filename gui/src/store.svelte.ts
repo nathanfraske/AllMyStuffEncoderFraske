@@ -166,6 +166,9 @@ import {
   cecGrants,
   cecCancelDial,
   cecDialed,
+  cecHelpList,
+  onCecHelp,
+  type CecHelpSeeker,
   cecForgetNumber,
   forgetNode,
   onCecRequest,
@@ -240,6 +243,9 @@ import {
  *  one of these per customer they dial; they're managed from the CEC tab, not
  *  the Meshes list, so they're filtered out of "Your meshes". */
 const CEC_NETWORK_PREFIX = "cec-";
+/** The one global help room every CEC client shares (the node's
+ *  `HELP_NETWORK_ID`). Node-managed — hidden from the Meshes list. */
+const CEC_HELP_NETWORK_ID = "cecsupport-clients";
 
 /** A stored customer unused for this long reads as "stale" — the cleanup nudge
  *  for a directory that grows as customers cycle out. Shared by the CEC tab's
@@ -584,6 +590,11 @@ class AppStore {
    *  goes active, the technician's remote-control console opens for them (the
    *  AnyDesk-style "connect and you're in"). Cleared once opened. */
   cecAutoOpenNode = $state<string | null>(null);
+  /** The customers currently asking for help on the global help room —
+   *  longest-waiting first (the node keeps queue order). Drives the CEC tab's
+   *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
+   *  event. */
+  cecHelpWaiting = $state<CecHelpSeeker[]>([]);
   /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
    *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
    *  Node CEC status/role deliberately does *not* auto-reveal it. */
@@ -969,6 +980,10 @@ class AppStore {
    *  daemon persists the room) — is deliberately NOT hidden, so it stays
    *  removable via the normal Leave instead of becoming invisible-and-stuck. */
   isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
+    // The global help room is always CEC-managed: the node joins/leaves it on
+    // its own (a customer's ask, a technician's queue) and it never carries a
+    // session — surfacing it in Meshes would just invite a confusing Leave.
+    if (net?.network_id === CEC_HELP_NETWORK_ID) return true;
     return this.isCecMesh(net) && this.cecManagedNetworkIds.has(net!.network_id!);
   }
 
@@ -1485,6 +1500,12 @@ class AppStore {
     });
     await onCecGrants((grants) => {
       this.cecGrantList = grants;
+    });
+    await onCecHelp((e) => {
+      // Technician side of `cec://help`: the node pushes the whole fresh
+      // queue on every membership change. (The `asking` field is the
+      // customer app's side of the event — irrelevant here.)
+      if (e.waiting) this.cecHelpWaiting = e.waiting;
     });
     void cecStatus().then((s) => {
       if (s) this.cecStatusInfo = s;
@@ -6790,6 +6811,11 @@ class AppStore {
     const dialed = await cecDialed();
     if (dialed) this.cecCustomers = dialed;
     else clientLog("[cec] dialed-list fetch failed — keeping the last snapshot");
+    // The help queue: same failure discipline — null keeps the last snapshot.
+    // The fetch itself is what first joins the global help room, so opening
+    // the CEC tab is enough to start hearing the beacons.
+    const waiting = await cecHelpList();
+    if (waiting) this.cecHelpWaiting = waiting;
   }
 
   /** Technician: dial a customer by the number they read out. On success the

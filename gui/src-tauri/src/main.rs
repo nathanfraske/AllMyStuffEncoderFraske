@@ -1306,6 +1306,18 @@ async fn cec_dialed(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Technician: the customers currently asking for help on the global help
+/// room, longest-waiting first. First use joins the room, so beacons keep
+/// landing whether or not the tab stays open.
+#[tauri::command]
+async fn cec_help_list(state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_help_list", json!({}))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Technician: stop whatever the in-flight dial is trying (discovery poll +
 /// connect-request re-sends). The attempt row stays in the directory.
 #[tauri::command]
@@ -2347,6 +2359,7 @@ fn main() {
             cec_revoke,
             cec_grants,
             cec_dialed,
+            cec_help_list,
             cec_forget_number,
             cec_cancel_dial,
             forget_node,
