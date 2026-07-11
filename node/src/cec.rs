@@ -108,6 +108,11 @@ pub struct DialedCustomer {
     pub number: String,
     /// Best-known label (the machine name, once presence lands).
     pub label: String,
+    /// Best-known hostname, shown beside the label so the technician's card
+    /// spells the same identity the customer's app shows. `default` so a
+    /// directory persisted by an older build still loads.
+    #[serde(default)]
+    pub hostname: String,
     /// Whether the customer is currently reachable.
     pub online: bool,
     /// The Silent mesh (`network_id_for_number`) the customer was dialed on.
@@ -126,6 +131,7 @@ impl DialedCustomer {
             "node": self.node,
             "number": self.number,
             "label": self.label,
+            "hostname": self.hostname,
             "online": self.online,
             "last_used": self.last_used,
         })
@@ -229,6 +235,10 @@ struct HelpSeeker {
     number: String,
     /// Their machine label (cosmetic, from the beacon).
     label: String,
+    /// Their machine hostname (cosmetic, from the beacon) — shown beside the
+    /// label so the technician's card and the customer's waiting screen spell
+    /// the same identity.
+    hostname: String,
     /// Unix seconds we first heard this ask — the queue position.
     asked_at: u64,
     /// Unix seconds of the latest beacon — the TTL clock.
@@ -350,6 +360,7 @@ impl Cec {
         node: String,
         number: String,
         label: String,
+        hostname: String,
         online: bool,
         network_id: String,
     ) -> DialedCustomer {
@@ -362,6 +373,7 @@ impl Cec {
                 node: node.clone(),
                 number: number.clone(),
                 label: label.clone(),
+                hostname: hostname.clone(),
                 online,
                 network_id: network_id.clone(),
                 last_used: now,
@@ -370,6 +382,9 @@ impl Cec {
         entry.number = number;
         if !label.is_empty() {
             entry.label = label;
+        }
+        if !hostname.is_empty() {
+            entry.hostname = hostname;
         }
         entry.online = online;
         entry.network_id = network_id;
@@ -433,6 +448,7 @@ impl Cec {
                 node: String::new(),
                 number: number.to_string(),
                 label: String::new(),
+                hostname: String::new(),
                 online: false,
                 network_id: network_id_for_number(number),
                 last_used: now,
@@ -733,15 +749,22 @@ impl Cec {
     /// payload. Returns whether the *membership* changed (a fresh asker, or a
     /// changed label) — pure keep-alives refresh the TTL clock without
     /// spamming an event.
-    pub fn record_help_beacon(&self, node: &str, number: &str, label: &str) -> bool {
+    pub fn record_help_beacon(
+        &self,
+        node: &str,
+        number: &str,
+        label: &str,
+        hostname: &str,
+    ) -> bool {
         let now = now_secs();
         let mut inner = self.inner.lock();
         let key = pubkey_part(node).to_string();
         match inner.help_wanted.get_mut(&key) {
             Some(s) => {
                 s.last_seen = now;
-                if s.label != label {
+                if s.label != label || s.hostname != hostname {
                     s.label = label.to_string();
+                    s.hostname = hostname.to_string();
                     return true;
                 }
                 false
@@ -752,6 +775,7 @@ impl Cec {
                     HelpSeeker {
                         number: number.to_string(),
                         label: label.to_string(),
+                        hostname: hostname.to_string(),
                         asked_at: now,
                         last_seen: now,
                     },
@@ -799,6 +823,7 @@ impl Cec {
                     "node": node,
                     "number": s.number,
                     "label": s.label,
+                    "hostname": s.hostname,
                     "asked_at": s.asked_at,
                     "last_seen": s.last_seen,
                 })
@@ -1044,6 +1069,7 @@ mod tests {
             TECH.into(),
             "123456789".into(),
             "Reception PC".into(),
+            "RECEPTION-01".into(),
             true,
             "cec-123456789".into(),
         );
@@ -1090,18 +1116,21 @@ mod tests {
     fn help_queue_records_dedupes_and_withdraws() {
         let cec = Cec::new(None);
         // First beacon: a new asker — membership changed.
-        assert!(cec.record_help_beacon(ME, "123 456 789", "Reception PC"));
-        // Keep-alive with the same label: TTL refresh only, no event churn.
-        assert!(!cec.record_help_beacon(ME, "123 456 789", "Reception PC"));
+        assert!(cec.record_help_beacon(ME, "123 456 789", "Reception PC", "RECEPTION-01"));
+        // Keep-alive with the same identity: TTL refresh only, no event churn.
+        assert!(!cec.record_help_beacon(ME, "123 456 789", "Reception PC", "RECEPTION-01"));
         // A renamed machine is worth re-announcing.
-        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk"));
+        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk", "RECEPTION-01"));
+        // ...and so is a changed hostname.
+        assert!(cec.record_help_beacon(ME, "123 456 789", "Front desk", "RECEPTION-02"));
         // Display-suffix and bare forms are the same asker.
         let display = format!("{ME}-AB12C");
-        assert!(!cec.record_help_beacon(&display, "123 456 789", "Front desk"));
+        assert!(!cec.record_help_beacon(&display, "123 456 789", "Front desk", "RECEPTION-02"));
         let list = cec.help_list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["number"], "123 456 789");
         assert_eq!(list[0]["label"], "Front desk");
+        assert_eq!(list[0]["hostname"], "RECEPTION-02");
         // Withdrawal (available:false / help arrived) empties the queue.
         assert!(cec.remove_help_beacon(&display));
         assert!(cec.help_list().is_empty());

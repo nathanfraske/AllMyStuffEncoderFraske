@@ -2085,7 +2085,8 @@ impl Mesh {
                     && matches!(p.role, allmystuff_cec_protocol::Role::Client)
                 {
                     tracing::info!("cec help beacon from {} (number {number})", short_id(&from));
-                    self.cec.record_help_beacon(&from, &number, &p.label)
+                    self.cec
+                        .record_help_beacon(&from, &number, &p.label, &p.hostname)
                 } else {
                     self.cec.remove_help_beacon(&from)
                 };
@@ -2918,11 +2919,12 @@ impl Mesh {
                 }
             })?;
 
-        let label = self.cec_peer_label(&canonical).unwrap_or_default();
+        let (label, hostname) = self.cec_peer_ident(&canonical).unwrap_or_default();
         let record = self.cec.record_dialed(
             customer.clone(),
             number.clone(),
             label,
+            hostname,
             true,
             network_id.clone(),
         );
@@ -3369,7 +3371,13 @@ impl Mesh {
             .as_ref()
             .map(|p| p.label.clone())
             .unwrap_or_default();
-        presence.hostname = allmystuff_inventory::scan().host.hostname;
+        // Cached: the hostname never changes within a run, and this fires on
+        // every 20s help re-beacon — a full scan() here meant a round of
+        // PowerShell probes per beacon on Windows.
+        static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        presence.hostname = HOSTNAME
+            .get_or_init(|| allmystuff_inventory::scan().host.hostname)
+            .clone();
         presence.sent_at = unix_now_ms() / 1000;
         let payload = match serde_json::to_value(&presence) {
             Ok(v) => v,
@@ -3385,16 +3393,18 @@ impl Mesh {
             .await;
     }
 
-    /// The best-known label for a peer by canonical id, from the live session.
-    fn cec_peer_label(&self, canonical: &str) -> Option<String> {
+    /// The best-known (label, hostname) for a peer by canonical id, from the
+    /// live session — the identity pair the CEC cards spell out so the
+    /// technician's row and the customer's own app match word for word.
+    fn cec_peer_ident(&self, canonical: &str) -> Option<(String, String)> {
         let st = self.state.lock();
         let session = st.session.as_ref()?;
-        let label = session
+        let ident = session
             .peers()
             .find(|p| crate::cec::pubkey_part(p.node.as_str()) == canonical)
-            .map(|p| p.label.clone())
-            .filter(|l| !l.is_empty());
-        label
+            .map(|p| (p.label.clone(), p.hostname.clone()))
+            .filter(|(l, h)| !l.is_empty() || !h.is_empty());
+        ident
     }
 
     /// Tear down every live route with a peer (by canonical id) and drop it from
