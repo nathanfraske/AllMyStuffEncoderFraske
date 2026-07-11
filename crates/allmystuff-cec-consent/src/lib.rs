@@ -241,6 +241,17 @@ impl ConsentStore {
         self.ephemeral.clear();
     }
 
+    /// Remove only the in-memory `Once` grant for `technician` — the session
+    /// it covered just ended. Persistent grants are untouched (a
+    /// 3-hours/Forever choice deliberately outlives sessions). Returns whether
+    /// anything was removed.
+    pub fn revoke_once(&mut self, technician: &str) -> bool {
+        let key = pubkey_part(technician).to_string();
+        let before = self.ephemeral.len();
+        self.ephemeral.retain(|g| g.technician != key);
+        before != self.ephemeral.len()
+    }
+
     /// Remove any expired persistent grants and persist if anything changed.
     /// Returns how many were pruned. Safe to call on a schedule.
     pub fn purge_expired(&mut self, now: u64) -> Result<usize, ConsentError> {

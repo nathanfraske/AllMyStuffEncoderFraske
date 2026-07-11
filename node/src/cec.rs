@@ -768,6 +768,20 @@ impl Cec {
         self.inner.lock().help_wanted.remove(&key).is_some()
     }
 
+    /// Drop every cached help beacon — the watch toggle's leave path, so the
+    /// queue empties the moment a technician stops watching.
+    pub fn clear_help(&self) {
+        self.inner.lock().help_wanted.clear();
+    }
+
+    /// Whether this node has ever acted as a technician (its role flipped on
+    /// the first dial). Guards the customer-side ask teardown on side-by-side
+    /// machines: a technician's help-room watch must survive a co-resident
+    /// customer app withdrawing its ask.
+    pub fn is_technician(&self) -> bool {
+        matches!(self.inner.lock().role, Role::Technician)
+    }
+
     /// Technician: the customers currently waiting for help, longest-waiting
     /// first (it's a queue, not a feed). Prunes anything past its beacon TTL
     /// on the way out, so a crashed asker disappears without a withdrawal.
@@ -835,6 +849,28 @@ impl Cec {
             .into_iter()
             .find(|g| pubkey_part(&g.technician) == key)
             .map(|g| g.scope)
+    }
+
+    /// The scope of a **standing** (persistent) grant for `tech` — 3-hours or
+    /// Forever only. This is the auto-approve check for a *new* session: an
+    /// "Approve Once" covers exactly the session it was granted in, so it must
+    /// never silently approve a reconnect — a fresh dial re-prompts instead.
+    pub fn standing_scope_for(&self, tech: &str) -> Option<ApprovalScope> {
+        let inner = self.inner.lock();
+        let key = pubkey_part(tech);
+        inner
+            .consent
+            .active_grants(now_secs())
+            .into_iter()
+            .find(|g| g.scope.persists() && pubkey_part(&g.technician) == key)
+            .map(|g| g.scope)
+    }
+
+    /// Retire the in-memory "Approve Once" grant for `tech` — the session it
+    /// covered ended, and Once must not outlive its session. Returns whether a
+    /// grant was actually dropped (so the caller can re-emit the grant list).
+    pub fn retire_once(&self, tech: &str) -> bool {
+        self.inner.lock().consent.revoke_once(tech)
     }
 }
 

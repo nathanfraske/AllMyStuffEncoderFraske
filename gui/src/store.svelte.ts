@@ -167,6 +167,7 @@ import {
   cecCancelDial,
   cecDialed,
   cecHelpList,
+  cecHelpWatch,
   onCecHelp,
   type CecHelpSeeker,
   cecForgetNumber,
@@ -595,6 +596,11 @@ class AppStore {
    *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
    *  event. */
   cecHelpWaiting = $state<CecHelpSeeker[]>([]);
+  /** The "Watch the help queue" opt-in, mirrored from the node's room
+   *  membership (`cec_status.help_watching`) — the saved state lives in the
+   *  daemon, so it survives restarts without a GUI-side flag. Off means this
+   *  install is not on the global help room at all. */
+  cecHelpWatching = $derived(this.cecStatusInfo?.help_watching === true);
   /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
    *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
    *  Node CEC status/role deliberately does *not* auto-reveal it. */
@@ -2728,10 +2734,36 @@ class AppStore {
    *  popover. */
   openConsole(nodeId: string) {
     // Resolve under any id form (display id vs bare pubkey): callers hand us
-    // whatever id they have — the CEC auto-open passes the id the *dial*
-    // returned, which need not match the catalog's key for the same machine.
-    // An exact lookup here used to miss, fail `consoleAllowed`, and return
-    // without a word — "the console just never opens".
+    // whatever id they have. An exact lookup here used to miss, fail
+    // `consoleAllowed`, and return without a word — "the console just never
+    // opens".
+    const node = this.machineByAnyId(nodeId);
+    if (node) nodeId = node.id;
+    // A CEC customer's console NEVER opens straight off the graph, the
+    // drawer, or the card buttons: every entry runs the Support tab's dial →
+    // approval flow instead. Opening directly would ride whatever
+    // authorization is left on the customer's node (e.g. an "Approve Once"
+    // from the last session) — around the normal checks, with no fresh
+    // approval. The tab opens showing the dial/waiting state, and the console
+    // still pops by itself the moment they approve (or instantly on a
+    // standing grant).
+    if (node && this.isCecCustomer(node.id)) {
+      this.openCecSupportFlowFor(node.id);
+      return;
+    }
+    if (!this.consoleAllowed(node, nodeId)) return;
+    if (isTauri() && !isMobile()) {
+      void openConsoleWindow(nodeId);
+      return;
+    }
+    this.openConsoleHere(nodeId);
+  }
+
+  /** The post-approval console open — the ONLY direct path onto a CEC
+   *  customer's console, reached exclusively through a session the customer
+   *  just approved (see [`openCecConsoleWhenFound`]). Ordinary machines never
+   *  come through here. */
+  private openCecConsoleDirect(nodeId: string) {
     const node = this.machineByAnyId(nodeId);
     if (node) nodeId = node.id;
     if (!this.consoleAllowed(node, nodeId)) return;
@@ -2740,6 +2772,15 @@ class AppStore {
       return;
     }
     this.openConsoleHere(nodeId);
+  }
+
+  /** Route a CEC customer's console ask through the Support tab: open the
+   *  tab (where the dial / waiting-for-approval system lives) and start the
+   *  normal Control flow for their number. */
+  openCecSupportFlowFor(nodeId: string) {
+    this.openSettings("cec");
+    const c = this.cecCustomers.find((x) => x.node && sameMachine(x.node, nodeId));
+    if (c && !this.cecDialing) void this.reconnectCec(c.number);
   }
 
   /** Start the console session *in this window* — the body of a console
@@ -6896,6 +6937,17 @@ class AppStore {
     await cecCancelDial();
   }
 
+  /** Flip the "Watch the help queue" opt-in, then re-read the node's status —
+   *  membership is the saved state, so the toggle shows what actually took
+   *  (and keeps showing it after a restart, no local flag needed). */
+  async setCecHelpWatch(on: boolean) {
+    await cecHelpWatch(on);
+    const status = await cecStatus();
+    if (status) this.cecStatusInfo = status;
+    if (on) void this.loadCec();
+    else this.cecHelpWaiting = [];
+  }
+
   /** Open the console for a just-approved CEC customer the moment their
    *  machine is actually in the catalog. Retries the resolve for a few
    *  seconds (the peer sweep + presence can land a breath after the approval
@@ -6904,7 +6956,9 @@ class AppStore {
   private openCecConsoleWhenFound(anyId: string, tries = 12) {
     const found = this.machineByAnyId(anyId);
     if (found) {
-      this.openConsole(found.id);
+      // Direct on purpose: this runs only off a session the customer just
+      // approved — the one moment a CEC console may open without re-dialing.
+      this.openCecConsoleDirect(found.id);
       return;
     }
     if (tries <= 0) {
