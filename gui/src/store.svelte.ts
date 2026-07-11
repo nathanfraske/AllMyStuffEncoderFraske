@@ -1465,13 +1465,14 @@ class AppStore {
         ...this.cecSessions.filter((x) => x.sessionId !== s.session_id),
       ];
       // The technician just got approval on a customer they dialed: open the
-      // remote-control console for them. A short beat lets the peer + its
-      // capabilities land in the catalog first (onCecPeer refreshes it), so the
-      // console can wire the screen route on open rather than to an empty node.
+      // remote-control console for them, as soon as the peer has actually
+      // landed in the catalog. The approval can beat the peer sweep by a
+      // breath — the old one-shot 400ms timer lost that race silently and the
+      // console "just never opened".
       if (s.state === "active" && this.cecAutoOpenNode) {
         const node = this.cecAutoOpenNode;
         this.cecAutoOpenNode = null;
-        setTimeout(() => this.openConsole(node), 400);
+        this.openCecConsoleWhenFound(node);
       } else if ((s.state === "denied" || s.state === "ended") && this.cecAutoOpenNode) {
         // A decline (or the session ending before approval) must disarm the
         // auto-open — leaving it armed both hides the outcome from the
@@ -2705,7 +2706,13 @@ class AppStore {
    *  consoles can be up side by side); the web preview keeps the in-page
    *  popover. */
   openConsole(nodeId: string) {
-    const node = this.node(nodeId);
+    // Resolve under any id form (display id vs bare pubkey): callers hand us
+    // whatever id they have — the CEC auto-open passes the id the *dial*
+    // returned, which need not match the catalog's key for the same machine.
+    // An exact lookup here used to miss, fail `consoleAllowed`, and return
+    // without a word — "the console just never opens".
+    const node = this.machineByAnyId(nodeId);
+    if (node) nodeId = node.id;
     if (!this.consoleAllowed(node, nodeId)) return;
     if (isTauri() && !isMobile()) {
       void openConsoleWindow(nodeId);
@@ -2724,7 +2731,9 @@ class AppStore {
    *  a video route that's already live (or a snapshot that never comes)
    *  still ends with control on. The toggles inside are the off-switches. */
   openConsoleHere(nodeId: string) {
-    const node = this.node(nodeId);
+    // Same any-form resolve as `openConsole` — this is the web/window body.
+    const node = this.machineByAnyId(nodeId);
+    if (node) nodeId = node.id;
     if (!this.consoleAllowed(node, nodeId)) return;
     this.consoleNodeId = nodeId;
     this.consoleAudio = false;
@@ -2814,7 +2823,11 @@ class AppStore {
   /** The gate both console entries share: a known remote machine that runs
    *  AllMyStuff and is yours (or shared with you). */
   private consoleAllowed(node: MeshNode | undefined, nodeId: string): node is MeshNode {
-    if (!node) return false;
+    if (!node) {
+      // Say so — a silent refusal here reads as "the button does nothing".
+      this.toast("warn", "That machine isn't on the graph yet — give it a beat and try again");
+      return false;
+    }
     if (nodeId === this.localId) {
       this.toast("warn", "That's this device");
       return false;
@@ -6855,6 +6868,28 @@ class AppStore {
   async cancelCecDial() {
     clientLog("[cec] cancel requested");
     await cecCancelDial();
+  }
+
+  /** Open the console for a just-approved CEC customer the moment their
+   *  machine is actually in the catalog. Retries the resolve for a few
+   *  seconds (the peer sweep + presence can land a breath after the approval
+   *  event), nudging a snapshot pull each beat; if they still haven't landed,
+   *  say so instead of doing nothing. */
+  private openCecConsoleWhenFound(anyId: string, tries = 12) {
+    const found = this.machineByAnyId(anyId);
+    if (found) {
+      this.openConsole(found.id);
+      return;
+    }
+    if (tries <= 0) {
+      this.toast(
+        "warn",
+        "They approved, but their machine hasn't appeared on the graph yet — press Control again",
+      );
+      return;
+    }
+    void this.pullSessionSnapshot();
+    setTimeout(() => this.openCecConsoleWhenFound(anyId, tries - 1), 500);
   }
 
   /** Stop waiting on an unanswered approval: quit the connect-request
