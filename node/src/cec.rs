@@ -768,6 +768,20 @@ impl Cec {
         self.inner.lock().help_wanted.remove(&key).is_some()
     }
 
+    /// Drop every cached help beacon — the watch toggle's leave path, so the
+    /// queue empties the moment a technician stops watching.
+    pub fn clear_help(&self) {
+        self.inner.lock().help_wanted.clear();
+    }
+
+    /// Whether this node has ever acted as a technician (its role flipped on
+    /// the first dial). Guards the customer-side ask teardown on side-by-side
+    /// machines: a technician's help-room watch must survive a co-resident
+    /// customer app withdrawing its ask.
+    pub fn is_technician(&self) -> bool {
+        matches!(self.inner.lock().role, Role::Technician)
+    }
+
     /// Technician: the customers currently waiting for help, longest-waiting
     /// first (it's a queue, not a feed). Prunes anything past its beacon TTL
     /// on the way out, so a crashed asker disappears without a withdrawal.

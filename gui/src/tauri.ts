@@ -1090,6 +1090,11 @@ export interface CecStatus {
   network_id: string;
   role: "client" | "technician";
   hosting: boolean;
+  /** Whether this node is sitting on the global help room — the "Watch the
+   *  help queue" opt-in. Read from room membership (the daemon persists it),
+   *  so the toggle's saved state comes back from the node itself. Absent from
+   *  an older node. */
+  help_watching?: boolean;
 }
 
 /** One inbound technician connect-request awaiting the customer's 3-choice
@@ -1225,11 +1230,19 @@ export interface CecHelpSeeker {
 }
 
 /** Technician: the customers currently asking for help, longest-waiting
- *  first. First call joins the global help room so beacons keep landing.
+ *  first. Read-only — it never joins the room (that's `cecHelpWatch`, the
+ *  explicit opt-in), so an install that isn't watching always reads empty.
  *  Null = fetch failed (keep the last snapshot); empty in web mode. */
 export async function cecHelpList(): Promise<CecHelpSeeker[] | null> {
   const r = await tryInvoke<CecHelpSeeker[]>("cec_help_list");
   return Array.isArray(r) ? r : null;
+}
+
+/** Technician: join (or leave) the global help room — the "Watch the help
+ *  queue" toggle. Sticks across restarts (the daemon persists the room), and
+ *  a default install never joins until this is explicitly turned on. */
+export async function cecHelpWatch(on: boolean): Promise<void> {
+  await tryInvoke("cec_help_watch", { on });
 }
 
 /** The help queue changed (`cec://help`) — a fresh asker, a withdrawal, or

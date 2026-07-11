@@ -167,6 +167,7 @@ import {
   cecCancelDial,
   cecDialed,
   cecHelpList,
+  cecHelpWatch,
   onCecHelp,
   type CecHelpSeeker,
   cecForgetNumber,
@@ -595,6 +596,11 @@ class AppStore {
    *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
    *  event. */
   cecHelpWaiting = $state<CecHelpSeeker[]>([]);
+  /** The "Watch the help queue" opt-in, mirrored from the node's room
+   *  membership (`cec_status.help_watching`) — the saved state lives in the
+   *  daemon, so it survives restarts without a GUI-side flag. Off means this
+   *  install is not on the global help room at all. */
+  cecHelpWatching = $derived(this.cecStatusInfo?.help_watching === true);
   /** Whether the secret CEC tab shows in Settings. Purely the manual reveal —
    *  the persisted keyboard-gesture toggle (Ctrl+Alt+Shift+C in App.svelte).
    *  Node CEC status/role deliberately does *not* auto-reveal it. */
@@ -6894,6 +6900,17 @@ class AppStore {
   async cancelCecDial() {
     clientLog("[cec] cancel requested");
     await cecCancelDial();
+  }
+
+  /** Flip the "Watch the help queue" opt-in, then re-read the node's status —
+   *  membership is the saved state, so the toggle shows what actually took
+   *  (and keeps showing it after a restart, no local flag needed). */
+  async setCecHelpWatch(on: boolean) {
+    await cecHelpWatch(on);
+    const status = await cecStatus();
+    if (status) this.cecStatusInfo = status;
+    if (on) void this.loadCec();
+    else this.cecHelpWaiting = [];
   }
 
   /** Open the console for a just-approved CEC customer the moment their

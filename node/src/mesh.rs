@@ -2626,7 +2626,17 @@ impl Mesh {
     /// room, its role (client/technician), and whether it's hosting.
     pub async fn cec_status(&self) -> Result<Value, String> {
         let me = self.resolve_local_id().await;
-        Ok(self.cec.status(me.as_deref()))
+        let mut status = self.cec.status(me.as_deref());
+        if let Some(o) = status.as_object_mut() {
+            // The technician's "watch the help queue" opt-in — read straight
+            // from room membership, the single source of truth, so the
+            // Support tab's toggle can never drift from reality.
+            o.insert(
+                "help_watching".into(),
+                Value::Bool(self.cec_help_watching()),
+            );
+        }
+        Ok(status)
     }
 
     /// `cec_start_hosting` (customer): join this device's own number-derived
@@ -2641,18 +2651,11 @@ impl Mesh {
         let (network_id, config) = crate::cec::silent_network_config(&number);
         self.cec_join_silent(&network_id, config).await?;
         self.cec_broadcast_presence(&network_id, &me, true).await;
-        // A stale help-room membership can outlive a crash mid-ask (the daemon
-        // persists CEC rooms): if we're not actually asking, quietly leave it
-        // so this customer isn't silently lurking on the global room.
-        if !self.cec.asking_help() {
-            let _ = self
-                .client
-                .request(&Request::NetworkRemove {
-                    network: allmystuff_cec_protocol::HELP_NETWORK_ID.to_string(),
-                    purge: false,
-                })
-                .await;
-        }
+        // Deliberately NO help-room cleanup here: on a side-by-side machine
+        // the shared node may be watching the help queue (the technician's
+        // explicit opt-in, `cec_help_watch`) — hosting bring-up must never
+        // kick it off that room. A membership left by a crash mid-ask is
+        // harmless: no beacons flow, so technicians see nothing.
         tracing::info!("CEC Support: hosting on {network_id} as number {number}");
         Ok(json!({ "number": number }))
     }
@@ -2728,27 +2731,80 @@ impl Mesh {
         }
         let (network_id, _) = crate::cec::help_network_config();
         self.cec_broadcast_presence(&network_id, me, false).await;
-        let _ = self
-            .client
-            .request(&Request::NetworkRemove {
-                network: network_id,
-                purge: false,
-            })
-            .await;
-        self.sync_networks().await;
+        // Leave the room only when this node is purely a customer: on a
+        // side-by-side machine the same node may be *watching* the queue as a
+        // technician (`cec_help_watch`), and withdrawing the ask must not tear
+        // that opt-in down. The `available: false` beacon above has already
+        // cleared us from every technician's queue either way.
+        if !self.cec_help_watching_role() {
+            let _ = self
+                .client
+                .request(&Request::NetworkRemove {
+                    network: network_id,
+                    purge: false,
+                })
+                .await;
+            self.sync_networks().await;
+        }
         // Tell this customer's own UI (the CEC Support app's waiting card) —
         // the automatic clear on approval otherwise leaves it looking armed.
         self.sink.emit("cec://help", json!({ "asking": false }));
         tracing::info!("CEC Support: no longer asking for help");
     }
 
+    /// Whether this node ever acts as a technician — the guard that keeps the
+    /// customer-side ask teardown from kicking a side-by-side technician off
+    /// the help room it deliberately watches.
+    fn cec_help_watching_role(&self) -> bool {
+        self.cec.is_technician()
+    }
+
+    /// Whether this node is sitting on the global help room right now. The
+    /// membership IS the technician's "watch the help queue" state — there is
+    /// no shadow flag to drift from it.
+    fn cec_help_watching(&self) -> bool {
+        self.state
+            .lock()
+            .networks
+            .iter()
+            .any(|n| n == allmystuff_cec_protocol::HELP_NETWORK_ID)
+    }
+
+    /// `cec_help_watch { on }` (technician): join or leave the global help
+    /// room. Watching is an **explicit opt-in** — nothing joins this room on
+    /// its own (listing doesn't, the tab doesn't) — and it sticks across
+    /// restarts because the daemon persists the room. Leaving clears the
+    /// queue cache so the tab empties immediately; it declines to leave while
+    /// this same node has a live customer ask riding the room.
+    pub async fn cec_help_watch(self: &Arc<Self>, on: bool) -> Result<Value, String> {
+        if on {
+            let (network_id, config) = crate::cec::help_network_config();
+            self.cec_join_silent(&network_id, config).await?;
+            tracing::info!("CEC Support: watching the help queue on {network_id}");
+        } else {
+            if !self.cec.asking_help() {
+                let _ = self
+                    .client
+                    .request(&Request::NetworkRemove {
+                        network: allmystuff_cec_protocol::HELP_NETWORK_ID.to_string(),
+                        purge: false,
+                    })
+                    .await;
+                self.sync_networks().await;
+            }
+            self.cec.clear_help();
+            self.sink.emit("cec://help", json!({ "waiting": [] }));
+            tracing::info!("CEC Support: stopped watching the help queue");
+        }
+        Ok(json!({ "watching": on }))
+    }
+
     /// `cec_help_list` (technician): the customers currently waiting on the
-    /// global help room, longest-waiting first. Joins the room on first use —
-    /// the daemon persists CEC rooms, so from then on beacons land (and the
-    /// TTL cache stays warm) whether or not the tab is open.
+    /// global help room, longest-waiting first. Read-only: it returns what the
+    /// cache holds and never joins the room — joining is `cec_help_watch`'s
+    /// job, an explicit opt-in, so merely opening the tab can't silently sign
+    /// a node up for the global queue.
     pub async fn cec_help_list(self: &Arc<Self>) -> Result<Value, String> {
-        let (network_id, config) = crate::cec::help_network_config();
-        self.cec_join_silent(&network_id, config).await?;
         Ok(Value::Array(self.cec.help_list()))
     }
 

@@ -158,15 +158,34 @@
     </form>
   </section>
 
-  <!-- Asking for help — customers waving on the global help room right now,
-       longest-waiting first (it's a queue). The same cards as Client meshes;
-       Control answers one by dialing their own number mesh, so the session
-       still takes the normal approval. Hidden while nobody's asking. -->
-  {#if app.cecHelpWaiting.length > 0}
-    <section class="block">
-      <div class="head">
-        <div class="title">Asking for help</div>
-      </div>
+  <!-- Asking for help — customers waving on the global help room, longest-
+       waiting first (it's a queue). Strictly opt-in: a default install is
+       never on that room; the node only joins it when "Watch the help queue"
+       is turned on here (inside the secret tab), and the daemon persists the
+       membership so the toggle's state survives restarts. Control answers a
+       waver by dialing their own number mesh — the normal approval still
+       gates everything. -->
+  <section class="block">
+    <div class="head">
+      <div class="title">Asking for help</div>
+      <label class="watch-toggle" title="Join the global help room and see customers who press Ask for help. Saved — stays on across restarts.">
+        <input
+          type="checkbox"
+          checked={app.cecHelpWatching}
+          onchange={(e) => void app.setCecHelpWatch(e.currentTarget.checked)}
+        />
+        <span>Watch the help queue</span>
+      </label>
+    </div>
+    {#if !app.cecHelpWatching}
+      <p class="notice">
+        Turn on <b>Watch the help queue</b> to see customers who press
+        <b>Ask for help</b> in their CEC Support app. Until then this machine
+        stays off the shared help room entirely.
+      </p>
+    {:else if app.cecHelpWaiting.length === 0}
+      <p class="notice">No one is asking right now — you're watching.</p>
+    {:else}
       <p class="hint">
         These customers pressed <b>Ask for help</b> and are waiting right now.
         <b>Control</b> answers them — they approve you, then their screen opens.
@@ -197,8 +216,8 @@
           </li>
         {/each}
       </ul>
-    </section>
-  {/if}
+    {/if}
+  </section>
 
   <!-- Client meshes — the customers this technician has dialed. Each is the
        customer's own private Silent mesh, kept here (and out of the Meshes tab)
@@ -548,6 +567,22 @@
      are "something live is waiting on a human"), solid to read as a queue. */
   .row.asking {
     border: 1px solid var(--accent);
+  }
+  /* The watch opt-in, sitting in the block header opposite the title. */
+  .watch-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--ink-soft);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .watch-toggle input {
+    width: 0.95rem;
+    height: 0.95rem;
+    accent-color: var(--accent);
   }
   .dot.busy {
     background: var(--accent);
