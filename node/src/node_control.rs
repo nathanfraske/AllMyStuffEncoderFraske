@@ -814,6 +814,21 @@ pub async fn dispatch(
             }))
         }
 
+        // Temps alone, off the sensor read only — no PowerShell probes, no
+        // full scan — so a UI can keep the spec card's one moving number
+        // moving with a cheap poll while `machine_specs` stays one-shot.
+        "machine_temps" => DispatchOut::Json(json!({
+            "temps": allmystuff_inventory::temps()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "label": t.label,
+                        "celsius": t.celsius,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })),
+
         // ---- live mesh (presence + routing) ------------------------------
         "connect_route" => {
             let from: String = try_arg!(arg(a, "from"));

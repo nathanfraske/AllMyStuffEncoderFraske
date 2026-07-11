@@ -92,7 +92,7 @@ pub fn scan() -> Inventory {
         // ([`listening::probe_services`]) is a separate, opt-in step a
         // caller runs off this hot path, since `scan` must stay cheap.
         listening: platform_listening(),
-        temps: collect_temps(),
+        temps: temps(),
     };
     ensure_category_defaults(&mut inv);
     inv
@@ -105,7 +105,7 @@ pub fn scan() -> Inventory {
 /// than show a blank. Readings that are non-finite, exactly 0 °C, or below
 /// −40 °C are dropped — the classic "zone exists but reads garbage"
 /// signatures, not temperatures a live machine reports.
-fn collect_temps() -> Vec<TempSensor> {
+pub fn temps() -> Vec<TempSensor> {
     let comps = sysinfo::Components::new_with_refreshed_list();
     let mut temps: Vec<TempSensor> = comps
         .iter()
