@@ -285,6 +285,7 @@ mod tests {
             inputs: vec![],
             usb: vec![],
             listening: vec![],
+            temps: vec![],
         }
     }
 

@@ -92,9 +92,36 @@ pub fn scan() -> Inventory {
         // ([`listening::probe_services`]) is a separate, opt-in step a
         // caller runs off this hot path, since `scan` must stay cheap.
         listening: platform_listening(),
+        temps: collect_temps(),
     };
     ensure_category_defaults(&mut inv);
     inv
+}
+
+/// Temperature sensors, strictly as the OS exposes them (sysinfo: hwmon on
+/// Linux, SMC on macOS, ACPI thermal zones on Windows). No vendor drivers, no
+/// elevation tricks — on many consumer Windows boards the ACPI zone is absent
+/// or admin-gated, and this returns empty there; UIs hide the section rather
+/// than show a blank. Readings that are non-finite, exactly 0 °C, or below
+/// −40 °C are dropped — the classic "zone exists but reads garbage"
+/// signatures, not temperatures a live machine reports.
+fn collect_temps() -> Vec<TempSensor> {
+    let comps = sysinfo::Components::new_with_refreshed_list();
+    let mut temps: Vec<TempSensor> = comps
+        .iter()
+        .filter_map(|c| {
+            let celsius = c.temperature()?;
+            if !celsius.is_finite() || celsius == 0.0 || celsius < -40.0 {
+                return None;
+            }
+            Some(TempSensor {
+                label: c.label().trim().to_string(),
+                celsius,
+            })
+        })
+        .collect();
+    temps.sort_by(|a, b| a.label.cmp(&b.label));
+    temps
 }
 
 /// Guarantee every device category that has a notion of "current default"

@@ -60,6 +60,24 @@ pub struct Inventory {
     /// decodes.
     #[serde(default)]
     pub listening: Vec<ListeningService>,
+    /// Temperature sensors the OS exposes, in °C. Strictly what the platform
+    /// reports (hwmon on Linux, SMC on macOS, ACPI thermal zones on Windows) —
+    /// many consumer Windows boards expose nothing without a vendor driver,
+    /// so an empty list is the common case there, and UIs should hide the
+    /// section rather than show a blank. `#[serde(default)]` so an older
+    /// snapshot/peer without the field still decodes.
+    #[serde(default)]
+    pub temps: Vec<TempSensor>,
+}
+
+/// One temperature reading, labelled by its source sensor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempSensor {
+    /// Sensor label as the platform names it, e.g. `"coretemp Package id 0"`
+    /// or `"ACPI\\ThermalZone\\TZ00_0"`.
+    pub label: String,
+    /// Degrees Celsius.
+    pub celsius: f32,
 }
 
 impl Inventory {

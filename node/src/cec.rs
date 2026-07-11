@@ -909,7 +909,9 @@ pub fn parse_scope(s: &str) -> Result<ApprovalScope, String> {
 /// digits of the Support ID of the concatenated technician id and session id,
 /// so both ends compute the same code to read back out-of-band.
 pub fn verification_code(tech: &str, session_id: &str) -> String {
-    let code = support_id_from_device(&format!("{tech}:{session_id}"));
+    // The raw string hash, NOT the device derivation: this input is
+    // `tech:session`, and device-id canonicalisation must never touch it.
+    let code = allmystuff_cec_protocol::support_id_from_string(&format!("{tech}:{session_id}"));
     code.chars().take(6).collect()
 }
 
