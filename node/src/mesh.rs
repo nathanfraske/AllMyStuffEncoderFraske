@@ -2696,11 +2696,16 @@ impl Mesh {
             let epoch = self.cec.help_epoch();
             let (network_id, config) = crate::cec::help_network_config();
             self.cec_join_silent(&network_id, config).await?;
+            // The room is Silent: without this, the beacon below broadcasts
+            // over zero connections and no technician ever hears the ask.
+            self.cec_connect_help_watchers(&network_id).await;
             self.cec_broadcast_presence(&network_id, &me, true).await;
             tracing::info!("CEC Support: asking for help on {network_id}");
             // Keep the ask alive: technicians age a silent beacon out after
             // HELP_TTL_SECS, so re-beacon on a shorter period. The epoch guard
-            // means a cancel + re-ask leaves exactly one loop beaconing.
+            // means a cancel + re-ask leaves exactly one loop beaconing. Each
+            // beat re-wires first, so a technician who started watching (or
+            // reconnected) mid-ask hears us within one period.
             let mesh = self.clone();
             crate::spawn(async move {
                 loop {
@@ -2712,6 +2717,7 @@ impl Mesh {
                         return;
                     }
                     let (network_id, _) = crate::cec::help_network_config();
+                    mesh.cec_connect_help_watchers(&network_id).await;
                     mesh.cec_broadcast_presence(&network_id, &me, true).await;
                 }
             });
@@ -2719,6 +2725,56 @@ impl Mesh {
             self.cec_stop_asking_help(&me).await;
         }
         Ok(json!({ "asking": on }))
+    }
+
+    /// Wire the help room: connect to every peer currently sighted on it. A
+    /// Silent room makes peers *visible* without connections, and a channel
+    /// broadcast only travels over live connections — so an asking customer
+    /// dials whoever is watching before each beacon, or the beacon reaches
+    /// nobody (the "asking, but the technician's queue stays empty" leg,
+    /// caught live: both sides logged each other as sighted-not-dialing while
+    /// every beacon went into the void). Idempotent — an already-connected
+    /// peer is a no-op for the daemon — and everyone on this room is CEC by
+    /// construction (the watchers' opt-in, the askers' button), so connecting
+    /// to all of them is exactly the intent. The wire carries the beacon and
+    /// nothing else: access still lives on the customer's own number room
+    /// behind the consent handshake.
+    async fn cec_connect_help_watchers(&self, network_id: &str) {
+        let me = self.resolve_local_id().await.unwrap_or_default();
+        let me_canon = crate::cec::pubkey_part(&me).to_string();
+        let Ok(resp) = self
+            .client
+            .request(&Request::PeersList {
+                network: network_id.to_string(),
+            })
+            .await
+        else {
+            return;
+        };
+        let peers: Vec<String> = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("peers"))
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("device_id").and_then(|v| v.as_str()))
+                    .map(|id| crate::cec::pubkey_part(id).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for peer in peers {
+            if peer == me_canon {
+                continue;
+            }
+            let _ = self
+                .client
+                .request(&Request::NetworkConnectPeer {
+                    network: network_id.to_string(),
+                    peer,
+                })
+                .await;
+        }
     }
 
     /// Withdraw the help ask: beacon `available: false` (so technician caches
@@ -2730,6 +2786,10 @@ impl Mesh {
             return;
         }
         let (network_id, _) = crate::cec::help_network_config();
+        // Re-wire before the withdrawal too — the goodbye also needs a live
+        // connection to travel over (watchers age us out via the TTL either
+        // way; this just clears their queues immediately).
+        self.cec_connect_help_watchers(&network_id).await;
         self.cec_broadcast_presence(&network_id, me, false).await;
         // Leave the room only when this node is purely a customer: on a
         // side-by-side machine the same node may be *watching* the queue as a
