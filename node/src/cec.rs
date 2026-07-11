@@ -656,12 +656,11 @@ impl Cec {
     pub fn knows_technician(&self, tech: &str) -> bool {
         let inner = self.inner.lock();
         let key = pubkey_part(tech);
-        inner.pending.iter().any(|p| pubkey_part(&p.tech) == key)
-            || inner
-                .consent
-                .active_grants(now_secs())
-                .iter()
-                .any(|g| pubkey_part(&g.technician) == key)
+        // Grant records count live **or lapsed** (`ConsentStore::known`): an
+        // expired technician must stay recognized, so the screen-offer gate
+        // keeps screening them (lapsed ≠ stranger) and a control refusal can
+        // name the lapsed approval instead of blaming the fleet roster.
+        inner.pending.iter().any(|p| pubkey_part(&p.tech) == key) || inner.consent.known(tech)
     }
 
     // ---- session state --------------------------------------------------

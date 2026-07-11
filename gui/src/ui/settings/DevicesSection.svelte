@@ -27,6 +27,21 @@
     if (n.relationship.kind === "unclaimed") return { text: n.claimable ? "claimable" : "unclaimed", cls: "soft" };
     return { text: n.kind === "this" ? "this device" : "yours", cls: "mine" };
   }
+
+  // Two-step arm for Forget (the graph gear's pattern): first click arms the
+  // one row, the second acts; any other row's click or a 3.5s lapse disarms.
+  let forgetArmed = $state<string | null>(null);
+  function forgetRow(id: string) {
+    if (forgetArmed === id) {
+      forgetArmed = null;
+      void app.forgetNode(id);
+    } else {
+      forgetArmed = id;
+      setTimeout(() => {
+        if (forgetArmed === id) forgetArmed = null;
+      }, 3500);
+    }
+  }
 </script>
 
 <div class="devices">
@@ -58,6 +73,18 @@
             <span class="net-chip none">—</span>
           {/if}
         </div>
+        {#if n.kind !== "this" && !app.isMe(n.id)}
+          <!-- Forget this node — the same action the graph's gear offers,
+               reachable from the roster too. Never on this device. -->
+          <button
+            class="btn-forget"
+            class:armed={forgetArmed === n.id}
+            title="Remove this node from the graph and end its session"
+            onclick={() => forgetRow(n.id)}
+          >
+            {forgetArmed === n.id ? "Sure?" : "Forget"}
+          </button>
+        {/if}
       </li>
     {/each}
     {#if devices.length === 0}
@@ -179,5 +206,22 @@
     justify-content: center;
     color: var(--ink-faint);
     font-size: 0.82rem;
+  }
+  .btn-forget {
+    flex-shrink: 0;
+    border: 1px solid var(--danger);
+    background: transparent;
+    color: var(--danger);
+    border-radius: var(--r-sm);
+    padding: 0.3rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn-forget:hover,
+  .btn-forget.armed {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

@@ -27,7 +27,13 @@
     const n = node;
     if (!n) return "finding" as const;
     if (!isAppNode(n)) return "presence" as const;
-    if (n.relationship.kind === "unclaimed") return "relationship" as const;
+    // A dialed CEC customer never becomes "yours" — you don't claim them,
+    // they approve you — so waiting on the relationship stage would park this
+    // window at "resolving whether it's yours…" forever. Their consent grant
+    // is the authorization, enforced by their node on every leg; the window
+    // is ready as soon as the machine and its presence are here.
+    if (n.relationship.kind === "unclaimed" && !app.isCecCustomer(n.id))
+      return "relationship" as const;
     return "ready" as const;
   });
 
