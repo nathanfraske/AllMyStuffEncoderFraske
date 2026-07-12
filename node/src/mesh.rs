@@ -1550,6 +1550,40 @@ impl Mesh {
                             });
                         }
                     }
+                    // The daemon proved THIS DEVICE was evicted from a
+                    // network by its signed governance (it verified the
+                    // log itself — this is not a peer's claim). If that
+                    // network is our FLEET mesh, the fleet is over for
+                    // this device: run the same teardown the owner's
+                    // cooperative Release performs, so an eviction that
+                    // happened while we were offline finally cleans up
+                    // instead of leaving a dead credential camping on a
+                    // mesh that denies it everywhere. Any other network's
+                    // eviction is daemon-side only (it already stood the
+                    // engine down); nothing to tear here.
+                    if event.get("event_kind").and_then(|v| v.as_str()) == Some("diag")
+                        && event.get("category").and_then(|v| v.as_str()) == Some("governance")
+                        && event
+                            .get("detail")
+                            .and_then(|d| d.get("hint"))
+                            .and_then(|v| v.as_str())
+                            == Some("self_evicted")
+                    {
+                        let evicted_net = event
+                            .get("network_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let fleet_net = self.ownership.fleet_network_id();
+                        if evicted_net.is_some() && evicted_net == fleet_net {
+                            tracing::warn!(
+                                "the fleet's signed governance evicted this device — clearing fleet state"
+                            );
+                            let mesh = self.clone();
+                            crate::spawn(async move {
+                                mesh.apply_fleet_release().await;
+                            });
+                        }
+                    }
                     // The daemon's own clock diagnostic (its heartbeat-based
                     // estimator, on daemons new enough to run one): surface
                     // it on the same UI event the presence-based estimate
@@ -4185,24 +4219,7 @@ impl Mesh {
                 let owner = self.ownership.owner();
                 if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
                     tracing::info!("released by {} — unowned again", short_id(from.as_str()));
-                    // Tear out of the fleet's closed network before clearing the
-                    // credential (set_owner(None) drops the key it derives from).
-                    let fleet_net = self.ownership.fleet_network_id();
-                    self.ownership.set_owner(None);
-                    if let Some(network) = fleet_net {
-                        let _ = self
-                            .client
-                            // Released by our owner — we've left this fleet, so
-                            // purge its signed state too: no stale genesis to
-                            // reload if we later join a different fleet.
-                            .request(&Request::NetworkRemove {
-                                network,
-                                purge: true,
-                            })
-                            .await;
-                    }
-                    self.refresh_fleet_authorization().await;
-                    self.ownership_check(None).await;
+                    self.apply_fleet_release().await;
                 }
             }
             OwnershipControl::Claimed { owner } => {
@@ -4304,6 +4321,36 @@ impl Mesh {
                 );
             }
         }
+    }
+
+    /// The device-side fleet teardown — everything "this device just left
+    /// / was let go from its fleet" implies, in one place: tear out of the
+    /// fleet's closed network (purging its signed state so a later rejoin
+    /// can't reload a stale genesis), clear the durable owner/key record,
+    /// and re-broadcast the now-unowned presence. Shared by the
+    /// cooperative path (the owner's `Release` frame) and the verified
+    /// path (the daemon's `self_evicted` governance event — the device
+    /// PROVED its own eviction from the signed log, which is stronger
+    /// authority than any frame a peer could send). Deliberately does NOT
+    /// re-enter claim mode: adoption is per-event consent on this device.
+    async fn apply_fleet_release(self: &Arc<Self>) {
+        // Tear out of the fleet's closed network before clearing the
+        // credential (set_owner(None) drops the key it derives from).
+        let fleet_net = self.ownership.fleet_network_id();
+        self.ownership.set_owner(None);
+        if let Some(network) = fleet_net {
+            let _ = self
+                .client
+                // We've left this fleet — purge its signed state too: no
+                // stale genesis to reload if we later join a different one.
+                .request(&Request::NetworkRemove {
+                    network,
+                    purge: true,
+                })
+                .await;
+        }
+        self.refresh_fleet_authorization().await;
+        self.ownership_check(None).await;
     }
 
     /// Re-stamp the live presence profile's owner/claimable from the store
