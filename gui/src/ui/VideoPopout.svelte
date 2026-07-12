@@ -195,8 +195,32 @@
       frameCount += 1;
     };
 
-    // JPEG bitmap decodes are async — chain them so frames paint in order.
-    let drawChain = Promise.resolve();
+    // MJPEG paint slot, latest-wins — the same supersede the console uses.
+    // Each JPEG is a complete picture, so painting history is pure lag: the
+    // old serial promise chain decoded and painted EVERY frame in arrival
+    // order, which is where "always catching up" lived whenever decode ran
+    // behind the wire in a popped-out stream.
+    let pendingJpeg: Blob | null = null;
+    let jpegPainting = false;
+    const paintNewestJpeg = async () => {
+      if (jpegPainting) return; // the running loop will pick ours up
+      jpegPainting = true;
+      try {
+        while (!cancelled && pendingJpeg) {
+          const blob = pendingJpeg;
+          pendingJpeg = null;
+          try {
+            const bmp = await createImageBitmap(blob);
+            paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            bmp.close();
+          } catch {
+            // A torn frame decodes as nothing; the next one stands alone.
+          }
+        }
+      } finally {
+        jpegPainting = false;
+      }
+    };
 
     void watchVideo(
       route,
@@ -210,17 +234,8 @@
           paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
         } else if (f.kind === "jpeg") {
           transport = "MJPEG";
-          const blob = new Blob([f.data], { type: "image/jpeg" });
-          drawChain = drawChain.then(async () => {
-            if (cancelled) return;
-            try {
-              const bmp = await createImageBitmap(blob);
-              paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
-              bmp.close();
-            } catch {
-              // A torn frame decodes as nothing; the next one stands alone.
-            }
-          });
+          pendingJpeg = new Blob([f.data], { type: "image/jpeg" });
+          void paintNewestJpeg();
         }
         // h264 never arrives here — decode: true means the backend hands
         // this window ready-to-paint frames.

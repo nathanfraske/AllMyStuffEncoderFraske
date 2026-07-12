@@ -1328,6 +1328,9 @@ where
     let started = Instant::now();
     let from_screen = stall_state == VideoStatusState::DisplayAsleep;
     let mut got_any = false;
+    // Whether the current quiet spell already got its convergence re-emit
+    // (below). Re-armed by every real frame.
+    let mut quiesced = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -1358,6 +1361,32 @@ where
                             ));
                         }
                     }
+                    continue;
+                }
+                // The screen went QUIET (change-driven capture delivers
+                // nothing while nothing moves). Every refresh mechanism —
+                // STATIC_REFRESH, the IDR cadence, a viewer's refresh ask —
+                // lives inside `encode`, which no longer runs; so if the
+                // transport dropped the tail of the last motion burst, the
+                // viewer stays frozen BEHIND the true screen until the next
+                // motion. Serve convergence from the encoder's retained
+                // last picture: one clean re-emit per quiet spell (this
+                // first ~250 ms timeout is the quiesce debounce), plus one
+                // per refresh ask that lands while quiet.
+                if !quiesced || encoder.wants_refresh() {
+                    quiesced = true;
+                    match encoder.re_emit(stats) {
+                        Ok(Some(out)) => {
+                            if on_packet(out) {
+                                stats.sent += 1;
+                            } else {
+                                stats.dropped += 1;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => return Err(e),
+                    }
+                    stats.maybe_log();
                 }
                 continue;
             }
@@ -1366,6 +1395,7 @@ where
             }
         };
         got_any = true;
+        quiesced = false;
         reporter.report(VideoStatusState::Ok, None);
         let started = Instant::now();
         while let Ok(newer) = frames.try_recv() {
@@ -1686,6 +1716,27 @@ impl FrameEncoder {
         self.seq += 1;
         Ok(Some(frame))
     }
+
+    /// Re-encode the retained last picture. The pump's rescue for a screen
+    /// that has gone QUIET: change-driven capture delivers nothing, so
+    /// `encode` — and with it [`STATIC_REFRESH`] and any viewer refresh
+    /// ask — never runs. Consumes a pending ask; emits at most one frame.
+    fn re_emit(&mut self, stats: &mut StreamStats) -> Result<Option<VideoFrame>, String> {
+        if self.prev.is_empty() || self.prev_size == (0, 0) {
+            return Ok(None);
+        }
+        self.refresh.store(false, Ordering::SeqCst);
+        let (dw, dh) = self.prev_size;
+        let t1 = Instant::now();
+        let jpeg = encode_jpeg(&self.prev, dw, dh, self.quality)?;
+        stats.encode += t1.elapsed();
+        stats.bytes += jpeg.len() as u64;
+        stats.keyframes += 1;
+        self.last_sent = Some(Instant::now());
+        let frame = VideoFrame::new(&self.route_id, self.seq, dw, dh, dw, dh, jpeg);
+        self.seq += 1;
+        Ok(Some(frame))
+    }
 }
 
 /// One route's encoder for the negotiated transport — with the rule that
@@ -1780,6 +1831,25 @@ impl StreamEncoder {
                 Ok(enc.encode(rgba, sw, sh, stats)?.map(VideoPacket::Jpeg))
             }
             StreamEncoder::H264(enc) => enc.encode(rgba, sw, sh, stats),
+        }
+    }
+
+    /// Whether a viewer's one-shot refresh ask is pending — peeked, not
+    /// consumed (`encode`/`re_emit` consume it). Lets the pump serve an ask
+    /// that lands while the screen is quiet and no frames reach `encode`.
+    fn wants_refresh(&self) -> bool {
+        match self {
+            StreamEncoder::Mjpeg(enc) => enc.refresh.load(Ordering::SeqCst),
+            StreamEncoder::H264(enc) => enc.refresh.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Re-emit the retained last picture (a forced IDR on H.264) — the
+    /// pump's rescue for a quiet screen; see the arms for the full story.
+    fn re_emit(&mut self, stats: &mut StreamStats) -> Result<Option<VideoPacket>, String> {
+        match self {
+            StreamEncoder::Mjpeg(enc) => Ok(enc.re_emit(stats)?.map(VideoPacket::Jpeg)),
+            StreamEncoder::H264(enc) => enc.re_emit(stats),
         }
     }
 }
@@ -1943,6 +2013,48 @@ impl H264Stream {
         // timestamp tracks wall-clock (a static-skip gap carries its full
         // elapsed time forward). Clamped to [1/2fps, 5 s] so a paused/just-
         // started route can't emit an absurd duration. First unit uses nominal.
+        let now = Instant::now();
+        let nominal = 1_000_000u64 / u64::from(self.fps.max(1));
+        let duration_us = match self.last_emit {
+            Some(prev) => {
+                (now.duration_since(prev).as_micros() as u64).clamp(nominal / 2, 5_000_000)
+            }
+            None => nominal,
+        };
+        self.last_emit = Some(now);
+        Ok(Some(VideoPacket::H264 { data, duration_us }))
+    }
+
+    /// Re-encode the retained last picture as a forced, clean IDR. The
+    /// pump's rescue for a screen that has gone QUIET: change-driven
+    /// capture delivers nothing while nothing moves, so `encode` — and
+    /// with it [`STATIC_REFRESH`], the IDR cadence and any viewer refresh
+    /// ask — never runs, and whatever the transport dropped at the tail of
+    /// the last burst stays wrong on the viewer until the next motion.
+    /// Consumes a pending ask; emits at most one unit.
+    fn re_emit(&mut self, stats: &mut StreamStats) -> Result<Option<VideoPacket>, String> {
+        if self.prev.is_empty() || self.prev_size == (0, 0) {
+            return Ok(None);
+        }
+        self.refresh.store(false, Ordering::SeqCst);
+        let (dw, dh) = self.prev_size;
+        let t1 = Instant::now();
+        let out = self
+            .codec
+            .encode_i420(&self.prev, dw as usize, dh as usize, true)?;
+        stats.encode += t1.elapsed();
+        self.last_sent = Some(Instant::now());
+        let Some((data, key)) = out else {
+            return Ok(None);
+        };
+        if key {
+            self.last_idr = Some(Instant::now());
+            stats.keyframes += 1;
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        stats.bytes += data.len() as u64;
         let now = Instant::now();
         let nominal = 1_000_000u64 / u64::from(self.fps.max(1));
         let duration_us = match self.last_emit {

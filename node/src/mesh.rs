@@ -2416,7 +2416,12 @@ impl Mesh {
     /// the sender's next IDR, and `video_unwatch`/route teardown remove
     /// the entry entirely.
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) {
-        const MAX_QUEUED: usize = 120;
+        // One second of 60 fps H.264. An unread backlog is pure latency by
+        // the time the window drains it (the old 120 held 2–4 s of "catch
+        // up"), and the overflow below re-enters at a queued keyframe
+        // instead of dumping the lot, so a slow-but-alive window loses
+        // moments, not the stream.
+        const MAX_QUEUED: usize = 60;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -2438,8 +2443,35 @@ impl Mesh {
             // enqueue_decoded's freshest-wins.
             w.queue.clear();
         } else if w.queue.len() >= MAX_QUEUED {
-            tracing::debug!("video queue for {route_id} unread for seconds — cleared");
-            w.queue.clear();
+            // H.264 backlog: skip forward to the NEWEST queued key unit —
+            // decode re-enters there cleanly, and the viewer jumps to
+            // near-live instead of replaying the whole backlog. The ipc
+            // header carries the key flag (kind 2 at byte 0, key at byte
+            // 1). No queued key (one delta chain longer than the cap, or
+            // a keyless backlog): the old wholesale clear, recovering on
+            // the sender's next IDR.
+            match w
+                .queue
+                .iter()
+                .rposition(|p| p.first() == Some(&2) && p.get(1) == Some(&1))
+            {
+                Some(i) if i > 0 => {
+                    tracing::debug!(
+                        "video queue for {route_id} unread — skipped {i} stale packets to its newest keyframe"
+                    );
+                    w.queue.drain(..i);
+                }
+                Some(_) => {
+                    // The only key is already at the front and the queue is
+                    // still at cap — the chain itself outgrew the bound.
+                    tracing::debug!("video queue for {route_id} unread for a second — cleared");
+                    w.queue.clear();
+                }
+                None => {
+                    tracing::debug!("video queue for {route_id} unread and keyless — cleared");
+                    w.queue.clear();
+                }
+            }
         }
         w.queue.push_back(packet);
         // Poke the watcher when the queue goes non-empty: the console
@@ -7112,6 +7144,15 @@ impl Mesh {
                 }
             });
         }
+        // When the outbound queue fills, packets get dropped — and on H.264
+        // every drop leaves the viewer's decoder referencing frames it never
+        // received (smear, or a freeze that outlives the burst). One forced
+        // IDR per gap heals it: set on the first send that SUCCEEDS after a
+        // drop, so the clean unit is asked for exactly when the queue has
+        // room again instead of being eaten by the same full queue.
+        let idr_mesh = Arc::downgrade(self);
+        let idr_route = route.id.clone();
+        let was_dropping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.video.start_capture(
             route.id.clone(),
             mode,
@@ -7123,8 +7164,19 @@ impl Mesh {
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
-                tx.try_send((peer.clone(), route_id.clone(), packet))
-                    .is_ok()
+                let ok = tx
+                    .try_send((peer.clone(), route_id.clone(), packet))
+                    .is_ok();
+                if ok {
+                    if was_dropping.swap(false, Ordering::SeqCst) {
+                        if let Some(mesh) = idr_mesh.upgrade() {
+                            mesh.video.force_idr(&idr_route);
+                        }
+                    }
+                } else {
+                    was_dropping.store(true, Ordering::SeqCst);
+                }
+                ok
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
