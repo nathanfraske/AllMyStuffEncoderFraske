@@ -2008,7 +2008,12 @@ impl Mesh {
                                 );
                             }
                             self.note_video_in(&full.route, "MJPEG", full.jpeg.len());
-                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full));
+                            // latest_wins: every JPEG is a complete picture, so
+                            // an unread backlog is pure latency — supersede it.
+                            // Without this the viewer replays history frame by
+                            // frame ("always catching up") whenever decode or
+                            // the wire runs behind the capture rate.
+                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full), true);
                         }
                     }
                     MediaPayload::VideoStatus(status) => {
@@ -2397,7 +2402,10 @@ impl Mesh {
                 },
             );
         } else {
-            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
+            // NOT latest_wins: H.264 deltas must all reach the decoder in
+            // order — freshest-wins happens after decode (enqueue_decoded) or
+            // at the GUI's paint slot instead.
+            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data), false);
         }
     }
 
@@ -2407,7 +2415,7 @@ impl Mesh {
     /// of stream and is then cleared wholesale — the decoder re-keys on
     /// the sender's next IDR, and `video_unwatch`/route teardown remove
     /// the entry entirely.
-    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>) {
+    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) {
         const MAX_QUEUED: usize = 120;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
@@ -2423,7 +2431,13 @@ impl Mesh {
             }
             return;
         };
-        if w.queue.len() >= MAX_QUEUED {
+        if latest_wins {
+            // Self-contained frames (MJPEG): anything the window hasn't
+            // pulled yet is stale the moment a newer picture exists —
+            // painting history buys nothing but lag. Mirrors
+            // enqueue_decoded's freshest-wins.
+            w.queue.clear();
+        } else if w.queue.len() >= MAX_QUEUED {
             tracing::debug!("video queue for {route_id} unread for seconds — cleared");
             w.queue.clear();
         }
@@ -2483,10 +2497,17 @@ impl Mesh {
         // it, the native decoder where it doesn't) — but inbound samples
         // arrive via the daemon, and an old one would negotiate a stream
         // it can't deliver.
-        let video = if self.daemon_video.load(Ordering::SeqCst) {
+        let video = if video.is_empty() {
             video
         } else {
-            Vec::new()
+            // This list is a one-shot decision for the whole session —
+            // wait out the bring-up race before stripping anything.
+            self.await_video_bringup().await;
+            if self.daemon_video.load(Ordering::SeqCst) {
+                video
+            } else {
+                Vec::new()
+            }
         };
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let media = parse_media(&media);
@@ -3924,7 +3945,15 @@ impl Mesh {
                     // Replies ride best-effort; the failure is already logged.
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
-                Effect::StartMedia(route) => self.start_media(&route),
+                Effect::StartMedia(route) => {
+                    // The sender's transport pick inside start_media is
+                    // one-shot too — same bring-up race guard, only for
+                    // routes that carry a picture.
+                    if matches!(route.media, MediaKind::Display | MediaKind::Video) {
+                        self.await_video_bringup().await;
+                    }
+                    self.start_media(&route)
+                }
                 Effect::RefreshMedia(id) => self.video.force_idr(&id),
                 Effect::TuneMedia {
                     route_id,
@@ -6980,6 +7009,20 @@ impl Mesh {
     /// offer asked for it and the route's sorted position falls inside
     /// the effective lane pool; MJPEG over the media channel otherwise,
     /// exactly as v1.
+    /// Bounded wait for the daemon's video bring-up before a one-shot
+    /// transport decision. Dials are fast now (the area dial has no
+    /// discovery pause), and racing the VideoSubscribe probe stripped
+    /// h264 and pinned capable pairs on MJPEG for the whole session. A
+    /// daemon that truly predates the track lane never flips the flag —
+    /// the timeout falls through to the honest MJPEG pick.
+    async fn await_video_bringup(&self) {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let by = std::time::Instant::now() + DEADLINE;
+        while !self.daemon_video.load(Ordering::SeqCst) && std::time::Instant::now() < by {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     fn pick_outbound_video_mode(&self, route: &Route, to_node: &str) -> VideoMode {
         let accepts_h264 = self
             .state
