@@ -81,6 +81,21 @@ impl ControlClient {
     /// reads one back, closes. No pooling (a local round trip is cheap and
     /// pooling muddies daemon-restart semantics).
     pub async fn request(&self, req: &Request) -> Result<Response> {
+        self.request_with_timeout(req, Duration::from_secs(5)).await
+    }
+
+    /// [`Self::request`] with a caller-sized read deadline — for the ops
+    /// whose reply legitimately takes longer than the 5 s default: a
+    /// `NetworkConnectPeer { wait_ms, .. }` holding for ACTIVE, or a
+    /// `ChannelSendReliable` holding for the peer's delivery ack. Size
+    /// it past the op's own deadline (`wait_ms` / `ttl_ms`), never
+    /// equal to it, so the daemon's honest timeout answer wins over the
+    /// socket's.
+    pub async fn request_with_timeout(
+        &self,
+        req: &Request,
+        read_timeout: Duration,
+    ) -> Result<Response> {
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -93,7 +108,7 @@ impl ControlClient {
         writer.flush().await.context("flush request")?;
 
         let mut buf = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+        let n = tokio::time::timeout(read_timeout, reader.read_line(&mut buf))
             .await
             .context("daemon response timed out")??;
         if n == 0 {

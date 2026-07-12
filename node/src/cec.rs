@@ -981,7 +981,7 @@ pub fn silent_network_config(number: &str) -> (String, Value) {
 /// mesh and the consent handshake.
 pub fn help_network_config() -> (String, Value) {
     let network_id = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
-    let config = json!({
+    let mut config = json!({
         "id": network_id,
         "network_id": network_id,
         "label": "CEC Support — asking for help",
@@ -989,7 +989,46 @@ pub fn help_network_config() -> (String, Value) {
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
     });
+    // The help room is Open (zero-config membership: the asker's button,
+    // the watcher's toggle) but it must not be a full mesh — with a hub
+    // tier configured, every member connects to a couple of CEC-operated
+    // hubs and beacons flood hub-wards to every watcher, so customers
+    // never connect to each other and nobody pays N². Hub ids come from
+    // `CEC_HELP_HUBS` (comma-separated device pubkeys, optional
+    // `:redundancy` suffix); unset keeps today's full mesh so nothing
+    // changes until CEC stands its hubs up.
+    if let Some(topology) = help_hub_topology(std::env::var("CEC_HELP_HUBS").ok().as_deref()) {
+        config["topology"] = topology;
+    }
     (network_id, config)
+}
+
+/// Parse `CEC_HELP_HUBS` ("hub1,hub2[:redundancy]") into the daemon's
+/// `hubs` topology JSON. `None` for unset/empty — the caller then leaves
+/// the daemon's default (full mesh). Pure for testing.
+pub fn help_hub_topology(spec: Option<&str>) -> Option<Value> {
+    let spec = spec?.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (ids, redundancy) = match spec.rsplit_once(':') {
+        Some((ids, r)) => (ids, r.trim().parse::<u32>().ok()),
+        None => (spec, None),
+    };
+    let hubs: Vec<String> = ids
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    if hubs.is_empty() {
+        return None;
+    }
+    let mut topology = json!({ "kind": "hubs", "hubs": hubs });
+    if let Some(r) = redundancy {
+        topology["spoke_redundancy"] = json!(r);
+    }
+    Some(topology)
 }
 
 /// Canonicalise a device id to its bare pubkey — the same `-XXXXX` display
@@ -1010,6 +1049,25 @@ pub fn pubkey_part(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_hub_topology_parses_specs_and_ignores_empties() {
+        assert_eq!(help_hub_topology(None), None);
+        assert_eq!(help_hub_topology(Some("")), None);
+        assert_eq!(help_hub_topology(Some("  ,, ")), None);
+
+        let t = help_hub_topology(Some("hubA,hubB")).unwrap();
+        assert_eq!(t["kind"], "hubs");
+        assert_eq!(t["hubs"], serde_json::json!(["hubA", "hubB"]));
+        assert!(
+            t.get("spoke_redundancy").is_none(),
+            "daemon default applies"
+        );
+
+        let t = help_hub_topology(Some("hubA, hubB ,hubC:1")).unwrap();
+        assert_eq!(t["hubs"], serde_json::json!(["hubA", "hubB", "hubC"]));
+        assert_eq!(t["spoke_redundancy"], 1);
+    }
 
     const ME: &str = "customerpubkeybase32aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TECH: &str = "techpubkeybase32bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
