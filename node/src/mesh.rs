@@ -2182,9 +2182,41 @@ impl Mesh {
     }
 
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
-    /// Opus decoder when it ends.
-    fn release_audio_lanes(&self, route_id: &str) {
+    /// Opus decoder when it ends — and close the daemon audio lane the
+    /// end freed. Audio lanes are positional, not pinned like video
+    /// ([`Self::audio_lane`]: a route streams on its rank among the
+    /// peer's live Opus routes), so the lane that goes idle is the old
+    /// **top** one — every survivor above the ended route shifts down —
+    /// which is why the index closed here is the survivor count, not the
+    /// ended route's own rank. A survivor mid-shift or a new route racing
+    /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
+    /// window and a write inside it revives the track with no SDP work.
+    fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
         self.audio_decoders.lock().remove(route_id);
+        let Some(peer) = self.route_peer(route_id) else {
+            return;
+        };
+        let cap = self.effective_audio_lanes(&peer);
+        if cap == 0 {
+            return;
+        }
+        // Excluding the ended route by id (rather than trusting it to be
+        // gone) keeps the count right at every call site: teardown leaves
+        // the route in the session map (only flipped to TornDown), and
+        // the StopMedia effect can run either side of that flip.
+        let survivors = self
+            .sorted_media_routes(&peer, true, "opus")
+            .iter()
+            .filter(|id| id.as_str() != route_id)
+            .count();
+        // Lanes [0, survivors) are still owned; lane `survivors` is the
+        // one this end vacated — when it had one at all. An overflow
+        // route beyond the pool frees nothing (survivors >= cap), and
+        // closing a lane that never opened is the daemon's idempotent
+        // no-op, so a non-Opus route ending here costs nothing.
+        if survivors < cap as usize {
+            self.close_daemon_media_lane(&peer, "audio", survivors as u8);
+        }
     }
 
     /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
@@ -6429,7 +6461,12 @@ impl Mesh {
                                     "opus encoder for {} failed ({e}) — falling back to PCM frames",
                                     route.id
                                 );
-                                self.release_audio_lanes(&route.id);
+                                // Decoder drop only — NOT release_audio_lanes:
+                                // the route is still live (it keeps its rank in
+                                // the peer's Opus order), so the positional
+                                // close there would hit the top-ranked
+                                // neighbour's lane, not this route's.
+                                self.audio_decoders.lock().remove(&route.id);
                                 None
                             }
                         }
