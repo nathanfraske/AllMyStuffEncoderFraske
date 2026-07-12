@@ -51,6 +51,24 @@
 
   type Placed = { node: MeshNode; x: number; y: number };
 
+  // ---- what the graph draws ---------------------------------------------
+  //
+  // The graph is the WORKING SET, not the archive: every machine that's
+  // reachable right now, plus your own devices even when they're off (a
+  // fleet box being down is exactly what you want to notice here). Anything
+  // else that's merely rostered-but-disconnected — someone's laptop that
+  // joined a mesh once, a shared device that's asleep — stays off the
+  // canvas until it comes back; it's still in Settings → Devices and in
+  // each mesh's own roster pane, which are the places to go looking for
+  // offline members. Ownership reads the same roster-authoritative
+  // `standing()` as everything else, so an evicted device doesn't cling to
+  // the graph on a stale advert.
+  const graphNodes = $derived.by((): MeshNode[] =>
+    app.catalog.nodes.filter(
+      (n) => n.kind === "this" || n.online || app.standingOf(n).ownedByMe,
+    ),
+  );
+
   // ---- fleet grouping -------------------------------------------------
   //
   // Every node belongs to exactly one fleet: yours (this device, your
@@ -70,10 +88,11 @@
         : "Your devices";
 
   function fleetKeyOf(n: MeshNode): { key: string; label: string } {
-    // A CEC customer a technician dialed is just an ordinary mesh peer here: the
-    // CEC mesh is Silent (no roster), so there is no "CEC Support" fleet to seat
-    // it under. It groups by its own standing like any other peer, and the CEC
-    // tab lists dialed customers from CEC state instead.
+    // A CEC customer a technician dialed is just an ordinary mesh peer here:
+    // the shared support area feeds the catalog only links this daemon
+    // actually holds (never its customer roster), so a dialed customer shows
+    // while the session lives and drops off with it. It groups by its own
+    // standing like any other peer; the CEC tab is where customers live.
     // Group by the authoritative `standing()` — the same roster-driven verdict
     // the drawer and every claim/fleet button read — NOT the node's stored
     // `relationship.kind` or its self-advertised `owner`. Those are stale: an
@@ -93,8 +112,10 @@
       const ownsOthers = app.catalog.nodes.some(
         (m) => m.id !== n.id && app.standingOf(m).ownedByMe,
       );
+      // "Alone" means alone ON THE GRAPH — hidden offline strangers don't
+      // stop a fleet-less local device from anchoring its own group.
       const aloneHere =
-        app.catalog.nodes.filter((m) => m.id !== n.id && isAppNode(m)).length === 0;
+        graphNodes.filter((m) => m.id !== n.id && isAppNode(m)).length === 0;
       return st.inFleet || ownsOthers || aloneHere
         ? { key: "mine", label: mineLabel() }
         : { key: "unknown", label: "Unknown fleet" };
@@ -122,7 +143,7 @@
     groupRank: (g: FleetGroup) => number,
   ): FleetGroup[] {
     const groups = new Map<string, FleetGroup>();
-    for (const n of app.catalog.nodes) {
+    for (const n of graphNodes) {
       const { key, label } = keyOf(n);
       const g = groups.get(key) ?? { key, label, nodes: [] };
       g.nodes.push(n);
@@ -305,8 +326,8 @@
     // before a scan re-homes the node off its first-scan placeholder, and we
     // must never leave the centre empty with "me" stranded out on the ring.
     const me =
-      app.catalog.nodes.find((n) => n.kind === "this") ??
-      app.catalog.nodes.find((n) => n.id === app.localId);
+      graphNodes.find((n) => n.kind === "this") ??
+      graphNodes.find((n) => n.id === app.localId);
     const others = fleetGroups.flatMap((g) => g.nodes).filter((n) => n.id !== me?.id);
     const placed: Placed[] = [];
     if (me) placed.push({ node: me, x: cx, y: cy });
@@ -445,7 +466,7 @@
   type Tether = { id: string; x1: number; y1: number; x2: number; y2: number };
   const kvmTethers = $derived.by((): Tether[] => {
     const out: Tether[] = [];
-    for (const n of app.catalog.nodes) {
+    for (const n of graphNodes) {
       if (!app.isKvm(n)) continue;
       const target = app.kvmTargetNode(n);
       if (!target) continue;
