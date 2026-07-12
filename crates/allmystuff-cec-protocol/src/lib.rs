@@ -10,32 +10,34 @@
 //! peer-to-peer substrate, but with two deliberate twists that make it behave
 //! like AnyDesk rather than an ordinary always-on mesh:
 //!
-//! 1. **A per-customer "Silent" mesh, named after the number.** Running the
-//!    CEC Support app gives the customer a short [`SupportId`](ids::SupportId)
-//!    number and joins a MyOwnMesh network of type `Silent` whose `network_id`
-//!    is *derived from that number* ([`network_id_for_number`]). A `Silent`
-//!    mesh auto-dials nobody and never gossips a roster — the machine is merely
-//!    *discoverable*, and only inside its own number-derived room. A technician
-//!    can't even signal a customer without being told the number, so the number
-//!    is the out-of-band discovery credential; the room is, in effect, secret
-//!    to that customer.
-//! 2. **Deliberate dial, then approve.** The technician is told the number,
-//!    derives the same `network_id`, joins that Silent mesh, finds the one
-//!    customer there, and *explicitly* dials them. The customer then approves
-//!    with one of three choices — [`ApprovalScope`] `Once` / `ThreeHours` /
-//!    `Forever` — and can revoke at any time. Approval state lives in
-//!    `allmystuff-cec-consent`; this crate defines only the *messages* and the
-//!    *scope*.
+//! 1. **One shared support area, hub-shaped.** Every CEC node — the customer
+//!    running the CEC Support app, and every technician's AllMyStuff install —
+//!    lives on the one well-known mesh, [`HELP_NETWORK_ID`]
+//!    (`cecsupport-clients`). Under its hub topology (`CEC_HELP_HUBS`),
+//!    customers hold connections only to CEC-operated infra hubs — never to
+//!    each other — and see nobody. Raising a hand is a
+//!    [`SupportPresence`] beacon on the area; the customer's short
+//!    [`SupportId`](ids::SupportId) number is a display/verification label
+//!    derived from the device key (readable over the phone as the fallback
+//!    when the queue is crowded), never a room name. A mesh is just a
+//!    signaling namespace — one area carries discovery, hand-raising, and
+//!    the session itself.
+//! 2. **Deliberate dial, then approve.** The technician answers a raised
+//!    hand (or resolves a phoned-in number to its device) and *explicitly*
+//!    dials that device on the area. The customer then approves with one of
+//!    three choices — [`ApprovalScope`] `Once` / `ThreeHours` / `Forever` —
+//!    and can revoke at any time. Approval state lives in
+//!    `allmystuff-cec-consent`; this crate defines only the *messages* and
+//!    the *scope*.
 //!
 //! ## Isolation from other MyOwnMesh ecosystems
 //!
 //! CEC Support forks MyOwnMesh's signing tags and home dir so its signatures
 //! never cross-verify against an AllMyStuff / MyOwnMesh / MyOwnLLM mesh and its
 //! identity + state never collide with an existing install. It deliberately does
-//! *not* fork the signaling app-id: each support session is already isolated by
-//! its per-number `network_id` (`cec-<number>`), which seeds a distinct room
-//! handle, so technician and customer meet on the default app-id with no env
-//! override.
+//! *not* fork the signaling app-id: the support area's well-known `network_id`
+//! seeds a distinct room handle, so technician and customer meet on the
+//! default app-id with no env override.
 //!
 //! - [`CEC_SIGN_DOMAIN_TAG`] / [`CEC_SIGN_DOMAIN_TAG_STATE`] — domain-separated
 //!   signing tags.
@@ -47,18 +49,18 @@ pub mod media;
 pub mod wire;
 
 pub use ids::{
-    device_pubkey, format_support_id, network_id_for_device, network_id_for_number,
-    support_id_from_device, support_id_from_string, SupportId, SUPPORT_ID_LEN,
+    device_pubkey, format_support_id, support_id_from_device, support_id_from_string, SupportId,
+    SUPPORT_ID_LEN,
 };
 pub use media::{
     decode_media_frame, encode_media_frame, MediaFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
 };
 pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, SupportPresence};
 
-/// Prefix for a customer's per-number `network_id`. The full id is
-/// [`network_id_for_number`]; e.g. number `123456789` → `"cec-123456789"`. Every
-/// CEC mesh id starts with this so they're easy to recognise and never collide
-/// with a customer's own AllMyStuff fleet networks.
+/// Prefix the retired per-number rooms carried (`cec-<9 digits>`). Kept
+/// solely so upgrading nodes can recognise and purge the legacy rooms older
+/// builds persisted — nothing derives new ids from it. (The NanoKVM claim
+/// meshes also start with `cec-` but never match the digits-only tail.)
 pub const CEC_NETWORK_PREFIX: &str = "cec-";
 
 /// The one well-known **global help mesh** every CEC client shares. A customer
