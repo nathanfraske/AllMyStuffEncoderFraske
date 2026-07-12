@@ -415,6 +415,13 @@ const SITE_REMAP_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// pipe onto a route we no longer hold gets one Reject, not one per frame.
 const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a CEC connect-request may wait for acknowledged delivery to
+/// the customer's node. Covers the WebRTC bring-up plus a mid-dial
+/// network wobble with room to spare; past it, the customer is genuinely
+/// unreachable and the session honestly ends. (Delivery ≠ decision — the
+/// customer can take as long as they like to click once the prompt is up.)
+const CEC_CONNECT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
 struct State {
     session: Option<Session>,
     /// Primary network — the fallback for route control/media when we don't
@@ -2116,18 +2123,62 @@ impl Mesh {
     /// its receive-side counters, any pending re-key ask, its native decoder,
     /// the host-side pinned track lane (freeing it for the next stream), and
     /// the viewer-side lane→route binding.
-    fn release_video_lanes(&self, route_id: &str) {
+    fn release_video_lanes(self: &Arc<Self>, route_id: &str) {
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
-        // Host side: free the pinned lane so a later stream can reuse it.
-        self.video_lane_pins.lock().remove(route_id);
+        // Host side: free the pinned lane so a later stream can reuse it —
+        // and tell the daemon (≥ 0.2.34) to close it, so the RTP track and
+        // its m-line stop existing the moment the route ends instead of
+        // idling on the connection forever. Best-effort + idempotent: an
+        // older daemon just errors the unknown op and the local free is
+        // still correct.
+        let pinned = self.video_lane_pins.lock().remove(route_id);
+        if let Some(lane) = pinned {
+            if let Some(peer) = self.route_peer(route_id) {
+                self.close_daemon_media_lane(&peer, "video", lane);
+            }
+        }
         // Viewer side: drop any lane binding that pointed at this route.
         let mut binds = self.video_lane_binds.lock();
         for per_peer in binds.values_mut() {
             per_peer.retain(|_, r| r != route_id);
         }
         binds.retain(|_, per_peer| !per_peer.is_empty());
+    }
+
+    /// Ask the daemon to close a media lane toward `peer` — the
+    /// lifecycle-side of the pinned-lane free above. Spawned + logged:
+    /// teardown must never block on the daemon, and a failure only means
+    /// the lane idles until the connection ends (the pre-0.2.34 world).
+    fn close_daemon_media_lane(self: &Arc<Self>, peer: &str, kind: &'static str, lane: u8) {
+        let Some(network) = self.network_for_peer(peer) else {
+            return;
+        };
+        let client = self.client.clone();
+        let peer = pubkey_part(peer).to_string();
+        crate::spawn(async move {
+            match client
+                .request(&Request::MediaLaneClose {
+                    network,
+                    peer: peer.clone(),
+                    kind: kind.to_string(),
+                    lane,
+                })
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    tracing::debug!("closed {kind} lane {lane} toward {}", short_id(&peer));
+                }
+                Ok(resp) => {
+                    tracing::debug!(
+                        "daemon declined {kind} lane close (older daemon?): {:?}",
+                        resp.error
+                    );
+                }
+                Err(e) => tracing::debug!("{kind} lane close failed: {e}"),
+            }
+        });
     }
 
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
@@ -2869,6 +2920,13 @@ impl Mesh {
             .request(&Request::NetworkConnectPeer {
                 network: network_id.clone(),
                 peer: canonical.clone(),
+                // A support session is a standing dial: the daemon redials
+                // this customer on every announce (the Silent room's one
+                // exception) and never ages the intent out — the far end
+                // sleeping, roaming, or rebooting no longer kills the
+                // relationship. Persisted daemon-side with the network.
+                pin: true,
+                wait_ms: 0,
             })
             .await
             .map_err(|e| e.to_string())
@@ -2896,14 +2954,16 @@ impl Mesh {
             short_id(&customer)
         );
 
-        // The connect handshake — the customer's node raises the 3-choice prompt
-        // from this. `connect_peer` above only *initiates* the WebRTC connection;
-        // the `cec.control` message needs an established data channel to the
-        // customer, which lands a beat later — a single send fired here races the
-        // handshake and is dropped, so the customer never sees the prompt. Re-send
-        // the request on a short loop until the customer answers (they dedupe it
-        // by technician, so re-sends are harmless) or a deadline. This is what
-        // makes the approval prompt reliably appear.
+        // The connect handshake — the customer's node raises the 3-choice
+        // prompt from this. `connect_peer` above only *initiates* the WebRTC
+        // connection; the daemon's acknowledged-delivery contract does the
+        // rest: the Request is queued until the customer's link is up,
+        // retransmitted across session rebuilds, and the reply resolves only
+        // when the customer's node has actually taken the frame — the 2s
+        // retransmit loop this used to need is the daemon's job now. The
+        // send rides a spawned task so the dial returns immediately; a
+        // delivery failure (TTL, terminal drop) marks the session ended so
+        // the GUI's waiting badge tells the truth instead of hanging.
         let session_id = format!("cec-{}-{}", short_id(&customer), fresh_boot_id());
         let want_control = true;
         self.cec.set_session(&session_id, "requested");
@@ -2921,30 +2981,27 @@ impl Mesh {
             let sid = session_id.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-                loop {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        // "Stop trying" reaches the approval wait too: quit
-                        // re-asking and mark the session ended so the GUI's
-                        // waiting badge clears.
+                match mesh
+                    .cec_send_control_acked(&net, &peer, &request, CEC_CONNECT_TTL)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "CEC Support: connect request delivered to {}",
+                            short_id(&peer)
+                        );
+                    }
+                    Err(e) => {
+                        // "Stop trying" beat us here, or delivery genuinely
+                        // lapsed — either way the waiting badge clears.
+                        if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            tracing::warn!("cec connect request undelivered: {e}");
+                        }
                         mesh.cec.set_session(&sid, "ended");
                         mesh.sink.emit(
                             "cec://session",
                             json!({ "session_id": sid, "state": "ended" }),
                         );
-                        break;
-                    }
-                    if let Err(e) = mesh.cec_send_control(&net, &peer, &request).await {
-                        tracing::warn!("cec connect-request send failed (will retry): {e}");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let answered = mesh
-                        .cec
-                        .session_state(&sid)
-                        .map(|s| s != "requested")
-                        .unwrap_or(false);
-                    if answered || std::time::Instant::now() > deadline {
-                        break;
                     }
                 }
             });
@@ -3008,18 +3065,16 @@ impl Mesh {
         self.cec.set_session(&session_id, "active");
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
-            let _ = self
-                .cec_send_control(
-                    &network_id,
-                    &canonical,
-                    &allmystuff_cec_protocol::ControlMessage::Connect(
-                        allmystuff_cec_protocol::ConnectControl::Approve {
-                            session_id: session_id.clone(),
-                            scope,
-                        },
-                    ),
-                )
-                .await;
+            self.cec_send_decision(
+                network_id,
+                canonical.clone(),
+                allmystuff_cec_protocol::ControlMessage::Connect(
+                    allmystuff_cec_protocol::ConnectControl::Approve {
+                        session_id: session_id.clone(),
+                        scope,
+                    },
+                ),
+            );
         }
         self.sink.emit(
             "cec://session",
@@ -3046,18 +3101,16 @@ impl Mesh {
         self.cec.set_session(&session_id, "denied");
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
-            let _ = self
-                .cec_send_control(
-                    &network_id,
-                    &canonical,
-                    &allmystuff_cec_protocol::ControlMessage::Connect(
-                        allmystuff_cec_protocol::ConnectControl::Deny {
-                            session_id: session_id.clone(),
-                            reason: "declined".into(),
-                        },
-                    ),
-                )
-                .await;
+            self.cec_send_decision(
+                network_id,
+                canonical.clone(),
+                allmystuff_cec_protocol::ControlMessage::Connect(
+                    allmystuff_cec_protocol::ConnectControl::Deny {
+                        session_id: session_id.clone(),
+                        reason: "declined".into(),
+                    },
+                ),
+            );
         }
         self.sink.emit(
             "cec://session",
@@ -3073,17 +3126,15 @@ impl Mesh {
         let removed = self.cec.revoke(&tech)?;
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
-            let _ = self
-                .cec_send_control(
-                    &network_id,
-                    &canonical,
-                    &allmystuff_cec_protocol::ControlMessage::Connect(
-                        allmystuff_cec_protocol::ConnectControl::End {
-                            session_id: String::new(),
-                        },
-                    ),
-                )
-                .await;
+            self.cec_send_decision(
+                network_id,
+                canonical.clone(),
+                allmystuff_cec_protocol::ControlMessage::Connect(
+                    allmystuff_cec_protocol::ConnectControl::End {
+                        session_id: String::new(),
+                    },
+                ),
+            );
         }
         // Tear down any live routes with the technician, exactly like forgetting
         // a node.
@@ -3297,6 +3348,75 @@ impl Mesh {
                 .map(|id| crate::cec::pubkey_part(id) == canonical)
                 .unwrap_or(false)
         })
+    }
+
+    /// Fire a customer *decision* (Approve / Deny / End) at a technician
+    /// under the acked contract, without blocking the GUI op that made
+    /// the decision: the send is spawned, queued daemon-side until the
+    /// technician's link is up, retransmitted across rebuilds, and a
+    /// terminal delivery failure is logged loudly — the one case left is
+    /// a technician gone past the TTL, who re-dials and (for standing
+    /// grants) auto-approves without the customer doing anything.
+    fn cec_send_decision(
+        self: &Arc<Self>,
+        network: String,
+        peer: String,
+        message: allmystuff_cec_protocol::ControlMessage,
+    ) {
+        let mesh = self.clone();
+        crate::spawn(async move {
+            if let Err(e) = mesh
+                .cec_send_control_acked(
+                    &network,
+                    &peer,
+                    &message,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "cec decision undelivered to {} (they can re-dial; standing grants auto-approve): {e}",
+                    short_id(&peer)
+                );
+            }
+        });
+    }
+
+    /// Send one CEC [`ControlMessage`](allmystuff_cec_protocol::ControlMessage)
+    /// under the daemon's acknowledged-delivery contract: queued until the
+    /// peer's link is up, retransmitted across session rebuilds, resolved
+    /// when the peer's node has taken the frame (or errs at `ttl`). The
+    /// client read deadline is sized past the TTL so the daemon's honest
+    /// timeout answer always wins over the socket's.
+    async fn cec_send_control_acked(
+        &self,
+        network: &str,
+        peer: &str,
+        message: &allmystuff_cec_protocol::ControlMessage,
+        ttl: std::time::Duration,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .request_with_timeout(
+                &Request::ChannelSendReliable {
+                    network: network.to_string(),
+                    channel: allmystuff_cec_protocol::CHANNEL_CONTROL.to_string(),
+                    peer: crate::cec::pubkey_part(peer).to_string(),
+                    payload,
+                    ttl_ms: ttl.as_millis() as u64,
+                },
+                ttl + std::time::Duration::from_secs(5),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp
+                .error
+                .unwrap_or_else(|| "cec acked control send failed".into()))
+        }
     }
 
     /// Send one CEC [`ControlMessage`](allmystuff_cec_protocol::ControlMessage)
@@ -3553,21 +3673,22 @@ impl Mesh {
                                     "cec auto-approve: standing grant covers {} — replying Approve session={session_id}",
                                     short_id(&from)
                                 );
-                                if let Err(e) = self
-                                    .cec_send_control(
-                                        &network,
-                                        &from,
-                                        &allmystuff_cec_protocol::ControlMessage::Connect(
-                                            allmystuff_cec_protocol::ConnectControl::Approve {
-                                                session_id,
-                                                scope,
-                                            },
-                                        ),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("cec auto-approve reply failed to send: {e}");
-                                }
+                                // Acked: a new-era technician sends its Request
+                                // exactly once, so this reply must survive drops
+                                // on its own — the daemon queues, retransmits
+                                // across rebuilds, and only gives up at the TTL.
+                                // (An old technician re-beats; its duplicate
+                                // Requests just re-spawn cheap dedup'd replies.)
+                                self.cec_send_decision(
+                                    network.clone(),
+                                    from.clone(),
+                                    allmystuff_cec_protocol::ControlMessage::Connect(
+                                        allmystuff_cec_protocol::ConnectControl::Approve {
+                                            session_id,
+                                            scope,
+                                        },
+                                    ),
+                                );
                                 // Help arrived (a standing grant answered the
                                 // beacon) — withdraw the ask, same as an
                                 // explicit approve does.

@@ -127,6 +127,20 @@ pub enum Request {
     NetworkConnectPeer {
         network: String,
         peer: String,
+        /// Record a standing dial (daemon ≥ 0.2.34): the daemon redials
+        /// this peer on every announce — even on a Silent network — and
+        /// never gives up, with the pin persisted in the network config.
+        /// The shape a support session needs to survive the far end
+        /// sleeping, roaming, or rebooting. `serde(default)` so the op
+        /// stays wire-compatible with older daemons (which ignore it).
+        #[serde(default)]
+        pin: bool,
+        /// When > 0, the daemon holds the reply until the peer reaches
+        /// ACTIVE (or the deadline) and reports the real outcome. Pair
+        /// with [`ControlClient::request_with_timeout`] — the default
+        /// 5 s client read timeout is shorter than any useful wait.
+        #[serde(default)]
+        wait_ms: u64,
     },
 
     // ---- event stream ------------------------------------------------
@@ -154,6 +168,42 @@ pub enum Request {
         /// daemon replies "peer not found". Strip the suffix before sending.
         peer: String,
         payload: Value,
+    },
+    /// Send on a typed channel under the daemon's acknowledged-delivery
+    /// contract (daemon ≥ 0.2.34): queued until the peer's link is up,
+    /// retransmitted across session rebuilds, and the reply resolves
+    /// when the peer's engine has delivered the frame (or errs at TTL /
+    /// terminal failure). Replaces application retransmit loops — the
+    /// CEC connect handshake rides this. Use
+    /// [`ControlClient::request_with_timeout`] sized past `ttl_ms`.
+    ChannelSendReliable {
+        network: String,
+        channel: String,
+        /// Bare pubkey, same addressing rule as [`Request::ChannelSendTo`].
+        peer: String,
+        payload: Value,
+        /// Milliseconds before an undelivered frame expires (0 = daemon
+        /// default, 60 s).
+        #[serde(default)]
+        ttl_ms: u64,
+    },
+    /// Open the lowest free media lane ("video" | "audio") toward a
+    /// connected peer (daemon ≥ 0.2.34), returning `{ lane }`. Lanes
+    /// also open transparently on first write; this is the explicit
+    /// reservation.
+    MediaLaneOpen {
+        network: String,
+        peer: String,
+        kind: String,
+    },
+    /// Close a media lane toward a peer (daemon ≥ 0.2.34; idempotent).
+    /// The daemon removes the track and the next renegotiation drops
+    /// the m-line — media capacity is paid only while a route runs.
+    MediaLaneClose {
+        network: String,
+        peer: String,
+        kind: String,
+        lane: u8,
     },
     ChannelSendAll {
         network: String,
@@ -740,5 +790,71 @@ mod tests {
             serde_json::from_str(r#"{"ok":true,"data":{"a":1},"extra":"ignored"}"#).unwrap();
         assert!(r.ok);
         assert_eq!(r.data.unwrap()["a"], 1);
+    }
+}
+
+#[cfg(test)]
+mod lane_lifecycle_wire_tests {
+    use super::*;
+
+    #[test]
+    fn connect_peer_pin_fields_are_wire_additive() {
+        // An old client's op (no pin/wait_ms) decodes with the defaults…
+        let old = r#"{"op":"network_connect_peer","network":"cec-1","peer":"pk"}"#;
+        let req: Request = serde_json::from_str(old).expect("old shape decodes");
+        match &req {
+            Request::NetworkConnectPeer { pin, wait_ms, .. } => {
+                assert!(!pin);
+                assert_eq!(*wait_ms, 0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // …and the new fields serialize under the same op tag.
+        let new = Request::NetworkConnectPeer {
+            network: "cec-1".into(),
+            peer: "pk".into(),
+            pin: true,
+            wait_ms: 0,
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["op"], "network_connect_peer");
+        assert_eq!(v["pin"], true);
+    }
+
+    #[test]
+    fn reliable_send_and_lane_ops_round_trip() {
+        let send = Request::ChannelSendReliable {
+            network: "net".into(),
+            channel: "cec.control".into(),
+            peer: "pk".into(),
+            payload: serde_json::json!({"t": "connect"}),
+            ttl_ms: 90_000,
+        };
+        let v = serde_json::to_value(&send).unwrap();
+        assert_eq!(v["op"], "channel_send_reliable");
+        let back: Request = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            Request::ChannelSendReliable { ttl_ms: 90_000, .. }
+        ));
+
+        let close = Request::MediaLaneClose {
+            network: "net".into(),
+            peer: "pk".into(),
+            kind: "video".into(),
+            lane: 3,
+        };
+        let v = serde_json::to_value(&close).unwrap();
+        assert_eq!(v["op"], "media_lane_close");
+        assert_eq!(v["lane"], 3);
+        let open = Request::MediaLaneOpen {
+            network: "net".into(),
+            peer: "pk".into(),
+            kind: "audio".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&open).unwrap()["op"],
+            "media_lane_open"
+        );
     }
 }
