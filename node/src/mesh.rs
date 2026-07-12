@@ -2008,7 +2008,12 @@ impl Mesh {
                                 );
                             }
                             self.note_video_in(&full.route, "MJPEG", full.jpeg.len());
-                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full));
+                            // latest_wins: every JPEG is a complete picture, so
+                            // an unread backlog is pure latency — supersede it.
+                            // Without this the viewer replays history frame by
+                            // frame ("always catching up") whenever decode or
+                            // the wire runs behind the capture rate.
+                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full), true);
                         }
                     }
                     MediaPayload::VideoStatus(status) => {
@@ -2397,7 +2402,10 @@ impl Mesh {
                 },
             );
         } else {
-            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data));
+            // NOT latest_wins: H.264 deltas must all reach the decoder in
+            // order — freshest-wins happens after decode (enqueue_decoded) or
+            // at the GUI's paint slot instead.
+            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data), false);
         }
     }
 
@@ -2407,7 +2415,7 @@ impl Mesh {
     /// of stream and is then cleared wholesale — the decoder re-keys on
     /// the sender's next IDR, and `video_unwatch`/route teardown remove
     /// the entry entirely.
-    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>) {
+    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) {
         const MAX_QUEUED: usize = 120;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
@@ -2423,7 +2431,13 @@ impl Mesh {
             }
             return;
         };
-        if w.queue.len() >= MAX_QUEUED {
+        if latest_wins {
+            // Self-contained frames (MJPEG): anything the window hasn't
+            // pulled yet is stale the moment a newer picture exists —
+            // painting history buys nothing but lag. Mirrors
+            // enqueue_decoded's freshest-wins.
+            w.queue.clear();
+        } else if w.queue.len() >= MAX_QUEUED {
             tracing::debug!("video queue for {route_id} unread for seconds — cleared");
             w.queue.clear();
         }

@@ -788,7 +788,36 @@
 
     // JPEG bitmap decodes are async — chain them so frames paint in
     // arrival order.
-    let drawChain = Promise.resolve();
+    // MJPEG paint slot, latest-wins: exactly one undrawn frame is ever
+    // held — a newer one supersedes it (each JPEG is a complete picture,
+    // so painting history is pure lag). The old serial promise chain
+    // decoded and painted EVERY frame in arrival order, which is where
+    // "the video is always catching up" lived when decode or the wire
+    // ran behind capture. Superseded frames land in recv-fps: painted
+    // frames drop below the sender's target, and the existing feedback
+    // tuner downshifts the encode edge on that same honest signal.
+    let pendingJpeg: Blob | null = null;
+    let jpegPainting = false;
+    const paintNewestJpeg = async () => {
+      if (jpegPainting) return; // the running loop will pick ours up
+      jpegPainting = true;
+      try {
+        while (!cancelled && pendingJpeg) {
+          const blob = pendingJpeg;
+          pendingJpeg = null;
+          try {
+            const bmp = await createImageBitmap(blob);
+            paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
+            maybeDetect(bmp); // sample this bitmap, not the live canvas
+            bmp.close();
+          } catch {
+            // A torn frame decodes as nothing; the next one stands alone.
+          }
+        }
+      } finally {
+        jpegPainting = false;
+      }
+    };
 
     const paint = (w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
       const c = canvasEl;
@@ -844,18 +873,10 @@
       if (cancelled) return;
       transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
-        const blob = new Blob([f.data], { type: "image/jpeg" });
-        drawChain = drawChain.then(async () => {
-          if (cancelled) return;
-          try {
-            const bmp = await createImageBitmap(blob);
-            paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
-            maybeDetect(bmp); // sample this bitmap, not the live canvas
-            bmp.close();
-          } catch {
-            // A torn frame decodes as nothing; the next one stands alone.
-          }
-        });
+        // Supersede, never queue: the newest picture is the only one worth
+        // painting, and the loop below drains at whatever rate decode allows.
+        pendingJpeg = new Blob([f.data], { type: "image/jpeg" });
+        void paintNewestJpeg();
         return;
       }
       if (f.kind === "raw") {
