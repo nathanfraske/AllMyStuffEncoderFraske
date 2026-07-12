@@ -122,23 +122,12 @@ pub fn normalize_input(input: &str) -> String {
         .collect()
 }
 
-/// Derive the per-customer MyOwnMesh `network_id` — the Silent mesh room — from
-/// a number. The number is canonicalised with [`normalize_input`] (so a
-/// technician may paste it grouped or with read-alike folds) and prefixed with
-/// [`CEC_NETWORK_PREFIX`](crate::CEC_NETWORK_PREFIX). The result satisfies
-/// MyOwnMesh's `normalize_network_id` (`[a-z0-9-_]`, length 3..=64), so it can
-/// be joined verbatim. Because the id is a pure function of the number, the
-/// customer and the technician independently derive the same room from the same
-/// number — no directory, no server.
-pub fn network_id_for_number(number: &str) -> String {
-    format!("{}{}", crate::CEC_NETWORK_PREFIX, normalize_input(number))
-}
-
-/// The Silent mesh a device joins for itself:
-/// `network_id_for_number(support_id_from_device(device_id))`.
-pub fn network_id_for_device(device_id: &str) -> String {
-    network_id_for_number(&support_id_from_device(device_id))
-}
+// The per-number room derivations (`network_id_for_number` /
+// `network_id_for_device`) lived here until the shared support area
+// (`HELP_NETWORK_ID`) took over sessions entirely: a number is a display /
+// verification label now, never a room. `CEC_NETWORK_PREFIX` survives in
+// `lib.rs` solely so upgrading nodes can recognise (and purge) the legacy
+// `cec-<digits>` rooms older builds persisted.
 
 #[cfg(test)]
 mod tests {
@@ -169,16 +158,12 @@ mod tests {
     fn suffixed_and_bare_forms_agree() {
         // The wire sees the bare pubkey; humans (and local identity) see the
         // display-suffixed form. Both must land on the same Support ID, or a
-        // technician answering a help beacon dials a room nobody hosts.
+        // phoned-in number wouldn't resolve to the device the beacon named.
         let bare = "dqbx4vwtyegzh47nsssg2zrqhev576jp7tkspvwr3mf4jk5wmmoa";
         let suffixed = format!("{bare}-0A307");
         assert_eq!(
             support_id_from_device(bare),
             support_id_from_device(&suffixed)
-        );
-        assert_eq!(
-            network_id_for_device(bare),
-            network_id_for_device(&suffixed)
         );
         // But a dash tail that isn't a 5-char display suffix is part of the
         // id and must NOT be stripped.
@@ -222,25 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn network_id_is_derived_and_valid() {
-        let id = SupportId::from_device("device-alpha");
-        let net = network_id_for_number(id.as_str());
-        assert!(net.starts_with("cec-"));
-        // Grouped input resolves to the same room.
-        assert_eq!(network_id_for_number(&id.grouped()), net);
-        // Valid MyOwnMesh network_id shape: [a-z0-9-_], length 3..=64.
-        assert!((3..=64).contains(&net.len()));
-        assert!(net
-            .bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')));
-    }
-
-    #[test]
-    fn device_and_number_agree_on_the_room() {
-        let dev = "device-beta";
-        assert_eq!(
-            network_id_for_device(dev),
-            network_id_for_number(&support_id_from_device(dev))
-        );
+    fn legacy_room_prefix_stays_frozen() {
+        // Upgrading nodes purge the retired per-number rooms by matching
+        // `CEC_NETWORK_PREFIX` + 9 digits — the prefix must never drift or
+        // the sweep misses what old builds persisted.
+        assert_eq!(crate::CEC_NETWORK_PREFIX, "cec-");
     }
 }

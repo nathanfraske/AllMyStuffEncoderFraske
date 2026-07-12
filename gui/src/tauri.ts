@@ -1204,17 +1204,17 @@ export async function fleetMfaDisable(code: string): Promise<void> {
 // events flow through the ordinary Tauri event bus (the node's event pump
 // forwards every emit by name).
 
-/** This node's CEC snapshot — its own support number + Silent room, its role,
- *  and whether it's hosting. Null in web mode. */
+/** This node's CEC snapshot — its own support number (a display label, from
+ *  the device key), its role, and the support area it's on. Null in web mode. */
 export interface CecStatus {
   number: string;
+  /** Always the shared support area (`cecsupport-clients`) — the only mesh
+   *  CEC uses now that per-number rooms are gone. */
   network_id: string;
   role: "client" | "technician";
-  hosting: boolean;
-  /** Whether this node is sitting on the global help room — the "Watch the
-   *  help queue" opt-in. Read from room membership (the daemon persists it),
-   *  so the toggle's saved state comes back from the node itself. Absent from
-   *  an older node. */
+  /** Whether the technician's help-queue view is armed — a node-held view
+   *  state, so the toggle reflects it across a reload. Absent from an older
+   *  node. */
   help_watching?: boolean;
 }
 
@@ -1265,10 +1265,12 @@ export function cecStatus(): Promise<CecStatus | null> {
   return tryInvoke<CecStatus>("cec_status");
 }
 
-/** Technician: dial a customer by the number they read out. Joins their secret
- *  Silent mesh and connects to the one peer there, which then shows on the graph
- *  as an ordinary peer. Throws with the backend's reason when nothing answered.
- *  Returns the customer's node id (null in web mode). */
+/** Technician: dial a customer by the number they read out — the fallback for
+ *  when the raised-hand list is too crowded to spot them. The node resolves
+ *  the digits to a device on the support area (a raised hand first, else any
+ *  area member whose key-derived number matches) and connects. Throws with the
+ *  backend's reason when nobody with that number is on the area. Returns the
+ *  customer's node id (null in web mode). */
 export async function cecDial(
   number: string,
   agentName: string,
@@ -1278,15 +1280,23 @@ export async function cecDial(
   return (await invoke("cec_dial", { number, agentName })) as { node: string };
 }
 
-/** Customer: start hosting on this device's own number-derived Silent mesh.
- *  Returns the support number to read out. Null in web mode. */
-export function cecStartHosting(): Promise<{ number: string } | null> {
-  return tryInvoke<{ number: string }>("cec_start_hosting");
+/** Technician: dial a customer's device directly — the headline path, fed by
+ *  a raised hand's beacon (its authenticated device id) or a directory
+ *  reconnect. Returns the customer's node id (null in web mode). */
+export async function cecDialNode(
+  node: string,
+  agentName: string,
+): Promise<{ node: string } | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("cec_dial_node", { node, agentName })) as { node: string };
 }
 
-/** Customer: stop hosting (standing consent grants are kept). No-op in web. */
-export function cecStopHosting(): Promise<null> {
-  return tryInvoke("cec_stop_hosting");
+/** Customer: take up residence on the shared support area — called at bring-up
+ *  so technicians can see and dial this device. Returns the support number to
+ *  read out (a display label). Null in web mode. */
+export function cecOnline(): Promise<{ number: string } | null> {
+  return tryInvoke<{ number: string }>("cec_online");
 }
 
 /** Customer: the inbound technician connect-requests awaiting a choice.
@@ -1358,19 +1368,19 @@ export interface CecHelpSeeker {
 }
 
 /** Technician: the customers currently asking for help, longest-waiting
- *  first. Read-only — it never joins the room (that's `cecHelpWatch`, the
- *  explicit opt-in), so an install that isn't watching always reads empty.
+ *  first. Read-only — empty unless the queue view is armed (`cecHelpWatch`).
  *  Null = fetch failed (keep the last snapshot); empty in web mode. */
 export async function cecHelpList(): Promise<CecHelpSeeker[] | null> {
   const r = await tryInvoke<CecHelpSeeker[]>("cec_help_list");
   return Array.isArray(r) ? r : null;
 }
 
-/** Technician: join (or leave) the global help room — the "Watch the help
- *  queue" toggle. Sticks across restarts (the daemon persists the room), and
- *  a default install never joins until this is explicitly turned on.
- *  Throws on failure: this exact call once failed silently for days (the
- *  command wasn't registered) while the toggle looked merely stubborn. */
+/** Technician: arm (or disarm) the help-queue view — the "Watch the help
+ *  queue" toggle. A view state, not a membership: the node stays on the
+ *  support area either way (dialed customers' sessions ride it), so disarming
+ *  never hangs up on anyone; it just stops surfacing raised hands. Throws on
+ *  failure: this exact call once failed silently for days (the command wasn't
+ *  registered) while the toggle looked merely stubborn. */
 export async function cecHelpWatch(on: boolean): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import("@tauri-apps/api/core");
@@ -1390,19 +1400,11 @@ export async function onCecHelp(
   );
 }
 
-/** Technician: stop whatever the in-flight dial is trying — discovery and the
- *  connect-request re-sends both quit at the node's cancel flag. No-op in web
- *  mode or when nothing is in flight. */
+/** Technician: stop whatever the in-flight dial is trying — the connect-request
+ *  re-sends quit at the node's cancel flag. No-op in web mode or when nothing
+ *  is in flight. */
 export async function cecCancelDial(): Promise<void> {
   await tryInvoke("cec_cancel_dial");
-}
-
-/** Technician: remove a directory row by its support number — the curation
- *  path for an attempt row that never discovered a node. No-op in web mode. */
-export async function cecForgetNumber(number: string): Promise<void> {
-  if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("cec_forget_number", { number });
 }
 
 /** "Forget this node" — an app-wide action on every node's gear: drop it from

@@ -223,7 +223,7 @@
                 class="btn small primary"
                 disabled={app.cecDialing}
                 title="Answer them — connect and open their screen once they approve"
-                onclick={() => void app.reconnectCec(w.number)}
+                onclick={() => void app.answerHelp(w.node, shownName)}
               >
                 Control
               </button>
@@ -255,7 +255,7 @@
         <span class="dot busy"></span>
         <span class="who">
           <b>Dialing {groupNumber(app.cecDialingNumber)}…</b>
-          <span class="sub">Finding the customer on their support mesh — this can take a moment.</span>
+          <span class="sub">Finding that number on the support area — this can take a moment.</span>
         </span>
         <button class="btn small danger" onclick={() => void app.cancelCecDial()}>Cancel</button>
       </div>
@@ -296,9 +296,9 @@
                 {:else}
                   <b>{app.cecCustomerName(c)}<span class="host">{hostTail(app.cecCustomerName(c), c.hostname)}</span></b>
                   <span class="sub">
-                    <span class="mesh" title={`Mesh cec-${c.number}`}>CEC Support {groupNumber(c.number)}</span>
+                    <span class="mesh" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
                     <span class="meta">
-                      · {c.node ? (c.online ? "online" : "offline") : "no answer yet"} · {lastUsedLabel(c.last_used)}
+                      · {c.online ? "online" : "offline"} · {lastUsedLabel(c.last_used)}
                     </span>
                     {#if c.node === app.cecAutoOpenNode}
                       <span class="pending-tag">waiting for approval</span>
@@ -327,7 +327,7 @@
                     class="btn small primary"
                     disabled={app.cecDialing}
                     title="Connect and open their screen — the customer approves unless their standing access still covers you"
-                    onclick={() => void app.reconnectCec(c.number)}
+                    onclick={() => void app.reconnectCec(c.node)}
                   >
                     Control
                   </button>
@@ -335,7 +335,7 @@
                 <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
                 <button
                   class="btn small danger"
-                  onclick={() => (c.node ? void app.forgetNode(c.node) : void app.removeCecNumber(c.number))}
+                  onclick={() => void app.removeCecCustomer(c.node)}
                 >
                   Remove
                 </button>
@@ -347,15 +347,16 @@
     {/if}
   </section>
 
-  <!-- Customer side: inbound requests + standing grants. Shown when this build
-       is hosting (a customer answering the prompt from the same engine). -->
-  {#if status?.hosting || requests.length > 0 || grants.length > 0}
+  <!-- Customer side: your number + inbound requests + standing grants. Shown
+       for a customer (never dialed anyone) or whenever there's live consent
+       state to manage. -->
+  {#if status?.role === "client" || requests.length > 0 || grants.length > 0}
     <section class="block">
-      <div class="title">You are hosting</div>
+      <div class="title">Your support number</div>
       {#if status?.number}
         <p class="hint">
-          Your number is <code>{status.number}</code> — read it to the technician so they can
-          connect.
+          Your number is <code>{groupNumber(status.number)}</code> — read it to the technician
+          if they ask, or just press <b>Ask for help</b> and they'll see you in the queue.
         </p>
       {/if}
 

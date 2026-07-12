@@ -12,11 +12,12 @@
 //! immediately, mid-session, exactly like AllMyStuff re-checks authorization
 //! per frame.
 //!
-//! Two roles share this one struct:
-//!  * a **customer** (the standalone CEC Support client, or any node hosting)
-//!    fills [`CecInner::consent`] + [`CecInner::pending`] + `hosting`;
-//!  * a **technician** (this AllMyStuff install, joined to a customer's secret
-//!    Silent mesh) fills `agent_name` + [`CecInner::dialed`].
+//! Two roles share this one struct, both living on the one shared support
+//! area (`cecsupport-clients` — see [`help_network_config`]):
+//!  * a **customer** (the standalone CEC Support client) fills
+//!    [`CecInner::consent`] + [`CecInner::pending`];
+//!  * a **technician** (this AllMyStuff install) fills `agent_name` +
+//!    [`CecInner::dialed`].
 //!
 //! Everything here is plain, lock-guarded state plus pure helpers, so the wire
 //! contract ([`allmystuff_cec_protocol`]) and the enforcement store
@@ -37,10 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
-use allmystuff_cec_protocol::{
-    format_support_id, network_id_for_device, network_id_for_number, support_id_from_device,
-    ApprovalScope, Role,
-};
+use allmystuff_cec_protocol::{format_support_id, support_id_from_device, ApprovalScope, Role};
 
 /// Where the customer's consent store lives:
 /// `~/.myownmesh/cec-consent.json`, honouring `MYOWNMESH_HOME` — the same home
@@ -101,10 +99,14 @@ impl PendingRequest {
 /// from CEC state ([`Cec::dialed_list`]), it is not a graph grouping.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialedCustomer {
-    /// The customer's device id — empty for an attempt whose discovery never
-    /// completed (the customer hasn't answered on this number yet).
+    /// The customer's device id — the directory key (canonical form) and
+    /// the address every dial targets on the shared support area mesh.
     pub node: String,
-    /// The support number the technician typed to reach them.
+    /// The customer's support number — a display/verification label derived
+    /// from their device key, kept so the technician's card and the
+    /// customer's app spell the same digits. It is NOT a room name: since
+    /// the per-number Silent rooms were removed, sessions ride the one
+    /// `cecsupport-clients` area mesh.
     pub number: String,
     /// Best-known label (the machine name, once presence lands).
     pub label: String,
@@ -115,8 +117,6 @@ pub struct DialedCustomer {
     pub hostname: String,
     /// Whether the customer is currently reachable.
     pub online: bool,
-    /// The Silent mesh (`network_id_for_number`) the customer was dialed on.
-    pub network_id: String,
     /// Epoch seconds of the last time the technician actively used this
     /// connection — a fresh dial, or the console session going active. Surfaced
     /// to the CEC tab so a technician can spot (and clean up) connections gone
@@ -142,6 +142,13 @@ impl DialedCustomer {
 /// canonical (bare-pubkey) id. `online` is reset to `false` — reachability is
 /// re-confirmed live (see the `cec_dialed` reconcile), never trusted from a
 /// prior run. A missing or corrupt file loads empty; it never bricks the node.
+///
+/// Migration: directories written before the shared-area model were
+/// number-keyed and could hold nodeless "attempt" rows (a dial whose
+/// per-number-room discovery never completed). A nodeless row is
+/// meaningless now — dials target a device id on the area mesh — so those
+/// rows are dropped on load; rows with a node id re-key by it losslessly.
+/// (Old rows also carried a `network_id` room field; serde ignores it.)
 fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
     let Some(path) = path else {
         return HashMap::new();
@@ -151,10 +158,10 @@ fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
     };
     let list: Vec<DialedCustomer> = serde_json::from_str(&text).unwrap_or_default();
     list.into_iter()
-        .filter(|c| !number_digits(&c.number).is_empty())
+        .filter(|c| !c.node.is_empty())
         .map(|mut c| {
             c.online = false;
-            (number_digits(&c.number), c)
+            (pubkey_part(&c.node).to_string(), c)
         })
         .collect()
 }
@@ -179,16 +186,10 @@ struct CecInner {
     /// Support app's role); flips to [`Role::Technician`] on the first
     /// `cec_dial`.
     role: Role,
-    /// Whether this node is currently hosting (a customer advertising itself on
-    /// its own number-derived Silent mesh, listening for connect-requests).
-    hosting: bool,
     /// This node's own support number (customer) — derived once the local id is
-    /// known. Empty until then.
+    /// known. Empty until then. A display/verification label only: every CEC
+    /// node, both roles, lives on the one `cecsupport-clients` area mesh.
     number: String,
-    /// The Silent mesh id this node is anchored to: a customer's own
-    /// `network_id_for_device(me)`, or the technician's most-recently-dialed
-    /// customer room.
-    network_id: String,
     /// The technician's **Agent Name** — the name a customer sees in the prompt.
     /// Persisted GUI-side; mirrored here so an outbound connect-request carries
     /// it.
@@ -211,10 +212,13 @@ struct CecInner {
     /// it; the discovery poll and the connect-request re-send loop both honor
     /// it, so "stop trying" actually stops everything being tried.
     dial_cancel: Option<Arc<AtomicBool>>,
-    /// Customer: whether this node is currently asking for help on the global
-    /// help mesh. In-memory only — a restart simply stops the beacon and the
-    /// technicians' TTL caches age the entry out.
+    /// Customer: whether this node is currently asking for help on the
+    /// support area. In-memory only — a restart simply stops the beacon and
+    /// the technicians' TTL caches age the entry out.
     asking_help: bool,
+    /// Technician: whether the help-queue view is armed. A view state, not a
+    /// membership — the area is standing either way.
+    watching_help: bool,
     /// Bumped on every asking-state transition, so the re-beacon loop can tell
     /// "still the same ask" from "cancelled and re-asked" and exactly one loop
     /// ever beacons.
@@ -273,9 +277,7 @@ impl Cec {
             dialed_path,
             inner: Mutex::new(CecInner {
                 role: Role::Client,
-                hosting: false,
                 number: String::new(),
-                network_id: String::new(),
                 agent_name: String::new(),
                 consent,
                 pending: Vec::new(),
@@ -283,6 +285,7 @@ impl Cec {
                 sessions: HashMap::new(),
                 dial_cancel: None,
                 asking_help: false,
+                watching_help: false,
                 help_epoch: 0,
                 help_wanted: HashMap::new(),
             }),
@@ -311,24 +314,21 @@ impl Cec {
 
     // ---- status ---------------------------------------------------------
 
-    /// The `cec_status` result: `{ number, network_id, role, hosting }`. When
-    /// `me` is known and this node has no number yet, derive its own from it so
-    /// a customer can read its code straight away.
+    /// The `cec_status` result: `{ number, network_id, role, asking_help }`.
+    /// When `me` is known and this node has no number yet, derive its own from
+    /// it so a customer can read its code straight away. `network_id` is
+    /// always the shared support area — the only mesh CEC uses.
     pub fn status(&self, me: Option<&str>) -> Value {
         let mut inner = self.inner.lock();
         if inner.number.is_empty() {
             if let Some(me) = me {
                 inner.number = support_id_from_device(me);
-                if inner.network_id.is_empty() {
-                    inner.network_id = network_id_for_device(me);
-                }
             }
         }
         json!({
             "number": inner.number,
-            "network_id": inner.network_id,
+            "network_id": allmystuff_cec_protocol::HELP_NETWORK_ID,
             "role": role_str(inner.role),
-            "hosting": inner.hosting,
             "asking_help": inner.asking_help,
         })
     }
@@ -345,12 +345,9 @@ impl Cec {
         self.inner.lock().agent_name = name;
     }
 
-    /// Note that this node is now acting as a technician (first dial), pinning
-    /// the last-dialed customer room as its `network_id`.
-    pub fn set_dialed_network(&self, network_id: String) {
-        let mut inner = self.inner.lock();
-        inner.role = Role::Technician;
-        inner.network_id = network_id;
+    /// Note that this node is now acting as a technician (first dial).
+    pub fn note_technician(&self) {
+        self.inner.lock().role = Role::Technician;
     }
 
     /// Record (or refresh) a dialed customer, keyed by canonical id. Returns the
@@ -362,20 +359,18 @@ impl Cec {
         label: String,
         hostname: String,
         online: bool,
-        network_id: String,
     ) -> DialedCustomer {
         let now = now_secs();
         let mut inner = self.inner.lock();
         let entry = inner
             .dialed
-            .entry(number_digits(&number))
+            .entry(pubkey_part(&node).to_string())
             .or_insert_with(|| DialedCustomer {
                 node: node.clone(),
                 number: number.clone(),
                 label: label.clone(),
                 hostname: hostname.clone(),
                 online,
-                network_id: network_id.clone(),
                 last_used: now,
             });
         entry.node = node;
@@ -387,7 +382,6 @@ impl Cec {
             entry.hostname = hostname;
         }
         entry.online = online;
-        entry.network_id = network_id;
         // A (re)dial is a fresh use — keep the stale-connection metric honest.
         entry.last_used = now;
         let record = entry.clone();
@@ -433,34 +427,6 @@ impl Cec {
         }
     }
 
-    /// Record a dial *attempt* the moment the technician dials: the permanent
-    /// directory row exists (and persists) before discovery, before approval,
-    /// whether or not the customer ever answers. Re-dialing an existing number
-    /// just refreshes its recency. The node id stays empty until discovery
-    /// fills it via [`Cec::record_dialed`].
-    pub fn record_attempt(&self, number: &str) -> DialedCustomer {
-        let now = now_secs();
-        let mut inner = self.inner.lock();
-        let entry = inner
-            .dialed
-            .entry(number_digits(number))
-            .or_insert_with(|| DialedCustomer {
-                node: String::new(),
-                number: number.to_string(),
-                label: String::new(),
-                hostname: String::new(),
-                online: false,
-                network_id: network_id_for_number(number),
-                last_used: now,
-            });
-        entry.last_used = now;
-        let record = entry.clone();
-        let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
-        drop(inner);
-        self.persist_dialed(snapshot);
-        record
-    }
-
     /// Mark a dialed customer online/offline (from presence), returning its
     /// updated record when the flag actually changed.
     pub fn set_customer_online(&self, canonical: &str, online: bool) -> Option<DialedCustomer> {
@@ -468,10 +434,7 @@ impl Cec {
         // this stays in memory; only the durable fields (record/last_used) are
         // ever written to disk.
         let mut inner = self.inner.lock();
-        let c = inner
-            .dialed
-            .values_mut()
-            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)?;
+        let c = inner.dialed.get_mut(canonical)?;
         if c.online == online {
             return None;
         }
@@ -486,10 +449,7 @@ impl Cec {
     /// dialed.
     pub fn touch_dialed(&self, canonical: &str) -> Option<DialedCustomer> {
         let mut inner = self.inner.lock();
-        let c = inner
-            .dialed
-            .values_mut()
-            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)?;
+        let c = inner.dialed.get_mut(canonical)?;
         c.last_used = now_secs();
         let record = c.clone();
         let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
@@ -499,13 +459,9 @@ impl Cec {
     }
 
     /// Whether `canonical` is a customer this technician has dialed. Used by
-    /// "Forget this node" to know a CEC customer needs its Silent room left too.
+    /// "Forget this node" to know a CEC directory row needs dropping too.
     pub fn is_dialed(&self, canonical: &str) -> bool {
-        self.inner
-            .lock()
-            .dialed
-            .values()
-            .any(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
+        self.inner.lock().dialed.contains_key(canonical)
     }
 
     /// The customers this technician has dialed, projected for the CEC tab's
@@ -522,34 +478,18 @@ impl Cec {
             .collect()
     }
 
-    /// The dialed customers as owned records (with `network_id`), for the async
-    /// `cec_dialed` projection that reconciles each one's live reachability
-    /// against the daemon's peer set. [`dialed_list`] returns the UI shape;
-    /// this keeps the fields that shape drops.
+    /// The dialed customers as owned records, for the async `cec_dialed`
+    /// projection that reconciles each one's live reachability against the
+    /// daemon's peer set. [`dialed_list`] returns the UI shape.
     pub fn dialed_records(&self) -> Vec<DialedCustomer> {
         self.inner.lock().dialed.values().cloned().collect()
-    }
-
-    /// The Silent mesh a dialed customer lives on, if any (for teardown).
-    pub fn dialed_network(&self, canonical: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .dialed
-            .values()
-            .find(|c| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
-            .map(|c| c.network_id.clone())
     }
 
     /// Drop a customer this technician dialed (the CEC part of "Forget this
     /// node"). Returns `true` when one was actually removed.
     pub fn forget_dialed(&self, canonical: &str) -> bool {
         let mut inner = self.inner.lock();
-        let key = inner
-            .dialed
-            .iter()
-            .find(|(_, c)| !c.node.is_empty() && pubkey_part(&c.node) == canonical)
-            .map(|(k, _)| k.clone());
-        let removed = key.and_then(|k| inner.dialed.remove(&k)).is_some();
+        let removed = inner.dialed.remove(canonical).is_some();
         if removed {
             let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
             drop(inner);
@@ -558,40 +498,19 @@ impl Cec {
         removed
     }
 
-    /// Remove a directory row by its support number — the curation path for an
-    /// attempt row whose discovery never completed (it has no node id for the
-    /// canonical-keyed [`Cec::forget_dialed`]). Returns the removed record so
-    /// the caller can tear down its Silent room too.
-    pub fn forget_number(&self, number: &str) -> Option<DialedCustomer> {
-        let mut inner = self.inner.lock();
-        let removed = inner.dialed.remove(&number_digits(number));
-        if removed.is_some() {
-            let snapshot: Vec<DialedCustomer> = inner.dialed.values().cloned().collect();
-            drop(inner);
-            self.persist_dialed(snapshot);
-        }
-        removed
-    }
+    // ---- customer (the 3-choice consent flow) ---------------------------
 
-    // ---- customer (hosting + the 3-choice consent flow) -----------------
-
-    /// Enter/leave hosting (a customer advertising on its own Silent mesh).
-    /// Returns the resolved support number when entering.
-    pub fn set_hosting(&self, hosting: bool, me: Option<&str>) -> String {
+    /// Resolve (and remember) this customer's support number for display —
+    /// the digits a caller reads out on the phone. Pure derivation from the
+    /// device key; no mesh state changes hands here.
+    pub fn own_number(&self, me: Option<&str>) -> String {
         let mut inner = self.inner.lock();
-        inner.hosting = hosting;
-        inner.role = Role::Client;
-        if hosting {
+        if inner.number.is_empty() {
             if let Some(me) = me {
                 inner.number = support_id_from_device(me);
-                inner.network_id = network_id_for_device(me);
             }
         }
         inner.number.clone()
-    }
-
-    pub fn is_hosting(&self) -> bool {
-        self.inner.lock().hosting
     }
 
     /// Record an inbound technician connect-request (customer side), replacing
@@ -792,26 +711,60 @@ impl Cec {
         self.inner.lock().help_wanted.remove(&key).is_some()
     }
 
-    /// Drop every cached help beacon — the watch toggle's leave path, so the
+    /// Drop every cached help beacon — the watch toggle's disarm path, so the
     /// queue empties the moment a technician stops watching.
     pub fn clear_help(&self) {
         self.inner.lock().help_wanted.clear();
     }
 
     /// Whether this node has ever acted as a technician (its role flipped on
-    /// the first dial). Guards the customer-side ask teardown on side-by-side
-    /// machines: a technician's help-room watch must survive a co-resident
-    /// customer app withdrawing its ask.
+    /// the first dial).
     pub fn is_technician(&self) -> bool {
         matches!(self.inner.lock().role, Role::Technician)
+    }
+
+    /// Arm/disarm the technician's help-queue view. A view state, not a
+    /// membership: the node stays on the support area either way (sessions
+    /// ride it); this only gates whether [`Cec::help_list`] surfaces the
+    /// cached beacons.
+    pub fn set_watching_help(&self, on: bool) {
+        self.inner.lock().watching_help = on;
+    }
+
+    pub fn watching_help(&self) -> bool {
+        self.inner.lock().watching_help
+    }
+
+    /// The waiting customer whose key-derived support number matches
+    /// `digits` — the raised hand IS the number→device binding, straight
+    /// from the beacon's authenticated sender. TTL-pruned like
+    /// [`Cec::help_list`], so a crashed asker can't be dialed by number
+    /// through a stale cache entry.
+    pub fn help_seeker_by_number(&self, digits: &str) -> Option<String> {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        inner
+            .help_wanted
+            .retain(|_, s| s.last_seen.saturating_add(HELP_TTL_SECS) >= now);
+        inner
+            .help_wanted
+            .iter()
+            .find(|(_, s)| s.number == digits)
+            .map(|(node, _)| node.clone())
     }
 
     /// Technician: the customers currently waiting for help, longest-waiting
     /// first (it's a queue, not a feed). Prunes anything past its beacon TTL
     /// on the way out, so a crashed asker disappears without a withdrawal.
+    /// Empty while the view is disarmed ([`Cec::set_watching_help`]) — the
+    /// cache may still fill from beacons (membership is standing), but a
+    /// technician who said "stop watching" sees nothing.
     pub fn help_list(&self) -> Vec<Value> {
         let now = now_secs();
         let mut inner = self.inner.lock();
+        if !inner.watching_help {
+            return Vec::new();
+        }
         inner
             .help_wanted
             .retain(|_, s| s.last_seen.saturating_add(HELP_TTL_SECS) >= now);
@@ -946,45 +899,30 @@ pub fn grouped_number(number: &str) -> String {
     format_support_id(number)
 }
 
-/// Build the daemon `NetworkAdd` config for a CEC Support **Silent** mesh named
-/// after `number`. `Silent` auto-dials nobody and never gossips a roster — the
-/// customer is merely *discoverable* inside its own number-derived room, and the
-/// technician must `connect_peer` deliberately. The room is isolated by the
-/// per-number `network_id` (`cec-<number>`) alone: technician and customer both
-/// use the default signaling app-id, so they derive the same room handle and
-/// meet with no env override.
-pub fn silent_network_config(number: &str) -> (String, Value) {
-    let network_id = network_id_for_number(number);
-    let config = json!({
-        "id": network_id,
-        "network_id": network_id,
-        "label": format!("CEC Support {}", grouped_number(number)),
-        // The Silent kind the sibling myownmesh change adds: no auto-dial, no
-        // roster gossip — peers are only *visible* until `connect_peer`.
-        "kind": "silent",
-        "auto_approve": true,
-        "signaling": { "strategy": "nostr", "mdns": true },
-    });
-    (network_id, config)
-}
-
-/// Build the daemon config for the **global help mesh** — the one well-known
-/// room every CEC client shares
-/// ([`HELP_NETWORK_ID`](allmystuff_cec_protocol::HELP_NETWORK_ID)). A customer
-/// joins it only while asking for help and beacons a `SupportPresence` there;
-/// technicians join it only while watching the queue. **Open, not Silent**:
-/// membership is already gated to exactly the peers who should connect (the
-/// asker's button, the watcher's toggle), so the daemon's native auto-dial IS
-/// the wiring — a raised hand connects to the watchers within a beat instead
-/// of hand-dialing before every beacon. The room still carries *want*, never
-/// access: a session goes through the customer's own (still Silent) number
-/// mesh and the consent handshake.
+/// Build the daemon config for the **support area** — the one well-known
+/// mesh every CEC node lives on
+/// ([`HELP_NETWORK_ID`](allmystuff_cec_protocol::HELP_NETWORK_ID)):
+/// `cecsupport-clients`, used by the CEC Support app (customers, standing
+/// membership from bring-up) and the CEC tab in AllMyStuff (technicians).
+/// This replaced the per-number Silent rooms — a mesh is just a signaling
+/// namespace, and one hub-shaped area carries discovery, hand-raising, AND
+/// the session itself; the number is a display label now, never a room.
+///
+/// **Open + hub topology**, and that combination is what keeps it silent in
+/// *experience*: with `CEC_HELP_HUBS` set, every member auto-connects only
+/// to the CEC-operated hubs (spokes never dial each other), hand-raise
+/// beacons flood hub-wards to the watching technicians, and a technician's
+/// deliberate pinned `connect_peer` — device id, straight from the beacon —
+/// opens the one customer session. Customers hold links to infrastructure,
+/// never to each other, and see nobody. The area carries *want* and
+/// transport, never access: every privileged frame still passes the
+/// pubkey-keyed consent gate.
 pub fn help_network_config() -> (String, Value) {
     let network_id = allmystuff_cec_protocol::HELP_NETWORK_ID.to_string();
     let mut config = json!({
         "id": network_id,
         "network_id": network_id,
-        "label": "CEC Support — asking for help",
+        "label": "CEC Support",
         "kind": "open",
         "auto_approve": true,
         "signaling": { "strategy": "nostr", "mdns": true },
@@ -1031,17 +969,19 @@ pub fn help_hub_topology(spec: Option<&str>) -> Option<Value> {
     Some(topology)
 }
 
-/// Canonicalise a device id to its bare pubkey — the same `-XXXXX` display
-/// suffix strip the consent store and the mesh use, so a technician isn't seen
-/// as a new peer across a reconnect. Re-exported shape of
-/// [`allmystuff_cec_consent::pubkey_part`].
-/// The bare digits of a support number — the directory key. An attempt and a
-/// completed dial share one row per number: the number is the stable identity
-/// of a client machine (its node id is only learned once discovery succeeds).
+/// The bare digits of a support number — the tolerant-input form of the
+/// dial-by-number fallback (the customer reads their digits over the phone;
+/// the technician types them with or without spacing). Matching happens
+/// against numbers derived from device ids on the area mesh; digits never
+/// name a room anymore.
 pub fn number_digits(number: &str) -> String {
     number.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Canonicalise a device id to its bare pubkey — the same `-XXXXX` display
+/// suffix strip the consent store and the mesh use, so a technician isn't seen
+/// as a new peer across a reconnect. Re-exported shape of
+/// [`allmystuff_cec_consent::pubkey_part`].
 pub fn pubkey_part(id: &str) -> &str {
     allmystuff_cec_consent::pubkey_part(id)
 }
@@ -1073,13 +1013,13 @@ mod tests {
     const TECH: &str = "techpubkeybase32bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
-    fn status_derives_number_and_room_from_me() {
+    fn status_derives_number_and_reports_the_shared_area() {
         let cec = Cec::new(None);
         let v = cec.status(Some(ME));
         assert_eq!(v["number"], support_id_from_device(ME));
-        assert_eq!(v["network_id"], network_id_for_device(ME));
+        // One mesh for everything — the number is a label, never a room.
+        assert_eq!(v["network_id"], allmystuff_cec_protocol::HELP_NETWORK_ID);
         assert_eq!(v["role"], "client");
-        assert_eq!(v["hosting"], false);
     }
 
     #[test]
@@ -1119,39 +1059,111 @@ mod tests {
     }
 
     #[test]
-    fn dialed_customers_track_the_cec_group() {
+    fn dialed_directory_is_device_keyed() {
         let cec = Cec::new(None);
         let canon = pubkey_part(TECH);
-        // An attempt is directory-worthy on its own: the row exists (nodeless)
-        // from the dial, and a completed discovery merges into the same row.
-        let attempt = cec.record_attempt("123 456 789");
-        assert!(attempt.node.is_empty());
+        // A dial records the row immediately (online=false pre-connect)…
+        let row = cec.record_dialed(
+            TECH.into(),
+            "123456789".into(),
+            String::new(),
+            String::new(),
+            false,
+        );
+        assert_eq!(row.node, TECH);
         assert_eq!(cec.dialed_list().len(), 1);
+        // …and the post-connect refresh merges into the SAME row (same
+        // device), filling ident and flipping online.
         cec.record_dialed(
             TECH.into(),
             "123456789".into(),
             "Reception PC".into(),
             "RECEPTION-01".into(),
             true,
-            "cec-123456789".into(),
         );
-        assert_eq!(cec.dialed_list().len(), 1, "attempt and dial share the row");
+        assert_eq!(cec.dialed_list().len(), 1, "one row per device");
         assert!(cec.is_dialed(canon));
-        assert_eq!(cec.dialed_network(canon).as_deref(), Some("cec-123456789"));
         // The dial stamps a `last_used` the CEC tab renders as time-since — it's
         // present, non-zero, and a `touch` refreshes the record for a re-emit.
         let listed = cec.dialed_list();
         assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["label"], "Reception PC");
         assert!(listed[0]["last_used"].as_u64().unwrap_or(0) > 0);
         assert!(cec.touch_dialed(canon).is_some());
         assert!(cec.touch_dialed("someone-we-never-dialed").is_none());
         assert!(cec.forget_dialed(canon));
         assert!(!cec.is_dialed(canon));
-        // A nodeless attempt row is curated away by number.
-        cec.record_attempt("987654321");
-        assert_eq!(cec.dialed_list().len(), 1);
-        assert!(cec.forget_number("987 654 321").is_some());
-        assert!(cec.dialed_list().is_empty());
+    }
+
+    #[test]
+    fn help_seeker_resolves_a_number_to_its_device() {
+        let cec = Cec::new(None);
+        // The raised hand IS the number→device binding: the beacon's
+        // authenticated sender resolves the digits.
+        cec.record_help_beacon(ME, &support_id_from_device(ME), "Front desk", "FRONT-01");
+        let digits = support_id_from_device(ME);
+        assert_eq!(
+            cec.help_seeker_by_number(&digits).as_deref(),
+            Some(pubkey_part(ME))
+        );
+        assert_eq!(cec.help_seeker_by_number("000000000"), None);
+    }
+
+    #[test]
+    fn help_list_is_gated_by_the_watch_view() {
+        let cec = Cec::new(None);
+        cec.record_help_beacon(ME, &support_id_from_device(ME), "Front desk", "FRONT-01");
+        // Cache fills regardless (membership is standing), but the queue
+        // only surfaces while the technician's view is armed.
+        assert!(cec.help_list().is_empty(), "disarmed view shows nothing");
+        cec.set_watching_help(true);
+        assert_eq!(cec.help_list().len(), 1);
+        cec.set_watching_help(false);
+        assert!(cec.help_list().is_empty());
+        // …and the number fallback still resolves while disarmed — a phoned-in
+        // number must work even when the queue view is off.
+        let digits = support_id_from_device(ME);
+        assert!(cec.help_seeker_by_number(&digits).is_some());
+    }
+
+    #[test]
+    fn legacy_number_keyed_directory_migrates_by_device() {
+        // A directory written by the per-number-room era: one completed dial
+        // (has a node), one nodeless attempt row, both with the old
+        // `network_id` room field. The completed row survives keyed by
+        // device; the nodeless attempt is meaningless without a room world
+        // and is dropped; the room field is ignored.
+        let path =
+            std::env::temp_dir().join(format!("cec-dialed-migration-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            serde_json::json!([
+                {
+                    "node": TECH,
+                    "number": "123456789",
+                    "label": "Reception PC",
+                    "online": true,
+                    "network_id": "cec-123456789",
+                    "last_used": 1700000000
+                },
+                {
+                    "node": "",
+                    "number": "987654321",
+                    "label": "",
+                    "online": false,
+                    "network_id": "cec-987654321",
+                    "last_used": 1700000001
+                }
+            ])
+            .to_string(),
+        )
+        .expect("write legacy directory");
+        let loaded = super::load_dialed(Some(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1, "nodeless attempt rows are dropped");
+        let row = loaded.get(pubkey_part(TECH)).expect("keyed by device");
+        assert_eq!(row.number, "123456789");
+        assert!(!row.online, "online is never trusted from disk");
     }
 
     #[test]
@@ -1177,6 +1189,9 @@ mod tests {
     #[test]
     fn help_queue_records_dedupes_and_withdraws() {
         let cec = Cec::new(None);
+        // The queue is a technician view — armed here so `help_list` surfaces
+        // what the beacons record.
+        cec.set_watching_help(true);
         // First beacon: a new asker — membership changed.
         assert!(cec.record_help_beacon(ME, "123 456 789", "Reception PC", "RECEPTION-01"));
         // Keep-alive with the same identity: TTL refresh only, no event churn.

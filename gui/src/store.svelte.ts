@@ -160,6 +160,7 @@ import {
   windowBehaviorSet,
   cecStatus,
   cecDial,
+  cecDialNode,
   cecPending,
   cecApprove,
   cecDeny,
@@ -171,7 +172,6 @@ import {
   cecHelpWatch,
   onCecHelp,
   type CecHelpSeeker,
-  cecForgetNumber,
   forgetNode,
   onCecRequest,
   onCecPeer,
@@ -240,27 +240,16 @@ import {
   type UpdateStatus,
 } from "./types";
 
-/** The `network_id` prefix every CEC Support customer room carries (mirrors the
- *  node's `CEC_NETWORK_PREFIX` in allmystuff-cec-protocol). A technician joins
- *  one of these per customer they dial; they're managed from the CEC tab, not
- *  the Meshes list, so they're filtered out of "Your meshes". */
-const CEC_NETWORK_PREFIX = "cec-";
-/** The one global help room every CEC client shares (the node's
- *  `HELP_NETWORK_ID`). Node-managed — hidden from the Meshes list. */
-const CEC_HELP_NETWORK_ID = "cecsupport-clients";
+/** The one shared CEC Support area every node lives on (the node's
+ *  `HELP_NETWORK_ID`). Node-managed — hidden from the Meshes list, since it's
+ *  driven entirely from the CEC tab. This single well-known id replaced the
+ *  old per-customer `cec-<number>` rooms: sessions ride the area now. */
+const CEC_AREA_NETWORK_ID = "cecsupport-clients";
 
 /** A stored customer unused for this long reads as "stale" — the cleanup nudge
  *  for a directory that grows as customers cycle out. Shared by the CEC tab's
  *  per-row badge and the "Remove stale" bulk curate action. */
 export const CEC_STALE_AFTER_S = 7 * 24 * 60 * 60;
-
-/** The bare digits of a customer's Support number — mirrors the node's
- *  `normalize_input` (strip spaces/dashes) closely enough to rebuild the
- *  `cec-<digits>` room id from a dialed customer's `number`, so the two can be
- *  matched GUI-side. Support IDs are all-digit, so a plain digit strip suffices. */
-function cecSupportDigits(number: string | undefined): string {
-  return (number ?? "").replace(/\D/g, "");
-}
 
 /** Which pane the settings panel is showing. */
 export type SettingsTab =
@@ -959,45 +948,16 @@ class AppStore {
     return net?.network_id === LOCAL_CLAIM_NETWORK_ID;
   }
 
-  /** Whether a mesh in the list is a **CEC Support customer room** — a
-   *  per-customer Silent mesh (`cec-…`) this technician joined by dialing a
-   *  number. These aren't ordinary meshes: they carry no roster, and you manage
-   *  them (open the console, disconnect) from the CEC tab, so the Meshes list
-   *  filters them out to keep client connections separate from your own meshes. */
-  isCecMesh(net: { network_id?: string } | null | undefined): boolean {
-    return !!net?.network_id && net.network_id.startsWith(CEC_NETWORK_PREFIX);
-  }
-
-  /** The `cec-…` room ids that currently have a **live dialed customer** — i.e.
-   *  the client meshes actively managed in the CEC tab. Rebuilt from the dialed
-   *  list (`cecCustomers`) by mirroring the node's `network_id_for_number`
-   *  (`cec-` + the number's digits), since the dialed record doesn't carry its
-   *  room id over the wire. */
-  cecManagedNetworkIds = $derived.by(
-    () =>
-      new Set(
-        this.cecCustomers.map((c) => `${CEC_NETWORK_PREFIX}${cecSupportDigits(c.number)}`),
-      ),
-  );
-
-  /** A CEC customer room that's actively managed in the CEC tab (has a dialed
-   *  customer). Only these are hidden from the Meshes list. An **orphaned**
-   *  `cec-…` room — a leftover from a previous node session, with no dialed
-   *  record (the dialed list is in-memory and not rebuilt on restart, but the
-   *  daemon persists the room) — is deliberately NOT hidden, so it stays
-   *  removable via the normal Leave instead of becoming invisible-and-stuck. */
+  /** Whether a mesh in the list is the **CEC Support area** — the one shared
+   *  mesh every CEC session rides. It's node-managed (joined at bring-up, or on
+   *  a technician's first dial) and driven from the CEC tab, so the Meshes list
+   *  filters it out to keep client support separate from your own meshes. */
   isManagedCecMesh(net: { network_id?: string } | null | undefined): boolean {
-    // The global help room is always CEC-managed: the node joins/leaves it on
-    // its own (a customer's ask, a technician's queue) and it never carries a
-    // session — surfacing it in Meshes would just invite a confusing Leave.
-    if (net?.network_id === CEC_HELP_NETWORK_ID) return true;
-    return this.isCecMesh(net) && this.cecManagedNetworkIds.has(net!.network_id!);
+    return net?.network_id === CEC_AREA_NETWORK_ID;
   }
 
-  /** Your meshes minus the CEC Support customer rooms you're actively managing
-   *  in the CEC tab — what the Meshes list actually shows. Active client rooms
-   *  live in the (secret) CEC tab instead; an orphaned `cec-…` room falls back
-   *  to this list so it can still be left. */
+  /** Your meshes minus the CEC Support area — what the Meshes list actually
+   *  shows. Client support lives in the (secret) CEC tab instead. */
   normalNetworks = $derived.by(() =>
     this.networks.filter((n) => !this.isManagedCecMesh(n)),
   );
@@ -2786,12 +2746,12 @@ class AppStore {
   }
 
   /** Route a CEC customer's console ask through the Support tab: open the
-   *  tab (where the dial / waiting-for-approval system lives) and start the
-   *  normal Control flow for their number. */
+   *  tab (where the dial / waiting-for-approval system lives) and re-open the
+   *  session with that device on the support area. */
   openCecSupportFlowFor(nodeId: string) {
     this.openSettings("cec");
     const c = this.cecCustomers.find((x) => x.node && sameMachine(x.node, nodeId));
-    if (c && !this.cecDialing) void this.reconnectCec(c.number);
+    if (c?.node && !this.cecDialing) void this.reconnectCec(c.node);
   }
 
   /** Start the console session *in this window* — the body of a console
@@ -6870,58 +6830,71 @@ class AppStore {
     if (waiting) this.cecHelpWaiting = waiting;
   }
 
-  /** Technician: dial a customer by the number they read out. On success the
-   *  customer appears on the graph as an ordinary peer and in the CEC tab's
-   *  "Active connections" list; a toast reports the outcome either way. */
+  /** Technician: answer a raised hand — dial the customer's device directly
+   *  (the beacon carried its id). The headline path; no number typed. */
+  async answerHelp(node: string, label?: string) {
+    await this.dialCecTarget({ node }, label ?? "that customer");
+  }
+
+  /** Technician: dial a customer by the number they read out — the fallback
+   *  for when the raised-hand list is too crowded to spot them. The node
+   *  resolves the digits to a device on the support area (a raised hand
+   *  first, else any area member whose number matches). On success the
+   *  customer appears in the CEC tab's "Active connections" list. */
   async dialCec() {
     const number = this.cecNumberDraft.trim();
     if (!number) {
       this.toast("warn", "Enter the customer's number first");
       return;
     }
-    if (await this.dialCecNumber(number)) this.cecNumberDraft = "";
+    if (await this.dialCecTarget({ number }, number)) this.cecNumberDraft = "";
   }
 
-  /** Reconnect to a machine already in the directory, by its number. Re-sends
-   *  the connect request, so an **expired** grant re-prompts the customer (a
-   *  still-valid one auto-approves) and the console opens on approval — the
-   *  one-click reuse the durable directory is for. */
-  async reconnectCec(number: string) {
-    await this.dialCecNumber(number);
+  /** Reconnect to a device already in the directory. Re-sends the connect
+   *  request, so an **expired** grant re-prompts the customer (a still-valid
+   *  one auto-approves) and the console opens on approval — the one-click
+   *  reuse the durable directory is for. Targets the stored device id, so it
+   *  never depends on the customer being reachable-by-number right now. */
+  async reconnectCec(node: string) {
+    await this.dialCecTarget({ node }, shortId(node));
   }
 
-  /** Shared connect/reconnect: dial `number`, arm the console to open the
-   *  moment the customer approves (see the onCecSession handler), and refresh
-   *  the CEC lists. Returns whether the dial was accepted (so `dialCec` can
-   *  clear its input only on success). */
-  private async dialCecNumber(number: string): Promise<boolean> {
+  /** Shared connect path for every CEC dial — a raised hand (`node`), the
+   *  number fallback (`number`), or a directory reconnect (`node`). Arms the
+   *  console to open the moment the customer approves (see the onCecSession
+   *  handler) and refreshes the CEC lists. Returns whether the dial was
+   *  accepted, so the caller can clear its input only on success. */
+  private async dialCecTarget(
+    target: { node: string } | { number: string },
+    display: string,
+  ): Promise<boolean> {
     if (!this.cecAgentName.trim()) {
       this.toast("warn", "Set your Agent Name first — the customer sees it");
       return false;
     }
+    const byNode = "node" in target;
     this.cecDialing = true;
-    this.cecDialingNumber = number;
-    clientLog(`[cec] dialing ${number}…`);
+    this.cecDialingNumber = byNode ? null : target.number;
+    clientLog(`[cec] dialing ${display}…`);
     try {
-      // Hard cap the wait. The node's own discovery deadline is 45s; if the
-      // socket request itself wedges past that, an un-timed await would leave
-      // cecDialing stuck true forever — every Connect button in the tab
-      // silently disabled (clicks do nothing, no Dialing row) until the app
-      // restarts. The UI must always get its state back.
+      // Hard cap the wait so a wedged socket request can't leave cecDialing
+      // stuck true forever (every Connect button then silently disabled until
+      // restart). The UI must always get its state back.
+      const agent = this.cecAgentName.trim();
       const r = await Promise.race([
-        cecDial(number, this.cecAgentName.trim()),
+        byNode ? cecDialNode(target.node, agent) : cecDial(target.number, agent),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("no answer from the node after 60s")), 60_000),
         ),
       ]);
       if (r?.node) {
         clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
-        this.toast("ok", `Connecting to ${number} — waiting for them to approve`);
+        this.toast("ok", `Connecting to ${display} — waiting for them to approve`);
         this.cecAutoOpenNode = r.node;
         void this.pullSessionSnapshot();
       } else {
         clientLog(`[cec] dial returned no node (web mode or empty reply)`);
-        this.toast("ok", `Dialed ${number}`);
+        this.toast("ok", `Dialed ${display}`);
       }
       return true;
     } catch (e) {
@@ -6930,7 +6903,7 @@ class AppStore {
       if (msg.includes("cancelled") || msg.includes("canceled")) {
         this.toast("ok", "Stopped dialing");
       } else {
-        this.toast("warn", `Couldn't reach ${number}: ${msg}`);
+        this.toast("warn", `Couldn't reach ${display}: ${msg}`);
       }
       return false;
     } finally {
@@ -7001,11 +6974,12 @@ class AppStore {
     void this.loadCec();
   }
 
-  /** Remove a directory row by its number — the curation path for an attempt
-   *  row that never discovered a node (it has no node id for forgetNode). */
-  async removeCecNumber(number: string) {
+  /** Remove a directory row — drops the device from the graph/roster and the
+   *  CEC directory. Every dialed row is device-keyed now, so this is just
+   *  `forgetNode` on the customer's id. */
+  async removeCecCustomer(node: string) {
     try {
-      await cecForgetNumber(number);
+      await forgetNode(node);
     } catch (e) {
       this.toast("warn", `Couldn't remove it: ${errMsg(e)}`);
     }
@@ -7020,17 +6994,16 @@ class AppStore {
   }
 
   /** Curate the directory in one action: forget every customer that's cycled
-   *  out (gone stale), instead of picking them off one by one. Leaves each
-   *  customer's Silent mesh and drops it from the graph, same as a single
-   *  Remove. */
+   *  out (gone stale), instead of picking them off one by one. Drops each from
+   *  the graph, same as a single Remove — the shared area stays (it's home). */
   async removeStaleCec() {
     const cutoff = Date.now() / 1000 - CEC_STALE_AFTER_S;
     const stale = this.cecCustomers.filter((c) => c.last_used && c.last_used < cutoff);
     if (stale.length === 0) return;
     for (const c of stale) {
+      if (!c.node) continue;
       try {
-        if (c.node) await forgetNode(c.node);
-        else await cecForgetNumber(c.number);
+        await forgetNode(c.node);
       } catch {
         /* keep going — one failure shouldn't strand the rest */
       }

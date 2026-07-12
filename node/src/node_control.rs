@@ -1401,17 +1401,41 @@ pub async fn dispatch(
 
         // ---- CEC Support -------------------------------------------------
         // The verbatim node-control surface the CEC Support client app and this
-        // app's CEC tab both depend on. Technician commands (`cec_dial`) and
-        // customer commands (`cec_start_hosting`, the approve/deny/revoke flow)
-        // share the one dispatch; the events (`cec://request|peer|session|
-        // grants`) ride the UiSink like every other engine event.
+        // app's CEC tab both depend on. Technician commands (`cec_dial_node`,
+        // the raised-hand answer; `cec_dial`, the number fallback) and customer
+        // commands (`cec_online`, the approve/deny/revoke flow) share the one
+        // dispatch; the events (`cec://request|peer|session|grants`) ride the
+        // UiSink like every other engine event. Everything lives on the one
+        // support area — the per-number room ops are gone.
         "cec_status" => json_result(mesh.cec_status().await),
-        "cec_start_hosting" => json_result(mesh.cec_start_hosting().await),
-        "cec_stop_hosting" => json_result(mesh.cec_stop_hosting().await),
+        "cec_online" => json_result(mesh.cec_online().await),
         "cec_dial" => {
             let number: String = try_arg!(arg(a, "number"));
             let agent_name: String = try_arg!(opt(a, "agent_name")).unwrap_or_default();
             json_result(mesh.cec_dial(number, agent_name).await)
+        }
+        "cec_dial_node" => {
+            let node: String = try_arg!(arg(a, "node"));
+            let agent_name: String = try_arg!(opt(a, "agent_name")).unwrap_or_default();
+            json_result(mesh.cec_dial_node(node, agent_name).await)
+        }
+        // The customer app's "name this computer" — an alias for the identity
+        // label op (the machine label the help beacon and the technician's
+        // card both read). Kept as a distinct name so the CEC Support client's
+        // existing call resolves; without this arm it was a silent no-op.
+        "cec_set_label" => {
+            let label: String = try_arg!(arg(a, "label"));
+            let out = daemon_request(
+                client,
+                Request::IdentitySetLabel {
+                    label: label.clone(),
+                },
+            )
+            .await;
+            if let DispatchOut::Json(_) = &out {
+                mesh.set_label(label).await;
+            }
+            out
         }
         "cec_pending" => json_result(mesh.cec_pending().await),
         "cec_approve" => {
@@ -1444,10 +1468,6 @@ pub async fn dispatch(
         "cec_help_watch" => {
             let on: bool = try_arg!(opt(a, "on")).unwrap_or(true);
             json_result(mesh.cec_help_watch(on).await)
-        }
-        "cec_forget_number" => {
-            let number: String = try_arg!(arg(a, "number"));
-            json_result(mesh.cec_forget_number(number).await)
         }
         // "Forget this node" is an app-wide feature on every node's gear (drops
         // any node from the graph/roster + tears its session down). It lives on
