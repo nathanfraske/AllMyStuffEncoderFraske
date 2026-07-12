@@ -2497,10 +2497,17 @@ impl Mesh {
         // it, the native decoder where it doesn't) — but inbound samples
         // arrive via the daemon, and an old one would negotiate a stream
         // it can't deliver.
-        let video = if self.daemon_video.load(Ordering::SeqCst) {
+        let video = if video.is_empty() {
             video
         } else {
-            Vec::new()
+            // This list is a one-shot decision for the whole session —
+            // wait out the bring-up race before stripping anything.
+            self.await_video_bringup().await;
+            if self.daemon_video.load(Ordering::SeqCst) {
+                video
+            } else {
+                Vec::new()
+            }
         };
         let me = self.local_node_id().ok_or("mesh not ready")?;
         let media = parse_media(&media);
@@ -3938,7 +3945,15 @@ impl Mesh {
                     // Replies ride best-effort; the failure is already logged.
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
-                Effect::StartMedia(route) => self.start_media(&route),
+                Effect::StartMedia(route) => {
+                    // The sender's transport pick inside start_media is
+                    // one-shot too — same bring-up race guard, only for
+                    // routes that carry a picture.
+                    if matches!(route.media, MediaKind::Display | MediaKind::Video) {
+                        self.await_video_bringup().await;
+                    }
+                    self.start_media(&route)
+                }
                 Effect::RefreshMedia(id) => self.video.force_idr(&id),
                 Effect::TuneMedia {
                     route_id,
@@ -6994,6 +7009,20 @@ impl Mesh {
     /// offer asked for it and the route's sorted position falls inside
     /// the effective lane pool; MJPEG over the media channel otherwise,
     /// exactly as v1.
+    /// Bounded wait for the daemon's video bring-up before a one-shot
+    /// transport decision. Dials are fast now (the area dial has no
+    /// discovery pause), and racing the VideoSubscribe probe stripped
+    /// h264 and pinned capable pairs on MJPEG for the whole session. A
+    /// daemon that truly predates the track lane never flips the flag —
+    /// the timeout falls through to the honest MJPEG pick.
+    async fn await_video_bringup(&self) {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let by = std::time::Instant::now() + DEADLINE;
+        while !self.daemon_video.load(Ordering::SeqCst) && std::time::Instant::now() < by {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     fn pick_outbound_video_mode(&self, route: &Route, to_node: &str) -> VideoMode {
         let accepts_h264 = self
             .state
