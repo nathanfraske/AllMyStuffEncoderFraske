@@ -1139,6 +1139,26 @@ export async function fleetRevokeRole(
   await invoke("fleet_revoke_role", { device, code: code ?? null });
 }
 
+/** Designate the fleet's infra hubs — the owner-signed, network-wide shape
+ *  every member's daemon converges onto (daemon ≥ 0.2.36). Pass the FULL hub
+ *  set each call (it replaces, not merges); an empty set returns the fleet to
+ *  full mesh. Owner-only; throws with the reason when refused — including the
+ *  "daemon needs 0.2.36+" hint from members whose daemon predates the op.
+ *  `code` is the custody second factor when fleet MFA is enrolled. */
+export async function fleetSetHubs(
+  hubs: string[],
+  redundancy?: number,
+  code?: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("fleet_set_hubs", {
+    hubs,
+    redundancy: redundancy ?? null,
+    code: code ?? null,
+  });
+}
+
 /** Whether this device has enrolled a custody authenticator for the fleet's
  *  closed network. `no_fleet` is true when there's no fleet to enroll yet. */
 export interface FleetMfaStatus {

@@ -1131,6 +1131,12 @@ pub async fn dispatch(
             let code: Option<String> = try_arg!(opt(a, "code"));
             json_result(mesh.fleet_revoke_role(device, code).await)
         }
+        "fleet_set_hubs" => {
+            let hubs: Vec<String> = try_arg!(arg(a, "hubs"));
+            let redundancy: Option<u32> = try_arg!(opt(a, "redundancy"));
+            let code: Option<String> = try_arg!(opt(a, "code"));
+            json_result(mesh.fleet_set_hubs(hubs, redundancy, code).await)
+        }
 
         // ---- daemon passthroughs ----------------------------------------
         "mesh_status" => daemon_request(client, Request::Status).await,

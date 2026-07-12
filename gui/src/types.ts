@@ -491,6 +491,18 @@ export interface OwnedRoster {
    *  set only on this machine, never synced from the fleet, never settable
    *  by a remote peer. Off (absent) = LAN-local claiming only — the default. */
   public_claims?: boolean;
+  /** Governed topology (daemon ≥ 0.2.36): the owner-signed, network-wide
+   *  shape the fleet mesh runs — `hubs` once infra hubs are designated,
+   *  `full_mesh` after an explicit reset. Null/absent when ungoverned (the
+   *  pre-hubs default) or when the local daemon predates governed topology.
+   *  Every member's daemon converges onto this via the signed log; it is
+   *  read-only here except through the owner's hub toggles. */
+  topology?:
+    | { kind: "hubs"; hubs: string[]; spoke_redundancy: number | null }
+    | { kind: "full_mesh" }
+    | { kind: "ring"; n_preferred: number | null }
+    | { kind: "star"; hub: string }
+    | null;
 }
 
 // ---- self-update (mirrors `allmystuff-updater`) -----------------------
