@@ -43,6 +43,65 @@
     void app.setFleetName(nameDraft);
   }
 
+  // ---- infra hubs (governed topology) --------------------------------
+  //
+  // The owner stages hub toggles on the member rows, then signs the whole
+  // shape in one governance transition (`fleet_set_hubs`). Every member's
+  // daemon (≥ 0.2.36) converges onto it via the signed log — nothing to
+  // configure per device. Draft state mirrors the fleet-name editor:
+  // seeded from the converged roster unless the user is mid-edit.
+
+  /** Canonical pubkey half of a device id (mirror of the backend's
+   *  `pubkey_part` — base32 has no dash, so everything past the first
+   *  dash is display suffix). */
+  const canon = (id: string) => id.split("-")[0];
+
+  const governedTopo = $derived(fleet?.topology ?? null);
+  const governedHubs = $derived(
+    governedTopo?.kind === "hubs" ? governedTopo.hubs : [],
+  );
+  const governedRedundancy = $derived(
+    governedTopo?.kind === "hubs" ? governedTopo.spoke_redundancy : null,
+  );
+
+  let hubsDraft = $state<string[]>([]);
+  let redundancyDraft = $state<number | null>(null);
+  let hubsDirty = $state(false);
+  $effect(() => {
+    const live = governedHubs;
+    const liveR = governedRedundancy;
+    if (!hubsDirty) {
+      hubsDraft = [...live];
+      redundancyDraft = liveR;
+    }
+  });
+
+  const isHubDraft = (device: string) =>
+    hubsDraft.some((h) => canon(h) === canon(device));
+  const isHubLive = (device: string) =>
+    governedHubs.some((h) => canon(h) === canon(device));
+
+  function toggleHub(device: string) {
+    hubsDirty = true;
+    const c = canon(device);
+    hubsDraft = hubsDraft.some((h) => canon(h) === c)
+      ? hubsDraft.filter((h) => canon(h) !== c)
+      : [...hubsDraft, c];
+  }
+
+  async function applyHubs() {
+    await app.setFleetHubs(hubsDraft, redundancyDraft ?? undefined);
+    // Converged roster (or the failure toast) is the outcome; either way
+    // the draft re-seeds from live state.
+    hubsDirty = false;
+  }
+
+  function cancelHubs() {
+    hubsDirty = false;
+    hubsDraft = [...governedHubs];
+    redundancyDraft = governedRedundancy;
+  }
+
   // Remote claiming by code — the WAN path behind the public-claims toggle.
   // Slow by nature (joins a randomized rendezvous network and waits for the
   // device to appear), so it carries its own busy + error state.
@@ -341,6 +400,7 @@
                   {#if isSelf} <span class="self-tag">this device</span>{/if}
                   {#if isOwner} <span class="owner-tag">★ Owner</span>
                   {:else if isManager} <span class="mgr-tag">Manager</span>{/if}
+                  {#if isHubLive(m.device)} <span class="hub-tag">⬢ Hub</span>{/if}
                 </div>
                 <div class="m-sub" title={m.device}>{m.device.slice(0, 18)}…</div>
               </div>
@@ -353,6 +413,18 @@
               >
                 🔍 View
               </button>
+              {#if app.isFleetOwner}
+                <button
+                  class="role-btn hub-toggle"
+                  class:hub-on={isHubDraft(m.device)}
+                  title={isHubDraft(m.device)
+                    ? "Staged as an infra hub — sign the shape below to apply"
+                    : "Stage this device as an infra hub: hubs full-mesh each other and carry the rest of the fleet, so spokes keep a couple of links instead of one per device. Pick always-on boxes."}
+                  onclick={() => toggleHub(m.device)}
+                >
+                  {isHubDraft(m.device) ? "⬢ Hub ✓" : "⬢ Hub"}
+                </button>
+              {/if}
               <!-- Controls reflect what the mesh layer actually enforces (these
                    are MyOwnMesh's closed-network roles): only an owner can make
                    or withdraw managers and owners; a manager (controller) can
@@ -433,6 +505,70 @@
           Only an owner can change roles; an owner or a manager can evict a
           member. This device can leave on its own below.
         </p>
+      {/if}
+    </section>
+
+    <section class="block">
+      <h4>⬢ Connection shape</h4>
+      {#if governedTopo === null}
+        <p class="hint">
+          Full mesh (default): every device connects to every other — fine
+          for a handful of machines, N² links as the fleet grows.
+          {#if app.isFleetOwner}
+            Toggle <b>⬢ Hub</b> on your always-on boxes above to move the
+            fleet onto a hub tier: hubs carry the traffic, everything else
+            keeps just a couple of links. Members need mesh daemon 0.2.36+
+            (it self-updates).
+          {/if}
+        </p>
+      {:else if governedTopo.kind === "hubs"}
+        <p class="hint">
+          Hub tier, signed by the owner: {governedHubs.length}
+          hub{governedHubs.length === 1 ? "" : "s"} carry the fleet — hubs
+          full-mesh each other, every other device keeps
+          {governedRedundancy ?? 2} hub
+          link{(governedRedundancy ?? 2) === 1 ? "" : "s"}. Every member's
+          daemon follows this automatically.
+        </p>
+      {:else if governedTopo.kind === "full_mesh"}
+        <p class="hint">
+          Full mesh, signed by the owner — every device connects to every
+          other. {#if app.isFleetOwner}Toggle <b>⬢ Hub</b> on members above
+            to move to a hub tier.{/if}
+        </p>
+      {:else}
+        <p class="hint">Owner-signed shape: {governedTopo.kind}.</p>
+      {/if}
+
+      {#if app.isFleetOwner && hubsDirty}
+        <div class="hub-apply">
+          {#if hubsDraft.length > 0}
+            <label class="hub-redundancy">
+              links per spoke
+              <input
+                type="number"
+                min="1"
+                max={Math.max(hubsDraft.length, 1)}
+                placeholder="2"
+                value={redundancyDraft ?? ""}
+                oninput={(e) => {
+                  const v = (e.currentTarget as HTMLInputElement).value;
+                  redundancyDraft = v === "" ? null : Math.max(1, Number(v));
+                }}
+              />
+            </label>
+          {:else}
+            <span class="hint-inline">
+              No hubs staged — signing returns the fleet to full mesh.
+            </span>
+          {/if}
+          <button class="btn small primary" onclick={() => void applyHubs()}>
+            {hubsDraft.length > 0
+              ? `Sign shape (${hubsDraft.length} hub${hubsDraft.length === 1 ? "" : "s"})`
+              : "Sign full mesh"}
+          </button>
+          <button class="btn small" onclick={cancelHubs}>Cancel</button>
+        </div>
       {/if}
     </section>
 
@@ -750,6 +886,52 @@
     background: var(--c-fleet-soft);
     border-radius: var(--r-pill);
     padding: 0.05rem 0.4rem;
+  }
+  /* Infra hub — the accent family, so shape reads apart from authority. */
+  .hub-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-radius: var(--r-pill);
+    padding: 0.05rem 0.4rem;
+  }
+  .role-btn.hub-on {
+    border-color: var(--accent-soft);
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+  .role-btn.hub-toggle:hover {
+    border-color: var(--accent);
+  }
+  .hub-apply {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+  }
+  .hub-redundancy {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+  }
+  .hub-redundancy input {
+    width: 4.5rem;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    color: var(--ink);
+    font: inherit;
+    padding: 0.25rem 0.45rem;
+  }
+  .hint-inline {
+    font-size: 0.78rem;
+    color: var(--ink-soft);
   }
 
   .m-name {

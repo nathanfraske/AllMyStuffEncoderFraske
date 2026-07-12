@@ -2182,9 +2182,41 @@ impl Mesh {
     }
 
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
-    /// Opus decoder when it ends.
-    fn release_audio_lanes(&self, route_id: &str) {
+    /// Opus decoder when it ends — and close the daemon audio lane the
+    /// end freed. Audio lanes are positional, not pinned like video
+    /// ([`Self::audio_lane`]: a route streams on its rank among the
+    /// peer's live Opus routes), so the lane that goes idle is the old
+    /// **top** one — every survivor above the ended route shifts down —
+    /// which is why the index closed here is the survivor count, not the
+    /// ended route's own rank. A survivor mid-shift or a new route racing
+    /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
+    /// window and a write inside it revives the track with no SDP work.
+    fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
         self.audio_decoders.lock().remove(route_id);
+        let Some(peer) = self.route_peer(route_id) else {
+            return;
+        };
+        let cap = self.effective_audio_lanes(&peer);
+        if cap == 0 {
+            return;
+        }
+        // Excluding the ended route by id (rather than trusting it to be
+        // gone) keeps the count right at every call site: teardown leaves
+        // the route in the session map (only flipped to TornDown), and
+        // the StopMedia effect can run either side of that flip.
+        let survivors = self
+            .sorted_media_routes(&peer, true, "opus")
+            .iter()
+            .filter(|id| id.as_str() != route_id)
+            .count();
+        // Lanes [0, survivors) are still owned; lane `survivors` is the
+        // one this end vacated — when it had one at all. An overflow
+        // route beyond the pool frees nothing (survivors >= cap), and
+        // closing a lane that never opened is the daemon's idempotent
+        // no-op, so a non-Opus route ending here costs nothing.
+        if survivors < cap as usize {
+            self.close_daemon_media_lane(&peer, "audio", survivors as u8);
+        }
     }
 
     /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
@@ -4643,6 +4675,10 @@ impl Mesh {
                 Some(n) => self.is_fleet_owner_signed(n).await,
                 None => false,
             };
+        let governed_topology = match network.as_deref() {
+            Some(n) => self.fleet_governed_topology(n).await.unwrap_or(Value::Null),
+            None => Value::Null,
+        };
         let mut value = serde_json::to_value(roster).unwrap_or_else(|_| empty_owned());
         if let Some(obj) = value.as_object_mut() {
             // Whether this device may take owner actions (signed owner or the
@@ -4666,6 +4702,11 @@ impl Mesh {
                 "public_claims".into(),
                 Value::Bool(self.ownership.public_claims()),
             );
+            // Governed topology (daemon ≥ 0.2.36): the owner-signed
+            // network-wide shape the fleet runs, or null when ungoverned
+            // (or the daemon predates it). The Fleet pane's infra-hub
+            // toggles render from this.
+            obj.insert("topology".into(), governed_topology);
             // Stamp each member with its governance role for the drawer's
             // grant/withdraw controls.
             if let Some(arr) = obj.get_mut("members").and_then(|v| v.as_array_mut()) {
@@ -5640,6 +5681,31 @@ impl Mesh {
             })
     }
 
+    /// The fleet network's governed topology — the owner-signed,
+    /// network-wide shape (daemon ≥ 0.2.36) — as the raw snapshot JSON
+    /// (`{"kind":"hubs","hubs":[…],"spoke_redundancy":…}` etc). `None`
+    /// when the network isn't governed, the daemon predates governed
+    /// topology (no `topology` key in the snapshot), or the state can't
+    /// be read — callers treat all three as "no governed shape".
+    async fn fleet_governed_topology(&self, network: &str) -> Option<Value> {
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return None,
+        };
+        let topo = data.get("state")?.get("topology")?.clone();
+        if topo.is_null() {
+            None
+        } else {
+            Some(topo)
+        }
+    }
+
     /// True if this device is a **signed owner** of `network` — granted the
     /// owner role in the governance log — regardless of whether it minted the
     /// fleet key. Management authority (evict, admit, promote) keys on this, not
@@ -6055,6 +6121,74 @@ impl Mesh {
         Ok(())
     }
 
+    /// Front-end command: designate the fleet's infra hubs — the owner-signed,
+    /// network-wide shape every member's daemon converges onto (≥ 0.2.36).
+    /// A non-empty `hubs` proposes the hub tier (hubs full-mesh each other,
+    /// every other member rides `redundancy` of them); an empty list proposes
+    /// `full_mesh`, the shape a fleet has before anyone designates hubs. The
+    /// daemon enforces owner authority; we float the proposal and surface any
+    /// refusal — including the "op unknown" parse error a pre-0.2.36 daemon
+    /// gives back, translated into an update hint.
+    pub async fn fleet_set_hubs(
+        self: &Arc<Self>,
+        hubs: Vec<String>,
+        redundancy: Option<u32>,
+        code: Option<String>,
+    ) -> Result<(), String> {
+        let network = self
+            .ownership
+            .fleet_network_id()
+            .ok_or("this device isn't in a fleet")?;
+        let canon: Vec<String> = hubs
+            .iter()
+            .map(|h| pubkey_part(h).to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        let (topology, hub) = if canon.is_empty() {
+            ("full_mesh".to_string(), None)
+        } else {
+            let spec = match redundancy {
+                Some(r) => format!("{}:{r}", canon.join(",")),
+                None => canon.join(","),
+            };
+            ("hubs".to_string(), Some(spec))
+        };
+        tracing::info!(
+            "proposing fleet topology {topology} ({} hubs) on {network}",
+            canon.len()
+        );
+        let resp = self
+            .client
+            .request(&Request::GovernanceProposeTopology {
+                network,
+                topology,
+                hub,
+                mfa_code: code,
+            })
+            .await;
+        match resp {
+            Ok(r) if r.ok => {}
+            Ok(r) => {
+                let msg = r
+                    .error
+                    .unwrap_or_else(|| "couldn't set the fleet topology".into());
+                // A pre-0.2.36 daemon can't parse the op at all — its serde
+                // error reads like gibberish in the UI, so translate it.
+                if msg.contains("unknown variant") || msg.contains("expected one of") {
+                    return Err(
+                        "the mesh daemon on this device predates governed topology — \
+                         it needs 0.2.36+ (it self-updates shortly after release)"
+                            .into(),
+                    );
+                }
+                return Err(msg);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        self.emit_owned().await;
+        Ok(())
+    }
+
     /// Front-end command: withdraw `device`'s fleet role — revoke it back to a
     /// plain member. Used for "withdraw as manager / owner". Like a grant, the
     /// daemon enforces who may revoke (authority over the target's current
@@ -6429,7 +6563,12 @@ impl Mesh {
                                     "opus encoder for {} failed ({e}) — falling back to PCM frames",
                                     route.id
                                 );
-                                self.release_audio_lanes(&route.id);
+                                // Decoder drop only — NOT release_audio_lanes:
+                                // the route is still live (it keeps its rank in
+                                // the peer's Opus order), so the positional
+                                // close there would hit the top-ranked
+                                // neighbour's lane, not this route's.
+                                self.audio_decoders.lock().remove(&route.id);
                                 None
                             }
                         }

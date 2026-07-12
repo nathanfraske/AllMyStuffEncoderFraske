@@ -366,6 +366,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
+    /// Propose the owner-signed, network-wide topology (daemon ≥ 0.2.36).
+    /// `topology` is `"ring"` | `"star"` | `"hubs"` | `"full_mesh"`; `hub`
+    /// carries the star hub id or the hubs spec
+    /// (`id1,id2[,…][:spoke_redundancy]`). Once ratified, every member's
+    /// daemon converges onto the shape — this is how fleet infra hubs are
+    /// designated. An older daemon rejects the unknown op; callers surface
+    /// that as "update the daemon".
+    GovernanceProposeTopology {
+        network: String,
+        topology: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hub: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
     /// Sign a pending proposal.
     GovernanceSign {
         network: String,

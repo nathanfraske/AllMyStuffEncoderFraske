@@ -1206,6 +1206,28 @@ async fn fleet_revoke_role(
     Ok(())
 }
 
+/// Designate the fleet's infra hubs — the owner-signed network-wide shape
+/// every member's daemon converges onto (daemon ≥ 0.2.36). Pass the full hub
+/// set each call; an empty set returns the fleet to full mesh. Owner-only.
+/// `code` is the custody second factor when fleet MFA is enrolled.
+#[tauri::command]
+async fn fleet_set_hubs(
+    state: State<'_, AppState>,
+    hubs: Vec<String>,
+    redundancy: Option<u32>,
+    code: Option<String>,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "fleet_set_hubs",
+            json!({ "hubs": hubs, "redundancy": redundancy, "code": code }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Whether this device has enrolled a custody authenticator for the fleet's
 /// closed network: `{ "enrolled": bool, "no_fleet"?: true }`.
 #[tauri::command]
@@ -2360,6 +2382,7 @@ fn main() {
             fleet_set_name,
             fleet_grant_role,
             fleet_revoke_role,
+            fleet_set_hubs,
             fleet_mfa_status,
             fleet_mfa_enroll,
             fleet_mfa_disable,

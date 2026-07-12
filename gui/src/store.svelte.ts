@@ -66,6 +66,7 @@ import {
   fleetSetName,
   fleetGrantRole,
   fleetRevokeRole,
+  fleetSetHubs,
   fleetMfaStatus,
   isMobile,
   isTauri,
@@ -1161,6 +1162,16 @@ class AppStore {
   /** Withdraw a fleet member's role, back to a plain member (owner-only). */
   async withdrawFleetRole(device: string) {
     await this.runFleetGov("Withdraw role", (code) => fleetRevokeRole(device, code));
+  }
+
+  /** Designate the fleet's infra hubs (owner-only; daemon ≥ 0.2.36 — the
+   *  backend enforces authority and may need the MFA code). Pass the FULL
+   *  hub set; an empty set signs the fleet back to full mesh. */
+  async setFleetHubs(hubs: string[], redundancy?: number) {
+    await this.runFleetGov(
+      hubs.length ? "Set infra hubs" : "Reset to full mesh",
+      (code) => fleetSetHubs(hubs, redundancy, code),
+    );
   }
 
   /** Name (or rename) the fleet — members only (the backend enforces it;
