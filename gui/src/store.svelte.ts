@@ -1503,14 +1503,26 @@ class AppStore {
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
       const renamed = (this.ownedFleet?.name ?? "") !== (r.name ?? "");
+      // Joining a fleet adds its closed network; leaving, being released or
+      // a dissolve REMOVES it (the node tears the mesh out before it emits
+      // this event). Either way the network SET changed, not just the
+      // roster — and the meshes list only re-reads network configs when
+      // asked, so without this the dead fleet mesh sat in the list until
+      // some unrelated refresh ("left the fleet but still on the fleet
+      // mesh"). Rename is the same story for the label only.
+      const fleetMeshChanged =
+        (this.ownedFleet?.network_id ?? null) !== (r.network_id ?? null);
       this.ownedFleet = r;
       this.reconcileFleetRelationships();
       // A rename changes the fleet *mesh* label, which the graph's network
       // chips (and the meshes list) read from the network config — not the
       // roster. The 3 s mesh poll never re-reads network labels, so pull them
-      // now and re-derive the graph, so a fleet rename actually shows up on the
-      // mesh pills, not just the "<name>'s fleet" grouping.
-      if (renamed) void this.refreshNetworks().then(() => this.syncMeshGraph());
+      // now and re-derive the graph, so a fleet rename (or the fleet mesh
+      // appearing/vanishing) actually shows up on the mesh pills, not just
+      // the "<name>'s fleet" grouping.
+      if (renamed || fleetMeshChanged) {
+        void this.refreshNetworks().then(() => this.syncMeshGraph());
+      }
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
@@ -7116,8 +7128,30 @@ class AppStore {
 
   /** The per-node gear "Forget this node": drop it from the graph + roster,
    *  tear its session down, end any CEC session. Removes it locally at once so
-   *  the graph reacts immediately; the next snapshot confirms. */
+   *  the graph reacts immediately; the next snapshot confirms.
+   *
+   *  A FLEET MEMBER can't be merely forgotten: the signed roster is the
+   *  authority, so a local-only forget gets gossiped straight back onto the
+   *  graph — an eternity member. Forgetting one therefore PROPAGATES: it
+   *  routes through the same owner/manager governance eviction the Fleet
+   *  pane runs (MFA prompt included), and only a completed evict lets the
+   *  local sweep proceed. If the evict is refused (not your fleet role) or
+   *  cancelled at the prompt, nothing is half-forgotten. */
   async forgetNode(nodeId: string) {
+    if (this.backendConnected && this.isFleetMember(nodeId) && !this.isMe(nodeId)) {
+      const label = this.node(nodeId)?.label ?? "that device";
+      await this.runFleetGov(`Forget ${label}`, async (code) => {
+        await fleetKick(nodeId, code);
+        await this.forgetNodeLocal(nodeId);
+      });
+      return;
+    }
+    await this.forgetNodeLocal(nodeId);
+  }
+
+  /** The local half of Forget — session/route teardown + catalog sweep.
+   *  Fleet members reach this only after their eviction went through. */
+  private async forgetNodeLocal(nodeId: string) {
     // Drop any live routes we hold to it, then the backend teardown.
     const routes = this.catalog.routes.filter(
       (r) => sameMachine(this.capNodeOf(r.from), nodeId) || sameMachine(this.capNodeOf(r.to), nodeId),
