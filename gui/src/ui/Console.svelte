@@ -891,14 +891,34 @@
       // H.264 — decode entry is a key unit; deltas before one wait. Every
       // access unit is fed straight to the decoder; the freshest decoded
       // frame wins at paint time (output callback below supersedes any
-      // earlier pending frame, one rAF blits the newest). No compressed-queue
-      // valve here: a hardware decoder keeps up with 4K60 natively, and the
-      // one that tried to bound the queue by force-dropping to keyframes
-      // thrashed a normally-pipelined decoder down to ~15 fps (and could trip
-      // the software-decode fallback). If a decoder genuinely can't keep up,
-      // the stall ladder below steps it down, and the sender's auto-adapt
-      // drops resolution — neither needs per-frame keyframe forcing.
+      // earlier pending frame, one rAF blits the newest). No per-frame
+      // compressed-queue valve here: a hardware decoder keeps up with 4K60
+      // natively, and the one that tried to bound the queue by force-dropping
+      // to keyframes thrashed a normally-pipelined decoder down to ~15 fps
+      // (and could trip the software-decode fallback). If a decoder genuinely
+      // can't keep up, the stall ladder below steps it down.
+      //
+      // What DOES exist is the live-edge snap: when the input queue has
+      // ballooned well past any normal pipeline depth (a decoder running
+      // just slightly behind arrival accumulates unboundedly — the picture
+      // "keeps catching up" seconds behind the cursor) and a fresh KEY unit
+      // is in hand, drop the queued backlog and re-enter at that key. It
+      // costs the stale frames only — never quality, never arriving frames —
+      // and normal pipelining (a handful queued) can't trip it.
       inCount += 1;
+      if (
+        decoder &&
+        decoder.state !== "closed" &&
+        f.key &&
+        decoder.decodeQueueSize > 12
+      ) {
+        try {
+          decoder.close();
+        } catch {
+          // already closed
+        }
+        decoder = null; // re-created right below, at this key unit
+      }
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
         codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";

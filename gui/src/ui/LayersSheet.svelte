@@ -68,8 +68,14 @@
   const venueChips = $derived(
     cap(app.venues.map((v) => ({ label: v.label, tag: v.builtin ? "public" : "private" }))),
   );
+  // Same list the Meshes pane shows — the node-managed CEC Support area is
+  // client-support plumbing, not one of "your meshes".
   const meshChips = $derived(
-    cap((Array.isArray(app.networks) ? app.networks : []).map((n) => ({ label: app.meshLabel(n) }))),
+    cap(
+      (Array.isArray(app.normalNetworks) ? app.normalNetworks : []).map((n) => ({
+        label: app.meshLabel(n),
+      })),
+    ),
   );
   const fleetChips = $derived(
     cap(

@@ -1503,14 +1503,26 @@ class AppStore {
     // a fresh copy. This is what makes a claim visibly *do* something.
     await onOwned((r) => {
       const renamed = (this.ownedFleet?.name ?? "") !== (r.name ?? "");
+      // Joining a fleet adds its closed network; leaving, being released or
+      // a dissolve REMOVES it (the node tears the mesh out before it emits
+      // this event). Either way the network SET changed, not just the
+      // roster — and the meshes list only re-reads network configs when
+      // asked, so without this the dead fleet mesh sat in the list until
+      // some unrelated refresh ("left the fleet but still on the fleet
+      // mesh"). Rename is the same story for the label only.
+      const fleetMeshChanged =
+        (this.ownedFleet?.network_id ?? null) !== (r.network_id ?? null);
       this.ownedFleet = r;
       this.reconcileFleetRelationships();
       // A rename changes the fleet *mesh* label, which the graph's network
       // chips (and the meshes list) read from the network config — not the
       // roster. The 3 s mesh poll never re-reads network labels, so pull them
-      // now and re-derive the graph, so a fleet rename actually shows up on the
-      // mesh pills, not just the "<name>'s fleet" grouping.
-      if (renamed) void this.refreshNetworks().then(() => this.syncMeshGraph());
+      // now and re-derive the graph, so a fleet rename (or the fleet mesh
+      // appearing/vanishing) actually shows up on the mesh pills, not just
+      // the "<name>'s fleet" grouping.
+      if (renamed || fleetMeshChanged) {
+        void this.refreshNetworks().then(() => this.syncMeshGraph());
+      }
     });
     await onOwnership((o) => {
       const who = this.catalog.nodes.find((n) => sameMachine(n.id, o.from))?.label ?? "A device";
@@ -1618,7 +1630,12 @@ class AppStore {
    *  membership — the roster of known devices plus currently-live peers,
    *  across every joined network. This is what makes "others on the mesh"
    *  appear; the bespoke presence channel only layers device detail on top
-   *  when a peer also runs AllMyStuff. Mirrors how MyOwnMesh builds its map. */
+   *  when a peer also runs AllMyStuff. Mirrors how MyOwnMesh builds its map.
+   *  Two deliberate exceptions keep normal churn from accreting here: the
+   *  CEC Support area contributes only links this daemon holds (never its
+   *  customer roster), and each poll ends with a sweep that drops the
+   *  capabilities, routes and grace stamps of machines that left the
+   *  catalog — a support box runs for days while customers come and go. */
   async syncMeshGraph() {
     if (!isTauri()) return;
     // Live peers are keyed by the full device id (`{pubkey}-{suffix}`) — the
@@ -1658,6 +1675,13 @@ class AppStore {
     const offlineCanons = new Set<string>();
     for (const net of nets) {
       const netName = this.meshLabel(net);
+      // The CEC Support area never contributes its ROSTER: hundreds of
+      // customers hold standing residence there and churn daily, and every
+      // one of them would otherwise sit on the graph (and in Devices) as a
+      // permanent offline card. Customers are CEC-tab material — the area
+      // only ever contributes links this daemon actually HOLDS right now
+      // (the infra hubs, a customer while we're dialed in), gated below.
+      const cecArea = this.isManagedCecMesh(net);
       let peers: PeerInfo[] = [];
       let roster: RosterPeer[] = [];
       try {
@@ -1665,12 +1689,29 @@ class AppStore {
       } catch {
         /* network still settling */
       }
-      try {
-        roster = await meshRosterList(net.config_id);
-      } catch {
-        /* roster optional */
+      if (!cecArea) {
+        try {
+          roster = await meshRosterList(net.config_id);
+        } catch {
+          /* roster optional */
+        }
       }
       for (const p of peers) {
+        if (cecArea) {
+          // Held links only: connected now, or a link that was connected
+          // moments ago riding the same grace every mesh gets (an ICE
+          // restart mid-support-session must not drop the customer's card).
+          // Everything else — announce-sighted residents we never dialed,
+          // rows gone terminal — never enters the catalog; a terminal row
+          // still settles the machine-wide grace so a hung-up customer
+          // leaves the graph on this poll, not 45 s later.
+          const canon = canonicalNodeId(p.device_id);
+          const terminal = p.status === "offline" || p.status === "error";
+          if (!CONNECTED_STATUSES.has(p.status) && (terminal || !this.withinPresenceGrace(canon))) {
+            if (terminal) offlineCanons.add(canon);
+            continue;
+          }
+        }
         if (p.status === "pending_approval") {
           // Surfaced as a "new device wants to join" nudge + popup, not on the
           // graph. Gathered across every network so the nudge catches them all.
@@ -1832,9 +1873,18 @@ class AppStore {
         ];
       }
     }
-    // The local machine is on every network we've joined.
+    // The local machine is on every network we've joined — minus the
+    // node-managed CEC area: that's client-support plumbing, and letting it
+    // onto this card would split the fleet's mesh sub-bands on a chip no
+    // other fleet device carries. (A dialed customer's card keeps the
+    // "CEC Support" chip — there it says something.)
     const me = this.node(this.localId) ?? this.catalog.nodes.find((n) => n.kind === "this");
-    if (me) me.networks = nets.map((n) => this.meshLabel(n)).sort();
+    if (me) {
+      me.networks = nets
+        .filter((n) => !this.isManagedCecMesh(n))
+        .map((n) => this.meshLabel(n))
+        .sort();
+    }
     // A machine that's no longer in any roster/peer set has dropped offline.
     // Compare by canonical pubkey so a presence node (display id) isn't wrongly
     // marked offline just because the daemon lists it under the bare pubkey.
@@ -1874,6 +1924,34 @@ class AppStore {
       if (keep) n.online = this.withinPresenceGrace(canon);
       return keep;
     });
+    // What pruned machines leave behind, swept the same poll that dropped
+    // them (forgetNode does the identical cleanup on the manual path):
+    // their capabilities and routes — dead sessions can't be re-wired, and a
+    // support workstation would otherwise bank a capability set per customer
+    // it ever dialed — and any presence-grace stamp past its window, so the
+    // map stops remembering every machine that ever connected. Routes are
+    // matched by the NODE a leg belongs to (not by capability id: a live
+    // terminal leg's endpoints aren't catalog capabilities).
+    const survivorCanons = new Set(this.catalog.nodes.map((n) => canonicalNodeId(n.id)));
+    if (this.catalog.capabilities.some((c) => !survivorCanons.has(canonicalNodeId(c.node)))) {
+      this.catalog.capabilities = this.catalog.capabilities.filter((c) =>
+        survivorCanons.has(canonicalNodeId(c.node)),
+      );
+    }
+    if (
+      this.catalog.routes.some(
+        (r) =>
+          !survivorCanons.has(this.capNodeOf(r.from)) || !survivorCanons.has(this.capNodeOf(r.to)),
+      )
+    ) {
+      this.catalog.routes = this.catalog.routes.filter(
+        (r) =>
+          survivorCanons.has(this.capNodeOf(r.from)) && survivorCanons.has(this.capNodeOf(r.to)),
+      );
+    }
+    for (const [canon, at] of [...this.lastConnectedAt]) {
+      if (Date.now() - at > PRESENCE_GRACE_MS) this.lastConnectedAt.delete(canon);
+    }
     // A freshly-discovered device may belong to someone we already share
     // with — fold it into that share.
     this.reconcileShares();
@@ -7050,8 +7128,30 @@ class AppStore {
 
   /** The per-node gear "Forget this node": drop it from the graph + roster,
    *  tear its session down, end any CEC session. Removes it locally at once so
-   *  the graph reacts immediately; the next snapshot confirms. */
+   *  the graph reacts immediately; the next snapshot confirms.
+   *
+   *  A FLEET MEMBER can't be merely forgotten: the signed roster is the
+   *  authority, so a local-only forget gets gossiped straight back onto the
+   *  graph — an eternity member. Forgetting one therefore PROPAGATES: it
+   *  routes through the same owner/manager governance eviction the Fleet
+   *  pane runs (MFA prompt included), and only a completed evict lets the
+   *  local sweep proceed. If the evict is refused (not your fleet role) or
+   *  cancelled at the prompt, nothing is half-forgotten. */
   async forgetNode(nodeId: string) {
+    if (this.backendConnected && this.isFleetMember(nodeId) && !this.isMe(nodeId)) {
+      const label = this.node(nodeId)?.label ?? "that device";
+      await this.runFleetGov(`Forget ${label}`, async (code) => {
+        await fleetKick(nodeId, code);
+        await this.forgetNodeLocal(nodeId);
+      });
+      return;
+    }
+    await this.forgetNodeLocal(nodeId);
+  }
+
+  /** The local half of Forget — session/route teardown + catalog sweep.
+   *  Fleet members reach this only after their eviction went through. */
+  private async forgetNodeLocal(nodeId: string) {
     // Drop any live routes we hold to it, then the backend teardown.
     const routes = this.catalog.routes.filter(
       (r) => sameMachine(this.capNodeOf(r.from), nodeId) || sameMachine(this.capNodeOf(r.to), nodeId),

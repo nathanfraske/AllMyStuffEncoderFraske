@@ -1550,6 +1550,40 @@ impl Mesh {
                             });
                         }
                     }
+                    // The daemon proved THIS DEVICE was evicted from a
+                    // network by its signed governance (it verified the
+                    // log itself — this is not a peer's claim). If that
+                    // network is our FLEET mesh, the fleet is over for
+                    // this device: run the same teardown the owner's
+                    // cooperative Release performs, so an eviction that
+                    // happened while we were offline finally cleans up
+                    // instead of leaving a dead credential camping on a
+                    // mesh that denies it everywhere. Any other network's
+                    // eviction is daemon-side only (it already stood the
+                    // engine down); nothing to tear here.
+                    if event.get("event_kind").and_then(|v| v.as_str()) == Some("diag")
+                        && event.get("category").and_then(|v| v.as_str()) == Some("governance")
+                        && event
+                            .get("detail")
+                            .and_then(|d| d.get("hint"))
+                            .and_then(|v| v.as_str())
+                            == Some("self_evicted")
+                    {
+                        let evicted_net = event
+                            .get("network_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let fleet_net = self.ownership.fleet_network_id();
+                        if evicted_net.is_some() && evicted_net == fleet_net {
+                            tracing::warn!(
+                                "the fleet's signed governance evicted this device — clearing fleet state"
+                            );
+                            let mesh = self.clone();
+                            crate::spawn(async move {
+                                mesh.apply_fleet_release().await;
+                            });
+                        }
+                    }
                     // The daemon's own clock diagnostic (its heartbeat-based
                     // estimator, on daemons new enough to run one): surface
                     // it on the same UI event the presence-based estimate
@@ -2416,7 +2450,12 @@ impl Mesh {
     /// the sender's next IDR, and `video_unwatch`/route teardown remove
     /// the entry entirely.
     fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) {
-        const MAX_QUEUED: usize = 120;
+        // One second of 60 fps H.264. An unread backlog is pure latency by
+        // the time the window drains it (the old 120 held 2–4 s of "catch
+        // up"), and the overflow below re-enters at a queued keyframe
+        // instead of dumping the lot, so a slow-but-alive window loses
+        // moments, not the stream.
+        const MAX_QUEUED: usize = 60;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -2438,8 +2477,35 @@ impl Mesh {
             // enqueue_decoded's freshest-wins.
             w.queue.clear();
         } else if w.queue.len() >= MAX_QUEUED {
-            tracing::debug!("video queue for {route_id} unread for seconds — cleared");
-            w.queue.clear();
+            // H.264 backlog: skip forward to the NEWEST queued key unit —
+            // decode re-enters there cleanly, and the viewer jumps to
+            // near-live instead of replaying the whole backlog. The ipc
+            // header carries the key flag (kind 2 at byte 0, key at byte
+            // 1). No queued key (one delta chain longer than the cap, or
+            // a keyless backlog): the old wholesale clear, recovering on
+            // the sender's next IDR.
+            match w
+                .queue
+                .iter()
+                .rposition(|p| p.first() == Some(&2) && p.get(1) == Some(&1))
+            {
+                Some(i) if i > 0 => {
+                    tracing::debug!(
+                        "video queue for {route_id} unread — skipped {i} stale packets to its newest keyframe"
+                    );
+                    w.queue.drain(..i);
+                }
+                Some(_) => {
+                    // The only key is already at the front and the queue is
+                    // still at cap — the chain itself outgrew the bound.
+                    tracing::debug!("video queue for {route_id} unread for a second — cleared");
+                    w.queue.clear();
+                }
+                None => {
+                    tracing::debug!("video queue for {route_id} unread and keyless — cleared");
+                    w.queue.clear();
+                }
+            }
         }
         w.queue.push_back(packet);
         // Poke the watcher when the queue goes non-empty: the console
@@ -4153,24 +4219,7 @@ impl Mesh {
                 let owner = self.ownership.owner();
                 if owner.as_deref().map(pubkey_part) == Some(pubkey_part(from.as_str())) {
                     tracing::info!("released by {} — unowned again", short_id(from.as_str()));
-                    // Tear out of the fleet's closed network before clearing the
-                    // credential (set_owner(None) drops the key it derives from).
-                    let fleet_net = self.ownership.fleet_network_id();
-                    self.ownership.set_owner(None);
-                    if let Some(network) = fleet_net {
-                        let _ = self
-                            .client
-                            // Released by our owner — we've left this fleet, so
-                            // purge its signed state too: no stale genesis to
-                            // reload if we later join a different fleet.
-                            .request(&Request::NetworkRemove {
-                                network,
-                                purge: true,
-                            })
-                            .await;
-                    }
-                    self.refresh_fleet_authorization().await;
-                    self.ownership_check(None).await;
+                    self.apply_fleet_release().await;
                 }
             }
             OwnershipControl::Claimed { owner } => {
@@ -4272,6 +4321,36 @@ impl Mesh {
                 );
             }
         }
+    }
+
+    /// The device-side fleet teardown — everything "this device just left
+    /// / was let go from its fleet" implies, in one place: tear out of the
+    /// fleet's closed network (purging its signed state so a later rejoin
+    /// can't reload a stale genesis), clear the durable owner/key record,
+    /// and re-broadcast the now-unowned presence. Shared by the
+    /// cooperative path (the owner's `Release` frame) and the verified
+    /// path (the daemon's `self_evicted` governance event — the device
+    /// PROVED its own eviction from the signed log, which is stronger
+    /// authority than any frame a peer could send). Deliberately does NOT
+    /// re-enter claim mode: adoption is per-event consent on this device.
+    async fn apply_fleet_release(self: &Arc<Self>) {
+        // Tear out of the fleet's closed network before clearing the
+        // credential (set_owner(None) drops the key it derives from).
+        let fleet_net = self.ownership.fleet_network_id();
+        self.ownership.set_owner(None);
+        if let Some(network) = fleet_net {
+            let _ = self
+                .client
+                // We've left this fleet — purge its signed state too: no
+                // stale genesis to reload if we later join a different one.
+                .request(&Request::NetworkRemove {
+                    network,
+                    purge: true,
+                })
+                .await;
+        }
+        self.refresh_fleet_authorization().await;
+        self.ownership_check(None).await;
     }
 
     /// Re-stamp the live presence profile's owner/claimable from the store
@@ -7112,6 +7191,15 @@ impl Mesh {
                 }
             });
         }
+        // When the outbound queue fills, packets get dropped — and on H.264
+        // every drop leaves the viewer's decoder referencing frames it never
+        // received (smear, or a freeze that outlives the burst). One forced
+        // IDR per gap heals it: set on the first send that SUCCEEDS after a
+        // drop, so the clean unit is asked for exactly when the queue has
+        // room again instead of being eaten by the same full queue.
+        let idr_mesh = Arc::downgrade(self);
+        let idr_route = route.id.clone();
+        let was_dropping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.video.start_capture(
             route.id.clone(),
             mode,
@@ -7123,8 +7211,19 @@ impl Mesh {
             move |packet| {
                 // try_send: a full queue drops this packet; the next
                 // capture carries a fresher picture.
-                tx.try_send((peer.clone(), route_id.clone(), packet))
-                    .is_ok()
+                let ok = tx
+                    .try_send((peer.clone(), route_id.clone(), packet))
+                    .is_ok();
+                if ok {
+                    if was_dropping.swap(false, Ordering::SeqCst) {
+                        if let Some(mesh) = idr_mesh.upgrade() {
+                            mesh.video.force_idr(&idr_route);
+                        }
+                    }
+                } else {
+                    was_dropping.store(true, Ordering::SeqCst);
+                }
+                ok
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
