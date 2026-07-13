@@ -2690,6 +2690,22 @@ impl Mesh {
         // window holds each stream and on which decode path — the missing
         // half of "frames flowing but no window watching".
         tracing::info!("window watching {route_id} (native decode: {decode})");
+        // A fresh watch (a re-open, an input switch) must start its peer's
+        // video dead-lane grace over. When the previous session closed, its
+        // orphaned frames drained with no route here and left a stale
+        // "unmapped since" mark for that peer's lane. Without this reset, the
+        // very first frame of the NEW stream — arriving in the brief gap before
+        // the route is mapped — sees that elapsed grace and NACKs the sender
+        // instantly, whose handle_dead_lane then StopMedia's the capture we
+        // just restarted: the "reconnect shows nothing / connecting forever"
+        // loop, and it bit every video route, not just CEC. Clearing only on a
+        // *new* watch keeps a genuine close (no re-watch) NACKing as before.
+        if let Some(peer) = self.route_peer(&route_id) {
+            let prefix = format!("deadlane:video:{}:", pubkey_part(&peer));
+            self.dead_lane_since
+                .lock()
+                .retain(|k, _| !k.starts_with(&prefix));
+        }
         self.video_watchers.lock().insert(
             route_id,
             VideoWatcher {
