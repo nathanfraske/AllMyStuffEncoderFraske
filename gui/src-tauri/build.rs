@@ -134,6 +134,15 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     // bump was for (a v0.2.0 leftover shadowing the v0.2.1 video lane,
     // say), so it's skipped with a note and the pinned release is fetched.
     if let Some(p) = sibling_daemon() {
+        // Watch the sibling binary itself so a plain `cargo build --bin
+        // myownmesh` in the sibling checkout re-triggers this script and
+        // re-stages the fresh daemon. Without this, the only watched inputs
+        // are `.myownmesh-rev` + the override env vars, so a rebuilt sibling
+        // was silently ignored and the app kept spawning the previously
+        // staged daemon — the "I rebuilt it but nothing changed" trap that
+        // makes the sibling dev loop untrustworthy for exactly the media
+        // fixes it exists to test.
+        println!("cargo:rerun-if-changed={}", p.display());
         let sibling_ver = binary_version(&p);
         let pin_ver = rev
             .as_deref()
