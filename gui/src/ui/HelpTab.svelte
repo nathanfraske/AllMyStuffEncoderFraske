@@ -47,6 +47,25 @@
     return ` (${h})`;
   }
 
+  // Inline rename: click a known machine's name to label it (stored by
+  // number in `cecAliases`, the same alias the full console and the queue
+  // read). `editingKey` is the number being edited.
+  let editingKey = $state<string | null>(null);
+  let aliasDraft = $state("");
+  function startRename(number: string) {
+    editingKey = number;
+    aliasDraft = app.cecAliases[number] ?? "";
+  }
+  function saveRename(number: string) {
+    app.setCecAlias(number, aliasDraft);
+    editingKey = null;
+    aliasDraft = "";
+  }
+  function cancelRename() {
+    editingKey = null;
+    aliasDraft = "";
+  }
+
   // The machines this technician has dialed before, grouped under the live
   // queue: online (reachable now — one tap re-opens) then previously
   // connected (offline, still remembered). A customer with a hand up right
@@ -118,21 +137,45 @@
       <li class="row known">
         <span class="dot" class:on={c.online} aria-hidden="true"></span>
         <div class="who">
-          <b class="name">{name}<span class="host">{hostTail(name, c.hostname)}</span></b>
-          <span class="sub">
-            <span class="num" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
-            <span class="meta">· {lastUsedLabel(c.last_used)}</span>
-          </span>
+          {#if editingKey === c.number}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="rename"
+              type="text"
+              autofocus
+              placeholder={c.label || "Customer name"}
+              bind:value={aliasDraft}
+              onblur={() => saveRename(c.number)}
+              onkeydown={(e) => {
+                if (e.key === "Enter") saveRename(c.number);
+                else if (e.key === "Escape") cancelRename();
+              }}
+            />
+          {:else}
+            <button
+              class="name-btn"
+              title="Click to rename"
+              onclick={() => startRename(c.number)}
+            >
+              <b class="name">{name}<span class="host">{hostTail(name, c.hostname)}</span></b>
+            </button>
+            <span class="sub">
+              <span class="num" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
+              <span class="meta">· {lastUsedLabel(c.last_used)}</span>
+            </span>
+          {/if}
         </div>
-        <button
-          class="reopen"
-          class:on={c.online}
-          disabled={app.cecDialing}
-          title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
-          onclick={() => void app.reconnectCec(c.node)}
-        >
-          {c.online ? "Open" : "Reconnect"}
-        </button>
+        {#if editingKey !== c.number}
+          <button
+            class="reopen"
+            class:on={c.online}
+            disabled={app.cecDialing}
+            title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
+            onclick={() => void app.reconnectCec(c.node)}
+          >
+            {c.online ? "Open" : "Reconnect"}
+          </button>
+        {/if}
       </li>
     {/snippet}
 
@@ -314,6 +357,36 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* The name doubles as a rename trigger — a bare text button, no chrome, so
+     it reads as the name until hovered. */
+  .name-btn {
+    display: block;
+    max-width: 100%;
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+    cursor: text;
+    overflow: hidden;
+  }
+  .name-btn:hover .name {
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+  }
+  .rename {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.2rem 0.4rem;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: 0.82rem;
   }
   .host {
     color: var(--ink-faint);
