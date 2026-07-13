@@ -3785,6 +3785,16 @@ class AppStore {
     return this.cecCustomers.some((c) => sameMachine(c.node, nodeId));
   }
 
+  /** The dialed CEC customer row for `nodeId`, if this node is one — the
+   *  graph/drawer twin of the Help sidebar's known-customer entry. Carries
+   *  the canonical CEC node id (what `reconnectCec` dials) and the live
+   *  online dot, so the node drawer can offer the same one-tap "Open" the
+   *  sidebar does instead of bouncing through the CEC settings tab. */
+  cecPeerFor(nodeId: string | undefined): CecPeer | null {
+    if (!nodeId) return null;
+    return this.cecCustomers.find((c) => c.node && sameMachine(c.node, nodeId)) ?? null;
+  }
+
   consoleAccess(node: MeshNode | undefined): ConsoleAccess {
     const none: ConsoleAccess = {
       remote: false,

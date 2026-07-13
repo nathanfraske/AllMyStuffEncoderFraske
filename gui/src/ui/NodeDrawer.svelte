@@ -32,6 +32,13 @@
   // A remote machine you can open a console session on.
   const isRemoteApp = $derived(!!st && !st.self && st.app);
 
+  // If this node is a CEC customer, the dialed-customer row behind it — the
+  // graph twin of the Help sidebar's known-customer entry. Present ⇒ this
+  // technician holds a support (consent-grant) relationship with them, so the
+  // Remote Control button dials straight through like the sidebar's "Open"
+  // rather than bouncing to the CEC settings tab; absent ⇒ no button.
+  const cecPeer = $derived(node ? app.cecPeerFor(node.id) : null);
+
   // Whether this device is part of *your* stuff — your own machine, or one in
   // your fleet (claimed/owned). Its raw capabilities ("Its stuff") are only
   // shown for these: a guest's or a stranger's machine isn't yours to wire up.
@@ -451,8 +458,26 @@
          machine's screen, audio passthrough and control. Owner/fleet only —
          sharing is one-directional: when you share your stuff *with* someone,
          their machine isn't yours to drive, so it never offers a remote
-         control (the far side would refuse it anyway). -->
-    {#if isRemoteApp && app.consoleAccess(node).remote}
+         control (the far side would refuse it anyway).
+
+         A CEC customer is the exception: they authorized you by their own
+         consent grant, so the button dials straight through exactly like the
+         Help sidebar's "Open" — the customer's node auto-approves on a live
+         standing grant, else re-prompts — instead of opening the CEC settings
+         tab (which is what the generic console open does for a customer, and
+         read as "the button just opens settings and doesn't work"). -->
+    {#if cecPeer}
+      <button
+        class="btn primary console-open"
+        disabled={app.cecDialing}
+        title="Connect and open their screen — they approve unless a standing grant still covers you"
+        onclick={() => {
+          if (cecPeer) void app.reconnectCec(cecPeer.node);
+        }}
+      >
+        🖥 Remote Control
+      </button>
+    {:else if isRemoteApp && app.consoleAccess(node).remote}
       <button class="btn primary console-open" onclick={() => app.openConsole(node.id)}>
         🖥 Remote Control
       </button>
