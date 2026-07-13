@@ -742,7 +742,19 @@ impl VideoBridge {
         if t.fps.is_some() && t.bitrate.is_some() {
             return false;
         }
-        self.retune(route_id, Tune { link, ..t });
+        // Instrumented: a capped stream's whole story is often this line — a
+        // CEC dial that never leaves Unknown/Wan stays at the 30fps cap, while
+        // a direct LAN dial flips to Lan and unlocks 60. Posted logs then show
+        // exactly which happened on each path.
+        let new_t = Tune { link, ..t };
+        tracing::info!(
+            "video relink {route_id}: {:?} → {:?} · fps cap {} → {}",
+            t.link,
+            link,
+            t.fps(),
+            new_t.fps(),
+        );
+        self.retune(route_id, new_t);
         true
     }
 
@@ -977,6 +989,14 @@ fn run_capture(
         let fps = tune.fps();
         let mut encoder = make_encoder(route_id, mode, (0, 0), tune, refresh, idr_ms, auto)?;
         let mut stats = StreamStats::new(route_id, encoder.mode());
+        tracing::info!(
+            "video stream start {route_id}: {} · link {:?} · fps cap {fps} · camera",
+            match mode {
+                VideoMode::H264 => "H.264",
+                VideoMode::Mjpeg => "MJPEG",
+            },
+            tune.link,
+        );
         let (session, frames) = match crate::camera_capture::open(device, fps) {
             Ok(open) => open,
             Err(e) => {
@@ -1053,6 +1073,20 @@ fn run_capture(
     let mut encoder = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
     let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
+    // One provenance line per stream — the numbers that explain a capped rate
+    // at a glance: codec, whether the path was classed LAN (60) or WAN/Unknown
+    // (30 cap), the effective fps ceiling, and the source size. A posted CEC
+    // dial's line vs a direct LAN dial's makes the cap self-evident.
+    tracing::info!(
+        "video stream start {route_id}: {} · link {:?} · fps cap {fps} · source {}×{}",
+        match mode {
+            VideoMode::H264 => "H.264",
+            VideoMode::Mjpeg => "MJPEG",
+        },
+        tune.link,
+        source_hint.0,
+        source_hint.1,
+    );
 
     // Windows: our own DXGI Output Duplication session — damage-driven,
     // per-monitor, releasable (see `win_capture` for why xcap's recorder
