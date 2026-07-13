@@ -205,6 +205,13 @@ pub struct InventorySummary {
     pub ram_bytes: u64,
     /// Headline device count for the "12 things" chip.
     pub device_count: u32,
+    /// Product / model name — the machine's own identity ("OptiPlex 7090",
+    /// "MacBook Pro"), the DMI product field without its maker prefix. This
+    /// rides presence so a CEC technician can tell one customer's box from
+    /// another at a glance. Empty when the host reports no usable product
+    /// string (a VM, a stripped DMI); `#[serde(default)]` (via the struct's
+    /// `#[serde(default)]`) keeps adverts from older peers decoding.
+    pub product: String,
 }
 
 /// What a node tells its peers about itself. Broadcast on the presence
@@ -1074,6 +1081,7 @@ mod tests {
                 cpu: "Test CPU".into(),
                 ram_bytes: 16 << 30,
                 device_count: 12,
+                product: "OptiPlex 7090".into(),
             },
             capabilities: vec![Capability::new(
                 "desk",

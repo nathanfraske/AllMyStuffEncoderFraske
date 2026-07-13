@@ -112,6 +112,12 @@ pub struct HostInfo {
     /// Friendly board / vendor label from DMI (`Dell Inc. XPS 15`) when
     /// available on x86 desktops/laptops.
     pub board: Option<String>,
+    /// Just the product / model name — the *second* DMI field, without the
+    /// manufacturer prefix that `board` carries (`XPS 15`, not `Dell Inc.
+    /// XPS 15`). This is the field that identifies which machine you're
+    /// looking at (a maker name doesn't), so it's what surfaces to a CEC
+    /// technician. `None` when DMI reports no usable product string.
+    pub product: Option<String>,
     /// Single-board-computer / SoC label when identifiable — e.g.
     /// "Raspberry Pi 5 Model B". `None` on most x86 and Macs. Same
     /// detection MyOwnLLM uses to right-size its model pick.

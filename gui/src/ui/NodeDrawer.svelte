@@ -421,6 +421,11 @@
     {#if node.summary}
       <section class="stats">
         <div class="stat"><span>System</span><b>{node.summary.os}</b></div>
+        {#if node.summary.product}
+          <!-- The machine's model — what identifies a CEC customer's box; it
+               rides presence from the far node's DMI product field. -->
+          <div class="stat"><span>Model</span><b>{node.summary.product}</b></div>
+        {/if}
         <div class="stat"><span>Chip</span><b>{node.summary.cpu}</b></div>
         <div class="stat"><span>Memory</span><b>{humanBytes(node.summary.ram_bytes)}</b></div>
         <div class="stat"><span>Things</span><b>{node.summary.device_count}</b></div>

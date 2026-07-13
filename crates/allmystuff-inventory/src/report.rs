@@ -350,6 +350,7 @@ mod tests {
                 kernel_version: None,
                 arch: "x86_64".into(),
                 board: Some("Acme Laptop".into()),
+                product: Some("Laptop".into()),
                 soc: None,
                 uptime_secs: 3_700,
             },
