@@ -172,6 +172,11 @@ import {
   cecHelpWatch,
   onCecHelp,
   type CecHelpSeeker,
+  cecChatSend,
+  cecChatHistory,
+  onCecChat,
+  openChatWindow,
+  type CecChatMsg,
   forgetNode,
   onCecRequest,
   onCecPeer,
@@ -586,6 +591,15 @@ class AppStore {
    *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
    *  event. */
   cecHelpWaiting = $state<CecHelpSeeker[]>([]);
+  /** Chat threads with CEC customers, keyed by the customer's node id, each
+   *  oldest-first. Reassigned (never mutated in place) on every change so the
+   *  pop-out chat window stays reactive — the same discipline as `cecAliases`.
+   *  Every window that runs `onCecChat` fills this; the chat window reads it. */
+  chatThreads = $state<Record<string, CecChatMsg[]>>({});
+  /** Unread inbound (customer) lines per customer since their thread was last
+   *  read — the little badge on the drawer's Chat affordance. Cleared by
+   *  {@link markChatRead} when the chat window takes focus. */
+  chatUnread = $state<Record<string, number>>({});
   /** The "Watch the help queue" opt-in, mirrored from the node's room
    *  membership (`cec_status.help_watching`) — the saved state lives in the
    *  daemon, so it survives restarts without a GUI-side flag. Off means this
@@ -1481,6 +1495,11 @@ class AppStore {
         const node = this.cecAutoOpenNode;
         this.cecAutoOpenNode = null;
         this.openCecConsoleWhenFound(node);
+        // Pop the customer chat alongside the console — the technician can
+        // message them ("close the browser and reopen it") right beside the
+        // live session. Needs the `open_chat_window` backend command (see the
+        // FLAG in the change report); a no-op in web mode.
+        this.openChat(node);
       } else if ((s.state === "denied" || s.state === "ended") && this.cecAutoOpenNode) {
         // A decline (or the session ending before approval) must disarm the
         // auto-open — leaving it armed both hides the outcome from the
@@ -1500,6 +1519,10 @@ class AppStore {
       // customer app's side of the event — irrelevant here.)
       if (e.waiting) this.cecHelpWaiting = e.waiting;
     });
+    // The customer chat plane: every window listens so any of them (the main
+    // window, the console window, the chat pop-out) keeps threads live. The
+    // append dedupes by id, so the sender's own echoed line shows once.
+    await onCecChat((e) => this.appendChat(e.peer, e.message));
     void cecStatus().then((s) => {
       if (s) this.cecStatusInfo = s;
     });
@@ -6917,6 +6940,108 @@ class AppStore {
     } catch {
       /* private mode — not persisted */
     }
+  }
+
+  /** The chat thread with one customer (their node id), oldest-first — empty
+   *  until history or a live line lands. A plain getter so components can read
+   *  `app.chatThread(peer)` reactively (it reads the `chatThreads` state). */
+  chatThread(peer: string): CecChatMsg[] {
+    return this.chatThreads[peer] ?? [];
+  }
+
+  /** Pull the stored history for a customer and fold it into the local thread,
+   *  oldest-first. Null-tolerant like {@link loadCec}: a failed fetch keeps the
+   *  last snapshot. Any live line that beat the history reply is preserved
+   *  (merged + de-duplicated by id), so opening the window never drops a line
+   *  that arrived a breath earlier. */
+  async loadChatHistory(peer: string) {
+    const msgs = await cecChatHistory(peer);
+    if (!msgs) return;
+    const seen = new Set(msgs.map((m) => m.id));
+    const extra = (this.chatThreads[peer] ?? []).filter((m) => !seen.has(m.id));
+    this.chatThreads = {
+      ...this.chatThreads,
+      [peer]: [...msgs, ...extra].sort((a, b) => a.ts - b.ts),
+    };
+  }
+
+  /** Technician → customer: send a line. Appends it optimistically (so the
+   *  thread updates the instant Enter is pressed), then calls the node and
+   *  reconciles the temporary row to the node-assigned id/ts. The node also
+   *  echoes the line back over `cec://chat`; {@link appendChat} dedupes that
+   *  echo against the reconciled row so it shows once. */
+  async sendChat(peer: string, text: string) {
+    const body = text.trim();
+    if (!body) return;
+    const tempId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.appendChat(peer, {
+      id: tempId,
+      from: "technician",
+      text: body,
+      // UNIX **seconds**, to match the node's `ts` — the thread sorts by `ts`,
+      // and a millisecond stamp here would misorder the optimistic bubble
+      // against real (seconds) rows until the send reply reconciled it.
+      ts: Math.floor(Date.now() / 1000),
+    });
+    const r = await cecChatSend(peer, body);
+    if (!r?.id) return;
+    const thread = this.chatThreads[peer] ?? [];
+    // The echo can beat this reply and already have collapsed the optimistic
+    // row (see appendChat) — only rewrite while our temp row is still pending,
+    // and never mint a duplicate of the canonical id.
+    if (thread.some((m) => m.id === tempId) && !thread.some((m) => m.id === r.id)) {
+      this.chatThreads = {
+        ...this.chatThreads,
+        [peer]: thread.map((m) =>
+          m.id === tempId ? { ...m, id: r.id, ts: r.ts } : m,
+        ),
+      };
+    }
+  }
+
+  /** Append one line to a customer's thread, deduped by id (the sender gets its
+   *  own line echoed back). A technician echo that arrives before its send call
+   *  reconciled the optimistic copy collapses that still-pending copy in place
+   *  rather than doubling it. An inbound customer line bumps the unread badge. */
+  private appendChat(peer: string, msg: CecChatMsg) {
+    let thread = this.chatThreads[peer] ?? [];
+    if (thread.some((m) => m.id === msg.id)) return;
+    if (msg.from === "technician") {
+      const pending = thread.findIndex(
+        (m) =>
+          m.id.startsWith("local-") &&
+          m.from === "technician" &&
+          m.text === msg.text,
+      );
+      if (pending >= 0) {
+        thread = thread.map((m, i) => (i === pending ? msg : m));
+        this.chatThreads = { ...this.chatThreads, [peer]: thread };
+        return;
+      }
+    }
+    this.chatThreads = { ...this.chatThreads, [peer]: [...thread, msg] };
+    if (msg.from === "client") {
+      this.chatUnread = {
+        ...this.chatUnread,
+        [peer]: (this.chatUnread[peer] ?? 0) + 1,
+      };
+    }
+  }
+
+  /** Clear a customer's unread badge (their chat window is open/focused). */
+  markChatRead(peer: string) {
+    if (!this.chatUnread[peer]) return;
+    const next = { ...this.chatUnread };
+    delete next[peer];
+    this.chatUnread = next;
+  }
+
+  /** Open (or focus) the pop-out chat window for a customer, priming its
+   *  history first. Desktop pops a real OS window (`open_chat_window`); the web
+   *  preview has no window to open, so this just loads the thread in place. */
+  openChat(peer: string) {
+    void this.loadChatHistory(peer);
+    void openChatWindow(peer);
   }
 
   /** Pull the node's CEC status + grants + pending requests + dialed customers. */

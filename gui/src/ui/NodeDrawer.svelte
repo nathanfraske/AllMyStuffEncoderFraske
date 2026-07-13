@@ -483,6 +483,21 @@
       </button>
     {/if}
 
+    <!-- Chat with a CEC customer: a real pop-out window to message them
+         ("close the browser and reopen it") beside the live session. It
+         opens on its own the moment a session goes active; this is the
+         manual open / re-focus, with an unread badge for lines that arrived
+         while it was closed. -->
+    {#if cecPeer}
+      <button
+        class="btn console-open"
+        title="Open a chat with this customer in its own window"
+        onclick={() => cecPeer && app.openChat(cecPeer.node)}
+      >
+        💬 Chat{#if app.chatUnread[cecPeer.node]}<span class="chat-unread">{app.chatUnread[cecPeer.node]}</span>{/if}
+      </button>
+    {/if}
+
     <!-- Open the file manager: a finder-like view of that machine's disk,
          over the mesh. Owner/fleet only — the same rule as the terminal,
          enforced again on the far side. -->
@@ -1691,6 +1706,23 @@
   .console-open {
     width: 100%;
     margin-bottom: 0.8rem;
+  }
+  /* Unread-lines badge on the Chat button — a small accent pill with the
+     count of customer messages that arrived while the window was closed. */
+  .chat-unread {
+    display: inline-grid;
+    place-items: center;
+    min-width: 1.15rem;
+    height: 1.15rem;
+    margin-left: 0.4rem;
+    padding: 0 0.3rem;
+    border-radius: var(--r-pill);
+    background: var(--accent);
+    color: var(--bg);
+    font-size: 0.7rem;
+    font-weight: 700;
+    line-height: 1;
+    vertical-align: middle;
   }
   /* "Upgrade available" — an accent-tinted call to action, distinct from the
      solid-accent Remote Control so it reads as "something new", not "the
