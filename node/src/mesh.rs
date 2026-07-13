@@ -7111,9 +7111,47 @@ impl Mesh {
                 return per_peer.get(&lane).cloned();
             }
         }
-        self.sorted_media_routes(peer, false, "h264")
+        // No binding announced yet (a fresh peer, or every lane freed when the
+        // last route to it tore down). Positional over the peer's active h264
+        // routes — the pre-binding behaviour.
+        if let Some(r) = self
+            .sorted_media_routes(peer, false, "h264")
             .into_iter()
             .nth(lane as usize)
+        {
+            return Some(r);
+        }
+        // Re-open fallback. On a re-open the SAME route id comes back and the
+        // sender re-establishes its RTP track — so samples land on the lane
+        // again — BEFORE the daemon's session re-tags that route's codec as
+        // h264. The positional filter above keys on that tag, so it misses the
+        // re-opened route and the frames are dropped into the void ("connecting
+        // forever" on the second open). The console IS watching the route, so
+        // map by position over the video routes we actually watch from this
+        // peer — knowledge that doesn't depend on the re-tag timing. Position
+        // keeps multi-monitor correct, and an authoritative binding (above)
+        // still wins the instant the streamer's VideoLane announce lands.
+        let mut watched = self.watched_video_routes_from(canon);
+        watched.sort_unstable();
+        watched.into_iter().nth(lane as usize)
+    }
+
+    /// Route ids of the inbound video routes this viewer currently watches whose
+    /// streamer is `canon` (bare pubkey) — the re-open fallback for
+    /// [`Self::video_route_for_lane`]. Cheap: the watcher map holds one entry
+    /// per open console stream.
+    fn watched_video_routes_from(&self, canon: &str) -> Vec<String> {
+        self.video_watchers
+            .lock()
+            .keys()
+            .filter(|rid| {
+                rid.strip_prefix("route:")
+                    .and_then(|s| s.split_once('→'))
+                    .map(|(from, _)| pubkey_part(&node_of(from)) == canon)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The audio twin of [`Self::video_route_for_lane`].
