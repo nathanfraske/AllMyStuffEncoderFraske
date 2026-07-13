@@ -231,6 +231,28 @@ pub enum AppControl {
     Unknown,
 }
 
+/// A free-text chat message exchanged between the connected technician and
+/// customer, carried inside [`ControlMessage::Chat`] on
+/// [`CHANNEL_CONTROL`](crate::CHANNEL_CONTROL) while a session is live. It is
+/// additive: a peer built before chat existed decodes the envelope to
+/// [`ControlMessage::Unknown`] and ignores it, so turning chat on never breaks
+/// a mixed-version session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// Sender-assigned id, unique within a session — lets the receiver dedupe
+    /// and lets the sender recognise the echo of its own message.
+    pub id: String,
+    /// Who sent it, so the UI renders the correct side without inferring it
+    /// from the transport peer.
+    pub from: Role,
+    /// The message body. Plain UTF-8; display-escaping is the UI's job.
+    pub text: String,
+    /// Unix seconds when the sender composed it (sender's clock — display
+    /// ordering only, never trusted for security).
+    #[serde(default)]
+    pub ts: u64,
+}
+
 /// The single point-to-point control envelope, dispatched on the outer `t`
 /// tag. Mirrors AllMyStuff's `ControlMessage` shape, trimmed to what CEC
 /// Support uses.
@@ -241,6 +263,9 @@ pub enum ControlMessage {
     Connect(ConnectControl),
     /// App/service control.
     App(AppControl),
+    /// A chat message between the connected technician and customer, live only
+    /// while a session is active.
+    Chat(ChatMessage),
     /// Forward-compat catch-all.
     #[serde(other)]
     Unknown,
@@ -301,6 +326,12 @@ mod tests {
                 session_id: "s1".into(),
             }),
             ControlMessage::App(AppControl::InstallService),
+            ControlMessage::Chat(ChatMessage {
+                id: "m1".into(),
+                from: Role::Technician,
+                text: "Can you close the browser and re-open it?".into(),
+                ts: 1_700_000_000,
+            }),
         ];
         for m in msgs {
             let json = serde_json::to_string(&m).unwrap();
