@@ -2700,8 +2700,20 @@ impl Mesh {
         // just restarted: the "reconnect shows nothing / connecting forever"
         // loop, and it bit every video route, not just CEC. Clearing only on a
         // *new* watch keeps a genuine close (no re-watch) NACKing as before.
-        if let Some(peer) = self.route_peer(&route_id) {
-            let prefix = format!("deadlane:video:{}:", pubkey_part(&peer));
+        //
+        // Derive the peer straight from the route id (`route:{from}→{to}`), NOT
+        // the session: at watch time the route often isn't registered yet (the
+        // offer and this watch land in the same tick — the daemon logs both at
+        // the same millisecond), so route_peer would return None and silently
+        // skip the reset. For an inbound video route the `from` end is the
+        // streaming peer, which is exactly what nack_dead_lane keys on.
+        if let Some(from_cap) = route_id
+            .strip_prefix("route:")
+            .and_then(|s| s.split_once('→'))
+            .map(|(from, _)| from)
+        {
+            let peer_node = node_of(from_cap);
+            let prefix = format!("deadlane:video:{}:", pubkey_part(&peer_node));
             self.dead_lane_since
                 .lock()
                 .retain(|k, _| !k.starts_with(&prefix));
