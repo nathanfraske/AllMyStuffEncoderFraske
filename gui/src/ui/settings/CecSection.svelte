@@ -20,6 +20,10 @@
 
   const web = !isTauri();
   const status = $derived(app.cecStatusInfo);
+
+  // Keep the dialed customers' online state live only while the console is open
+  // — refcounted in the store, so nothing polls once every CEC surface is gone.
+  onMount(() => app.watchCecPresence());
   const requests = $derived(app.cecRequests);
   const grants = $derived(app.cecGrantList);
 

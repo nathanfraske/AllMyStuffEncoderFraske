@@ -156,6 +156,15 @@
   let frameW = $state(0);
   let frameH = $state(0);
   let fps = $state(0);
+  // Honest per-stage rates so a pinned number names its own bottleneck:
+  // `inFps` arrives on the wire, `decFps` leaves the decoder, `fps` is what
+  // actually paints. dec ≫ paint ⇒ the blit/compositor is the wall; in ≈ dec ≈
+  // paint and all low ⇒ the decoder is (software H.264 of a 4K frame tops out
+  // ~15 fps on a CPU). `decodePath` names which decoder is live — the crux of
+  // the whole readout, since a silent fall to software is exactly the 4K60 killer.
+  let decFps = $state(0);
+  let inFps = $state(0);
+  let decodePath = $state("");
   let transport = $state("");
   let decodeFails = $state(0);
   /// Pipeline anomaly readout — empty while healthy, e.g.
@@ -164,6 +173,7 @@
   let pipeDiag = $state("");
   let frameCount = 0;
   let inCount = 0;
+  let decCount = 0;
   let queuePeek = () => 0;
   let stallKick = () => {};
   let decodeModeNote = "";
@@ -589,8 +599,11 @@
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       const inRate = inCount;
+      inFps = inRate;
+      decFps = decCount;
       frameCount = 0;
       inCount = 0;
+      decCount = 0;
       // Healthy: most of what arrives gets painted. Anything else is an
       // anomaly worth wearing on the chip.
       pipeDiag =
@@ -688,8 +701,12 @@
     transport = "";
     decodeFails = 0;
     pipeDiag = "";
+    decFps = 0;
+    inFps = 0;
+    decodePath = "";
     frameCount = 0;
     inCount = 0;
+    decCount = 0;
     // A new stream starts at its natural fit, with the trackpad cursor
     // re-centered, and any touch gesture from the old one is over — but
     // ONLY on an actual route change. The decode ladder re-runs this
@@ -739,17 +756,22 @@
     let paintScheduled = false;
     queuePeek = () => decoder?.decodeQueueSize ?? 0;
     decodeModeNote = native ? "native" : "";
+    // "webview (hw)" only asserts we *asked* for hardware (prefer-hardware);
+    // whether WKWebView honours it shows in whether decFps reaches 60.
+    decodePath = native ? "native (sw)" : "webview (hw)";
 
     const rebuildDecoder = () => {
       if (decodeMode !== "prefer-software") {
         decodeMode = "prefer-software";
         decodeModeNote = "sw";
+        decodePath = "webview (sw)";
       } else {
         // Software decode stalled too — hand the stream to the backend's
         // openh264 decoder. Setting the flag re-runs this effect, which
         // re-watches the route in native mode (and tears this rung down).
         console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
         nativeDecode = true;
+        decodePath = "native (sw)";
         askRefresh();
         return;
       }
@@ -807,6 +829,7 @@
           pendingJpeg = null;
           try {
             const bmp = await createImageBitmap(blob);
+            decCount += 1;
             paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
             maybeDetect(bmp); // sample this bitmap, not the live canvas
             bmp.close();
@@ -873,6 +896,7 @@
       if (cancelled) return;
       transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
+        decodePath = "mjpeg";
         // Supersede, never queue: the newest picture is the only one worth
         // painting, and the loop below drains at whatever rate decode allows.
         pendingJpeg = new Blob([f.data], { type: "image/jpeg" });
@@ -880,8 +904,11 @@
         return;
       }
       if (f.kind === "raw") {
-        // The backend already decoded — RGBA in, one blit out.
+        // The backend already decoded — RGBA in, one blit out. Arrival IS a
+        // decoded frame here, so it counts on both the in and dec stages; the
+        // native openh264 decode rate is exactly what shows up on the wire.
         inCount += 1;
+        decCount += 1;
         if (f.data.byteLength !== f.width * f.height * 4) return;
         const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
         const img = new ImageData(pixels, f.width, f.height);
@@ -925,6 +952,7 @@
         decoder = new VideoDecoder({
           output: (frame) => {
             decodeOutputs += 1;
+            decCount += 1;
             if (pendingFrame) pendingFrame.close();
             pendingFrame = frame;
             if (!paintScheduled) {
@@ -2239,7 +2267,8 @@
               </div>
               {#if hasFrame}
                 <div class="mstats">
-                  {frameW}×{frameH} · {fps} fps · {transport}{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
+                  {frameW}×{frameH} · {transport} · {decodePath}
+                  · in {inFps} → dec {decFps} → paint {fps}/s{pipeDiag ? ` · ⚠ ${pipeDiag}` : ""}
                 </div>
               {/if}
             {/if}

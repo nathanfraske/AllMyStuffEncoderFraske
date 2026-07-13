@@ -2690,6 +2690,34 @@ impl Mesh {
         // window holds each stream and on which decode path — the missing
         // half of "frames flowing but no window watching".
         tracing::info!("window watching {route_id} (native decode: {decode})");
+        // A fresh watch (a re-open, an input switch) must start its peer's
+        // video dead-lane grace over. When the previous session closed, its
+        // orphaned frames drained with no route here and left a stale
+        // "unmapped since" mark for that peer's lane. Without this reset, the
+        // very first frame of the NEW stream — arriving in the brief gap before
+        // the route is mapped — sees that elapsed grace and NACKs the sender
+        // instantly, whose handle_dead_lane then StopMedia's the capture we
+        // just restarted: the "reconnect shows nothing / connecting forever"
+        // loop, and it bit every video route, not just CEC. Clearing only on a
+        // *new* watch keeps a genuine close (no re-watch) NACKing as before.
+        //
+        // Derive the peer straight from the route id (`route:{from}→{to}`), NOT
+        // the session: at watch time the route often isn't registered yet (the
+        // offer and this watch land in the same tick — the daemon logs both at
+        // the same millisecond), so route_peer would return None and silently
+        // skip the reset. For an inbound video route the `from` end is the
+        // streaming peer, which is exactly what nack_dead_lane keys on.
+        if let Some(from_cap) = route_id
+            .strip_prefix("route:")
+            .and_then(|s| s.split_once('→'))
+            .map(|(from, _)| from)
+        {
+            let peer_node = node_of(from_cap);
+            let prefix = format!("deadlane:video:{}:", pubkey_part(&peer_node));
+            self.dead_lane_since
+                .lock()
+                .retain(|k, _| !k.starts_with(&prefix));
+        }
         self.video_watchers.lock().insert(
             route_id,
             VideoWatcher {
@@ -3299,10 +3327,13 @@ impl Mesh {
         // reconnected — an expired grant just re-prompts the customer).
         let records = self.cec.dialed_records();
         let area = allmystuff_cec_protocol::HELP_NETWORK_ID;
+        // The tab polls this, so fetch the peer set ONCE and reconcile the whole
+        // directory against it — not a round-trip per serviced machine.
+        let reachable = self.cec_reachable_set(area).await;
         let mut out = Vec::with_capacity(records.len());
         for r in records {
             let canonical = crate::cec::pubkey_part(&r.node).to_string();
-            let online = self.cec_peer_reachable(area, &canonical).await;
+            let online = reachable.contains(&canonical);
             if online != r.online {
                 self.cec.set_customer_online(&canonical, online);
             }
@@ -3393,7 +3424,14 @@ impl Mesh {
     /// per the daemon's `PeersList` — the live-reachability check behind a stored
     /// customer's online dot. A daemon error or a network we've left reads as
     /// offline (best-effort; the row stays, it just shows unreachable).
-    async fn cec_peer_reachable(&self, network_id: &str, canonical: &str) -> bool {
+    /// The set of canonical (bare-pubkey) ids **connected** on `network_id`
+    /// right now. "Reachable" is the `active`/`shelved` cut the graph reads
+    /// online from — an offline / sighted / handshaking row is a peer the
+    /// daemon remembers, not one a technician can reach, so it must not read as
+    /// online. (The old per-id check ignored status, so a still-listed but
+    /// offline customer read "online" until the app restarted.)
+    async fn cec_reachable_set(&self, network_id: &str) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
         let Ok(resp) = self
             .client
             .request(&Request::PeersList {
@@ -3401,7 +3439,7 @@ impl Mesh {
             })
             .await
         else {
-            return false;
+            return set;
         };
         let Some(peers) = resp
             .data
@@ -3409,14 +3447,17 @@ impl Mesh {
             .and_then(|d| d.get("peers"))
             .and_then(|p| p.as_array())
         else {
-            return false;
+            return set;
         };
-        peers.iter().any(|p| {
-            p.get("device_id")
-                .and_then(|v| v.as_str())
-                .map(|id| crate::cec::pubkey_part(id) == canonical)
-                .unwrap_or(false)
-        })
+        for p in peers {
+            if !status_is_reachable(p.get("status").and_then(|v| v.as_str())) {
+                continue;
+            }
+            if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {
+                set.insert(crate::cec::pubkey_part(id).to_string());
+            }
+        }
+        set
     }
 
     /// Fire a customer *decision* (Approve / Deny / End) at a technician
@@ -7070,9 +7111,47 @@ impl Mesh {
                 return per_peer.get(&lane).cloned();
             }
         }
-        self.sorted_media_routes(peer, false, "h264")
+        // No binding announced yet (a fresh peer, or every lane freed when the
+        // last route to it tore down). Positional over the peer's active h264
+        // routes — the pre-binding behaviour.
+        if let Some(r) = self
+            .sorted_media_routes(peer, false, "h264")
             .into_iter()
             .nth(lane as usize)
+        {
+            return Some(r);
+        }
+        // Re-open fallback. On a re-open the SAME route id comes back and the
+        // sender re-establishes its RTP track — so samples land on the lane
+        // again — BEFORE the daemon's session re-tags that route's codec as
+        // h264. The positional filter above keys on that tag, so it misses the
+        // re-opened route and the frames are dropped into the void ("connecting
+        // forever" on the second open). The console IS watching the route, so
+        // map by position over the video routes we actually watch from this
+        // peer — knowledge that doesn't depend on the re-tag timing. Position
+        // keeps multi-monitor correct, and an authoritative binding (above)
+        // still wins the instant the streamer's VideoLane announce lands.
+        let mut watched = self.watched_video_routes_from(canon);
+        watched.sort_unstable();
+        watched.into_iter().nth(lane as usize)
+    }
+
+    /// Route ids of the inbound video routes this viewer currently watches whose
+    /// streamer is `canon` (bare pubkey) — the re-open fallback for
+    /// [`Self::video_route_for_lane`]. Cheap: the watcher map holds one entry
+    /// per open console stream.
+    fn watched_video_routes_from(&self, canon: &str) -> Vec<String> {
+        self.video_watchers
+            .lock()
+            .keys()
+            .filter(|rid| {
+                rid.strip_prefix("route:")
+                    .and_then(|s| s.split_once('→'))
+                    .map(|(from, _)| pubkey_part(&node_of(from)) == canon)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The audio twin of [`Self::video_route_for_lane`].
@@ -10411,13 +10490,17 @@ fn pubkey_part(id: &str) -> &str {
 /// reachable-only / gap-fill / canonical-key rules are unit-tested. See
 /// [`Mesh::refresh_peer_networks`] for why the gap is what stranded a peer
 /// sharing only a secondary mesh.
+/// The daemon peer-status values that count as **reachable** — a live link
+/// (`active`/`shelved`), the same cut the graph reads "online" from. An
+/// offline / sighted / handshaking / errored row is a peer the daemon
+/// remembers, not one you can reach right now.
+fn status_is_reachable(status: Option<&str>) -> bool {
+    matches!(status, Some("active") | Some("shelved"))
+}
+
 fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], network: &str) {
     for p in peers {
-        let reachable = p
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "active" || s == "shelved");
-        if !reachable {
+        if !status_is_reachable(p.get("status").and_then(|v| v.as_str())) {
             continue;
         }
         if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {

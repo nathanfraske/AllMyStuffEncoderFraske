@@ -65,26 +65,72 @@ fn s(v: &serde_json::Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// A placeholder DMI string firmware leaves in the *system* identity fields
+/// on a custom-built PC — ASUS ships "System Product Name" / "System
+/// manufacturer", other boards "To be filled by O.E.M." or "Default string".
+/// Mirrors `linux::dmi_placeholder`; matched precisely so a real model that
+/// merely starts with "System" (IBM "System x3650 M4") is left alone.
+fn dmi_placeholder(v: &str) -> bool {
+    let l = v.to_lowercase();
+    v.is_empty()
+        || l.contains("to be filled")
+        || l.contains("system manufacturer")
+        || l.contains("system product")
+        || l.contains("default string")
+        || l == "none"
+}
+
+/// A trimmed, non-empty WMI field that also isn't a DMI placeholder.
+fn clean(v: &serde_json::Value, key: &str) -> Option<String> {
+    s(v, key).filter(|x| !dmi_placeholder(x))
+}
+
+/// The motherboard's own manufacturer + product from `Win32_BaseBoard`. On a
+/// custom build `Win32_ComputerSystem` carries only the "System Product Name"
+/// placeholder, and the real identity is here — `Product` is the sibling of
+/// `Manufacturer` ("PRIME X570-P" next to "ASUSTeK COMPUTER INC.").
+fn baseboard() -> (Option<String>, Option<String>) {
+    match ps_json(
+        "Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product | ConvertTo-Json -Compress",
+    ) {
+        Some(v) => (clean(&v, "Manufacturer"), clean(&v, "Product")),
+        None => (None, None),
+    }
+}
+
 pub fn board_label() -> Option<String> {
-    let v = ps_json(
+    let sys = ps_json(
         "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model | ConvertTo-Json -Compress",
-    )?;
-    let vendor = s(&v, "Manufacturer");
-    let model = s(&v, "Model")?;
+    );
+    let mut vendor = sys.as_ref().and_then(|v| clean(v, "Manufacturer"));
+    let mut model = sys.as_ref().and_then(|v| clean(v, "Model"));
+
+    // A DIY machine's system record is placeholders — fall back to the board,
+    // whose Manufacturer/Product siblings carry the real identity.
+    if vendor.is_none() || model.is_none() {
+        let (bb_vendor, bb_product) = baseboard();
+        vendor = vendor.or(bb_vendor);
+        model = model.or(bb_product);
+    }
+
+    let model = model?;
     Some(match vendor {
         Some(vn) if !model.starts_with(&vn) => format!("{vn} {model}"),
         _ => model,
     })
 }
 
-/// Just the product / model name — `Win32_ComputerSystem.Model`, without
-/// the `Manufacturer` prefix `board_label` adds ("OptiPlex 7090", not
-/// "Dell Inc. OptiPlex 7090").
+/// Just the product / model name — the friendly `Win32_ComputerSystem.Model`
+/// an OEM burns in ("OptiPlex 7090", not "Dell Inc. OptiPlex 7090"). On a
+/// custom build that field is only the "System Product Name" placeholder, so
+/// fall back to the motherboard's own product — the sibling of its
+/// manufacturer in `Win32_BaseBoard` ("PRIME X570-P").
 pub fn product_label() -> Option<String> {
-    let v = ps_json(
+    let sys_model = ps_json(
         "Get-CimInstance Win32_ComputerSystem | Select-Object Model | ConvertTo-Json -Compress",
-    )?;
-    s(&v, "Model")
+    )
+    .and_then(|v| clean(&v, "Model"));
+    sys_model.or_else(|| baseboard().1)
 }
 
 pub fn soc_label() -> Option<String> {

@@ -27,18 +27,28 @@ use crate::types::*;
 // =======================================================================
 
 /// Friendly board label from DMI — "Dell Inc. XPS 15 9520". `None`
-/// inside VMs / containers where DMI is stripped.
+/// inside VMs / containers where DMI is stripped. On a custom build the
+/// `sys_vendor`/`product_name` fields are placeholders, so fall back to the
+/// motherboard's own `board_vendor`/`board_name`.
 pub fn board_label() -> Option<String> {
-    let vendor = read_trim("/sys/class/dmi/id/sys_vendor");
-    let product = read_trim("/sys/class/dmi/id/product_name");
+    let vendor = read_trim("/sys/class/dmi/id/sys_vendor")
+        .filter(|v| !dmi_placeholder(v))
+        .or_else(|| read_trim("/sys/class/dmi/id/board_vendor"));
+    let product = read_trim("/sys/class/dmi/id/product_name")
+        .filter(|p| !dmi_placeholder(p))
+        .or_else(|| read_trim("/sys/class/dmi/id/board_name"));
     parse_dmi_board(vendor.as_deref(), product.as_deref())
 }
 
 /// Just the product / model name — the DMI `product_name` field, without
-/// the `sys_vendor` prefix `board_label` adds. `None` when it's absent or
-/// a placeholder ("To be filled by O.E.M.").
+/// the `sys_vendor` prefix `board_label` adds. On a custom build that field
+/// is a placeholder ("System Product Name" / "To be filled by O.E.M."), so
+/// fall back to `board_name` — the motherboard's own model. `None` when both
+/// are absent or placeholders.
 pub fn product_label() -> Option<String> {
-    read_trim("/sys/class/dmi/id/product_name").filter(|p| !dmi_placeholder(p))
+    read_trim("/sys/class/dmi/id/product_name")
+        .filter(|p| !dmi_placeholder(p))
+        .or_else(|| read_trim("/sys/class/dmi/id/board_name").filter(|p| !dmi_placeholder(p)))
 }
 
 pub fn soc_label() -> Option<String> {
