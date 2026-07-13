@@ -10,6 +10,7 @@
   import { swipeToClose } from "../swipe";
   import RoomsTab from "./RoomsTab.svelte";
   import SitesTab from "./SitesTab.svelte";
+  import HelpTab from "./HelpTab.svelte";
 
   const WIDTH_KEY = "allmystuff.sidebar.width.v1";
   const COLLAPSED_KEY = "allmystuff.sidebar.collapsed.v1";
@@ -48,6 +49,16 @@
     Object.values(app.roomKnocks).reduce((n, ks) => n + ks.length, 0),
   );
   const siteCount = $derived(app.sitesByMachine.reduce((n, g) => n + g.sites.length, 0));
+  // The Help tab only exists once the (secret) CEC support area is unlocked —
+  // an ordinary user never sees it. Its badge is the live count of customers
+  // with a hand up right now (only meaningful while watching the queue).
+  const helpWaiting = $derived(app.cecHelpWatching ? app.cecHelpWaiting.length : 0);
+
+  // If the CEC area is re-locked while the Help tab is showing, fall back to
+  // Sites so the panel never renders a tab that no longer exists.
+  $effect(() => {
+    if (!app.cecEnabled && app.sidebarTab === "help") app.sidebarTab = "sites";
+  });
 
   function setCollapsed(v: boolean) {
     collapsed = v;
@@ -58,7 +69,7 @@
     }
   }
 
-  function select(tab: "rooms" | "sites") {
+  function select(tab: "rooms" | "sites" | "help") {
     app.sidebarTab = tab;
     if (collapsed) setCollapsed(false);
     if (tab !== "rooms") app.roomDraftOpen = false;
@@ -134,6 +145,12 @@
         🪩
         {#if roomAttention > 0}<span class="rail-attn" aria-label="{roomAttention} asking to join"></span>{/if}
       </button>
+      {#if app.cecEnabled}
+        <button class="rail-btn" title="Help queue" aria-label="Help queue" onclick={() => select("help")}>
+          ✋
+          {#if helpWaiting > 0}<span class="rail-count">{helpWaiting}</span>{/if}
+        </button>
+      {/if}
     </div>
   {:else}
     <div class="head">
@@ -159,6 +176,18 @@
           {#if app.rooms.length > 0}<span class="count">{app.rooms.length}</span>{/if}
           {#if roomAttention > 0 && app.sidebarTab !== "rooms"}<span class="attn" title="{roomAttention} asking to join"></span>{/if}
         </button>
+        {#if app.cecEnabled}
+          <button
+            class="tab"
+            class:active={app.sidebarTab === "help"}
+            role="tab"
+            aria-selected={app.sidebarTab === "help"}
+            onclick={() => select("help")}
+          >
+            ✋ Help
+            {#if helpWaiting > 0}<span class="count">{helpWaiting}</span>{/if}
+          </button>
+        {/if}
       </div>
       <button class="collapse" title="Collapse" aria-label="Collapse sidebar" onclick={() => setCollapsed(true)}>‹</button>
     </div>
@@ -166,6 +195,8 @@
     <div class="body" role="tabpanel">
       {#if app.sidebarTab === "rooms"}
         <RoomsTab />
+      {:else if app.sidebarTab === "help" && app.cecEnabled}
+        <HelpTab />
       {:else}
         <SitesTab />
       {/if}

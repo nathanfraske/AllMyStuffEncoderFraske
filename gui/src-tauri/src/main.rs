@@ -946,6 +946,23 @@ async fn open_video_window(
     )
 }
 
+/// Pop the CEC Support console out into its own window (`?cec=1`). A single
+/// fixed label so re-opening focuses the existing console instead of stacking
+/// a second one. The technician's whole help-desk surface, off on its own
+/// screen while the main window keeps the device graph.
+#[tauri::command]
+async fn open_cec_window(app: tauri::AppHandle) -> Result<(), String> {
+    open_secondary_window(
+        &app,
+        "cec-console",
+        "index.html?cec=1".to_string(),
+        "CEC Console",
+        (960.0, 720.0),
+        (420.0, 480.0),
+        AUMID_CEC,
+    )
+}
+
 /// A node id reduced to the characters Tauri allows in a window label —
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
@@ -985,6 +1002,7 @@ const AUMID_CONSOLE: &str = "works.allmystuff.console";
 const AUMID_FILES: &str = "works.allmystuff.files";
 const AUMID_ROOM: &str = "works.allmystuff.room";
 const AUMID_VIDEO: &str = "works.allmystuff.video";
+const AUMID_CEC: &str = "works.allmystuff.cec";
 
 /// Give a secondary window its own taskbar identity (an explicit per-window
 /// AppUserModelID) so it groups separately from the main AllMyStuff app and is
@@ -2381,6 +2399,7 @@ fn main() {
             cec_status,
             cec_dial,
             cec_dial_node,
+            open_cec_window,
             cec_pending,
             cec_approve,
             cec_deny,
