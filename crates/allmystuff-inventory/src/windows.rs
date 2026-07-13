@@ -81,7 +81,9 @@ pub fn board_label() -> Option<String> {
 /// the `Manufacturer` prefix `board_label` adds ("OptiPlex 7090", not
 /// "Dell Inc. OptiPlex 7090").
 pub fn product_label() -> Option<String> {
-    let v = ps_json("Get-CimInstance Win32_ComputerSystem | Select-Object Model | ConvertTo-Json -Compress")?;
+    let v = ps_json(
+        "Get-CimInstance Win32_ComputerSystem | Select-Object Model | ConvertTo-Json -Compress",
+    )?;
     s(&v, "Model")
 }
 
