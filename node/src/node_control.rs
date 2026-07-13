@@ -772,6 +772,11 @@ pub async fn dispatch(
                 // motherboard model on a custom build) — null when the
                 // firmware doesn't say.
                 "board": inv.host.board,
+                // Just the product / model name — the DMI *product* field
+                // without its maker prefix ("XPS 15", not "Dell Inc. XPS
+                // 15"). The spec card shows THIS as the machine's identity;
+                // the maker name doesn't tell a technician which box it is.
+                "product": inv.host.product,
                 "cpu": {
                     "brand": inv.cpu.brand,
                     "cores": inv.cpu.physical_cores,

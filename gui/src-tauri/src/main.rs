@@ -946,6 +946,23 @@ async fn open_video_window(
     )
 }
 
+/// Pop the CEC Support console out into its own window (`?cec=1`). A single
+/// fixed label so re-opening focuses the existing console instead of stacking
+/// a second one. The technician's whole help-desk surface, off on its own
+/// screen while the main window keeps the device graph.
+#[tauri::command]
+async fn open_cec_window(app: tauri::AppHandle) -> Result<(), String> {
+    open_secondary_window(
+        &app,
+        "cec-console",
+        "index.html?cec=1".to_string(),
+        "CEC Console",
+        (960.0, 720.0),
+        (420.0, 480.0),
+        AUMID_CEC,
+    )
+}
+
 /// A node id reduced to the characters Tauri allows in a window label —
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
@@ -985,6 +1002,7 @@ const AUMID_CONSOLE: &str = "works.allmystuff.console";
 const AUMID_FILES: &str = "works.allmystuff.files";
 const AUMID_ROOM: &str = "works.allmystuff.room";
 const AUMID_VIDEO: &str = "works.allmystuff.video";
+const AUMID_CEC: &str = "works.allmystuff.cec";
 
 /// Give a secondary window its own taskbar identity (an explicit per-window
 /// AppUserModelID) so it groups separately from the main AllMyStuff app and is
@@ -1296,22 +1314,22 @@ async fn cec_dial(
         .map_err(|e| e.to_string())
 }
 
-/// Customer: start hosting on this device's own number-derived Silent mesh.
+/// Technician: dial a specific customer by node id — the raised-hand answer
+/// (the queue hands us a node, not a number). This bridge was missing, so
+/// every "answer" `invoke("cec_dial_node")` failed with "Command not found"
+/// even though the node has handled it all along. Returns `{ node }`.
 #[tauri::command]
-async fn cec_start_hosting(state: State<'_, AppState>) -> Result<Value, String> {
+async fn cec_dial_node(
+    state: State<'_, AppState>,
+    node: String,
+    agent_name: Option<String>,
+) -> Result<Value, String> {
     state
         .node
-        .request("cec_start_hosting", json!({}))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Customer: stop hosting (standing consent grants are kept).
-#[tauri::command]
-async fn cec_stop_hosting(state: State<'_, AppState>) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_stop_hosting", json!({}))
+        .request(
+            "cec_dial_node",
+            json!({ "node": node, "agent_name": agent_name }),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -1365,18 +1383,7 @@ async fn cec_cancel_dial(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Technician: curate away a directory row by its support number — the removal
-/// path for an attempt row that never discovered a node.
-#[tauri::command]
-async fn cec_forget_number(state: State<'_, AppState>, number: String) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_forget_number", json!({ "number": number }))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Customer: the inbound technician connect-requests awaiting a choice.
+/// The inbound technician connect-requests awaiting a choice.
 #[tauri::command]
 async fn cec_pending(state: State<'_, AppState>) -> Result<Value, String> {
     state
@@ -1419,7 +1426,10 @@ async fn cec_deny(
 ) -> Result<Value, String> {
     state
         .node
-        .request("cec_deny", json!({ "tech": tech, "session_id": session_id }))
+        .request(
+            "cec_deny",
+            json!({ "tech": tech, "session_id": session_id }),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -2388,8 +2398,8 @@ fn main() {
             fleet_mfa_disable,
             cec_status,
             cec_dial,
-            cec_start_hosting,
-            cec_stop_hosting,
+            cec_dial_node,
+            open_cec_window,
             cec_pending,
             cec_approve,
             cec_deny,
@@ -2398,7 +2408,6 @@ fn main() {
             cec_dialed,
             cec_help_list,
             cec_help_watch,
-            cec_forget_number,
             cec_cancel_dial,
             forget_node,
             mesh_status,

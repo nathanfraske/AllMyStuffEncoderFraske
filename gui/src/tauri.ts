@@ -1583,6 +1583,20 @@ export function videoWindowTarget(): string | null {
   return new URLSearchParams(window.location.search).get("video");
 }
 
+/** Pop the CEC Support console out into its own window. One fixed window —
+ *  re-invoking focuses it rather than stacking a second console. */
+export async function openCecWindow(): Promise<void> {
+  if (!isTauri()) return;
+  await tryInvoke("open_cec_window", {});
+}
+
+/** True when THIS webview is the CEC console popout (`?cec=1`), so the main
+ *  App renders just the console and CecSection hides its own pop-out button. */
+export function isCecWindow(): boolean {
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("cec") === "1";
+}
+
 /** The same-device chatter between this app's windows about video
  *  popouts — the popout-presence twin of [`RoomLocalEvent`]. A popout
  *  announces itself (`opened` at boot, and again in answer to a `hello`

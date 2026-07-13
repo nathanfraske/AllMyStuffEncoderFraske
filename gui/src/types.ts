@@ -95,6 +95,11 @@ export interface InventorySummary {
   cpu: string;
   ram_bytes: number;
   device_count: number;
+  /** Product / model name ("OptiPlex 7090", "MacBook Pro") — the machine's
+   *  own identity, so a CEC technician can tell one customer's box from
+   *  another. Optional: absent from adverts by an AllMyStuff older than the
+   *  release that added it. */
+  product?: string;
 }
 
 export interface MeshNode {

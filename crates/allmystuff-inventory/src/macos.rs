@@ -48,6 +48,19 @@ pub fn board_label() -> Option<String> {
     }
 }
 
+/// Just the product / model name — the Mac's machine name ("MacBook Pro"),
+/// without the ` · Apple M2` chip suffix `board_label` adds. Falls back to
+/// the raw `hw.model` code ("Mac14,7") when the friendly name is absent.
+pub fn product_label() -> Option<String> {
+    let hw = system_profiler("SPHardwareDataType")?;
+    let item = hw["SPHardwareDataType"].as_array()?.first()?;
+    item["machine_name"]
+        .as_str()
+        .or_else(|| item["machine_model"].as_str())
+        .map(str::to_string)
+        .or_else(|| sysctl("hw.model"))
+}
+
 /// Apple-silicon chip label for the `soc` field ("Apple M2"). `None` on
 /// Intel Macs.
 pub fn soc_label() -> Option<String> {

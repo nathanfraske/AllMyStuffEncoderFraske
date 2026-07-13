@@ -13,13 +13,25 @@ pub fn host_info() -> HostInfo {
     let arch = std::env::consts::ARCH.to_string();
 
     #[cfg(target_os = "linux")]
-    let (board, soc) = (crate::linux::board_label(), crate::linux::soc_label());
+    let (board, product, soc) = (
+        crate::linux::board_label(),
+        crate::linux::product_label(),
+        crate::linux::soc_label(),
+    );
     #[cfg(target_os = "macos")]
-    let (board, soc) = (crate::macos::board_label(), crate::macos::soc_label());
+    let (board, product, soc) = (
+        crate::macos::board_label(),
+        crate::macos::product_label(),
+        crate::macos::soc_label(),
+    );
     #[cfg(target_os = "windows")]
-    let (board, soc) = (crate::windows::board_label(), crate::windows::soc_label());
+    let (board, product, soc) = (
+        crate::windows::board_label(),
+        crate::windows::product_label(),
+        crate::windows::soc_label(),
+    );
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    let (board, soc) = (None, None);
+    let (board, product, soc) = (None, None, None);
 
     HostInfo {
         hostname: device_hostname(),
@@ -28,6 +40,7 @@ pub fn host_info() -> HostInfo {
         kernel_version: System::kernel_version(),
         arch,
         board,
+        product,
         soc,
         uptime_secs: System::uptime(),
     }

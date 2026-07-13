@@ -12,7 +12,11 @@
   // is shown too, so a build that hosts can drive it from here.
   import { onMount } from "svelte";
   import { app, CEC_STALE_AFTER_S } from "../../store.svelte";
-  import { isTauri, type CecScope } from "../../tauri";
+  import { isTauri, openCecWindow, type CecScope } from "../../tauri";
+
+  // `windowed` = this is the popped-out CEC Console window (rendered by
+  // CecHost), so the pop-out button hides itself.
+  let { windowed = false }: { windowed?: boolean } = $props();
 
   const web = !isTauri();
   const status = $derived(app.cecStatusInfo);
@@ -144,6 +148,16 @@
       oninput={(e) => app.setCecAgentName(e.currentTarget.value)}
     />
   </section>
+
+  <!-- Pop the console out into its own window — the technician's whole
+       help-desk surface on its own screen while the main window keeps the
+       device graph. Hidden inside the popout itself (nothing to pop). -->
+  {#if !windowed && !web}
+    <button class="popout" onclick={() => void openCecWindow()}>
+      <span class="popout-ico" aria-hidden="true">⤢</span>
+      <span>Open the CEC Console in its own window</span>
+    </button>
+  {/if}
 
   <!-- Connect to a customer -->
   <section class="block">
@@ -421,6 +435,33 @@
   h3 {
     margin: 0 0 0.3rem;
     font-size: 1.1rem;
+  }
+  /* The big pop-out button — full width, right under the agent name, so the
+     technician can lift the whole console onto its own screen. */
+  .popout {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.55rem;
+    width: 100%;
+    margin-bottom: 0.9rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-md, 0.6rem);
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font: inherit;
+    font-size: 0.92rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .popout:hover {
+    background: var(--accent);
+    color: #fff;
+  }
+  .popout-ico {
+    font-size: 1.15rem;
+    line-height: 1;
   }
   .lead {
     margin: 0 0 1rem;

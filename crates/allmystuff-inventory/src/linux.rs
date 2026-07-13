@@ -34,6 +34,13 @@ pub fn board_label() -> Option<String> {
     parse_dmi_board(vendor.as_deref(), product.as_deref())
 }
 
+/// Just the product / model name — the DMI `product_name` field, without
+/// the `sys_vendor` prefix `board_label` adds. `None` when it's absent or
+/// a placeholder ("To be filled by O.E.M.").
+pub fn product_label() -> Option<String> {
+    read_trim("/sys/class/dmi/id/product_name").filter(|p| !dmi_placeholder(p))
+}
+
 pub fn soc_label() -> Option<String> {
     if let Ok(raw) = fs::read("/proc/device-tree/model") {
         if let Some(label) = parse_device_tree_model(&raw) {
@@ -48,17 +55,21 @@ pub fn soc_label() -> Option<String> {
     None
 }
 
+/// A placeholder DMI string OEMs leave in when they don't stamp real
+/// values — treat these as "no value" everywhere DMI is read.
+fn dmi_placeholder(s: &str) -> bool {
+    let l = s.to_lowercase();
+    s.is_empty()
+        || l.contains("to be filled")
+        || l.contains("system manufacturer")
+        || l.contains("system product")
+        || l.contains("default string")
+        || l == "none"
+}
+
 fn parse_dmi_board(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
-    let bad = |s: &str| {
-        let l = s.to_lowercase();
-        s.is_empty()
-            || l.contains("to be filled")
-            || l.contains("system manufacturer")
-            || l.contains("default string")
-            || l == "none"
-    };
-    let vendor = vendor.filter(|v| !bad(v));
-    let product = product.filter(|p| !bad(p))?;
+    let vendor = vendor.filter(|v| !dmi_placeholder(v));
+    let product = product.filter(|p| !dmi_placeholder(p))?;
     Some(match vendor {
         Some(v) if !product.starts_with(v) => format!("{v} {product}"),
         _ => product.to_string(),

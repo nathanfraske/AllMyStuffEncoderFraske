@@ -52,6 +52,13 @@ impl Capability {
     }
 }
 
+/// The safe minimum a grant carries when its `capabilities` field is absent
+/// (an older persisted grant): view-only, never control. A missing field must
+/// never widen access.
+fn default_capabilities() -> Vec<Capability> {
+    vec![Capability::ScreenView]
+}
+
 /// Map the wire `want_control` flag to the capability set a grant should carry.
 pub fn capabilities_for(want_control: bool) -> Vec<Capability> {
     if want_control {
@@ -72,7 +79,10 @@ pub struct Grant {
     /// choose to forget it.
     #[serde(default)]
     pub agent_name: String,
-    /// What the technician may do.
+    /// What the technician may do. Defaults to view-only ([`Capability::ScreenView`])
+    /// when a persisted grant predates this field, so an older store still loads
+    /// (at minimum privilege) instead of being discarded.
+    #[serde(default = "default_capabilities")]
     pub capabilities: Vec<Capability>,
     /// Why this grant exists / how it was made.
     pub scope: ApprovalScope,
@@ -114,8 +124,30 @@ pub enum ConsentError {
 struct Persisted {
     #[serde(default)]
     version: u32,
-    #[serde(default)]
+    /// Loaded **per-grant tolerantly** (see [`de_lenient_grants`]): an unreadable
+    /// grant is dropped on its own instead of failing the whole load. Previously
+    /// one grant a reader build couldn't parse (a scope/shape skew from a
+    /// differently-versioned node sharing the same consent file) discarded
+    /// EVERY standing approval, so a customer had to re-approve after a restart.
+    #[serde(default, deserialize_with = "de_lenient_grants")]
     grants: Vec<Grant>,
+}
+
+/// Deserialize the grant list element-by-element, keeping the readable grants
+/// and silently dropping any that don't parse — so one malformed or
+/// older-shaped grant can never erase a customer's whole standing consent. The
+/// per-field tolerance on [`Grant`] (defaulted `capabilities`, string-or-tagged
+/// `scope`) means legacy grants are *read*, not dropped; this is the backstop
+/// for anything still unreadable.
+fn de_lenient_grants<'de, D>(deserializer: D) -> Result<Vec<Grant>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<Grant>(v).ok())
+        .collect())
 }
 
 const STORE_VERSION: u32 = 1;
@@ -532,5 +564,70 @@ mod tests {
         assert_eq!(pubkey_part("abc-def"), "abc-def"); // tail not 5 chars
         assert_eq!(pubkey_part("abc"), "abc");
         assert_eq!(pubkey_part("abc-AB1!C"), "abc-AB1!C"); // non-alnum
+    }
+
+    // ---- shape migration + tolerant load (the "can't reuse the approval" bug) --
+
+    #[test]
+    fn legacy_bare_string_scope_and_missing_capabilities_still_load() {
+        // A grant persisted by an older build: `scope` a bare string (not the
+        // tagged {"kind":...} object) and no `capabilities` field at all. The
+        // tolerant Grant deserializer must read it — view-only, the safe
+        // minimum — instead of the whole store failing and re-prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let legacy = format!(
+            r#"{{ "version": 1, "grants": [
+                {{ "technician": "{TECH}", "agent_name": "Alex",
+                   "scope": "forever", "granted_at": {T0} }}
+            ] }}"#
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let s = ConsentStore::load(&path);
+        // The Forever grant survived the reload and still authorises view.
+        assert!(s.is_allowed(TECH, Capability::ScreenView, T0 + 999_999));
+        // Missing capabilities defaulted to view-only — never silently control.
+        assert!(!s.is_allowed(TECH, Capability::Control, T0 + 999_999));
+        // The file was NOT quarantined — it read cleanly.
+        assert!(!path.with_file_name("consent.json.corrupt").exists());
+    }
+
+    #[test]
+    fn tagged_scope_object_still_loads() {
+        // The current on-disk shape (tagged scope object) must keep working.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let current = format!(
+            r#"{{ "version": 1, "grants": [
+                {{ "technician": "{TECH}", "agent_name": "Alex",
+                   "capabilities": ["screen_view","control"],
+                   "scope": {{ "kind": "forever" }}, "granted_at": {T0} }}
+            ] }}"#
+        );
+        std::fs::write(&path, current).unwrap();
+        let s = ConsentStore::load(&path);
+        assert!(s.is_allowed(TECH, Capability::Control, T0 + 999_999));
+    }
+
+    #[test]
+    fn one_unreadable_grant_does_not_wipe_the_readable_ones() {
+        // The crux of the reuse bug: a single grant the reader can't parse must
+        // drop on its own, NOT discard every standing approval in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let good = "goodpubkeybase32aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mixed = format!(
+            r#"{{ "version": 1, "grants": [
+                {{ "technician": "{good}", "agent_name": "Alex",
+                   "capabilities": ["screen_view"], "scope": {{ "kind": "forever" }},
+                   "granted_at": {T0} }},
+                {{ "technician": "brokenrow", "scope": 12345 }}
+            ] }}"#
+        );
+        std::fs::write(&path, mixed).unwrap();
+        let s = ConsentStore::load(&path);
+        // The good grant survived; only the broken one was dropped.
+        assert!(s.is_allowed(good, Capability::ScreenView, T0 + 10));
+        assert_eq!(s.active_grants(T0 + 10).len(), 1);
     }
 }

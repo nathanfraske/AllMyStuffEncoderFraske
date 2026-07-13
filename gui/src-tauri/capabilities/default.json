@@ -1,14 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/capabilities/2",
   "identifier": "default",
-  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console, terminal and files window, each room call window, and each video-popout window)",
+  "description": "Default capabilities for the AllMyStuff GUI (the main window and every per-machine console, terminal and files window, each room call window, each video-popout window, and the CEC Console window)",
   "windows": [
     "main",
     "console-*",
     "terminal-*",
     "files-*",
     "room-*",
-    "video-*"
+    "video-*",
+    "cec-console"
   ],
   "permissions": [
     "core:default",

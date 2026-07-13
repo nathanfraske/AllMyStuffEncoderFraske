@@ -235,6 +235,9 @@ pub fn node_summary(inv: &Inventory) -> InventorySummary {
         cpu: inv.cpu.brand.clone(),
         ram_bytes: inv.memory.total_bytes,
         device_count: inv.device_count() as u32,
+        // The product/model name identifies the machine to a CEC technician;
+        // empty when DMI has nothing usable (the wire default).
+        product: inv.host.product.clone().unwrap_or_default(),
     }
 }
 
@@ -259,6 +262,7 @@ mod tests {
                 kernel_version: None,
                 arch: "x86_64".into(),
                 board: None,
+                product: None,
                 soc: None,
                 uptime_secs: 0,
             },

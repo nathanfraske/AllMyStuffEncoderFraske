@@ -29,6 +29,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "AllMyStuff",
+    "copyright": "Copyright © 2026 AllMyStuff",
+    "category": "Utility",
+    "shortDescription": "Your own computers, meshed together.",
+    "longDescription": "AllMyStuff is a personal mesh for your own machines — remote desktop, screen and file sharing, and CEC remote support, peer-to-peer over your MyOwnMesh network.",
     "externalBin": ["binaries/myownmesh", "binaries/allmystuff-serve"],
     "icon": [
       "icons/32x32.png",
