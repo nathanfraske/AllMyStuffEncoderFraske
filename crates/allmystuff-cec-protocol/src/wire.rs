@@ -106,7 +106,7 @@ impl SupportPresence {
 /// [`Once`]: ApprovalScope::Once
 /// [`ThreeHours`]: ApprovalScope::ThreeHours
 /// [`Forever`]: ApprovalScope::Forever
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ApprovalScope {
     /// This session only. Never written to disk; gone on restart or session end.
@@ -116,6 +116,40 @@ pub enum ApprovalScope {
     ThreeHours,
     /// Auto-approve until the customer revokes ("Forget this technician").
     Forever,
+}
+
+// Deserialize is hand-written (not derived) so a scope reads from BOTH the
+// current internally-tagged object `{"kind":"three_hours"}` AND a bare string
+// `"three_hours"`. An earlier build persisted the scope as a bare string; the
+// tagged-only derive rejected those files, and because the consent store used
+// to fail its whole load on one unreadable grant, that silently wiped a
+// customer's standing approvals across a restart (the "can't reuse the
+// approval" bug). Serialization stays tagged (unchanged on the wire).
+impl<'de> Deserialize<'de> for ApprovalScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            Tagged { kind: String },
+        }
+        let word = match Raw::deserialize(deserializer)? {
+            Raw::Bare(s) => s,
+            Raw::Tagged { kind } => kind,
+        };
+        match word.as_str() {
+            "once" => Ok(ApprovalScope::Once),
+            "three_hours" => Ok(ApprovalScope::ThreeHours),
+            "forever" => Ok(ApprovalScope::Forever),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["once", "three_hours", "forever"],
+            )),
+        }
+    }
 }
 
 impl ApprovalScope {
