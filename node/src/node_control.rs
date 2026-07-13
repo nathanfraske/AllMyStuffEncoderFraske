@@ -1458,6 +1458,15 @@ pub async fn dispatch(
             let session_id: String = try_arg!(arg(a, "session_id"));
             json_result(mesh.cec_deny(tech, session_id).await)
         }
+        "cec_chat_send" => {
+            let peer: String = try_arg!(arg(a, "peer"));
+            let text: String = try_arg!(arg(a, "text"));
+            json_result(mesh.cec_chat_send(peer, text).await)
+        }
+        "cec_chat_history" => {
+            let peer: String = try_arg!(arg(a, "peer"));
+            json_result(mesh.cec_chat_history(peer).await)
+        }
         "cec_revoke" => {
             let tech: String = try_arg!(arg(a, "tech"));
             json_result(mesh.cec_revoke(tech).await)

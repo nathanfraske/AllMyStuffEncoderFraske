@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use allmystuff_cec_consent::{capabilities_for, Capability, ConsentStore};
-use allmystuff_cec_protocol::{format_support_id, support_id_from_device, ApprovalScope, Role};
+use allmystuff_cec_protocol::{
+    format_support_id, support_id_from_device, ApprovalScope, ChatMessage, Role,
+};
 
 /// Where the customer's consent store lives:
 /// `~/.myownmesh/cec-consent.json`, honouring `MYOWNMESH_HOME` — the same home
@@ -166,6 +168,38 @@ fn load_dialed(path: Option<&PathBuf>) -> HashMap<String, DialedCustomer> {
         .collect()
 }
 
+/// The persisted shape of the per-peer chat transcripts: a version tag plus the
+/// map of canonical-peer-id → messages (oldest-first). Versioned like the
+/// consent store so a future format change is a migration, never a silent wipe.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedChats {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    chats: HashMap<String, Vec<ChatMessage>>,
+}
+
+/// Current on-disk version of the chat transcript store.
+const CHAT_STORE_VERSION: u32 = 1;
+
+/// How many of the most recent messages a single peer's transcript keeps. A
+/// live chat is small, but the store is durable across sessions, so cap each
+/// peer so an old relationship's file can't grow without bound — the oldest
+/// lines fall off first.
+const CHAT_HISTORY_CAP: usize = 500;
+
+/// Load the persisted chat transcripts, keyed by each peer's canonical
+/// (bare-pubkey) id. A missing file loads empty and a corrupt one is quarantined
+/// aside by [`crate::persist::load_json`] rather than bricking the node — at
+/// worst a transcript restarts empty, exactly like the consent/dialed stores.
+fn load_chats(path: Option<&PathBuf>) -> HashMap<String, Vec<ChatMessage>> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    let loaded: PersistedChats = crate::persist::load_json(path);
+    loaded.chats
+}
+
 /// The CEC state a node carries — all behind one lock, since both the
 /// node-control commands and the mesh's per-frame gate reach it from many
 /// tasks. Cheap to hold: the enforcement (expiry, persistence) lives in the
@@ -179,6 +213,10 @@ pub struct Cec {
     /// re-prompts the customer on the next connect). `None` for an in-memory
     /// node (tests), where nothing is written.
     dialed_path: Option<PathBuf>,
+    /// Where the per-peer chat transcripts are mirrored (`cec-chats.json`),
+    /// alongside the consent + dialed stores under the same node home. `None`
+    /// for an in-memory node (tests), where nothing is written.
+    chats_path: Option<PathBuf>,
 }
 
 struct CecInner {
@@ -228,6 +266,11 @@ struct CecInner {
     /// last beacon; an `available: false` beacon (cancel / help arrived)
     /// removes one immediately.
     help_wanted: HashMap<String, HelpSeeker>,
+    /// Per-peer chat transcripts (both roles), keyed by the peer's canonical
+    /// (bare-pubkey) id, each oldest-first and capped at [`CHAT_HISTORY_CAP`].
+    /// Holds both received lines and the echoes of ones this node sent, so a
+    /// peer's history is the whole conversation. Mirrored to `chats_path`.
+    chats: HashMap<String, Vec<ChatMessage>>,
 }
 
 /// One customer waiting on the global help mesh, as heard from their beacon.
@@ -268,13 +311,21 @@ impl Cec {
             .as_ref()
             .and_then(|p| p.parent())
             .map(|dir| dir.join("cec-dialed.json"));
+        // The chat transcripts live beside the consent + dialed stores under the
+        // same node home, on the same tolerant-load / atomic-write discipline.
+        let chats_path = consent_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("cec-chats.json"));
         let consent = match consent_path {
             Some(p) => ConsentStore::load(p),
             None => ConsentStore::in_memory(),
         };
         let dialed = load_dialed(dialed_path.as_ref());
+        let chats = load_chats(chats_path.as_ref());
         Cec {
             dialed_path,
+            chats_path,
             inner: Mutex::new(CecInner {
                 role: Role::Client,
                 number: String::new(),
@@ -288,6 +339,7 @@ impl Cec {
                 watching_help: false,
                 help_epoch: 0,
                 help_wanted: HashMap::new(),
+                chats,
             }),
         }
     }
@@ -310,6 +362,68 @@ impl Cec {
             }
             Err(e) => tracing::warn!("couldn't serialize CEC dialed customers: {e}"),
         }
+    }
+
+    // ---- chat transcript (both roles) -----------------------------------
+
+    /// Mirror the chat transcripts to disk atomically (temp + fsync + rename,
+    /// 0600 on Unix) — the same crash-safe discipline the consent store uses, so
+    /// a half-written transcript can never replace a good one. Best-effort: a
+    /// write failure warns and is dropped (the in-memory log still serves the
+    /// live session). Called after every append.
+    fn persist_chats(&self, chats: HashMap<String, Vec<ChatMessage>>) {
+        let Some(path) = &self.chats_path else {
+            return;
+        };
+        let doc = PersistedChats {
+            version: CHAT_STORE_VERSION,
+            chats,
+        };
+        match serde_json::to_vec_pretty(&doc) {
+            Ok(bytes) => {
+                if let Err(e) = crate::persist::write_atomic(path, &bytes) {
+                    tracing::warn!(
+                        "couldn't persist CEC chat transcripts to {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("couldn't serialize CEC chat transcripts: {e}"),
+        }
+    }
+
+    /// Append one message to `peer`'s transcript (canonicalised key) and persist.
+    /// Used for both an inbound receive and the echo of a line this node sent, so
+    /// a peer's history holds both halves of the conversation oldest-first. The
+    /// transcript is capped at [`CHAT_HISTORY_CAP`] — the oldest lines fall off
+    /// so a durable file can't grow without bound.
+    pub fn push_chat(&self, peer: &str, msg: ChatMessage) {
+        let key = pubkey_part(peer).to_string();
+        let mut inner = self.inner.lock();
+        let log = inner.chats.entry(key).or_default();
+        log.push(msg);
+        if log.len() > CHAT_HISTORY_CAP {
+            let excess = log.len() - CHAT_HISTORY_CAP;
+            log.drain(0..excess);
+        }
+        // Snapshot under the lock, persist outside it (write_atomic does disk
+        // I/O — never hold the state lock across a syscall), mirroring how the
+        // dialed directory is persisted.
+        let snapshot = inner.chats.clone();
+        drop(inner);
+        self.persist_chats(snapshot);
+    }
+
+    /// `peer`'s stored transcript (canonicalised key), oldest-first — what
+    /// `cec_chat_history` projects for the GUI. Empty for a peer never chatted.
+    pub fn chat_history(&self, peer: &str) -> Vec<ChatMessage> {
+        let key = pubkey_part(peer);
+        self.inner
+            .lock()
+            .chats
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // ---- status ---------------------------------------------------------
