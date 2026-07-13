@@ -1296,22 +1296,22 @@ async fn cec_dial(
         .map_err(|e| e.to_string())
 }
 
-/// Customer: start hosting on this device's own number-derived Silent mesh.
+/// Technician: dial a specific customer by node id — the raised-hand answer
+/// (the queue hands us a node, not a number). This bridge was missing, so
+/// every "answer" `invoke("cec_dial_node")` failed with "Command not found"
+/// even though the node has handled it all along. Returns `{ node }`.
 #[tauri::command]
-async fn cec_start_hosting(state: State<'_, AppState>) -> Result<Value, String> {
+async fn cec_dial_node(
+    state: State<'_, AppState>,
+    node: String,
+    agent_name: Option<String>,
+) -> Result<Value, String> {
     state
         .node
-        .request("cec_start_hosting", json!({}))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Customer: stop hosting (standing consent grants are kept).
-#[tauri::command]
-async fn cec_stop_hosting(state: State<'_, AppState>) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_stop_hosting", json!({}))
+        .request(
+            "cec_dial_node",
+            json!({ "node": node, "agent_name": agent_name }),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -1365,18 +1365,7 @@ async fn cec_cancel_dial(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Technician: curate away a directory row by its support number — the removal
-/// path for an attempt row that never discovered a node.
-#[tauri::command]
-async fn cec_forget_number(state: State<'_, AppState>, number: String) -> Result<Value, String> {
-    state
-        .node
-        .request("cec_forget_number", json!({ "number": number }))
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Customer: the inbound technician connect-requests awaiting a choice.
+/// The inbound technician connect-requests awaiting a choice.
 #[tauri::command]
 async fn cec_pending(state: State<'_, AppState>) -> Result<Value, String> {
     state
@@ -1419,7 +1408,10 @@ async fn cec_deny(
 ) -> Result<Value, String> {
     state
         .node
-        .request("cec_deny", json!({ "tech": tech, "session_id": session_id }))
+        .request(
+            "cec_deny",
+            json!({ "tech": tech, "session_id": session_id }),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -2388,8 +2380,7 @@ fn main() {
             fleet_mfa_disable,
             cec_status,
             cec_dial,
-            cec_start_hosting,
-            cec_stop_hosting,
+            cec_dial_node,
             cec_pending,
             cec_approve,
             cec_deny,
@@ -2398,7 +2389,6 @@ fn main() {
             cec_dialed,
             cec_help_list,
             cec_help_watch,
-            cec_forget_number,
             cec_cancel_dial,
             forget_node,
             mesh_status,
