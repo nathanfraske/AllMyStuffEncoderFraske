@@ -10,6 +10,7 @@
   // Settings tab / its popout window). Watching the queue is the thing a
   // technician wants glanceable while they work, so it earns a sidebar.
   import { app } from "../store.svelte";
+  import type { CecPeer } from "../tauri";
 
   /** "123 456 789" — the spaced support number a customer reads out. */
   function groupNumber(n: string): string {
@@ -26,6 +27,18 @@
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   }
 
+  /** "just now" / "12m ago" / "3d ago" — how long since a machine was last used. */
+  function lastUsedLabel(lastUsed: number): string {
+    if (!lastUsed) return "used recently";
+    const s = Math.max(0, Math.round(Date.now() / 1000 - lastUsed));
+    if (s < 45) return "just now";
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.round(h / 24)}d ago`;
+  }
+
   /** The machine hostname as a dim tail after the display name, only when it
    *  adds information (differs from what's already shown). */
   function hostTail(shown: string, hostname?: string): string {
@@ -33,6 +46,21 @@
     if (!h || h.toLowerCase() === shown.trim().toLowerCase()) return "";
     return ` (${h})`;
   }
+
+  // The machines this technician has dialed before, grouped under the live
+  // queue: online (reachable now — one tap re-opens) then previously
+  // connected (offline, still remembered). A customer with a hand up right
+  // now is shown in the queue above, so drop them here — no double listing.
+  // `cecCustomersByRecent` is already most-recently-used first, so each
+  // group stays in that order.
+  const known = $derived.by(() => {
+    const waiting = new Set(app.cecHelpWaiting.map((w) => w.node));
+    const rows = app.cecCustomersByRecent.filter((c) => c.node && !waiting.has(c.node));
+    return {
+      online: rows.filter((c) => c.online),
+      offline: rows.filter((c) => !c.online),
+    };
+  });
 </script>
 
 <div class="help">
@@ -82,6 +110,52 @@
         </li>
       {/each}
     </ul>
+  {/if}
+
+  {#if known.online.length > 0 || known.offline.length > 0}
+    {#snippet machine(c: CecPeer)}
+      {@const name = app.cecCustomerName(c)}
+      <li class="row known">
+        <span class="dot" class:on={c.online} aria-hidden="true"></span>
+        <div class="who">
+          <b class="name">{name}<span class="host">{hostTail(name, c.hostname)}</span></b>
+          <span class="sub">
+            <span class="num" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
+            <span class="meta">· {lastUsedLabel(c.last_used)}</span>
+          </span>
+        </div>
+        <button
+          class="reopen"
+          class:on={c.online}
+          disabled={app.cecDialing}
+          title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
+          onclick={() => void app.reconnectCec(c.node)}
+        >
+          {c.online ? "Open" : "Reconnect"}
+        </button>
+      </li>
+    {/snippet}
+
+    <div class="known-wrap">
+      {#if known.online.length > 0}
+        <div class="group-head">
+          <span class="group-title">Online</span>
+          <span class="group-count">{known.online.length}</span>
+        </div>
+        <ul class="rows">
+          {#each known.online as c (c.number)}{@render machine(c)}{/each}
+        </ul>
+      {/if}
+      {#if known.offline.length > 0}
+        <div class="group-head">
+          <span class="group-title">Previously connected</span>
+          <span class="group-count">{known.offline.length}</span>
+        </div>
+        <ul class="rows">
+          {#each known.offline as c (c.number)}{@render machine(c)}{/each}
+        </ul>
+      {/if}
+    </div>
   {/if}
 </div>
 
@@ -160,6 +234,73 @@
     height: 0.55rem;
     border-radius: 50%;
     background: var(--warn);
+  }
+  /* A known machine's dot is grey when offline, green when reachable — unlike
+     the amber queue dot, which always means "asking right now". */
+  .row.known .dot {
+    background: var(--ink-faint);
+  }
+  .row.known .dot.on {
+    background: var(--ok);
+  }
+  /* The grouped known-machines list under the live queue. */
+  .known-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.3rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--line);
+  }
+  .group-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.15rem 0.1rem;
+  }
+  .group-title {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .group-count {
+    font-size: 0.64rem;
+    font-weight: 700;
+    background: var(--surface-2);
+    color: var(--ink-faint);
+    border-radius: var(--r-pill);
+    padding: 0 0.3rem;
+    line-height: 1.4;
+  }
+  .reopen {
+    flex-shrink: 0;
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.74rem;
+    font-weight: 700;
+    padding: 0.28rem 0.6rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .reopen.on {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+  }
+  .reopen:hover:not(:disabled) {
+    background: var(--surface);
+  }
+  .reopen.on:hover:not(:disabled) {
+    background: var(--accent);
+    color: #fff;
+  }
+  .reopen:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .who {
     flex: 1;
