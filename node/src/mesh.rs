@@ -3299,10 +3299,13 @@ impl Mesh {
         // reconnected — an expired grant just re-prompts the customer).
         let records = self.cec.dialed_records();
         let area = allmystuff_cec_protocol::HELP_NETWORK_ID;
+        // The tab polls this, so fetch the peer set ONCE and reconcile the whole
+        // directory against it — not a round-trip per serviced machine.
+        let reachable = self.cec_reachable_set(area).await;
         let mut out = Vec::with_capacity(records.len());
         for r in records {
             let canonical = crate::cec::pubkey_part(&r.node).to_string();
-            let online = self.cec_peer_reachable(area, &canonical).await;
+            let online = reachable.contains(&canonical);
             if online != r.online {
                 self.cec.set_customer_online(&canonical, online);
             }
@@ -3393,7 +3396,14 @@ impl Mesh {
     /// per the daemon's `PeersList` — the live-reachability check behind a stored
     /// customer's online dot. A daemon error or a network we've left reads as
     /// offline (best-effort; the row stays, it just shows unreachable).
-    async fn cec_peer_reachable(&self, network_id: &str, canonical: &str) -> bool {
+    /// The set of canonical (bare-pubkey) ids **connected** on `network_id`
+    /// right now. "Reachable" is the `active`/`shelved` cut the graph reads
+    /// online from — an offline / sighted / handshaking row is a peer the
+    /// daemon remembers, not one a technician can reach, so it must not read as
+    /// online. (The old per-id check ignored status, so a still-listed but
+    /// offline customer read "online" until the app restarted.)
+    async fn cec_reachable_set(&self, network_id: &str) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
         let Ok(resp) = self
             .client
             .request(&Request::PeersList {
@@ -3401,7 +3411,7 @@ impl Mesh {
             })
             .await
         else {
-            return false;
+            return set;
         };
         let Some(peers) = resp
             .data
@@ -3409,14 +3419,17 @@ impl Mesh {
             .and_then(|d| d.get("peers"))
             .and_then(|p| p.as_array())
         else {
-            return false;
+            return set;
         };
-        peers.iter().any(|p| {
-            p.get("device_id")
-                .and_then(|v| v.as_str())
-                .map(|id| crate::cec::pubkey_part(id) == canonical)
-                .unwrap_or(false)
-        })
+        for p in peers {
+            if !status_is_reachable(p.get("status").and_then(|v| v.as_str())) {
+                continue;
+            }
+            if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {
+                set.insert(crate::cec::pubkey_part(id).to_string());
+            }
+        }
+        set
     }
 
     /// Fire a customer *decision* (Approve / Deny / End) at a technician
@@ -10411,13 +10424,17 @@ fn pubkey_part(id: &str) -> &str {
 /// reachable-only / gap-fill / canonical-key rules are unit-tested. See
 /// [`Mesh::refresh_peer_networks`] for why the gap is what stranded a peer
 /// sharing only a secondary mesh.
+/// The daemon peer-status values that count as **reachable** — a live link
+/// (`active`/`shelved`), the same cut the graph reads "online" from. An
+/// offline / sighted / handshaking / errored row is a peer the daemon
+/// remembers, not one you can reach right now.
+fn status_is_reachable(status: Option<&str>) -> bool {
+    matches!(status, Some("active") | Some("shelved"))
+}
+
 fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], network: &str) {
     for p in peers {
-        let reachable = p
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "active" || s == "shelved");
-        if !reachable {
+        if !status_is_reachable(p.get("status").and_then(|v| v.as_str())) {
             continue;
         }
         if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {

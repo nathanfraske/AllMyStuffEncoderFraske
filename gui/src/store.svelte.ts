@@ -1567,6 +1567,12 @@ class AppStore {
     if (!isTauri() || this.meshPoll) return;
     this.meshPoll = setInterval(() => {
       void this.syncMeshGraph();
+      // The dialed customers' `online` flags are reconciled by the node against
+      // its live peer set on every fetch, but nothing re-fetches them off a
+      // cec:// event — and a customer simply going offline fires none. Refresh
+      // on this poll so a card that went offline stops reading online instead
+      // of staying stuck "online" until the app restarts.
+      if (this.cecEnabled) void this.refreshCecPresence();
       // Safety net for a missed `live` event. The node emits it exactly once,
       // fire-and-forget — so a GUI that subscribed *after* the node went live
       // (a cold first launch, common on Windows where the node cold-spawns
@@ -6906,6 +6912,16 @@ class AppStore {
     // the CEC tab is enough to start hearing the beacons.
     const waiting = await cecHelpList();
     if (waiting) this.cecHelpWaiting = waiting;
+  }
+
+  /** Lightweight poll refresh of the dialed customers' live `online` state,
+   *  null-tolerant like {@link loadCec}. Kept separate from loadCec so the 3s
+   *  mesh poll doesn't also re-fetch status/grants/pending — those change only
+   *  on their own cec:// events, while `online` has no event and must be polled
+   *  (else a customer that went offline stays "online" until an app restart). */
+  private async refreshCecPresence() {
+    const dialed = await cecDialed();
+    if (dialed) this.cecCustomers = dialed;
   }
 
   /** Technician: answer a raised hand — dial the customer's device directly
