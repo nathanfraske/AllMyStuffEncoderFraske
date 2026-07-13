@@ -1570,9 +1570,11 @@ class AppStore {
       // The dialed customers' `online` flags are reconciled by the node against
       // its live peer set on every fetch, but nothing re-fetches them off a
       // cec:// event — and a customer simply going offline fires none. Refresh
-      // on this poll so a card that went offline stops reading online instead
-      // of staying stuck "online" until the app restarts.
-      if (this.cecEnabled) void this.refreshCecPresence();
+      // ONLY while a CEC surface is actually on screen (Help sidebar / console):
+      // the freshness matters only to someone looking, so a technician who isn't
+      // costs nothing. Local IPC either way — this reads the daemon's peer
+      // table, never the mesh.
+      if (this.cecSurfaceWatchers > 0) void this.refreshCecPresence();
       // Safety net for a missed `live` event. The node emits it exactly once,
       // fire-and-forget — so a GUI that subscribed *after* the node went live
       // (a cold first launch, common on Windows where the node cold-spawns
@@ -6914,11 +6916,30 @@ class AppStore {
     if (waiting) this.cecHelpWaiting = waiting;
   }
 
+  /** How many CEC surfaces (Help sidebar, CEC console) are on screen right now.
+   *  The presence poll runs only while this is > 0 — see {@link watchCecPresence}. */
+  private cecSurfaceWatchers = 0;
+
+  /** A CEC surface is on screen and wants the dialed customers' live `online`
+   *  state kept fresh while it's visible. Refcounted; returns an unwatch fn to
+   *  call on destroy. Refreshes once immediately (so opening the surface reads
+   *  live at once), then rides the existing 3s mesh poll — no extra timer, and
+   *  nothing polls when no CEC surface is shown. The refresh is local IPC (it
+   *  reads the daemon's already-maintained peer table); it puts nothing on the
+   *  mesh. */
+  watchCecPresence(): () => void {
+    this.cecSurfaceWatchers += 1;
+    if (this.cecSurfaceWatchers === 1) void this.refreshCecPresence();
+    return () => {
+      this.cecSurfaceWatchers = Math.max(0, this.cecSurfaceWatchers - 1);
+    };
+  }
+
   /** Lightweight poll refresh of the dialed customers' live `online` state,
-   *  null-tolerant like {@link loadCec}. Kept separate from loadCec so the 3s
-   *  mesh poll doesn't also re-fetch status/grants/pending — those change only
-   *  on their own cec:// events, while `online` has no event and must be polled
-   *  (else a customer that went offline stays "online" until an app restart). */
+   *  null-tolerant like {@link loadCec}. Separate from loadCec so the poll
+   *  doesn't also re-fetch status/grants/pending — those change only on their
+   *  own cec:// events, while `online` has no event and must be polled (else a
+   *  customer that went offline stays "online" until an app restart). */
   private async refreshCecPresence() {
     const dialed = await cecDialed();
     if (dialed) this.cecCustomers = dialed;

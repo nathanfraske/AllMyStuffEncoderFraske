@@ -9,8 +9,13 @@
   // customer directory, and consent live in the full CEC Console (the
   // Settings tab / its popout window). Watching the queue is the thing a
   // technician wants glanceable while they work, so it earns a sidebar.
+  import { onMount } from "svelte";
   import { app } from "../store.svelte";
   import type { CecPeer } from "../tauri";
+
+  // Keep the dialed customers' online dots live only while this sidebar is on
+  // screen — refcounted in the store, so the poll stops the moment it's hidden.
+  onMount(() => app.watchCecPresence());
 
   /** "123 456 789" — the spaced support number a customer reads out. */
   function groupNumber(n: string): string {
