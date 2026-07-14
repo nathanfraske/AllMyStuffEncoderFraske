@@ -1035,7 +1035,16 @@ class AppStore {
     const ownedByMe = inFleet || (advertisedMine && !this.inFleet);
     const offering = node.claimable === true;
     const mine = ownedByMe;
-    const claimable = !self && app && offering && !mine && !ownedByOther;
+    // Claiming needs the device reachable *right now*: a machine that has gone
+    // offline (left the mesh, dropped off a disabled network, or is past its
+    // presence grace) is no longer available for adoption, so it must not read
+    // as claimable even while its last advert still says it was offering.
+    // `offering` stays raw (it's this device's own advertised claim-mode flag,
+    // which the drawer's Make-claimable toggle reflects); `claimable` is the
+    // derived "you can take it now", and that's what every claim affordance and
+    // the graph's claimable badge read. `online` is the same live-reachability
+    // signal the graph filter and every presence dot use.
+    const claimable = !self && app && offering && !mine && !ownedByOther && node.online === true;
     let kind: Standing["kind"];
     if (self) kind = "self";
     else if (!app) kind = "mesh";
@@ -1264,13 +1273,20 @@ class AppStore {
   );
 
   /** Devices offering themselves for adoption that you can actually take —
-   *  running AllMyStuff, still unclaimed, in claim mode, and not already owned
-   *  by someone else. The mirror of `freshJoins` for the claim step: what the
-   *  top-bar "ready to claim" nudge counts and the Claim sheet lists. */
+   *  running AllMyStuff, reachable right now, still unclaimed, in claim mode,
+   *  and not already owned by someone else. The mirror of `freshJoins` for the
+   *  claim step: what the top-bar "ready to claim" nudge counts and the Claim
+   *  sheet lists. The `online` gate is what keeps a device that's no longer
+   *  available — it left the mesh, dropped off a network you've disabled, or is
+   *  riding out its last presence grace before being pruned — from lingering
+   *  here as "ready to claim" on the strength of a stale advert; a claim can't
+   *  land on a machine we can't reach, so it must not read as available. This
+   *  matches the graph, which already hides offline devices you don't own. */
   claimables = $derived(
     this.catalog.nodes.filter(
       (n) =>
         isAppNode(n) &&
+        n.online === true &&
         n.relationship.kind === "unclaimed" &&
         n.claimable === true &&
         !(n.owner && !this.isMe(n.owner)),
