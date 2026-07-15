@@ -2237,6 +2237,33 @@ class AppStore {
           ...p.capabilities,
         ];
       }
+
+      // A console that opened before THIS peer's capabilities converged wired
+      // to nothing — the CEC case, where the console pops the instant a
+      // customer approves, ahead of their screen/input endpoints landing in
+      // the catalog. So `applyConsoleVideo` found no input to watch (blank
+      // stage until you reclick) and the auto-legs found no control sink to
+      // reach (dead until you toggle control off→on). Now that this snapshot
+      // (re)carried the peer's caps, re-assert the wire the way that manual
+      // reclick / toggle does — pick the screen if we never got one, and bring
+      // up any granted leg that isn't live yet. Idempotent: each guard is
+      // "only if not already on", so a steady-state snapshot no-ops and a
+      // fleet machine (caps present at open) never enters here. Runs after the
+      // caps update above, so the endpoints these calls resolve are the fresh
+      // ones — the whole point.
+      if (this.consoleNodeId && sameMachine(this.consoleNodeId, p.node)) {
+        if (!this.consoleInput) {
+          const first = this.consoleVideoInputs(this.consoleNodeId)[0]?.id ?? null;
+          if (first) {
+            this.consoleInput = first;
+            void this.applyConsoleVideo();
+          }
+        }
+        const access = this.consoleAccess(this.consoleNode ?? undefined);
+        if (!this.consoleAudio && access.audio) this.toggleConsoleAudio();
+        if (!this.consoleControl && access.control) this.toggleConsoleControl();
+        if (!this.consoleClipboard && access.clipboard) this.toggleConsoleClipboard();
+      }
     }
 
     // Reflect live routes (active ones become catalog routes), and keep
