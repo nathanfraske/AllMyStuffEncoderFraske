@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -62,8 +62,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-cec-consent"
+version = "0.2.41"
+dependencies = [
+ "allmystuff-cec-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "allmystuff-cec-protocol"
+version = "0.2.41"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "allmystuff-graph"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -72,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-mobile-core"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -115,9 +134,11 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "allmystuff-bridge",
+ "allmystuff-cec-consent",
+ "allmystuff-cec-protocol",
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-pixels",
@@ -152,7 +173,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "allmystuff-graph",
  "serde",
@@ -161,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -172,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.19"
+version = "0.2.41"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -271,7 +292,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -282,7 +303,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1312,7 +1333,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1553,7 +1574,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2908,13 +2929,13 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "myownmesh"
-version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=07598b28b50b95c7b2e57232a8dd4a153510af6f#07598b28b50b95c7b2e57232a8dd4a153510af6f"
+version = "0.3.0"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
 dependencies = [
  "anyhow",
  "clap",
@@ -2933,12 +2954,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "winresource",
 ]
 
 [[package]]
 name = "myownmesh-core"
-version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=07598b28b50b95c7b2e57232a8dd4a153510af6f#07598b28b50b95c7b2e57232a8dd4a153510af6f"
+version = "0.3.0"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2971,8 +2993,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-services"
-version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=07598b28b50b95c7b2e57232a8dd4a153510af6f#07598b28b50b95c7b2e57232a8dd4a153510af6f"
+version = "0.3.0"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
 dependencies = [
  "async-trait",
  "myownmesh-core",
@@ -2986,8 +3008,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=07598b28b50b95c7b2e57232a8dd4a153510af6f#07598b28b50b95c7b2e57232a8dd4a153510af6f"
+version = "0.3.0"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3012,8 +3034,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-updater"
-version = "0.2.30"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?rev=07598b28b50b95c7b2e57232a8dd4a153510af6f#07598b28b50b95c7b2e57232a8dd4a153510af6f"
+version = "0.3.0"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
 dependencies = [
  "hex",
  "minisign-verify",
@@ -3133,7 +3155,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3913,7 +3935,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4258,7 +4280,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4784,7 +4806,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5772,7 +5794,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6497,7 +6519,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7098,6 +7120,16 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml 1.1.2+spec-1.1.0",
+ "version_check",
 ]
 
 [[package]]
