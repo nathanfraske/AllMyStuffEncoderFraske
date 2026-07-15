@@ -3244,9 +3244,17 @@ impl Mesh {
                 ),
             );
         }
+        // Carry `tech`/`agent_name` on the event (like the auto-approve path
+        // does), so the customer GUI can bind the session — and its chat — to
+        // this technician even when no `cec://request` preceded it.
         self.sink.emit(
             "cec://session",
-            json!({ "session_id": session_id, "state": "active" }),
+            json!({
+                "session_id": session_id,
+                "state": "active",
+                "tech": tech,
+                "agent_name": agent_name,
+            }),
         );
         self.cec_emit_grants();
         // Help arrived — an approved session withdraws the ask automatically,
@@ -3318,20 +3326,18 @@ impl Mesh {
             text,
             ts: crate::cec::now_secs(),
         };
-        // Reliable, not fire-and-forget. The connect handshake survives a briefly
-        // down / not-yet-open data channel because the technician *retransmits* its
-        // Request every 2s; chat has no such app-level retransmit, so a plain
-        // `ChannelSendTo` is silently dropped whenever the peer's channel isn't
-        // open at that instant — common right after a dial and on a flaky link,
-        // and asymmetric (one direction can carry while the other can't). That was
-        // the "chat from the technician never reaches the customer" bug. The acked
-        // path queues-until-open and retransmits until delivered (or the ttl
-        // lapses, when this errs and the optimistic bubble simply stays unsent).
-        self.cec_send_control_acked(
+        // Send chat over the very same peer-to-peer path as everything else on
+        // the session (the connect handshake, presence, roster): direct over the
+        // P2P link, the topology's forwarders only if there's no direct edge. The
+        // acked/reliable path was the wrong tool — its per-peer outbox flushes
+        // ONLY over a direct link and *parks* the frame when that link isn't up
+        // (an ICE flap drops `data_channel_open`), so on the hub-shaped CEC area a
+        // technician's line could sit unsent instead of just going P2P like the
+        // rest of the session.
+        self.cec_send_control(
             &network,
             &canonical,
             &allmystuff_cec_protocol::ControlMessage::Chat(msg.clone()),
-            std::time::Duration::from_secs(15),
         )
         .await?;
         tracing::info!(
