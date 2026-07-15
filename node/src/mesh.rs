@@ -3318,12 +3318,27 @@ impl Mesh {
             text,
             ts: crate::cec::now_secs(),
         };
-        self.cec_send_control(
+        // Reliable, not fire-and-forget. The connect handshake survives a briefly
+        // down / not-yet-open data channel because the technician *retransmits* its
+        // Request every 2s; chat has no such app-level retransmit, so a plain
+        // `ChannelSendTo` is silently dropped whenever the peer's channel isn't
+        // open at that instant — common right after a dial and on a flaky link,
+        // and asymmetric (one direction can carry while the other can't). That was
+        // the "chat from the technician never reaches the customer" bug. The acked
+        // path queues-until-open and retransmits until delivered (or the ttl
+        // lapses, when this errs and the optimistic bubble simply stays unsent).
+        self.cec_send_control_acked(
             &network,
             &canonical,
             &allmystuff_cec_protocol::ControlMessage::Chat(msg.clone()),
+            std::time::Duration::from_secs(15),
         )
         .await?;
+        tracing::info!(
+            "cec chat out to {} ({} chars) on {network}",
+            short_id(&canonical),
+            msg.text.chars().count()
+        );
         // Append + echo our own line so the sender's history is complete and the
         // GUI has ONE render path (the `cec://chat` event) for sent and received
         // alike.
@@ -3960,6 +3975,11 @@ impl Mesh {
         chat: &allmystuff_cec_protocol::ChatMessage,
     ) {
         let canonical = pubkey_part(from).to_string();
+        tracing::info!(
+            "cec chat in from {} ({} chars)",
+            short_id(&canonical),
+            chat.text.chars().count()
+        );
         self.cec.push_chat(&canonical, chat.clone());
         self.emit_cec_chat(&canonical, chat);
     }
