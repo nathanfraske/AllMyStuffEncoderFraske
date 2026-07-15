@@ -11,6 +11,7 @@
   }
   import {
     appVersion,
+    chatWindowTarget,
     consoleWindowTarget,
     filesWindowTarget,
     isCecWindow,
@@ -34,6 +35,7 @@
   import Console from "./Console.svelte";
   import ConsoleHost from "./ConsoleHost.svelte";
   import CecHost from "./CecHost.svelte";
+  import CecChatWindow from "./CecChatWindow.svelte";
   import Files from "./Files.svelte";
   import FilesHost from "./FilesHost.svelte";
   import Terminal from "./Terminal.svelte";
@@ -54,6 +56,7 @@
   const roomTarget = roomWindowTarget();
   const videoTarget = videoWindowTarget();
   const cecTarget = isCecWindow();
+  const chatTarget = chatWindowTarget();
 
   // Which build this is. Comes from gui/src-tauri/Cargo.toml via Tauri
   // (kept in sync by scripts/bump-version.sh); empty in the in-browser
@@ -74,7 +77,15 @@
   }
 
   onMount(() => {
-    if (consoleTarget || terminalTarget || filesTarget || roomTarget || videoTarget || cecTarget)
+    if (
+      consoleTarget ||
+      terminalTarget ||
+      filesTarget ||
+      roomTarget ||
+      videoTarget ||
+      cecTarget ||
+      chatTarget
+    )
       return;
     // Wire up live backend data (scan + presence + routes) if the Tauri
     // backend is here; otherwise the demo graph stands in so the app is
@@ -116,6 +127,8 @@
   <RoomHost target={roomTarget} />
 {:else if cecTarget}
   <CecHost />
+{:else if chatTarget}
+  <CecChatWindow peer={chatTarget} />
 {:else}
 <div class="shell">
   <header class="topbar">

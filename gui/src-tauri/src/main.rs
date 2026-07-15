@@ -963,6 +963,27 @@ async fn open_cec_window(app: tauri::AppHandle) -> Result<(), String> {
     )
 }
 
+/// Open (or focus) the pop-out chat window for one CEC customer (`?chat=<peer>`)
+/// — the sibling of `open_console_window`, so a technician can message a
+/// customer beside the live session. One window per customer (`chat-<peer>`),
+/// so re-opening focuses the existing thread instead of stacking a second one.
+/// Built through the same `open_secondary_window` helper as every other
+/// secondary window, so it gets its taskbar identity like the rest.
+#[tauri::command]
+async fn open_chat_window(app: tauri::AppHandle, peer: String) -> Result<(), String> {
+    open_secondary_window(
+        &app,
+        &format!("chat-{}", window_slug(&peer)),
+        // The peer is a node id (may carry non-label chars) — percent-encode
+        // so the query survives; the frontend's URLSearchParams decodes it.
+        format!("index.html?chat={}", query_encode(&peer)),
+        "AllMyStuff chat",
+        (420.0, 620.0),
+        (320.0, 420.0),
+        AUMID_CHAT,
+    )
+}
+
 /// A node id reduced to the characters Tauri allows in a window label —
 /// one stable label per machine, so re-opening focuses instead of stacking.
 fn window_slug(node: &str) -> String {
@@ -1003,6 +1024,7 @@ const AUMID_FILES: &str = "works.allmystuff.files";
 const AUMID_ROOM: &str = "works.allmystuff.room";
 const AUMID_VIDEO: &str = "works.allmystuff.video";
 const AUMID_CEC: &str = "works.allmystuff.cec";
+const AUMID_CHAT: &str = "works.allmystuff.chat";
 
 /// Give a secondary window its own taskbar identity (an explicit per-window
 /// AppUserModelID) so it groups separately from the main AllMyStuff app and is
@@ -2400,6 +2422,7 @@ fn main() {
             cec_dial,
             cec_dial_node,
             open_cec_window,
+            open_chat_window,
             cec_pending,
             cec_approve,
             cec_deny,

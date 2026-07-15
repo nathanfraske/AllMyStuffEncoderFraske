@@ -1456,6 +1456,56 @@ export async function onCecGrants(
   );
 }
 
+// ---- CEC customer chat (the technician ↔ customer thread) ---------------
+
+/** One line in a CEC customer chat thread. `from` is who wrote it (the dialed
+ *  customer vs this technician); `ts` is the node-assigned epoch-ms timestamp;
+ *  `id` is the node-assigned line id the whole plane dedupes on. */
+export interface CecChatMsg {
+  id: string;
+  from: "client" | "technician";
+  text: string;
+  ts: number;
+}
+
+/** Technician → customer: send a chat line to a dialed customer (`peer` is
+ *  their node id). The node persists it, returns the assigned `{ id, ts }`,
+ *  and *also* echoes it back over `cec://chat` — so the sender dedupes by id
+ *  rather than double-showing its own line. Null in web mode. */
+export async function cecChatSend(
+  peer: string,
+  text: string,
+): Promise<{ id: string; ts: number } | null> {
+  return tryInvoke<{ id: string; ts: number }>("cec_chat_send", { peer, text });
+}
+
+/** The stored chat history with one customer, oldest-first. `null` = couldn't
+ *  fetch (web mode, or a transient RPC failure) — callers keep their last
+ *  snapshot rather than blanking the thread, the same discipline as
+ *  {@link cecDialed}. */
+export async function cecChatHistory(
+  peer: string,
+): Promise<CecChatMsg[] | null> {
+  const r = await tryInvoke<{ messages: CecChatMsg[] }>("cec_chat_history", {
+    peer,
+  });
+  return r && Array.isArray(r.messages) ? r.messages : null;
+}
+
+/** A chat line landed for some customer (`cec://chat`) — an inbound line from
+ *  the customer, or this technician's own line echoed back. Carries the
+ *  customer's node id so a listener can file it under the right thread. No-op
+ *  listener in web mode. */
+export async function onCecChat(
+  cb: (e: { peer: string; message: CecChatMsg }) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ peer: string; message: CecChatMsg }>("cec://chat", (e) =>
+    cb(e.payload),
+  );
+}
+
 // ---- virtual rooms (the rooms plane) ------------------------------------
 
 /** Fan one room-plane message out to `members` (canonical or display node
@@ -1595,6 +1645,24 @@ export async function openCecWindow(): Promise<void> {
 export function isCecWindow(): boolean {
   if (typeof window === "undefined") return false;
   return new URLSearchParams(window.location.search).get("cec") === "1";
+}
+
+/** Pop a customer chat out into its own OS window (`?chat=<peer node id>`),
+ *  the sibling of the per-machine console window. One window per customer
+ *  (`chat-<peer>` label) — re-opening focuses the existing thread rather than
+ *  stacking a second one. Desktop only; the web preview has no windows to pop
+ *  into. Rides `open_chat_window`, the chat twin of `open_console_window`. */
+export async function openChatWindow(peer: string): Promise<void> {
+  if (!isTauri()) return;
+  await tryInvoke("open_chat_window", { peer });
+}
+
+/** Which customer this window is a chat for, when it was opened by
+ *  {@link openChatWindow} (`?chat=<peer node id>`). Null in the main window
+ *  and every other popout. */
+export function chatWindowTarget(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("chat");
 }
 
 /** The same-device chatter between this app's windows about video

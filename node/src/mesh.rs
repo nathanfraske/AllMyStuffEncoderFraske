@@ -3287,6 +3287,66 @@ impl Mesh {
         Ok(Value::Null)
     }
 
+    /// `cec_chat_send` (either side): send one live chat line to `peer` over the
+    /// existing CEC session, then echo it into our own transcript. Chat is
+    /// live-only — it rides the `cec.control` channel of a session that already
+    /// exists, so with no known network/route to the peer there is nothing to
+    /// carry it and this errs (the GUI only offers chat inside a live session).
+    pub async fn cec_chat_send(
+        self: &Arc<Self>,
+        peer: String,
+        text: String,
+    ) -> Result<Value, String> {
+        let canonical = crate::cec::pubkey_part(&peer).to_string();
+        let network = self
+            .network_for_peer(&peer)
+            .ok_or_else(|| "no live CEC session with this peer to carry chat".to_string())?;
+        // `from` is THIS node's own side of the session, which is what the far
+        // GUI aligns the bubble from. We are the technician exactly when we
+        // dialed this peer (they sit in our dialed-customer directory);
+        // otherwise we are the customer who answered a request — the two sides a
+        // CEC session ever has. The wire message's own `from` is never trusted
+        // for the peer key, only for rendering.
+        let from = if self.cec.is_dialed(&canonical) {
+            allmystuff_cec_protocol::Role::Technician
+        } else {
+            allmystuff_cec_protocol::Role::Client
+        };
+        let msg = allmystuff_cec_protocol::ChatMessage {
+            id: fresh_chat_id(),
+            from,
+            text,
+            ts: crate::cec::now_secs(),
+        };
+        self.cec_send_control(
+            &network,
+            &canonical,
+            &allmystuff_cec_protocol::ControlMessage::Chat(msg.clone()),
+        )
+        .await?;
+        // Append + echo our own line so the sender's history is complete and the
+        // GUI has ONE render path (the `cec://chat` event) for sent and received
+        // alike.
+        self.cec.push_chat(&canonical, msg.clone());
+        self.emit_cec_chat(&canonical, &msg);
+        Ok(json!({ "id": msg.id, "ts": msg.ts }))
+    }
+
+    /// `cec_chat_history` (either side): the persisted transcript with `peer`,
+    /// oldest-first, as `{ messages: [ { id, from, text, ts } ] }` — what a GUI
+    /// loads when it opens the chat pane. Both sent and received lines are here,
+    /// since a sent line is echoed into the store on the way out.
+    pub async fn cec_chat_history(self: &Arc<Self>, peer: String) -> Result<Value, String> {
+        let canonical = crate::cec::pubkey_part(&peer).to_string();
+        let messages: Vec<Value> = self
+            .cec
+            .chat_history(&canonical)
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+            .collect();
+        Ok(json!({ "messages": messages }))
+    }
+
     /// `cec_revoke` (customer): "Forget this technician" — drop every grant and
     /// tear the session down. The consent revoke bites the next privileged frame
     /// even if this wire End is lost.
@@ -3670,6 +3730,14 @@ impl Mesh {
                 return;
             }
         };
+        // Chat rides the same control channel as the connect handshake but is a
+        // pure transcript event, not part of the approve/deny state machine —
+        // attribute it to the authenticated sender, store it, surface it, and
+        // return before the Connect dispatch below (which consumes `msg`).
+        if let allmystuff_cec_protocol::ControlMessage::Chat(chat) = &msg {
+            self.on_cec_chat_in(&from, chat).await;
+            return;
+        }
         if let allmystuff_cec_protocol::ControlMessage::Connect(connect) = msg {
             tracing::info!(
                 "cec connect message from {}: {}",
@@ -3878,6 +3946,34 @@ impl Mesh {
                 allmystuff_cec_protocol::ConnectControl::Unknown => {}
             }
         }
+    }
+
+    /// Handle an inbound [`ChatMessage`](allmystuff_cec_protocol::ChatMessage)
+    /// off the `cec.control` channel: attribute it to the **authenticated**
+    /// sender (`from`) — never the message's self-declared `chat.from`, which is
+    /// only the Role the far side renders as — append it to that peer's
+    /// transcript, and surface it to the GUI. The sender's own line is echoed by
+    /// [`Self::cec_chat_send`], so this path covers received lines only.
+    async fn on_cec_chat_in(
+        self: &Arc<Self>,
+        from: &str,
+        chat: &allmystuff_cec_protocol::ChatMessage,
+    ) {
+        let canonical = pubkey_part(from).to_string();
+        self.cec.push_chat(&canonical, chat.clone());
+        self.emit_cec_chat(&canonical, chat);
+    }
+
+    /// Emit the `cec://chat` GUI event for one message on `peer`'s transcript —
+    /// the single render path for both an inbound receive and the echo of a sent
+    /// line, so the GUI has ONE way to draw a chat bubble. The message object is
+    /// the wire [`ChatMessage`](allmystuff_cec_protocol::ChatMessage) serialized
+    /// as-is (`from` → `"client"` / `"technician"`), so the event shape can never
+    /// drift from the protocol type.
+    fn emit_cec_chat(&self, peer: &str, chat: &allmystuff_cec_protocol::ChatMessage) {
+        let message = serde_json::to_value(chat).unwrap_or(Value::Null);
+        self.sink
+            .emit("cec://chat", json!({ "peer": peer, "message": message }));
     }
 
     // ---- shares (durable, person-scoped grants) -----------------------
@@ -10574,6 +10670,29 @@ fn fresh_share_token() -> String {
     }
     let mut s = String::with_capacity(6 + 32);
     s.push_str("share_");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// A fresh opaque id for one chat line — 16 random bytes as hex, unique within a
+/// session so the receiver can dedupe and the sender can recognise the echo of
+/// its own message. Mirrors [`fresh_share_token`]; the `msg_` prefix only tells
+/// the two apart in a trace.
+fn fresh_chat_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // RNG unavailable (vanishingly rare): a wall-clock nonce is unique
+        // enough for one app run.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        return format!("msg_{n:032x}");
+    }
+    let mut s = String::with_capacity(4 + 32);
+    s.push_str("msg_");
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }

@@ -55,7 +55,9 @@ pub use ids::{
 pub use media::{
     decode_media_frame, encode_media_frame, MediaFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
 };
-pub use wire::{AppControl, ApprovalScope, ConnectControl, ControlMessage, Role, SupportPresence};
+pub use wire::{
+    AppControl, ApprovalScope, ChatMessage, ConnectControl, ControlMessage, Role, SupportPresence,
+};
 
 /// Prefix the retired per-number rooms carried (`cec-<9 digits>`). Kept
 /// solely so upgrading nodes can recognise and purge the legacy rooms older
