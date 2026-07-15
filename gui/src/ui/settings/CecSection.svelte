@@ -245,6 +245,14 @@
               >
                 Control
               </button>
+              <button
+                class="btn small"
+                disabled={app.cecDialing}
+                title="Chat — connect and message them without taking their screen"
+                onclick={() => void app.chatWithCustomer(w.node)}
+              >
+                💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
+              </button>
             </div>
           </li>
         {/each}
@@ -350,6 +358,14 @@
                     Control
                   </button>
                 {/if}
+                <button
+                  class="btn small"
+                  disabled={app.cecDialing}
+                  title="Chat — connect and message them without taking their screen"
+                  onclick={() => void app.chatWithCustomer(c.node)}
+                >
+                  💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
+                </button>
                 <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
                 <button
                   class="btn small danger"
@@ -721,6 +737,22 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
+  }
+  /* Unread-lines count riding the Chat button. */
+  .chat-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.05rem;
+    height: 1.05rem;
+    margin-left: 0.3rem;
+    padding: 0 0.25rem;
+    font-size: 0.62rem;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    background: var(--accent);
+    border-radius: var(--r-pill);
   }
   .dot {
     width: 0.55rem;

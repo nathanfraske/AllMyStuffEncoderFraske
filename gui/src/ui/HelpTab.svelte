@@ -131,6 +131,15 @@
           >
             Answer
           </button>
+          <button
+            class="chat-btn"
+            disabled={app.cecDialing}
+            title="Chat — connect and message this customer (without taking their screen)"
+            aria-label="Chat with this customer"
+            onclick={() => void app.chatWithCustomer(w.node)}
+          >
+            💬{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
+          </button>
         </li>
       {/each}
     </ul>
@@ -179,6 +188,15 @@
             onclick={() => void app.reconnectCec(c.node)}
           >
             {c.online ? "Open" : "Reconnect"}
+          </button>
+          <button
+            class="chat-btn"
+            disabled={app.cecDialing}
+            title="Chat — connect and message this customer (without taking their screen)"
+            aria-label="Chat with this customer"
+            onclick={() => void app.chatWithCustomer(c.node)}
+          >
+            💬{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
           </button>
         {/if}
       </li>
@@ -349,6 +367,45 @@
   .reopen:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  /* The compact chat companion to Answer / Open — an icon button so the narrow
+     sidebar row stays readable, with an unread badge riding its corner. */
+  .chat-btn {
+    position: relative;
+    flex-shrink: 0;
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.82rem;
+    line-height: 1;
+    padding: 0.28rem 0.4rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .chat-btn:hover:not(:disabled) {
+    background: var(--surface);
+  }
+  .chat-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .chat-badge {
+    position: absolute;
+    top: -0.35rem;
+    right: -0.35rem;
+    min-width: 0.95rem;
+    height: 0.95rem;
+    padding: 0 0.2rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.6rem;
+    font-weight: 700;
+    line-height: 1;
+    color: #fff;
+    background: var(--accent);
+    border-radius: var(--r-pill);
   }
   .who {
     flex: 1;

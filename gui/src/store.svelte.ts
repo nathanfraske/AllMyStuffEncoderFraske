@@ -586,6 +586,11 @@ class AppStore {
    *  goes active, the technician's remote-control console opens for them (the
    *  AnyDesk-style "connect and you're in"). Cleared once opened. */
   cecAutoOpenNode = $state<string | null>(null);
+  /** When the pending auto-open was armed by the **Chat** button, open only the
+   *  chat window on approval, not the remote-control console — so a technician
+   *  can reach a customer by chat *before* (or without) taking their screen. A
+   *  Remote-Control / Answer dial leaves this false and opens both. */
+  private cecAutoOpenChatOnly = false;
   /** The customers currently asking for help on the global help room —
    *  longest-waiting first (the node keeps queue order). Drives the CEC tab's
    *  "Asking for help" section; fed by `cec_help_list` + the `cec://help`
@@ -1493,8 +1498,12 @@ class AppStore {
       // console "just never opened".
       if (s.state === "active" && this.cecAutoOpenNode) {
         const node = this.cecAutoOpenNode;
+        const chatOnly = this.cecAutoOpenChatOnly;
         this.cecAutoOpenNode = null;
-        this.openCecConsoleWhenFound(node);
+        this.cecAutoOpenChatOnly = false;
+        // A Chat-button dial opens only the chat (chat before remote control);
+        // a Remote-Control / Answer dial also opens the console.
+        if (!chatOnly) this.openCecConsoleWhenFound(node);
         // Pop the customer chat alongside the console — the technician can
         // message them ("close the browser and reopen it") right beside the
         // live session. Needs the `open_chat_window` backend command (see the
@@ -1505,6 +1514,7 @@ class AppStore {
         // auto-open — leaving it armed both hides the outcome from the
         // technician and would pop a console on the wrong, later dial.
         this.cecAutoOpenNode = null;
+        this.cecAutoOpenChatOnly = false;
         if (s.state === "denied") {
           this.toast("warn", "The customer declined the connection");
         }
@@ -7071,6 +7081,20 @@ class AppStore {
     void openChatWindow(peer);
   }
 
+  /** Chat with a customer, **ensuring they're connected first** — the same
+   *  guarantee the Remote-Control button gives, so a technician can open a chat
+   *  from any CEC surface (the sidebar, the Help queue, the CEC console) even
+   *  before a session exists. Opens the chat window immediately (so it's on
+   *  screen while the dial runs), then dials/reconnects the customer's device;
+   *  an expired grant re-prompts, a live one auto-approves. On approval only the
+   *  chat opens — the console is deliberately left closed (chat *before* remote
+   *  control). If a session is already live this is just an open+focus, since
+   *  the redial auto-approves instantly. */
+  async chatWithCustomer(node: string) {
+    this.openChat(node);
+    await this.dialCecTarget({ node }, shortId(node), { chatOnly: true });
+  }
+
   /** Pull the node's CEC status + grants + pending requests + dialed customers. */
   async loadCec() {
     // Each fetch can transiently fail while the node socket is busy (mid-dial,
@@ -7160,6 +7184,7 @@ class AppStore {
   private async dialCecTarget(
     target: { node: string } | { number: string },
     display: string,
+    opts?: { chatOnly?: boolean },
   ): Promise<boolean> {
     if (!this.cecAgentName.trim()) {
       this.toast("warn", "Set your Agent Name first — the customer sees it");
@@ -7184,6 +7209,7 @@ class AppStore {
         clientLog(`[cec] dial ok — customer node ${r.node}; waiting for approval`);
         this.toast("ok", `Connecting to ${display} — waiting for them to approve`);
         this.cecAutoOpenNode = r.node;
+        this.cecAutoOpenChatOnly = opts?.chatOnly ?? false;
         void this.pullSessionSnapshot();
       } else {
         clientLog(`[cec] dial returned no node (web mode or empty reply)`);

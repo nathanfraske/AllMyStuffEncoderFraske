@@ -484,15 +484,18 @@
     {/if}
 
     <!-- Chat with a CEC customer: a real pop-out window to message them
-         ("close the browser and reopen it") beside the live session. It
-         opens on its own the moment a session goes active; this is the
-         manual open / re-focus, with an unread badge for lines that arrived
-         while it was closed. -->
+         ("close the browser and reopen it"). Like Remote Control it dials the
+         customer first (auto-approves on a live grant, else re-prompts), so a
+         technician can start a chat before — or instead of — taking the screen;
+         only the chat opens on approval, not the console. It also opens on its
+         own the moment a session goes active; this is the manual open / dial,
+         with an unread badge for lines that arrived while it was closed. -->
     {#if cecPeer}
       <button
         class="btn console-open"
-        title="Open a chat with this customer in its own window"
-        onclick={() => cecPeer && app.openChat(cecPeer.node)}
+        disabled={app.cecDialing}
+        title="Connect and open a chat with this customer (dials them like Remote Control, opens chat only)"
+        onclick={() => cecPeer && void app.chatWithCustomer(cecPeer.node)}
       >
         💬 Chat{#if app.chatUnread[cecPeer.node]}<span class="chat-unread">{app.chatUnread[cecPeer.node]}</span>{/if}
       </button>
