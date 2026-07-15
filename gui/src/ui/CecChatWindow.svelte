@@ -123,7 +123,9 @@
 
   function fmtTime(ts: number): string {
     try {
-      return new Date(ts).toLocaleTimeString([], {
+      // `ts` is UNIX **seconds** (the node's `now_secs`) — to milliseconds for
+      // the Date, else every line renders at the 1970 epoch.
+      return new Date(ts * 1000).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
       });
