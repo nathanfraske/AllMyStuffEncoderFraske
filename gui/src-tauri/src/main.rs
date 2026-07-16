@@ -1476,6 +1476,36 @@ async fn cec_grants(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Technician: send a chat line to a dialed customer. The node persists it,
+/// relays it over the session, and echoes it back on `cec://chat`; returns
+/// the assigned `{ id, ts }`. Unregistered until now, every send from the
+/// chat window died as a swallowed "command not found" — the optimistic
+/// bubble showed and nothing left the machine (the cec_dial_node /
+/// cec_help_watch ghost all over again).
+#[tauri::command]
+async fn cec_chat_send(
+    state: State<'_, AppState>,
+    peer: String,
+    text: String,
+) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_chat_send", json!({ "peer": peer, "text": text }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Technician: the stored chat thread with one customer, oldest-first —
+/// what fills the window on open, so a thread survives closing it.
+#[tauri::command]
+async fn cec_chat_history(state: State<'_, AppState>, peer: String) -> Result<Value, String> {
+    state
+        .node
+        .request("cec_chat_history", json!({ "peer": peer }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The per-node gear "Forget this node": drop it from the graph + roster, tear
 /// its session down, and end any CEC session.
 #[tauri::command]
@@ -2428,6 +2458,8 @@ fn main() {
             cec_deny,
             cec_revoke,
             cec_grants,
+            cec_chat_send,
+            cec_chat_history,
             cec_dialed,
             cec_help_list,
             cec_help_watch,
