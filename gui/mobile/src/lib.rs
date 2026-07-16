@@ -10,18 +10,21 @@
 //! What differs from the desktop shell (`../src-tauri/src/main.rs`) is *how*
 //! this Rust side answers. The desktop spawns a separate `allmystuff-serve`
 //! node and drives it over a control socket. iOS forbids a sandboxed app
-//! from spawning child processes, so the phone instead **embeds** its
-//! viewer/controller brain in-process: this shell is built on
-//! [`allmystuff_mobile_core`], and the live mesh engine drops in behind that
-//! crate's `MeshClient` seam (the embedded `myownmesh-core` binding — the
-//! next slice; see `docs/MOBILE.md`).
+//! from spawning child processes, so the phone **embeds the whole stack
+//! in-process** (see [`engine`]): the `myownmesh` daemon, the same
+//! `allmystuff-node` engine the serve binary runs (built capture-less), and
+//! the desktop's node-backed command surface dispatched straight into it —
+//! presence, routing, video/terminal/files, sites, rooms, fleet admin, CEC.
+//! See `docs/MOBILE.md` for the full architecture.
 //!
-//! Today this shell answers exactly the calls it can answer *honestly* from
-//! `mobile-core` — chiefly [`scan_self`], which puts a real phone node on the
-//! graph with the real viewer/controller capability set. Calls that need a
-//! live mesh (presence, routing, the media planes) are intentionally not
-//! registered yet, so the frontend keeps its demo behaviour for them until
-//! the engine binding makes them real, rather than this side faking a mesh.
+//! [`allmystuff_mobile_core`] remains the phone's *model*: the
+//! viewer/controller capability set and `NodeProfile` it puts on the graph.
+//! [`scan_self`] answers from the live engine when it's up and falls back to
+//! that model (under the `"this"` placeholder id the store re-homes) while
+//! the engine is still booting — so the graph is honest from the first frame.
+//! What stays desktop-only, deliberately: secondary windows (every surface is
+//! in-app on a phone), the self-updater (the stores own updates), the
+//! Always-On service, and tray/autostart behaviour.
 
 use allmystuff_mobile_core::prelude::*;
 use serde_json::{json, Value};
@@ -230,9 +233,25 @@ pub fn run() {
             commands::fleet_set_name,
             commands::fleet_grant_role,
             commands::fleet_revoke_role,
+            commands::fleet_set_hubs,
             commands::fleet_mfa_status,
             commands::fleet_mfa_enroll,
             commands::fleet_mfa_disable,
+            commands::forget_node,
+            commands::cec_status,
+            commands::cec_dial,
+            commands::cec_dial_node,
+            commands::cec_dialed,
+            commands::cec_help_list,
+            commands::cec_help_watch,
+            commands::cec_cancel_dial,
+            commands::cec_pending,
+            commands::cec_approve,
+            commands::cec_deny,
+            commands::cec_revoke,
+            commands::cec_grants,
+            commands::cec_chat_send,
+            commands::cec_chat_history,
             commands::mesh_status,
             commands::mesh_identity,
             commands::mesh_networks,
