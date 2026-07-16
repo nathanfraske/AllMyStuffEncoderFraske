@@ -10,9 +10,15 @@
   // you manage its devices there, not as a plain mesh roster.
   import { onMount } from "svelte";
   import { app } from "../../store.svelte";
+  import { isMobile } from "../../tauri";
   import { networkDisplayName } from "../../types";
   import { PUBLIC_VENUE_ID } from "../../venues";
   import NetworkServers from "./NetworkServers.svelte";
+
+  // Export writes through a native save dialog + a desktop-only backend
+  // command; a phone has neither (Copy invite / Import cover its sharing
+  // story), so the button would only ever fail there. Hide it.
+  const canExport = !isMobile();
 
   let nameInput = $state("");
   let joinId = $state("");
@@ -201,7 +207,9 @@
                 <span class="net-sub">{n.network_id}{#if n.phase} · {n.phase}{/if}</span>
               </button>
               <button class="btn small" title="Copy this mesh's invite to add a device — it carries the mesh's venue, so the other device lands on the same relays" onclick={() => copyHandle(n.network_id)}>{copied === n.network_id ? "Copied ✓" : "Copy invite"}</button>
-              <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
+              {#if canExport}
+                <button class="btn small" class:saved={exported === n.config_id} title="Save this mesh's full settings to a file to import on another device" onclick={() => exportNet(n.config_id)}>{exported === n.config_id ? "Exported ✓" : "Export"}</button>
+              {/if}
               <button class="btn small" title="Choose where this mesh calls out (its venue)" onclick={() => { app.serversNetwork = n.config_id; app.networksSubtab = "servers"; void app.loadNetworkConfigs(); }}>Venue</button>
               <button class="btn small" title="Switch this mesh off without deleting it (the pill menu can turn it back on)" onclick={() => app.toggleNetworkEnabled(n.config_id, false)}>Disable</button>
               <button class="btn small danger" onclick={() => app.leaveNetwork(n.config_id)}>Leave</button>

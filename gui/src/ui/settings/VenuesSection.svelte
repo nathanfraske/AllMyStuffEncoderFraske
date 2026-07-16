@@ -8,7 +8,11 @@
   import type { TurnEntry } from "../../types";
   import { newVenueId, type Venue } from "../../venues";
   import { exportVenue, tryParseVenue, venueFromExport } from "../../venue-settings";
-  import { exportNetworkFile } from "../../tauri";
+  import { exportNetworkFile, isMobile } from "../../tauri";
+
+  // Same rule as NetworksSection: export needs the desktop's save dialog +
+  // backend write command, neither of which exists on a phone. Hide it.
+  const canExport = !isMobile();
 
   const venues = $derived(app.venues);
   const draft = $derived(app.venueDraft);
@@ -224,7 +228,9 @@
           <button class="btn small" onclick={() => edit(v)}>View</button>
         {:else}
           <button class="btn small" onclick={() => edit(v)}>Edit</button>
-          <button class="btn small" title="Save this venue to a file to share" onclick={() => exportOne(v)}>Export</button>
+          {#if canExport}
+            <button class="btn small" title="Save this venue to a file to share" onclick={() => exportOne(v)}>Export</button>
+          {/if}
           <button class="btn small danger" onclick={() => app.deleteVenue(v.id)}>Delete</button>
         {/if}
       </li>

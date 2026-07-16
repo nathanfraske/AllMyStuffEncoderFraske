@@ -590,6 +590,16 @@
     padding-top: calc(0.4rem + max(3.4rem, env(safe-area-inset-top, 0px)));
   }
 
+  /* Touch: the header's icon-only controls are the app's most-tapped
+     buttons — give them the ~40px finger minimum they're just under. */
+  @media (hover: none) {
+    .help,
+    .refresh,
+    .gear {
+      padding: 0.7rem 0.85rem;
+    }
+  }
+
   /* Phone-width windows: compact the header — no tagline, tighter gaps,
      safe-area padding so it stays out from under the notch / status bar
      (zero everywhere that has neither). Chips get an ellipsis cap so a

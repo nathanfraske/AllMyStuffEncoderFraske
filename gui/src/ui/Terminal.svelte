@@ -23,6 +23,7 @@
     clipboardRead,
     clipboardWrite,
     closeThisWindow,
+    isMobile,
     onTermExit,
     onTermResize,
     onTerminalSessions,
@@ -32,6 +33,7 @@
     watchTerminal,
   } from "../tauri";
   import { displayName, type TerminalSessionInfo } from "../types";
+  import TerminalKeys, { type StripKey } from "./TerminalKeys.svelte";
 
   let {
     host,
@@ -70,6 +72,59 @@
   let activeId = $state(0);
   let bell = $state(false);
   let nextTabId = 1;
+
+  // ---- the mobile key strip (TerminalKeys) -----------------------------
+  // On a phone the OS keyboard types into xterm's own textarea; the strip
+  // adds what that keyboard can't say (Esc/Tab/Ctrl/arrows) and the tap
+  // that summons it. `ctrlArmed` is the one-shot Ctrl: the next character
+  // xterm reports is folded into its control byte on the onData path.
+  const mobile = isMobile();
+  let ctrlArmed = $state(false);
+  // How far the OS keyboard lifted the strip — the pane shrinks to match
+  // so the shell's bottom rows aren't typing blind behind the keys.
+  let keysLift = $state(0);
+
+  /** Fold the one-shot Ctrl into a just-typed character: the classic
+   *  terminal mapping (letters and @[\]^_ mask to 0x01–0x1f, space is
+   *  NUL). Anything unfoldable passes through — a spent Ctrl never eats
+   *  the keystroke. */
+  function foldCtrl(s: string): string {
+    if (s.length !== 1) return s;
+    const c = s === " " ? 0x40 : s.toUpperCase().charCodeAt(0);
+    return c >= 0x40 && c <= 0x5f ? String.fromCharCode(c & 0x1f) : s;
+  }
+
+  /** A strip key, as the byte sequence the active shell expects — arrows
+   *  honour the emulator's application-cursor mode (vim, less, htop), and
+   *  an armed Ctrl turns them into the word-jump chords. */
+  function stripKey(k: StripKey) {
+    const t = tabs.find((x) => x.id === activeId);
+    const rt = runtimes.get(activeId);
+    if (!t?.routeId || t.status !== "live" || !rt) return;
+    const appCursor = !!rt.term.modes.applicationCursorKeysMode;
+    const arrow = (letter: string) =>
+      ctrlArmed ? `\x1b[1;5${letter}` : appCursor ? `\x1bO${letter}` : `\x1b[${letter}`;
+    const seq =
+      k === "esc"
+        ? "\x1b"
+        : k === "tab"
+          ? "\t"
+          : k === "up"
+            ? arrow("A")
+            : k === "down"
+              ? arrow("B")
+              : k === "right"
+                ? arrow("C")
+                : arrow("D");
+    ctrlArmed = false;
+    sendBytes(t.routeId, new TextEncoder().encode(seq));
+  }
+
+  /** The ⌨ button — a real user gesture, which is what iOS requires to
+   *  bring the OS keyboard up for xterm's hidden textarea. */
+  function summonKeyboard() {
+    runtimes.get(activeId)?.term.focus();
+  }
   const runtimes = new Map<number, TabRuntime>();
   // Bumped when an emulator mounts (or disposes). The `runtimes` Map isn't
   // reactive, so the status effect reads this to re-run the instant a
@@ -282,7 +337,15 @@
     rt.cleanup.push(
       term.onData((s) => {
         const t = tabs.find((x) => x.id === tabId);
-        if (t?.routeId && t.status === "live") sendBytes(t.routeId, new TextEncoder().encode(s));
+        if (!t?.routeId || t.status !== "live") return;
+        let data = s;
+        // The strip's one-shot Ctrl discharges on the next thing typed,
+        // foldable or not — sticky keys never stay stuck.
+        if (ctrlArmed) {
+          data = foldCtrl(s);
+          ctrlArmed = false;
+        }
+        sendBytes(t.routeId, new TextEncoder().encode(data));
       }).dispose,
     );
     rt.cleanup.push(
@@ -739,11 +802,15 @@
       </header>
 
       <!-- role=application: a shell surface — keys belong to the far
-           machine; right-click is copy/paste, never the browser menu. -->
+           machine; right-click is copy/paste, never the browser menu.
+           On mobile the stage keeps clear of the fixed key strip (and of
+           the OS keyboard the strip is riding) — the ResizeObserver refits
+           the emulator as the padding moves. -->
       <div
         class="stage"
         role="application"
         aria-label="Shell on {displayName(node)}"
+        style:padding-bottom={mobile ? `calc(2.9rem + ${keysLift}px)` : null}
         oncontextmenu={onPaneContextMenu}
       >
         {#each tabs as t (t.id)}
@@ -780,6 +847,16 @@
           </div>
         {/each}
       </div>
+
+      {#if mobile}
+        <TerminalKeys
+          ctrl={ctrlArmed}
+          ontogglectrl={() => (ctrlArmed = !ctrlArmed)}
+          onkey={stripKey}
+          onkeyboard={summonKeyboard}
+          onlift={(px) => (keysLift = px)}
+        />
+      {/if}
     </div>
   </div>
 {/if}
