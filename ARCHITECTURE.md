@@ -49,6 +49,18 @@ to build its own `Mesh` with a Tauri-backed `UiSink`; two nodes under one
 identity is precisely what stopped machines connecting.) See
 [The headless node](CONTRIBUTING.md#the-headless-node).
 
+**The one deliberate exception is the phone.** iOS forbids a sandboxed app
+from spawning child processes, so the mobile shell (`gui/mobile`) runs the
+identical pieces as tasks in its own process: the `myownmesh` daemon
+in-process (v0.3.0's `embedded` module), the same `allmystuff-node` engine
+built capture-less (the capture/inject planes swap for stubs; audio I/O
+stays real), and the same command surface dispatched straight into
+`node_control::dispatch` — the desktop's socket match, minus the socket.
+Everything above the process boundary — the daemon wire protocol, the
+engine bring-up, the frontend event contract — is byte-identical, and the
+shared Svelte UI cannot tell which platform answered. The full story is in
+[docs/MOBILE.md](docs/MOBILE.md).
+
 The library workspace (`crates/`) compiles and tests with nothing but
 `cargo` — no webview, no daemon, no network. The GUI is its own Cargo
 workspace (`gui/src-tauri`) so a root `cargo build --workspace` never drags
@@ -58,14 +70,18 @@ in Tauri. Same split MyOwnMesh uses.
 
 ```
 crates/
-├── allmystuff-inventory   # scan a machine for everything plugged in
-├── allmystuff-graph       # the device graph + authorization model
-├── allmystuff-protocol    # wire types: myownmesh control mirror + app messages
-├── allmystuff-bridge      # Inventory ──► graph Capabilities (+ presence summary)
-├── allmystuff-session     # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
-├── allmystuff-updater     # self-update: release feed, SHA-256 verify, stage-then-apply
-├── allmystuff-service     # install/manage the OS background service (systemd / launchd / Windows SCM)
-└── allmystuff-cli         # `allmystuff` — opens the GUI, or scan / capabilities / update / serve / service
+├── allmystuff-inventory     # scan a machine for everything plugged in
+├── allmystuff-graph         # the device graph + authorization model
+├── allmystuff-protocol      # wire types: myownmesh control mirror + app messages
+├── allmystuff-bridge        # Inventory ──► graph Capabilities (+ presence summary)
+├── allmystuff-session       # live presence + the route offer/accept handshake + media frame types (audio/video/input/terminal/files/clipboard)
+├── allmystuff-term          # `amst` — the command-line terminal (a mesh PTY in your own terminal)
+├── allmystuff-cec-protocol  # CEC Support's wire types: support ids, consent control, the help beacon
+├── allmystuff-cec-consent   # a customer's standing technician approvals (once / 3 hours / forever)
+├── allmystuff-mobile-core   # the phone's model: viewer/controller capability set + NodeProfile (docs/MOBILE.md)
+├── allmystuff-updater       # self-update: release feed, SHA-256 verify, stage-then-apply
+├── allmystuff-service       # install/manage the OS background service (systemd / launchd / Windows SCM)
+└── allmystuff-cli           # `allmystuff` — opens the GUI, or scan / capabilities / update / serve / service
 
 node/                      # the headless node engine (its own workspace, heavy media deps)
 └── allmystuff-node        # the engine the GUI links + `allmystuff-serve` (runs it with no webview)

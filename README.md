@@ -143,7 +143,7 @@ AllMyStuff is under active development. What works today:
 | File access | ✅ | Browse, preview, upload, download, rename, delete; bulk transfers stream in chunks with backpressure, straight to disk |
 | Audio and camera | ✅ | Opus audio and H.264 camera over the same transport |
 | Discovery and routing | ✅ | Peers appear via presence; sessions negotiate and tear down cleanly |
-| Mobile (iOS/Android) | 🚧 | In design; the pure client core has landed (`allmystuff-mobile-core`). See [docs/MOBILE.md](docs/MOBILE.md) |
+| Mobile (iOS/Android) | 🚧 | Runnable Tauri shell in `gui/mobile`: embeds the mesh daemon + the node engine in-process (iOS can't spawn them) with the full graph/console/terminal/files surface, touch-adapted. Device validation and store release remain. See [docs/MOBILE.md](docs/MOBILE.md) |
 
 ## Building from source
 

@@ -736,6 +736,38 @@ pub async fn fleet_revoke_role(
     Ok(())
 }
 
+/// Owner-only: pin the fleet's infra hubs (or return it to full mesh with an
+/// empty set). Same custody second factor (`code`) as the other owner verbs.
+#[tauri::command]
+pub async fn fleet_set_hubs(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    hubs: Vec<String>,
+    redundancy: Option<u32>,
+    code: Option<String>,
+) -> Result<(), String> {
+    state
+        .engine()?
+        .request(
+            "fleet_set_hubs",
+            json!({ "hubs": hubs, "redundancy": redundancy, "code": code }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The per-node gear "Forget this node": drop it from the graph + roster,
+/// tear its session down, and end any CEC session.
+#[tauri::command]
+pub async fn forget_node(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    node: String,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request("forget_node", json!({ "node": node }))
+        .await
+}
+
 #[tauri::command]
 pub async fn fleet_mfa_status(
     state: tauri::State<'_, crate::engine::EngineState>,
@@ -826,6 +858,183 @@ pub async fn room_unshare(app: tauri::AppHandle, tokens: Vec<String>) {
             .request("room_unshare", json!({ "tokens": tokens }))
             .await;
     }
+}
+
+// ---- CEC Support passthroughs ----------------------------------------------
+//
+// The same `cec_*` surface the desktop registers, minus the pop-out windows
+// (`open_cec_window` / `open_chat_window` stay desktop-only — the store
+// already keeps every surface in-app on mobile). The in-process engine
+// carries the full CEC relay, so a phone can hold both ends of a help call:
+// approve/deny + revoke as a customer, and the queue/dial/chat verbs a
+// technician answering from a phone needs.
+
+/// This node's CEC snapshot: its support number, role, hosting.
+#[tauri::command]
+pub async fn cec_status(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_status", json!({})).await
+}
+
+/// Technician: dial a customer by support number. Returns `{ node }`.
+#[tauri::command]
+pub async fn cec_dial(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    number: String,
+    agent_name: Option<String>,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "cec_dial",
+            json!({ "number": number, "agent_name": agent_name }),
+        )
+        .await
+}
+
+/// Technician: dial a specific customer by node id — the raised-hand answer.
+#[tauri::command]
+pub async fn cec_dial_node(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    node: String,
+    agent_name: Option<String>,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "cec_dial_node",
+            json!({ "node": node, "agent_name": agent_name }),
+        )
+        .await
+}
+
+/// Technician: the dialed-customer directory, with live reachability.
+#[tauri::command]
+pub async fn cec_dialed(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_dialed", json!({})).await
+}
+
+/// Technician: the customers currently asking for help, longest-waiting first.
+#[tauri::command]
+pub async fn cec_help_list(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_help_list", json!({})).await
+}
+
+/// Technician: join or leave the global help room (persisted opt-in).
+#[tauri::command]
+pub async fn cec_help_watch(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    on: bool,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request("cec_help_watch", json!({ "on": on }))
+        .await
+}
+
+/// Technician: stop whatever the in-flight dial is trying.
+#[tauri::command]
+pub async fn cec_cancel_dial(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_cancel_dial", json!({})).await
+}
+
+/// The inbound technician connect-requests awaiting a choice.
+#[tauri::command]
+pub async fn cec_pending(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_pending", json!({})).await
+}
+
+/// Customer: approve a technician at a scope (once / three_hours / forever).
+#[tauri::command]
+pub async fn cec_approve(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    tech: String,
+    scope: String,
+    session_id: String,
+    want_control: bool,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "cec_approve",
+            json!({
+                "tech": tech,
+                "scope": scope,
+                "session_id": session_id,
+                "want_control": want_control,
+            }),
+        )
+        .await
+}
+
+/// Customer: decline a pending connect-request.
+#[tauri::command]
+pub async fn cec_deny(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    tech: String,
+    session_id: String,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "cec_deny",
+            json!({ "tech": tech, "session_id": session_id }),
+        )
+        .await
+}
+
+/// Customer: "Forget this technician" — revoke every grant and tear down.
+#[tauri::command]
+pub async fn cec_revoke(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    tech: String,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request("cec_revoke", json!({ "tech": tech }))
+        .await
+}
+
+/// Customer: the live consent grants.
+#[tauri::command]
+pub async fn cec_grants(
+    state: tauri::State<'_, crate::engine::EngineState>,
+) -> Result<Value, String> {
+    state.engine()?.request("cec_grants", json!({})).await
+}
+
+/// Technician: send a chat line to a dialed customer; returns `{ id, ts }`.
+#[tauri::command]
+pub async fn cec_chat_send(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    peer: String,
+    text: String,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request("cec_chat_send", json!({ "peer": peer, "text": text }))
+        .await
+}
+
+/// Technician: the stored chat thread with one customer, oldest-first.
+#[tauri::command]
+pub async fn cec_chat_history(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    peer: String,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request("cec_chat_history", json!({ "peer": peer }))
+        .await
 }
 
 // ---- mesh control passthroughs ----------------------------------------------

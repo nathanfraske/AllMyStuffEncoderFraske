@@ -18,11 +18,17 @@
     closeThisWindow,
     fileDownload,
     fileSend,
+    isMobile,
     onFileProgress,
     onFileSaved,
     onThisWindowClose,
     watchFiles,
   } from "../tauri";
+
+  // Touch has no reliable double-tap (and iOS eats it for zoom), so folders
+  // open on the second *single* tap instead: first tap selects (revealing the
+  // row actions), tapping the selected row again opens it. No timing window.
+  const mobile = isMobile();
   import { displayName, humanBytes, type FileEntry, type FileEvent } from "../types";
 
   let { host, windowed = false }: { host: string; windowed?: boolean } = $props();
@@ -635,6 +641,12 @@
                 tabindex="0"
                 onclick={() => {
                   const was = selected === e.name;
+                  // On touch, a second tap on the selected row opens it —
+                  // the double-click with the timing window removed.
+                  if (mobile && was) {
+                    open(e);
+                    return;
+                  }
                   selected = was ? null : e.name;
                   // Selecting a file previews it right away (the finder
                   // habit) — folders still wait for the double-click.
@@ -1146,6 +1158,21 @@
     }
     .head {
       padding-top: calc(0.6rem + max(3.4rem, env(safe-area-inset-top, 0px)));
+    }
+  }
+
+  /* Touch: the hover-reveal row actions are finger targets here, not mouse
+     targets — give them the ~40px minimum and a little air. (Reveal itself
+     already works on touch: tapping a row selects it, and `.row.selected
+     .c-acts` is visible.) */
+  @media (hover: none) {
+    .row {
+      min-height: 2.75rem;
+    }
+    .act {
+      width: 2.5rem;
+      height: 2.5rem;
+      font-size: 0.95rem;
     }
   }
 </style>

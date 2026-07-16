@@ -658,15 +658,45 @@
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  // The active canvas gesture: panning (right-drag) or marqueeing (left-drag on
-  // empty). Node drags are tracked separately, below.
+  // The active canvas gesture: panning (right-drag / one finger), marqueeing
+  // (left-drag on empty), or the two-finger pinch (mobile radial). Node drags
+  // are tracked separately, below.
   type Gesture =
     // `ox`/`oy` is the origin the drag moves from: the scroll offset in grid,
     // the pan in radial. A right/middle-drag "pan" nudges whichever applies.
-    | { kind: "pan"; x: number; y: number; ox: number; oy: number }
-    | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number };
+    // `id` (mobile only) is the finger the pan belongs to — after a pinch
+    // hands off to one remaining finger, that finger may not be the primary
+    // pointer, so ownership can't ride `isPrimary`.
+    | { kind: "pan"; x: number; y: number; ox: number; oy: number; id?: number }
+    | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number }
+    // `a`/`b` are the two pointer ids; everything else is the gesture's
+    // starting state — distance, zoom, midpoint (canvas coords), pan — so
+    // each move re-derives absolutely from the anchor instead of
+    // accumulating drift.
+    | {
+        kind: "pinch";
+        a: number;
+        b: number;
+        d0: number;
+        z0: number;
+        mx0: number;
+        my0: number;
+        px0: number;
+        py0: number;
+      };
   let gesture = $state<Gesture | null>(null);
   const panning = $derived(gesture?.kind === "pan");
+
+  // Live client-coordinate positions of the fingers on the canvas — the
+  // second one's arrival turns the radial pan into a pinch.
+  const touchPts = new Map<number, { x: number; y: number }>();
+  const fingerGap = (
+    pa: { x: number; y: number },
+    pb: { x: number; y: number },
+  ) =>
+    // Floored: fingertips can land nearly on top of each other, and a
+    // near-zero base distance would make the zoom ratio explode.
+    Math.max(24, Math.hypot(pb.x - pa.x, pb.y - pa.y));
 
   // Multi-selection (the marquee's result). The single-click selection still
   // flows through app.selectedNodeId so the drawer always has one focused node;
@@ -759,11 +789,37 @@
     if (mobile) {
       // A finger drag only pans/scrolls — never marquee, never share. Grid
       // scrolls natively (the real scroller + touch-action: pan-y on the
-      // canvas); radial pans via this gesture. No preventDefault and no
+      // canvas); radial pans via this gesture, and a second finger turns the
+      // pan into a pinch (the canvas is touch-action: none there, so the
+      // browser won't page-zoom underneath it). No preventDefault and no
       // pointer capture here: either could retarget or suppress the tap's
       // click, which is what selects a node.
-      if (!isGrid && e.isPrimary) {
-        gesture = { kind: "pan", x: e.clientX, y: e.clientY, ox: panX, oy: panY };
+      if (!isGrid) {
+        touchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touchPts.size === 2) {
+          const [[ida, pa], [idb, pb]] = [...touchPts.entries()];
+          const rect = canvas?.getBoundingClientRect();
+          gesture = {
+            kind: "pinch",
+            a: ida,
+            b: idb,
+            d0: fingerGap(pa, pb),
+            z0: zoom,
+            mx0: (pa.x + pb.x) / 2 - (rect?.left ?? 0),
+            my0: (pa.y + pb.y) / 2 - (rect?.top ?? 0),
+            px0: panX,
+            py0: panY,
+          };
+        } else if (e.isPrimary) {
+          gesture = {
+            kind: "pan",
+            x: e.clientX,
+            y: e.clientY,
+            ox: panX,
+            oy: panY,
+            id: e.pointerId,
+          };
+        }
       }
       return;
     }
@@ -793,10 +849,33 @@
     }
   }
   function onPointerMove(e: PointerEvent) {
+    // Keep every tracked finger's position fresh — the pinch reads both.
+    if (mobile && touchPts.has(e.pointerId)) {
+      touchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
     if (!gesture) return;
-    // Phone: the pan gesture belongs to the first finger — a second finger's
-    // moves would yank the origin around.
-    if (mobile && !e.isPrimary) return;
+    if (gesture.kind === "pinch") {
+      if (e.pointerId !== gesture.a && e.pointerId !== gesture.b) return;
+      const pa = touchPts.get(gesture.a);
+      const pb = touchPts.get(gesture.b);
+      if (!pa || !pb) return;
+      const rect = canvas?.getBoundingClientRect();
+      const next = clampZoom(gesture.z0 * (fingerGap(pa, pb) / gesture.d0));
+      const ratio = next / gesture.z0;
+      // Keep the content that started under the fingers' midpoint under it
+      // as they move — spreading zooms, sliding both pans, in one gesture.
+      const mx = (pa.x + pb.x) / 2 - (rect?.left ?? 0);
+      const my = (pa.y + pb.y) / 2 - (rect?.top ?? 0);
+      panX = mx - (gesture.mx0 - gesture.px0) * ratio;
+      panY = my - (gesture.my0 - gesture.py0) * ratio;
+      zoom = next;
+      return;
+    }
+    // Phone: the pan gesture belongs to one finger — another's moves would
+    // yank the origin around.
+    if (mobile && gesture.kind === "pan" && gesture.id !== undefined && e.pointerId !== gesture.id)
+      return;
+    if (mobile && gesture.kind === "marquee" && !e.isPrimary) return;
     if (gesture.kind === "pan") {
       if (isGrid && scroller) {
         // Dragging right/down moves the content right/down — i.e. scroll left/up.
@@ -812,6 +891,18 @@
     }
   }
   function onPointerUp(e: PointerEvent) {
+    touchPts.delete(e.pointerId);
+    if (gesture?.kind === "pinch") {
+      if (e.pointerId !== gesture.a && e.pointerId !== gesture.b) return;
+      // One finger up: keep panning with the one still down, from where it
+      // is now (the zoom stays where the pinch left it).
+      const remId = e.pointerId === gesture.a ? gesture.b : gesture.a;
+      const rem = touchPts.get(remId);
+      gesture = rem
+        ? { kind: "pan", x: rem.x, y: rem.y, ox: panX, oy: panY, id: remId }
+        : null;
+      return;
+    }
     if (gesture?.kind === "marquee") {
       // Commit whatever the live preview is highlighting (read it before the
       // gesture clears, since it's derived from the box).
@@ -1384,11 +1475,16 @@
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
   onpointerenter={() => (hovering = true)}
-  onpointerleave={() => {
+  onpointerleave={(e) => {
     hovering = false;
-    // The mobile radial pan runs uncaptured (capture would steal the tap's
-    // click from the node) — if the finger slides off the canvas, end it.
-    if (mobile) gesture = null;
+    // The mobile radial pan/pinch runs uncaptured (capture would steal the
+    // tap's click from the node) — if a finger slides off the canvas, end
+    // the gesture and forget that finger, or a stale entry would make the
+    // next touch read as a second finger.
+    if (mobile) {
+      touchPts.delete(e.pointerId);
+      gesture = null;
+    }
   }}
   oncontextmenu={onContextMenu}
   role="application"
@@ -2800,6 +2896,22 @@
     height: 1.1rem;
     background: var(--line);
     margin: 0 0.1rem;
+  }
+  /* Touch: the zoombar is fingers-only there (no wheel), so its buttons get
+     the ~40px minimum and clear the home-indicator inset. */
+  @media (hover: none) {
+    .zoombar {
+      bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+    }
+    .zbtn {
+      width: 2.6rem;
+      height: 2.4rem;
+      font-size: 1.05rem;
+    }
+    .zbtn.wide {
+      width: 3.4rem;
+      font-size: 0.8rem;
+    }
   }
 
   /* ---- list view ----------------------------------------------------- */

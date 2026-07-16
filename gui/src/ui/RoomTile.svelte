@@ -404,6 +404,13 @@
   .corner:focus-within {
     opacity: 1;
   }
+  /* Touch has no hover to reveal them with — and an invisible button can't
+     take the focus that would. Keep the corner controls visible. */
+  @media (hover: none) {
+    .corner {
+      opacity: 1;
+    }
+  }
   .corner-btn {
     border: 1px solid rgba(255, 255, 255, 0.22);
     background: rgba(0, 0, 0, 0.55);

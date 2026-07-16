@@ -91,6 +91,13 @@ html,
 body {
   margin: 0;
   height: 100%;
+  /* The app is a viewport-filling shell, not a document: reaching a panel's
+     end must not rubber-band the whole webview or trigger pull-to-refresh
+     (Android WebView / iOS WKWebView both chain scroll to the page). */
+  overscroll-behavior: none;
+  /* Keep phone browsers from inflating text on rotate — layout is ours. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -108,9 +115,23 @@ body {
 }
 
 #app {
+  /* dvh tracks the *visible* viewport on phones (browser chrome and the
+     soft keyboard shrink it); 100vh stays as the fallback for engines
+     without it. On desktop the two are identical. */
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
+}
+
+/* iOS zooms the page onto any focused control whose font is under 16px —
+   a jarring jump that also leaves the layout half-zoomed after blur. Give
+   form controls a 16px floor on touch builds only (`html.is-mobile` is
+   stamped at boot); desktop keeps its denser type. */
+html.is-mobile input,
+html.is-mobile textarea,
+html.is-mobile select {
+  font-size: max(1em, 16px);
 }
 
 button {
