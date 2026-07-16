@@ -1,28 +1,40 @@
 //! # allmystuff-mobile-core
 //!
-//! The brain of the AllMyStuff **mobile** app (iOS / Android), minus
-//! everything platform-specific. It is deliberately pure Rust — `serde`,
-//! `thiserror`, and the three pure AllMyStuff library crates
-//! ([`allmystuff_graph`], [`allmystuff_protocol`], [`allmystuff_session`]) —
-//! so the bytes the phone puts on (and takes off) the mesh are verified by
-//! `cargo test`, exactly the way the desktop's wire contract is. No webview,
-//! no daemon, no native decoders, no network: those live one layer up.
+//! The **model** of the AllMyStuff mobile app (iOS / Android): what a phone
+//! *is* on the graph, and the client half of the wire it would speak. It is
+//! deliberately pure Rust — `serde`, `thiserror`, and the three pure
+//! AllMyStuff library crates ([`allmystuff_graph`], [`allmystuff_protocol`],
+//! [`allmystuff_session`]) — so everything here is verified by `cargo test`,
+//! exactly the way the desktop's wire contract is. No webview, no daemon, no
+//! native decoders, no network: those live one layer up.
 //!
 //! ## Why the phone is a *node*, not a thin client
 //!
 //! On the desktop, the GUI is a thin client of a separate `allmystuff-serve`
 //! process it **spawns**, which in turn spawns the `myownmesh` daemon. iOS
 //! forbids a sandboxed app from spawning child processes, so that model can't
-//! cross over. The mobile app instead **embeds** `myownmesh-core` in-process
-//! and becomes a first-class mesh peer: its own ed25519 identity, direct
-//! WebRTC DTLS/SRTP to its peers, signaling only. The "no central server,
-//! peer-to-peer, end-to-end encrypted" promise is preserved — see
-//! `docs/MOBILE.md` for the full architecture and the cross-compile findings.
+//! cross over: the phone becomes a first-class mesh peer itself — its own
+//! ed25519 identity, direct WebRTC DTLS/SRTP to its peers, signaling only.
+//! The "no central server, peer-to-peer, end-to-end encrypted" promise is
+//! preserved — see `docs/MOBILE.md` for the full architecture.
 //!
-//! That embedded engine is reached through one seam — [`MeshClient`] — which
-//! the FFI layer over `myownmesh-core` implements on device and an in-memory
-//! fake implements in tests. Everything in this crate is written against that
-//! seam, so the orchestration logic is exercised without a radio.
+//! ## What the app uses, and what stands as the spec
+//!
+//! The shipped shell (`gui/mobile`) embeds the **whole node engine**
+//! (`allmystuff-node`, capture-less) plus the `myownmesh` daemon in-process,
+//! so at runtime the wire is spoken by the same engine code as everywhere
+//! else. Two of this crate's modules ride in the app itself:
+//!
+//! * [`caps`] + [`node`] — the phone's capability set and [`NodeProfile`]:
+//!   what `scan_self` answers from while the engine boots, and the pinned
+//!   truth about a phone's synthetic endpoints (see below).
+//!
+//! The rest — [`connect`], [`control`], [`transport`], [`media`] — is the
+//! tested, executable **spec of the viewer/controller client**: every path
+//! written against one seam, [`MeshClient`], which an in-memory fake
+//! implements in tests so the logic runs without a radio. It is the starting
+//! point if a pure-native (non-Tauri) client is ever built, and the
+//! reference for what a conforming viewer/controller must send.
 //!
 //! ## What a phone is, on the graph
 //!
