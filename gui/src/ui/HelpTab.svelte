@@ -62,6 +62,11 @@
     aliasDraft = app.cecAliases[number] ?? "";
   }
   function saveRename(number: string) {
+    // Guard the trailing blur: committing via Enter (or cancelling via
+    // Escape) closes the editor, and removing a focused input fires its
+    // `blur` — which would land back here with the freshly-cleared draft
+    // and erase the alias that was just saved. Only the open editor saves.
+    if (editingKey !== number) return;
     app.setCecAlias(number, aliasDraft);
     editingKey = null;
     aliasDraft = "";
