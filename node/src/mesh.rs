@@ -10333,6 +10333,37 @@ impl Mesh {
         Ok(delivered)
     }
 
+    /// Ordered networks to try when sending to `peer`: the last network the
+    /// slot proved (an inbound frame, or a prior confirmed send), then the
+    /// primary network, then every other joined network. A multi-homed peer —
+    /// a KVM sits on its fleet mesh, the local-claim mesh and the CEC help
+    /// mesh at once, broadcasting presence on all of them — keeps overwriting
+    /// the single `peer_networks` slot with whichever mesh delivered its last
+    /// advert, and that mesh is not necessarily one that carries OUR frames
+    /// back (hub topologies relay a beacon without giving us a direct lane).
+    /// One slot, one attempt was the lottery behind "shows up online, the
+    /// site opens, but nothing connects."
+    fn peer_network_candidates(&self, peer: &str) -> Vec<String> {
+        let st = self.state.lock();
+        ordered_send_candidates(
+            st.peer_networks.get(pubkey_part(peer)),
+            st.network.as_ref(),
+            &st.networks,
+        )
+    }
+
+    /// Record that a send to `peer` was daemon-confirmed on `network`, so the
+    /// tunnel traffic that follows (site/input frames ride the slot) sticks to
+    /// a mesh that provably reaches the peer — until the next inbound frame or
+    /// confirmed send updates it again.
+    fn note_peer_network(&self, peer: &str, network: &str) {
+        let mut st = self.state.lock();
+        let key = pubkey_part(peer).to_string();
+        if st.peer_networks.get(&key).map(String::as_str) != Some(network) {
+            st.peer_networks.insert(key, network.to_string());
+        }
+    }
+
     /// Send a control message to one peer, reporting whether the daemon
     /// actually dispatched it. The daemon's peer set is keyed by the *bare
     /// pubkey* (what signaling announces), while AllMyStuff mostly holds
@@ -10340,28 +10371,43 @@ impl Mesh {
     /// — so the id is canonicalised here, at the daemon boundary. Addressing
     /// the display form made every send come back "peer not found", an error
     /// this used to swallow: a claim showed "asking…" and then nothing.
+    ///
+    /// Tries every shared network until the daemon confirms one (the KVM's
+    /// bridge sweeps its networks the same way — "the correct network's send
+    /// reaches them and others are harmless no-ops"), then pins the peer's
+    /// slot to the network that actually delivered, so the media frames that
+    /// follow a route offer ride the proven mesh instead of the last one a
+    /// presence advert happened to arrive on.
     async fn send_control(&self, peer: &str, message: &ControlMessage) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let candidates = self.peer_network_candidates(peer);
+        if candidates.is_empty() {
             return Err(format!("no shared network with {peer}"));
-        };
-        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
-        let resp = self
-            .client
-            .request(&Request::ChannelSendTo {
-                network,
-                channel: CHANNEL_CONTROL.to_string(),
-                peer: pubkey_part(peer).to_string(),
-                payload,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        if resp.ok {
-            Ok(())
-        } else {
-            let err = resp.error.unwrap_or_else(|| "channel send failed".into());
-            tracing::warn!("control send to {peer} failed: {err}");
-            Err(err)
         }
+        let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let mut last_err = String::new();
+        for network in candidates {
+            let resp = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network: network.clone(),
+                    channel: CHANNEL_CONTROL.to_string(),
+                    peer: pubkey_part(peer).to_string(),
+                    payload: payload.clone(),
+                })
+                .await;
+            match resp {
+                Ok(r) if r.ok => {
+                    self.note_peer_network(peer, &network);
+                    return Ok(());
+                }
+                Ok(r) => {
+                    last_err = r.error.unwrap_or_else(|| "channel send failed".into());
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        tracing::warn!("control send to {peer} failed on every shared network: {last_err}");
+        Err(last_err)
     }
 
     fn emit_snapshot(&self) {
@@ -10852,6 +10898,25 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
                 .or_insert_with(|| network.to_string());
         }
     }
+}
+
+/// The try-order for sending to one peer: its slot (last proven network)
+/// first, then the primary, then every other joined network, deduped in that
+/// priority. Pure, so the order — the part that decides whether a
+/// multi-homed peer's tunnel finds its live mesh — is testable on its own;
+/// [`Mesh::peer_network_candidates`] feeds it the live state.
+fn ordered_send_candidates(
+    slot: Option<&String>,
+    primary: Option<&String>,
+    joined: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in slot.into_iter().chain(primary).chain(joined) {
+        if !out.contains(n) {
+            out.push(n.clone());
+        }
+    }
+    out
 }
 
 /// One peer row's link class off the daemon's `selected_pair` — the
@@ -11350,6 +11415,46 @@ mod tests {
         // (the media is part of the contract, not just the suffix).
         let display = term_route("host:terminal", "me:term-view:1", MediaKind::Display);
         assert!(!is_terminal_route(&display));
+    }
+
+    #[test]
+    fn ordered_send_candidates_tries_slot_then_primary_then_the_rest() {
+        let slot = "cec-help".to_string();
+        let primary = "joining".to_string();
+        let joined = vec![
+            "joining".to_string(),
+            "allmystuff-local-claim-v1".to_string(),
+            "cec-help".to_string(),
+            "fleet-mesh".to_string(),
+        ];
+        // Slot first (last proven), then primary, then the remaining joined
+        // networks — each exactly once. This order is what lets a send to a
+        // multi-homed peer (a KVM on fleet + local-claim + help mesh at once)
+        // fall through to the mesh that actually carries our frames.
+        assert_eq!(
+            ordered_send_candidates(Some(&slot), Some(&primary), &joined),
+            vec![
+                "cec-help".to_string(),
+                "joining".to_string(),
+                "allmystuff-local-claim-v1".to_string(),
+                "fleet-mesh".to_string(),
+            ]
+        );
+        // No slot yet (never heard from the peer): primary leads.
+        assert_eq!(
+            ordered_send_candidates(None, Some(&primary), &joined),
+            vec![
+                "joining".to_string(),
+                "allmystuff-local-claim-v1".to_string(),
+                "cec-help".to_string(),
+                "fleet-mesh".to_string(),
+            ]
+        );
+        // Nothing known at all: nothing to try.
+        assert_eq!(
+            ordered_send_candidates(None, None, &[]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
