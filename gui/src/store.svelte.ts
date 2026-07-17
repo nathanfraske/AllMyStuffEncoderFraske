@@ -3891,6 +3891,20 @@ class AppStore {
     return this.cecCustomers.find((c) => c.node && sameMachine(c.node, nodeId)) ?? null;
   }
 
+  /** Live CEC standing toward a machine: we dialed it (it's in the customer
+   *  directory) or its hand is up in the watched help queue right now. This is
+   *  the technician's authority arm for a KVM's session doors — the same
+   *  lifetime as the appliance's own approved-tech set (admitted while asking
+   *  or on dial, dropped on hangup), which is what actually authorizes every
+   *  tunneled request. This gate only decides what the GUI offers. */
+  cecStanding(nodeId: string | undefined): boolean {
+    if (!nodeId) return false;
+    return (
+      this.isCecCustomer(nodeId) ||
+      this.cecHelpWaiting.some((w) => w.node && sameMachine(w.node, nodeId))
+    );
+  }
+
   consoleAccess(node: MeshNode | undefined): ConsoleAccess {
     const none: ConsoleAccess = {
       remote: false,
@@ -3943,12 +3957,19 @@ class AppStore {
         (self ? this.localTerminalAllowed : mineOrFleet || this.hasShareGrant(node, "terminal")),
       sites:
         // A KVM may advertise only FEATURE_KVM (not FEATURE_SITES), yet its
-        // web UI still rides the sites proxy (see `mapSite`'s kvmAllowed
+        // web UI still rides the sites proxy (see `mapSite`'s kvmDoors
         // bypass) — so `|| kvm` lets the standard globe show for it too.
+        // A KVM's globe also opens for live CEC standing (the help tech's
+        // arm, matching the appliance's own approved-tech admission);
+        // an ordinary customer's sites stay owner/fleet-only — the CEC
+        // consent model covers screen + control, so a person's exposed
+        // sites would just be denied.
         (this.sitesSupported(node) || kvm) &&
         (node.sites?.length ?? 0) > 0 &&
         !self &&
-        (mineOrFleet || this.hasShareGrant(node, "sites")),
+        (mineOrFleet ||
+          this.hasShareGrant(node, "sites") ||
+          (kvm && this.cecStanding(node.id))),
       // Audio passthrough: only when the machine has audio to send and you may
       // hear it.
       audio:
@@ -4155,10 +4176,13 @@ class AppStore {
   async mapSite(nodeId: string, site: SiteAdvert) {
     const node = this.node(nodeId);
     if (!node) return;
-    // A KVM's own web UI rides this same proxy path; it's gated by the same
-    // owner/fleet rule (`kvmAllowed`), so accept it even if the appliance
-    // advertises only FEATURE_KVM and not the FEATURE_SITES tag.
-    if (!this.sitesAllowed(node) && !this.kvmAllowed(node)) {
+    // A KVM's own web UI rides this same proxy path — gated by its session
+    // doors (`kvmDoors`: yours to curate, OR live CEC standing as the help
+    // tech), so accept it even if the appliance advertises only FEATURE_KVM
+    // and not the FEATURE_SITES tag. The door showing but this gate refusing
+    // was the "Sites are owner/fleet only" a standing tech used to hit: the
+    // KVM itself admits the session's tech, the GUI must not refuse first.
+    if (!this.sitesAllowed(node) && !this.kvmDoors(node)) {
       this.toast("warn", `Sites are owner/fleet only — ${node.label} isn't yours`);
       return;
     }
@@ -4267,14 +4291,28 @@ class AppStore {
     return named ?? sites.find((s) => siteIsWeb(s)) ?? undefined;
   }
 
-  /** Whether the KVM's actions are reachable for you — the same owner/fleet
-   *  rule as its sites (a KVM's web UI + GPIO are just as privileged). Lets
-   *  the drawers show the KVM affordances only for a KVM that's yours. */
+  /** Whether the KVM is YOURS to curate — owner / co-fleet / shared, the rule
+   *  for attach/detach and the drawer's fleet tools. The session doors (web
+   *  Site, Power/Reset) are the wider `kvmDoors`: a help technician gets
+   *  those, never this. */
   kvmAllowed(node: MeshNode | undefined): boolean {
     if (!this.isKvm(node) || this.isMe(node!.id)) return false;
     const ownerIsMe = !!node!.owner && this.isMe(node!.owner);
     const coFleet = this.isFleetMember(this.localId) && this.isFleetMember(node!.id);
     return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
+  }
+
+  /** Whether the KVM's session doors — its manufacturer web Site and the
+   *  Power/Reset that ride the same tunnel — are yours to open: a KVM you
+   *  curate (`kvmAllowed`), or one you hold live CEC standing toward (you
+   *  dialed it, or its hand is up in your watched queue). The appliance is the
+   *  real authority: it accepts a tunnel only from its owner, its fleet, or a
+   *  tech it admitted for the live support session (admitted while asking or
+   *  on dial, dropped on hangup) — so widening this gate can't grant access
+   *  the KVM itself would refuse; it just stops the GUI refusing first. */
+  kvmDoors(node: MeshNode | undefined): boolean {
+    if (!this.isKvm(node)) return false;
+    return this.kvmAllowed(node) || this.cecStanding(node!.id);
   }
 
   /** The fleet-graph twin of a CEC help/directory row, when the machine that
@@ -4286,22 +4324,16 @@ class AppStore {
    *  customer, a KVM outside our graph, or one whose KVM affordances aren't
    *  ours to use.
    *
-   *  Authorization is EITHER side of the tech/owner divide: `kvmAllowed`
-   *  (ours / co-fleet / shared) for a KVM in our own fleet, or — mirroring
-   *  `capabilitiesFor`'s `isCec` arm — a dialed CEC customer. A help
-   *  technician is neither owner nor co-fleet of the customer's appliance,
-   *  yet the KVM's whole point on the help queue is that the tech can open
-   *  its manufacturer web UI; the KVM itself authorizes that tunnel by its
-   *  mesh roster, so the gate here only decides whether the button shows.
-   *  `raisedHand` (queue rows) skips the ACL entirely: the hand-raise IS the
-   *  ask — a beacon this customer deliberately lit — so the Site door shows
-   *  the moment the graph knows the machine is a KVM, even before Answer. */
-  kvmTwin(cecNode: string | undefined, opts?: { raisedHand?: boolean }): MeshNode | undefined {
+   *  Authorization is the KVM's session doors (`kvmDoors`): ours to curate,
+   *  or live CEC standing — a dialed customer, or a hand up in the watched
+   *  queue right now (the hand-raise IS the ask, a beacon the customer
+   *  deliberately lit). One gate for showing the door AND opening it, so the
+   *  button can never render only for the tunnel to refuse; the KVM itself
+   *  still authorizes every request by its own approved-tech set. */
+  kvmTwin(cecNode: string | undefined): MeshNode | undefined {
     if (!cecNode) return undefined;
     const node = this.nodeByCanonical(cecNode);
-    if (!this.isKvm(node)) return undefined;
-    if (opts?.raisedHand) return node;
-    return this.kvmAllowed(node) || this.isCecCustomer(cecNode) ? node : undefined;
+    return this.kvmDoors(node) ? node : undefined;
   }
 
   /** Open a KVM's own web UI through the mesh — map its web site to a local

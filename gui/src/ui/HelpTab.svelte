@@ -119,7 +119,7 @@
     <ul class="rows">
       {#each app.cecHelpWaiting as w (w.node)}
         {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
-        {@const kvm = app.kvmTwin(w.node, { raisedHand: true })}
+        {@const kvm = app.kvmTwin(w.node)}
         {@const phase = app.cecWaitPhase(w.node)}
         <li class="row">
           <div class="row-head">
