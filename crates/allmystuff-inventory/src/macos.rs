@@ -31,21 +31,12 @@ fn sysctl(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Friendly board label — "MacBook Pro · Apple M2".
+/// The Mac's board/model identifier exactly as the system reports it —
+/// `sysctl hw.model` ("Mac14,7"), verbatim. Deliberately NO friendly-name
+/// or chip composition: the Board row shows whatever the system has for
+/// the field. (The friendly name still shows as the model via `product`.)
 pub fn board_label() -> Option<String> {
-    let hw = system_profiler("SPHardwareDataType")?;
-    let item = hw["SPHardwareDataType"].as_array()?.first()?;
-    let name = item["machine_name"]
-        .as_str()
-        .or_else(|| item["machine_model"].as_str());
-    let chip = item["chip_type"]
-        .as_str()
-        .or_else(|| item["cpu_type"].as_str());
-    match (name, chip) {
-        (Some(n), Some(c)) => Some(format!("{n} · {c}")),
-        (Some(n), None) => Some(n.to_string()),
-        _ => sysctl("hw.model"),
-    }
+    sysctl("hw.model")
 }
 
 /// Just the product / model name — the Mac's machine name ("MacBook Pro"),

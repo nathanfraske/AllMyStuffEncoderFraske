@@ -98,26 +98,13 @@ fn baseboard() -> (Option<String>, Option<String>) {
     }
 }
 
+/// The motherboard's own product string, exactly as `Win32_BaseBoard.Product`
+/// reports it — verbatim. Deliberately NO placeholder filtering, NO
+/// manufacturer prefixing, NO fallback to the system record: the Board row
+/// shows whatever the system has for the field.
 pub fn board_label() -> Option<String> {
-    let sys = ps_json(
-        "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model | ConvertTo-Json -Compress",
-    );
-    let mut vendor = sys.as_ref().and_then(|v| clean(v, "Manufacturer"));
-    let mut model = sys.as_ref().and_then(|v| clean(v, "Model"));
-
-    // A DIY machine's system record is placeholders — fall back to the board,
-    // whose Manufacturer/Product siblings carry the real identity.
-    if vendor.is_none() || model.is_none() {
-        let (bb_vendor, bb_product) = baseboard();
-        vendor = vendor.or(bb_vendor);
-        model = model.or(bb_product);
-    }
-
-    let model = model?;
-    Some(match vendor {
-        Some(vn) if !model.starts_with(&vn) => format!("{vn} {model}"),
-        _ => model,
-    })
+    ps_json("Get-CimInstance Win32_BaseBoard | Select-Object Product | ConvertTo-Json -Compress")
+        .and_then(|v| s(&v, "Product"))
 }
 
 /// Just the product / model name — the friendly `Win32_ComputerSystem.Model`

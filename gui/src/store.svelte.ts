@@ -4257,6 +4257,20 @@ class AppStore {
     return ownerIsMe || coFleet || this.hasShareGrant(node, "sites");
   }
 
+  /** The fleet-graph twin of a CEC help/directory row, when the machine that
+   *  raised its hand (or was dialed) is a KVM we can also reach on the normal
+   *  mesh. The CEC plane's beacon carries no site adverts, but the same
+   *  appliance's graph presence does — this is the bridge that lets a
+   *  raised-hand row offer the KVM's web Site (and anything else the graph
+   *  knows) alongside the remote-control console. Undefined for an ordinary
+   *  customer, a KVM outside our graph, or one whose KVM affordances aren't
+   *  ours to use. */
+  kvmTwin(cecNode: string | undefined): MeshNode | undefined {
+    if (!cecNode) return undefined;
+    const node = this.nodeByCanonical(cecNode);
+    return this.isKvm(node) && this.kvmAllowed(node) ? node : undefined;
+  }
+
   /** Open a KVM's own web UI through the mesh — map its web site to a local
    *  port if it isn't already, then open `http(s)://localhost:<port>` in the
    *  system browser. In web mode (no backend) there's nothing to map, so the

@@ -26,18 +26,13 @@ use crate::types::*;
 // host: board + SoC
 // =======================================================================
 
-/// Friendly board label from DMI — "Dell Inc. XPS 15 9520". `None`
-/// inside VMs / containers where DMI is stripped. On a custom build the
-/// `sys_vendor`/`product_name` fields are placeholders, so fall back to the
-/// motherboard's own `board_vendor`/`board_name`.
+/// The motherboard's own model string, exactly as the firmware reports it:
+/// `/sys/class/dmi/id/board_name`, verbatim. `None` inside VMs / containers
+/// where DMI is stripped (or the file is empty). Deliberately NO placeholder
+/// filtering, NO vendor prefixing, NO composition — the Board row shows
+/// whatever the system has for the field, even an OEM placeholder.
 pub fn board_label() -> Option<String> {
-    let vendor = read_trim("/sys/class/dmi/id/sys_vendor")
-        .filter(|v| !dmi_placeholder(v))
-        .or_else(|| read_trim("/sys/class/dmi/id/board_vendor"));
-    let product = read_trim("/sys/class/dmi/id/product_name")
-        .filter(|p| !dmi_placeholder(p))
-        .or_else(|| read_trim("/sys/class/dmi/id/board_name"));
-    parse_dmi_board(vendor.as_deref(), product.as_deref())
+    read_trim("/sys/class/dmi/id/board_name")
 }
 
 /// Just the product / model name — the DMI `product_name` field, without
@@ -75,15 +70,6 @@ fn dmi_placeholder(s: &str) -> bool {
         || l.contains("system product")
         || l.contains("default string")
         || l == "none"
-}
-
-fn parse_dmi_board(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
-    let vendor = vendor.filter(|v| !dmi_placeholder(v));
-    let product = product.filter(|p| !dmi_placeholder(p))?;
-    Some(match vendor {
-        Some(v) if !product.starts_with(v) => format!("{v} {product}"),
-        _ => product.to_string(),
-    })
 }
 
 /// `/proc/device-tree/model` — NUL-terminated string on Pi / ARM SBCs.
@@ -919,32 +905,6 @@ fn read_trim(path: impl AsRef<Path>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dmi_board_combines_vendor_and_product() {
-        assert_eq!(
-            parse_dmi_board(Some("Dell Inc."), Some("XPS 15 9520")).as_deref(),
-            Some("Dell Inc. XPS 15 9520")
-        );
-    }
-
-    #[test]
-    fn dmi_board_rejects_placeholder_strings() {
-        assert_eq!(
-            parse_dmi_board(Some("System manufacturer"), Some("To be filled by O.E.M.")),
-            None
-        );
-        assert_eq!(parse_dmi_board(None, None), None);
-    }
-
-    #[test]
-    fn dmi_board_skips_redundant_vendor_prefix() {
-        // Some products already embed the vendor; don't double it.
-        assert_eq!(
-            parse_dmi_board(Some("ASUS"), Some("ASUS TUF Gaming")).as_deref(),
-            Some("ASUS TUF Gaming")
-        );
-    }
 
     #[test]
     fn device_tree_model_trims_nul() {

@@ -225,6 +225,7 @@
       <ul class="rows">
         {#each app.cecHelpWaiting as w (w.node)}
           {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
+          {@const kvm = app.kvmTwin(w.node)}
           <li class="row col asking">
             <div class="row-top">
               <span class="dot busy"></span>
@@ -245,6 +246,17 @@
               >
                 Control
               </button>
+              {#if kvm}
+                <!-- A raised hand from one of our KVMs: alongside the console,
+                     its normal web Site is one tap away via the graph. -->
+                <button
+                  class="btn small"
+                  title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+                  onclick={() => void app.openKVM(kvm.id)}
+                >
+                  🌐 Site
+                </button>
+              {/if}
               <button
                 class="btn small"
                 disabled={app.cecDialing}
@@ -302,6 +314,7 @@
       </p>
       <ul class="rows">
         {#each customers as c (c.number)}
+          {@const kvm = app.kvmTwin(c.node)}
           <li class="row col" class:stale={isStale(c.last_used)}>
             <div class="row-top">
               <span class="dot" class:on={c.online}></span>
@@ -356,6 +369,15 @@
                     onclick={() => void app.reconnectCec(c.node)}
                   >
                     Control
+                  </button>
+                {/if}
+                {#if kvm}
+                  <button
+                    class="btn small"
+                    title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+                    onclick={() => void app.openKVM(kvm.id)}
+                  >
+                    🌐 Site
                   </button>
                 {/if}
                 <button
