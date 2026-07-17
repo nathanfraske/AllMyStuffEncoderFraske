@@ -1473,6 +1473,7 @@ pub async fn dispatch(
             json_result(mesh.cec_revoke(tech).await)
         }
         "cec_grants" => json_result(mesh.cec_grants().await),
+        "cec_viewing" => json_result(mesh.cec_viewing().await),
         "cec_dialed" => json_result(mesh.cec_dialed().await),
         "cec_cancel_dial" => json_result(mesh.cec_cancel_dial().await),
         "cec_ask_help" => {
