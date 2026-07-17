@@ -1858,23 +1858,47 @@ impl Mesh {
                                 short_id(node_id.as_str())
                             );
                             self.fleet_drop_member(node_id.to_string()).await;
-                        } else if in_my_fleet && still_ours && (new_boot || !known) {
-                            // A member that's still ours just (re)appeared. If the
-                            // original fleet-key handoff was lost — we were offline
-                            // when it accepted the claim, or the frame dropped — it's
-                            // claimed-but-keyless and stuck outside the closed
-                            // network. Re-hand the key now; the member's
-                            // `adopt_fleet_key` is a no-op when it already holds it,
-                            // so this is safe to repeat on every (re)appearance and
-                            // self-heals the handoff without a manual nudge. Gated on
-                            // the member still being in *our* roster so it never
-                            // undoes an eviction (an evicted device we dropped is no
-                            // longer `in_my_fleet`, so it isn't re-keyed).
-                            tracing::info!(
-                                "fleet member {} (re)appeared — re-handing the fleet key in case it was missed",
-                                short_id(node_id.as_str())
-                            );
-                            self.send_fleet_key(node_id.as_str()).await;
+                        } else if in_my_fleet && still_ours {
+                            if new_boot || !known {
+                                // A member that's still ours just (re)appeared. If the
+                                // original fleet-key handoff was lost — we were offline
+                                // when it accepted the claim, or the frame dropped — it's
+                                // claimed-but-keyless and stuck outside the closed
+                                // network. Re-hand the key now; the member's
+                                // `adopt_fleet_key` is a no-op when it already holds it,
+                                // so this is safe to repeat on every (re)appearance and
+                                // self-heals the handoff without a manual nudge. Gated on
+                                // the member still being in *our* roster so it never
+                                // undoes an eviction (an evicted device we dropped is no
+                                // longer `in_my_fleet`, so it isn't re-keyed).
+                                tracing::info!(
+                                    "fleet member {} (re)appeared — re-handing the fleet key in case it was missed",
+                                    short_id(node_id.as_str())
+                                );
+                                self.send_fleet_key(node_id.as_str()).await;
+                            }
+                            // Signed-roster self-heal. The claim-time admit authors a
+                            // new member's RoleGrant *before* that member has joined the
+                            // fleet network — the key handoff (and so the join) lands
+                            // after — and a constrained co-node like a KVM appliance can
+                            // be absent from the closed net at that instant, so the grant
+                            // never takes and nothing re-admits it until a restart. The
+                            // member then sits on the fleet mesh yet missing from the
+                            // signed roster the graph reads: it shows "unclaimed /
+                            // unknown fleet" with its owner-gated controls (web Site,
+                            // reboot, Wi-Fi, unclaim) dead, even though it holds the right
+                            // key and name. So whenever a still-ours member is present but
+                            // not yet in our signed roster, re-run the idempotent admit;
+                            // the admit loop skips members already in the log, so this
+                            // quiesces the moment the roster converges.
+                            if !self.fleet_authorized.lock().contains(&peer) {
+                                tracing::info!(
+                                    "fleet member {} is present but unsigned — admitting it to the fleet roster",
+                                    short_id(node_id.as_str())
+                                );
+                                self.ensure_fleet_network().await;
+                                self.refresh_fleet_authorization().await;
+                            }
                         }
                     }
                     if new_boot || (!is_self && !known) {

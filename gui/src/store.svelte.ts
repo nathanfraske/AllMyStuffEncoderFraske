@@ -1031,15 +1031,6 @@ class AppStore {
     const self = node.kind === "this" || this.isMe(node.id);
     const app = isAppNode(node);
     const shared = node.relationship.kind === "shared" ? node.relationship.person : null;
-    // "In a fleet": for *this* device, whether it's claimed at all — either it
-    // holds a fleet credential (a solo fleet you founded still counts) *or* it's
-    // been claimed by an owner whose fleet-key handoff hasn't landed yet (owned
-    // but keyless). Both mean it isn't free: the make-claimable button gives way
-    // to "Leave the fleet", matching the backend's no-claiming-while-owned rule
-    // so the UI can't say "not in a fleet" while the backend refuses adoption.
-    // For a remote device, whether it's a member of your fleet roster.
-    const inFleet = self ? this.inFleet : this.isFleetMember(node.id);
-    const role = this.fleetRoleOf(node.id);
     // Roster-authoritative ownership. The signed fleet roster — what the
     // settings Fleet pane and the graph's fleet grouping both read — is the
     // authority for "is this device in my fleet". A device's *own* presence
@@ -1051,6 +1042,31 @@ class AppStore {
     // contradict it).
     const advertisedMine = !!node.owner && this.isMe(node.owner);
     const ownedByOther = !!node.owner && !this.isMe(node.owner);
+    // A KVM we claimed announces us as its owner and — via our fleet-key
+    // handoff — joins our fleet's CLOSED mesh (it can only be there because we
+    // admitted it). A constrained KVM can lag converging into the signed roster
+    // membership is normally read from, so `isFleetMember` misses it for a while
+    // — leaving it stuck "unclaimed / unknown fleet" with its own claimed-state
+    // controls, the exact contradiction this resolves. Trust the KVM's own
+    // advert when it is BOTH owned-by-us AND live on our fleet network. Unlike a
+    // bare owner-advert this can't pin a stale claim: eviction drops the device
+    // from the fleet mesh, so `onMyFleetMesh` clears the moment it's really gone.
+    // (The backend self-heals the signed roster too; this makes the graph agree
+    // immediately, before that convergence lands.)
+    const onMyFleetMesh =
+      !!this.fleetNetworkId && (node.kvm?.meshes ?? []).includes(this.fleetNetworkId);
+    const kvmClaimedByMe = !self && this.isKvm(node) && advertisedMine && onMyFleetMesh;
+    // "In a fleet": for *this* device, whether it's claimed at all — either it
+    // holds a fleet credential (a solo fleet you founded still counts) *or* it's
+    // been claimed by an owner whose fleet-key handoff hasn't landed yet (owned
+    // but keyless). Both mean it isn't free: the make-claimable button gives way
+    // to "Leave the fleet", matching the backend's no-claiming-while-owned rule
+    // so the UI can't say "not in a fleet" while the backend refuses adoption.
+    // For a remote device, whether it's a member of your fleet roster — plus the
+    // just-claimed-KVM self-heal above, so it reads as ours the instant it lands
+    // on our fleet mesh, not only once the signed roster catches up.
+    const inFleet = self ? this.inFleet : this.isFleetMember(node.id) || kvmClaimedByMe;
+    const role = this.fleetRoleOf(node.id);
     const ownedByMe = inFleet || (advertisedMine && !this.inFleet);
     const offering = node.claimable === true;
     const mine = ownedByMe;
