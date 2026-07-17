@@ -1166,7 +1166,7 @@ impl Mesh {
                             .routes()
                             .map(|r| {
                                 (
-                                    r.peer.clone(),
+                                    r.peer.as_str().to_string(),
                                     r.route.id.clone(),
                                     matches!(r.route.media, MediaKind::Display | MediaKind::Video),
                                     route_drive_plane(&r.route),
