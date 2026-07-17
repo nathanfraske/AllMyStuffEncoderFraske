@@ -561,6 +561,10 @@ class AppStore {
    *  CEC tab renders it as a live "Dialing…" row so a connect attempt is
    *  visible from the first click (discovery alone can take up to ~45s). */
   cecDialingNumber = $state<string | null>(null);
+  /** The NODE currently being dialed (Answer / Open / Chat go by node, which
+   *  never sets `cecDialingNumber`) — what lets the help sidebar pin its
+   *  inline "Connecting…" status to the row that was actually clicked. */
+  cecDialingNode = $state<string | null>(null);
   /** Live CEC sessions this app is party to, newest first. */
   cecSessions = $state<{ sessionId: string; state: string; node?: string }[]>([]);
   /** The customer's live consent grants (populated when hosting). */
@@ -4280,11 +4284,24 @@ class AppStore {
    *  raised-hand row offer the KVM's web Site (and anything else the graph
    *  knows) alongside the remote-control console. Undefined for an ordinary
    *  customer, a KVM outside our graph, or one whose KVM affordances aren't
-   *  ours to use. */
-  kvmTwin(cecNode: string | undefined): MeshNode | undefined {
+   *  ours to use.
+   *
+   *  Authorization is EITHER side of the tech/owner divide: `kvmAllowed`
+   *  (ours / co-fleet / shared) for a KVM in our own fleet, or — mirroring
+   *  `capabilitiesFor`'s `isCec` arm — a dialed CEC customer. A help
+   *  technician is neither owner nor co-fleet of the customer's appliance,
+   *  yet the KVM's whole point on the help queue is that the tech can open
+   *  its manufacturer web UI; the KVM itself authorizes that tunnel by its
+   *  mesh roster, so the gate here only decides whether the button shows.
+   *  `raisedHand` (queue rows) skips the ACL entirely: the hand-raise IS the
+   *  ask — a beacon this customer deliberately lit — so the Site door shows
+   *  the moment the graph knows the machine is a KVM, even before Answer. */
+  kvmTwin(cecNode: string | undefined, opts?: { raisedHand?: boolean }): MeshNode | undefined {
     if (!cecNode) return undefined;
     const node = this.nodeByCanonical(cecNode);
-    return this.isKvm(node) && this.kvmAllowed(node) ? node : undefined;
+    if (!this.isKvm(node)) return undefined;
+    if (opts?.raisedHand) return node;
+    return this.kvmAllowed(node) || this.isCecCustomer(cecNode) ? node : undefined;
   }
 
   /** Open a KVM's own web UI through the mesh — map its web site to a local
@@ -7223,6 +7240,10 @@ class AppStore {
     const byNode = "node" in target;
     this.cecDialing = true;
     this.cecDialingNumber = byNode ? null : target.number;
+    // Which ROW is being dialed, for the help sidebar's inline status — a
+    // by-node dial (Answer / Open / Chat) never sets `cecDialingNumber`, so
+    // without this the sidebar had nothing to pin its "Connecting…" line to.
+    this.cecDialingNode = byNode ? target.node : null;
     clientLog(`[cec] dialing ${display}…`);
     try {
       // Hard cap the wait so a wedged socket request can't leave cecDialing
@@ -7258,6 +7279,7 @@ class AppStore {
     } finally {
       this.cecDialing = false;
       this.cecDialingNumber = null;
+      this.cecDialingNode = null;
       void this.loadCec();
     }
   }
@@ -7268,6 +7290,22 @@ class AppStore {
   async cancelCecDial() {
     clientLog("[cec] cancel requested");
     await cecCancelDial();
+  }
+
+  /** The inline wait status a CEC row should show for `node`: "dialing" while
+   *  the connect RPC is in flight to that machine, "approval" once the dial
+   *  landed and the ball is in the customer's court (their approve prompt is
+   *  up), null when nothing is pending. The help sidebar renders this in the
+   *  row itself — it has no status strip like the settings console panel. */
+  cecWaitPhase(node: string | undefined): "dialing" | "approval" | null {
+    if (!node) return null;
+    if (this.cecAutoOpenNode && this.isSameMachine(this.cecAutoOpenNode, node)) {
+      return "approval";
+    }
+    if (this.cecDialing && this.cecDialingNode && this.isSameMachine(this.cecDialingNode, node)) {
+      return "dialing";
+    }
+    return null;
   }
 
   /** Flip the "Watch the help queue" opt-in, then re-read the node's status —

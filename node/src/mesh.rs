@@ -1148,14 +1148,21 @@ impl Mesh {
         const SWEEP: std::time::Duration = std::time::Duration::from_secs(2);
         let mesh = Arc::downgrade(self);
         crate::spawn(async move {
+            // The last `cec://viewing` map this sweep emitted — technician
+            // canonical id → (screen live, control live). `None` until the
+            // first pass so a fresh node always emits once (even an empty
+            // map), giving a GUI that hydrated before us a baseline.
+            let mut last_viewing: Option<std::collections::BTreeMap<String, (bool, bool)>> = None;
             loop {
                 tokio::time::sleep(SWEEP).await;
                 let Some(mesh) = mesh.upgrade() else { break };
-                // A technician node enforces no consent (it isn't the host of
-                // the gated screen/input) — skip the whole pass.
-                if mesh.cec.is_technician() {
-                    continue;
-                }
+                // NOTE: no `is_technician` skip here. That early-out assumed a
+                // technician node hosts nothing consent-gated — but the role
+                // flips permanently on the first dial, and a DUAL-ROLE node
+                // (dialed someone once, yet also reachable as a customer) very
+                // much still hosts a consent-gated screen. On a pure technician
+                // node the body no-ops anyway: its routes point at customers,
+                // and `knows_technician` is false for those peers.
                 // Snapshot every live route (peer, id, is-screen, drive-plane)
                 // under the state lock, then drop it before touching the CEC
                 // store or tearing anything down (`disconnect` re-locks state).
@@ -1179,6 +1186,16 @@ impl Mesh {
                 let mut stale_routes: Vec<String> = Vec::new();
                 let mut lapsed_techs: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
+                // What each technician is ACTUALLY doing right now, from the
+                // routes themselves: screen = a live display route, control = a
+                // live input route. This — not session state — is what the
+                // customer's "Viewing/Controlling your screen" chip keys on:
+                // a technician closing their console tears the routes down but
+                // sends no session event, and chat keeps the session itself
+                // alive, so session state over-claims. A route this very pass
+                // is tearing down for lapsed consent doesn't count.
+                let mut viewing: std::collections::BTreeMap<String, (bool, bool)> =
+                    std::collections::BTreeMap::new();
                 for (peer, route_id, is_screen, plane) in routes {
                     // Only CEC technicians are consent-gated; an owner/fleet or
                     // ordinary peer's routes are none of this sweep's business.
@@ -1190,33 +1207,74 @@ impl Mesh {
                     if screen_lapsed || drive_lapsed {
                         stale_routes.push(route_id);
                         lapsed_techs.insert(crate::cec::pubkey_part(&peer).to_string());
+                        continue;
                     }
+                    let entry = viewing
+                        .entry(crate::cec::pubkey_part(&peer).to_string())
+                        .or_insert((false, false));
+                    entry.0 |= is_screen;
+                    entry.1 |= plane == Some(DrivePlane::Input);
                 }
-                if stale_routes.is_empty() {
-                    continue;
-                }
-                for id in &stale_routes {
-                    tracing::info!(
-                        "CEC consent lapsed — tearing down route {id} (approval revoked or expired)"
-                    );
-                    let _ = mesh.disconnect(id.clone()).await;
-                }
-                // End the lapsed technicians' sessions so the customer's
-                // "connected" banner clears — a route teardown alone emits no
-                // session event — and retire any leftover "Approve Once" grant.
-                for tech in lapsed_techs {
-                    for sid in mesh.cec.end_sessions_for(&tech) {
-                        mesh.sink.emit(
-                            "cec://session",
-                            json!({ "session_id": sid, "state": "ended" }),
+                if !stale_routes.is_empty() {
+                    for id in &stale_routes {
+                        tracing::info!(
+                            "CEC consent lapsed — tearing down route {id} (approval revoked or expired)"
                         );
+                        let _ = mesh.disconnect(id.clone()).await;
                     }
-                    mesh.cec.retire_once(&tech);
+                    // End the lapsed technicians' sessions so the customer's
+                    // "connected" banner clears — a route teardown alone emits no
+                    // session event — and retire any leftover "Approve Once" grant.
+                    for tech in lapsed_techs {
+                        for sid in mesh.cec.end_sessions_for(&tech) {
+                            mesh.sink.emit(
+                                "cec://session",
+                                json!({ "session_id": sid, "state": "ended" }),
+                            );
+                        }
+                        mesh.cec.retire_once(&tech);
+                    }
+                    mesh.cec_emit_grants();
+                    mesh.emit_snapshot();
                 }
-                mesh.cec_emit_grants();
-                mesh.emit_snapshot();
+                // Tell the GUI what's live whenever the picture changes (and
+                // once at startup, so a GUI that hydrated before this sweep
+                // gets its baseline). The event carries the whole map, so a
+                // missed frame self-heals on the next change.
+                if last_viewing.as_ref() != Some(&viewing) {
+                    mesh.sink.emit("cec://viewing", cec_viewing_value(&viewing));
+                    last_viewing = Some(viewing);
+                }
             }
         });
+    }
+
+    /// `cec_viewing` (customer): what each connected technician is actually
+    /// doing right now — `{ techs: { <canonical tech>: { screen, control } } }`
+    /// — derived from the LIVE routes, not session state. The event twin
+    /// (`cec://viewing`) is pushed by the consent sweep on every change; this
+    /// command is the pull for GUI hydrate, so an app that starts mid-session
+    /// paints the chip without waiting for a transition.
+    pub async fn cec_viewing(self: &Arc<Self>) -> Result<Value, String> {
+        let mut viewing: std::collections::BTreeMap<String, (bool, bool)> =
+            std::collections::BTreeMap::new();
+        {
+            let st = self.state.lock();
+            if let Some(session) = st.session.as_ref() {
+                for r in session.routes() {
+                    let peer = r.peer.as_str();
+                    if !self.cec.knows_technician(peer) {
+                        continue;
+                    }
+                    let entry = viewing
+                        .entry(crate::cec::pubkey_part(peer).to_string())
+                        .or_insert((false, false));
+                    entry.0 |= matches!(r.route.media, MediaKind::Display | MediaKind::Video);
+                    entry.1 |= route_drive_plane(&r.route) == Some(DrivePlane::Input);
+                }
+            }
+        }
+        Ok(cec_viewing_value(&viewing))
     }
 
     /// Re-scan this machine's inventory every [`INVENTORY_RESCAN`] and
@@ -10870,6 +10928,21 @@ fn fresh_share_token() -> String {
 /// session so the receiver can dedupe and the sender can recognise the echo of
 /// its own message. Mirrors [`fresh_share_token`]; the `msg_` prefix only tells
 /// the two apart in a trace.
+/// The `cec://viewing` event / `cec_viewing` command payload: technician
+/// canonical id → what their live routes actually carry right now.
+fn cec_viewing_value(viewing: &std::collections::BTreeMap<String, (bool, bool)>) -> Value {
+    let techs: serde_json::Map<String, Value> = viewing
+        .iter()
+        .map(|(tech, (screen, control))| {
+            (
+                tech.clone(),
+                json!({ "screen": screen, "control": control }),
+            )
+        })
+        .collect();
+    json!({ "techs": techs })
+}
+
 fn fresh_chat_id() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::getrandom(&mut bytes).is_err() {

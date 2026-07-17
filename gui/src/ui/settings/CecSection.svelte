@@ -225,7 +225,7 @@
       <ul class="rows">
         {#each app.cecHelpWaiting as w (w.node)}
           {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
-          {@const kvm = app.kvmTwin(w.node)}
+          {@const kvm = app.kvmTwin(w.node, { raisedHand: true })}
           <li class="row col asking">
             <div class="row-top">
               <span class="dot busy"></span>
@@ -247,8 +247,9 @@
                 Control
               </button>
               {#if kvm}
-                <!-- A raised hand from one of our KVMs: alongside the console,
-                     its normal web Site is one tap away via the graph. -->
+                <!-- A raised hand from a KVM: alongside the console, its
+                     manufacturer web Site is one tap away via the graph. No
+                     chat door - a KVM appliance isn't someone to chat with. -->
                 <button
                   class="btn small"
                   title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
@@ -256,15 +257,16 @@
                 >
                   🌐 Site
                 </button>
+              {:else}
+                <button
+                  class="btn small"
+                  disabled={app.cecDialing}
+                  title="Chat — connect and message them without taking their screen"
+                  onclick={() => void app.chatWithCustomer(w.node)}
+                >
+                  💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
+                </button>
               {/if}
-              <button
-                class="btn small"
-                disabled={app.cecDialing}
-                title="Chat — connect and message them without taking their screen"
-                onclick={() => void app.chatWithCustomer(w.node)}
-              >
-                💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
-              </button>
             </div>
           </li>
         {/each}
@@ -372,6 +374,8 @@
                   </button>
                 {/if}
                 {#if kvm}
+                  <!-- A KVM's row: its Site instead of a chat door (a KVM
+                       appliance isn't someone to chat with). -->
                   <button
                     class="btn small"
                     title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
@@ -379,15 +383,16 @@
                   >
                     🌐 Site
                   </button>
+                {:else}
+                  <button
+                    class="btn small"
+                    disabled={app.cecDialing}
+                    title="Chat — connect and message them without taking their screen"
+                    onclick={() => void app.chatWithCustomer(c.node)}
+                  >
+                    💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
+                  </button>
                 {/if}
-                <button
-                  class="btn small"
-                  disabled={app.cecDialing}
-                  title="Chat — connect and message them without taking their screen"
-                  onclick={() => void app.chatWithCustomer(c.node)}
-                >
-                  💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
-                </button>
                 <button class="btn small" onclick={() => startRename(c.number)}>Rename</button>
                 <button
                   class="btn small danger"

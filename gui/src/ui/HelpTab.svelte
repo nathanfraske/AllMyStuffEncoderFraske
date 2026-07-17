@@ -119,46 +119,72 @@
     <ul class="rows">
       {#each app.cecHelpWaiting as w (w.node)}
         {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
-        {@const kvm = app.kvmTwin(w.node)}
+        {@const kvm = app.kvmTwin(w.node, { raisedHand: true })}
+        {@const phase = app.cecWaitPhase(w.node)}
         <li class="row">
-          <span class="dot" aria-hidden="true"></span>
-          <div class="who">
-            <b class="name">{shownName}<span class="host">{hostTail(shownName, w.hostname)}</span></b>
-            <span class="sub">
-              <span class="num" title={`Number ${w.number}`}>CEC {groupNumber(w.number)}</span>
-              <span class="meta">· {waitingLabel(w.asked_at)}</span>
-            </span>
+          <div class="row-head">
+            <span class="dot" aria-hidden="true"></span>
+            <div class="who">
+              <b class="name">{shownName}<span class="host">{hostTail(shownName, w.hostname)}</span></b>
+              <span class="sub">
+                <span class="num" title={`Number ${w.number}`}>CEC {groupNumber(w.number)}</span>
+                <span class="meta">· {waitingLabel(w.asked_at)}</span>
+              </span>
+            </div>
           </div>
-          <button
-            class="answer"
-            disabled={app.cecDialing}
-            title="Answer — connect and open their screen once they approve"
-            onclick={() => void app.answerHelp(w.node, shownName)}
-          >
-            Answer
-          </button>
-          {#if kvm}
-            <!-- A raised hand from one of our KVMs: the console (Answer) is
-                 only half the story — its normal web Site rides the graph,
-                 one tap away. -->
-            <button
-              class="site-btn"
-              title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
-              aria-label="Open this KVM's web Site"
-              onclick={() => void app.openKVM(kvm.id)}
-            >
-              🌐
-            </button>
-          {/if}
-          <button
-            class="chat-btn"
-            disabled={app.cecDialing}
-            title="Chat — connect and message this customer (without taking their screen)"
-            aria-label="Chat with this customer"
-            onclick={() => void app.chatWithCustomer(w.node)}
-          >
-            💬{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
-          </button>
+          <!-- The card's action row. Every door this row offers lives down
+               here (and new ones join here), instead of icons squeezed
+               beside the name. While a connect to THIS row is in flight the
+               buttons give way to an inline status - the sidebar has no
+               status strip like the settings console panel, so the card
+               itself says what's happening. -->
+          <div class="row-actions">
+            {#if phase}
+              <span class="wait-line">
+                <span class="wait-dot" aria-hidden="true"></span>
+                {phase === "approval" ? "Waiting for them to approve…" : "Connecting…"}
+              </span>
+              <button
+                class="stop-btn"
+                title={phase === "approval" ? "Stop waiting for their approval" : "Stop this connection attempt"}
+                onclick={() => void (phase === "approval" ? app.stopCecWait() : app.cancelCecDial())}
+              >
+                Stop
+              </button>
+            {:else}
+              <button
+                class="answer"
+                disabled={app.cecDialing}
+                title="Answer — connect and open their screen once they approve"
+                onclick={() => void app.answerHelp(w.node, shownName)}
+              >
+                Answer
+              </button>
+              {#if kvm}
+                <!-- A raised hand from a KVM: the console (Answer) is only half
+                     the story — its manufacturer web Site rides the graph, one
+                     tap away. -->
+                <button
+                  class="site-btn"
+                  title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+                  onclick={() => void app.openKVM(kvm.id)}
+                >
+                  🌐 Site
+                </button>
+              {:else}
+                <!-- A person's machine gets the chat door; a KVM appliance is
+                     not someone to chat with, so its row doesn't. -->
+                <button
+                  class="chat-btn"
+                  disabled={app.cecDialing}
+                  title="Chat — connect and message this customer (without taking their screen)"
+                  onclick={() => void app.chatWithCustomer(w.node)}
+                >
+                  💬 Chat{#if app.chatUnread[w.node]}<span class="chat-badge">{app.chatUnread[w.node]}</span>{/if}
+                </button>
+              {/if}
+            {/if}
+          </div>
         </li>
       {/each}
     </ul>
@@ -169,65 +195,86 @@
       {@const name = app.cecCustomerName(c)}
       {@const kvm = app.kvmTwin(c.node)}
       <li class="row known">
-        <span class="dot" class:on={c.online} aria-hidden="true"></span>
-        <div class="who">
-          {#if editingKey === c.number}
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="rename"
-              type="text"
-              autofocus
-              placeholder={c.label || "Customer name"}
-              bind:value={aliasDraft}
-              onblur={() => saveRename(c.number)}
-              onkeydown={(e) => {
-                if (e.key === "Enter") saveRename(c.number);
-                else if (e.key === "Escape") cancelRename();
-              }}
-            />
-          {:else}
-            <button
-              class="name-btn"
-              title="Click to rename"
-              onclick={() => startRename(c.number)}
-            >
-              <b class="name">{name}<span class="host">{hostTail(name, c.hostname)}</span></b>
-            </button>
-            <span class="sub">
-              <span class="num" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
-              <span class="meta">· {lastUsedLabel(c.last_used)}</span>
-            </span>
-          {/if}
+        <div class="row-head">
+          <span class="dot" class:on={c.online} aria-hidden="true"></span>
+          <div class="who">
+            {#if editingKey === c.number}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="rename"
+                type="text"
+                autofocus
+                placeholder={c.label || "Customer name"}
+                bind:value={aliasDraft}
+                onblur={() => saveRename(c.number)}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") saveRename(c.number);
+                  else if (e.key === "Escape") cancelRename();
+                }}
+              />
+            {:else}
+              <button
+                class="name-btn"
+                title="Click to rename"
+                onclick={() => startRename(c.number)}
+              >
+                <b class="name">{name}<span class="host">{hostTail(name, c.hostname)}</span></b>
+              </button>
+              <span class="sub">
+                <span class="num" title={`Support number ${groupNumber(c.number)}`}>#{groupNumber(c.number)}</span>
+                <span class="meta">· {lastUsedLabel(c.last_used)}</span>
+              </span>
+            {/if}
+          </div>
         </div>
         {#if editingKey !== c.number}
-          <button
-            class="reopen"
-            class:on={c.online}
-            disabled={app.cecDialing}
-            title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
-            onclick={() => void app.reconnectCec(c.node)}
-          >
-            {c.online ? "Open" : "Reconnect"}
-          </button>
-          {#if kvm}
-            <button
-              class="site-btn"
-              title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
-              aria-label="Open this KVM's web Site"
-              onclick={() => void app.openKVM(kvm.id)}
-            >
-              🌐
-            </button>
-          {/if}
-          <button
-            class="chat-btn"
-            disabled={app.cecDialing}
-            title="Chat — connect and message this customer (without taking their screen)"
-            aria-label="Chat with this customer"
-            onclick={() => void app.chatWithCustomer(c.node)}
-          >
-            💬{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
-          </button>
+          <!-- Bottom action row, same layout as the queue cards - and the
+               same inline status while a connect to this row is pending. -->
+          {@const phase = app.cecWaitPhase(c.node)}
+          <div class="row-actions">
+            {#if phase}
+              <span class="wait-line">
+                <span class="wait-dot" aria-hidden="true"></span>
+                {phase === "approval" ? "Waiting for them to approve…" : "Connecting…"}
+              </span>
+              <button
+                class="stop-btn"
+                title={phase === "approval" ? "Stop waiting for their approval" : "Stop this connection attempt"}
+                onclick={() => void (phase === "approval" ? app.stopCecWait() : app.cancelCecDial())}
+              >
+                Stop
+              </button>
+            {:else}
+              <button
+                class="reopen"
+                class:on={c.online}
+                disabled={app.cecDialing}
+                title={c.online ? "Reconnect and open their screen" : "Try to reconnect — they must be online and approve"}
+                onclick={() => void app.reconnectCec(c.node)}
+              >
+                {c.online ? "Open" : "Reconnect"}
+              </button>
+              {#if kvm}
+                <button
+                  class="site-btn"
+                  title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+                  onclick={() => void app.openKVM(kvm.id)}
+                >
+                  🌐 Site
+                </button>
+              {:else}
+                <!-- Chat is for people; a KVM row offers its Site instead. -->
+                <button
+                  class="chat-btn"
+                  disabled={app.cecDialing}
+                  title="Chat — connect and message this customer (without taking their screen)"
+                  onclick={() => void app.chatWithCustomer(c.node)}
+                >
+                  💬 Chat{#if app.chatUnread[c.node]}<span class="chat-badge">{app.chatUnread[c.node]}</span>{/if}
+                </button>
+              {/if}
+            {/if}
+          </div>
         {/if}
       </li>
     {/snippet}
@@ -316,13 +363,60 @@
     flex-direction: column;
     gap: 0.4rem;
   }
+  /* Each entry is a small card: identity on top, its action buttons in a
+     row along the bottom (with room for more as they earn a spot). */
   .row {
     display: flex;
-    align-items: center;
+    flex-direction: column;
     gap: 0.5rem;
     padding: 0.5rem 0.55rem;
     background: var(--surface-2);
     border-radius: var(--r-sm);
+  }
+  .row-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .row-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  /* Inline connect status - takes the action row's place while a dial to
+     this row is in flight or the customer's approve prompt is up. */
+  .wait-line {
+    flex: 1;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: var(--ok);
+  }
+  .wait-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--ok);
+    animation: pulse 1.8s ease-out infinite;
+  }
+  .stop-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--danger);
+    background: transparent;
+    color: var(--danger);
+    font: inherit;
+    font-size: 0.74rem;
+    font-weight: 700;
+    padding: 0.28rem 0.6rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .stop-btn:hover {
+    background: var(--danger-soft);
   }
   .dot {
     flex-shrink: 0;
@@ -398,25 +492,27 @@
     opacity: 0.5;
     cursor: default;
   }
-  /* The KVM's web-Site door — same compact icon-button shape as the chat
-     companion, shown only when the row's machine is one of our KVMs. */
+  /* The KVM's manufacturer web-Site door — a labeled button on the card's
+     action row, shown only when the row's machine is a KVM. */
   .site-btn {
     flex-shrink: 0;
     border: 1px solid var(--line-strong);
     background: transparent;
     color: var(--ink-soft);
     font: inherit;
-    font-size: 0.82rem;
+    font-size: 0.74rem;
+    font-weight: 700;
     line-height: 1;
-    padding: 0.28rem 0.4rem;
+    padding: 0.3rem 0.6rem;
     border-radius: var(--r-sm);
     cursor: pointer;
   }
   .site-btn:hover {
     background: var(--surface);
   }
-  /* The compact chat companion to Answer / Open — an icon button so the narrow
-     sidebar row stays readable, with an unread badge riding its corner. */
+  /* The chat companion to Answer / Open — a labeled button on the action row
+     (people only; a KVM row shows its Site instead), with an unread badge
+     riding its corner. */
   .chat-btn {
     position: relative;
     flex-shrink: 0;
@@ -424,9 +520,10 @@
     background: transparent;
     color: var(--ink-soft);
     font: inherit;
-    font-size: 0.82rem;
+    font-size: 0.74rem;
+    font-weight: 700;
     line-height: 1;
-    padding: 0.28rem 0.4rem;
+    padding: 0.3rem 0.6rem;
     border-radius: var(--r-sm);
     cursor: pointer;
   }
