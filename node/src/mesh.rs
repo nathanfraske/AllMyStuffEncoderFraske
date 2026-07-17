@@ -881,6 +881,11 @@ impl Mesh {
         // sit "awaiting accept" forever — a black console with no error.
         self.spawn_offer_reaper();
 
+        // Enforce CEC consent by teardown on a ~2s sweep rather than on every
+        // input frame: a lapsed grant (revoke/expiry) tears the session's
+        // routes down here. Engine-lifetime; a no-op on a technician node.
+        self.spawn_cec_consent_sweep();
+
         // The daemon-link loop: subscribe → bring up → drain events → and on
         // any end of the stream, around again with a fresh subscription and
         // a full re-bring-up (fresh client_id, channel subscribes, media
@@ -1118,6 +1123,98 @@ impl Mesh {
                     }
                     mesh.emit_snapshot();
                 }
+            }
+        });
+    }
+
+    /// Enforce CEC consent by teardown on a slow sweep instead of on every
+    /// frame. A dialed technician's screen-view and control authority is the
+    /// customer's live consent grant; that grant is checked once when a route
+    /// is *offered* (admission — the offer gate's [`Self::sender_may_drive`] /
+    /// [`Self::cec_screen_offer_denied`]) and then **not re-evaluated per
+    /// frame**. This sweep is the other half: every [`SWEEP`] it re-checks each
+    /// live CEC route against those same gates and tears down any that a lapsed
+    /// grant — revoked, expired, or an "Approve Once" that ended — no longer
+    /// covers. A revoke that lands between sweeps still bites at once through its
+    /// own explicit teardown ([`Self::cec_revoke`]); this backstops **expiry**,
+    /// which nothing else tears down, and closes its screen twin — a lapsed
+    /// grant used to leave the customer *still streaming their screen* until they
+    /// disconnected, because only the input plane was gated per frame. The cost
+    /// is one grant evaluation per live CEC route every couple of seconds, versus
+    /// the tens per second an input stream drove. Customer-side only: a
+    /// technician node hosts nothing consent-gated and `knows_technician` is
+    /// false there, so the body no-ops.
+    fn spawn_cec_consent_sweep(self: &Arc<Self>) {
+        const SWEEP: std::time::Duration = std::time::Duration::from_secs(2);
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP).await;
+                let Some(mesh) = mesh.upgrade() else { break };
+                // A technician node enforces no consent (it isn't the host of
+                // the gated screen/input) — skip the whole pass.
+                if mesh.cec.is_technician() {
+                    continue;
+                }
+                // Snapshot every live route (peer, id, is-screen, drive-plane)
+                // under the state lock, then drop it before touching the CEC
+                // store or tearing anything down (`disconnect` re-locks state).
+                let routes: Vec<(String, String, bool, Option<DrivePlane>)> = {
+                    let st = mesh.state.lock();
+                    match st.session.as_ref() {
+                        Some(session) => session
+                            .routes()
+                            .map(|r| {
+                                (
+                                    r.peer.as_str().to_string(),
+                                    r.route.id.clone(),
+                                    matches!(r.route.media, MediaKind::Display | MediaKind::Video),
+                                    route_drive_plane(&r.route),
+                                )
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+                let mut stale_routes: Vec<String> = Vec::new();
+                let mut lapsed_techs: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for (peer, route_id, is_screen, plane) in routes {
+                    // Only CEC technicians are consent-gated; an owner/fleet or
+                    // ordinary peer's routes are none of this sweep's business.
+                    if !mesh.cec.knows_technician(&peer) {
+                        continue;
+                    }
+                    let screen_lapsed = is_screen && mesh.cec_screen_offer_denied(&peer);
+                    let drive_lapsed = plane.is_some_and(|pl| !mesh.sender_may_drive(&peer, pl));
+                    if screen_lapsed || drive_lapsed {
+                        stale_routes.push(route_id);
+                        lapsed_techs.insert(crate::cec::pubkey_part(&peer).to_string());
+                    }
+                }
+                if stale_routes.is_empty() {
+                    continue;
+                }
+                for id in &stale_routes {
+                    tracing::info!(
+                        "CEC consent lapsed — tearing down route {id} (approval revoked or expired)"
+                    );
+                    let _ = mesh.disconnect(id.clone()).await;
+                }
+                // End the lapsed technicians' sessions so the customer's
+                // "connected" banner clears — a route teardown alone emits no
+                // session event — and retire any leftover "Approve Once" grant.
+                for tech in lapsed_techs {
+                    for sid in mesh.cec.end_sessions_for(&tech) {
+                        mesh.sink.emit(
+                            "cec://session",
+                            json!({ "session_id": sid, "state": "ended" }),
+                        );
+                    }
+                    mesh.cec.retire_once(&tech);
+                }
+                mesh.cec_emit_grants();
+                mesh.emit_snapshot();
             }
         });
     }
@@ -2079,15 +2176,21 @@ impl Mesh {
                     }
                     MediaPayload::Input(ev) => {
                         // Injecting keystrokes is the most privileged thing
-                        // on the mesh, so it takes both gates: a live input
+                        // on the mesh, so it takes two gates: a live input
                         // route from this exact sender, *and* the sender being
                         // authorized to drive this machine's control plane —
                         // its recorded owner, a co-owned fleet member, or a
                         // person the owner deliberately granted control to (the
                         // share path; without it a shared "Control" route
-                        // activates but every event is dropped here).
+                        // activates but every event is dropped here). A CEC
+                        // technician's authority is their customer's consent
+                        // grant, which is evaluated at route *admission* and by
+                        // the ~2s consent sweep — never per frame (see
+                        // `sender_may_drive_admitted` / `spawn_cec_consent_sweep`):
+                        // a lapsed grant tears the route down within a couple of
+                        // seconds, so here a live CEC route just passes.
                         let route_ok = self.inbound_media_ok(&ev.route, &from, MediaKind::Input);
-                        if route_ok && self.sender_may_drive(&from, DrivePlane::Input) {
+                        if route_ok && self.sender_may_drive_admitted(&from, DrivePlane::Input) {
                             self.injector.apply(&ev.route, ev.action);
                         } else {
                             // Refusing silently is how "controls just stopped
@@ -3231,6 +3334,9 @@ impl Mesh {
         let agent_name = self.cec.pending_agent_name(&tech);
         self.cec.approve(&tech, &agent_name, scope, want_control)?;
         self.cec.set_session(&session_id, "active");
+        // Bind the session to this technician so the consent sweep can end
+        // exactly their sessions when the grant later lapses.
+        self.cec.bind_session(&session_id, &tech);
         let canonical = crate::cec::pubkey_part(&tech).to_string();
         if let Some(network_id) = self.network_for_peer(&tech) {
             self.cec_send_decision(
@@ -3854,6 +3960,10 @@ impl Mesh {
                                     );
                                 }
                                 self.cec.set_session(&session_id, "active");
+                                // Bind the auto-approved session to this
+                                // technician so the consent sweep can end it
+                                // when the standing grant later lapses.
+                                self.cec.bind_session(&session_id, &from);
                                 if let Some(rec) =
                                     self.cec.touch_dialed(crate::cec::pubkey_part(&from))
                                 {
@@ -9299,6 +9409,28 @@ impl Mesh {
         self.fleet_authorized.lock().contains(canon)
     }
 
+    /// Whether `sender` may drive one privileged `plane` on this machine, at
+    /// **admission grade** — evaluating a CEC technician's *live* consent grant.
+    /// Used where a route is first authorized (the offer gate) and by the consent
+    /// sweep; the per-frame input path uses [`Self::sender_may_drive_admitted`]
+    /// instead. See [`Self::may_drive`] for the full owner/fleet/share/CEC rules.
+    fn sender_may_drive(&self, sender: &str, plane: DrivePlane) -> bool {
+        self.may_drive(sender, plane, true)
+    }
+
+    /// The per-frame twin of [`Self::sender_may_drive`]: identical owner/fleet
+    /// and person-share checks, but it does **not** re-evaluate a CEC consent
+    /// grant. A CEC route is authorized once at admission (the offer gate calls
+    /// [`Self::sender_may_drive`]) and torn down within a couple of seconds of
+    /// its grant lapsing by [`Self::spawn_cec_consent_sweep`] — so a *live* CEC
+    /// route from a known technician is authorized by construction, and the
+    /// input hot path (tens of frames a second) must not pay the grant + expiry
+    /// evaluation on every one. Owner/fleet and share revocations are *not*
+    /// swept, so those stay evaluated here per frame, unchanged.
+    fn sender_may_drive_admitted(&self, sender: &str, plane: DrivePlane) -> bool {
+        self.may_drive(sender, plane, false)
+    }
+
     /// Whether `sender` may drive one privileged `plane` on this machine: the
     /// owner/fleet trust of [`Self::sender_may_control`], **or** an explicit
     /// person-to-person *share grant* this machine extended that names exactly
@@ -9312,23 +9444,31 @@ impl Mesh {
     /// chose, never narrows the existing owner/fleet path. Config writes
     /// (`SetExposed`) and the `Upgrade` command deliberately stay
     /// owner/fleet-only and keep calling [`Self::sender_may_control`] directly.
-    fn sender_may_drive(&self, sender: &str, plane: DrivePlane) -> bool {
+    ///
+    /// `eval_cec_grant` selects the CEC arm: `true` evaluates the customer's
+    /// live consent grant (admission / sweep); `false` trusts an already-admitted
+    /// route from a known technician (the per-frame path — see the two wrappers
+    /// above). Every drive plane (input, terminal, files, sites, clipboard) maps
+    /// to the `Control` capability; screen *viewing* is gated separately at the
+    /// Display offer and by the sweep.
+    fn may_drive(&self, sender: &str, plane: DrivePlane, eval_cec_grant: bool) -> bool {
         if self.sender_may_control(sender) {
             return true;
         }
         // CEC Support: a dialed technician holds no fleet membership, so the
-        // owner/fleet check above fails for them. Instead the customer's **live
-        // consent grant** authorizes each privileged plane — the exact
-        // per-frame substitution the CEC design calls for. It only ever
-        // *widens* access (the owner/fleet path already ran and said no), and a
-        // revoke bites the next frame because `is_allowed` reads the store fresh
-        // against the clock. Every drive plane (input, terminal, files, sites,
-        // clipboard) maps to the `Control` capability; screen *viewing* is
-        // gated separately at the Display offer.
-        if self
-            .cec
-            .is_allowed(sender, allmystuff_cec_consent::Capability::Control)
-        {
+        // owner/fleet check above fails for them. Their authority is the
+        // customer's consent grant — evaluated live at admission and by the
+        // ~2s sweep, or (per frame) trusted via the admitted route: a still-live
+        // route from a `knows_technician` peer was admitted under a valid grant
+        // and has not been swept, so it need not re-hit the store per frame.
+        // It only ever *widens* access (the owner/fleet path already said no).
+        let cec_ok = if eval_cec_grant {
+            self.cec
+                .is_allowed(sender, allmystuff_cec_consent::Capability::Control)
+        } else {
+            self.cec.knows_technician(sender)
+        };
+        if cec_ok {
             return true;
         }
         let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {

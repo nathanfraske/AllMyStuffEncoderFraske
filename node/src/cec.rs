@@ -245,6 +245,12 @@ struct CecInner {
     dialed: HashMap<String, DialedCustomer>,
     /// Live session states by session id, for `cec://session`.
     sessions: HashMap<String, String>,
+    /// Which technician (canonical id) each active session belongs to —
+    /// populated when the customer approves (or auto-approves) a session, so
+    /// the consent sweep can end exactly that technician's sessions when their
+    /// grant lapses. Keyed by session id, like [`Self::sessions`]; customer
+    /// side only.
+    session_tech: HashMap<String, String>,
     /// Cancellation flag for the in-flight dial (one at a time — the GUI
     /// serializes dials). `begin_dial` mints a fresh flag; `cancel_dial` trips
     /// it; the discovery poll and the connect-request re-send loop both honor
@@ -334,6 +340,7 @@ impl Cec {
                 pending: Vec::new(),
                 dialed,
                 sessions: HashMap::new(),
+                session_tech: HashMap::new(),
                 dial_cancel: None,
                 asking_help: false,
                 watching_help: false,
@@ -902,10 +909,47 @@ impl Cec {
 
     /// Record a session's state, returning it for the `cec://session` emit.
     pub fn set_session(&self, session_id: &str, state: &str) {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        inner
             .sessions
             .insert(session_id.to_string(), state.to_string());
+        // A session that reached a terminal state no longer needs its
+        // technician binding — drop it so the sweep's `session_tech` map can't
+        // accumulate stale rows across a technician's reconnects.
+        if matches!(state, "ended" | "denied") {
+            inner.session_tech.remove(session_id);
+        }
+    }
+
+    /// Bind a session to the technician it authorises (customer side) — called
+    /// when the customer approves or auto-approves, so the consent sweep can
+    /// later end the right technician's sessions. The tech id is canonicalised,
+    /// matching every other consent-store key. Idempotent.
+    pub fn bind_session(&self, session_id: &str, tech: &str) {
+        self.inner
+            .lock()
+            .session_tech
+            .insert(session_id.to_string(), pubkey_part(tech).to_string());
+    }
+
+    /// End (and forget) every session bound to `tech`, returning their ids so
+    /// the caller can emit `cec://session … ended`. Also clears their entries
+    /// from the live-session map. Customer side, driven by the consent sweep
+    /// when a grant lapses.
+    pub fn end_sessions_for(&self, tech: &str) -> Vec<String> {
+        let key = pubkey_part(tech).to_string();
+        let mut inner = self.inner.lock();
+        let ids: Vec<String> = inner
+            .session_tech
+            .iter()
+            .filter(|(_, t)| **t == key)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in &ids {
+            inner.session_tech.remove(sid);
+            inner.sessions.remove(sid);
+        }
+        ids
     }
 
     /// The last recorded state for a session (`requested` / `active` / `denied`
@@ -1170,6 +1214,55 @@ mod tests {
             .unwrap();
         assert!(cec.is_allowed(TECH, Capability::ScreenView));
         assert!(!cec.is_allowed(TECH, Capability::Control));
+    }
+
+    // ---- session ↔ technician binding (the consent sweep's teardown map) ----
+
+    const TECH_B: &str = "techpubkeybase32cccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn end_sessions_for_returns_only_that_techs_sessions_and_clears_them() {
+        let cec = Cec::new(None);
+        // Two live sessions for TECH, one for a different technician.
+        cec.set_session("s1", "active");
+        cec.bind_session("s1", TECH);
+        cec.set_session("s2", "active");
+        cec.bind_session("s2", TECH);
+        cec.set_session("s3", "active");
+        cec.bind_session("s3", TECH_B);
+
+        let mut ended = cec.end_sessions_for(TECH);
+        ended.sort();
+        assert_eq!(ended, vec!["s1".to_string(), "s2".to_string()]);
+        // TECH's sessions are gone from the live-session map…
+        assert_eq!(cec.session_state("s1"), None);
+        assert_eq!(cec.session_state("s2"), None);
+        // …while the other technician's session is untouched.
+        assert_eq!(cec.session_state("s3").as_deref(), Some("active"));
+        // A second call finds nothing left to end.
+        assert!(cec.end_sessions_for(TECH).is_empty());
+    }
+
+    #[test]
+    fn session_binding_canonicalises_the_technician_id() {
+        let cec = Cec::new(None);
+        // Bound under a display-suffixed id, ended by the bare pubkey (and
+        // vice-versa) — the sweep must reach it however the id arrives.
+        cec.set_session("s1", "active");
+        cec.bind_session("s1", &format!("{TECH}-AB12C"));
+        let ended = cec.end_sessions_for(TECH);
+        assert_eq!(ended, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn terminal_state_drops_the_session_binding() {
+        let cec = Cec::new(None);
+        cec.set_session("s1", "active");
+        cec.bind_session("s1", TECH);
+        // A normal end (or deny) clears the binding, so a later lapse-driven
+        // sweep can't resurrect a stale "ended" for a reused technician.
+        cec.set_session("s1", "ended");
+        assert!(cec.end_sessions_for(TECH).is_empty());
     }
 
     #[test]
