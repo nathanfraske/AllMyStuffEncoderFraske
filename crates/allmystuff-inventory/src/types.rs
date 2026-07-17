@@ -109,8 +109,10 @@ pub struct HostInfo {
     pub kernel_version: Option<String>,
     /// `x86_64`, `aarch64`, … — what the running binary was built for.
     pub arch: String,
-    /// Friendly board / vendor label from DMI (`Dell Inc. XPS 15`) when
-    /// available on x86 desktops/laptops.
+    /// The system's board field, verbatim — Linux `board_name`, Windows
+    /// `Win32_BaseBoard.Product`, macOS `hw.model` — with no parsing or
+    /// formatting (not even placeholder filtering: what the firmware says
+    /// is what shows). `None` when the platform doesn't report one.
     pub board: Option<String>,
     /// Just the product / model name — the *second* DMI field, without the
     /// manufacturer prefix that `board` carries (`XPS 15`, not `Dell Inc.

@@ -768,9 +768,10 @@ pub async fn dispatch(
                     Some(v) => format!("{} {}", inv.host.os, v),
                     None => inv.host.os.clone(),
                 },
-                // The DMI board / system label ("Dell Inc. XPS 15", a
-                // motherboard model on a custom build) — null when the
-                // firmware doesn't say.
+                // The system's board field, verbatim (Linux `board_name`,
+                // Windows `Win32_BaseBoard.Product`, macOS `hw.model`) —
+                // no parsing or formatting; null when the platform doesn't
+                // report one.
                 "board": inv.host.board,
                 // Just the product / model name — the DMI *product* field
                 // without its maker prefix ("XPS 15", not "Dell Inc. XPS

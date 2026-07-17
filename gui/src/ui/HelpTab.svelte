@@ -119,6 +119,7 @@
     <ul class="rows">
       {#each app.cecHelpWaiting as w (w.node)}
         {@const shownName = app.cecAliases[w.number]?.trim() || w.label?.trim() || "Customer"}
+        {@const kvm = app.kvmTwin(w.node)}
         <li class="row">
           <span class="dot" aria-hidden="true"></span>
           <div class="who">
@@ -136,6 +137,19 @@
           >
             Answer
           </button>
+          {#if kvm}
+            <!-- A raised hand from one of our KVMs: the console (Answer) is
+                 only half the story — its normal web Site rides the graph,
+                 one tap away. -->
+            <button
+              class="site-btn"
+              title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+              aria-label="Open this KVM's web Site"
+              onclick={() => void app.openKVM(kvm.id)}
+            >
+              🌐
+            </button>
+          {/if}
           <button
             class="chat-btn"
             disabled={app.cecDialing}
@@ -153,6 +167,7 @@
   {#if known.online.length > 0 || known.offline.length > 0}
     {#snippet machine(c: CecPeer)}
       {@const name = app.cecCustomerName(c)}
+      {@const kvm = app.kvmTwin(c.node)}
       <li class="row known">
         <span class="dot" class:on={c.online} aria-hidden="true"></span>
         <div class="who">
@@ -194,6 +209,16 @@
           >
             {c.online ? "Open" : "Reconnect"}
           </button>
+          {#if kvm}
+            <button
+              class="site-btn"
+              title={`Open ${kvm.label || "this KVM"}'s web Site over the mesh`}
+              aria-label="Open this KVM's web Site"
+              onclick={() => void app.openKVM(kvm.id)}
+            >
+              🌐
+            </button>
+          {/if}
           <button
             class="chat-btn"
             disabled={app.cecDialing}
@@ -372,6 +397,23 @@
   .reopen:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  /* The KVM's web-Site door — same compact icon-button shape as the chat
+     companion, shown only when the row's machine is one of our KVMs. */
+  .site-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--line-strong);
+    background: transparent;
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 0.82rem;
+    line-height: 1;
+    padding: 0.28rem 0.4rem;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .site-btn:hover {
+    background: var(--surface);
   }
   /* The compact chat companion to Answer / Open — an icon button so the narrow
      sidebar row stays readable, with an unread badge riding its corner. */
