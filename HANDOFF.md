@@ -88,7 +88,7 @@ decode-capability handshake** (fail-soft before the AMD box lands).
 - **App-side slice pacer** (`mesh.rs send_video_paced` + `video.rs
   split_annexb_paced`): keyframes leave as byte-capped slices with
   rate-matched inter-chunk gaps. Drain model is LINK-FITTED as of
-  0.2.48: LAN keeps the 800 Mbps shallow-buffer shape; WAN spreads at
+  the prototype line (1a8d188): LAN keeps the 800 Mbps shallow-buffer shape; WAN spreads at
   the route's send rate ×1.5 over ≤1 frame interval (`route_pace` →
   `RouteRate` seam). Gaps run deadline-based through
   `os_perf::precise_sleep`. Speaks both codecs. Lossless IDRs = 32
@@ -187,7 +187,7 @@ for the posture's codec+features; viewer has a decoder for that codec).
   `docs/SMOOTHNESS-IDEAS-2026-07.md` (deep-brainstorm pass, 2026-07-18):
   19 graded ideas + the M1–M5 measure-first plan + an explicitly-
   rejected list that encodes the frozen-daemon rule. **LANDED same day
-  (`a97678f` + `1a8d188`, in 0.2.48):** T3.2+T3.1 (process power/timer
+  (`a97678f` + `1a8d188`, prototype line):** T3.2+T3.1 (process power/timer
   opt-outs, `precise_sleep` — 435 µs worst overshoot measured — MMCSS
   opt-in via `ALLMYSTUFF_MMCSS=1`), M2 (`pace gaps` minute line), M3
   (`video in` chunk-train line), T2.1a (WAN pacer drain = route rate
@@ -258,8 +258,28 @@ for the posture's codec+features; viewer has a decoder for that codec).
   that the main console Mode control cycles Balanced→Game→Studio→Studio·LL
   with the warning on first Studio entry.
 
+## The CPU-kernel line (b992776)
+
+The fork's charter includes the computer-engineering layer, and the two
+hottest CPU kernels are now at the memory wall: **NV12→RGBA** runs an
+AVX2 lane (scalar-identical integer math, 8 px/step, `vpermd` chroma
+quad-sharing) with **non-temporal stores** when 16-aligned (kills the
+RFO that doubled write traffic; `sfence` before consumers) — measured
+**3.5 → 1.8 ms avg @1440p** (p95 4.5 → 2.2), byte-exactness pinned by
+`simd_lane_matches_scalar_byte_for_byte`. The pacer's **Annex-B walk**
+is memchr(0x01)-anchored with a `[0,0]` look-behind (provably equivalent
+to the forward scan). Both already O(n) — every remaining win there is
+constant-factor; the true algorithmic cut is pass DELETION (idea bank
+T2.8 zero-copy present deletes the RGBA kernel outright, and T2.5's
+damage-scoping shrinks n). Next kernel candidates: the CPU-lane pixels
+crate converts (same AVX2 treatment), double-buffered D3D11VA staging
+(T3.4, ~1–2 ms decode overlap).
+
 ## Commit trail (newest first)
 
+`b992776` **CPU kernels: AVX2+NT NV12→RGBA (3.5→1.8 ms), memchr scan** ·
+`f5f1f21` **integration report for Chris** · `86615bd` **versioning
+held at 0.2.46 (Chris's to cut)** ·
 `d100022` **auto-bitrate reserved to Game + per-layer bandwidth logs** ·
 `1a8d188` **closed WAN loop** (link-fitted pacer, BWE, AIMD, shaped
 waves, M2/M3 lines) · `a97678f` **OS scheduling honesty** ·

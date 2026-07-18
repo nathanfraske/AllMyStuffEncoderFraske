@@ -418,6 +418,45 @@ media, ever). Postures referenced: **Game** (GDR, latency-first), **Balanced**,
 - **Validate:** M4 decode→glass histogram before/after; photodiode-style LED test
   (capture host flashes a rect, viewer camera) for absolute glass-to-glass.
 
+### T2.9 · Damage-metadata pixel grouping — skip work classified by metadata that costs zero pixel reads (nathanfraske, 2026-07-18)
+
+- **Postures:** Balanced/Studio/Studio·Lossless (desktop content); Game benefits
+  at menus/HUD-quiet moments.
+- **What/why:** the principle: to beat O(n) in practice you don't beat linear —
+  you *group pixels by a factor that requires no reads* and give whole groups
+  zero compute. The classifier already exists: DXGI duplication hands the SENDER
+  compositor-exact dirty rects without touching pixels. Ship them as a few bytes
+  of app-layer metadata per frame (datapath — rides the existing sample framing,
+  never signaling), and the VIEWER partitions clean/dirty for free: convert
+  (NV12→RGBA) and repaint only the dirty union; re-blit the clean remainder from
+  the previous frame's buffer. Typing/scroll/cursor workloads dirty 1–5% of a
+  frame → effective n drops 20–100× on exactly Studio's content. Composes with
+  the AVX2 kernel (`b992776` — convert only dirty bands), with T2.5 (same rects
+  steer encoder QP), and with T2.8 (a GPU presenter can scissor to the same
+  rects). Sibling forms of the same principle: the GPU dispatch itself
+  ("compute all groups simultaneously" — O(n) work, ~O(1) depth) and the
+  endgame, NV12 hardware overlay planes (MPO/DirectComposition), where the
+  display controller's fixed-function CSC converts at scanout — zero compute
+  in any engine we own.
+- **Where it lands:** `win_capture.rs` (rects already available at
+  `AcquireNextFrame` — currently unread), sample metadata beside the AU
+  (app-layer framing, old viewers ignore), `video_decode.rs`/GUI paint slot
+  (partial convert + partial `putImageData` — the canvas API takes dirty
+  rects natively).
+- **Expected win:** viewer convert+paint cost scales with damage, not
+  resolution: a 1440p typing session's ~2 ms convert + ~3 ms paint collapses
+  to ~0.1 ms steady-state. Also cuts the ~885 MB/s IPC stream proportionally
+  (ship only dirty tiles + coordinates).
+- **Risk/effort:** medium — the decoder must still decode full frames (the
+  bitstream is full-frame), so this optimizes convert/IPC/paint, not decode;
+  correctness needs care at IDRs/waves (full repaint on any decode re-entry)
+  and encoder-side motion search can dirty more than the compositor reported
+  (trust the encoder's OWN skip decisions? no — trust the capture rects, they
+  bound what the encoder saw change).
+- **Validate:** byte-exact invariant — partial-path output must equal
+  full-convert output every frame (the same test discipline as the SIMD lane);
+  M4 paint-interval + IPC-bandwidth columns before/after on a typing workload.
+
 ---
 
 ## Tier 3 — kernel/OS-level (Windows) hyper-optimizations

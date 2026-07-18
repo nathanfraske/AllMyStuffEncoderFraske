@@ -269,6 +269,10 @@ a97678f perf(os): scheduling honesty (Win11 opt-outs, precise sleep)
 1a8d188 feat(video): closed WAN loop (link-fitted pacer, BWE, AIMD, waves)
 d100022 feat(video): auto-bitrate reserved to Game; per-layer bandwidth logs
 86615bd build: hold versioning at 0.2.46 — versions are Chris's to cut
+f5f1f21 docs: this integration report
+b992776 perf(kernels): AVX2 + non-temporal NV12→RGBA; memchr start-code
+        scan — the viewer convert 3.5→1.8 ms avg @1440p (byte-exact
+        pinned by test); pacer's Annex-B walk memchr-anchored
 ```
 
 Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
@@ -289,7 +293,10 @@ Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
   and decodes clean; `precise_sleep` worst overshoot 435 µs.
 - **Benches:** NVDEC 4.24 ms vs D3D11VA 5.76 ms avg decode+copy at
   1440p (ladder order is measured); preset grid (game P2 5.7 ms);
-  encode-path A/B/C columns in `docs/ENCODER-PASS-2026-07.md`.
+  encode-path A/B/C columns in `docs/ENCODER-PASS-2026-07.md`; the
+  NV12→RGBA viewer kernel 3.5 → 1.8 ms avg @1440p after the AVX2 +
+  non-temporal-store pass (`b992776`, byte-exact against the scalar
+  reference by test).
 - **Field-pending (2-machine rig):** BWE estimate accuracy vs imposed
   rates, freeze-seconds A/B for the closed loop (Game posture),
   pace-gap fidelity on a stock Win11 box, the D3D11VA rung on the
