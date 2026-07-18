@@ -93,12 +93,29 @@ const NV_ENC_H264_PROFILE_MAIN_GUID: GUID = GUID::from_values(
 );
 /// Hi444PP — the profile that carries `transform_bypass` (lossless);
 /// despite the name it admits 4:2:0 chroma, which is what the NV12 lane
-/// feeds.
+/// feeds. (Data4 corrected against the n12.0.16.0 header — the first
+/// transcription mis-remembered the tail and the driver silently fell
+/// back to autoselect, which the bypass flag then steered right anyway.)
 const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID::from_values(
     0x7ac6_63cb,
     0xa598,
     0x4960,
-    [0x98, 0x44, 0x1c, 0x9e, 0x3a, 0xa5, 0xbe, 0x90],
+    [0xb8, 0x44, 0x33, 0x9b, 0x26, 0x1a, 0x7d, 0x52],
+);
+const NV_ENC_CODEC_HEVC_GUID: GUID = GUID::from_values(
+    0x790c_dc88,
+    0x4522,
+    0x4d7b,
+    [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
+);
+/// HEVC needs no special profile for lossless — transquant bypass is
+/// core syntax, reachable from Main — so the rung hands the driver
+/// autoselect and lets the lossless tuning steer.
+const NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID: GUID = GUID::from_values(
+    0xbfd6_f8e7,
+    0x233c,
+    0x4341,
+    [0x8b, 0x3e, 0x48, 0x18, 0x52, 0x38, 0x03, 0xf4],
 );
 
 #[allow(dead_code)]
@@ -214,13 +231,59 @@ mod h264_flags {
     pub const QP_PRIME_Y_ZERO_TRANSFORM_BYPASS: u32 = 1 << 15;
 }
 
+/// `NV_ENC_CONFIG_HEVC` — exact (n12.0.16.0).
+#[allow(dead_code)]
+#[repr(C)]
+struct ConfigHevc {
+    level: u32,
+    tier: u32,
+    min_cu_size: u32,
+    max_cu_size: u32,
+    /// The 20 feature bits + 12 reserved. Unlike H.264's layout,
+    /// `chromaFormatIDC` (bits 9–10) and `pixelBitDepthMinus8` (bits
+    /// 11–13) are multi-bit fields packed *inside* this word — see
+    /// [`hevc_flags`].
+    flags: u32,
+    idr_period: u32,
+    intra_refresh_period: u32,
+    intra_refresh_cnt: u32,
+    max_num_ref_frames_in_dpb: u32,
+    ltr_num_frames: u32,
+    vps_id: u32,
+    sps_id: u32,
+    pps_id: u32,
+    slice_mode: u32,
+    slice_mode_data: u32,
+    max_temporal_layers_minus_1: u32,
+    /// The header typedefs the HEVC VUI to the H.264 shape.
+    hevc_vui_parameters: H264VuiParams,
+    ltr_trust_mode: u32,
+    use_bframes_as_ref: u32,
+    num_ref_l0: u32,
+    num_ref_l1: u32,
+    reserved1: [u32; 214],
+    reserved2: [*mut c_void; 64],
+}
+const _: () = assert!(std::mem::size_of::<ConfigHevc>() == 1560);
+
+/// Bit positions inside [`ConfigHevc::flags`] (header order).
+mod hevc_flags {
+    pub const REPEAT_SPSPPS: u32 = 1 << 7;
+    /// `chromaFormatIDC` occupies bits 9–10; value 1 = 4:2:0 (NV12
+    /// input), 3 = 4:4:4. [`CHROMA_MASK`] clears the field first.
+    pub const CHROMA_MASK: u32 = 0b11 << 9;
+    pub const CHROMA_420: u32 = 1 << 9;
+}
+
 /// `NV_ENC_CODEC_CONFIG` — deliberately oversized (see module docs). The
 /// true union is `max(sizeof members)` (H.264's 1792 is the largest we
-/// transcribed); 2048 gives headroom over every SDK 12.0 member.
+/// transcribed; HEVC's 1560 fits under it); 2048 gives headroom over
+/// every SDK 12.0 member.
 #[allow(dead_code)]
 #[repr(C)]
 union CodecConfig {
     h264: std::mem::ManuallyDrop<ConfigH264>,
+    hevc: std::mem::ManuallyDrop<ConfigHevc>,
     raw: [u64; 256],
 }
 const _: () = assert!(std::mem::size_of::<CodecConfig>() == 2048);
@@ -565,6 +628,7 @@ pub struct NvencH264 {
     intra_refresh: bool,
     studio: bool,
     lossless: bool,
+    hevc: bool,
     label: String,
 }
 
@@ -589,7 +653,9 @@ impl NvencH264 {
         game: bool,
         studio: bool,
     ) -> Result<Self, String> {
-        Self::open_inner(device, width, height, fps, bitrate, game, studio, false)
+        Self::open_inner(
+            device, width, height, fps, bitrate, game, studio, false, false,
+        )
     }
 
     /// Studio's aspirational tier, as a measurement rung: mathematically
@@ -607,7 +673,23 @@ impl NvencH264 {
         height: u32,
         fps: u32,
     ) -> Result<Self, String> {
-        Self::open_inner(device, width, height, fps, 0, false, true, true)
+        Self::open_inner(device, width, height, fps, 0, false, true, true, false)
+    }
+
+    /// The hardware-decodable lossless: HEVC under the same constQP-0
+    /// contract. Where H.264 lossless needed the Hi444PP profile (which
+    /// no hardware decoder opens), HEVC carries transquant bypass as core
+    /// syntax — the produced stream is what NVDEC/WebCodecs can actually
+    /// decode, which is what makes this the candidate for Studio's
+    /// shipped Lossless mode rather than a measurement curiosity.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_lossless_hevc_on_device(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self, String> {
+        Self::open_inner(device, width, height, fps, 0, false, true, true, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -620,6 +702,7 @@ impl NvencH264 {
         game: bool,
         studio: bool,
         lossless: bool,
+        hevc: bool,
     ) -> Result<Self, String> {
         let intra_refresh = game && !studio;
         let api = api()?;
@@ -655,7 +738,10 @@ impl NvencH264 {
                 intra_refresh,
                 studio,
                 lossless,
-                label: if lossless {
+                hevc,
+                label: if lossless && hevc {
+                    "NVENC SDK (HEVC, studio-lossless)".to_string()
+                } else if lossless {
                     "NVENC SDK (H.264, studio-lossless)".to_string()
                 } else if studio {
                     "NVENC SDK (H.264, studio)".to_string()
@@ -694,16 +780,15 @@ impl NvencH264 {
         } else {
             (NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
         };
+        let codec_guid = if self.hevc {
+            NV_ENC_CODEC_HEVC_GUID
+        } else {
+            NV_ENC_CODEC_H264_GUID
+        };
         let mut preset: Box<PresetConfig> = Box::new(std::mem::zeroed());
         preset.version = sv(4) | (1 << 31);
         preset.preset_cfg.version = sv(8) | (1 << 31);
-        let status = preset_ex(
-            self.encoder,
-            NV_ENC_CODEC_H264_GUID,
-            preset_guid,
-            tuning,
-            &mut *preset,
-        );
+        let status = preset_ex(self.encoder, codec_guid, preset_guid, tuning, &mut *preset);
         if status != NV_ENC_SUCCESS {
             return Err(self.err("GetEncodePresetConfigEx", status));
         }
@@ -713,7 +798,9 @@ impl NvencH264 {
         drop(preset);
         let cfg = &mut *self.config;
         cfg.version = sv(8) | (1 << 31);
-        cfg.profile_guid = if self.lossless {
+        cfg.profile_guid = if self.hevc {
+            NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID
+        } else if self.lossless {
             NV_ENC_H264_PROFILE_HIGH_444_GUID
         } else {
             NV_ENC_H264_PROFILE_MAIN_GUID
@@ -762,51 +849,71 @@ impl NvencH264 {
             // constant-latency framing far more than from burst headroom.
             cfg.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
         }
-        let h264 = &mut cfg.encode_codec_config.h264;
-        h264.flags |= h264_flags::REPEAT_SPSPPS;
-        if self.lossless {
-            h264.flags |= h264_flags::QP_PRIME_Y_ZERO_TRANSFORM_BYPASS;
-        }
-        h264.entropy_coding_mode = 0; // autoselect (CABAC where allowed)
-        if crate::video::paced_slices_enabled() {
-            // Slice-count mode (sliceMode 3): the send-side pacer's cut
-            // points — a keyframe leaves as several independently-
-            // decodable slices instead of one wall. Count, not bytes:
-            // byte-based slicing (mode 1) is rejected outright by real
-            // drivers in the field ("Byte based slice encoding is not
-            // supported"), while count mode is universal. 8 slices at
-            // ≥1080p ≈ the ~24 KB pacing grain on a worst-case keyframe.
-            h264.slice_mode = 3;
-            h264.slice_mode_data = if self.width * self.height >= 1920 * 1080 {
-                8
-            } else {
-                4
-            };
-        }
-        if self.intra_refresh {
-            // GDR: no automatic IDRs at all; intra data rides a refresh
-            // wave every ~0.5 s (the field pass at 2 s left loss artifacts
-            // lingering visibly in-game — half a second bounds the heal to
-            // a blink while still spreading the intra cost). Recovery-point
-            // SEI marks each wave so a decoder knows where clean starts. A
-            // forced IDR (viewer join, quiesce rescue) still cuts through
-            // via the per-picture flag.
-            cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
-            h264.idr_period = NVENC_INFINITE_GOPLENGTH;
-            h264.flags |= h264_flags::ENABLE_INTRA_REFRESH | h264_flags::OUTPUT_RECOVERY_POINT_SEI;
-            let period = (self.fps / 2).max(15);
-            h264.intra_refresh_period = period;
-            h264.intra_refresh_cnt = (period / 5).max(3);
+        let paced = crate::video::paced_slices_enabled();
+        let slice_count = if self.width * self.height >= 1920 * 1080 {
+            8
         } else {
-            // Stable-arc shape: same ~4 s GOP backstop as the MF rung; the
-            // stream's adaptive IDR cadence forces the real keyframes.
+            4
+        };
+        if self.hevc {
+            // The HEVC face of the same stream shape: VPS/SPS/PPS on
+            // every IDR for the pacer's clean joins, 4:2:0 for the NV12
+            // input, count-mode slices for the pacer's cut points, and
+            // the stable-arc GOP backstop (this rung never runs GDR —
+            // lossless is a studio posture).
+            let hevc = &mut cfg.encode_codec_config.hevc;
+            hevc.flags |= hevc_flags::REPEAT_SPSPPS;
+            hevc.flags = (hevc.flags & !hevc_flags::CHROMA_MASK) | hevc_flags::CHROMA_420;
+            if paced {
+                hevc.slice_mode = 3;
+                hevc.slice_mode_data = slice_count;
+            }
             cfg.gop_length = self.fps.saturating_mul(4).max(1);
-            h264.idr_period = cfg.gop_length;
+            hevc.idr_period = cfg.gop_length;
+        } else {
+            let h264 = &mut cfg.encode_codec_config.h264;
+            h264.flags |= h264_flags::REPEAT_SPSPPS;
+            if self.lossless {
+                h264.flags |= h264_flags::QP_PRIME_Y_ZERO_TRANSFORM_BYPASS;
+            }
+            h264.entropy_coding_mode = 0; // autoselect (CABAC where allowed)
+            if paced {
+                // Slice-count mode (sliceMode 3): the send-side pacer's cut
+                // points — a keyframe leaves as several independently-
+                // decodable slices instead of one wall. Count, not bytes:
+                // byte-based slicing (mode 1) is rejected outright by real
+                // drivers in the field ("Byte based slice encoding is not
+                // supported"), while count mode is universal. 8 slices at
+                // ≥1080p ≈ the ~24 KB pacing grain on a worst-case keyframe.
+                h264.slice_mode = 3;
+                h264.slice_mode_data = slice_count;
+            }
+            if self.intra_refresh {
+                // GDR: no automatic IDRs at all; intra data rides a refresh
+                // wave every ~0.5 s (the field pass at 2 s left loss artifacts
+                // lingering visibly in-game — half a second bounds the heal to
+                // a blink while still spreading the intra cost). Recovery-point
+                // SEI marks each wave so a decoder knows where clean starts. A
+                // forced IDR (viewer join, quiesce rescue) still cuts through
+                // via the per-picture flag.
+                cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
+                h264.idr_period = NVENC_INFINITE_GOPLENGTH;
+                h264.flags |=
+                    h264_flags::ENABLE_INTRA_REFRESH | h264_flags::OUTPUT_RECOVERY_POINT_SEI;
+                let period = (self.fps / 2).max(15);
+                h264.intra_refresh_period = period;
+                h264.intra_refresh_cnt = (period / 5).max(3);
+            } else {
+                // Stable-arc shape: same ~4 s GOP backstop as the MF rung; the
+                // stream's adaptive IDR cadence forces the real keyframes.
+                cfg.gop_length = self.fps.saturating_mul(4).max(1);
+                h264.idr_period = cfg.gop_length;
+            }
         }
 
         let init = &mut *self.init;
         init.version = sv(5) | (1 << 31);
-        init.encode_guid = NV_ENC_CODEC_H264_GUID;
+        init.encode_guid = codec_guid;
         init.preset_guid = preset_guid;
         init.encode_width = self.width;
         init.encode_height = self.height;
@@ -821,16 +928,24 @@ impl NvencH264 {
         let init_fn = self.api.initialize_encoder.ok_or("no InitializeEncoder")?;
         let mut status = init_fn(self.encoder, &mut *self.init);
         if status != NV_ENC_SUCCESS {
-            let h264 = &mut self.config.encode_codec_config.h264;
-            if h264.slice_mode != 0 {
+            // Both codecs park slice_mode/slice_mode_data at the same
+            // conceptual spot; pick the active union member's pair.
+            let (slice_mode, slice_mode_data) = if self.hevc {
+                let h = &mut *self.config.encode_codec_config.hevc;
+                (&mut h.slice_mode, &mut h.slice_mode_data)
+            } else {
+                let h = &mut *self.config.encode_codec_config.h264;
+                (&mut h.slice_mode, &mut h.slice_mode_data)
+            };
+            if *slice_mode != 0 {
                 // A driver that rejects our slice config must cost the
                 // pacer its cut points, never the whole SDK rung: retry
                 // once with default (single-slice) framing.
                 tracing::info!(
                     "NVENC rejected slice config (status {status}); retrying single-slice"
                 );
-                h264.slice_mode = 0;
-                h264.slice_mode_data = 0;
+                *slice_mode = 0;
+                *slice_mode_data = 0;
                 status = init_fn(self.encoder, &mut *self.init);
             }
         }
@@ -1204,18 +1319,19 @@ mod tests {
         // its latency under continuous full-frame motion; the
         // content-classed bench (`bench_nvenc_lossless_content`) brackets
         // the realistic and worst-case bandwidth.
-        const MATRIX: [(&str, bool, bool, bool, u32); 5] = [
-            ("balanced 30M", false, false, false, 30_000_000),
-            ("game 30M", true, false, false, 30_000_000),
-            ("game 200M", true, false, false, 200_000_000),
-            ("studio 150M", false, true, false, 150_000_000),
-            ("studio lossless", false, true, true, 0),
+        const MATRIX: [(&str, bool, bool, bool, bool, u32); 6] = [
+            ("balanced 30M", false, false, false, false, 30_000_000),
+            ("game 30M", true, false, false, false, 30_000_000),
+            ("game 200M", true, false, false, false, 200_000_000),
+            ("studio 150M", false, true, false, false, 150_000_000),
+            ("studio lossless", false, true, true, false, 0),
+            ("hevc lossless", false, true, true, true, 0),
         ];
         // `ALLMYSTUFF_SOAK_ONLY=<substring>` runs a single posture — the
         // full sequence outlives one runner window, so the harness chains
         // one posture per invocation.
         let only = std::env::var("ALLMYSTUFF_SOAK_ONLY").ok();
-        for (label, game, studio, lossless, bitrate) in MATRIX {
+        for (label, game, studio, lossless, hevc, bitrate) in MATRIX {
             if only.as_deref().is_some_and(|f| !label.contains(f)) {
                 continue;
             }
@@ -1227,7 +1343,9 @@ mod tests {
                     return;
                 }
             };
-            let opened = if lossless {
+            let opened = if lossless && hevc {
+                NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60)
+            } else if lossless {
                 NvencH264::open_lossless_on_device(&gpu.device(), w, h, 60)
             } else {
                 NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio)
@@ -1383,6 +1501,86 @@ mod tests {
         );
     }
 
+    /// The HEVC-lossless pilot meets the real driver. Nothing in this
+    /// crate decodes HEVC (openh264 is H.264-only), so this asserts the
+    /// bitstream *shape* — VPS/SPS/PPS present, IDR slices present, a
+    /// unit per frame, keyframes flagged — and, with
+    /// `ALLMYSTUFF_HEVC_DUMP=<path>`, writes the Annex-B stream out for
+    /// the WebCodecs decode probe (the true end-to-end proof runs in the
+    /// webview engine, which is the decoder that matters for shipping).
+    #[test]
+    fn nvenc_hevc_lossless_smoke() {
+        let (w, h) = (1280u32, 720u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: GPU convert unavailable: {e}");
+                return;
+            }
+        };
+        let mut enc = match NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: NVENC HEVC session unavailable: {e}");
+                return;
+            }
+        };
+        assert_eq!(enc.label(), "NVENC SDK (HEVC, studio-lossless)");
+        // Scrolling document — the realistic desktop case the probe
+        // should later decode frame for frame.
+        let mut doc = vec![0u8; wu * (hu + 300) * 4];
+        paint_document(&mut doc, wu, hu + 300);
+        let mut bgra = vec![0u8; wu * hu * 4];
+        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+        let mut stream: Vec<u8> = Vec::new();
+        let (mut units, mut keys) = (0u32, 0u32);
+        for i in 0..90u64 {
+            let off = (i as usize) * 3;
+            bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
+            gpu.update_bgra(&tex, &bgra, w, h);
+            let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+            let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+            gpu.release(slot);
+            for (d, key) in &out.units {
+                units += 1;
+                if *key {
+                    keys += 1;
+                }
+                stream.extend_from_slice(d);
+            }
+        }
+        assert!(units >= 89, "a unit per frame (got {units})");
+        assert!(keys >= 1, "a keyframe came out");
+        // Annex-B walk: the HEVC nal_unit_type is bits 1..6 of the first
+        // byte after the start code (32 VPS · 33 SPS · 34 PPS · 19/20
+        // IDR slices).
+        let mut have = [false; 64];
+        let mut i = 0usize;
+        while i + 4 < stream.len() {
+            if stream[i] == 0
+                && stream[i + 1] == 0
+                && (stream[i + 2] == 1 || (stream[i + 2] == 0 && stream[i + 3] == 1))
+            {
+                let s = i + if stream[i + 2] == 1 { 3 } else { 4 };
+                if s < stream.len() {
+                    have[((stream[s] >> 1) & 0x3F) as usize] = true;
+                }
+                i = s;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(have[32], "VPS present");
+        assert!(have[33], "SPS present");
+        assert!(have[34], "PPS present");
+        assert!(have[19] || have[20], "IDR slices present");
+        if let Ok(path) = std::env::var("ALLMYSTUFF_HEVC_DUMP") {
+            std::fs::write(&path, &stream).expect("dump");
+            eprintln!("dumped {} bytes ({units} units) to {path}", stream.len());
+        }
+    }
+
     /// Deterministic LCG — the benches must not vary run to run.
     fn lcg(s: &mut u64) -> u32 {
         *s = (*s)
@@ -1478,13 +1676,16 @@ mod tests {
         paint_document(&mut doc, wu, hu + 912);
         let mut vid = vec![0u8; (wu + 512) * hu * 4];
         paint_video(&mut vid, wu + 512, hu);
-        const RUNS: [(&str, bool, u32); 2] =
-            [("lossless", true, 0), ("studio 150M", false, 150_000_000)];
+        const RUNS: [(&str, bool, bool, u32); 3] = [
+            ("h264 lossless", true, false, 0),
+            ("hevc lossless", true, true, 0),
+            ("studio 150M", false, false, 150_000_000),
+        ];
         const CONTENT: [&str; 4] = ["static-desktop", "scrolling-text", "video-motion", "noise"];
         println!(
             "=== NVENC content-classed bandwidth · 1440p · {frames} frames/cell · 60 fps basis ==="
         );
-        for (enc_label, lossless, bitrate) in RUNS {
+        for (enc_label, lossless, hevc, bitrate) in RUNS {
             for content in CONTENT {
                 let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
                     Ok(g) => g,
@@ -1493,7 +1694,9 @@ mod tests {
                         return;
                     }
                 };
-                let opened = if lossless {
+                let opened = if lossless && hevc {
+                    NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60)
+                } else if lossless {
                     NvencH264::open_lossless_on_device(&gpu.device(), w, h, 60)
                 } else {
                     NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, false, true)
@@ -1578,7 +1781,7 @@ mod tests {
                 let n = enc_ms.len();
                 let mbps = bytes as f64 * 8.0 * 60.0 / frames as f64 / 1e6;
                 println!(
-                    "  [{enc_label:>11} · {content:<15}] {mbps:8.1} Mbps@60 · frame avg {:7.1} KB · IDR avg {:8.1} KB ×{keys} · enc {:5.2} ms avg · p95 {:5.2} · max {:5.2}",
+                    "  [{enc_label:>13} · {content:<15}] {mbps:8.1} Mbps@60 · frame avg {:7.1} KB · IDR avg {:8.1} KB ×{keys} · enc {:5.2} ms avg · p95 {:5.2} · max {:5.2}",
                     bytes as f64 / frames as f64 / 1024.0,
                     if keys > 0 {
                         key_bytes as f64 / f64::from(keys) / 1024.0

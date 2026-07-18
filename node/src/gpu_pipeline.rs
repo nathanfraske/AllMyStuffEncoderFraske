@@ -400,6 +400,53 @@ impl GpuConvert {
 mod tests {
     use super::*;
 
+    /// Diagnostic: what this GPU's D3D11 video device actually offers
+    /// for hardware decode — the driver-side ground truth beneath every
+    /// browser's WebCodecs answer. Run:
+    /// `cargo test --release -- --ignored probe_d3d11_decoder --nocapture`
+    #[test]
+    #[ignore = "diagnostic probe — run with --ignored --nocapture"]
+    fn probe_d3d11_decoder_profiles() {
+        use windows::core::Interface as _;
+        let gpu = match GpuConvert::new(64, 64, 64, 64) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let video: windows::Win32::Graphics::Direct3D11::ID3D11VideoDevice =
+            match gpu.device().cast() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("SKIP: no ID3D11VideoDevice: {e}");
+                    return;
+                }
+            };
+        let known: [(u128, &str); 6] = [
+            (0x1b81be68_a0c7_11d3_b984_00c04f2e73c5, "H264 VLD NoFGT"),
+            (0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0, "HEVC VLD Main"),
+            (0x107af0e0_ef1a_4d19_aba8_67a163073d13, "HEVC VLD Main10"),
+            (0x8c56eb1e_2b47_466f_8d33_7dbcd63f3df2, "AV1 VLD Profile0"),
+            (0x463707f8_a1d0_4585_876d_83aa6d60b89e, "VP9 VLD Profile0"),
+            (0xa4c749ef_6ecf_48aa_8448_50a7a1165ff7, "VP9 VLD 10bit Profile2"),
+        ];
+        unsafe {
+            let n = video.GetVideoDecoderProfileCount();
+            println!("{n} D3D11 decoder profiles on this adapter:");
+            for i in 0..n {
+                if let Ok(g) = video.GetVideoDecoderProfile(i) {
+                    let tag = known
+                        .iter()
+                        .find(|(k, _)| windows::core::GUID::from_u128(*k) == g)
+                        .map(|(_, t)| *t)
+                        .unwrap_or("");
+                    println!("  {g:?}  {tag}");
+                }
+            }
+        }
+    }
+
     /// The whole GPU lane in isolation: synthetic BGRA frames → texture →
     /// VideoProcessor NV12 → hardware MFT (opened on the shared device
     /// manager, fed textures — zero CPU pixel work) → Annex-B → openh264
