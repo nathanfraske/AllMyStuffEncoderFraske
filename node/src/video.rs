@@ -2612,7 +2612,27 @@ fn run_gpu_lane(
                         stats.add_encode(t1.elapsed());
                         if outcome.consumed {
                             retained.push_back(frame);
-                            while retained.len() > 2 {
+                            // Retirement depth per rung: 2 proved out on
+                            // NVENC (sync) and the NVIDIA MFT; AMD's MFT
+                            // pipelines reads deeper and the 9060 XT
+                            // field run showed the depth-2 tear
+                            // signature — the MF rung holds 4.
+                            // `ALLMYSTUFF_RING_RETIRE` pins it for A/B
+                            // on the box (ring is sized for ≤4).
+                            static RETIRE: std::sync::LazyLock<Option<usize>> =
+                                std::sync::LazyLock::new(|| {
+                                    std::env::var("ALLMYSTUFF_RING_RETIRE")
+                                        .ok()
+                                        .and_then(|v| v.parse().ok())
+                                });
+                            let depth = RETIRE
+                                .unwrap_or(if matches!(&enc, GpuCodec::Mf(_)) {
+                                    4
+                                } else {
+                                    2
+                                })
+                                .clamp(1, crate::gpu_pipeline::NV12_RING - 4);
+                            while retained.len() > depth {
                                 if let Some(old) = retained.pop_front() {
                                     let _ = lane.release.try_send(old.slot);
                                 }

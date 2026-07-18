@@ -1354,9 +1354,11 @@
     const box = s.getBoundingClientRect();
     const ar = activeRegion;
     // Where the cursor sits on screen right now (through the active region
-    // and the current zoom), and where the stage centre is.
-    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    // and the current zoom), and where the stage centre is. Mapped over
+    // the CONTENT box — in theater the element carries letterbox bars.
+    const cb = contentBox(r);
+    const px = cb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * cb.width;
+    const py = cb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * cb.height;
     // Centre of the VISIBLE area: when the soft keyboard has eaten the bottom
     // `kbInset` px, the middle of what the user can still see sits that much
     // higher — so a cursor centred here stays above the keyboard where they're
@@ -1365,6 +1367,27 @@
     const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
+  // The picture's content box within the canvas ELEMENT — object-fit:
+  // contain's inset, the same min-scale math normPoint runs. Outside
+  // theater the element IS the content box (auto-sized), so the inset is
+  // zero and this degrades to the rect itself; in theater the element
+  // fills the stage and the picture letterboxes inside it, and every
+  // virt→client mapping must go through here or it drifts by a bar width.
+  function contentBox(r: DOMRect): { left: number; top: number; width: number; height: number } {
+    if (!frameW || !frameH || r.width === 0 || r.height === 0) {
+      return { left: r.left, top: r.top, width: r.width, height: r.height };
+    }
+    const scale = Math.min(r.width / frameW, r.height / frameH);
+    const w = frameW * scale;
+    const h = frameH * scale;
+    return {
+      left: r.left + (r.width - w) / 2,
+      top: r.top + (r.height - h) / 2,
+      width: w,
+      height: h,
+    };
+  }
+
   // Pin the aiming crosshair to the commanded position. Same client-space math
   // as followCursor (getBoundingClientRect reflects the zoom transform), made
   // relative to the stage so a windowed console's own transform can't offset
@@ -1375,11 +1398,11 @@
     const c = canvasEl;
     const s = stageEl;
     if (!el || !c || !s || !hasFrame) return;
-    const r = c.getBoundingClientRect();
+    const cb = contentBox(c.getBoundingClientRect());
     const sb = s.getBoundingClientRect();
     const ar = activeRegion;
-    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    const x = cb.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * cb.width;
+    const y = cb.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * cb.height;
     el.style.transform = `translate(${x}px, ${y}px)`;
   }
   $effect(() => {
@@ -1451,6 +1474,33 @@
     if (!app.consoleControl) untrack(() => touchMouse.reset());
   });
 
+  // ---- pointer lock (theater mouse capture) --------------------------
+  // The popout's game-aiming path, brought to the console: in THEATER
+  // with control live, a click captures the mouse and RELATIVE deltas
+  // stream to the host (`mouse_move_rel`) — FPS camera control instead
+  // of a cursor pinned to the stage edge, which is exactly the
+  // "fullscreen game doesn't capture the cursor" field report. Esc (the
+  // browser's own gesture) releases; leaving theater or control drops it.
+  let pointerLocked = $state(false);
+  function lockChanged() {
+    pointerLocked = document.pointerLockElement === stageEl;
+  }
+  function maybePointerLock() {
+    if (theater && stagePointerActive && !pointerLocked) {
+      void stageEl?.requestPointerLock();
+    }
+  }
+  $effect(() => {
+    document.addEventListener("pointerlockchange", lockChanged);
+    return () => document.removeEventListener("pointerlockchange", lockChanged);
+  });
+  $effect(() => {
+    // Falling out of theater or control releases the capture.
+    if (pointerLocked && (!theater || !stagePointerActive)) {
+      document.exitPointerLock();
+    }
+  });
+
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
@@ -1460,6 +1510,13 @@
   function onPointerMove(e: PointerEvent) {
     if (e.pointerType === "touch") {
       touchMouse.move(e);
+      return;
+    }
+    if (pointerLocked && stagePointerActive) {
+      // Raw deltas, no throttle — the aiming path.
+      if (e.movementX !== 0 || e.movementY !== 0) {
+        app.sendConsoleInput({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+      }
       return;
     }
     // Keep keyboard focus on the stage whenever control is on (even over a
@@ -1543,6 +1600,17 @@
       } catch {
         // a stale/synthetic pointer id — capture is best-effort
       }
+    }
+    // Theater aiming: the click that lands in the picture captures the
+    // mouse; while captured, buttons forward raw (no position re-seat —
+    // the relative stream owns the cursor).
+    if (down) maybePointerLock();
+    if (pointerLocked) {
+      e.preventDefault();
+      app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
+      if (down) heldButtons.add(e.button);
+      else heldButtons.delete(e.button);
+      return;
     }
     const p = normPoint(e);
     if (!p) {
@@ -2389,17 +2457,26 @@
   .console.theater .live {
     border-radius: 0;
     box-shadow: none;
+    /* Theater FILLS the monitor: the element takes the whole stage and
+       the picture letterboxes inside it (bars where the aspect differs)
+       instead of sitting at native size in a black field. Every
+       virt→client mapping goes through contentBox() so the inset never
+       skews the pointer, crosshair, or follow-cursor math; normPoint
+       always computed it. Windowed keeps the element==content-box
+       pattern below. */
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
   }
   .live {
-    /* Size the element to the video's OWN box (its intrinsic backing store
-       scaled down to fit the stage), centered by the stage's place-items — the
-       standard responsive-replaced-element pattern (display:block + auto dims +
-       max caps). NOT width/height:100% + object-fit, which makes the element the
-       full cell with the video letterboxed INSIDE it: normPoint then has to
-       recompute that inset and it drifts by ~a bar width (the "offset = letterbox
-       size" skew). With the element == the content box, normPoint's inset is 0
-       and it normalizes over the element directly — like the KVM's accurate web
-       UI. The pinch-zoom transform scales this same box; getBoundingClientRect
+    /* Windowed: size the element to the video's OWN box (its intrinsic
+       backing store scaled down to fit the stage), centered by the stage's
+       place-items — the responsive-replaced-element pattern. Theater
+       overrides to width/height:100% + object-fit (fills the monitor,
+       bars inside the element); every virt→client mapping goes through
+       contentBox() so the inset is handled in BOTH shapes — normPoint
+       always computed it, and the crosshair/follow paths do now too. The
+       pinch-zoom transform scales the same box; getBoundingClientRect
        keeps reporting the truth. */
     display: block;
     width: auto;

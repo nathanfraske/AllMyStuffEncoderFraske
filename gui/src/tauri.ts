@@ -1625,6 +1625,16 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
   return next;
 }
 
+/** The window's REAL fullscreen state — the OS can flip it without our
+ *  ⛶ (Win+Up, taskbar, a shell gesture), and pointer-lock/fit logic
+ *  keys off the flag, so callers re-query on resize instead of trusting
+ *  their last click. Web mode reports the Fullscreen API instead. */
+export async function isWindowFullscreen(): Promise<boolean> {
+  if (!isTauri()) return document.fullscreenElement != null;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().isFullscreen();
+}
+
 // ---- video popouts (one stream in its own OS window) -------------------
 
 /** Open (or focus) the dedicated popout window for one video stream.

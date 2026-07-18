@@ -49,16 +49,17 @@ use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGID
 /// How many NV12 output textures cycle in the ring. Slots are explicitly
 /// checked out ([`GpuConvert::convert`]) and released
 /// ([`GpuConvert::release`]); the consumer holds the shallow frame
-/// channel plus its retirement queue of the last TWO consumed pictures —
-/// two, not one, because the async MFT can still be reading frame N−1's
-/// texture when frame N is fed (its bits haven't drained yet), and the
-/// field showed exactly that as torn bands on damage bursts when N−1's
-/// slot went back into rotation at N's consume. Depth-2 retirement means
-/// a slot returns only after the encoder has been fed two newer frames —
-/// by then its read is provably drained (the sync SDK rung never needed
-/// this, but runs the same discipline). Six slots = channel 2 + retired 2
-/// + in-flight 1, with one spare.
-pub(crate) const NV12_RING: usize = 6;
+/// channel plus its retirement queue of the last consumed pictures —
+/// more than one, because the async MFT can still be reading frame
+/// N−1's texture when frame N is fed (its bits haven't drained yet),
+/// and the field showed exactly that as torn bands on damage bursts
+/// when N−1's slot went back into rotation at N's consume. The
+/// retirement DEPTH is the encoder rung's to choose (see the lane: 2
+/// proved out on NVENC and the NVIDIA MFT; AMD's MFT pipelines deeper —
+/// the 9060 XT run showed the tear signature at depth 2, so the MF rung
+/// runs 4 there, `ALLMYSTUFF_RING_RETIRE` to A/B). Eight slots = channel
+/// 2 + retired ≤4 + in-flight 1, with one spare.
+pub(crate) const NV12_RING: usize = 8;
 
 /// Keeps the GPU's clocks awake while a route streams. The soaks proved
 /// the encode engine's own load does NOT hold boost clocks — 8 minutes

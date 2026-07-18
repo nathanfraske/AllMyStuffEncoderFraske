@@ -25,6 +25,7 @@
   import { app } from "../store.svelte";
   import {
     focusThisWindow,
+    isWindowFullscreen,
     onThisWindowClose,
     sendInput,
     toggleWindowFullscreen,
@@ -165,6 +166,24 @@
     // into the picture.
     if (controlActive) stageEl?.focus({ preventScroll: true });
   }
+
+  // The OS can flip fullscreen without our ⛶ (Win+Up, a shell gesture) —
+  // and pointer lock engages off this flag, which is exactly the field's
+  // "fullscreen game doesn't capture the cursor": the flag said windowed,
+  // so the click never locked. Re-query the REAL state on every resize.
+  $effect(() => {
+    let alive = true;
+    const sync = () =>
+      void isWindowFullscreen().then((v) => {
+        if (alive) fullscreen = v;
+      });
+    sync();
+    window.addEventListener("resize", sync);
+    return () => {
+      alive = false;
+      window.removeEventListener("resize", sync);
+    };
+  });
 
   // ---- quality pills (streams this window owns) ----------------------
   type PillChoice = { label: string; value: number | null };
