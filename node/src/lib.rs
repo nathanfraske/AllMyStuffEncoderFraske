@@ -86,6 +86,13 @@ pub mod mediafoundation;
 pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
+/// Direct NVENC (NVIDIA Video Codec SDK, runtime-loaded — no build
+/// toolchain): the game-mode encoder rung with intra-refresh/GDR and
+/// guaranteed in-place reconfigure, fed the GPU lane's NV12 textures.
+/// Windows + host, like the GPU lane it extends; opt-in via
+/// `ALLMYSTUFF_NVENC=1` until soaked.
+#[cfg(all(windows, feature = "host"))]
+pub mod nvenc;
 /// OS performance levers for the media-plane threads (timer resolution +
 /// thread priority) — Windows-real, no-op elsewhere.
 pub(crate) mod os_perf;

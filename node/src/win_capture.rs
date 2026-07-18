@@ -692,6 +692,9 @@ mod gpu_lane {
         pub frames: mpsc::Receiver<GpuFrame>,
         /// Spent ring slots ride back to the capture side on this.
         pub release: mpsc::SyncSender<usize>,
+        /// The lane's D3D11 device — the direct-NVENC rung opens its
+        /// session on it (input textures must be device-local).
+        pub device: ID3D11Device,
         /// The device manager the encoder MFT must be opened with.
         pub manager: IMFDXGIDeviceManager,
         /// The duplication device's adapter — scopes encoder enumeration
@@ -751,6 +754,7 @@ mod gpu_lane {
             last_emit: Instant::now(),
             release: release_rx,
         };
+        let device = d.device.clone();
         let thread = std::thread::spawn(move || pump_gpu(&mut d, monitor_id, &stop_thread, &tx));
         Ok(GpuLane {
             session: Session {
@@ -759,6 +763,7 @@ mod gpu_lane {
             },
             frames: rx,
             release: release_tx,
+            device,
             manager,
             adapter_luid,
             out_size: (dw, dh),

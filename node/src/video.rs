@@ -1967,6 +1967,54 @@ enum GpuEnd {
     Fallback(String),
 }
 
+/// Opt-in for the direct-NVENC rung of the GPU lane
+/// (`ALLMYSTUFF_NVENC=1`). Default OFF until soaked — the MF rung is the
+/// proven default; flipping this on puts the SDK session first with the
+/// MF rung as its in-lane fallback.
+#[cfg(windows)]
+fn nvenc_opt_in() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("ALLMYSTUFF_NVENC")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+            .unwrap_or(false);
+        if on {
+            tracing::info!("ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled");
+        }
+        on
+    });
+    *ON
+}
+
+/// The GPU lane's texture-eating encoder: the direct-NVENC SDK session
+/// (opt-in, game-mode levers) or the Media Foundation MFT (the proven
+/// default, and the in-lane fallback the healer steps down to).
+#[cfg(windows)]
+enum GpuCodec {
+    Nvenc(crate::nvenc::NvencH264),
+    Mf(crate::mediafoundation::MediaFoundationH264),
+}
+
+#[cfg(windows)]
+impl GpuCodec {
+    fn encode_texture(
+        &mut self,
+        tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        force_idr: bool,
+    ) -> Result<EncodeOutcome, String> {
+        match self {
+            GpuCodec::Nvenc(e) => e.encode_texture(tex, force_idr),
+            GpuCodec::Mf(e) => e.encode_texture(tex, force_idr),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            GpuCodec::Nvenc(e) => e.label(),
+            GpuCodec::Mf(e) => e.label(),
+        }
+    }
+}
+
 /// Open the best hardware H.264 MFT **on the lane's adapter**, bound to
 /// its device manager — the encoder must live where the textures live.
 /// `None` when no MFT on that adapter accepts the manager and types.
@@ -2059,10 +2107,28 @@ fn run_gpu_lane(
         .bitrate
         .unwrap_or_else(|| h264_bitrate_for(dw, dh, fps, tune.link))
         .clamp(250_000, 80_000_000);
-    let Some(mut enc) = open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
-    else {
-        return GpuEnd::Fallback("no hardware MFT accepted the shared device".into());
+    let game = game_mode();
+    let mut enc = 'open: {
+        if nvenc_opt_in() {
+            // The SDK rung first: same textures, direct session, the
+            // game-mode levers (in game mode: GDR instead of IDR walls).
+            match crate::nvenc::NvencH264::open_on_device(&lane.device, dw, dh, fps, bitrate, game)
+            {
+                Ok(n) => break 'open GpuCodec::Nvenc(n),
+                Err(e) => tracing::info!(
+                    "direct NVENC unavailable for {route_id} ({e}); using the MF rung"
+                ),
+            }
+        }
+        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager) {
+            Some(m) => GpuCodec::Mf(m),
+            None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
+        }
     };
+    // GDR streams have no periodic-IDR cadence by design — the refresh
+    // wave is the convergence mechanism; only explicit asks (viewer join,
+    // quiesce rescue) force an IDR through.
+    let gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
         enc.label(),
@@ -2132,8 +2198,8 @@ fn run_gpu_lane(
                 (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
                 let idr_every = Duration::from_millis(idr_ms.load(Ordering::Relaxed));
-                let force_idr =
-                    refresh_asked || last_idr.is_none_or(|idr| idr.elapsed() >= idr_every);
+                let force_idr = refresh_asked
+                    || (!gdr && last_idr.is_none_or(|idr| idr.elapsed() >= idr_every));
                 let t1 = Instant::now();
                 match enc.encode_texture(&frame.tex, force_idr) {
                     Ok(outcome) => {
@@ -2179,7 +2245,10 @@ fn run_gpu_lane(
                             open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
                         }) {
                             Ok(Some(next)) => {
-                                enc = next;
+                                // A heal always lands on the MF rung — a
+                                // failing SDK session steps down rather
+                                // than retrying itself.
+                                enc = GpuCodec::Mf(next);
                                 refresh.store(true, Ordering::SeqCst);
                             }
                             Ok(None) => {}
@@ -2246,7 +2315,7 @@ fn run_gpu_lane(
                                 )
                             }) {
                                 Ok(Some(next)) => {
-                                    enc = next;
+                                    enc = GpuCodec::Mf(next);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
@@ -2283,7 +2352,7 @@ fn run_gpu_lane(
                                 )
                             }) {
                                 Ok(Some(next)) => {
-                                    enc = next;
+                                    enc = GpuCodec::Mf(next);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
