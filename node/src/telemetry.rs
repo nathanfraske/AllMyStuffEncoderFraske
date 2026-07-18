@@ -103,6 +103,55 @@ mod tests {
     }
 }
 
+/// One line describing the attached monitors: name, mode, refresh,
+/// desktop position, primary marker — the multi-monitor test's ground
+/// truth, logged at start and again whenever the topology changes
+/// (hotplug, resolution switch, rotation).
+fn monitors_line() -> String {
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+    };
+    let mut parts = Vec::new();
+    unsafe {
+        for i in 0..16u32 {
+            let mut dev: DISPLAY_DEVICEW = std::mem::zeroed();
+            dev.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if EnumDisplayDevicesW(std::ptr::null(), i, &mut dev, 0) == 0 {
+                break;
+            }
+            const ACTIVE: u32 = 0x1;
+            const PRIMARY: u32 = 0x4;
+            if dev.StateFlags & ACTIVE == 0 {
+                continue;
+            }
+            let name_end = dev.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+            let name = String::from_utf16_lossy(&dev.DeviceName[..name_end]);
+            let mut mode: DEVMODEW = std::mem::zeroed();
+            mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            if EnumDisplaySettingsW(dev.DeviceName.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) != 0
+            {
+                let pos = mode.Anonymous1.Anonymous2.dmPosition;
+                parts.push(format!(
+                    "{name} {}x{}@{} at ({},{}){}",
+                    mode.dmPelsWidth,
+                    mode.dmPelsHeight,
+                    mode.dmDisplayFrequency,
+                    pos.x,
+                    pos.y,
+                    if dev.StateFlags & PRIMARY != 0 {
+                        " primary"
+                    } else {
+                        ""
+                    }
+                ));
+            } else {
+                parts.push(name);
+            }
+        }
+    }
+    format!("monitors: {}", parts.join(" · "))
+}
+
 /// Start the sampler; returns quietly if disabled or unavailable.
 pub fn start() {
     if std::env::var("ALLMYSTUFF_TELEMETRY")
@@ -143,6 +192,12 @@ pub fn start() {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get() as f64)
                 .unwrap_or(1.0);
+            tracing::info!("{}", monitors_line());
+            let mut last_monitors = monitors_line();
+            // Per-media-thread CPU accounting: last (kernel+user) 100 ns
+            // per registered handle.
+            let mut thread_last: std::collections::HashMap<isize, u64> =
+                std::collections::HashMap::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 let _ = PdhCollectQueryData(query);
@@ -170,16 +225,66 @@ pub fn start() {
                 } else {
                     None
                 };
+                // Per-thread busy% for every registered media thread —
+                // this is the CPU side of "busy vs wait": which stage of
+                // the pipeline is actually burning cycles. Dead threads
+                // fall out of the registry (handle closed).
+                let mut thread_bits = String::new();
+                if let Ok(mut reg) = crate::os_perf::MEDIA_THREADS.lock() {
+                    reg.retain(|(name, handle)| {
+                        let h = *handle as windows_sys::Win32::Foundation::HANDLE;
+                        let zero = windows_sys::Win32::Foundation::FILETIME {
+                            dwLowDateTime: 0,
+                            dwHighDateTime: 0,
+                        };
+                        let (mut c, mut e, mut k, mut u) = (zero, zero, zero, zero);
+                        if windows_sys::Win32::System::Threading::GetThreadTimes(
+                            h, &mut c, &mut e, &mut k, &mut u,
+                        ) == 0
+                        {
+                            let _ = windows_sys::Win32::Foundation::CloseHandle(h);
+                            thread_last.remove(handle);
+                            return false;
+                        }
+                        // Thread exited but the handle is alive: exit
+                        // time set → retire it.
+                        if e.dwLowDateTime != 0 || e.dwHighDateTime != 0 {
+                            let _ = windows_sys::Win32::Foundation::CloseHandle(h);
+                            thread_last.remove(handle);
+                            return false;
+                        }
+                        let now = ((u64::from(k.dwHighDateTime) << 32)
+                            | u64::from(k.dwLowDateTime))
+                            + ((u64::from(u.dwHighDateTime) << 32) | u64::from(u.dwLowDateTime));
+                        let prev = thread_last.insert(*handle, now).unwrap_or(now);
+                        let pct = (now.saturating_sub(prev)) as f64 / sys_delta * 100.0 * cores;
+                        if pct >= 0.5 {
+                            use std::fmt::Write as _;
+                            let _ = write!(thread_bits, " {name} {pct:.0}%");
+                        }
+                        true
+                    });
+                }
+                let threads = if thread_bits.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · threads:{thread_bits}")
+                };
                 match gpu {
                     Some((d3, enc, dec, copy)) => tracing::info!(
-                        "telemetry: cpu proc {proc_pct:.0}% total {total_pct:.0}% · gpu 3d {d3:.0}% enc {enc:.0}% dec {dec:.0}% copy {copy:.0}%{}",
+                        "telemetry: cpu proc {proc_pct:.0}% total {total_pct:.0}% · gpu 3d {d3:.0}% enc {enc:.0}% dec {dec:.0}% copy {copy:.0}%{}{threads}",
                         vram_mb
                             .map(|v| format!(" · vram {:.0} MB", v / 1_048_576.0))
                             .unwrap_or_default()
                     ),
                     None => tracing::info!(
-                        "telemetry: cpu proc {proc_pct:.0}% total {total_pct:.0}%"
+                        "telemetry: cpu proc {proc_pct:.0}% total {total_pct:.0}%{threads}"
                     ),
+                }
+                let monitors = monitors_line();
+                if monitors != last_monitors {
+                    tracing::info!("{monitors} (topology changed)");
+                    last_monitors = monitors;
                 }
             }
         });

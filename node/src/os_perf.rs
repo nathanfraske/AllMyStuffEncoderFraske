@@ -63,16 +63,42 @@ impl Drop for TimerResolutionGuard {
 ///     budget holds while the scheduler retains the right to overrule
 ///     (CPU sets are a preference, unlike hard affinity — nothing starves
 ///     if a game owns the P-cores; our raised priority arbitrates).
+/// Media threads registered for the telemetry line's per-thread CPU
+/// split: (label, real thread handle). Every media thread passes through
+/// [`boost_media_thread`], which makes this the one free hook.
+#[cfg(windows)]
+pub(crate) static MEDIA_THREADS: std::sync::Mutex<Vec<(String, isize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub(crate) fn boost_media_thread() {
     #[cfg(windows)]
     unsafe {
+        use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadInformation, SetThreadPriority, SetThreadSelectedCpuSets,
-            ThreadPowerThrottling, THREAD_POWER_THROTTLING_CURRENT_VERSION,
-            THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
-            THREAD_PRIORITY_ABOVE_NORMAL,
+            GetCurrentProcess, GetCurrentThread, SetThreadInformation, SetThreadPriority,
+            SetThreadSelectedCpuSets, ThreadPowerThrottling,
+            THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_ABOVE_NORMAL,
         };
         let thread = GetCurrentThread();
+        // Register for the telemetry per-thread CPU split — the pseudo
+        // handle only means "me", so duplicate a real one.
+        let mut real: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        if windows_sys::Win32::Foundation::DuplicateHandle(
+            GetCurrentProcess(),
+            thread,
+            GetCurrentProcess(),
+            &mut real,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) != 0
+        {
+            let name = std::thread::current().name().unwrap_or("media").to_string();
+            if let Ok(mut reg) = MEDIA_THREADS.lock() {
+                reg.push((name, real as isize));
+            }
+        }
         let _ = SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
         // ControlMask names the knob, StateMask=0 turns throttling OFF —
         // i.e. "never EcoQoS this thread".

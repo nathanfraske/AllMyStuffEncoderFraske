@@ -235,6 +235,9 @@ windows-sys = { version = "0.60", features = [
     # workspace has to ask for it explicitly.
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
+    # Monitor topology for the telemetry line (EnumDisplayDevices/
+    # EnumDisplaySettings — the multi-monitor field-test picture).
+    "Win32_Graphics_Gdi",
 ] }
 # The Service Control Manager glue so `allmystuff-serve --service` runs as a
 # real Windows service: the control dispatcher + status/stop handler the SCM
