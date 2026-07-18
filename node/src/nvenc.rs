@@ -83,11 +83,22 @@ const NV_ENC_PRESET_P5_GUID: GUID = GUID::from_values(
     [0x99, 0x8f, 0xb6, 0xcb, 0xde, 0x72, 0xad, 0xe3],
 );
 const NV_ENC_TUNING_INFO_HIGH_QUALITY: u32 = 1;
+const NV_ENC_TUNING_INFO_LOSSLESS: u32 = 4;
+const NV_ENC_PARAMS_RC_CONSTQP: u32 = 0x0;
 const NV_ENC_H264_PROFILE_MAIN_GUID: GUID = GUID::from_values(
     0x60b5_c1d4,
     0x67fe,
     0x4790,
     [0x94, 0xd5, 0xc4, 0x72, 0x6d, 0x7b, 0x6e, 0x6d],
+);
+/// Hi444PP — the profile that carries `transform_bypass` (lossless);
+/// despite the name it admits 4:2:0 chroma, which is what the NV12 lane
+/// feeds.
+const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID::from_values(
+    0x7ac6_63cb,
+    0xa598,
+    0x4960,
+    [0x98, 0x44, 0x1c, 0x9e, 0x3a, 0xa5, 0xbe, 0x90],
 );
 
 #[allow(dead_code)]
@@ -198,6 +209,9 @@ mod h264_flags {
     pub const OUTPUT_RECOVERY_POINT_SEI: u32 = 1 << 9;
     pub const ENABLE_INTRA_REFRESH: u32 = 1 << 10;
     pub const REPEAT_SPSPPS: u32 = 1 << 12;
+    /// `qpPrimeYZeroTransformBypassFlag` — with constQP 0, the transform
+    /// and quantizer are bypassed entirely: mathematically lossless.
+    pub const QP_PRIME_Y_ZERO_TRANSFORM_BYPASS: u32 = 1 << 15;
 }
 
 /// `NV_ENC_CODEC_CONFIG` — deliberately oversized (see module docs). The
@@ -550,6 +564,7 @@ pub struct NvencH264 {
     frame_index: u64,
     intra_refresh: bool,
     studio: bool,
+    lossless: bool,
     label: String,
 }
 
@@ -573,6 +588,38 @@ impl NvencH264 {
         bitrate: u32,
         game: bool,
         studio: bool,
+    ) -> Result<Self, String> {
+        Self::open_inner(device, width, height, fps, bitrate, game, studio, false)
+    }
+
+    /// Studio's aspirational tier, as a measurement rung: mathematically
+    /// lossless H.264 (constQP 0 + transform bypass, Hi444PP profile) of
+    /// the lane's NV12 — lossless **relative to the 4:2:0 conversion**;
+    /// chroma was already subsampled upstream. There is no rate control
+    /// at all: bandwidth is whatever the content's entropy demands, which
+    /// is exactly what the soak/bench harnesses exist to measure. Not
+    /// routable in the app until the viewer decodes Hi444PP (the
+    /// hardware-decode epic) — no browser path does today.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_lossless_on_device(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self, String> {
+        Self::open_inner(device, width, height, fps, 0, false, true, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_inner(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        game: bool,
+        studio: bool,
+        lossless: bool,
     ) -> Result<Self, String> {
         let intra_refresh = game && !studio;
         let api = api()?;
@@ -607,7 +654,10 @@ impl NvencH264 {
                 frame_index: 0,
                 intra_refresh,
                 studio,
-                label: if studio {
+                lossless,
+                label: if lossless {
+                    "NVENC SDK (H.264, studio-lossless)".to_string()
+                } else if studio {
                     "NVENC SDK (H.264, studio)".to_string()
                 } else if intra_refresh {
                     "NVENC SDK (H.264, intra-refresh)".to_string()
@@ -633,8 +683,13 @@ impl NvencH264 {
         // Balanced/game run P4 + ultra-low-latency tuning; studio runs
         // P5 + high-quality tuning (a slower, better encode the LAN
         // fidelity budget is meant to feed — still no B-frames, forced
-        // below, so latency stays interactive).
-        let (preset_guid, tuning) = if self.studio {
+        // below, so latency stays interactive). Lossless keeps studio's
+        // P5 (better prediction = fewer residual bits — presets still
+        // matter when every residual is coded exactly) under the
+        // dedicated lossless tuning.
+        let (preset_guid, tuning) = if self.lossless {
+            (NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_LOSSLESS)
+        } else if self.studio {
             (NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY)
         } else {
             (NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
@@ -658,21 +713,44 @@ impl NvencH264 {
         drop(preset);
         let cfg = &mut *self.config;
         cfg.version = sv(8) | (1 << 31);
-        cfg.profile_guid = NV_ENC_H264_PROFILE_MAIN_GUID;
+        cfg.profile_guid = if self.lossless {
+            NV_ENC_H264_PROFILE_HIGH_444_GUID
+        } else {
+            NV_ENC_H264_PROFILE_MAIN_GUID
+        };
         cfg.frame_interval_p = 1; // IPP…, never B (latency + LTR/invalidatable)
-        cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_VBR;
-        cfg.rc_params.average_bit_rate = bitrate;
-        let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
-        cfg.rc_params.max_bit_rate = peak;
-        cfg.rc_params.vbv_buffer_size = vbv;
-        cfg.rc_params.vbv_initial_delay = 0;
-        if self.studio {
+        if self.lossless {
+            // No rate to control: constQP 0 everywhere (with transform
+            // bypass below, that IS lossless). The lossless-tuning preset
+            // config already says this — restated so the contract doesn't
+            // hang on a driver default. Bitrate/VBV fields are meaningless
+            // here and stay zeroed.
+            cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_CONSTQP;
+            cfg.rc_params.const_qp = NvEncQp {
+                qp_inter_p: 0,
+                qp_inter_b: 0,
+                qp_intra: 0,
+            };
+            cfg.rc_params.average_bit_rate = 0;
+            cfg.rc_params.max_bit_rate = 0;
+            cfg.rc_params.vbv_buffer_size = 0;
+            cfg.rc_params.vbv_initial_delay = 0;
+        } else {
+            cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_VBR;
+            cfg.rc_params.average_bit_rate = bitrate;
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
+            cfg.rc_params.max_bit_rate = peak;
+            cfg.rc_params.vbv_buffer_size = vbv;
+            cfg.rc_params.vbv_initial_delay = 0;
+        }
+        if self.studio && !self.lossless {
             // Studio: quality-first on a LAN that can carry it — a full
             // second of VBV lets rate control spend where the picture
             // needs it, and the peak stays close to the (already high)
             // mean so the pacer's bursts stay predictable. 4:4:4 chroma
-            // and the lossless preset slot in here once the viewer
-            // decodes them (the hardware-decode epic).
+            // slots in here once the viewer decodes it (the
+            // hardware-decode epic); lossless graduated to its own rung
+            // (`open_lossless_on_device`).
             cfg.rc_params.vbv_buffer_size = bitrate;
             cfg.rc_params.max_bit_rate = bitrate + bitrate / 5;
         }
@@ -686,6 +764,9 @@ impl NvencH264 {
         }
         let h264 = &mut cfg.encode_codec_config.h264;
         h264.flags |= h264_flags::REPEAT_SPSPPS;
+        if self.lossless {
+            h264.flags |= h264_flags::QP_PRIME_Y_ZERO_TRANSFORM_BYPASS;
+        }
         h264.entropy_coding_mode = 0; // autoselect (CABAC where allowed)
         if crate::video::paced_slices_enabled() {
             // Slice-count mode (sliceMode 3): the send-side pacer's cut
@@ -890,6 +971,11 @@ impl NvencH264 {
     /// what the MF rung only partially honors: mean, peak, and VBV all
     /// move, no reset, no IDR.
     pub fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        if self.lossless {
+            // constQP-0 has no rate to move; pretending otherwise would
+            // hand the stream's backoff a knob wired to nothing.
+            return false;
+        }
         unsafe {
             let Some(reconfigure) = self.api.reconfigure_encoder else {
                 return false;
@@ -1080,15 +1166,16 @@ mod tests {
         // shape), game at its uncorked 200 Mbps ceiling (the "extra bits
         // are latency-free under single-frame VBV" claim), and studio
         // (P5 + high-quality tuning at its 150 Mbps floor).
-        const MATRIX: [(&str, bool, bool, u32); 4] = [
-            ("balanced 30M", false, false, 30_000_000),
-            ("game 30M", true, false, 30_000_000),
-            ("game 200M", true, false, 200_000_000),
-            ("studio 150M", false, true, 150_000_000),
+        const MATRIX: [(&str, bool, bool, bool, u32); 5] = [
+            ("balanced 30M", false, false, false, 30_000_000),
+            ("game 30M", true, false, false, 30_000_000),
+            ("game 200M", true, false, false, 200_000_000),
+            ("studio 150M", false, true, false, 150_000_000),
+            ("studio lossless", false, true, true, 0),
         ];
         for round in [1u32, 2] {
-            for (label, game, studio, bitrate) in MATRIX {
-                bench_cycle_posture(round, label, game, studio, bitrate);
+            for (label, game, studio, lossless, bitrate) in MATRIX {
+                bench_cycle_posture(round, label, game, studio, lossless, bitrate);
             }
         }
     }
@@ -1108,17 +1195,23 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(360);
-        const MATRIX: [(&str, bool, bool, u32); 4] = [
-            ("balanced 30M", false, false, 30_000_000),
-            ("game 30M", true, false, 30_000_000),
-            ("game 200M", true, false, 200_000_000),
-            ("studio 150M", false, true, 150_000_000),
+        // The lossless row's soak content (the per-byte rolling gradient
+        // below) is near-adversarial for constQP-0 — every byte moves
+        // every frame — so read its Mbps as the *stress ceiling* under
+        // sustained worst-case load, and the content-classed bench
+        // (`bench_nvenc_lossless_content`) for realistic numbers.
+        const MATRIX: [(&str, bool, bool, bool, u32); 5] = [
+            ("balanced 30M", false, false, false, 30_000_000),
+            ("game 30M", true, false, false, 30_000_000),
+            ("game 200M", true, false, false, 200_000_000),
+            ("studio 150M", false, true, false, 150_000_000),
+            ("studio lossless", false, true, true, 0),
         ];
         // `ALLMYSTUFF_SOAK_ONLY=<substring>` runs a single posture — the
         // full sequence outlives one runner window, so the harness chains
         // one posture per invocation.
         let only = std::env::var("ALLMYSTUFF_SOAK_ONLY").ok();
-        for (label, game, studio, bitrate) in MATRIX {
+        for (label, game, studio, lossless, bitrate) in MATRIX {
             if only.as_deref().is_some_and(|f| !label.contains(f)) {
                 continue;
             }
@@ -1130,14 +1223,18 @@ mod tests {
                     return;
                 }
             };
-            let mut enc =
-                match NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("SKIP: {e}");
-                        return;
-                    }
-                };
+            let opened = if lossless {
+                NvencH264::open_lossless_on_device(&gpu.device(), w, h, 60)
+            } else {
+                NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio)
+            };
+            let mut enc = match opened {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("SKIP: {e}");
+                    return;
+                }
+            };
             let mut bgra = vec![0u8; (w * h * 4) as usize];
             let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
             let frame_budget = Duration::from_micros(16_667);
@@ -1214,7 +1311,14 @@ mod tests {
         }
     }
 
-    fn bench_cycle_posture(round: u32, label: &str, game: bool, studio: bool, bitrate: u32) {
+    fn bench_cycle_posture(
+        round: u32,
+        label: &str,
+        game: bool,
+        studio: bool,
+        lossless: bool,
+        bitrate: u32,
+    ) {
         use std::time::{Duration, Instant};
         let (w, h) = (2560u32, 1440u32);
         let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
@@ -1224,14 +1328,18 @@ mod tests {
                 return;
             }
         };
-        let mut enc =
-            match NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("SKIP: {e}");
-                    return;
-                }
-            };
+        let opened = if lossless {
+            NvencH264::open_lossless_on_device(&gpu.device(), w, h, 60)
+        } else {
+            NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio)
+        };
+        let mut enc = match opened {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
         let n = 150u32;
@@ -1269,6 +1377,216 @@ mod tests {
             "  encode_texture (sync, true latency): {:6.3} ms avg · p95 {p95:6.3} · max {max:6.3}",
             ms(t_enc)
         );
+    }
+
+    /// Deterministic LCG — the benches must not vary run to run.
+    fn lcg(s: &mut u64) -> u32 {
+        *s = (*s)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*s >> 33) as u32
+    }
+
+    /// A document-ish master: light page, dark 3×5 dot-matrix "glyphs" in
+    /// 10×18 cells with margins, word gaps, and occasional tinted "link"
+    /// lines — the spatial statistics of UI text (sharp, high-contrast,
+    /// fine grain) without shipping a font. Each dot's right column
+    /// half-blends toward the page, faking the AA edge real glyphs carry.
+    fn paint_document(buf: &mut [u8], w: usize, rows: usize) {
+        for px in buf.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xEE, 0xEC, 0xE8, 0xFF]);
+        }
+        let mut s = 0x5EED_1234_u64;
+        let (cw, ch) = (10usize, 18usize);
+        for cy in 0..rows / ch {
+            let kind = lcg(&mut s) % 10;
+            if kind < 2 {
+                continue; // blank line
+            }
+            for cx in 0..w / cw {
+                let r = lcg(&mut s);
+                if !(8..w / cw - 8).contains(&cx) || r % 100 < 15 {
+                    continue; // margins and word gaps
+                }
+                let ink: [u8; 4] = if kind == 9 {
+                    [0x8A, 0x46, 0x1C, 0xFF] // a "link" line (BGRA)
+                } else {
+                    [0x24, 0x20, 0x1E, 0xFF]
+                };
+                for p in 0..15u32 {
+                    if (r >> p) & 1 == 0 {
+                        continue;
+                    }
+                    let x0 = cx * cw + 1 + (p as usize % 3) * 3;
+                    let y0 = cy * ch + 4 + (p as usize / 3) * 2;
+                    for dy in 0..2 {
+                        for dx in 0..3 {
+                            let i = ((y0 + dy) * w + x0 + dx) * 4;
+                            if dx == 2 {
+                                for k in 0..3 {
+                                    buf[i + k] =
+                                        ((u32::from(buf[i + k]) + u32::from(ink[k])) / 2) as u8;
+                                }
+                            } else {
+                                buf[i..i + 4].copy_from_slice(&ink);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A photographic-ish master: smooth low-frequency color fields. The
+    /// bench pans across it and floats a shaded disc over it — global
+    /// motion plus occlusion, the two costs real video pays.
+    fn paint_video(buf: &mut [u8], w: usize, h: usize) {
+        for y in 0..h {
+            for x in 0..w {
+                let (xf, yf) = (x as f64, y as f64);
+                let r = 128.0 + 96.0 * (xf * 0.0113 + yf * 0.0071).sin();
+                let g = 128.0 + 96.0 * (xf * 0.0059 - yf * 0.0097).sin();
+                let b = 128.0 + 96.0 * ((xf + yf) * 0.0041).cos();
+                let i = (y * w + x) * 4;
+                buf[i] = b as u8;
+                buf[i + 1] = g as u8;
+                buf[i + 2] = r as u8;
+                buf[i + 3] = 0xFF;
+            }
+        }
+    }
+
+    /// The lossless-economics bench: constQP-0 has **no rate control** —
+    /// bandwidth is the content's entropy, full stop — so one synthetic
+    /// number would mislead. Four content classes bracket the range
+    /// (static UI ≈ floor, scrolling text ≈ realistic desktop worst,
+    /// panning video ≈ motion cost, noise ≈ physical ceiling), each also
+    /// run through lossy studio-150M as the reference column. Run:
+    /// `cargo test --release -- --ignored bench_nvenc_lossless_content --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_nvenc_lossless_content() {
+        use std::time::Instant;
+        let (w, h) = (2560u32, 1440u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let frames = 300u64;
+        let mut doc = vec![0u8; wu * (hu + 912) * 4];
+        paint_document(&mut doc, wu, hu + 912);
+        let mut vid = vec![0u8; (wu + 512) * hu * 4];
+        paint_video(&mut vid, wu + 512, hu);
+        const RUNS: [(&str, bool, u32); 2] =
+            [("lossless", true, 0), ("studio 150M", false, 150_000_000)];
+        const CONTENT: [&str; 4] = ["static-desktop", "scrolling-text", "video-motion", "noise"];
+        println!(
+            "=== NVENC content-classed bandwidth · 1440p · {frames} frames/cell · 60 fps basis ==="
+        );
+        for (enc_label, lossless, bitrate) in RUNS {
+            for content in CONTENT {
+                let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("SKIP: {e}");
+                        return;
+                    }
+                };
+                let opened = if lossless {
+                    NvencH264::open_lossless_on_device(&gpu.device(), w, h, 60)
+                } else {
+                    NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, false, true)
+                };
+                let mut enc = match opened {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("SKIP: {e}");
+                        return;
+                    }
+                };
+                let mut bgra = vec![0u8; wu * hu * 4];
+                let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+                let (mut bytes, mut key_bytes, mut keys) = (0u64, 0u64, 0u32);
+                let mut enc_ms: Vec<f32> = Vec::with_capacity(frames as usize);
+                for i in 0..frames {
+                    match content {
+                        "static-desktop" => {
+                            if i == 0 {
+                                bgra.copy_from_slice(&doc[..wu * hu * 4]);
+                            }
+                        }
+                        "scrolling-text" => {
+                            // 3 px/frame ≈ a 180 px/s reading scroll; the
+                            // master is tall enough that 300 frames never
+                            // wrap.
+                            let off = (i as usize) * 3;
+                            bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
+                        }
+                        "video-motion" => {
+                            // Sine pan (no cuts) plus an occluding disc —
+                            // uncovered background is the expensive part.
+                            let off = (256.0 + 255.0 * ((i as f64) * 0.05).sin()) as usize;
+                            for row in 0..hu {
+                                let src = (row * (wu + 512) + off) * 4;
+                                bgra[row * wu * 4..][..wu * 4]
+                                    .copy_from_slice(&vid[src..][..wu * 4]);
+                            }
+                            let fi = i as f64;
+                            let cx = wu as f64 / 2.0 + (wu as f64 / 3.0) * (fi * 0.021).sin();
+                            let cy = hu as f64 / 2.0 + (hu as f64 / 3.5) * (fi * 0.017).cos();
+                            let rr = 220.0f64;
+                            for y in (cy - rr).max(0.0) as usize..((cy + rr) as usize).min(hu) {
+                                for x in (cx - rr).max(0.0) as usize..((cx + rr) as usize).min(wu) {
+                                    let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+                                    let d = (dx * dx + dy * dy).sqrt();
+                                    if d < rr {
+                                        let v = (230.0 - 150.0 * d / rr) as u8;
+                                        let idx = (y * wu + x) * 4;
+                                        bgra[idx..idx + 4].copy_from_slice(&[30, 60, v, 0xFF]);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Noise: the incompressible ceiling (alpha is
+                            // randomized too; the BGRA→NV12 blt ignores it).
+                            let mut s = 0x0DD_BA11_u64 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                            for wpx in bgra.chunks_exact_mut(8) {
+                                s = s
+                                    .wrapping_mul(6_364_136_223_846_793_005)
+                                    .wrapping_add(1_442_695_040_888_963_407);
+                                wpx.copy_from_slice(&s.to_le_bytes());
+                            }
+                        }
+                    }
+                    gpu.update_bgra(&tex, &bgra, w, h);
+                    let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+                    let t = Instant::now();
+                    let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+                    enc_ms.push(t.elapsed().as_secs_f32() * 1000.0);
+                    gpu.release(slot);
+                    for (d, key) in &out.units {
+                        bytes += d.len() as u64;
+                        if *key {
+                            keys += 1;
+                            key_bytes += d.len() as u64;
+                        }
+                    }
+                }
+                enc_ms.sort_by(f32::total_cmp);
+                let n = enc_ms.len();
+                let mbps = bytes as f64 * 8.0 * 60.0 / frames as f64 / 1e6;
+                println!(
+                    "  [{enc_label:>11} · {content:<15}] {mbps:8.1} Mbps@60 · frame avg {:7.1} KB · IDR avg {:8.1} KB ×{keys} · enc {:5.2} ms avg · p95 {:5.2} · max {:5.2}",
+                    bytes as f64 / frames as f64 / 1024.0,
+                    if keys > 0 {
+                        key_bytes as f64 / f64::from(keys) / 1024.0
+                    } else {
+                        0.0
+                    },
+                    enc_ms.iter().sum::<f32>() / n as f32,
+                    enc_ms[(n * 95 / 100).min(n - 1)],
+                    enc_ms[n - 1],
+                );
+            }
+        }
     }
 
     /// The GDR pilot: with intra-refresh on, a two-second stream contains
