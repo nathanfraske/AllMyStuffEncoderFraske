@@ -1698,7 +1698,7 @@ pub(crate) mod tests_support {
                 };
                 Some(preset)
             });
-            let Some(mut preset) = attempt else {
+            let Some(preset) = attempt else {
                 println!("VERDICT: no AV1 encode on this NVENC (pre-Ada silicon) — arc needs 40-series hosts");
                 let _ = (api.destroy_encoder.expect("destroy"))(encoder);
                 return;

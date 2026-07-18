@@ -41,6 +41,11 @@
 // Audio is gated separately (`audio-io`, included in `host`): it's the one
 // capture plane iOS can genuinely run — cpal speaks CoreAudio there — so
 // the phone builds it real while the rest stay stubs.
+/// AMD AMF encode — the Radeon twin of `nvenc`, in progress (loader +
+/// availability probe today; component vtables next). Runtime-loaded from
+/// the Radeon driver's DLL; absent driver = absent rung, softly.
+#[cfg(all(windows, feature = "host"))]
+pub mod amf;
 #[cfg(feature = "audio-io")]
 pub mod audio;
 #[cfg(not(feature = "audio-io"))]
