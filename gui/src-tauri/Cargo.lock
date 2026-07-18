@@ -124,6 +124,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "libloading 0.8.9",
+ "memchr",
  "nokhwa",
  "openh264",
  "opus",
