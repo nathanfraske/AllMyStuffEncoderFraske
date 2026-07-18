@@ -167,6 +167,15 @@ for the posture's codec+features; viewer has a decoder for that codec).
 
 ## Open arcs & tasks (see the in-tool task list #16–#34)
 
+- **Smoothness/pacing/latency idea bank** —
+  `docs/SMOOTHNESS-IDEAS-2026-07.md` (deep-brainstorm pass, 2026-07-18):
+  19 graded ideas across industry-standard / novel / kernel-level tiers
+  + a measure-first plan (M1–M5) + an explicitly-rejected list that
+  encodes the frozen-daemon rule. Top of the stack by win÷effort:
+  link-fitted pacer drain, AIMD bitrate on the existing reconfigure
+  seam, the Win11 scheduling-honesty bundle, chunk-train BWE, LTR
+  recovery. Start with M2/M3 (~40 lines, they de-risk everything else).
+
 - **#33 AMF rung (AMD encode)** — loader shipped (`f460b13`). NEXT: C-ABI
   vtable transcription from staged headers in the session scratchpad
   `…/scratchpad/amf/` (Factory→Context InitDX11→Component
