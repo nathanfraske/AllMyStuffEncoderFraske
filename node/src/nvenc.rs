@@ -1075,15 +1075,25 @@ mod tests {
     #[test]
     #[ignore = "bench — run with --ignored --nocapture"]
     fn bench_nvenc_sdk_cycle() {
-        // Interleaved posture A/B: balanced (deep VBV, IDR cadence) vs
-        // game (GDR + single-frame VBV) — the decomposition of what the
-        // game kernel costs and buys at the encoder.
-        for (round, game) in [(1, false), (1, true), (2, false), (2, true)] {
-            bench_cycle_posture(round, game);
+        // Interleaved posture matrix — the decomposition of what each
+        // kernel costs and buys at the encoder: balanced vs game (VBV
+        // shape), game at its uncorked 200 Mbps ceiling (the "extra bits
+        // are latency-free under single-frame VBV" claim), and studio
+        // (P5 + high-quality tuning at its 150 Mbps floor).
+        const MATRIX: [(&str, bool, bool, u32); 4] = [
+            ("balanced 30M", false, false, 30_000_000),
+            ("game 30M", true, false, 30_000_000),
+            ("game 200M", true, false, 200_000_000),
+            ("studio 150M", false, true, 150_000_000),
+        ];
+        for round in [1u32, 2] {
+            for (label, game, studio, bitrate) in MATRIX {
+                bench_cycle_posture(round, label, game, studio, bitrate);
+            }
         }
     }
 
-    fn bench_cycle_posture(round: u32, game: bool) {
+    fn bench_cycle_posture(round: u32, label: &str, game: bool, studio: bool, bitrate: u32) {
         use std::time::{Duration, Instant};
         let (w, h) = (2560u32, 1440u32);
         let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
@@ -1094,7 +1104,7 @@ mod tests {
             }
         };
         let mut enc =
-            match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, game, false) {
+            match NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("SKIP: {e}");
@@ -1130,8 +1140,7 @@ mod tests {
         let p95 = enc_ms[(enc_ms.len() * 95 / 100).min(enc_ms.len() - 1)];
         let max = enc_ms[enc_ms.len() - 1];
         println!(
-            "bench NVENC SDK @1440p [round {round} · {}] over {n} frames ({units} units):",
-            if game { "GAME: gdr+1f-vbv" } else { "balanced" }
+            "bench NVENC SDK @1440p [round {round} · {label}] over {n} frames ({units} units):",
         );
         println!("  upload (synthetic, not paid live): {:6.3} ms", ms(t_up));
         println!("  convert (blt queue)              : {:6.3} ms", ms(t_conv));
