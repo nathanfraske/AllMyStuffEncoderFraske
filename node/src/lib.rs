@@ -113,6 +113,11 @@ pub(crate) mod persist;
 pub mod reboot;
 pub mod shares;
 pub mod sites;
+/// The field-test telemetry line: process/system CPU + per-engine GPU
+/// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —
+/// the same line on NVIDIA, AMD, and Intel boxes.
+#[cfg(windows)]
+pub mod telemetry;
 #[cfg(feature = "host")]
 pub mod terminal;
 #[cfg(not(feature = "host"))]

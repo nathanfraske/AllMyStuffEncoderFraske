@@ -547,6 +547,10 @@ fn init_logging(as_service: bool) {
         .with(verbose_layer)
         .with(stdout_layer.and_then(file_layer).with_filter(filter))
         .init();
+    // The field-test telemetry line rides the log just initialized —
+    // CPU + per-engine GPU busy + VRAM every 5 s, vendor-neutral.
+    #[cfg(windows)]
+    allmystuff_node::telemetry::start();
 }
 
 /// A `MakeWriter` over `./allmystuff-serve.log` — the launch directory's
