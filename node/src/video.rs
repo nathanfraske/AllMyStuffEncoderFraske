@@ -128,6 +128,11 @@ pub struct StreamStats {
     bytes: u64,
     scale: Duration,
     encode: Duration,
+    /// Per-frame samples (ms) inside the current window, for the p95s —
+    /// smoothness lives in the tail, not the average: a clean 8 ms mean
+    /// with a 40 ms p95 *is* the stutter the viewer feels.
+    scale_ms: Vec<f32>,
+    encode_ms: Vec<f32>,
     out_w: u32,
     out_h: u32,
 }
@@ -148,9 +153,32 @@ impl StreamStats {
             bytes: 0,
             scale: Duration::ZERO,
             encode: Duration::ZERO,
+            scale_ms: Vec::new(),
+            encode_ms: Vec::new(),
             out_w: 0,
             out_h: 0,
         }
+    }
+
+    /// Record one conversion's cost: the total feeds the window average,
+    /// the sample feeds the p95.
+    fn add_scale(&mut self, d: Duration) {
+        self.scale += d;
+        self.scale_ms.push(d.as_secs_f32() * 1000.0);
+    }
+
+    /// Record one encode call's cost — see [`Self::add_scale`].
+    fn add_encode(&mut self, d: Duration) {
+        self.encode += d;
+        self.encode_ms.push(d.as_secs_f32() * 1000.0);
+    }
+
+    fn p95(samples: &mut [f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        samples.sort_by(f32::total_cmp);
+        samples[(samples.len() * 95 / 100).min(samples.len() - 1)]
     }
 
     fn maybe_log(&mut self) {
@@ -160,8 +188,10 @@ impl StreamStats {
         }
         let secs = elapsed.as_secs_f64();
         let frames = self.sent.max(1) as f64;
+        let scale_p95 = Self::p95(&mut self.scale_ms);
+        let encode_p95 = Self::p95(&mut self.encode_ms);
         let line = format!(
-            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms · encode {:.1}ms · {} key · {} static-skip · {} dropped",
+            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
@@ -187,6 +217,8 @@ impl StreamStats {
         self.bytes = 0;
         self.scale = Duration::ZERO;
         self.encode = Duration::ZERO;
+        self.scale_ms.clear();
+        self.encode_ms.clear();
     }
 }
 
@@ -241,6 +273,13 @@ const REFINE_PASSES: u8 = 2;
 const REFINE_AFTER: Duration = Duration::from_millis(350);
 /// Spacing between refinement passes.
 const REFINE_SPACING: Duration = Duration::from_millis(800);
+/// How long a degraded (screenshot-fallback) spell runs before the route
+/// re-attempts a DXGI duplication session. Duplication failures are usually
+/// transient — a fullscreen-exclusive app, the UAC desktop, a driver reset —
+/// and without this a route stayed pinned on soft, CPU-hungry GDI grabs for
+/// its whole life once it fell.
+#[cfg(windows)]
+const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(30);
 
 /// The forced-IDR interval (ms) the latest receiver feedback implies. The
 /// conservative half of the adaptation: relax to [`IDR_MS_RELAXED`] only on
@@ -1169,51 +1208,79 @@ fn run_capture(
 
     // Windows: our own DXGI Output Duplication session — damage-driven,
     // per-monitor, releasable (see `win_capture` for why xcap's recorder
-    // can't carry this). A failed start (output held elsewhere, RDP
-    // session) falls through to the screenshot loop.
+    // can't carry this). A failed start or a dead session falls back to the
+    // screenshot loop, but only for [`DXGI_REPROMOTE_AFTER`] at a time:
+    // duplication failures are usually transient (a fullscreen-exclusive
+    // app, the UAC desktop, a driver reset), and a route used to stay
+    // pinned on soft, expensive GDI grabs for its whole life once it fell.
     #[cfg(windows)]
     {
         match monitor.id() {
-            Ok(mid) => match crate::win_capture::start(mid) {
-                Ok((session, frames, reclaim)) => {
-                    tracing::info!("DXGI duplication started for {route_id} (monitor {mid:#x})");
-                    let reclaim_fn = |buf: Vec<u8>| {
-                        let _ = reclaim.try_send(buf);
-                    };
-                    let result = pump_frames(
-                        stop,
-                        fps,
-                        &frames,
-                        move |f: crate::win_capture::RawFrame| {
-                            // DXGI is the only raw, unrotated scan-out; its own
-                            // DXGI_OUTDUPL_DESC.Rotation (carried on the frame)
-                            // is authoritative for making it upright.
-                            orient_to_monitor(f.rgba, f.width, f.height, f.rotation_deg)
-                        },
-                        on_packet,
-                        &mut encoder,
-                        &mut stats,
-                        &mut reporter,
-                        Some(&reclaim_fn),
-                    );
-                    drop(session);
-                    match result {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            if stop.load(Ordering::SeqCst) {
-                                return Ok(());
+            Ok(mid) => loop {
+                match crate::win_capture::start(mid) {
+                    Ok((session, frames, reclaim)) => {
+                        tracing::info!(
+                            "DXGI duplication started for {route_id} (monitor {mid:#x})"
+                        );
+                        let reclaim_fn = |buf: Vec<u8>| {
+                            let _ = reclaim.try_send(buf);
+                        };
+                        let result = pump_frames(
+                            stop,
+                            fps,
+                            &frames,
+                            move |f: crate::win_capture::RawFrame| {
+                                // DXGI is the only raw, unrotated scan-out; its own
+                                // DXGI_OUTDUPL_DESC.Rotation (carried on the frame)
+                                // is authoritative for making it upright.
+                                orient_to_monitor(f.rgba, f.width, f.height, f.rotation_deg)
+                            },
+                            on_packet,
+                            &mut encoder,
+                            &mut stats,
+                            &mut reporter,
+                            Some(&reclaim_fn),
+                        );
+                        drop(session);
+                        match result {
+                            Ok(()) => return Ok(()),
+                            Err(e) => {
+                                if stop.load(Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                tracing::warn!(
+                                    "DXGI duplication for {route_id} ended ({e}); \
+                                     falling back to per-frame screenshots"
+                                );
                             }
-                            tracing::warn!(
-                                "DXGI duplication for {route_id} ended ({e}); \
-                                 falling back to per-frame screenshots"
-                            );
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        "DXGI duplication for {route_id} unavailable ({e}); \
+                         falling back to per-frame screenshots"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    "DXGI duplication for {route_id} unavailable ({e}); \
-                     falling back to per-frame screenshots"
-                ),
+                // A fresh monitor handle for the fallback — the duplication
+                // may have died to a mode change that moved things around.
+                let monitor = select_monitor(monitor_id).inspect_err(|e| {
+                    reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
+                })?;
+                if !run_oneshot_capture(
+                    stop,
+                    fps,
+                    route_id,
+                    &monitor,
+                    on_packet,
+                    &mut encoder,
+                    &mut stats,
+                    &mut reporter,
+                    Some(DXGI_REPROMOTE_AFTER),
+                )? {
+                    return Ok(()); // route stopped while degraded
+                }
+                tracing::info!(
+                    "retrying DXGI duplication for {route_id} after the screenshot spell"
+                );
             },
             Err(e) => tracing::warn!(
                 "monitor id unreadable for {route_id} ({e}); \
@@ -1349,7 +1416,9 @@ fn run_capture(
         &mut encoder,
         &mut stats,
         &mut reporter,
+        None,
     )
+    .map(|_| ())
 }
 
 /// Mirrors xcap's (private) `wayland_detect`, so our path choice matches
@@ -1537,7 +1606,7 @@ where
                         quiesced = false;
                         refines_left = 0;
                         refine_at = None;
-                        stats.scale += staged.scale_spent;
+                        stats.add_scale(staged.scale_spent);
                         match encoder.encode_staged(staged, stats, &mut recycle) {
                             Ok(packets) => emit_packets(packets, on_packet, stats),
                             Err(e) => break Err(e),
@@ -1826,7 +1895,10 @@ fn run_session_capture(
 /// One screenshot per tick — the X11 path and the universal fallback.
 /// Every grab pays the platform's full one-shot cost, so the effective
 /// rate is whatever that path allows; the encoder's unchanged-frame gate
-/// at least makes idle screens cheap to *send*.
+/// at least makes idle screens cheap to *send*. When `retry_capture_after`
+/// is set, the loop returns `Ok(true)` once that long has passed — the
+/// caller's cue to re-attempt a real capture session; `Ok(false)` means the
+/// route stopped.
 #[allow(clippy::too_many_arguments)]
 fn run_oneshot_capture(
     stop: &AtomicBool,
@@ -1837,10 +1909,17 @@ fn run_oneshot_capture(
     encoder: &mut HealingEncoder,
     stats: &mut StreamStats,
     reporter: &mut StatusReporter,
-) -> Result<(), String> {
+    retry_capture_after: Option<Duration>,
+) -> Result<bool, String> {
     let budget = Duration::from_secs(1) / fps.max(1);
+    let began = Instant::now();
     let mut failures = 0u64;
     while !stop.load(Ordering::SeqCst) {
+        if let Some(after) = retry_capture_after {
+            if began.elapsed() >= after {
+                return Ok(true);
+            }
+        }
         let started = Instant::now();
         // Grab failures and encoder failures are different conditions with
         // different fates: a failing grab (screen lock, denied permission)
@@ -1888,7 +1967,7 @@ fn run_oneshot_capture(
             std::thread::sleep(rest);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The monitor a capture should run on: by enumeration id when the route
@@ -2008,7 +2087,7 @@ impl FrameEncoder {
         } else {
             scale_rgba(&rgba, sw, sh, dw, dh)
         };
-        stats.scale += t0.elapsed();
+        stats.add_scale(t0.elapsed());
         (stats.out_w, stats.out_h) = (dw, dh);
         let refresh_due = self.refresh.swap(false, Ordering::SeqCst)
             || self
@@ -2020,7 +2099,7 @@ impl FrameEncoder {
         }
         let t1 = Instant::now();
         let jpeg = encode_jpeg(&scaled, dw, dh, self.quality)?;
-        stats.encode += t1.elapsed();
+        stats.add_encode(t1.elapsed());
         stats.bytes += jpeg.len() as u64;
         stats.keyframes += 1; // every MJPEG frame is standalone
         self.prev = scaled;
@@ -2043,7 +2122,7 @@ impl FrameEncoder {
         let (dw, dh) = self.prev_size;
         let t1 = Instant::now();
         let jpeg = encode_jpeg(&self.prev, dw, dh, self.quality)?;
-        stats.encode += t1.elapsed();
+        stats.add_encode(t1.elapsed());
         stats.bytes += jpeg.len() as u64;
         stats.keyframes += 1;
         self.last_sent = Some(Instant::now());
@@ -2628,7 +2707,7 @@ impl H264Stream {
             YuvFormat::I420 => scale_rgba_to_i420(&rgba, sw, sh, dw, dh),
             YuvFormat::Nv12 => scale_rgba_to_nv12(&rgba, sw, sh, dw, dh),
         };
-        stats.scale += t0.elapsed();
+        stats.add_scale(t0.elapsed());
         self.encode_prepared(yuv, format, dw, dh, stats, &mut |_spent| {})
     }
 
@@ -2703,7 +2782,7 @@ impl H264Stream {
         let outcome = self
             .codec
             .encode_yuv(&yuv, dw as usize, dh as usize, force_idr)?;
-        stats.encode += t1.elapsed();
+        stats.add_encode(t1.elapsed());
         if outcome.consumed {
             recycle(std::mem::replace(&mut self.prev, yuv));
             self.prev_size = (dw, dh);
@@ -2744,7 +2823,7 @@ impl H264Stream {
         let outcome = self
             .codec
             .encode_yuv(&self.prev, dw as usize, dh as usize, force_idr)?;
-        stats.encode += t1.elapsed();
+        stats.add_encode(t1.elapsed());
         if outcome.consumed {
             self.last_sent = Some(Instant::now());
             if force_idr {

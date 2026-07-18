@@ -324,17 +324,39 @@ impl MediaPipe {
             *writer = Some(send_half);
         }
         let w = writer.as_mut().expect("connected above");
-        if let Err(e) = w.write_all(line.as_bytes()).await {
-            *writer = None;
-            return Err(anyhow!("media pipe write: {e}"));
+        // Bounded: a daemon that stops *reading* (wedged, not dead) never
+        // errors the write — it just never completes, silently stalling
+        // every media send behind this mutex forever. The timeout converts
+        // that into the same drop-and-reconnect a write error gets. A
+        // healthy local-socket write completes in microseconds; seconds of
+        // blockage is a wedged peer, not backpressure.
+        let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+            w.write_all(line.as_bytes()).await?;
+            w.flush().await
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                *writer = None;
+                Err(anyhow!("media pipe write: {e}"))
+            }
+            Err(_) => {
+                *writer = None;
+                Err(anyhow!(
+                    "media pipe write timed out after {}s — dropping the connection",
+                    PIPE_WRITE_TIMEOUT.as_secs()
+                ))
+            }
         }
-        if let Err(e) = w.flush().await {
-            *writer = None;
-            return Err(anyhow!("media pipe flush: {e}"));
-        }
-        Ok(())
     }
 }
+
+/// How long one pipe write may block before the connection is declared
+/// wedged and dropped for reconnect. Healthy local IPC flushes in
+/// microseconds; genuine backpressure shows as *slow* progress, not a
+/// multi-second single write.
+const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A persistent connection dedicated to **binary** media-track sends — the
 /// H.264 and Opus lanes. The first send converts the connection with a single
@@ -400,32 +422,49 @@ impl MediaTrackPipe {
             spawn_response_drain(reader);
             // Convert the fresh connection to the binary media-track protocol.
             let line = serde_json::to_string(&Request::MediaTrackPipe)? + "\n";
-            send_half
-                .write_all(line.as_bytes())
-                .await
-                .context("media-track handshake")?;
-            send_half
-                .flush()
-                .await
-                .context("media-track handshake flush")?;
+            let hs = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+                send_half.write_all(line.as_bytes()).await?;
+                send_half.flush().await
+            })
+            .await;
+            match hs {
+                Ok(r) => r.context("media-track handshake")?,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "media-track handshake timed out after {}s",
+                        PIPE_WRITE_TIMEOUT.as_secs()
+                    ))
+                }
+            }
             *writer = Some(send_half);
         }
         // Header and body go out under one lock so frames never interleave.
+        // Bounded like the JSON pipe: a hung-but-open daemon socket must
+        // cost a reconnect, not a silent forever-stall of every audio and
+        // video send behind this mutex (the one silent-freeze vector the
+        // encoder pass left open).
         let w = writer.as_mut().expect("connected above");
         let len = (body.len() as u32).to_le_bytes();
-        if let Err(e) = w.write_all(&len).await {
-            *writer = None;
-            return Err(anyhow!("media-track len: {e}"));
+        let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+            w.write_all(&len).await?;
+            w.write_all(&body).await?;
+            w.flush().await
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                *writer = None;
+                Err(anyhow!("media-track write: {e}"))
+            }
+            Err(_) => {
+                *writer = None;
+                Err(anyhow!(
+                    "media-track write timed out after {}s — dropping the connection",
+                    PIPE_WRITE_TIMEOUT.as_secs()
+                ))
+            }
         }
-        if let Err(e) = w.write_all(&body).await {
-            *writer = None;
-            return Err(anyhow!("media-track body: {e}"));
-        }
-        if let Err(e) = w.flush().await {
-            *writer = None;
-            return Err(anyhow!("media-track flush: {e}"));
-        }
-        Ok(())
     }
 }
 
