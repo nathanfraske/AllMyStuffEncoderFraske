@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-/// One H.264 access unit headed for a route's decoder.
+/// One access unit headed for a route's decoder (H.264 or HEVC — the
+/// stream declares itself; see [`sniff_codec`]).
 pub struct Au {
     /// Presentation time in µs (from the RTP clock).
     pub ts_us: u64,
@@ -31,6 +32,48 @@ pub struct Au {
     pub key: bool,
     /// Annex-B bytes.
     pub data: Vec<u8>,
+}
+
+/// Which codec an Annex-B access unit opens with, judged from its first
+/// NAL header byte — and only for *parameter-set-led* units (the decode
+/// entries both our encoders emit with repeated VPS/SPS/PPS), where the
+/// byte values are unambiguous: HEVC VPS/SPS/PPS read as H.264 types
+/// 0/2/4, which no H.264 key unit leads with, and H.264 SPS/PPS/IDR read
+/// as HEVC types 19/51/50/etc. outside the parameter-set range. Delta
+/// units return `None` — the stream's codec is a property carried from
+/// key to key, not re-judged per frame.
+#[derive(Clone, Copy, PartialEq)]
+enum AuCodec {
+    H264,
+    Hevc,
+}
+
+fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
+    let mut i = 0usize;
+    let b = loop {
+        if i + 3 >= data.len() {
+            return None;
+        }
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                break data[i + 3];
+            }
+            if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
+                break data[i + 4];
+            }
+        }
+        i += 1;
+    };
+    if b & 0x80 != 0 {
+        return None;
+    }
+    match (b >> 1) & 0x3F {
+        32 | 33 | 34 => Some(AuCodec::Hevc), // VPS · SPS · PPS
+        _ => match b & 0x1F {
+            5 | 7 | 8 => Some(AuCodec::H264), // IDR · SPS · PPS
+            _ => None,
+        },
+    }
 }
 
 /// Pending AUs per route before the overflow dump. Kept short (~200 ms at
@@ -139,7 +182,18 @@ fn run_decode<F, G>(
     // viewer box doesn't stutter the picture it's watching.
     crate::os_perf::boost_media_thread();
 
-    let mut decoder: Option<Decoder> = None;
+    // The route's decoder, whichever codec the stream declared at its
+    // last key unit. H.264 = software openh264 (every platform); HEVC =
+    // NVDEC (Windows + NVIDIA — the posture negotiation only offers HEVC
+    // where this rung exists, so the unavailable arm is a guard, not a
+    // path).
+    enum Active {
+        H264(Decoder),
+        #[cfg(all(windows, feature = "host"))]
+        Hevc(crate::nvdec::NvdecHevc),
+    }
+    let mut decoder: Option<Active> = None;
+    let mut stream_codec = AuCodec::H264;
     // Decode entry is a key unit; deltas before one can't decode.
     let mut waiting_key = true;
     let mut last_err: Option<Instant> = None;
@@ -160,60 +214,112 @@ fn run_decode<F, G>(
             waiting_key = true;
             on_glitch();
         }
-        if waiting_key && !au.key {
+        // A parameter-set-led unit is a decode entry in both codecs and
+        // carries the stream's codec declaration — trusted over `au.key`,
+        // whose daemon-side derivation is H.264-shaped and blind to HEVC.
+        let sniffed = sniff_codec(&au.data);
+        let is_key = au.key || sniffed.is_some();
+        if waiting_key && !is_key {
             continue;
+        }
+        if let Some(c) = sniffed {
+            if stream_codec != c {
+                // Codec morph mid-route (posture change): the old decoder
+                // has nothing valid to say about the new stream.
+                stream_codec = c;
+                decoder = None;
+            }
         }
         let dec = match &mut decoder {
             Some(d) => d,
-            None => match Decoder::with_api_config(
-                openh264::OpenH264API::from_source(),
-                DecoderConfig::new(),
-            ) {
-                Ok(d) => decoder.insert(d),
-                Err(e) => {
-                    // Init trouble is permanent for this stream — say so
-                    // once a window, keep draining so the route isn't
-                    // backed up behind us.
-                    if last_err.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-                        last_err = Some(Instant::now());
-                        tracing::warn!("openh264 decoder init for {route_id} failed: {e}");
-                    }
-                    continue;
-                }
-            },
-        };
-        let t0 = Instant::now();
-        match dec.decode(&au.data) {
-            Ok(picture) => {
-                // A key unit that decoded clean re-arms the stream even if
-                // this call produced no picture (headers-only AU): the
-                // reference frame now lives in the decoder.
-                waiting_key = false;
-                if let Some(yuv) = picture {
-                    let (w, h) = yuv.dimensions();
-                    if w == 0 || h == 0 {
+            None => {
+                let built = match stream_codec {
+                    AuCodec::H264 => Decoder::with_api_config(
+                        openh264::OpenH264API::from_source(),
+                        DecoderConfig::new(),
+                    )
+                    .map(Active::H264)
+                    .map_err(|e| format!("openh264: {e}")),
+                    #[cfg(all(windows, feature = "host"))]
+                    AuCodec::Hevc => crate::nvdec::NvdecHevc::open().map(Active::Hevc),
+                    #[cfg(not(all(windows, feature = "host")))]
+                    AuCodec::Hevc => Err("no HEVC decoder on this platform".to_string()),
+                };
+                match built {
+                    Ok(d) => decoder.insert(d),
+                    Err(e) => {
+                        // Init trouble is permanent for this stream — say
+                        // so once a window, keep draining so the route
+                        // isn't backed up behind us.
+                        if last_err.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                            last_err = Some(Instant::now());
+                            tracing::warn!("decoder init for {route_id} failed: {e}");
+                        }
                         continue;
                     }
-                    let mut packet = raw_ipc_packet(au.ts_us, w as u32, h as u32);
-                    yuv.write_rgba8(&mut packet[crate::mesh::VIDEO_IPC_HEADER_LEN..]);
-                    spent += t0.elapsed();
-                    frames += 1;
-                    out_dims = (w, h);
-                    on_frame(packet);
                 }
             }
-            Err(e) => {
-                // Corrupt bitstream (a lost unit upstream): drop the
-                // decoder, re-enter at the next IDR. Rate-limited — at
-                // frame rate this would otherwise be a log flood.
-                if last_err.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-                    last_err = Some(Instant::now());
-                    tracing::warn!("H.264 decode for {route_id} failed ({e}); awaiting a key unit");
+        };
+        let t0 = Instant::now();
+        let mut broke: Option<String> = None;
+        match dec {
+            Active::H264(dec) => match dec.decode(&au.data) {
+                Ok(picture) => {
+                    // A key unit that decoded clean re-arms the stream
+                    // even if this call produced no picture (headers-only
+                    // AU): the reference frame now lives in the decoder.
+                    waiting_key = false;
+                    if let Some(yuv) = picture {
+                        let (w, h) = yuv.dimensions();
+                        if w == 0 || h == 0 {
+                            continue;
+                        }
+                        let mut packet = raw_ipc_packet(au.ts_us, w as u32, h as u32);
+                        yuv.write_rgba8(&mut packet[crate::mesh::VIDEO_IPC_HEADER_LEN..]);
+                        spent += t0.elapsed();
+                        frames += 1;
+                        out_dims = (w, h);
+                        on_frame(packet);
+                    }
                 }
-                decoder = None;
-                waiting_key = true;
-                on_glitch();
+                Err(e) => broke = Some(format!("H.264: {e}")),
+            },
+            #[cfg(all(windows, feature = "host"))]
+            Active::Hevc(dec) => match dec.decode(&au.data, au.ts_us) {
+                Ok(pics) => {
+                    waiting_key = false;
+                    for f in pics {
+                        let (w, h) = (f.width as usize, f.height as usize);
+                        if w == 0 || h == 0 {
+                            continue;
+                        }
+                        let mut packet = raw_ipc_packet(f.ts_us, f.width, f.height);
+                        crate::nvdec::nv12_to_rgba(
+                            &f.nv12,
+                            w,
+                            h,
+                            &mut packet[crate::mesh::VIDEO_IPC_HEADER_LEN..],
+                        );
+                        spent += t0.elapsed();
+                        frames += 1;
+                        out_dims = (w, h);
+                        on_frame(packet);
+                    }
+                }
+                Err(e) => broke = Some(format!("HEVC: {e}")),
+            },
+        }
+        if let Some(e) = broke {
+            // Corrupt bitstream (a lost unit upstream): drop the decoder,
+            // re-enter at the next IDR. Rate-limited — at frame rate this
+            // would otherwise be a log flood.
+            if last_err.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                last_err = Some(Instant::now());
+                tracing::warn!("video decode for {route_id} failed ({e}); awaiting a key unit");
             }
+            decoder = None;
+            waiting_key = true;
+            on_glitch();
         }
         let elapsed = since.elapsed();
         if elapsed >= STATS_EVERY && frames > 0 {
@@ -304,5 +410,93 @@ mod tests {
         assert!(bridge.is_running("r1"));
         bridge.stop("r1");
         assert!(!bridge.is_running("r1"));
+    }
+
+    /// HEVC through the whole bridge on the real hardware rungs: NVENC
+    /// lossless AUs fed with `key: false` on purpose — the daemon's key
+    /// flag is H.264-shaped and must never be load-bearing for HEVC; the
+    /// sniff carries the entry. 640×360 codes with CTB padding (384
+    /// rows), so the display crop is exercised too. Skips (passing)
+    /// without the NVIDIA rungs.
+    #[cfg(all(windows, feature = "host"))]
+    #[test]
+    fn hevc_stream_decodes_through_bridge() {
+        let (w, h) = (640u32, 360u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: GPU convert unavailable: {e}");
+                return;
+            }
+        };
+        let mut enc =
+            match crate::nvenc::NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("SKIP: NVENC HEVC unavailable: {e}");
+                    return;
+                }
+            };
+        // Availability probe, held open through the test: paying cuInit
+        // here keeps the bridge thread's lazy open fast, the same warm
+        // state a live viewer reaches after its first session.
+        let _warm = match crate::nvdec::NvdecHevc::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP: NVDEC unavailable: {e}");
+                return;
+            }
+        };
+        let bridge = DecodeBridge::new();
+        let got = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut bgra = vec![0u8; wu * hu * 4];
+        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+        for i in 0..30u64 {
+            for (j, v) in bgra.iter_mut().enumerate() {
+                *v = ((j as u64).wrapping_add(i * 11) % 251) as u8;
+            }
+            gpu.update_bgra(&tex, &bgra, w, h);
+            let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+            // Periodic IDRs, like the live stream's adaptive cadence: if
+            // the bridge's bounded queue ever dumps (slow first open),
+            // the stream carries its own re-entry points.
+            let out = enc
+                .encode_texture(&nv12, i.is_multiple_of(10))
+                .expect("encode");
+            gpu.release(slot);
+            for (d, _) in out.units {
+                let sink = got.clone();
+                bridge.feed(
+                    "route-hevc",
+                    Au {
+                        ts_us: i * 16_667,
+                        key: false,
+                        data: d,
+                    },
+                    move |p| sink.lock().push(p),
+                    || {},
+                );
+            }
+            // Stay under the bounded queue — the decoder runs ~1 ms/frame.
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while got.lock().len() < 30 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        bridge.stop("route-hevc");
+        let packets = got.lock();
+        // ≥18: allows one dumped queue window at start-up (≤12 units)
+        // healed by the next periodic key — the bridge's designed
+        // recovery — while still proving a sustained decoded stream.
+        assert!(packets.len() >= 18, "decoded packets: {}", packets.len());
+        let expect = crate::mesh::VIDEO_IPC_HEADER_LEN + wu * hu * 4;
+        assert!(packets.iter().all(|p| p.len() == expect), "packet shape");
+        let pw = u32::from_le_bytes(packets[0][4..8].try_into().unwrap());
+        let ph = u32::from_le_bytes(packets[0][8..12].try_into().unwrap());
+        assert_eq!((pw, ph), (w, h), "display-cropped dimensions");
+        let body = &packets[5][crate::mesh::VIDEO_IPC_HEADER_LEN..];
+        assert!(body.iter().any(|&b| b > 8), "pixels arrived");
     }
 }
