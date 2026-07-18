@@ -993,6 +993,71 @@ mod tests {
         assert!(decoded >= fed - 3, "decoded {decoded} of {fed}");
     }
 
+    /// Ignored-by-default bench: the SDK rung's per-frame cost at 1440p,
+    /// with the exact parameters of `bench_gpu_lane_cycle` (30 Mbps, 150
+    /// frames, full-frame gradient shift) so its encode column compares
+    /// directly against the MF rung's. One semantic difference to read
+    /// with the numbers: this rung is synchronous — the call time IS the
+    /// frame's true encode-to-bits latency — while the MF rung's call
+    /// returns while the hardware still works and its bits surface a call
+    /// later (~a frame of hidden pipeline latency at the pump's cadence).
+    /// Run: `cargo test --release -- --ignored bench_nvenc --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_nvenc_sdk_cycle() {
+        use std::time::{Duration, Instant};
+        let (w, h) = (2560u32, 1440u32);
+        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, false) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+        let n = 150u32;
+        let (mut t_up, mut t_conv, mut t_enc) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let mut enc_ms: Vec<f64> = Vec::with_capacity(n as usize);
+        let mut units = 0usize;
+        for i in 0..n {
+            for (j, v) in bgra.iter_mut().enumerate() {
+                *v = ((j as u32).wrapping_add(i.wrapping_mul(7)) % 255) as u8;
+            }
+            let t0 = Instant::now();
+            gpu.update_bgra(&tex, &bgra, w, h);
+            let t1 = Instant::now();
+            let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+            let t2 = Instant::now();
+            let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+            let t3 = Instant::now();
+            gpu.release(slot);
+            units += out.units.len();
+            t_up += t1 - t0;
+            t_conv += t2 - t1;
+            t_enc += t3 - t2;
+            enc_ms.push((t3 - t2).as_secs_f64() * 1000.0);
+        }
+        enc_ms.sort_by(f64::total_cmp);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(n);
+        let p95 = enc_ms[(enc_ms.len() * 95 / 100).min(enc_ms.len() - 1)];
+        let max = enc_ms[enc_ms.len() - 1];
+        println!("bench NVENC SDK @1440p over {n} frames ({units} units):");
+        println!("  upload (synthetic, not paid live): {:6.3} ms", ms(t_up));
+        println!("  convert (blt queue)              : {:6.3} ms", ms(t_conv));
+        println!(
+            "  encode_texture (sync, true latency): {:6.3} ms avg · p95 {p95:6.3} · max {max:6.3}",
+            ms(t_enc)
+        );
+    }
+
     /// The GDR pilot: with intra-refresh on, a two-second stream contains
     /// **no IDR after the first frame** — the intra data rides refresh
     /// waves — yet decodes cleanly end to end. This is the burst-shrinking
