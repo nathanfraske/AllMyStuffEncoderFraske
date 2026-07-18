@@ -227,31 +227,60 @@ impl VideoToolboxH264 {
         let sink = Box::into_raw(Box::new(CallbackSink { tx }));
         let mut session: VTCompressionSessionRef = std::ptr::null_mut();
 
-        // Encoder specification: hardware or nothing (see above).
-        let require_hw = unsafe {
-            CFDictionary::from_CFType_pairs(&[(
+        // Encoder specification: hardware or nothing (see above), plus the
+        // low-latency rate controller where the system has it (macOS
+        // 11.3+): strict one-in-one-out, no reordering, and faster rate
+        // adaptation to link changes — the productized form of the realtime
+        // posture the properties below ask for piecemeal. The key is built
+        // by *name* rather than the linked symbol so binaries still load on
+        // older systems (an unknown spec key there fails the create, which
+        // is why the create retries without it — hardware-required stays
+        // non-negotiable on both attempts).
+        let spec_for = |low_latency: bool| unsafe {
+            let mut pairs = vec![(
                 core_foundation::string::CFString::wrap_under_get_rule(
                     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 )
                 .as_CFType(),
                 CFBoolean::true_value().as_CFType(),
-            )])
+            )];
+            if low_latency {
+                pairs.push((
+                    core_foundation::string::CFString::new("EnableLowLatencyRateControl")
+                        .as_CFType(),
+                    CFBoolean::true_value().as_CFType(),
+                ));
+            }
+            CFDictionary::from_CFType_pairs(&pairs)
         };
 
-        let status = unsafe {
-            VTCompressionSessionCreate(
-                std::ptr::null(),
-                w as i32,
-                h as i32,
-                CM_VIDEO_CODEC_TYPE_H264,
-                require_hw.as_concrete_TypeRef(),
-                std::ptr::null(),
-                std::ptr::null(),
-                output_callback,
-                sink.cast(),
-                &mut session,
-            )
-        };
+        let mut status = 0;
+        for low_latency in [true, false] {
+            let spec = spec_for(low_latency);
+            status = unsafe {
+                VTCompressionSessionCreate(
+                    std::ptr::null(),
+                    w as i32,
+                    h as i32,
+                    CM_VIDEO_CODEC_TYPE_H264,
+                    spec.as_concrete_TypeRef(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    output_callback,
+                    sink.cast(),
+                    &mut session,
+                )
+            };
+            if status == 0 && !session.is_null() {
+                if !low_latency {
+                    tracing::info!(
+                        "VideoToolbox opened without low-latency rate control (pre-11.3 macOS?)"
+                    );
+                }
+                break;
+            }
+            session = std::ptr::null_mut();
+        }
         if status != 0 || session.is_null() {
             // Re-own the sink so the failed open leaks nothing.
             unsafe { drop(Box::from_raw(sink)) };

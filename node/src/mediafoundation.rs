@@ -190,14 +190,17 @@ impl HwEncoder {
         // recovery cadence. Plus the ability to force a keyframe on demand.
         let codecapi = transform.cast::<ICodecAPI>().ok();
         if let Some(api) = &codecapi {
-            let peak = bitrate.saturating_mul(2);
+            // Peak + VBV from the shared posture: quality-first by default,
+            // trimmed for burst latency in game mode (see
+            // `video::burst_bounds`).
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
                 &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
             );
             let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
             let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
-            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(bitrate));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
             let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &variant_bool(true));
             let _ = api.SetValue(
                 &CODECAPI_AVEncMPVGOPSize,

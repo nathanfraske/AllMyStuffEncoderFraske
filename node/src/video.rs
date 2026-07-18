@@ -284,25 +284,67 @@ pub enum LinkClass {
     Unknown,
 }
 
+/// Game mode (`ALLMYSTUFF_GAME_MODE=1`): the cadence-and-latency-first
+/// posture for driving a game over the stream. Two automatic dials move —
+/// the off-LAN fps floor rises to 60 ([`auto_fps`]) and the encoder's burst
+/// headroom tightens ([`burst_bounds`]) so a scene change queues for half
+/// the time. The caveat is documented honestly: the transport is still
+/// open-loop (no pacer/BWE), so 60 fps over a weak WAN link is the
+/// operator's deliberate trade until the transport work lands — which is
+/// exactly why this is an explicit opt-in and not the default.
+pub(crate) fn game_mode() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_GAME_MODE") {
+            Ok(v) if !v.is_empty() && v != "0" => {
+                tracing::info!("ALLMYSTUFF_GAME_MODE on: 60 fps floor + tight burst bounds");
+                true
+            }
+            _ => false,
+        });
+    *ON
+}
+
 /// Capture cadence to aim for — a ceiling, not a promise. Session capture
 /// sustains it (damage-driven backends produce less on quiet screens);
 /// the one-shot fallback runs at whatever the platform's screenshot path
 /// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
 pub(crate) fn target_fps(link: LinkClass) -> u32 {
-    // 60 on a LAN — this is a Parsec-tier 4K60 stream; 30 made fast motion
-    // look choppy. It's a ceiling, not a promise (damage-driven backends
-    // produce less on quiet screens). Off-LAN (or before the path class is
-    // known) the automatic default steps back to 30: the transport is still
-    // open-loop (no pacer/BWE yet), and doubling the cadence there buys
-    // queueing latency, not smoothness. The env dial overrides the gate for
-    // every stream; an explicit viewer Tune never reaches this function.
     static FPS: std::sync::LazyLock<Option<u32>> =
         std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
-    FPS.unwrap_or(match link {
-        LinkClass::Lan => 60,
-        LinkClass::Wan | LinkClass::Unknown => 30,
-    })
-    .clamp(1, 120)
+    FPS.unwrap_or(auto_fps(link, game_mode())).clamp(1, 120)
+}
+
+/// The automatic cadence: 60 on a LAN — this is a Parsec-tier 4K60 stream;
+/// 30 made fast motion look choppy. It's a ceiling, not a promise
+/// (damage-driven backends produce less on quiet screens). Off-LAN (or
+/// before the path class is known) the default steps back to 30: the
+/// transport is still open-loop (no pacer/BWE yet), and doubling the
+/// cadence there buys queueing latency, not smoothness — unless
+/// [`game_mode`] pins the cadence-first trade deliberately. The env dial
+/// overrides everything; an explicit viewer Tune never reaches this.
+fn auto_fps(link: LinkClass, game: bool) -> u32 {
+    match (link, game) {
+        (LinkClass::Lan, _) => 60,
+        (_, true) => 60,
+        _ => 30,
+    }
+}
+
+/// The rate controller's burst posture: `(peak, vbv_window)` for a target
+/// bitrate. The standard posture gives a fast-motion / scene-change frame
+/// ~2× headroom over a ~1 s window — quality-first, and bare mean-rate CBR
+/// (the setting before it) was exactly the "blocky on fast motion" symptom.
+/// Game mode trims to 1.5× over ~½ s: a burst that queues for a full second
+/// is *felt* as input lag mid-game, and the post-quiesce refinement passes
+/// now repair what the tighter budget costs a transition. Shared by every
+/// backend that exposes peak/VBV (MF on Windows, the FFmpeg vendor
+/// encoders; VideoToolbox manages its own and ignores these).
+pub(crate) fn burst_bounds(bitrate: u32, game: bool) -> (u32, u32) {
+    if game {
+        (bitrate.saturating_mul(3) / 2, bitrate / 2)
+    } else {
+        (bitrate.saturating_mul(2), bitrate)
+    }
 }
 
 /// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
@@ -3170,6 +3212,24 @@ mod tests {
         assert!(q.windows(2).all(|w| w[0] <= w[1]), "monotonic: {q:?}");
         assert!(*q.first().unwrap() < JPEG_QUALITY); // "Speed" softer than neutral
         assert!(*q.last().unwrap() > JPEG_QUALITY); // "Quality" sharper
+    }
+
+    #[test]
+    fn game_mode_dials_raise_fps_and_tighten_bursts() {
+        // The pure halves of the game-mode preset (the env read is a
+        // process-wide LazyLock; tests exercise the logic directly).
+        assert_eq!(auto_fps(LinkClass::Lan, false), 60);
+        assert_eq!(auto_fps(LinkClass::Wan, false), 30);
+        assert_eq!(auto_fps(LinkClass::Unknown, false), 30);
+        assert_eq!(
+            auto_fps(LinkClass::Wan, true),
+            60,
+            "game mode floors 60 off-LAN"
+        );
+        assert_eq!(auto_fps(LinkClass::Unknown, true), 60);
+        // Standard posture: 2× peak over ~1 s; game mode: 1.5× over ~½ s.
+        assert_eq!(burst_bounds(40_000_000, false), (80_000_000, 40_000_000));
+        assert_eq!(burst_bounds(40_000_000, true), (60_000_000, 20_000_000));
     }
 
     #[test]

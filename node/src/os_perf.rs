@@ -14,7 +14,13 @@
 //! to stream through. A single step above normal keeps them responsive
 //! without starving anything (well below the audio/realtime classes).
 //!
-//! Both are silent no-ops off Windows.
+//! macOS gets the QoS-class arm of the same idea: on Apple silicon there is
+//! **no thread-affinity API** — a thread's QoS class is the only mechanism
+//! that steers it onto performance vs efficiency cores (and drives timer
+//! coalescing and I/O throttling). An untagged worker thread can sit on
+//! E-cores while the P-cores idle. The timer guard is Windows-only (macOS
+//! timers aren't quantized the same way); everything is a silent no-op on
+//! the remaining platforms.
 
 /// Holds the OS timer resolution at 1 ms for as long as any guard lives.
 /// winmm refcounts `timeBeginPeriod`/`timeEndPeriod` process-wide, so
@@ -85,6 +91,14 @@ pub(crate) fn boost_media_thread() {
         if !p_cores.is_empty() {
             let _ = SetThreadSelectedCpuSets(thread, p_cores.as_ptr(), p_cores.len() as u32);
         }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // USER_INTERACTIVE is the P-core / no-coalescing tier; the relative
+        // priority offset stays 0. Apple's guidance reserves this tier for
+        // work the user is actively perceiving — a live stream's capture,
+        // encode, and input-injection threads are exactly that.
+        let _ = libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 

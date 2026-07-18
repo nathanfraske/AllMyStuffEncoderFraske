@@ -77,6 +77,12 @@ fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
             d.set("preset", "veryfast");
             d.set("low_power", "1");
             d.set("forced_idr", "1");
+            // Low-latency screen-content posture: the remote-desktop
+            // scenario hint, no frame queueing (default async_depth is 4 —
+            // four frames of latency), no B-frame planning.
+            d.set("scenario", "displayremoting");
+            d.set("async_depth", "1");
+            d.set("b_strategy", "0");
         }
         "h264_videotoolbox" => {
             d.set("realtime", "1");
@@ -89,12 +95,13 @@ fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
     }
     // Peak/VBV headroom for every rate-controlled vendor (generic AVOptions →
     // rc_max_rate / rc_buffer_size; the hardware controllers honour them).
-    // VideoToolbox manages its own rate control and ignores these. maxrate =
-    // 2× average, bufsize ≈ 1 s so motion bursts can spike without starving.
+    // VideoToolbox manages its own rate control and ignores these. The
+    // shared posture (`video::burst_bounds`): 2×/1 s quality-first, trimmed
+    // to 1.5×/½ s in game mode for burst latency.
     if name != "h264_videotoolbox" {
-        let maxrate = u64::from(bitrate).saturating_mul(2);
+        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
         d.set("maxrate", &maxrate.to_string());
-        d.set("bufsize", &bitrate.to_string());
+        d.set("bufsize", &bufsize.to_string());
     }
     d
 }
