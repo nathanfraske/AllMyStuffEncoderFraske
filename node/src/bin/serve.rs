@@ -553,10 +553,15 @@ fn init_logging(as_service: bool) {
     allmystuff_node::telemetry::start();
 }
 
-/// A `MakeWriter` over `./allmystuff-serve.log` — the launch directory's
-/// verbose field-test log, truncated once per start. `None` (layer simply
-/// absent) when the cwd isn't writable or `ALLMYSTUFF_CWD_LOG=0`.
-fn cwd_log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static> {
+/// A `MakeWriter` over the verbose field-test log, truncated once per
+/// start. The dedicated home is `%LOCALAPPDATA%\AllMyStuff\logs\
+/// allmystuff-serve.log` — a guaranteed-writable, always-the-same place
+/// (the installed app's cwd is the install dir, where writes are denied
+/// or virtualized and the log silently vanished in the field). When the
+/// launch directory IS writable, a `./allmystuff-serve.log` is kept too
+/// — the console-run habit — but the fixed path is the one to grab.
+/// `None` when neither opens or `ALLMYSTUFF_CWD_LOG=0`.
+fn cwd_log_writer() -> Option<impl Fn() -> TeeHandle + Send + Sync + 'static> {
     if std::env::var("ALLMYSTUFF_CWD_LOG").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -565,13 +570,65 @@ fn cwd_log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static
     }) {
         return None;
     }
-    let file = std::fs::OpenOptions::new()
+    let fixed = dirs::data_local_dir().and_then(|d| {
+        let dir = d.join("AllMyStuff").join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("allmystuff-serve.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        eprintln!("verbose log: {}", path.display());
+        Some(file)
+    });
+    let cwd = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open("allmystuff-serve.log")
-        .ok()?;
-    Some(move || file.try_clone().expect("clone cwd log file handle"))
+        .ok();
+    match (fixed, cwd) {
+        (Some(a), Some(b)) => Some(TeeWriter(a, Some(b)).into_make()),
+        (Some(a), None) => Some(TeeWriter(a, None).into_make()),
+        (None, Some(b)) => Some(TeeWriter(b, None).into_make()),
+        (None, None) => None,
+    }
+}
+
+/// Two file handles, one write — the fixed-location log and the
+/// launch-directory convenience copy stay identical.
+struct TeeWriter(std::fs::File, Option<std::fs::File>);
+
+impl TeeWriter {
+    fn into_make(self) -> impl Fn() -> TeeHandle + Send + Sync + 'static {
+        move || {
+            TeeHandle(
+                self.0.try_clone().expect("clone log handle"),
+                self.1.as_ref().and_then(|f| f.try_clone().ok()),
+            )
+        }
+    }
+}
+
+struct TeeHandle(std::fs::File, Option<std::fs::File>);
+
+impl std::io::Write for TeeHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        if let Some(b) = &mut self.1 {
+            let _ = b.write_all(buf);
+        }
+        self.0.write_all(buf).map(|()| buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(b) = &mut self.1 {
+            let _ = b.flush();
+        }
+        self.0.flush()
+    }
 }
 
 /// A `MakeWriter` over `~/.myownmesh/logs/node.log` (honoring `MYOWNMESH_HOME`,
