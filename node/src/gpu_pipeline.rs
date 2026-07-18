@@ -60,6 +60,107 @@ use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGID
 /// + in-flight 1, with one spare.
 pub(crate) const NV12_RING: usize = 6;
 
+/// Keeps the GPU's clocks awake while a route streams. The soaks proved
+/// the encode engine's own load does NOT hold boost clocks — 8 minutes
+/// of nonstop 60 fps encoding still settled to idle-state latency
+/// (~23 ms/frame vs ~16 boosted), because the driver's P-state governor
+/// watches the 3D/copy engines. This thread submits a trivial 16×16
+/// copy + flush every few milliseconds on the lane's own (multithread-
+/// protected) device, so the governor never sees the engines idle while
+/// someone is watching. Games don't need it (they boost themselves);
+/// the quiet-desktop stream is exactly the case it exists for. Costs a
+/// few watts while a route is live; `ALLMYSTUFF_GPU_HEARTBEAT=0` kills
+/// it, `ALLMYSTUFF_GPU_HEARTBEAT_MS` tunes the cadence (default 5).
+pub(crate) struct ClockKeeper {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct KeeperDevice(ID3D11Device);
+// SAFETY: the device is created multithread-protected (see
+// `create_video_device`) — D3D serializes cross-thread use.
+unsafe impl Send for KeeperDevice {}
+
+impl ClockKeeper {
+    /// Start the heartbeat on `device`, or `None` when disabled by env.
+    pub(crate) fn start(device: &ID3D11Device) -> Option<Self> {
+        let off = std::env::var("ALLMYSTUFF_GPU_HEARTBEAT")
+            .map(|v| matches!(v.trim(), "0" | "off" | "false"))
+            .unwrap_or(false);
+        if off {
+            return None;
+        }
+        // The A/B taught the calibration: a 16×16 copy at 5 ms held boost
+        // for ~80 s before the governor classified it idle and settled
+        // anyway (avg 20.9 ms vs 23.7 baseline — partial). The default is
+        // now a 256×256 copy at 2 ms (~130 MB/s of copy-engine traffic,
+        // still noise for the GPU) to stay above the governor's floor.
+        let period_ms: u64 = std::env::var("ALLMYSTUFF_GPU_HEARTBEAT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+            .clamp(1, 100);
+        let px: u32 = std::env::var("ALLMYSTUFF_GPU_HEARTBEAT_PX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            .clamp(16, 1024);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let dev = KeeperDevice(device.clone());
+        let thread = std::thread::Builder::new()
+            .name("gpu-heartbeat".into())
+            .spawn(move || unsafe {
+                let device = dev.0;
+                let Ok(ctx) = device.GetImmediateContext() else {
+                    return;
+                };
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: px,
+                    Height: px,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    ..Default::default()
+                };
+                let (mut a, mut b) = (None, None);
+                if device.CreateTexture2D(&desc, None, Some(&mut a)).is_err()
+                    || device.CreateTexture2D(&desc, None, Some(&mut b)).is_err()
+                {
+                    return;
+                }
+                let (a, b) = (a.unwrap(), b.unwrap());
+                tracing::info!("GPU heartbeat up ({period_ms} ms cadence) — holding boost clocks");
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    // The copy is the work; the flush makes it a real
+                    // submission instead of a batched intent.
+                    ctx.CopyResource(&a, &b);
+                    ctx.Flush();
+                    std::thread::sleep(std::time::Duration::from_millis(period_ms));
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ClockKeeper {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// The per-route GPU conversion stage: BGRA texture in, NV12 texture out,
 /// plus the device manager the encoder MFT opens with.
 pub struct GpuConvert {

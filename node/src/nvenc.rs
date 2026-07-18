@@ -570,9 +570,11 @@ fn api() -> Result<&'static FunctionList, String> {
         if max_ver(&mut driver_ver) != NV_ENC_SUCCESS {
             return Err("NvEncodeAPIGetMaxSupportedVersion failed".into());
         }
-        // Version word is (major | minor<<24) on both sides; compare as
-        // (major, minor).
-        let (drv_major, drv_minor) = (driver_ver & 0xffffff, driver_ver >> 24);
+        // The MaxSupportedVersion word is NOT the NVENCAPI_VERSION
+        // layout: the header defines it as 4 LSBs = minor, rest = major
+        // (red team: the old NVENCAPI-shaped decode made the gate pass
+        // every driver ever and log garbage versions).
+        let (drv_major, drv_minor) = (driver_ver >> 4, driver_ver & 0xF);
         if (drv_major, drv_minor) < (12, 0) {
             return Err(format!(
                 "driver NVENC API {drv_major}.{drv_minor} < 12.0 (driver too old)"
@@ -850,10 +852,16 @@ impl NvencH264 {
             cfg.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
         }
         let paced = crate::video::paced_slices_enabled();
-        let slice_count = if self.width * self.height >= 1920 * 1080 {
-            8
-        } else {
-            4
+        // 8 slices sizes a lossy keyframe (~190 KB) to the 24 KB pacing
+        // grain. Lossless IDRs run ~1.4 MB — at 8 slices each burst is a
+        // 175 KB wall the splitter can't cut into; 32 slices brings the
+        // grain back (~44 KB), worth the ~1-3% CABAC-reset cost on a
+        // posture that spends bits for smooth delivery anyway.
+        let slice_count = match (self.width * self.height >= 1920 * 1080, self.lossless) {
+            (true, true) => 32,
+            (true, false) => 8,
+            (false, true) => 16,
+            (false, false) => 4,
         };
         if self.hevc {
             // The HEVC face of the same stream shape: VPS/SPS/PPS on
@@ -937,7 +945,18 @@ impl NvencH264 {
                 let h = &mut *self.config.encode_codec_config.h264;
                 (&mut h.slice_mode, &mut h.slice_mode_data)
             };
-            if *slice_mode != 0 {
+            // Only parameter rejections implicate the slice config —
+            // retrying a transient failure (BUSY, OUT_OF_MEMORY) with
+            // slices stripped would silently cost the pacer its cut
+            // points for the session's whole life (red team, finding 5).
+            const NV_ENC_ERR_INVALID_PARAM: u32 = 8;
+            const NV_ENC_ERR_UNSUPPORTED_PARAM: u32 = 15;
+            if *slice_mode != 0
+                && matches!(
+                    status,
+                    NV_ENC_ERR_INVALID_PARAM | NV_ENC_ERR_UNSUPPORTED_PARAM
+                )
+            {
                 // A driver that rejects our slice config must cost the
                 // pacer its cut points, never the whole SDK rung: retry
                 // once with default (single-slice) framing.
@@ -1023,12 +1042,16 @@ impl NvencH264 {
                 pic.encode_pic_flags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
                 if self.intra_refresh {
                     // An IDR mid-GDR: restart the refresh wave after it so
-                    // the stream returns to walls-free steady state.
+                    // the stream returns to walls-free steady state. The
+                    // field takes the wave's frame count — writing 0 here
+                    // (as the first pass did) is the *disabled* value, a
+                    // documented guarantee the code never implemented
+                    // (red team, finding 6).
                     let words = std::slice::from_raw_parts_mut(
                         pic.codec_pic_params.as_mut_ptr() as *mut u32,
                         8,
                     );
-                    words[H264_PIC_FORCE_INTRA_REFRESH_IDX] = 0;
+                    words[H264_PIC_FORCE_INTRA_REFRESH_IDX] = ((self.fps / 2).max(15) / 5).max(3);
                 }
             }
 
@@ -1046,6 +1069,16 @@ impl NvencH264 {
                         .unmap_input_resource
                         .map(|f| f(self.encoder, map.mapped_resource));
                     return Err(self.err("LockBitstream", status));
+                }
+                if lock.bitstream_buffer_ptr.is_null() {
+                    // A success status with a null payload (TDR race,
+                    // device removal) must take the clean heal path —
+                    // `from_raw_parts` on null is UB even for length 0.
+                    let _ = self
+                        .api
+                        .unmap_input_resource
+                        .map(|f| f(self.encoder, map.mapped_resource));
+                    return Err("LockBitstream returned success with a null payload".into());
                 }
                 let data = std::slice::from_raw_parts(
                     lock.bitstream_buffer_ptr as *const u8,
@@ -1099,6 +1132,18 @@ impl NvencH264 {
             let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
             self.config.rc_params.max_bit_rate = peak;
             self.config.rc_params.vbv_buffer_size = vbv;
+            // Re-apply the posture's VBV shape — reconfigure must keep
+            // the contract init made, not regress to the generic bounds
+            // (red team: the first in-place retune would have widened
+            // game's single-frame VBV into a ~500 ms bucket and blown
+            // the GDR latency story silently).
+            if self.studio {
+                self.config.rc_params.vbv_buffer_size = bitrate;
+                self.config.rc_params.max_bit_rate = bitrate + bitrate / 5;
+            }
+            if self.intra_refresh {
+                self.config.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
+            }
             let mut params: Box<ReconfigureParams> = Box::new(std::mem::zeroed());
             params.version = sv(1) | (1 << 31);
             std::ptr::copy_nonoverlapping(&*self.init, &mut params.re_init_encode_params, 1);
@@ -1356,6 +1401,14 @@ mod tests {
                     eprintln!("SKIP: {e}");
                     return;
                 }
+            };
+            // `ALLMYSTUFF_SOAK_HEARTBEAT=1` runs the posture with the
+            // clock keeper up — the A/B that measures what holding the
+            // 3D engine awake buys the encode engine.
+            let _keeper = if std::env::var("ALLMYSTUFF_SOAK_HEARTBEAT").as_deref() == Ok("1") {
+                crate::gpu_pipeline::ClockKeeper::start(&gpu.device())
+            } else {
+                None
             };
             let mut bgra = vec![0u8; (w * h * 4) as usize];
             let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");

@@ -203,6 +203,7 @@ struct CudaMemcpy2d {
     width_in_bytes: usize,
     height: usize,
 }
+const _: () = assert!(std::mem::size_of::<CudaMemcpy2d>() == 128);
 
 macro_rules! load_fn {
     ($module:expr, $name:literal, $ty:ty) => {{
@@ -350,20 +351,31 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
         return 0;
     }
     let surfaces = u32::from(f.min_num_decode_surfaces).max(4);
+    let display_w = (f.display_right - f.display_left).max(2) as u32;
+    let display_h = (f.display_bottom - f.display_top).max(2) as u32;
     if !state.decoder.is_null() {
-        // Mid-stream format change: only identical geometry can reuse the
-        // decoder; anything else is a stream restart from our own sender,
-        // which tears the route down first. Fail loudly otherwise.
-        if f.coded_width == state.coded_width && f.coded_height == state.coded_height {
+        // Mid-stream format change: only *fully* identical geometry can
+        // reuse the decoder — coded AND display. Coded dims alone are a
+        // trap: HEVC pads to CTB alignment, so a lane rebuild that moves
+        // the display size within one alignment bucket (1280×718 ↔ ×720
+        // both code 1280×768) would sail through a coded-only check and
+        // keep the stale crop forever (red-team round 2, finding 1).
+        // Failing loudly is the recovery: the bridge drops the session
+        // and reopens fresh at the next key unit.
+        if f.coded_width == state.coded_width
+            && f.coded_height == state.coded_height
+            && display_w == state.display_width
+            && display_h == state.display_height
+        {
             return surfaces as i32;
         }
-        state.error = Some("mid-stream resolution change".into());
+        state.error = Some("mid-stream geometry change".into());
         return 0;
     }
     state.coded_width = f.coded_width;
     state.coded_height = f.coded_height;
-    state.display_width = (f.display_right - f.display_left).max(2) as u32;
-    state.display_height = (f.display_bottom - f.display_top).max(2) as u32;
+    state.display_width = display_w;
+    state.display_height = display_h;
     let mut info = DecodeCreateInfo {
         width: f.coded_width,
         height: f.coded_height,

@@ -71,7 +71,14 @@ fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
     // decoder on every frame. (Caught in review; the byte-exact match is
     // collision-free because H.264 types 0/2/4 never lead an AU.)
     match b {
-        0x40 | 0x42 | 0x44 => Some(AuCodec::Hevc), // VPS · SPS · PPS
+        // VPS · SPS · PPS, plus IDR_W_RADL (0x26): an H.264 SEI would
+        // share that byte only with nal_ref_idc=1, which the H.264 spec
+        // forbids for SEI — so a conformant stream leading with 0x26 is
+        // HEVC, and a paramless HEVC IDR still reads as a decode entry
+        // instead of silently starving `waiting_key` (red team round 2).
+        // IDR_N_LP (0x28) stays out: it collides with a legal H.264 PPS
+        // byte, and our senders always lead IDRs with parameter sets.
+        0x40 | 0x42 | 0x44 | 0x26 => Some(AuCodec::Hevc),
         _ => match b & 0x1F {
             5 | 7 | 8 => Some(AuCodec::H264), // IDR · SPS · PPS
             _ => None,
@@ -83,7 +90,12 @@ fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
 /// 60 fps) so a decoder that stalls dumps to the next keyframe fast instead of
 /// playing seconds of stale, latency-inducing backlog — a healthy decoder (a
 /// few ms per frame) never queues anywhere near this.
-const MAX_PENDING: usize = 12;
+// Sized in *samples*, and the pacer sends each sliced AU as several
+// samples (a lossless frame is 8+, more at its IDRs) — 48 keeps the
+// documented ~200 ms of headroom for chunked streams where 12 was 1.5
+// frames. Whole-AU reassembly upstream of the queue is the follow-up
+// that makes this exact again.
+const MAX_PENDING: usize = 48;
 
 /// How often each decoder logs its dial-in line (matches the encode side).
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -291,6 +303,7 @@ fn run_decode<F, G>(
             Active::Hevc(dec) => match dec.decode(&au.data, au.ts_us) {
                 Ok(pics) => {
                     waiting_key = false;
+                    let mut emitted = false;
                     for f in pics {
                         let (w, h) = (f.width as usize, f.height as usize);
                         if w == 0 || h == 0 {
@@ -303,10 +316,16 @@ fn run_decode<F, G>(
                             h,
                             &mut packet[crate::mesh::VIDEO_IPC_HEADER_LEN..],
                         );
-                        spent += t0.elapsed();
                         frames += 1;
+                        emitted = true;
                         out_dims = (w, h);
                         on_frame(packet);
+                    }
+                    // Once per AU, not per picture — the per-picture form
+                    // double-counted overlapping elapsed time whenever an
+                    // AU yields several pictures.
+                    if emitted {
+                        spent += t0.elapsed();
                     }
                 }
                 Err(e) => broke = Some(format!("HEVC: {e}")),

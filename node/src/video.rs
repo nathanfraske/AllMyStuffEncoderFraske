@@ -2263,11 +2263,25 @@ fn run_gpu_lane(
     // than either mode; the posture re-arms on the next retune.
     let noise_frame_bytes = (dw as usize * dh as usize) / 2;
     let mut noise_window: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
-    let mut noise_guard_armed = lossless;
+    // Fast trip: ~300 ms of bytes at 4× the oversize rate ends the wait
+    // early — the 2 s ratio window alone let ~2 s of Gbps-class frames
+    // through before reacting (red team, pacing item 6).
+    let mut noise_recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let noise_burst_bytes = noise_frame_bytes * 72; // 18 frames × 4×
+                                                    // Armed only when the lossless rung actually opened — a fallback
+                                                    // that already runs rate-controlled studio has nothing to guard
+                                                    // (red team, encoder finding 7).
+    let mut noise_guard_armed = lossless && enc.label().contains("studio-lossless");
+    // Hold boost clocks while this route streams — the encode engine's
+    // own load doesn't (the soak evidence lives on the struct). RAII:
+    // every lane exit path drops it and the GPU goes back to sleep.
+    let _clock_keeper = crate::gpu_pipeline::ClockKeeper::start(&lane.device);
     // GDR streams have no periodic-IDR cadence by design — the refresh
     // wave is the convergence mechanism; only explicit asks (viewer join,
-    // quiesce rescue) force an IDR through.
-    let gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
+    // quiesce rescue) force an IDR through. Mutable: a mid-stream heal
+    // onto the MF rung loses GDR, and the cadence must come back with it
+    // (red team, encoder finding 4).
+    let mut gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
         enc.label(),
@@ -2388,8 +2402,15 @@ fn run_gpu_lane(
                             if noise_window.len() > 120 {
                                 noise_window.pop_front();
                             }
-                            if noise_window.len() == 120
-                                && noise_window.iter().filter(|&&over| over).count() >= 90
+                            noise_recent.push_back(frame_bytes);
+                            if noise_recent.len() > 18 {
+                                noise_recent.pop_front();
+                            }
+                            let burst = noise_recent.len() == 18
+                                && noise_recent.iter().sum::<usize>() > noise_burst_bytes;
+                            if burst
+                                || (noise_window.len() == 120
+                                    && noise_window.iter().filter(|&&over| over).count() >= 90)
                             {
                                 noise_window.clear();
                                 noise_guard_armed = false;
@@ -2445,8 +2466,11 @@ fn run_gpu_lane(
                             Ok(Some(next)) => {
                                 // A heal always lands on the MF rung — a
                                 // failing SDK session steps down rather
-                                // than retrying itself.
+                                // than retrying itself. The MF rung has
+                                // no GDR: the periodic-IDR cadence takes
+                                // recovery duty back.
                                 enc = GpuCodec::Mf(next);
+                                gdr = false;
                                 refresh.store(true, Ordering::SeqCst);
                             }
                             Ok(None) => {}

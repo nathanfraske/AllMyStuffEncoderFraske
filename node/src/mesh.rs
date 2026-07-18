@@ -715,19 +715,28 @@ impl Mesh {
         if chunks.len() < 2 {
             return self.send_video_track(peer, lane, data, duration_us).await;
         }
-        // Spread the unit: balanced runs 1.5 ms gaps under a 10 ms cap
-        // (libwebrtc's 5 ms-quanta regime); game mode tightens to 1 ms
-        // under 6 ms — still burst-shaped for the queue, but the frame's
-        // tail lands ~4 ms sooner on the path latency rides on.
-        let (gap_us, cap_ms) = if game { (1000, 6) } else { (1500, 10) };
-        let gap = std::time::Duration::from_micros(gap_us)
-            .min(std::time::Duration::from_millis(cap_ms) / (chunks.len() as u32 - 1));
+        // Spread the unit with gaps matched to each chunk's actual wire
+        // time (an 800 Mbps drain model — conservative for a LAN, sane
+        // for good WAN): a 24 KB steady-state slice earns ~300 µs, a
+        // 175 KB keyframe wall earns the full cap. The old fixed
+        // 1–1.5 ms gap charged every frame the keyframe's toll — for a
+        // lossless steady-state AU (8 slices already at the pacing
+        // grain, nothing to shape) that was ~10 ms of idle wire added to
+        // every frame's tail. Rate-matching keeps the burst shape where
+        // walls exist and stops taxing the frames that don't need it.
+        // Caps unchanged: game 1 ms/6 ms, others 1.5 ms/10 ms.
+        let (gap_cap_us, budget_ms) = if game { (1000, 6) } else { (1500, 10) };
+        let budget_each = std::time::Duration::from_millis(budget_ms) / (chunks.len() as u32 - 1);
         let last = chunks.len() - 1;
         for (i, range) in chunks.into_iter().enumerate() {
             let dur = if i == last { duration_us } else { 0 };
+            let sent_bytes = range.len();
             self.send_video_track(peer, lane, data[range].to_vec(), dur)
                 .await?;
             if i != last {
+                // bytes × 8 bits / 800 Mbps = bytes / 100 µs.
+                let drain_us = (sent_bytes as u64 / 100).clamp(100, gap_cap_us);
+                let gap = std::time::Duration::from_micros(drain_us).min(budget_each);
                 tokio::time::sleep(gap).await;
             }
         }
