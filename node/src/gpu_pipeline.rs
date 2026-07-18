@@ -11,19 +11,19 @@
 //! the encoder MFT through an `IMFDXGIDeviceManager` — the encoder reads
 //! it in place. CPU touches per frame: none.
 //!
-//! Ownership: one [`GpuConvert`] per route owns the D3D11 device
-//! (multithread-protected — Media Foundation requires it), the video
-//! processor, a small NV12 output-texture ring, and the device manager the
-//! MFT is opened with. The capture side will create its duplication on
-//! this same device (adapter affinity is what makes the whole chain
-//! zero-copy), which also decides the policy question the adapter pin
-//! raised: a pinned cross-adapter encode keeps the CPU lane.
+//! Ownership: one [`GpuConvert`] per route owns the video processor, a
+//! small checked-out NV12 output-texture ring, and the device manager the
+//! MFT is opened with — all on a D3D11 device the capture side created
+//! ([`create_video_device`], multithread-protected — Media Foundation
+//! requires it) and runs its duplication on. Same device = same adapter =
+//! zero copies, which also decides the policy question the adapter pin
+//! raised: a pinned cross-adapter encode keeps the CPU lane
+//! (`win_capture::start_gpu` is the capture half; `video::run_gpu_lane`
+//! drives the encoder half).
 //!
-//! This module lands **proven but unwired**: the `gpu_lane_end_to_end`
-//! test drives synthetic BGRA textures through convert → MFT → openh264
-//! decode and asserts picture validity, so the novel COM plumbing is
-//! validated in isolation before the capture/pump integration slice
-//! switches the live path over.
+//! The `gpu_lane_end_to_end` test drives synthetic BGRA textures through
+//! convert → MFT → openh264 decode and asserts picture validity, so the
+//! novel COM plumbing stays validated in isolation.
 
 #![cfg(windows)]
 
@@ -46,14 +46,16 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 
-/// How many NV12 output textures cycle in the ring. The encoder holds a
-/// texture only while it reads it (the MFT resolves the DXGI buffer during
-/// `ProcessInput`); four gives generous slack over its 1–2 frame depth, and
-/// the end-to-end decode test is the corruption tripwire for that
-/// assumption — the same discipline the CPU-side ring was held to (and
-/// dropped under; this one earns its keep by deleting *all* the copies,
-/// not just the allocation).
-const NV12_RING: usize = 4;
+/// How many NV12 output textures cycle in the ring. Slots are explicitly
+/// checked out ([`GpuConvert::convert`]) and released
+/// ([`GpuConvert::release`]) — the consumer holds at most one retained
+/// picture plus the shallow frame channel, so four never starves — and the
+/// release ordering guarantees the async MFT is ≥3 slot-reuses behind any
+/// texture it could still be reading (measured encode latency ≤ ~10 ms vs
+/// ≥20 ms to cycle three slots at 144 Hz damage). The end-to-end decode
+/// test is the corruption tripwire for that margin; the NVENC SDK rung
+/// replaces it with real completion events.
+pub(crate) const NV12_RING: usize = 4;
 
 /// The per-route GPU conversion stage: BGRA texture in, NV12 texture out,
 /// plus the device manager the encoder MFT opens with.
@@ -69,6 +71,10 @@ pub struct GpuConvert {
     out_size: (u32, u32),
     ring: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     ring_next: usize,
+    /// Checked-out slots: `true` while the consumer side may still be
+    /// reading the texture (in the frame channel, in the encoder, or
+    /// retained as the last picture). [`Self::convert`] skips them.
+    busy: [bool; NV12_RING],
 }
 
 // SAFETY: the device is created multithread-protected (below) and a
@@ -77,38 +83,61 @@ pub struct GpuConvert {
 // its own synchronization through the device manager.
 unsafe impl Send for GpuConvert {}
 
+/// A hardware D3D11 device fit for the whole GPU lane: BGRA + video
+/// support (the VideoProcessor needs the latter), multithread-protected —
+/// Media Foundation shares the device across its own worker threads, and
+/// so do the lane's capture and encode threads; without the protection
+/// that's a data race inside D3D. The default adapter, same as the CPU
+/// lane's duplication device.
+pub(crate) fn create_video_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+    unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE(std::ptr::null_mut()),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .map_err(|e| format!("D3D11CreateDevice (video): {e}"))?;
+        let device = device.ok_or("D3D11CreateDevice returned no device")?;
+        let context = context.ok_or("D3D11CreateDevice returned no context")?;
+        let mt: ID3D11Multithread = context
+            .cast()
+            .map_err(|e| format!("ID3D11Multithread: {e}"))?;
+        let _ = mt.SetMultithreadProtected(true);
+        Ok((device, context))
+    }
+}
+
 impl GpuConvert {
+    /// Build the conversion stage on its own fresh device — the test path;
+    /// the live lane shares the capture device via [`Self::on_device`].
+    pub fn new(in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Result<Self, String> {
+        let (device, context) = create_video_device()?;
+        Self::on_device(device, context, in_w, in_h, out_w, out_h)
+    }
+
     /// Build the conversion stage for `in_w`×`in_h` BGRA frames fitted to
     /// `out_w`×`out_h` NV12 (the video processor scales when they differ —
-    /// GPU downscale replaces the CPU `fit_within` path on this lane).
-    /// Fails soft: any missing capability sends the ladder back to the CPU
-    /// lane.
-    pub fn new(in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Result<Self, String> {
+    /// GPU downscale replaces the CPU `fit_within` path on this lane) on an
+    /// existing device from [`create_video_device`] — the duplication runs
+    /// on the same one, which is what makes the chain zero-copy. Fails
+    /// soft: any missing capability sends the ladder back to the CPU lane.
+    pub fn on_device(
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+    ) -> Result<Self, String> {
         unsafe {
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE(std::ptr::null_mut()),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-            .map_err(|e| format!("D3D11CreateDevice (video): {e}"))?;
-            let device = device.ok_or("D3D11CreateDevice returned no device")?;
-            let context = context.ok_or("D3D11CreateDevice returned no context")?;
-            // Media Foundation shares the device across its own worker
-            // threads; without multithread protection that's a data race
-            // inside D3D.
-            let mt: ID3D11Multithread = context
-                .cast()
-                .map_err(|e| format!("ID3D11Multithread: {e}"))?;
-            let _ = mt.SetMultithreadProtected(true);
-
             let video_device: ID3D11VideoDevice = device
                 .cast()
                 .map_err(|e| format!("ID3D11VideoDevice: {e}"))?;
@@ -168,6 +197,7 @@ impl GpuConvert {
                 out_size: (out_w, out_h),
                 ring: Vec::new(),
                 ring_next: 0,
+                busy: [false; NV12_RING],
             })
         }
     }
@@ -199,15 +229,26 @@ impl GpuConvert {
     }
 
     /// Convert one BGRA texture (created on this stage's device, `in` size)
-    /// to the next NV12 ring texture, scaling to the fitted output size.
-    /// The returned texture stays valid until [`NV12_RING`] further calls.
-    pub fn convert(&mut self, bgra: &ID3D11Texture2D) -> Result<ID3D11Texture2D, String> {
+    /// to a free NV12 ring texture, scaling to the fitted output size. The
+    /// slot is checked out to the caller: the texture is not reused until
+    /// [`Self::release`]\(slot). `Ok(None)` = every slot is still checked
+    /// out (the consumer is far behind) — drop the frame; the next release
+    /// frees a slot.
+    pub fn convert(
+        &mut self,
+        bgra: &ID3D11Texture2D,
+    ) -> Result<Option<(usize, ID3D11Texture2D)>, String> {
         unsafe {
             if self.ring.is_empty() {
                 self.build_ring()?;
             }
-            let idx = self.ring_next % NV12_RING;
-            self.ring_next = self.ring_next.wrapping_add(1);
+            let Some(idx) = (0..NV12_RING)
+                .map(|o| (self.ring_next + o) % NV12_RING)
+                .find(|&i| !self.busy[i])
+            else {
+                return Ok(None);
+            };
+            self.ring_next = (idx + 1) % NV12_RING;
 
             let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0,
@@ -243,7 +284,16 @@ impl GpuConvert {
                 let _ = std::mem::ManuallyDrop::take(&mut s.pInputSurface);
             }
             blt.map_err(|e| format!("VideoProcessorBlt: {e}"))?;
-            Ok(out_tex.clone())
+            self.busy[idx] = true;
+            Ok(Some((idx, out_tex.clone())))
+        }
+    }
+
+    /// Return a ring slot to circulation once nothing downstream can still
+    /// read its texture. Idempotent; an out-of-range slot is ignored.
+    pub fn release(&mut self, slot: usize) {
+        if let Some(b) = self.busy.get_mut(slot) {
+            *b = false;
         }
     }
 
@@ -403,22 +453,28 @@ mod tests {
                 }
             }
             gpu.update_bgra(&tex, &bgra, w, h);
-            let nv12 = match gpu.convert(&tex) {
-                Ok(t) => t,
+            let (slot, nv12) = match gpu.convert(&tex) {
+                Ok(Some(s)) => s,
+                Ok(None) => panic!("ring exhausted with every slot released"),
                 Err(e) => {
                     eprintln!("SKIP: VideoProcessor convert failed: {e}");
                     return;
                 }
             };
             let out = enc.encode_texture(&nv12, i == 0).expect("texture encode");
+            gpu.release(slot);
             if out.consumed {
                 fed += 1;
             }
             units.extend(out.units);
         }
         for _ in 0..3 {
-            let nv12 = gpu.convert(&tex).expect("drain convert");
+            let (slot, nv12) = gpu
+                .convert(&tex)
+                .expect("drain convert")
+                .expect("free slot");
             let out = enc.encode_texture(&nv12, false).expect("drain");
+            gpu.release(slot);
             if out.consumed {
                 fed += 1;
             }
@@ -460,5 +516,67 @@ mod tests {
             decoded >= fed.saturating_sub(3),
             "decoded {decoded} of {fed}"
         );
+    }
+
+    /// Ignored-by-default bench: the GPU lane's per-frame CPU cost at
+    /// 1440p — `upload` (synthetic test feed; the live lane pays a GPU
+    /// `CopyResource` instead), `convert` (blt queue), `encode`
+    /// (texture ProcessInput + drain). The decomposition "after" numbers
+    /// for the lane, comparable against the CPU lane's scale/encode
+    /// columns. Run:
+    /// `cargo test --release -- --ignored bench_gpu --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_gpu_lane_cycle() {
+        use std::time::{Duration, Instant};
+        let (w, h) = (2560u32, 1440u32);
+        let mut gpu = match GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let hw = crate::mediafoundation::hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            eprintln!("SKIP: no MFT");
+            return;
+        };
+        let mut enc = match first.open_with_manager(w, h, 60, 12_000_000, Some(&gpu.manager())) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+        let n = 240u32;
+        let (mut t_up, mut t_conv, mut t_enc) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let mut units = 0usize;
+        for i in 0..n {
+            // Vary content so the encoder does real work each frame.
+            let off = ((i as usize) * 7919 * 4096) % (bgra.len() - 4096);
+            for b in &mut bgra[off..off + 4096] {
+                *b = b.wrapping_add(13);
+            }
+            let t0 = Instant::now();
+            gpu.update_bgra(&tex, &bgra, w, h);
+            let t1 = Instant::now();
+            let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+            let t2 = Instant::now();
+            let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+            let t3 = Instant::now();
+            gpu.release(slot);
+            units += out.units.len();
+            t_up += t1 - t0;
+            t_conv += t2 - t1;
+            t_enc += t3 - t2;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(n);
+        println!("bench GPU lane @1440p over {n} frames ({units} units):");
+        println!("  upload (synthetic, not paid live): {:6.3} ms", ms(t_up));
+        println!("  convert (blt queue)              : {:6.3} ms", ms(t_conv));
+        println!("  encode_texture (feed + drain)    : {:6.3} ms", ms(t_enc));
     }
 }

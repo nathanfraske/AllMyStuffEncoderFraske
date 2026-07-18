@@ -164,6 +164,70 @@ enum NextError {
     Fatal(String),
 }
 
+/// Find the output whose `HMONITOR` is `monitor_id` on `device`'s adapter
+/// and duplicate *only* that one — an already-duplicated sibling output
+/// must not abort us. Returns the duplication plus its clockwise scan-out
+/// rotation: the duplicated output's own rotation is the ground truth for
+/// how its raw scan-out is oriented — far more reliable than a separate
+/// monitor-rotation query, which can report the native (unrotated)
+/// geometry. Read once: it's fixed for the duplication's life, and an
+/// orientation change tears the duplication down with ACCESS_LOST (the
+/// pump re-acquires, re-reading it on the fresh one).
+unsafe fn duplicate_output(
+    device: &ID3D11Device,
+    monitor_id: u32,
+) -> Result<(IDXGIOutputDuplication, u32), String> {
+    let dxgi: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
+    let adapter: IDXGIAdapter = dxgi.GetAdapter().map_err(|e| e.to_string())?;
+    let mut index = 0u32;
+    loop {
+        let Ok(output) = adapter.EnumOutputs(index) else {
+            return Err(format!(
+                "monitor {monitor_id:#x} not found on the primary adapter"
+            ));
+        };
+        index += 1;
+        let desc = output.GetDesc().map_err(|e| e.to_string())?;
+        if desc.Monitor.0 as usize as u32 != monitor_id {
+            continue;
+        }
+        let output1: IDXGIOutput1 = output.cast().map_err(|e| e.to_string())?;
+        let dup = output1
+            .DuplicateOutput(device)
+            .map_err(|e| format!("DuplicateOutput: {e}"))?;
+        // GetDesc is infallible and by-value.
+        let rotation_deg = match dup.GetDesc().Rotation {
+            DXGI_MODE_ROTATION_ROTATE90 => 90,
+            DXGI_MODE_ROTATION_ROTATE180 => 180,
+            DXGI_MODE_ROTATION_ROTATE270 => 270,
+            _ => 0, // IDENTITY / UNSPECIFIED / anything else: upright.
+        };
+        return Ok((dup, rotation_deg));
+    }
+}
+
+/// Fetch the current pointer bitmap from a held frame (held-frame only).
+/// `None` on failure — the caller keeps its previous shape.
+unsafe fn fetch_cursor_shape(dup: &IDXGIOutputDuplication, size: u32) -> Option<CursorShape> {
+    let mut buf = vec![0u8; size as usize];
+    let mut required = 0u32;
+    let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+    dup.GetFramePointerShape(
+        size,
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        &mut required,
+        &mut info,
+    )
+    .ok()?;
+    Some(CursorShape {
+        kind: info.Type,
+        width: info.Width,
+        height: info.Height,
+        pitch: info.Pitch,
+        buf,
+    })
+}
+
 /// The mouse cursor as DXGI hands it over — the real OS pointer shape (arrow,
 /// I-beam, hand, resize, a custom app cursor). Desktop Duplication never draws
 /// it into the frame (that's a hardware overlay), so on Windows we composite it
@@ -236,56 +300,22 @@ impl Duplication {
             .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
             let device = device.ok_or("D3D11CreateDevice returned no device")?;
             let context = context.ok_or("D3D11CreateDevice returned no context")?;
-            let dxgi: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
-            let adapter: IDXGIAdapter = dxgi.GetAdapter().map_err(|e| e.to_string())?;
-
-            // Find the target output, and duplicate *only* that one — an
-            // already-duplicated sibling output must not abort us.
-            let mut index = 0u32;
-            loop {
-                let Ok(output) = adapter.EnumOutputs(index) else {
-                    return Err(format!(
-                        "monitor {monitor_id:#x} not found on the primary adapter"
-                    ));
-                };
-                index += 1;
-                let desc = output.GetDesc().map_err(|e| e.to_string())?;
-                if desc.Monitor.0 as usize as u32 != monitor_id {
-                    continue;
-                }
-                let output1: IDXGIOutput1 = output.cast().map_err(|e| e.to_string())?;
-                let dup = output1
-                    .DuplicateOutput(&device)
-                    .map_err(|e| format!("DuplicateOutput: {e}"))?;
-                // The duplicated output's own rotation is the ground truth for
-                // how its raw scan-out is oriented — far more reliable than a
-                // separate monitor-rotation query, which can report the native
-                // (unrotated) geometry. Read it once: it's fixed for the
-                // duplication's life, and an orientation change tears the
-                // duplication down with ACCESS_LOST (pump re-acquires, re-reads
-                // it on the fresh one). GetDesc is infallible and by-value.
-                let rotation_deg = match dup.GetDesc().Rotation {
-                    DXGI_MODE_ROTATION_ROTATE90 => 90,
-                    DXGI_MODE_ROTATION_ROTATE180 => 180,
-                    DXGI_MODE_ROTATION_ROTATE270 => 270,
-                    _ => 0, // IDENTITY / UNSPECIFIED / anything else: upright.
-                };
-                return Ok(Duplication {
-                    _device: device,
-                    context,
-                    dup,
-                    staging: None,
-                    rotation_deg,
-                    cursor: None,
-                    ptr_x: 0,
-                    ptr_y: 0,
-                    ptr_visible: false,
-                    clean: Vec::new(),
-                    clean_dims: (0, 0),
-                    last_cursor_emit: Instant::now(),
-                    reclaim: None,
-                });
-            }
+            let (dup, rotation_deg) = duplicate_output(&device, monitor_id)?;
+            Ok(Duplication {
+                _device: device,
+                context,
+                dup,
+                staging: None,
+                rotation_deg,
+                cursor: None,
+                ptr_x: 0,
+                ptr_y: 0,
+                ptr_visible: false,
+                clean: Vec::new(),
+                clean_dims: (0, 0),
+                last_cursor_emit: Instant::now(),
+                reclaim: None,
+            })
         }
     }
 
@@ -345,26 +375,8 @@ impl Duplication {
     /// Fetch and cache the current pointer bitmap (held-frame only). Silent on
     /// failure — the cursor just keeps its last shape.
     unsafe fn update_cursor_shape(&mut self, size: u32) {
-        let mut buf = vec![0u8; size as usize];
-        let mut required = 0u32;
-        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-        if self
-            .dup
-            .GetFramePointerShape(
-                size,
-                buf.as_mut_ptr() as *mut core::ffi::c_void,
-                &mut required,
-                &mut info,
-            )
-            .is_ok()
-        {
-            self.cursor = Some(CursorShape {
-                kind: info.Type,
-                width: info.Width,
-                height: info.Height,
-                pitch: info.Pitch,
-                buf,
-            });
+        if let Some(shape) = fetch_cursor_shape(&self.dup, size) {
+            self.cursor = Some(shape);
         }
     }
 
@@ -498,6 +510,23 @@ impl Duplication {
 /// unknown type is skipped. Fully bounds-checked, so a malformed shape can only
 /// draw less, never out of bounds.
 fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32, py: i32) {
+    composite_cursor_impl::<false>(dst, dw, dh, cur, px, py)
+}
+
+/// [`composite_cursor`] generic over the destination's channel order —
+/// `BGRA_DST = true` blends into BGRA pixels (the GPU lane's save-under
+/// patch, which never leaves the GPU's native order), `false` into RGBA
+/// (the CPU lane's frame buffers). The cursor source is BGRA either way;
+/// only the write order differs, and the const parameter folds the swap
+/// away.
+fn composite_cursor_impl<const BGRA_DST: bool>(
+    dst: &mut [u8],
+    dw: u32,
+    dh: u32,
+    cur: &CursorShape,
+    px: i32,
+    py: i32,
+) {
     let dw = dw as i32;
     let dh = dh as i32;
     let pitch = cur.pitch as usize;
@@ -528,10 +557,11 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
                         cur.buf[s + 1] as u32,
                         cur.buf[s + 2] as u32,
                     );
+                    let (c0, c2) = if BGRA_DST { (b, r) } else { (r, b) };
                     let d = (dy as usize * dw as usize + dx as usize) * 4;
-                    dst[d] = ((r * a + dst[d] as u32 * (255 - a)) / 255) as u8;
+                    dst[d] = ((c0 * a + dst[d] as u32 * (255 - a)) / 255) as u8;
                     dst[d + 1] = ((g * a + dst[d + 1] as u32 * (255 - a)) / 255) as u8;
-                    dst[d + 2] = ((b * a + dst[d + 2] as u32 * (255 - a)) / 255) as u8;
+                    dst[d + 2] = ((c2 * a + dst[d + 2] as u32 * (255 - a)) / 255) as u8;
                 }
             }
         }
@@ -554,15 +584,16 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
                         continue;
                     }
                     let (b, g, r, a) = (cur.buf[s], cur.buf[s + 1], cur.buf[s + 2], cur.buf[s + 3]);
+                    let (c0, c2) = if BGRA_DST { (b, r) } else { (r, b) };
                     let d = (dy as usize * dw as usize + dx as usize) * 4;
                     if a == 0 {
-                        dst[d] = r;
+                        dst[d] = c0;
                         dst[d + 1] = g;
-                        dst[d + 2] = b;
+                        dst[d + 2] = c2;
                     } else {
-                        dst[d] ^= r;
+                        dst[d] ^= c0;
                         dst[d + 1] ^= g;
-                        dst[d + 2] ^= b;
+                        dst[d + 2] ^= c2;
                     }
                 }
             }
@@ -607,6 +638,541 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(feature = "host")]
+pub use gpu_lane::{start_gpu, GpuFrame, GpuLane};
+
+/// The GPU zero-copy capture lane: duplication, cursor composite, and
+/// BGRA→NV12 conversion all on **one** D3D11 device, frames leaving as
+/// NV12 *textures* for a device-manager-fed encoder MFT
+/// (`video::run_gpu_lane` is the consuming half). Per frame the CPU
+/// touches at most a cursor-sized save-under patch — the pointer is the
+/// one thing Desktop Duplication never draws, so its rect round-trips
+/// through a tiny staging texture while everything else stays GPU work:
+/// acquired frame → `CopyResource` into the persistent clean texture →
+/// VideoProcessor blt (fused colour convert + scale) → encoder reads the
+/// ring texture in place.
+#[cfg(feature = "host")]
+mod gpu_lane {
+    use super::*;
+    use crate::gpu_pipeline::{create_video_device, GpuConvert, NV12_RING};
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Graphics::Direct3D11::{D3D11_BOX, D3D11_USAGE_DEFAULT};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
+
+    /// One GPU-lane frame: a checked-out NV12 ring texture the encoder
+    /// reads in place. `slot` rides back on [`GpuLane::release`] once
+    /// nothing downstream can still read the texture.
+    pub struct GpuFrame {
+        pub slot: usize,
+        pub tex: ID3D11Texture2D,
+        /// The texture's (fitted) size.
+        pub out_w: u32,
+        pub out_h: u32,
+        /// CPU time the capture side spent producing this frame (copy
+        /// queue + cursor patch + blt queue) — the lane's analog of the
+        /// CPU lane's convert column.
+        pub spent: Duration,
+    }
+
+    // SAFETY: the texture lives on a multithread-protected device (see
+    // `gpu_pipeline::create_video_device`); a frame is produced by the
+    // capture thread, sent, and from then on touched only by the route
+    // thread — never concurrently.
+    unsafe impl Send for GpuFrame {}
+
+    /// A running GPU capture lane, as handed to `video::run_gpu_lane`.
+    /// Dropping it (the `session`) stops the capture thread and releases
+    /// the duplication.
+    pub struct GpuLane {
+        pub session: Session,
+        pub frames: mpsc::Receiver<GpuFrame>,
+        /// Spent ring slots ride back to the capture side on this.
+        pub release: mpsc::SyncSender<usize>,
+        /// The device manager the encoder MFT must be opened with.
+        pub manager: IMFDXGIDeviceManager,
+        /// The duplication device's adapter — scopes encoder enumeration
+        /// to the GPU that actually holds the textures.
+        pub adapter_luid: LUID,
+        /// Fitted output size (what the NV12 textures measure).
+        pub out_size: (u32, u32),
+        /// The desktop's size (pre-fit) — for re-fitting when the edge
+        /// cap changes mid-route.
+        pub src_size: (u32, u32),
+    }
+
+    /// Start the GPU lane on `monitor_id`, fitting output to `out_edge`.
+    /// Every failure is soft — the caller falls back to the CPU lane.
+    /// Rotated outputs are declined here: the VideoProcessor could rotate,
+    /// but they're rare and the CPU lane's rotation path is proven.
+    pub fn start_gpu(monitor_id: u32, out_edge: u32) -> Result<GpuLane, String> {
+        let (device, context) = create_video_device()?;
+        let (dup, rotation_deg) = unsafe { duplicate_output(&device, monitor_id)? };
+        if rotation_deg != 0 {
+            return Err(format!(
+                "output is rotated ({rotation_deg}°) — the CPU lane handles rotation"
+            ));
+        }
+        let desc = unsafe { dup.GetDesc() };
+        let (sw, sh) = (desc.ModeDesc.Width, desc.ModeDesc.Height);
+        if sw == 0 || sh == 0 {
+            return Err("duplication reports a degenerate mode".into());
+        }
+        let (dw, dh) = crate::video::fit_within_even(sw, sh, out_edge);
+        let gpu = GpuConvert::on_device(device.clone(), context.clone(), sw, sh, dw, dh)?;
+        let manager = gpu.manager();
+        let adapter_luid = unsafe {
+            let dxgi: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
+            let adapter: IDXGIAdapter = dxgi.GetAdapter().map_err(|e| e.to_string())?;
+            adapter.GetDesc().map_err(|e| e.to_string())?.AdapterLuid
+        };
+        let clean = bgra_default_texture(&device, sw, sh)?;
+        let (tx, rx) = mpsc::sync_channel::<GpuFrame>(2);
+        let (release_tx, release_rx) = mpsc::sync_channel::<usize>(NV12_RING);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let mut d = GpuDup {
+            device,
+            context,
+            dup,
+            gpu,
+            clean,
+            cursor_staging: None,
+            patch: Vec::new(),
+            src: (sw, sh),
+            cursor: None,
+            ptr_x: 0,
+            ptr_y: 0,
+            ptr_visible: false,
+            have_clean: false,
+            last_emit: Instant::now(),
+            release: release_rx,
+        };
+        let thread = std::thread::spawn(move || pump_gpu(&mut d, monitor_id, &stop_thread, &tx));
+        Ok(GpuLane {
+            session: Session {
+                stop,
+                thread: Some(thread),
+            },
+            frames: rx,
+            release: release_tx,
+            manager,
+            adapter_luid,
+            out_size: (dw, dh),
+            src_size: (sw, sh),
+        })
+    }
+
+    /// A GPU-resident BGRA texture with no bind flags — copy target, blt
+    /// input.
+    fn bgra_default_texture(
+        device: &ID3D11Device,
+        w: u32,
+        h: u32,
+    ) -> Result<ID3D11Texture2D, String> {
+        unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: 0,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .map_err(|e| format!("CreateTexture2D (clean): {e}"))?;
+            tex.ok_or_else(|| "CreateTexture2D returned no texture".to_string())
+        }
+    }
+
+    /// The GPU lane's duplication state, owned by its capture thread.
+    struct GpuDup {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        dup: IDXGIOutputDuplication,
+        gpu: GpuConvert,
+        /// The persistent cursor-free desktop image — GPU-resident,
+        /// refreshed by each damage frame's `CopyResource`. The cursor
+        /// patch is drawn on and restored around each blt, so between
+        /// frames it is always clean (pointer-only moves re-blt it).
+        clean: ID3D11Texture2D,
+        /// Save-under staging for the cursor rect: pristine pixels out
+        /// (`Map`), patched pixels back (`UpdateSubresource`), pristine
+        /// restored after the blt. Sized to the current shape; rebuilt
+        /// when a bigger one arrives.
+        cursor_staging: Option<(ID3D11Texture2D, u32, u32)>,
+        /// CPU-side patch buffer, reused across frames.
+        patch: Vec<u8>,
+        src: (u32, u32),
+        cursor: Option<CursorShape>,
+        ptr_x: i32,
+        ptr_y: i32,
+        ptr_visible: bool,
+        have_clean: bool,
+        /// Rate limit for pointer-only re-emits (see [`Duplication`]).
+        last_emit: Instant,
+        release: mpsc::Receiver<usize>,
+    }
+
+    // SAFETY: all COM state lives on a multithread-protected device and is
+    // driven only by the capture thread this value moves onto at spawn.
+    unsafe impl Send for GpuDup {}
+
+    fn pump_gpu(
+        d: &mut GpuDup,
+        monitor_id: u32,
+        stop: &AtomicBool,
+        tx: &mpsc::SyncSender<GpuFrame>,
+    ) {
+        crate::os_perf::boost_media_thread();
+        while !stop.load(Ordering::SeqCst) {
+            // Slots the consumer has finished with go back into rotation
+            // before we look for a frame to put in one.
+            while let Ok(slot) = d.release.try_recv() {
+                d.gpu.release(slot);
+            }
+            match d.next_gpu_frame(100, tx) {
+                Ok(()) => {}
+                Err(NextError::AccessLost) => {
+                    // Mode change / fullscreen toggle / secure desktop.
+                    // Re-acquire on the same device — but if the mode came
+                    // back *different* (size or rotation), every fitted
+                    // size in the lane is stale: end the thread and let
+                    // the consumer restart the lane fresh.
+                    tracing::debug!(
+                        "GPU-lane duplication of monitor {monitor_id:#x} lost — re-acquiring"
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match unsafe { duplicate_output(&d.device, monitor_id) } {
+                            Ok((dup, rot)) => {
+                                let desc = unsafe { dup.GetDesc() };
+                                if rot != 0 || (desc.ModeDesc.Width, desc.ModeDesc.Height) != d.src
+                                {
+                                    tracing::debug!(
+                                        "GPU-lane duplication came back with a different mode — \
+                                         lane restart"
+                                    );
+                                    return;
+                                }
+                                d.dup = dup;
+                                break;
+                            }
+                            Err(e) if Instant::now() < deadline => {
+                                tracing::debug!("GPU-lane re-acquire not ready ({e}); retrying");
+                                std::thread::sleep(Duration::from_millis(250));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "GPU-lane duplication of monitor {monitor_id:#x} \
+                                     not recoverable: {e}"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(NextError::Fatal(e)) => {
+                    tracing::warn!("GPU-lane capture for monitor {monitor_id:#x} ended: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    impl GpuDup {
+        /// One acquire tick: refresh cursor metadata, refresh the clean
+        /// desktop texture on damage, and send a composed NV12 frame when
+        /// there's anything new to show.
+        fn next_gpu_frame(
+            &mut self,
+            timeout_ms: u32,
+            tx: &mpsc::SyncSender<GpuFrame>,
+        ) -> Result<(), NextError> {
+            unsafe {
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource: Option<IDXGIResource> = None;
+                if let Err(e) = self
+                    .dup
+                    .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
+                {
+                    return match e.code() {
+                        c if c == DXGI_ERROR_WAIT_TIMEOUT => Ok(()),
+                        c if c == DXGI_ERROR_ACCESS_LOST => Err(NextError::AccessLost),
+                        _ => Err(NextError::Fatal(e.to_string())),
+                    };
+                }
+                if info.PointerShapeBufferSize > 0 {
+                    if let Some(shape) = fetch_cursor_shape(&self.dup, info.PointerShapeBufferSize)
+                    {
+                        self.cursor = Some(shape);
+                    }
+                }
+                if info.LastMouseUpdateTime != 0 {
+                    let p = info.PointerPosition;
+                    self.ptr_x = p.Position.x;
+                    self.ptr_y = p.Position.y;
+                    self.ptr_visible = p.Visible.as_bool();
+                }
+                if info.LastPresentTime != 0 {
+                    // New desktop pixels: queue the GPU copy into the
+                    // persistent clean texture, then release immediately —
+                    // same discipline as the CPU lane (holding the frame
+                    // throttles the compositor).
+                    let refreshed = self.refresh_clean(resource);
+                    let _ = self.dup.ReleaseFrame();
+                    if !refreshed {
+                        return Ok(());
+                    }
+                    self.have_clean = true;
+                } else {
+                    let _ = self.dup.ReleaseFrame();
+                    // Pointer-only update: re-emit the retained clean
+                    // desktop with the cursor at its new spot, rate-limited
+                    // so a fast mouse can't spin the pump.
+                    if !self.have_clean || !self.ptr_visible || self.cursor.is_none() {
+                        return Ok(());
+                    }
+                    if self.last_emit.elapsed() < Duration::from_millis(15) {
+                        return Ok(());
+                    }
+                }
+                self.compose_and_send(tx)
+            }
+        }
+
+        /// Queue the copy of a held frame's texture into `clean`. `false`
+        /// when the resource is missing or degenerate — skip the frame.
+        unsafe fn refresh_clean(&mut self, resource: Option<IDXGIResource>) -> bool {
+            let Some(resource) = resource else {
+                return false;
+            };
+            let Ok(texture) = resource.cast::<ID3D11Texture2D>() else {
+                return false;
+            };
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            if (desc.Width, desc.Height) != self.src {
+                // A size change without ACCESS_LOST shouldn't happen; skip
+                // rather than corrupt (the mode-change path restarts the
+                // lane).
+                return false;
+            }
+            self.context.CopyResource(&self.clean, &texture);
+            true
+        }
+
+        /// Blt the clean desktop — with the cursor patched over its rect —
+        /// to a free NV12 ring slot and hand it to the consumer. All GPU
+        /// work except the cursor-sized patch blend.
+        fn compose_and_send(&mut self, tx: &mpsc::SyncSender<GpuFrame>) -> Result<(), NextError> {
+            let t0 = Instant::now();
+            let patched = if self.ptr_visible && self.cursor.is_some() {
+                self.patch_cursor_on_clean()
+            } else {
+                None
+            };
+            let converted = self.gpu.convert(&self.clean);
+            // Restore is queued after the blt: the outgoing frame keeps
+            // the cursor while `clean` returns to cursor-free.
+            if let Some(rect) = patched {
+                self.restore_clean(rect);
+            }
+            let (slot, tex) = match converted {
+                Ok(Some(s)) => s,
+                // Every slot still checked out — the consumer is far
+                // behind, and this frame is stale by definition.
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(NextError::Fatal(format!("GPU convert: {e}"))),
+            };
+            self.last_emit = Instant::now();
+            let (out_w, out_h) = self.gpu.out_size();
+            let frame = GpuFrame {
+                slot,
+                tex,
+                out_w,
+                out_h,
+                spent: t0.elapsed(),
+            };
+            if tx.try_send(frame).is_err() {
+                // Full channel = consumer behind; reclaim the slot at once.
+                self.gpu.release(slot);
+            }
+            Ok(())
+        }
+
+        /// Draw the cursor over `clean`'s rect via the save-under staging:
+        /// pristine rect out (`Map`), blend on the CPU, patched rect back.
+        /// Returns the affected rect for [`Self::restore_clean`], or
+        /// `None` when nothing was drawn (off-screen cursor, staging
+        /// trouble) — the frame then goes out cursor-less, like a failed
+        /// shape fetch on the CPU lane.
+        fn patch_cursor_on_clean(&mut self) -> Option<(u32, u32, u32, u32)> {
+            let (cw, ch) = {
+                let cur = self.cursor.as_ref()?;
+                let eff_h = cur.height / if cur.kind == 1 { 2 } else { 1 };
+                (cur.width, eff_h)
+            };
+            if cw == 0 || ch == 0 {
+                return None;
+            }
+            let (sw, sh) = self.src;
+            let rx = self.ptr_x.max(0);
+            let ry = self.ptr_y.max(0);
+            let right = (self.ptr_x + cw as i32).min(sw as i32);
+            let bottom = (self.ptr_y + ch as i32).min(sh as i32);
+            if rx >= right || ry >= bottom {
+                return None;
+            }
+            let (rw, rh) = ((right - rx) as u32, (bottom - ry) as u32);
+            let (rx, ry) = (rx as u32, ry as u32);
+            unsafe {
+                let staging = self.staging_for_cursor(cw, ch)?;
+                let src_box = D3D11_BOX {
+                    left: rx,
+                    top: ry,
+                    front: 0,
+                    right: rx + rw,
+                    bottom: ry + rh,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &self.clean,
+                    0,
+                    Some(&src_box),
+                );
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                if self
+                    .context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .is_err()
+                {
+                    return None;
+                }
+                let pitch = mapped.RowPitch as usize;
+                let (rwu, rhu) = (rw as usize, rh as usize);
+                let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * rhu);
+                self.patch.clear();
+                self.patch.reserve(rwu * rhu * 4);
+                for row in 0..rhu {
+                    self.patch.extend_from_slice(&src[row * pitch..][..rwu * 4]);
+                }
+                self.context.Unmap(&staging, 0);
+                let cur = self.cursor.as_ref()?;
+                composite_cursor_impl::<true>(
+                    &mut self.patch,
+                    rw,
+                    rh,
+                    cur,
+                    // Cursor position relative to the patch origin (≤0 when
+                    // the shape is clipped at the left/top edge).
+                    self.ptr_x - rx as i32,
+                    self.ptr_y - ry as i32,
+                );
+                let dst_box = D3D11_BOX {
+                    left: rx,
+                    top: ry,
+                    front: 0,
+                    right: rx + rw,
+                    bottom: ry + rh,
+                    back: 1,
+                };
+                self.context.UpdateSubresource(
+                    &self.clean,
+                    0,
+                    Some(&dst_box),
+                    self.patch.as_ptr() as *const core::ffi::c_void,
+                    rw * 4,
+                    0,
+                );
+                Some((rx, ry, rw, rh))
+            }
+        }
+
+        /// Undo the cursor patch: copy the pristine save-under back onto
+        /// `clean`'s rect. Queued after the blt, so ordering on the
+        /// immediate context guarantees the outgoing frame saw the cursor.
+        fn restore_clean(&mut self, (rx, ry, rw, rh): (u32, u32, u32, u32)) {
+            let Some((staging, _, _)) = &self.cursor_staging else {
+                return;
+            };
+            unsafe {
+                let src_box = D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: rw,
+                    bottom: rh,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &self.clean,
+                    0,
+                    rx,
+                    ry,
+                    0,
+                    staging,
+                    0,
+                    Some(&src_box),
+                );
+            }
+        }
+
+        /// The save-under staging texture, at least the current shape's
+        /// size (recreated only when a bigger shape arrives).
+        unsafe fn staging_for_cursor(&mut self, w: u32, h: u32) -> Option<ID3D11Texture2D> {
+            if let Some((tex, tw, th)) = &self.cursor_staging {
+                if *tw >= w && *th >= h {
+                    return Some(tex.clone());
+                }
+            }
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            if self
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .is_err()
+            {
+                return None;
+            }
+            let tex = tex?;
+            self.cursor_staging = Some((tex.clone(), w, h));
+            Some(tex)
+        }
     }
 }
 

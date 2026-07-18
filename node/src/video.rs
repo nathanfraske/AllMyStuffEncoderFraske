@@ -173,6 +173,15 @@ impl StreamStats {
         self.encode_ms.push(d.as_secs_f32() * 1000.0);
     }
 
+    /// Re-label the stats line after the encoder's transport settled (a
+    /// route whose H.264 init fell to the MJPEG floor).
+    fn set_mode(&mut self, mode: VideoMode) {
+        self.label = match mode {
+            VideoMode::H264 => "H.264",
+            VideoMode::Mjpeg => "MJPEG",
+        };
+    }
+
     fn p95(samples: &mut [f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -1187,10 +1196,8 @@ fn run_capture(
     // every other backend delivers the upright presentation image (rotation 0).
     // `source_hint` is the monitor's reported size — it only pre-budgets the
     // encoder's starting bitrate; the first real frame locks the true size.
-    let mut encoder =
-        HealingEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
-    let mut stats = StreamStats::new(route_id, encoder.mode());
     let fps = tune.fps();
+    let mut stats = StreamStats::new(route_id, mode);
     // One provenance line per stream — the numbers that explain a capped rate
     // at a glance: codec, whether the path was classed LAN (60) or WAN/Unknown
     // (30 cap), the effective fps ceiling, and the source size. A posted CEC
@@ -1205,6 +1212,73 @@ fn run_capture(
         source_hint.0,
         source_hint.1,
     );
+
+    // Windows, H.264: the GPU zero-copy lane runs INSTEAD of the CPU
+    // pipeline when the whole chain comes up (duplication, cursor, and
+    // colour conversion on one D3D11 device; the encoder MFT reading the
+    // NV12 textures in place — see `win_capture::start_gpu` and
+    // `run_gpu_lane`). It's tried before any CPU encoder exists, so a
+    // GPU-lane route holds ONE hardware encoder session, not two. Every
+    // failure is soft — the reason is logged and the proven CPU path below
+    // takes over; a mode or edge-cap change restarts the lane with fresh
+    // geometry, budgeted so a flapping driver can't loop forever. The
+    // operator's adapter pin wins over the lane: pinning exists to encode
+    // on a *different* GPU than the display's, which is inherently
+    // cross-adapter — the CPU lane's system-memory NV12 serves that.
+    #[cfg(windows)]
+    if mode == VideoMode::H264
+        && gpu_lane_enabled()
+        && !crate::mediafoundation::adapter_pin_active()
+    {
+        if let Ok(mid) = monitor.id() {
+            let mut window = Instant::now();
+            let mut attempts = 0u32;
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if window.elapsed() > Duration::from_secs(60) {
+                    window = Instant::now();
+                    attempts = 0;
+                }
+                attempts += 1;
+                if attempts > 10 {
+                    tracing::warn!(
+                        "GPU lane for {route_id} restarting too often; using the CPU lane"
+                    );
+                    break;
+                }
+                match run_gpu_lane(
+                    stop,
+                    fps,
+                    route_id,
+                    mid,
+                    tune,
+                    refresh,
+                    idr_ms,
+                    auto,
+                    on_packet,
+                    &mut stats,
+                    &mut reporter,
+                ) {
+                    GpuEnd::Stopped => return Ok(()),
+                    GpuEnd::Restart => continue,
+                    GpuEnd::Fallback(why) => {
+                        tracing::info!(
+                            "GPU lane unavailable for {route_id} ({why}); using the CPU lane"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut encoder =
+        HealingEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
+    // The negotiated transport pre-labelled the stats line; correct it if
+    // the encoder fell to the MJPEG floor.
+    stats.set_mode(encoder.mode());
 
     // Windows: our own DXGI Output Duplication session — damage-driven,
     // per-monitor, releasable (see `win_capture` for why xcap's recorder
@@ -1854,6 +1928,384 @@ fn log_orient(rotation_deg: u32, bw: u32, bh: u32, turns: u8, ow: u32, oh: u32) 
             target: "capture::orient",
             "rotation_deg={rotation_deg} buf={bw}x{bh} -> turns={turns} out={ow}x{oh}"
         );
+    }
+}
+
+/// Kill-switch for the GPU zero-copy lane (`ALLMYSTUFF_GPU_LANE=0`).
+/// Default ON: the lane self-proves at start and falls back to the CPU
+/// path on any failure, so the dial exists for diagnosis, not safety.
+#[cfg(windows)]
+fn gpu_lane_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let off = std::env::var("ALLMYSTUFF_GPU_LANE")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
+            .unwrap_or(false);
+        if off {
+            tracing::info!("ALLMYSTUFF_GPU_LANE off — GPU zero-copy lane disabled");
+        }
+        !off
+    });
+    *ON
+}
+
+/// How a GPU-lane run ended. Hard errors fold into `Fallback`'s reason —
+/// the lane never takes the route down; the CPU path always gets its turn.
+#[cfg(windows)]
+enum GpuEnd {
+    /// The route was stopped — done.
+    Stopped,
+    /// The lane's geometry went stale (mode change, edge-cap change) —
+    /// start a fresh lane.
+    Restart,
+    /// The lane can't run here (rotated output, no capable MFT, persistent
+    /// encoder failure…) — use the CPU path, and say why.
+    Fallback(String),
+}
+
+/// Open the best hardware H.264 MFT **on the lane's adapter**, bound to
+/// its device manager — the encoder must live where the textures live.
+/// `None` when no MFT on that adapter accepts the manager and types.
+#[cfg(windows)]
+fn open_gpu_encoder(
+    adapter: windows::Win32::Foundation::LUID,
+    w: u32,
+    h: u32,
+    fps: u32,
+    bitrate: u32,
+    manager: &windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager,
+) -> Option<crate::mediafoundation::MediaFoundationH264> {
+    for hw in crate::mediafoundation::hardware_h264_mfts_on(adapter) {
+        match hw.open_with_manager(w, h, fps, bitrate, Some(manager)) {
+            Ok(enc) => return Some(enc),
+            Err(e) => tracing::debug!("GPU-lane MFT {} declined: {e}", hw.name()),
+        }
+    }
+    None
+}
+
+/// One GPU-lane encoder error: skip, reopen, or give up per the shared
+/// [`RebuildPolicy`]. `Ok(Some(_))` = a fresh encoder (the caller arms the
+/// refresh flag — its first unit is an IDR); `Ok(None)` = skip this frame;
+/// `Err(why)` = the lane is done, fall back.
+#[cfg(windows)]
+fn gpu_heal(
+    policy: &mut RebuildPolicy,
+    route_id: &str,
+    err: &str,
+    reopen: impl FnOnce() -> Option<crate::mediafoundation::MediaFoundationH264>,
+) -> Result<Option<crate::mediafoundation::MediaFoundationH264>, String> {
+    match policy.on_error(Instant::now()) {
+        PolicyVerdict::SkipFrame => {
+            tracing::debug!(
+                "GPU-lane encoder for {route_id} still failing ({err}); rebuild not yet due"
+            );
+            Ok(None)
+        }
+        PolicyVerdict::GiveUp => Err(format!(
+            "encoder failed persistently after {REBUILD_MAX} reopens: {err}"
+        )),
+        PolicyVerdict::Rebuild => {
+            tracing::warn!("GPU-lane encoder for {route_id} failed ({err}); reopening");
+            match reopen() {
+                Some(enc) => Ok(Some(enc)),
+                None => Err(format!("encoder reopen failed after: {err}")),
+            }
+        }
+    }
+}
+
+/// The GPU zero-copy screen pump: frames arrive as NV12 *textures* from
+/// [`crate::win_capture::start_gpu`] (duplication, cursor composite, and
+/// colour conversion all on one D3D11 device) and go to a
+/// device-manager-bound hardware MFT that reads them in place — no CPU
+/// pixel work anywhere on the lane. Runs INSTEAD of the CPU pump when the
+/// chain comes up; every failure is soft (the caller falls back to the
+/// proven CPU path, which keeps its own healing ladder).
+///
+/// Mirrors the CPU pump's cadence machinery: freshest-wins drains, fps
+/// pacing, the adaptive IDR cadence + viewer refresh flag, first-frame
+/// wake pressure, and the quiet-spell convergence IDR + refinement passes
+/// (re-encoding the retained last *texture*, whose ring slot stays
+/// checked out until a newer frame replaces it). The static-skip byte
+/// compare has no analog here on purpose: damage-driven duplication IS
+/// the static gate.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_lane(
+    stop: &AtomicBool,
+    fps: u32,
+    route_id: &str,
+    mid: u32,
+    tune: Tune,
+    refresh: &Arc<AtomicBool>,
+    idr_ms: &Arc<AtomicU64>,
+    auto: &Arc<AutoAdapt>,
+    on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
+    stats: &mut StreamStats,
+    reporter: &mut StatusReporter,
+) -> GpuEnd {
+    let edge = effective_h264_edge(tune, auto);
+    let lane = match crate::win_capture::start_gpu(mid, edge) {
+        Ok(l) => l,
+        Err(e) => return GpuEnd::Fallback(e),
+    };
+    let (dw, dh) = lane.out_size;
+    let bitrate = tune
+        .bitrate
+        .unwrap_or_else(|| h264_bitrate_for(dw, dh, fps, tune.link))
+        .clamp(250_000, 80_000_000);
+    let Some(mut enc) = open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
+    else {
+        return GpuEnd::Fallback("no hardware MFT accepted the shared device".into());
+    };
+    tracing::info!(
+        "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
+        enc.label(),
+        lane.src_size.0,
+        lane.src_size.1,
+        bitrate as f64 / 1e6
+    );
+    (stats.out_w, stats.out_h) = (dw, dh);
+
+    let budget = Duration::from_secs(1) / fps.max(1);
+    let started = Instant::now();
+    let mut got_any = false;
+    let mut policy = RebuildPolicy::new();
+    // The last successfully encoded frame, kept checked out so the quiet
+    // path can re-encode its texture (the slot only goes home when a newer
+    // frame replaces it — the capture side can't blt over it meanwhile).
+    let mut retained: Option<crate::win_capture::GpuFrame> = None;
+    let mut last_idr: Option<Instant> = None;
+    let mut last_emit: Option<Instant> = None;
+    // Watchdog: an MFT that consumes frames but never produces a unit is a
+    // silent brick. The CPU ladder's synthetic frame-send test can't run
+    // here (it would need a texture from this very lane), so the live
+    // stream is the send test.
+    let mut units_ever = false;
+    let mut consumed_without_unit = 0u32;
+    let mut quiesced = false;
+    let mut refines_left: u8 = 0;
+    let mut refine_at: Option<Instant> = None;
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return GpuEnd::Stopped;
+        }
+        match lane.frames.recv_timeout(Duration::from_millis(250)) {
+            Ok(mut frame) => {
+                let frame_start = Instant::now();
+                got_any = true;
+                reporter.report(VideoStatusState::Ok, None);
+                // Freshest-wins: displaced frames' slots go straight home.
+                while let Ok(newer) = lane.frames.try_recv() {
+                    stats.dropped += 1;
+                    let _ = lane.release.try_send(frame.slot);
+                    frame = newer;
+                }
+                // The receiver's edge cap may have moved (auto-adapt); the
+                // blt output size is baked into the lane, so a changed fit
+                // rebuilds the lane rather than mis-scaling.
+                let want = fit_within_even(
+                    lane.src_size.0,
+                    lane.src_size.1,
+                    effective_h264_edge(tune, auto),
+                );
+                if want != lane.out_size {
+                    tracing::info!(
+                        "GPU lane for {route_id}: fitted size {}×{} -> {}×{} — rebuilding lane",
+                        lane.out_size.0,
+                        lane.out_size.1,
+                        want.0,
+                        want.1
+                    );
+                    return GpuEnd::Restart;
+                }
+                quiesced = false;
+                refines_left = 0;
+                refine_at = None;
+                stats.add_scale(frame.spent);
+                (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
+                let refresh_asked = refresh.swap(false, Ordering::SeqCst);
+                let idr_every = Duration::from_millis(idr_ms.load(Ordering::Relaxed));
+                let force_idr =
+                    refresh_asked || last_idr.is_none_or(|idr| idr.elapsed() >= idr_every);
+                let t1 = Instant::now();
+                match enc.encode_texture(&frame.tex, force_idr) {
+                    Ok(outcome) => {
+                        stats.add_encode(t1.elapsed());
+                        if outcome.consumed {
+                            if let Some(old) = retained.replace(frame) {
+                                let _ = lane.release.try_send(old.slot);
+                            }
+                        } else {
+                            let _ = lane.release.try_send(frame.slot);
+                            if refresh_asked {
+                                // Not served — re-arm for the next tick
+                                // (see `encode_prepared`'s twin).
+                                refresh.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        if outcome.units.is_empty() {
+                            if !units_ever {
+                                consumed_without_unit += 1;
+                                if consumed_without_unit > 90 {
+                                    return GpuEnd::Fallback(format!(
+                                        "{} consumed {consumed_without_unit} frames without \
+                                         producing a unit",
+                                        enc.label()
+                                    ));
+                                }
+                            }
+                        } else {
+                            units_ever = true;
+                        }
+                        let packets = packetize_units(
+                            outcome.units,
+                            fps,
+                            &mut last_emit,
+                            &mut last_idr,
+                            stats,
+                        );
+                        emit_packets(packets, on_packet, stats);
+                    }
+                    Err(e) => {
+                        let _ = lane.release.try_send(frame.slot);
+                        match gpu_heal(&mut policy, route_id, &e, || {
+                            open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
+                        }) {
+                            Ok(Some(next)) => {
+                                enc = next;
+                                refresh.store(true, Ordering::SeqCst);
+                            }
+                            Ok(None) => {}
+                            Err(why) => return GpuEnd::Fallback(why),
+                        }
+                    }
+                }
+                stats.maybe_log();
+                if let Some(rest) = budget.checked_sub(frame_start.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !got_any {
+                    // Frameless from birth = a dark display (damage-driven
+                    // capture sends nothing from a sleeping screen). Keep
+                    // wake pressure on the panel, like the CPU pump.
+                    wake::force_display_on();
+                    if started.elapsed() >= FIRST_FRAME_STALL {
+                        reporter.report(VideoStatusState::DisplayAsleep, None);
+                    }
+                    continue;
+                }
+                // Quiet spell: serve convergence from the retained last
+                // texture — one clean IDR per spell (plus any refresh ask
+                // that lands while quiet), then the refinement passes
+                // sharpen what the burst left coarse (the CPU pump's twin).
+                let Some(kept) = &retained else {
+                    continue;
+                };
+                if !quiesced || refresh.load(Ordering::SeqCst) {
+                    quiesced = true;
+                    let refresh_asked = refresh.load(Ordering::SeqCst);
+                    let t1 = Instant::now();
+                    match enc.encode_texture(&kept.tex, true) {
+                        Ok(outcome) => {
+                            stats.add_encode(t1.elapsed());
+                            if outcome.consumed && refresh_asked {
+                                refresh.store(false, Ordering::SeqCst);
+                            }
+                            let emitted = !outcome.units.is_empty();
+                            let packets = packetize_units(
+                                outcome.units,
+                                fps,
+                                &mut last_emit,
+                                &mut last_idr,
+                                stats,
+                            );
+                            emit_packets(packets, on_packet, stats);
+                            if emitted {
+                                refines_left = REFINE_PASSES;
+                                refine_at = Some(Instant::now() + REFINE_AFTER);
+                            }
+                        }
+                        Err(e) => {
+                            match gpu_heal(&mut policy, route_id, &e, || {
+                                open_gpu_encoder(
+                                    lane.adapter_luid,
+                                    dw,
+                                    dh,
+                                    fps,
+                                    bitrate,
+                                    &lane.manager,
+                                )
+                            }) {
+                                Ok(Some(next)) => {
+                                    enc = next;
+                                    refresh.store(true, Ordering::SeqCst);
+                                }
+                                Ok(None) => {}
+                                Err(why) => return GpuEnd::Fallback(why),
+                            }
+                        }
+                    }
+                    stats.maybe_log();
+                } else if refines_left > 0 && refine_at.is_some_and(|t| Instant::now() >= t) {
+                    let t1 = Instant::now();
+                    match enc.encode_texture(&kept.tex, false) {
+                        Ok(outcome) => {
+                            stats.add_encode(t1.elapsed());
+                            let packets = packetize_units(
+                                outcome.units,
+                                fps,
+                                &mut last_emit,
+                                &mut last_idr,
+                                stats,
+                            );
+                            emit_packets(packets, on_packet, stats);
+                            refines_left -= 1;
+                            refine_at = (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
+                        }
+                        Err(e) => {
+                            match gpu_heal(&mut policy, route_id, &e, || {
+                                open_gpu_encoder(
+                                    lane.adapter_luid,
+                                    dw,
+                                    dh,
+                                    fps,
+                                    bitrate,
+                                    &lane.manager,
+                                )
+                            }) {
+                                Ok(Some(next)) => {
+                                    enc = next;
+                                    refresh.store(true, Ordering::SeqCst);
+                                }
+                                Ok(None) => {}
+                                Err(why) => return GpuEnd::Fallback(why),
+                            }
+                        }
+                    }
+                    stats.maybe_log();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The capture thread ended: a mode change (the restart
+                // builds the new geometry) or an unrecoverable duplication
+                // (the restart's `start_gpu` error then routes to the CPU
+                // path, whose fallback ladder owns the reporting).
+                return if stop.load(Ordering::SeqCst) {
+                    GpuEnd::Stopped
+                } else {
+                    GpuEnd::Restart
+                };
+            }
+        }
     }
 }
 
@@ -2679,10 +3131,7 @@ impl H264Stream {
     /// The edge this frame fits to: the tuned ceiling, capped by the
     /// receiver-driven auto-adapt when it's active.
     fn effective_edge(&self) -> u32 {
-        match self.auto.edge_cap() {
-            Some(cap) => self.tune.h264_edge().min(cap),
-            None => self.tune.h264_edge(),
-        }
+        effective_h264_edge(self.tune, &self.auto)
     }
 
     fn encode(
@@ -2833,45 +3282,73 @@ impl H264Stream {
         Ok(self.packetize(outcome.units, stats))
     }
 
-    /// Stamp drained units into wire packets: keyframe/byte accounting, and
-    /// the RTP duration — the real wall-clock gap since the last emitted unit
-    /// (so the 90 kHz clock tracks wall-clock across static-skip gaps),
-    /// clamped to [1/2fps, 5 s] and split evenly across a drained backlog.
-    /// First-ever unit uses the nominal 1/fps.
+    /// See [`packetize_units`] — bound to this stream's clock state.
     fn packetize(
         &mut self,
         units: Vec<(Vec<u8>, bool)>,
         stats: &mut StreamStats,
     ) -> Vec<VideoPacket> {
-        let units: Vec<(Vec<u8>, bool)> =
-            units.into_iter().filter(|(d, _)| !d.is_empty()).collect();
-        if units.is_empty() {
-            return Vec::new();
-        }
-        let now = Instant::now();
-        let nominal = 1_000_000u64 / u64::from(self.fps.max(1));
-        let total = match self.last_emit {
-            Some(prev) => {
-                (now.duration_since(prev).as_micros() as u64).clamp(nominal / 2, 5_000_000)
+        packetize_units(
+            units,
+            self.fps,
+            &mut self.last_emit,
+            &mut self.last_idr,
+            stats,
+        )
+    }
+}
+
+/// Stamp drained units into wire packets: keyframe/byte accounting, and
+/// the RTP duration — the real wall-clock gap since the last emitted unit
+/// (so the 90 kHz clock tracks wall-clock across static-skip gaps),
+/// clamped to [1/2fps, 5 s] and split evenly across a drained backlog.
+/// First-ever unit uses the nominal 1/fps. Free-standing because two
+/// stream shapes share it: [`H264Stream`] (the CPU lane) and the GPU
+/// lane's texture pump, each carrying its own `last_emit`/`last_idr`
+/// clock.
+fn packetize_units(
+    units: Vec<(Vec<u8>, bool)>,
+    fps: u32,
+    last_emit: &mut Option<Instant>,
+    last_idr: &mut Option<Instant>,
+    stats: &mut StreamStats,
+) -> Vec<VideoPacket> {
+    let units: Vec<(Vec<u8>, bool)> = units.into_iter().filter(|(d, _)| !d.is_empty()).collect();
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let nominal = 1_000_000u64 / u64::from(fps.max(1));
+    let total = match *last_emit {
+        Some(prev) => (now.duration_since(prev).as_micros() as u64).clamp(nominal / 2, 5_000_000),
+        None => nominal.saturating_mul(units.len() as u64),
+    };
+    let per_unit = (total / units.len() as u64).max(1);
+    *last_emit = Some(now);
+    units
+        .into_iter()
+        .map(|(data, key)| {
+            if key {
+                *last_idr = Some(now);
+                stats.keyframes += 1;
             }
-            None => nominal.saturating_mul(units.len() as u64),
-        };
-        let per_unit = (total / units.len() as u64).max(1);
-        self.last_emit = Some(now);
-        units
-            .into_iter()
-            .map(|(data, key)| {
-                if key {
-                    self.last_idr = Some(now);
-                    stats.keyframes += 1;
-                }
-                stats.bytes += data.len() as u64;
-                VideoPacket::H264 {
-                    data,
-                    duration_us: per_unit,
-                }
-            })
-            .collect()
+            stats.bytes += data.len() as u64;
+            VideoPacket::H264 {
+                data,
+                duration_us: per_unit,
+            }
+        })
+        .collect()
+}
+
+/// The H.264 edge a frame fits to right now: the tuned ceiling, capped by
+/// the receiver-driven auto-adapt when it's active. Shared by
+/// [`H264Stream`] and the GPU lane (which re-fits — and rebuilds — when
+/// this changes under it).
+fn effective_h264_edge(tune: Tune, auto: &AutoAdapt) -> u32 {
+    match auto.edge_cap() {
+        Some(cap) => tune.h264_edge().min(cap),
+        None => tune.h264_edge(),
     }
 }
 
@@ -3242,8 +3719,10 @@ fn make_h264_encoder(
 }
 
 /// [`fit_within`], then force both edges even (4:2:0 chroma subsampling
-/// needs it; a 1-pixel crop is invisible at these sizes).
-fn fit_within_even(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
+/// needs it; a 1-pixel crop is invisible at these sizes). `pub(crate)`:
+/// the GPU lane fits its blt output with the same rule
+/// (`win_capture::start_gpu`).
+pub(crate) fn fit_within_even(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     let (w, h) = fit_within(w, h, max_edge);
     ((w & !1).max(2), (h & !1).max(2))
 }

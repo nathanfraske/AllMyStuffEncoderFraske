@@ -289,6 +289,27 @@ pub fn hardware_h264_mfts() -> Vec<HwEncoder> {
     unsafe { enum_hw_h264() }
 }
 
+/// [`hardware_h264_mfts`] scoped to one adapter — the GPU lane's
+/// enumeration: the encoder must live on the duplication device's adapter
+/// or the shared device manager buys nothing. Empty when that adapter has
+/// no H.264 encoder MFT; the lane then falls back to the CPU path (which
+/// may still find an encoder elsewhere).
+pub(crate) fn hardware_h264_mfts_on(adapter: LUID) -> Vec<HwEncoder> {
+    ensure_mf_started();
+    ensure_com_thread();
+    unsafe { enum_h264_encoders(Some(adapter)) }
+}
+
+/// Whether the operator pinned encoding to a specific adapter
+/// (`ALLMYSTUFF_VIDEO_ENCODE_ADAPTER`). The GPU zero-copy lane steps aside
+/// when so: the pin's whole point is encoding on a *different* GPU than
+/// the display's (iGPU offload), which is inherently cross-adapter — the
+/// CPU lane's system-memory NV12 serves that; a same-device texture lane
+/// can't.
+pub(crate) fn adapter_pin_active() -> bool {
+    adapter_pin().is_some()
+}
+
 unsafe fn enum_hw_h264() -> Vec<HwEncoder> {
     // The operator's adapter pin runs first — soft, like every rung of the
     // ladder: a pin that matches no adapter, or an adapter with no H.264
@@ -567,9 +588,6 @@ impl MediaFoundationH264 {
     /// device is registered in ([`HwEncoder::open_with_manager`]); the
     /// encoder reads the surface in place — no CPU pixel work anywhere on
     /// this path.
-    // The capture/pump integration slice consumes this; until it lands the
-    // only caller is gpu_pipeline's end-to-end test.
-    #[allow(dead_code)]
     pub(crate) fn encode_texture(
         &mut self,
         nv12: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
