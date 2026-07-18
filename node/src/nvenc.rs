@@ -1093,6 +1093,127 @@ mod tests {
         }
     }
 
+    /// The long-form soak: each posture runs for `ALLMYSTUFF_SOAK_SECS`
+    /// (default 360 s) **paced to a real 60 fps cadence** — the encoder at
+    /// field duty cycle, thermals and clocks included — with a rolling
+    /// 15 s profile window (avg/p95/max/effective-Mbps), a final
+    /// percentile ladder (p50→p99.9), and the ten slowest frames with
+    /// their timestamps. Run:
+    /// `cargo test --release -- --ignored soak_nvenc --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "soak — minutes per posture; run with --ignored --nocapture"]
+    fn soak_nvenc_postures() {
+        use std::time::{Duration, Instant};
+        let secs: u64 = std::env::var("ALLMYSTUFF_SOAK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(360);
+        const MATRIX: [(&str, bool, bool, u32); 4] = [
+            ("balanced 30M", false, false, 30_000_000),
+            ("game 30M", true, false, 30_000_000),
+            ("game 200M", true, false, 200_000_000),
+            ("studio 150M", false, true, 150_000_000),
+        ];
+        // `ALLMYSTUFF_SOAK_ONLY=<substring>` runs a single posture — the
+        // full sequence outlives one runner window, so the harness chains
+        // one posture per invocation.
+        let only = std::env::var("ALLMYSTUFF_SOAK_ONLY").ok();
+        for (label, game, studio, bitrate) in MATRIX {
+            if only.as_deref().is_some_and(|f| !label.contains(f)) {
+                continue;
+            }
+            let (w, h) = (2560u32, 1440u32);
+            let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIP: {e}");
+                    return;
+                }
+            };
+            let mut enc =
+                match NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("SKIP: {e}");
+                        return;
+                    }
+                };
+            let mut bgra = vec![0u8; (w * h * 4) as usize];
+            let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+            let frame_budget = Duration::from_micros(16_667);
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            let started = Instant::now();
+            let mut all_ms: Vec<f32> = Vec::with_capacity((secs as usize) * 62);
+            let mut slowest: Vec<(f32, u64)> = Vec::new(); // (ms, frame idx)
+            let (mut win_ms, mut win_bytes) = (Vec::<f32>::new(), 0u64);
+            let mut win_start = Instant::now();
+            let (mut i, mut units, mut bytes) = (0u64, 0u64, 0u64);
+            println!("=== SOAK {label} · {secs}s @60fps · 1440p ===");
+            while Instant::now() < deadline {
+                let cycle = Instant::now();
+                for (j, v) in bgra.iter_mut().enumerate() {
+                    *v = ((j as u64).wrapping_add(i.wrapping_mul(7)) % 255) as u8;
+                }
+                gpu.update_bgra(&tex, &bgra, w, h);
+                let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+                let t = Instant::now();
+                let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+                let e_ms = t.elapsed().as_secs_f32() * 1000.0;
+                gpu.release(slot);
+                i += 1;
+                all_ms.push(e_ms);
+                win_ms.push(e_ms);
+                for (d, _) in &out.units {
+                    units += 1;
+                    bytes += d.len() as u64;
+                    win_bytes += d.len() as u64;
+                }
+                slowest.push((e_ms, i));
+                if slowest.len() > 10 {
+                    slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    slowest.truncate(10);
+                }
+                if win_start.elapsed() >= Duration::from_secs(15) {
+                    win_ms.sort_by(f32::total_cmp);
+                    let n = win_ms.len();
+                    println!(
+                        "  [{:>4}s] {} frames · avg {:5.2} ms · p95 {:5.2} · max {:5.2} · {:6.1} Mbps",
+                        started.elapsed().as_secs(),
+                        n,
+                        win_ms.iter().sum::<f32>() / n as f32,
+                        win_ms[(n * 95 / 100).min(n - 1)],
+                        win_ms[n - 1],
+                        (win_bytes as f64 * 8.0) / win_start.elapsed().as_secs_f64() / 1e6,
+                    );
+                    win_ms.clear();
+                    win_bytes = 0;
+                    win_start = Instant::now();
+                }
+                if let Some(rest) = frame_budget.checked_sub(cycle.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+            }
+            all_ms.sort_by(f32::total_cmp);
+            let n = all_ms.len();
+            let pct = |p: f64| all_ms[((n as f64 * p) as usize).min(n - 1)];
+            println!(
+                "  DONE {label}: {n} frames · {units} units · {:.1} GB · avg {:.2} ms",
+                bytes as f64 / 1e9,
+                all_ms.iter().sum::<f32>() / n as f32,
+            );
+            println!(
+                "  ladder: p50 {:5.2} · p90 {:5.2} · p95 {:5.2} · p99 {:5.2} · p99.9 {:5.2} · max {:5.2}",
+                pct(0.50), pct(0.90), pct(0.95), pct(0.99), pct(0.999), pct(1.0),
+            );
+            slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let worst: Vec<String> = slowest
+                .iter()
+                .map(|(ms, idx)| format!("{ms:.1}ms@#{idx}"))
+                .collect();
+            println!("  slowest: {}", worst.join(" · "));
+        }
+    }
+
     fn bench_cycle_posture(round: u32, label: &str, game: bool, studio: bool, bitrate: u32) {
         use std::time::{Duration, Instant};
         let (w, h) = (2560u32, 1440u32);
