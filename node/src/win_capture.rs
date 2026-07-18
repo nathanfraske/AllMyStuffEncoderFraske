@@ -202,6 +202,15 @@ unsafe fn duplicate_output(
             DXGI_MODE_ROTATION_ROTATE270 => 270,
             _ => 0, // IDENTITY / UNSPECIFIED / anything else: upright.
         };
+        // The datastream↔monitor link: this device name is the same
+        // `\\.\DISPLAYn` key the telemetry `monitors:` line prints, so
+        // one grep correlates a route's stream with the physical panel's
+        // mode/refresh/position — the multi-monitor field-test question.
+        let name_end = desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+        tracing::info!(
+            "capture bound to {} (monitor id {monitor_id} · rotation {rotation_deg}°)",
+            String::from_utf16_lossy(&desc.DeviceName[..name_end])
+        );
         return Ok((dup, rotation_deg));
     }
 }
