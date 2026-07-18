@@ -134,9 +134,12 @@
   // honor the Game step.
   const MODES = ["balanced", "game", "studio"] as const;
   const MODE_LABEL = { balanced: "Balanced", game: "Game", studio: "Studio" } as const;
-  function cycleMode() {
-    const cur = tune.mode ?? (tune.game ? "game" : "balanced");
-    const next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
+  // Studio spends a lot of bandwidth — one confirmation the first time,
+  // with a persisted "don't warn again". Only the transition INTO studio
+  // gates; cycling past it later never re-warns.
+  const STUDIO_ACK_KEY = "ams.studioBandwidthAck";
+  let studioPrompt = $state(false);
+  function applyMode(next: (typeof MODES)[number]) {
     tune = {
       ...tune,
       mode: next === "balanced" ? undefined : next,
@@ -144,6 +147,20 @@
     };
     openPill = null;
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
+  }
+  function cycleMode() {
+    const cur = tune.mode ?? (tune.game ? "game" : "balanced");
+    const next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
+    if (next === "studio" && localStorage.getItem(STUDIO_ACK_KEY) !== "1") {
+      studioPrompt = true;
+      return;
+    }
+    applyMode(next);
+  }
+  function confirmStudio(dontAskAgain: boolean) {
+    if (dontAskAgain) localStorage.setItem(STUDIO_ACK_KEY, "1");
+    studioPrompt = false;
+    applyMode("studio");
   }
   const modeLabel = () => MODE_LABEL[tune.mode ?? (tune.game ? "game" : "balanced")];
 
@@ -537,9 +554,113 @@
       }}>{fullscreen ? "⤡" : "⛶"}</button
     >
   </footer>
+
+  {#if studioPrompt}
+    <div
+      class="studio-scrim"
+      role="presentation"
+      onpointerdown={(e) => e.stopPropagation()}
+      onclick={() => (studioPrompt = false)}
+      onkeydown={(e) => e.key === "Escape" && (studioPrompt = false)}
+    >
+      <div
+        class="studio-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="studio-title"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <h3 id="studio-title">Turn on Studio mode?</h3>
+        <p>
+          Studio streams at high fidelity and can use <strong>150–250 Mbps</strong> —
+          it's meant for a fast local network. On a slower or metered
+          connection the host keeps it on the balanced setting.
+        </p>
+        <div class="studio-actions">
+          <button class="studio-btn ghost" onclick={() => (studioPrompt = false)}
+            >Cancel</button
+          >
+          <button class="studio-btn ghost" onclick={() => confirmStudio(true)}
+            >Don't ask again</button
+          >
+          <button class="studio-btn primary" onclick={() => confirmStudio(false)}
+            >Use Studio</button
+          >
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
+  .studio-scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(2px);
+  }
+  .studio-dialog {
+    width: min(30rem, calc(100vw - 3rem));
+    background: #16181d;
+    color: #e8ebf0;
+    border: 1px solid #2c323b;
+    border-radius: 10px;
+    padding: 1.25rem 1.35rem 1.1rem;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .studio-dialog h3 {
+    margin: 0 0 0.5rem;
+    font-size: 1.05rem;
+    font-weight: 640;
+  }
+  .studio-dialog p {
+    margin: 0 0 1.1rem;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: #b6bdc8;
+  }
+  .studio-dialog strong {
+    color: #e8ebf0;
+    font-variant-numeric: tabular-nums;
+  }
+  .studio-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .studio-btn {
+    padding: 0.45rem 0.85rem;
+    border-radius: 7px;
+    font-size: 0.85rem;
+    font-weight: 560;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .studio-btn.ghost {
+    background: transparent;
+    border-color: #363d47;
+    color: #c4cbd6;
+  }
+  .studio-btn.ghost:hover {
+    border-color: #4a525e;
+    color: #e8ebf0;
+  }
+  .studio-btn.primary {
+    background: #2f6fab;
+    color: #fff;
+  }
+  .studio-btn.primary:hover {
+    background: #3a7cbb;
+  }
+  .studio-btn:focus-visible {
+    outline: 2px solid #5b96cf;
+    outline-offset: 2px;
+  }
   .popout {
     position: relative;
     height: 100vh;

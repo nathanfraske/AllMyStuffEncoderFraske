@@ -217,11 +217,18 @@
     { label: "4 Mbps", value: 4_000_000 },
   ];
   type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
-  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice }> = [
-    { label: "Auto", value: "auto" },
-    { label: "H.264", value: "h264" },
-    { label: "H.264 · native decode", value: "native" },
-    { label: "MJPEG", value: "mjpeg" },
+  // These pick the *transport + decode path* for a watched stream, not a
+  // specific encoder — the host picks its best encoder itself (NVENC on
+  // NVIDIA, the GPU's Media Foundation encoder otherwise, software as the
+  // floor), all of which produce H.264. So the labels describe what the
+  // viewer chooses between: hardware-accelerated H.264 decode here,
+  // software H.264 decode for webviews that can't, and the MJPEG
+  // compatibility fallback.
+  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice; hint: string }> = [
+    { label: "Auto", value: "auto", hint: "Best available — H.264, hardware decode where the viewer supports it" },
+    { label: "H.264 · hardware decode", value: "h264", hint: "GPU-accelerated decode in the viewer (lowest CPU)" },
+    { label: "H.264 · software decode", value: "native", hint: "Decoded on the CPU — for viewers without hardware H.264" },
+    { label: "MJPEG · compatibility", value: "mjpeg", hint: "Per-frame JPEG — the universal fallback, higher bandwidth" },
   ];
 
   // ---- source aspect (mouse letterbox correction) --------------------
@@ -2225,6 +2232,7 @@
                         <button
                           class="vopt"
                           class:sel={codecChoice === c.value}
+                          title={c.hint}
                           onclick={() => pickCodec(c.value)}>{c.label}</button
                         >
                       {/each}
