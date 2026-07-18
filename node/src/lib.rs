@@ -61,6 +61,12 @@ pub mod clipboard;
 #[path = "stubs/clipboard.rs"]
 pub mod clipboard;
 pub mod control_client;
+/// D3D11VA (DXVA) HEVC decode — the vendor-neutral receive rung: drives
+/// `ID3D11VideoDecoder` on whatever GPU is present (NVIDIA/AMD/Intel,
+/// dGPU or iGPU), no codec packs, no vendor SDK. The rung that turns
+/// Studio·Lossless from an NVIDIA-pair feature into any-Windows-viewer.
+#[cfg(all(windows, feature = "host"))]
+pub mod d3d11va;
 pub mod daemon_spawn;
 pub mod files;
 /// The GPU frame lane — D3D11 VideoProcessor colour conversion + a DXGI

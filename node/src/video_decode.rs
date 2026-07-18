@@ -178,6 +178,63 @@ impl DecodeBridge {
     }
 }
 
+/// The HEVC hardware ladder: NVDEC where the NVIDIA driver lives (the
+/// proven rung, CUDA-warm on every field pair to date), else D3D11VA —
+/// the vendor-neutral `ID3D11VideoDecoder` rung that makes an AMD/Intel/
+/// iGPU viewer a full Studio·Lossless citizen. `ALLMYSTUFF_HEVC_DECODER`
+/// (`nvdec` | `d3d11va`) pins a rung for A/B runs and demos; both rungs
+/// speak the same seam, so the bridge below can't tell them apart.
+#[cfg(all(windows, feature = "host"))]
+enum HevcRung {
+    Nvdec(crate::nvdec::NvdecHevc),
+    // Boxed: the DXVA session carries its parser stores inline and would
+    // otherwise dwarf the enum every H.264 route also instantiates.
+    Dxva(Box<crate::d3d11va::D3d11vaHevc>),
+}
+
+#[cfg(all(windows, feature = "host"))]
+impl HevcRung {
+    fn open() -> Result<Self, String> {
+        let force = std::env::var("ALLMYSTUFF_HEVC_DECODER")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match force.as_str() {
+            "nvdec" => crate::nvdec::NvdecHevc::open().map(Self::Nvdec),
+            "d3d11va" | "dxva" => {
+                crate::d3d11va::D3d11vaHevc::open().map(|d| Self::Dxva(Box::new(d)))
+            }
+            other => {
+                if !other.is_empty() {
+                    tracing::warn!(
+                        "ALLMYSTUFF_HEVC_DECODER={other} isn't a rung (nvdec | d3d11va); using the ladder"
+                    );
+                }
+                crate::nvdec::NvdecHevc::open()
+                    .map(Self::Nvdec)
+                    .or_else(|nv| {
+                        crate::d3d11va::D3d11vaHevc::open()
+                            .map(|d| Self::Dxva(Box::new(d)))
+                            .map_err(|dx| format!("NVDEC: {nv}; D3D11VA: {dx}"))
+                    })
+            }
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Nvdec(d) => d.label(),
+            Self::Dxva(d) => d.label(),
+        }
+    }
+
+    fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<crate::nvdec::NvFrame>, String> {
+        match self {
+            Self::Nvdec(d) => d.decode(au, ts_us),
+            Self::Dxva(d) => d.decode(au, ts_us),
+        }
+    }
+}
+
 fn run_decode<F, G>(
     stop: &AtomicBool,
     need_key: &AtomicBool,
@@ -199,13 +256,13 @@ fn run_decode<F, G>(
 
     // The route's decoder, whichever codec the stream declared at its
     // last key unit. H.264 = software openh264 (every platform); HEVC =
-    // NVDEC (Windows + NVIDIA — the posture negotiation only offers HEVC
-    // where this rung exists, so the unavailable arm is a guard, not a
-    // path).
+    // a hardware ladder, NVDEC → D3D11VA (Windows: nvcuvid where the
+    // NVIDIA driver lives, else the vendor-neutral `ID3D11VideoDecoder`
+    // any GPU driver exposes — AMD/Intel/iGPU viewers included).
     enum Active {
         H264(Decoder),
         #[cfg(all(windows, feature = "host"))]
-        Hevc(crate::nvdec::NvdecHevc),
+        Hevc(HevcRung),
     }
     let mut decoder: Option<Active> = None;
     let mut stream_codec = AuCodec::H264;
@@ -256,7 +313,12 @@ fn run_decode<F, G>(
                     .map(Active::H264)
                     .map_err(|e| format!("openh264: {e}")),
                     #[cfg(all(windows, feature = "host"))]
-                    AuCodec::Hevc => crate::nvdec::NvdecHevc::open().map(Active::Hevc),
+                    AuCodec::Hevc => HevcRung::open().map(|dec| {
+                        // The one line that says which glass this stream
+                        // crosses — the cross-vendor story in the log.
+                        tracing::info!("HEVC decoder for {route_id}: {}", dec.label());
+                        Active::Hevc(dec)
+                    }),
                     #[cfg(not(all(windows, feature = "host")))]
                     AuCodec::Hevc => Err("no HEVC decoder on this platform".to_string()),
                 };
