@@ -1,0 +1,57 @@
+# Cross-platform compile check for the node engine — the encoder work is
+# developed on Windows, and the macOS (VideoToolbox) and Linux (Wayland/
+# PipeWire) arms are otherwise compile-blind until someone builds there.
+# check + clippy only (no hardware to run against); the Windows job mirrors
+# the local gate and is required, the other two surface breakage without
+# blocking while they stabilize.
+name: node-check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "node/**"
+      - "Cargo.*"
+      - ".github/workflows/node-check.yml"
+  pull_request:
+    paths:
+      - "node/**"
+      - "Cargo.*"
+      - ".github/workflows/node-check.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            soft: false
+          - os: macos-latest
+            soft: true
+          - os: ubuntu-latest
+            soft: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.soft }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Linux system deps (xcap/X11, audio, DBus for the portal)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb1-dev libxcb-randr0-dev \
+            libxcb-shm0-dev libxcb-xfixes0-dev libdbus-1-dev libasound2-dev \
+            libpipewire-0.3-dev cmake nasm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - name: clippy (deny warnings)
+        working-directory: node
+        run: cargo clippy --all-targets -- -D warnings
