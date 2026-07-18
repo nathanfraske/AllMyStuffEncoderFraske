@@ -199,13 +199,22 @@ impl StreamStats {
         let frames = self.sent.max(1) as f64;
         let scale_p95 = Self::p95(&mut self.scale_ms);
         let encode_p95 = Self::p95(&mut self.encode_ms);
+        // The bandwidth at each sender layer, so a field log names where
+        // the bits go: `raw` = the pixels entering the encoder (NV12 for
+        // H.264, RGBA-equivalent for MJPEG counts the same 12 bpp — the
+        // convert layer's output either way), `wire` = the encoded bytes
+        // handed to the daemon's track lane (what the ICE path carries,
+        // before RTP overhead).
+        let raw_mbps =
+            self.sent as f64 * self.out_w as f64 * self.out_h as f64 * 1.5 * 8.0 / secs / 1e6;
         let line = format!(
-            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
+            "video out {}: {:.1} fps {} {}×{} · raw {:.0} Mbps → wire {:.1} Mbps · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
             self.out_w,
             self.out_h,
+            raw_mbps,
             (self.bytes as f64 * 8.0) / secs / 1_000_000.0,
             self.scale.as_secs_f64() * 1000.0 / frames,
             self.encode.as_secs_f64() * 1000.0 / frames,
@@ -1156,18 +1165,20 @@ impl VideoBridge {
         }
         // Closed-loop bitrate: AIMD against the posture lane's budget,
         // applied by the encode thread through the in-place reconfigure
-        // (no reset, no IDR, no visible seam). Skips: user-pinned
+        // (no reset, no IDR, no visible seam). Reserved to the postures
+        // whose use case it serves in every case — Game by default (see
+        // [`rate_adapt_mode`]). Skips besides the gate: user-pinned
         // bitrates (their wire to own), lossless (no rate to move), and
         // routes with no live rate registration (CPU lane, MJPEG floor).
-        if rate_adapt_enabled() {
-            let (pinned, target_fps) = {
+        {
+            let (pinned, target_fps, game) = {
                 let routes = self.routes.lock();
                 routes
                     .get(route_id)
-                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps()))
-                    .unwrap_or((true, 0))
+                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps(), r.tune.game()))
+                    .unwrap_or((true, 0, false))
             };
-            if !pinned {
+            if !pinned && rate_adapt_allowed(game, rate_adapt_mode()) {
                 if let Some(rate) = route_rates().lock().get(route_id).cloned() {
                     let current = rate.target.load(Ordering::Relaxed);
                     let ceiling = rate.ceiling.load(Ordering::Relaxed);
@@ -3914,22 +3925,55 @@ pub(crate) fn route_rates(
     &RATES
 }
 
-/// Closed-loop bitrate: **on by default** (`ALLMYSTUFF_RATE_ADAPT=0`
-/// disables) — unlike the resolution auto-scale, a bitrate step is
-/// invisible (no mode change, no IDR, no size change), so the
-/// native-quality contract that keeps [`auto_adapt_enabled`] opt-in
-/// doesn't apply. Routes with a user-pinned bitrate are never touched.
-fn rate_adapt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let off = std::env::var("ALLMYSTUFF_RATE_ADAPT")
-            .map(|v| matches!(v.trim(), "0" | "off" | "false"))
-            .unwrap_or(false);
-        if off {
-            tracing::info!("ALLMYSTUFF_RATE_ADAPT=0 — closed-loop bitrate disabled");
+/// Where the closed-loop bitrate may act. The rule: an automatic rate
+/// changer runs by default ONLY where it is beneficial in every case
+/// for that mode's use case. **Game qualifies** — its identity is
+/// smoothness/latency over quality, so a congestion cut is always the
+/// right trade there and even a false positive costs little (the climb
+/// restores). **Balanced and Studio don't**: their deal is the picked
+/// quality, and a false-positive cut (viewer-side CPU hiccup reading as
+/// congestion) would silently soften a healthy stream — the same
+/// native-quality contract that keeps [`auto_adapt_enabled`] opt-in.
+/// `ALLMYSTUFF_RATE_ADAPT=1` opts every lossy posture in (field A/B);
+/// `=0` kills it everywhere; unset = game-only.
+#[derive(Clone, Copy, PartialEq)]
+enum RateAdaptMode {
+    Off,
+    GameOnly,
+    All,
+}
+
+fn rate_adapt_mode() -> RateAdaptMode {
+    static MODE: std::sync::LazyLock<RateAdaptMode> = std::sync::LazyLock::new(|| {
+        match std::env::var("ALLMYSTUFF_RATE_ADAPT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "0" | "off" | "false" => {
+                tracing::info!("ALLMYSTUFF_RATE_ADAPT=0 — closed-loop bitrate disabled");
+                RateAdaptMode::Off
+            }
+            "1" | "on" | "true" | "all" => {
+                tracing::info!(
+                    "ALLMYSTUFF_RATE_ADAPT on: closed-loop bitrate for every lossy posture"
+                );
+                RateAdaptMode::All
+            }
+            _ => RateAdaptMode::GameOnly,
         }
-        !off
     });
-    *ON
+    *MODE
+}
+
+/// The gate itself, pure for the tests.
+fn rate_adapt_allowed(game: bool, mode: RateAdaptMode) -> bool {
+    match mode {
+        RateAdaptMode::Off => false,
+        RateAdaptMode::GameOnly => game,
+        RateAdaptMode::All => true,
+    }
 }
 
 /// Consecutive struggling reports (~2 s apart) before a cut — one report
@@ -4790,6 +4834,20 @@ mod tests {
             rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
             Some(28_000_000)
         );
+    }
+
+    /// The reservation rule: automatic bitrate changes act only where
+    /// they are beneficial in every case for the mode's use case — Game
+    /// by default; everything else opt-in, off means off.
+    #[test]
+    fn rate_adapt_is_reserved_to_game_by_default() {
+        assert!(rate_adapt_allowed(true, RateAdaptMode::GameOnly));
+        assert!(
+            !rate_adapt_allowed(false, RateAdaptMode::GameOnly),
+            "balanced/studio keep the picked quality unless opted in"
+        );
+        assert!(rate_adapt_allowed(false, RateAdaptMode::All));
+        assert!(!rate_adapt_allowed(true, RateAdaptMode::Off));
     }
 
     /// The wave chooser: a first loss heals with the smooth default; a

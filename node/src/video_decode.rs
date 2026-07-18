@@ -271,6 +271,9 @@ fn run_decode<F, G>(
     let mut last_err: Option<Instant> = None;
     let (mut frames, mut spent, mut out_dims, mut since) =
         (0u32, Duration::ZERO, (0usize, 0usize), Instant::now());
+    // Compressed bytes fed this window — the wire layer's bandwidth at
+    // the decoder's door (the nv12/rgba layers derive from frames×dims).
+    let mut in_bytes = 0u64;
 
     while !stop.load(Ordering::SeqCst) {
         // A bounded wait keeps the stop flag responsive on a quiet stream.
@@ -279,6 +282,7 @@ fn run_decode<F, G>(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        in_bytes += au.data.len() as u64;
         if need_key.swap(false, Ordering::SeqCst) {
             // The feeder overflowed: drain the stale backlog and wait for
             // the sender's next IDR — same recovery as a decode error.
@@ -409,19 +413,28 @@ fn run_decode<F, G>(
         }
         let elapsed = since.elapsed();
         if elapsed >= STATS_EVERY && frames > 0 {
+            // Bandwidth at each viewer layer: `wire` = compressed bytes
+            // into the decoder, `nv12` = the decoder's picture output,
+            // `rgba` = what crosses the IPC boundary to the window —
+            // the field log's answer to "where does the bandwidth go".
+            let secs = elapsed.as_secs_f64();
+            let px = frames as f64 * out_dims.0 as f64 * out_dims.1 as f64;
             let line = format!(
-                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native)",
-                frames as f64 / elapsed.as_secs_f64(),
+                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native) · wire {:.1} → nv12 {:.0} → rgba {:.0} Mbps",
+                frames as f64 / secs,
                 spent.as_secs_f64() * 1000.0 / frames as f64,
                 out_dims.0,
                 out_dims.1,
+                in_bytes as f64 * 8.0 / secs / 1e6,
+                px * 1.5 * 8.0 / secs / 1e6,
+                px * 4.0 * 8.0 / secs / 1e6,
             );
             if crate::video::stats_to_info() {
                 tracing::info!("{line}");
             } else {
                 tracing::debug!("{line}");
             }
-            (frames, spent, since) = (0, Duration::ZERO, Instant::now());
+            (frames, spent, in_bytes, since) = (0, Duration::ZERO, 0, Instant::now());
         }
     }
 }
