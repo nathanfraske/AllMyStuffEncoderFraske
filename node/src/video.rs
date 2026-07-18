@@ -1,4 +1,4 @@
-﻿//! The video media plane: capture of this machine's screens **and
+//! The video media plane: capture of this machine's screens **and
 //! cameras**, so an active display or camera route actually streams
 //! pixels â€” H.264 on the mesh's track lane, MJPEG as the compatibility
 //! floor (the piKVM transport: every frame a standalone JPEG, no codec
@@ -1987,9 +1987,18 @@ enum GpuEnd {
 /// MF rung as its in-lane fallback.
 #[cfg(windows)]
 fn nvenc_opt_in() -> bool {
+    // Default ON: trying to open the SDK session IS the NVIDIA detection
+    // (no driver fails the load softly and the lane keeps the MF rung),
+    // so the default costs nothing where it can't win. =0 pins MF for
+    // comparison runs.
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var("ALLMYSTUFF_NVENC")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+        let on = !std::env::var("ALLMYSTUFF_NVENC")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
             .unwrap_or(false);
         if on {
             tracing::info!("ALLMYSTUFF_NVENC=1 â€” direct NVENC rung enabled");

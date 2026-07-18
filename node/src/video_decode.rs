@@ -134,6 +134,11 @@ fn run_decode<F, G>(
     use openh264::decoder::{Decoder, DecoderConfig};
     use openh264::formats::YUVSource as _;
 
+    // The decode thread is the viewer's media plane — same priority/EcoQoS
+    // treatment as the host's capture and encode threads, so a loaded
+    // viewer box doesn't stutter the picture it's watching.
+    crate::os_perf::boost_media_thread();
+
     let mut decoder: Option<Decoder> = None;
     // Decode entry is a key unit; deltas before one can't decode.
     let mut waiting_key = true;
