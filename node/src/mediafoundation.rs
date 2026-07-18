@@ -634,6 +634,37 @@ impl MediaFoundationH264 {
         }
     }
 
+    /// Re-aim the rate controller mid-stream — mean plus the matching
+    /// peak/VBV posture, no reopen, no forced IDR. `true` when the MFT
+    /// accepted the mean (NVENC's does); a `false` leaves the encoder
+    /// exactly as it was, and the caller keeps the rebuild path. This is
+    /// the knob smooth receiver-driven adaptation needs: today a bitrate
+    /// move costs a codec rebuild whose first unit is an IDR — a burst on
+    /// the wire at the exact moment the link is struggling.
+    // Production consumer lands with receiver-driven bitrate adaptation
+    // (BWE); until then `hardware_bitrate_reconfigures_in_place` proves it.
+    #[allow(dead_code)]
+    pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        let Some(api) = &self.codecapi else {
+            return false;
+        };
+        unsafe {
+            if api
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate))
+                .is_err()
+            {
+                return false;
+            }
+            // Peak + VBV follow the mean so the burst posture stays
+            // proportional; best-effort — a box that only re-aims the mean
+            // still adapts.
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+            let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
+            true
+        }
+    }
+
     /// Synchronous MFT: feed one input, drain every output it produces —
     /// each drained sample is its own access unit, in order. A sync MFT with
     /// pending output can refuse input (`MF_E_NOTACCEPTING`): drain, then
@@ -941,6 +972,108 @@ mod tests {
         assert!(
             decoded >= fed.saturating_sub(3),
             "decoded {decoded} of {fed} fed frames"
+        );
+    }
+
+    /// The in-place bitrate pilot, in the direction adaptation actually
+    /// needs it: **downward, instantly, without a reopen or an IDR** — a
+    /// congested link wants the rate cut NOW, and a rebuild's first-IDR
+    /// burst is the worst possible thing to send it. `set_bitrate` must be
+    /// accepted, the output rate must genuinely fall (≥3× on a 6× cut),
+    /// and the stream must decode cleanly across the change (an encoder
+    /// that internally reset would snap the reference chain).
+    ///
+    /// The upward direction was probed too and is only partially honored:
+    /// the NVIDIA MFT stores the new mean exactly (reads back verbatim)
+    /// but self-clamps peak/VBV to a driver-internal ceiling and tracked
+    /// ~5.7 Mbps of a 2→12 ask in the probe run. So the operational rule
+    /// this pilot sets: in-place for downshifts (and modest upshifts);
+    /// large upshifts take the rebuild path, whose IDR a healthy link
+    /// absorbs.
+    #[test]
+    fn hardware_bitrate_reconfigures_in_place() {
+        let hw = hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            eprintln!("SKIP: no hardware H.264 MFT on this machine");
+            return;
+        };
+        let (w, h) = (1280u32, 720u32);
+        let mut enc = match first.open(w, h, 60, 12_000_000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: MFT open failed: {e}");
+                return;
+            }
+        };
+        let (wu, hu) = (w as usize, h as usize);
+        let mut nv12 = vec![128u8; wu * hu + 2 * ((wu / 2) * (hu / 2))];
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
+        // Full-luma churn every frame so the rate controller is genuinely
+        // rate-limited (a too-easy scene converges below both targets and
+        // the ratio says nothing).
+        let mut feed = |enc: &mut MediaFoundationH264,
+                        units: &mut Vec<(Vec<u8>, bool)>,
+                        base: u32,
+                        n: u32|
+         -> u64 {
+            let mut bytes = 0u64;
+            for i in 0..n {
+                for (j, v) in nv12[..wu * hu].iter_mut().enumerate() {
+                    // Decorrelated per-pixel, per-frame noise (integer
+                    // hash): incompressible, so BOTH windows are genuinely
+                    // rate-limited and the byte ratio reflects the rate
+                    // change. (A smooth pattern quality-saturates below
+                    // the high target and the ratio understates the move.)
+                    let x = (j as u32)
+                        .wrapping_add((base + i).wrapping_mul(9973))
+                        .wrapping_mul(2654435761);
+                    *v = (x >> 24) as u8;
+                }
+                let out = enc.encode_nv12(&nv12, base == 0 && i == 0).expect("encode");
+                for (d, k) in out.units {
+                    bytes += d.len() as u64;
+                    units.push((d, k));
+                }
+            }
+            bytes
+        };
+        // Warm-up (rate control settles), then the measured high window.
+        feed(&mut enc, &mut units, 0, 30);
+        let high = feed(&mut enc, &mut units, 30, 60);
+        if !enc.set_bitrate(2_000_000) {
+            eprintln!("SKIP: {} rejects dynamic bitrate", enc.label());
+            return;
+        }
+        // Settle, then the measured low window.
+        feed(&mut enc, &mut units, 90, 45);
+        let low = feed(&mut enc, &mut units, 135, 60);
+        // Two claims: the 60-frame (1 s) low window lands on the new 2 Mbps
+        // target (≤35% over), and the rate genuinely moved (≥2× down from
+        // the high window — which VBR may itself undershoot on saturated
+        // content, so the ratio bound stays modest).
+        let target_window = 2_000_000u64 / 8;
+        assert!(
+            low <= target_window + target_window / 3,
+            "low window {low} B doesn't track the 2 Mbps ask (~{target_window} B)"
+        );
+        assert!(
+            low.saturating_mul(2) <= high,
+            "rate didn't fall: high window {high} B, low window {low} B (asked 12 -> 2 Mbps)"
+        );
+        // The whole stream — across the reconfigure — must decode clean:
+        // an encoder that internally reset would snap the reference chain
+        // here.
+        let mut dec = openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new(),
+        )
+        .expect("decoder");
+        for (d, _) in &units {
+            dec.decode(d).expect("clean decode across bitrate change");
+        }
+        println!(
+            "in-place bitrate: high window {high} B -> low window {low} B ({:.1}x cut)",
+            high as f64 / low.max(1) as f64
         );
     }
 }
