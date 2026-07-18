@@ -542,7 +542,10 @@ mod tests {
             eprintln!("SKIP: no MFT");
             return;
         };
-        let mut enc = match first.open_with_manager(w, h, 60, 12_000_000, Some(&gpu.manager())) {
+        // 30 Mbps / 150 frames / a full-frame shift per frame — the same
+        // parameters and content churn as `bench_mf_encode_call_latency`,
+        // so the CPU lane's encode column and this one compare directly.
+        let mut enc = match first.open_with_manager(w, h, 60, 30_000_000, Some(&gpu.manager())) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("SKIP: {e}");
@@ -551,14 +554,14 @@ mod tests {
         };
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
-        let n = 240u32;
+        let n = 150u32;
         let (mut t_up, mut t_conv, mut t_enc) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let mut units = 0usize;
         for i in 0..n {
-            // Vary content so the encoder does real work each frame.
-            let off = ((i as usize) * 7919 * 4096) % (bgra.len() - 4096);
-            for b in &mut bgra[off..off + 4096] {
-                *b = b.wrapping_add(13);
+            // Full-frame gradient shift (outside the timed regions), the
+            // BGRA analog of the MF bench's luma shift.
+            for (j, v) in bgra.iter_mut().enumerate() {
+                *v = ((j as u32).wrapping_add(i.wrapping_mul(7)) % 255) as u8;
             }
             let t0 = Instant::now();
             gpu.update_bgra(&tex, &bgra, w, h);
