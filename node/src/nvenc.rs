@@ -70,6 +70,36 @@ const NV_ENC_CODEC_H264_GUID: GUID = GUID::from_values(
     0x4ca4,
     [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
 );
+const NV_ENC_PRESET_P1_GUID: GUID = GUID::from_values(
+    0xfc0a_8d3e,
+    0x45f8,
+    0x4cf8,
+    [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
+);
+const NV_ENC_PRESET_P2_GUID: GUID = GUID::from_values(
+    0xf581_cfb8,
+    0x88d6,
+    0x4381,
+    [0x93, 0xf0, 0xdf, 0x13, 0xf9, 0xc2, 0x7d, 0xab],
+);
+const NV_ENC_PRESET_P3_GUID: GUID = GUID::from_values(
+    0x3685_0110,
+    0x3a07,
+    0x441f,
+    [0x94, 0xd5, 0x36, 0x70, 0x63, 0x1f, 0x91, 0xf6],
+);
+const NV_ENC_PRESET_P6_GUID: GUID = GUID::from_values(
+    0x8e75_c279,
+    0x6299,
+    0x4ab6,
+    [0x83, 0x02, 0x0b, 0x21, 0x5a, 0x33, 0x5c, 0xf5],
+);
+const NV_ENC_PRESET_P7_GUID: GUID = GUID::from_values(
+    0x8484_8c12,
+    0x6f71,
+    0x4c13,
+    [0x93, 0x1b, 0x53, 0xe2, 0x83, 0xf5, 0x79, 0x74],
+);
 const NV_ENC_PRESET_P4_GUID: GUID = GUID::from_values(
     0x90a7_b826,
     0xdf06,
@@ -775,12 +805,40 @@ impl NvencH264 {
         // P5 (better prediction = fewer residual bits — presets still
         // matter when every residual is coded exactly) under the
         // dedicated lossless tuning.
+        // Preset defaults, set by the measured grid (bench_nvenc_preset_grid,
+        // 1440p, boost held): lossless runs P3 — at constQP-0 the output
+        // is bit-exact by definition, presets only change compression
+        // efficiency, and P3 matched P5's bits within 0.5% at HALF the
+        // latency (6.5 vs 12.9 ms). Game runs P2 — 5.7 vs P4's 12.6 ms at
+        // identical bitrate (rate control holds the budget; the residual
+        // difference is refinement quality, the latency-first posture's
+        // explicit trade). Studio keeps P5: quality-first is its charter.
+        // P6/P7 are banned from streaming paths outright — their HQ
+        // configs enable 16-frame lookahead (~267 ms of buffering).
         let (preset_guid, tuning) = if self.lossless {
-            (NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_LOSSLESS)
+            (NV_ENC_PRESET_P3_GUID, NV_ENC_TUNING_INFO_LOSSLESS)
         } else if self.studio {
             (NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY)
+        } else if self.intra_refresh {
+            (NV_ENC_PRESET_P2_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
         } else {
             (NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
+        };
+        // `ALLMYSTUFF_NVENC_PRESET=1..7` overrides the posture's preset —
+        // the field dial for the latency/quality ladder the preset-grid
+        // bench maps (tuning stays the posture's own).
+        let preset_guid = match std::env::var("ALLMYSTUFF_NVENC_PRESET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            Some(1) => NV_ENC_PRESET_P1_GUID,
+            Some(2) => NV_ENC_PRESET_P2_GUID,
+            Some(3) => NV_ENC_PRESET_P3_GUID,
+            Some(4) => NV_ENC_PRESET_P4_GUID,
+            Some(5) => NV_ENC_PRESET_P5_GUID,
+            Some(6) => NV_ENC_PRESET_P6_GUID,
+            Some(7) => NV_ENC_PRESET_P7_GUID,
+            _ => preset_guid,
         };
         let codec_guid = if self.hevc {
             NV_ENC_CODEC_HEVC_GUID
@@ -1944,6 +2002,89 @@ pub(crate) mod tests_support {
 mod tests_bench {
     use super::tests_support::{paint_document, paint_video};
     use super::*;
+
+    /// The kernel's preset ladder, measured: encode latency and bits per
+    /// preset at 1440p with the clock keeper holding boost — the raw
+    /// compute map behind the posture defaults (game P4, studio P5,
+    /// lossless P5). Also surfaces each preset's hidden latency
+    /// machinery (multi-pass, lookahead) from the driver's own returned
+    /// config. Run:
+    /// `cargo test --release -- --ignored bench_nvenc_preset_grid --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_nvenc_preset_grid() {
+        let (w, h) = (2560u32, 1440u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let frames = 120u64;
+        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let _keeper = crate::gpu_pipeline::ClockKeeper::start(&gpu.device());
+        let mut doc = vec![0u8; wu * (hu + 912) * 4];
+        paint_document(&mut doc, wu, hu + 912);
+        let mut bgra = vec![0u8; wu * hu * 4];
+        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+        const GRID: [(&str, u32, bool, bool, bool, u32); 9] = [
+            ("game P1", 1, true, false, false, 30_000_000),
+            ("game P2", 2, true, false, false, 30_000_000),
+            ("game P3", 3, true, false, false, 30_000_000),
+            ("game P4*", 4, true, false, false, 30_000_000),
+            ("studio P4", 4, false, true, false, 150_000_000),
+            ("studio P5*", 5, false, true, false, 150_000_000),
+            ("studio P6", 6, false, true, false, 150_000_000),
+            ("hevcLL P3", 3, false, true, true, 0),
+            ("hevcLL P5*", 5, false, true, true, 0),
+        ];
+        println!(
+            "=== NVENC preset grid · 1440p · {frames} frames · heartbeat held · * = shipping default ==="
+        );
+        for (label, preset, game, studio, ll, bitrate) in GRID {
+            std::env::set_var("ALLMYSTUFF_NVENC_PRESET", preset.to_string());
+            let opened = if ll {
+                NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60)
+            } else {
+                NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio)
+            };
+            let mut enc = match opened {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("  [{label}] SKIP: {e}");
+                    continue;
+                }
+            };
+            let (mp, la) = (
+                enc.config.rc_params.multi_pass,
+                enc.config.rc_params.lookahead_depth,
+            );
+            let (mut bytes, mut ms) = (0u64, Vec::<f32>::new());
+            for i in 0..frames {
+                let off = (i as usize) * 3;
+                bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
+                gpu.update_bgra(&tex, &bgra, w, h);
+                let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+                let t = std::time::Instant::now();
+                let out = enc.encode_texture(&nv12, i == 0).expect("encode");
+                ms.push(t.elapsed().as_secs_f32() * 1000.0);
+                gpu.release(slot);
+                for (d, _) in out.units {
+                    bytes += d.len() as u64;
+                }
+            }
+            ms.sort_by(f32::total_cmp);
+            let n = ms.len();
+            println!(
+                "  [{label:>10}] enc avg {:5.2} ms · p95 {:5.2} · {:6.1} KB/frame · multipass {mp} · lookahead {la}",
+                ms.iter().sum::<f32>() / n as f32,
+                ms[(n * 95 / 100).min(n - 1)],
+                bytes as f64 / frames as f64 / 1024.0,
+            );
+        }
+        std::env::remove_var("ALLMYSTUFF_NVENC_PRESET");
+    }
 
     /// The lossless-economics bench: constQP-0 has **no rate control** —
     /// bandwidth is the content's entropy, full stop — so one synthetic
