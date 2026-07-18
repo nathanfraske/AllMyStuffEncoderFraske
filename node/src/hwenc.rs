@@ -13,6 +13,8 @@ use std::sync::Once;
 
 use ffmpeg_next as ff;
 
+use crate::video::EncodeOutcome;
+
 static FF_INIT: Once = Once::new();
 
 /// The hardware H.264 encoders to try, best first, for the current platform.
@@ -148,14 +150,17 @@ impl FfmpegH264 {
     }
 
     /// Encode one contiguous I420 frame (`width*height` Y, then quarter-size U,
-    /// then V). Returns the concatenated Annex-B access unit and whether it was
-    /// a keyframe; `None` when the encoder produced nothing this call (it should
-    /// not, with B-frames off and zero latency, but a backend may still buffer).
-    pub fn encode_i420(
+    /// then V). Returns every Annex-B access unit the encoder had ready, oldest
+    /// first (with B-frames off and zero latency that's normally exactly one;
+    /// a backend that buffers hands its backlog to a later call) — see
+    /// [`EncodeOutcome`]. `send_frame` accepting the frame is what `consumed`
+    /// reports. `pub(crate)`: the outcome type is the video module's internal
+    /// seam.
+    pub(crate) fn encode_i420(
         &mut self,
         i420: &[u8],
         force_idr: bool,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> Result<EncodeOutcome, String> {
         let (w, h) = (self.width as usize, self.height as usize);
         let ysize = w * h;
         let csize = (w / 2) * (h / 2);
@@ -195,22 +200,27 @@ impl FfmpegH264 {
         self.encoder
             .send_frame(&frame)
             .map_err(|e| format!("{}: send_frame: {e}", self.name))?;
-        self.drain()
+        Ok(EncodeOutcome {
+            units: self.drain()?,
+            consumed: true,
+        })
     }
 
-    /// Pull every packet the encoder has ready, concatenating their Annex-B
-    /// bytes (valid — start codes delimit NALs) and OR-ing their key flags.
-    fn drain(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut keyframe = false;
+    /// Pull every packet the encoder has ready — each one is its own access
+    /// unit with its own keyframe flag, in encode order (concatenating them
+    /// would smear a whole drained backlog into one oversized "unit" with one
+    /// timestamp).
+    fn drain(&mut self) -> Result<Vec<(Vec<u8>, bool)>, String> {
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
         let mut packet = ff::Packet::empty();
         loop {
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
                     if let Some(data) = packet.data() {
-                        out.extend_from_slice(data);
+                        if !data.is_empty() {
+                            units.push((data.to_vec(), packet.is_key()));
+                        }
                     }
-                    keyframe |= packet.is_key();
                 }
                 // EAGAIN (needs more input) / EOF — nothing more right now.
                 Err(ff::Error::Other {
@@ -220,11 +230,7 @@ impl FfmpegH264 {
                 Err(e) => return Err(format!("{}: receive_packet: {e}", self.name)),
             }
         }
-        if out.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some((out, keyframe)))
-        }
+        Ok(units)
     }
 }
 

@@ -71,12 +71,17 @@ pub mod input_inject;
 /// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
 /// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
 /// the encoder ladder in [`video`] enumerates and frame-send-tests it, falling
-/// to software openh264 when no hardware MFT produces frames.
-#[cfg(windows)]
+/// to software openh264 when no hardware MFT produces frames. Host-gated like
+/// [`video`] itself: the backend speaks the real video module's
+/// [`video::EncodeOutcome`] seam, which the capture-less stub doesn't carry.
+#[cfg(all(windows, feature = "host"))]
 pub mod mediafoundation;
 pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
+/// OS performance levers for the media-plane threads (timer resolution +
+/// thread priority) — Windows-real, no-op elsewhere.
+pub(crate) mod os_perf;
 pub mod ownership;
 pub(crate) mod persist;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
@@ -97,8 +102,10 @@ pub mod video;
 pub mod video_decode;
 /// Hardware H.264 encode via VideoToolbox — the Mac's media engine, no
 /// FFmpeg toolchain; the encoder ladder in [`video`] frame-send-tests it and
-/// falls back to software openh264.
-#[cfg(target_os = "macos")]
+/// falls back to software openh264. Host-gated like [`video`] itself: the
+/// backend speaks the real video module's [`video::EncodeOutcome`] seam,
+/// which the capture-less stub doesn't carry.
+#[cfg(all(target_os = "macos", feature = "host"))]
 pub mod videotoolbox;
 #[cfg(feature = "host")]
 pub mod wake;

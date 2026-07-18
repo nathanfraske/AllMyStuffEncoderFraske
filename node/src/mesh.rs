@@ -9480,12 +9480,7 @@ impl Mesh {
         // window where the daemon's converged roster is still healing (or
         // briefly lost the member to a stale tombstone) — the gap that
         // surfaced as "video streams but keyboard/mouse are refused".
-        if self
-            .ownership
-            .fleet_member_ids()
-            .iter()
-            .any(|d| pubkey_part(d) == canon)
-        {
+        if self.ownership.any_fleet_member(|d| pubkey_part(d) == canon) {
             return true;
         }
         self.fleet_authorized.lock().contains(canon)

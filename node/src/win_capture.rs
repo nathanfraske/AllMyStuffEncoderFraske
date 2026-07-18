@@ -95,6 +95,9 @@ pub fn start(monitor_id: u32) -> Result<(Session, mpsc::Receiver<RawFrame>), Str
 }
 
 fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>) {
+    // The duplication readback competes with whatever loaded the GPU/CPU —
+    // the exact condition the stream exists for.
+    crate::os_perf::boost_media_thread();
     while !stop.load(Ordering::SeqCst) {
         match dup.next_frame(100) {
             Ok(Some(frame)) => {
@@ -182,12 +185,16 @@ struct Duplication {
     ptr_x: i32,
     ptr_y: i32,
     ptr_visible: bool,
-    /// The last frame's pixels WITHOUT the cursor drawn in, so a pointer-only
-    /// move (no desktop change — the common case while hovering) can be
-    /// re-emitted with the cursor at its new spot instead of freezing it.
-    last_clean: Option<Vec<u8>>,
-    last_dims: (u32, u32),
-    /// Rate limit for those cursor-only re-emits so a fast mouse can't spin the
+    /// The persistent cursor-free desktop image, refreshed in place by each
+    /// damage frame's readback (the swizzle writes straight into it — no
+    /// per-frame allocation, no zeroing) and re-emitted with the cursor at
+    /// its new spot on pointer-only moves. Every outgoing frame is one
+    /// copy-out of this buffer plus a small cursor-rect composite; the old
+    /// shape paid a zeroed allocation, a swizzle, AND a full-frame clone per
+    /// damage frame. Empty until the first readback.
+    clean: Vec<u8>,
+    clean_dims: (u32, u32),
+    /// Rate limit for cursor-only re-emits so a fast mouse can't spin the
     /// pump faster than the capture cadence.
     last_cursor_emit: Instant,
 }
@@ -255,8 +262,8 @@ impl Duplication {
                     ptr_x: 0,
                     ptr_y: 0,
                     ptr_visible: false,
-                    last_clean: None,
-                    last_dims: (0, 0),
+                    clean: Vec::new(),
+                    clean_dims: (0, 0),
                     last_cursor_emit: Instant::now(),
                 });
             }
@@ -279,9 +286,9 @@ impl Duplication {
                     _ => Err(NextError::Fatal(e.to_string())),
                 };
             }
-            // From here the frame is held; release it on every path or
-            // the next acquire can't proceed. Pointer metadata must be read
-            // while the frame is held too, so do it before copy_out.
+            // From here the frame is held. Pointer metadata must be read
+            // while it's held; so must the GPU copy be *queued*. Everything
+            // else happens after release.
             if info.PointerShapeBufferSize > 0 {
                 // A new pointer bitmap is available — cache it. Best-effort:
                 // a failed fetch keeps the previous shape, never breaks capture.
@@ -293,9 +300,26 @@ impl Duplication {
                 self.ptr_y = p.Position.y;
                 self.ptr_visible = p.Visible.as_bool();
             }
-            let result = self.copy_out(info, resource);
+            if info.LastPresentTime == 0 {
+                // No new desktop pixels: release at once. If only the pointer
+                // moved, re-emit the retained clean frame with the cursor at
+                // its new spot so it doesn't freeze on a static screen.
+                let _ = self.dup.ReleaseFrame();
+                return Ok(self.cursor_only_frame());
+            }
+            // New desktop pixels: queue the GPU copy into our reusable
+            // staging texture, then release the frame IMMEDIATELY — before
+            // the CPU map/swizzle. Holding it through the readback throttled
+            // the duplication itself (the compositor can't hand over the
+            // next frame until release); copy-then-release-then-map is the
+            // documented fast path, and `Map` still waits for the queued
+            // copy to complete.
+            let queued = self.queue_copy(resource);
             let _ = self.dup.ReleaseFrame();
-            result.map_err(NextError::Fatal)
+            match queued.map_err(NextError::Fatal)? {
+                Some((staging, w, h)) => self.read_back(&staging, w, h).map_err(NextError::Fatal),
+                None => Ok(None),
+            }
         }
     }
 
@@ -325,41 +349,28 @@ impl Duplication {
         }
     }
 
-    /// A pointer-only update (no desktop change): re-emit the last frame with
-    /// the cursor moved to its new spot, rate-limited to the capture cadence.
-    /// `None` when there's nothing to show or the limiter says wait.
+    /// A pointer-only update (no desktop change): re-emit the retained clean
+    /// frame with the cursor moved to its new spot, rate-limited to the
+    /// capture cadence. `None` when there's nothing to show or the limiter
+    /// says wait.
     fn cursor_only_frame(&mut self) -> Option<RawFrame> {
-        if !self.ptr_visible || self.cursor.is_none() || self.last_clean.is_none() {
+        if !self.ptr_visible || self.cursor.is_none() || self.clean.is_empty() {
             return None;
         }
         if self.last_cursor_emit.elapsed() < Duration::from_millis(15) {
             return None;
         }
-        let (w, h) = self.last_dims;
-        let mut rgba = self.last_clean.as_ref().unwrap().clone();
-        if let Some(cur) = &self.cursor {
-            composite_cursor(&mut rgba, w, h, cur, self.ptr_x, self.ptr_y);
-        }
-        self.last_cursor_emit = Instant::now();
-        Some(RawFrame {
-            rgba,
-            width: w,
-            height: h,
-            rotation_deg: self.rotation_deg,
-        })
+        let (w, h) = self.clean_dims;
+        Some(self.assemble_frame(w, h))
     }
 
-    unsafe fn copy_out(
+    /// Queue the GPU copy of the held frame into the reusable staging
+    /// texture. Runs while the frame is held; the caller releases the frame
+    /// right after, before any CPU readback. `Ok(None)` = degenerate frame.
+    unsafe fn queue_copy(
         &mut self,
-        info: DXGI_OUTDUPL_FRAME_INFO,
         resource: Option<IDXGIResource>,
-    ) -> Result<Option<RawFrame>, String> {
-        if info.LastPresentTime == 0 {
-            // No desktop change. If only the pointer moved, re-emit the last
-            // frame with the cursor at its new spot so it doesn't freeze on a
-            // static screen; a bare timeout yields nothing.
-            return Ok(self.cursor_only_frame());
-        }
+    ) -> Result<Option<(ID3D11Texture2D, u32, u32)>, String> {
         let resource = resource.ok_or("AcquireNextFrame returned no resource")?;
         let texture: ID3D11Texture2D = resource.cast().map_err(|e| e.to_string())?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -370,49 +381,56 @@ impl Duplication {
         }
         let staging = self.staging_for(w, h)?;
         self.context.CopyResource(&staging, &texture);
+        Ok(Some((staging, w, h)))
+    }
+
+    /// Map the staging copy and swizzle it straight into the persistent
+    /// cursor-free desktop buffer (`Map` waits for the queued copy), then
+    /// assemble the outgoing frame.
+    unsafe fn read_back(
+        &mut self,
+        staging: &ID3D11Texture2D,
+        w: u32,
+        h: u32,
+    ) -> Result<Option<RawFrame>, String> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         self.context
-            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .map_err(|e| format!("Map staging: {e}"))?;
         let pitch = mapped.RowPitch as usize;
         let (wu, hu) = (w as usize, h as usize);
         let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * hu);
-        let mut rgba = vec![0u8; wu * hu * 4];
-        for row in 0..hu {
-            let s = &src[row * pitch..][..wu * 4];
-            let d = &mut rgba[row * wu * 4..][..wu * 4];
-            // BGRA → RGBA fused into the copy we must do anyway; alpha is
-            // forced opaque (duplication leaves it undefined).
-            for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
-                dp[0] = sp[2];
-                dp[1] = sp[1];
-                dp[2] = sp[0];
-                dp[3] = 255;
-            }
-        }
-        self.context.Unmap(&staging, 0);
-        // Desktop Duplication delivers the desktop WITHOUT the cursor (it's a
-        // hardware overlay), so draw the real OS pointer shape in ourselves —
-        // matching what macOS/Linux capture already bakes in. Keep the
-        // cursor-free pixels first so a later pointer-only move can re-emit
-        // (see cursor_only_frame). Compositing runs on the pre-rotation buffer,
-        // so the cursor rotates with the frame downstream.
-        if self.ptr_visible && self.cursor.is_some() {
-            self.last_clean = Some(rgba.clone());
-            self.last_dims = (w, h);
+        // BGRA → RGBA fused into the copy we must do anyway; alpha forced
+        // opaque (duplication leaves it undefined). Lives in the pixels
+        // crate so it compiles at opt-level 3 in every profile.
+        allmystuff_pixels::bgra_to_rgba_into(src, pitch, wu, hu, &mut self.clean);
+        self.context.Unmap(staging, 0);
+        self.clean_dims = (w, h);
+        Ok(Some(self.assemble_frame(w, h)))
+    }
+
+    /// The outgoing frame: one copy-out of the clean desktop plus the real
+    /// OS pointer composited over the copy's small rect — Desktop
+    /// Duplication delivers the desktop WITHOUT the cursor (it's a hardware
+    /// overlay), so we draw it in ourselves, matching what macOS/Linux
+    /// capture bakes in. `clean` itself stays cursor-free so a pointer-only
+    /// move re-emits without re-capturing; compositing runs on the
+    /// pre-rotation buffer, so the cursor rotates with the frame downstream.
+    fn assemble_frame(&mut self, w: u32, h: u32) -> RawFrame {
+        let mut rgba = Vec::with_capacity(self.clean.len());
+        rgba.extend_from_slice(&self.clean);
+        if self.ptr_visible {
             if let Some(cur) = &self.cursor {
                 composite_cursor(&mut rgba, w, h, cur, self.ptr_x, self.ptr_y);
             }
-            self.last_cursor_emit = Instant::now();
-        } else {
-            self.last_clean = None;
         }
-        Ok(Some(RawFrame {
+        self.last_cursor_emit = Instant::now();
+        RawFrame {
             rgba,
             width: w,
             height: h,
             rotation_deg: self.rotation_deg,
-        }))
+        }
     }
 
     /// The reusable CPU-readable texture, rebuilt when the desktop size
@@ -563,5 +581,72 @@ fn composite_cursor(dst: &mut [u8], dw: u32, dh: u32, cur: &CursorShape, px: i32
             }
         }
         _ => {}
+    }
+}
+
+/// Ignored-by-default micro-benches — the capture-side per-frame costs, i.e.
+/// the "before" decomposition of the win_capture CPU pass. Pure CPU over
+/// synthetic buffers (no D3D device), so they run on any Windows box. The
+/// swizzle here is deliberately the exact loop shape `copy_out` runs,
+/// compiled in THIS crate — release profile = opt-level "s" — so its number
+/// is the true shipped cost, comparable against the pixels-crate (O3) home
+/// the loop moves to. Run:
+/// `cargo test --release -- --ignored bench_ --nocapture --test-threads=1`
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Average ms/call over `iters`, one warmup call first.
+    fn time_ms<R>(iters: u32, mut f: impl FnMut() -> R) -> f64 {
+        std::hint::black_box(f());
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(f());
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / f64::from(iters)
+    }
+
+    /// The exact BGRA→RGBA loop `copy_out` runs today, in this crate's
+    /// optimization profile.
+    fn swizzle_here(src: &[u8], pitch: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut rgba = vec![0u8; w * h * 4];
+        for row in 0..h {
+            let s = &src[row * pitch..][..w * 4];
+            let d = &mut rgba[row * w * 4..][..w * 4];
+            for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                dp[0] = sp[2];
+                dp[1] = sp[1];
+                dp[2] = sp[0];
+                dp[3] = 255;
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_swizzle_and_cursor_path_costs() {
+        let (w, h) = (3840usize, 2160usize);
+        let pitch = w * 4;
+        let src: Vec<u8> = (0..pitch * h).map(|i| (i % 253) as u8).collect();
+        let sw = time_ms(30, || swizzle_here(&src, pitch, w, h));
+        let frame = src.clone();
+        let clone_ms = time_ms(30, || frame.clone());
+        let zalloc = time_ms(30, || vec![0u8; w * h * 4]);
+        let cur = CursorShape {
+            kind: 2,
+            width: 32,
+            height: 32,
+            pitch: 32 * 4,
+            buf: (0..32 * 32 * 4).map(|i| (i % 255) as u8).collect(),
+        };
+        let mut canvas = src.clone();
+        let comp = time_ms(200, || {
+            composite_cursor(&mut canvas, w as u32, h as u32, &cur, 1000, 1000)
+        });
+        println!("bench node(-Os) BGRA->RGBA swizzle 4K        : {sw:7.3} ms/frame");
+        println!("bench 4K frame clone (cursor path, per frame): {clone_ms:7.3} ms");
+        println!("bench 4K zeroed alloc (per frame today)      : {zalloc:7.3} ms");
+        println!("bench 32x32 cursor composite (rect only)     : {comp:7.3} ms");
     }
 }
