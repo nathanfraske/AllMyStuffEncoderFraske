@@ -232,6 +232,17 @@ impl HwEncoder {
                 &CODECAPI_AVEncMPVGOPSize,
                 &variant_u32(fps.saturating_mul(4).max(1)),
             );
+            if crate::video::paced_slices_enabled() {
+                // Byte-capped slices for the app-side pacer (mode 1 =
+                // bits per slice). Best-effort — MFT support varies by
+                // vendor; without it the pacer still splits at whatever
+                // NAL boundaries exist.
+                let _ = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(1));
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncSliceControlSize,
+                    &variant_u32((crate::video::PACE_SLICE_BYTES * 8) as u32),
+                );
+            }
         }
 
         // Event generator for the async (hardware) drive model.

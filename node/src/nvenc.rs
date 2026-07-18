@@ -642,6 +642,13 @@ impl NvencH264 {
         let h264 = &mut cfg.encode_codec_config.h264;
         h264.flags |= h264_flags::REPEAT_SPSPPS;
         h264.entropy_coding_mode = 0; // autoselect (CABAC where allowed)
+        if crate::video::paced_slices_enabled() {
+            // Byte-capped slices (sliceMode 1 = max bytes per slice): the
+            // send-side pacer's cut points — a keyframe leaves as several
+            // independently-decodable slices instead of one wall.
+            h264.slice_mode = 1;
+            h264.slice_mode_data = crate::video::PACE_SLICE_BYTES as u32;
+        }
         if self.intra_refresh {
             // GDR: no automatic IDRs at all; intra data rides a refresh
             // wave ~every 2 s, ~15% of the period long. A forced IDR (a

@@ -624,11 +624,12 @@ impl Mesh {
                             result
                         }
                         // An H.264 access unit rides the mesh's RTP track
-                        // lane — no chunking (RTP packetizes), no ceiling.
+                        // lane — no size ceiling (RTP packetizes), but
+                        // optionally paced: see [`Mesh::send_video_paced`].
                         VideoPacket::H264 { data, duration_us } => {
                             match mesh.video_lane(&route_id, &peer, true) {
                                 Some(lane) => {
-                                    mesh.send_video_track(&peer, lane, data, duration_us).await
+                                    mesh.send_video_paced(&peer, lane, data, duration_us).await
                                 }
                                 // No lane for this route right now — it has
                                 // just torn down, or another of this peer's
@@ -680,6 +681,52 @@ impl Mesh {
             })
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Send one H.264 access unit, paced when the dial is on: the unit is
+    /// split at slice-NAL boundaries into ≤[`video::PACE_SLICE_BYTES`]
+    /// chunks and each chunk goes out as its own track send, spaced by a
+    /// small gap — on the wire, one keyframe's back-to-back packet wall
+    /// becomes a few ~20-packet bursts a shallow bottleneck queue can
+    /// absorb. Non-final chunks carry `duration_us = 0`, so every chunk
+    /// shares one RTP timestamp and the receive side reassembles each as
+    /// its own decodable sample (verified against the daemon's
+    /// `H264AuAssembler`: it emits per marker, and its contiguity anchor
+    /// spans consecutive writes). This task is the route's only video
+    /// sender, so chunk order is inherent; the sleeps also release the
+    /// pipe's writer between chunks, letting audio frames interleave
+    /// instead of queueing behind a keyframe. A mid-unit send failure
+    /// surfaces like any send failure — the chunks already sent decode as
+    /// a partial picture, no worse than the same bytes lost on the wire.
+    async fn send_video_paced(
+        &self,
+        peer: &str,
+        lane: u8,
+        data: Vec<u8>,
+        duration_us: u64,
+    ) -> Result<(), String> {
+        if !crate::video::paced_slices_enabled() {
+            return self.send_video_track(peer, lane, data, duration_us).await;
+        }
+        let chunks = crate::video::split_annexb_paced(&data, crate::video::PACE_SLICE_BYTES);
+        if chunks.len() < 2 {
+            return self.send_video_track(peer, lane, data, duration_us).await;
+        }
+        // Spread the whole unit over at most ~10 ms; 1.5 ms between
+        // bursts when the budget allows (libwebrtc's pacer operates in
+        // the same 5 ms-quanta regime).
+        let gap = std::time::Duration::from_micros(1500)
+            .min(std::time::Duration::from_millis(10) / (chunks.len() as u32 - 1));
+        let last = chunks.len() - 1;
+        for (i, range) in chunks.into_iter().enumerate() {
+            let dur = if i == last { duration_us } else { 0 };
+            self.send_video_track(peer, lane, data[range].to_vec(), dur)
+                .await?;
+            if i != last {
+                tokio::time::sleep(gap).await;
+            }
+        }
+        Ok(())
     }
 
     /// Send one H.264 access unit to `peer` over the daemon's video track

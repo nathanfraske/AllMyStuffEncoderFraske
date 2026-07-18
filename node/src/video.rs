@@ -3410,6 +3410,99 @@ fn packetize_units(
         .collect()
 }
 
+/// Byte cap for one paced burst — the slice pacer's grain. Encoders are
+/// asked to cap slices at this (NVENC `sliceMode=1`, the MF codec API,
+/// openh264 `max_slice_len`), and the send-side splitter groups NALs into
+/// chunks of at most this many bytes. ≈20 RTP packets ≈ 0.25 ms of line
+/// rate per burst — the shape a shallow bottleneck queue absorbs without
+/// tail drops.
+pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
+
+/// Opt-in for the app-side slice pacer (`ALLMYSTUFF_PACED_SLICES=1`),
+/// default OFF until soaked. When on: encoders emit byte-capped slices
+/// and the mesh forwarder writes each slice group as its own track send
+/// with a small gap — one keyframe's 200-packet wall becomes a handful
+/// of spaced ~20-packet bursts, with zero MyOwnMesh involvement (its
+/// reassembler emits per marker and its contiguity anchor spans the
+/// split writes — verified against the daemon's `H264AuAssembler`).
+pub(crate) fn paced_slices_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("ALLMYSTUFF_PACED_SLICES")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+            .unwrap_or(false);
+        if on {
+            tracing::info!("ALLMYSTUFF_PACED_SLICES=1 — app-side slice pacing enabled");
+        }
+        on
+    });
+    *ON
+}
+
+/// Split one Annex-B access unit into paced chunks of at most `max_chunk`
+/// bytes, cutting **only** at slice-NAL boundaries (types 1 and 5) so
+/// every chunk is independently feedable to a decoder, and gluing any
+/// parameter-set/SEI run (SPS/PPS/AUD/SEI) to the slice that follows it
+/// — a chunk never strands a slice from its headers. Returns contiguous
+/// ranges that concatenate back to `data` byte-identically; a unit whose
+/// single slice exceeds the cap stays whole (slice granularity is the
+/// floor — the encoder-side slice cap is what makes real splits exist).
+pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
+    // Walk the start codes (00 00 01 and 00 00 00 01), recording each
+    // NAL's offset and type.
+    let mut nals: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let hdr = if data[i + 2] == 1 {
+                i + 3
+            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if hdr < data.len() {
+                nals.push((i, data[hdr] & 0x1f));
+            }
+            i = hdr + 1;
+        } else {
+            i += 1;
+        }
+    }
+    // One decodable unit per slice NAL, absorbing the non-slice run
+    // before it; anything before the first slice belongs to the first
+    // unit, anything after the last slice's data to the last.
+    let mut unit_starts: Vec<usize> = Vec::new();
+    let mut pending: Option<usize> = None;
+    for &(off, ty) in &nals {
+        if ty == 1 || ty == 5 {
+            unit_starts.push(pending.take().unwrap_or(off));
+        } else if pending.is_none() {
+            pending = Some(off);
+        }
+    }
+    if unit_starts.len() < 2 {
+        return std::iter::once(0..data.len()).collect();
+    }
+    unit_starts[0] = 0;
+    // Greedy pack: extend the current chunk unit by unit; cut when the
+    // next extension would overflow the cap (an oversized single unit
+    // still ships whole).
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_end = 0usize;
+    for (k, &s) in unit_starts.iter().enumerate() {
+        let e = unit_starts.get(k + 1).copied().unwrap_or(data.len());
+        if chunk_end > chunk_start && e - chunk_start > max_chunk {
+            out.push(chunk_start..chunk_end);
+            chunk_start = s;
+        }
+        chunk_end = e;
+    }
+    out.push(chunk_start..chunk_end);
+    out
+}
+
 /// The H.264 edge a frame fits to right now: the tuned ceiling, capped by
 /// the receiver-driven auto-adapt when it's active. Shared by
 /// [`H264Stream`] and the GPU lane (which re-fits — and rebuilds — when
@@ -3778,11 +3871,17 @@ fn make_h264_encoder(
         .bitrate
         .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
         .clamp(250_000, 80_000_000);
-    let config = EncoderConfig::new()
+    let mut config = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
         .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(fps as f32));
+    if paced_slices_enabled() {
+        // Byte-capped slices give the send-side pacer real cut points —
+        // a keyframe becomes several independently-decodable slices
+        // instead of one wall (see [`split_annexb_paced`]).
+        config = config.max_slice_len(PACE_SLICE_BYTES as u32);
+    }
     Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
         .map_err(|e| format!("openh264 init: {e}"))
 }
@@ -3836,6 +3935,150 @@ use allmystuff_pixels::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One synthetic Annex-B NAL: start code + header byte (type in the
+    /// low 5 bits) + a body that can't fake a start code.
+    fn nal(ty: u8, len: usize, four_byte_sc: bool) -> Vec<u8> {
+        let mut v = if four_byte_sc {
+            vec![0, 0, 0, 1]
+        } else {
+            vec![0, 0, 1]
+        };
+        v.push(ty);
+        v.extend(std::iter::repeat_n(0xAB, len));
+        v
+    }
+
+    /// The slice splitter's contract on a synthetic AU: cuts land only
+    /// before slice NALs, parameter sets and SEI travel with the slice
+    /// that follows them, the ranges partition the input byte-exactly,
+    /// and an unsplittable unit ships whole.
+    #[test]
+    fn splitter_cuts_only_at_slices_and_partitions_exactly() {
+        let sps = nal(7, 10, true);
+        let pps = nal(8, 4, true);
+        let s1 = nal(5, 900, false);
+        let s2 = nal(5, 900, false);
+        let sei = nal(6, 8, false);
+        let s3 = nal(1, 900, false);
+        let au: Vec<u8> = [sps.clone(), pps.clone(), s1.clone(), s2, sei.clone(), s3].concat();
+        let chunks = split_annexb_paced(&au, 1000);
+        let rebuilt: Vec<u8> = chunks
+            .iter()
+            .flat_map(|r| au[r.clone()].iter().copied())
+            .collect();
+        assert_eq!(rebuilt, au, "chunks partition the unit byte-exactly");
+        assert_eq!(chunks.len(), 3, "three slice-anchored chunks: {chunks:?}");
+        assert!(
+            chunks[0].len() >= sps.len() + pps.len() + s1.len(),
+            "SPS/PPS glued to the first slice"
+        );
+        let c2 = &au[chunks[2].clone()];
+        assert_eq!(&c2[..sei.len()], &sei[..], "SEI travels with its slice");
+        for r in &chunks {
+            let c = &au[r.clone()];
+            assert!(
+                c.starts_with(&[0, 0, 1]) || c.starts_with(&[0, 0, 0, 1]),
+                "every chunk begins at a start code"
+            );
+        }
+        // A unit with one oversized slice can't split below slice
+        // granularity — it ships whole.
+        let solo = [nal(7, 10, true), nal(8, 4, true), nal(5, 5000, false)].concat();
+        let whole = split_annexb_paced(&solo, 1000);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0], 0..solo.len());
+        // Degenerate inputs never panic and never split.
+        assert_eq!(split_annexb_paced(&[], 1000).len(), 1);
+        assert_eq!(split_annexb_paced(&[0, 0], 1000)[0], 0..2);
+    }
+
+    /// The pacer's core claim on a REAL bitstream: an openh264 encoder
+    /// with a slice cap emits multi-slice units, the splitter cuts them,
+    /// and a decoder fed **chunk by chunk** — exactly how the far side
+    /// sees paced sends arrive as separate samples — still decodes every
+    /// picture cleanly. No hardware needed, so this holds on every CI
+    /// platform.
+    #[test]
+    fn paced_slice_chunks_decode_independently() {
+        use openh264::encoder::{
+            BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
+        };
+        let (w, h) = (640usize, 480usize);
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(8_000_000))
+            .max_frame_rate(FrameRate::from_hz(30.0))
+            .max_slice_len(4 * 1024);
+        let mut enc =
+            Encoder::with_api_config(openh264::OpenH264API::from_source(), config).expect("enc");
+        let mut dec = openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new(),
+        )
+        .expect("dec");
+        let mut yuv = vec![128u8; w * h + 2 * ((w / 2) * (h / 2))];
+        let mut saw_multi = false;
+        let mut decoded = 0u32;
+        let mut on_last_chunk = 0u32;
+        for i in 0..10u32 {
+            // Encodable-but-busy content (marching stripes + texture) so
+            // rate control never frame-skips, while slices still fill to
+            // the cap. (Pure noise at this bitrate makes openh264 skip
+            // alternate frames entirely — a rate-control artifact that
+            // says nothing about chunked feeding.)
+            for (j, v) in yuv[..w * h].iter_mut().enumerate() {
+                let row = j / w;
+                let stripe = (row as u32 + i * 3) % 32 < 16;
+                let texture = ((j as u32).wrapping_mul(31) >> 3) % 48;
+                *v = if stripe {
+                    170 + (texture as u8 / 2)
+                } else {
+                    40 + texture as u8
+                };
+            }
+            let au = enc
+                .encode(&I420Frame { buf: &yuv, w, h })
+                .expect("encode")
+                .to_vec();
+            let chunks = split_annexb_paced(&au, 4 * 1024);
+            let rebuilt: Vec<u8> = chunks
+                .iter()
+                .flat_map(|r| au[r.clone()].iter().copied())
+                .collect();
+            assert_eq!(rebuilt, au, "real-bitstream partition is byte-exact");
+            if chunks.len() > 1 {
+                saw_multi = true;
+            }
+            let last = chunks.len() - 1;
+            for (ci, r) in chunks.into_iter().enumerate() {
+                if dec
+                    .decode(&au[r])
+                    .expect("each paced chunk decodes cleanly")
+                    .is_some()
+                {
+                    decoded += 1;
+                    if ci == last {
+                        on_last_chunk += 1;
+                    }
+                }
+            }
+        }
+        assert!(saw_multi, "the slice cap produced multi-chunk units");
+        assert!(
+            decoded >= 9,
+            "pictures completed across chunk-by-chunk feeding ({decoded}/10)"
+        );
+        // The zero-added-latency property: openh264 completes a picture by
+        // macroblock accounting, so it surfaces on the SAME frame's final
+        // chunk — never held for the next AU. This is what lets the live
+        // viewer decode paced chunks as they arrive, no coalescing stage.
+        assert!(
+            on_last_chunk >= decoded.saturating_sub(1),
+            "pictures surface on their own frame's last chunk ({on_last_chunk}/{decoded})"
+        );
+    }
 
     fn fb(recv_fps: u32, decode_fails: u32, queue_depth: u32) -> RecvFeedback {
         RecvFeedback {
