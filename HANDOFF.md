@@ -19,8 +19,12 @@ ladder: NVDEC first where the NVIDIA driver lives (measured faster:
 Four postures work end-to-end: **Balanced**, **Game** (GDR,
 latency-first), **Studio** (lossy high-bitrate), **Studio · Lossless**
 (bit-exact HEVC). Latest field build:
-`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\AllMyStuff_0.2.47_x64-setup.exe`
-(2026-07-18 evening, carries the D3D11VA rung). Two hardware arcs wait
+`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\nsis\AllMyStuff_0.2.47_x64-setup.exe`
+(2026-07-18 evening; carries the D3D11VA rung AND the popout
+fullscreen-fit fix; sidecar staged manually per the recipe below —
+build.rs's "sidecar bundle skipped" warning is benign, the staged copy
+is what ships; `ALLMYSTUFF_SERVE_BIN=<path>` makes build.rs stage it
+itself). Two hardware arcs wait
 on boxes the user will provide: **AMF** (AMD encode) needs the Radeon
 9060 XT, **AV1** needs a 50-series. Next high-value item: the **viewer
 decode-capability handshake** (fail-soft before the AMD box lands).
