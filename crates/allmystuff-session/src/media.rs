@@ -104,6 +104,13 @@ pub enum InputAction {
         code: Option<String>,
         down: bool,
     },
+    /// Relative mouse motion in device pixels — the viewer's Pointer Lock
+    /// deltas (game-mode aiming: fullscreen mouse capture). No
+    /// normalization and no screen clamp: FPS camera control needs the
+    /// raw deltas, not a position. An older receiver ignores it via the
+    /// catch-all below (motion just doesn't land there — the viewer's
+    /// pointer-lock UI is the newer build's feature to offer).
+    MouseMoveRel { dx: f64, dy: f64 },
     /// An input kind a newer build introduced. Decodes here and is ignored
     /// rather than failing the whole frame, so a future action can never
     /// drop the keyboard/mouse events this build does understand.

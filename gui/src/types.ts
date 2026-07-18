@@ -568,6 +568,7 @@ export interface UpdatePrefs {
  *  modifiers composed here). */
 export type InputAction =
   | { kind: "mouse_move"; x: number; y: number; screen?: number }
+  | { kind: "mouse_move_rel"; dx: number; dy: number }
   | { kind: "mouse_button"; button: number; down: boolean }
   | { kind: "wheel"; dx: number; dy: number }
   | { kind: "key"; key: string; code?: string; down: boolean };

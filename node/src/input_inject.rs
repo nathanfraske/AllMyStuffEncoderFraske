@@ -170,6 +170,12 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 let (gx, gy) = rect.denorm(x, y);
                 move_mouse_global(&mut enigo, gx, gy)
             }
+            // Pointer-lock deltas: raw relative motion, straight through —
+            // games read this as camera movement, so no screen resolve, no
+            // clamping, no coalescing beyond what the sender already did.
+            InputAction::MouseMoveRel { dx, dy } => enigo
+                .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
+                .map_err(|e| e.to_string()),
             InputAction::MouseButton { button, down } => match dom_button(button) {
                 Some(b) => enigo.button(b, direction(down)).map_err(|e| e.to_string()),
                 None => Ok(()),

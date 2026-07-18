@@ -304,9 +304,43 @@
     stageEl?.focus({ preventScroll: true });
   }
 
+  // ---- pointer lock (fullscreen mouse capture) -----------------------
+  // Game-mode aiming: in fullscreen control, a click captures the mouse
+  // and RELATIVE deltas stream to the host (`mouse_move_rel`) — FPS
+  // camera control instead of a cursor pinned to the window edge. Esc
+  // (the browser's own gesture) releases it; leaving fullscreen or
+  // control drops it too.
+  let pointerLocked = $state(false);
+  function lockChanged() {
+    pointerLocked = document.pointerLockElement === stageEl;
+  }
+  function maybePointerLock() {
+    if (fullscreen && controlActive && !pointerLocked) {
+      void stageEl?.requestPointerLock();
+    }
+  }
+  $effect(() => {
+    document.addEventListener("pointerlockchange", lockChanged);
+    return () => document.removeEventListener("pointerlockchange", lockChanged);
+  });
+  $effect(() => {
+    // Falling out of fullscreen or control releases the capture.
+    if (pointerLocked && (!fullscreen || !controlActive)) {
+      document.exitPointerLock();
+    }
+  });
+
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
+    if (pointerLocked) {
+      // Raw deltas, uncoalesced beyond the browser's own batching — this
+      // is the aim path; the 16 ms absolute-move throttle doesn't apply.
+      if (e.movementX !== 0 || e.movementY !== 0) {
+        send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+      }
+      return;
+    }
     claimFocus();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
@@ -320,6 +354,12 @@
     // A click is the most reliable focus pin — land it on the stage so keys
     // forward even if the cursor was last over a hover-bar button.
     if (down) stageEl?.focus({ preventScroll: true });
+    if (down) maybePointerLock();
+    if (pointerLocked) {
+      e.preventDefault();
+      send({ kind: "mouse_button", button: e.button, down });
+      return;
+    }
     const p = norm(e);
     if (!p) return;
     e.preventDefault();
