@@ -19,6 +19,7 @@
   // arriving over the local lane — runs the same teardown, announces
   // `closed`, and the tab that popped it re-wires itself.
   import { onMount } from "svelte";
+  import { Fsr1 } from "../fsr1";
   import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
@@ -67,6 +68,47 @@
   const ended = $derived(routeState === "torn_down" || routeState === "rejected");
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+
+  // ---- FSR1-style upscale (edge-adaptive, text-biased sharpening) ----
+  // When the decoded stream is smaller than the display box, the plain
+  // path is the browser's bilinear stretch — soft edges, smeared text.
+  // The overlay canvas runs the WebGL2 EASU+RCAS pipeline instead,
+  // engaged automatically at >1.1× upscale and killable from the Scale
+  // pill. Pointer events stay on the base canvas (the normalizer and
+  // pointer lock never see the overlay). This is also Reach mode's
+  // presentation layer: a deliberately low-res stream over a starved
+  // link gets rebuilt here.
+  let glCanvasEl = $state<HTMLCanvasElement | null>(null);
+  let fsrOn = $state(localStorage.getItem("ams.fsrOff") !== "1");
+  let fsrShow = $state(false);
+  let fsrEngine: Fsr1 | null = null;
+  let fsrDead = false;
+  function presentFsr(w: number, h: number) {
+    const base = canvasEl;
+    const gl = glCanvasEl;
+    if (!base || !gl) return;
+    const dpr = window.devicePixelRatio || 1;
+    const dw = Math.round(base.clientWidth * dpr);
+    const dh = Math.round(base.clientHeight * dpr);
+    if (!(fsrOn && !fsrDead && dw > w * 1.1)) {
+      fsrShow = false;
+      return;
+    }
+    try {
+      fsrEngine ??= new Fsr1(gl);
+      fsrEngine.render(base, w, h, dw, dh);
+      fsrShow = true;
+    } catch (e) {
+      console.warn("FSR upscale unavailable; plain scaling:", e);
+      fsrDead = true;
+      fsrShow = false;
+    }
+  }
+  function toggleFsr() {
+    fsrOn = !fsrOn;
+    localStorage.setItem("ams.fsrOff", fsrOn ? "0" : "1");
+    if (!fsrOn) fsrShow = false;
+  }
   // The role=application surface. Key forwarding lives on this element (not
   // `<svelte:window>`) so it fires whenever the element holds focus — and
   // hovering pins that focus (below), the reliable way to make a secondary
@@ -236,6 +278,7 @@
       frameH = h;
       hasFrame = true;
       frameCount += 1;
+      presentFsr(w, h);
     };
 
     // MJPEG paint slot, latest-wins — the same supersede the console uses.
@@ -452,6 +495,7 @@
   oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
+  <canvas bind:this={glCanvasEl} class="fsr" class:active={fsrShow && hasFrame}></canvas>
   {#if !hasFrame}
     <div class="placeholder" style="--mc: {sourceCap ? mediaColor(sourceCap.media) : '#888'}">
       <div class="glyph">{sourceCap ? originIcon(sourceCap.origin, sourceCap.media) : "🪟"}</div>
@@ -540,6 +584,19 @@
         }}
       >
         Mode · {modeLabel()}
+      </button>
+      <button
+        class="pill"
+        class:tuned={fsrShow}
+        title="Edge-adaptive upscaling with text-biased sharpening when the stream is smaller than the window — replaces the browser's soft bilinear stretch"
+        onpointerdown={(e) => e.stopPropagation()}
+        onpointerup={(e) => e.stopPropagation()}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleFsr();
+        }}
+      >
+        Scale · {fsrOn ? (fsrShow ? "FSR" : "Auto") : "Off"}
       </button>
       {@render pillMenu("res", "Res", RES_CHOICES, tune.maxEdge, "maxEdge")}
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}
@@ -700,6 +757,19 @@
   canvas.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* The FSR overlay sits exactly on the fitted video box; input never
+     touches it (the pointer normalizer and pointer lock live on the base
+     canvas underneath). */
+  canvas.fsr {
+    display: none;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    pointer-events: none;
+  }
+  canvas.fsr.active {
+    display: block;
   }
   .placeholder {
     display: flex;
