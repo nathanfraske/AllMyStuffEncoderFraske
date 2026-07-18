@@ -136,6 +136,10 @@ pub enum Effect {
         decode_fails: u32,
         queue_depth: u32,
         lost_ts_us: Option<u64>,
+        /// Viewer-side bandwidth estimate (kbps, 0 = none) and one-way
+        /// delay trend (µs/s) — the closed-loop bitrate's inputs.
+        est_kbps: u32,
+        delay_trend_us_per_s: i32,
     },
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
@@ -525,6 +529,8 @@ impl Session {
                 decode_fails,
                 queue_depth,
                 lost_ts_us,
+                est_kbps,
+                delay_trend_us_per_s,
             } => {
                 // Only the route's own viewer reports on it, and only while
                 // it's live — same gate as a refresh/tune ask.
@@ -539,6 +545,8 @@ impl Session {
                         decode_fails,
                         queue_depth,
                         lost_ts_us,
+                        est_kbps,
+                        delay_trend_us_per_s,
                     }];
                 }
                 Vec::new()
@@ -1060,11 +1068,13 @@ mod tests {
                 max_edge: Some(1920),
                 bitrate: None,
                 fps: Some(60),
+                game: false,
+                mode: None,
             }),
         );
         assert!(matches!(
             fx.as_slice(),
-            [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60) }]
+            [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60), game: false, mode: None }]
                 if route_id == "r1"
         ));
         // …and report its decode health back (receiver → sender).
@@ -1076,6 +1086,8 @@ mod tests {
                 decode_fails: 3,
                 queue_depth: 1,
                 lost_ts_us: Some(123_456),
+                est_kbps: 12_000,
+                delay_trend_us_per_s: -40,
             }),
         );
         assert!(matches!(
@@ -1086,6 +1098,8 @@ mod tests {
                 decode_fails: 3,
                 queue_depth: 1,
                 lost_ts_us: Some(123_456),
+                est_kbps: 12_000,
+                delay_trend_us_per_s: -40,
             }]
                 if route_id == "r1"
         ));

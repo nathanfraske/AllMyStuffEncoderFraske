@@ -51,6 +51,7 @@ use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge};
+use std::time::{Duration, Instant};
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -74,6 +75,16 @@ pub struct Mesh {
     /// asked for ready-to-paint frames (no WebCodecs in its webview, or its
     /// decoder stalled out).
     video_decode: Arc<DecodeBridge>,
+    /// M2 — the pacer's requested-vs-actual gap ledger (one log line per
+    /// minute): the honesty check on every sub-millisecond spacing the
+    /// drain model asks for.
+    pace_gaps: Mutex<PaceGapStats>,
+    /// M3 + the chunk-train bandwidth estimator: per inbound video route,
+    /// arrival dispersion of the pacer's own timed bursts → a bottleneck
+    /// estimate and a one-way-delay trend, attached to every outbound
+    /// [`RouteControl::VideoFeedback`] (the ICE datapath's control
+    /// channel — never signaling).
+    video_arrivals: Mutex<HashMap<String, ArrivalState>>,
     /// Keyboard/mouse injection for input routes that sink here — gated on
     /// the sender being our owner or a fleet member.
     injector: Injector,
@@ -455,6 +466,72 @@ struct State {
     profile: Option<NodeProfile>,
 }
 
+/// M2 — the pacer's requested-vs-actual gap ledger (a minute at a time).
+#[derive(Default)]
+struct PaceGapStats {
+    n: u64,
+    req_us: u64,
+    act_us: u64,
+    worst_over_us: u64,
+    over_1ms: u64,
+    last_log: Option<Instant>,
+}
+
+/// M3 + T1.1 — one inbound video route's arrival measurement: the current
+/// chunk train being timed, the dispersion-derived bandwidth estimate,
+/// and the one-way-delay trend window.
+struct ArrivalState {
+    /// The train in progress (chunks sharing one RTP timestamp).
+    ts: u32,
+    first: Instant,
+    last: Instant,
+    bytes: usize,
+    chunks: u32,
+    /// EWMA of per-train dispersion samples (kbps); 0 = none yet. What a
+    /// timed train measures is min(sender's drain rate, bottleneck) —
+    /// exactly the number a closed loop can act on.
+    est_kbps: f64,
+    /// This minute's samples (Mbps) for the log line's percentiles.
+    window: Vec<f64>,
+    /// (arrival, relative one-way delay µs) over the last ~2 s — the
+    /// slope is a standing queue growing before loss says so. Clock skew
+    /// between the sender's RTP clock and our monotonic is ppm-scale,
+    /// two orders under the trend threshold.
+    owd: std::collections::VecDeque<(Instant, i64)>,
+    /// Wall/RTP anchor for the relative delay; re-anchored periodically
+    /// so u32 RTP wrap (~13 h) never crosses a window.
+    base: Option<(Instant, u32)>,
+    last_log: Instant,
+}
+
+/// Execute one pacing gap against a deadline: bulk asynchronously (the
+/// worker stays free for audio interleave), finish with the precise
+/// sleeper so 100–1500 µs requests are real instead of timer-wheel
+/// millisecond roundings. Falls back to the plain async sleep on a
+/// current-thread runtime (tests), where blocking a worker would deadlock.
+async fn paced_gap(gap: std::time::Duration) {
+    let deadline = Instant::now() + gap;
+    let precise_ok = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    loop {
+        let now = Instant::now();
+        let Some(rem) = deadline.checked_duration_since(now) else {
+            return;
+        };
+        if rem > std::time::Duration::from_millis(3) {
+            tokio::time::sleep(rem - std::time::Duration::from_millis(2)).await;
+            continue;
+        }
+        if precise_ok {
+            tokio::task::block_in_place(|| crate::os_perf::precise_sleep(rem));
+        } else {
+            tokio::time::sleep(rem).await;
+        }
+        return;
+    }
+}
+
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
         // Shallow queues both: at most a few frames in flight, so a slow
@@ -470,6 +547,8 @@ impl Mesh {
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
             video_decode: Arc::new(DecodeBridge::new()),
+            pace_gaps: Mutex::new(PaceGapStats::default()),
+            video_arrivals: Mutex::new(HashMap::new()),
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
@@ -629,8 +708,8 @@ impl Mesh {
                         VideoPacket::H264 { data, duration_us } => {
                             match mesh.video_lane(&route_id, &peer, true) {
                                 Some(lane) => {
-                                    let game = mesh.video.route_game(&route_id);
-                                    mesh.send_video_paced(&peer, lane, data, duration_us, game)
+                                    let pace = mesh.video.route_pace(&route_id);
+                                    mesh.send_video_paced(&peer, lane, data, duration_us, pace)
                                         .await
                                 }
                                 // No lane for this route right now — it has
@@ -695,18 +774,31 @@ impl Mesh {
     /// its own decodable sample (verified against the daemon's
     /// `H264AuAssembler`: it emits per marker, and its contiguity anchor
     /// spans consecutive writes). This task is the route's only video
-    /// sender, so chunk order is inherent; the sleeps also release the
+    /// sender, so chunk order is inherent; the gaps also release the
     /// pipe's writer between chunks, letting audio frames interleave
     /// instead of queueing behind a keyframe. A mid-unit send failure
     /// surfaces like any send failure — the chunks already sent decode as
     /// a partial picture, no worse than the same bytes lost on the wire.
+    ///
+    /// The drain model is link-fitted: on a LAN the historical 800 Mbps
+    /// shape (shallow-buffer smoothing, budget 6/10 ms) stands; on a
+    /// WAN-class path the spread rate is the route's OWN send bitrate
+    /// ×1.5 with a one-frame-interval budget — spreading a wall across
+    /// its own frame slot adds zero pipeline latency by definition, while
+    /// the old constants handed a 40 Mbps path a ~2-frame standing queue
+    /// per keyframe (a ~190 KB wall in 1.7 ms is an instantaneous
+    /// ~890 Mbps). `ALLMYSTUFF_PACE_DRAIN_MBPS` pins the drain for A/B.
+    /// Gaps are executed against a deadline with [`os_perf::precise_sleep`]
+    /// under the hood — the requested spacing is real now, not
+    /// timer-wheel-rounded — and every gap is ledgered (the `pace gaps`
+    /// line, one per minute).
     async fn send_video_paced(
         &self,
         peer: &str,
         lane: u8,
         data: Vec<u8>,
         duration_us: u64,
-        game: bool,
+        pace: (bool, bool, u32),
     ) -> Result<(), String> {
         if !crate::video::paced_slices_enabled() {
             return self.send_video_track(peer, lane, data, duration_us).await;
@@ -715,32 +807,185 @@ impl Mesh {
         if chunks.len() < 2 {
             return self.send_video_track(peer, lane, data, duration_us).await;
         }
-        // Spread the unit with gaps matched to each chunk's actual wire
-        // time (an 800 Mbps drain model — conservative for a LAN, sane
-        // for good WAN): a 24 KB steady-state slice earns ~300 µs, a
-        // 175 KB keyframe wall earns the full cap. The old fixed
-        // 1–1.5 ms gap charged every frame the keyframe's toll — for a
-        // lossless steady-state AU (8 slices already at the pacing
-        // grain, nothing to shape) that was ~10 ms of idle wire added to
-        // every frame's tail. Rate-matching keeps the burst shape where
-        // walls exist and stops taxing the frames that don't need it.
-        // Caps unchanged: game 1 ms/6 ms, others 1.5 ms/10 ms.
-        let (gap_cap_us, budget_ms) = if game { (1000, 6) } else { (1500, 10) };
+        // (game posture, WAN-class path, current send rate bps) — the
+        // shape `VideoBridge::route_pace` hands the forwarder.
+        let (game, wan, rate_bps) = pace;
+        static DRAIN_OVERRIDE_MBPS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            std::env::var("ALLMYSTUFF_PACE_DRAIN_MBPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        // (drain bps, per-gap cap µs, whole-AU budget ms).
+        let (drain_bps, gap_cap_us, budget_ms) = if *DRAIN_OVERRIDE_MBPS > 0 {
+            (*DRAIN_OVERRIDE_MBPS * 1_000_000, 8_000, 16)
+        } else if wan && rate_bps > 0 {
+            // The link is asked to carry `rate_bps` steady-state; walls
+            // spread at 1.5× that (peaks are real) across at most one
+            // frame interval.
+            ((rate_bps as u64) * 3 / 2, 8_000, 16)
+        } else if game {
+            (800_000_000, 1_000, 6)
+        } else {
+            (800_000_000, 1_500, 10)
+        };
         let budget_each = std::time::Duration::from_millis(budget_ms) / (chunks.len() as u32 - 1);
         let last = chunks.len() - 1;
+        let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(last);
         for (i, range) in chunks.into_iter().enumerate() {
             let dur = if i == last { duration_us } else { 0 };
             let sent_bytes = range.len();
             self.send_video_track(peer, lane, data[range].to_vec(), dur)
                 .await?;
             if i != last {
-                // bytes × 8 bits / 800 Mbps = bytes / 100 µs.
-                let drain_us = (sent_bytes as u64 / 100).clamp(100, gap_cap_us);
+                let drain_us =
+                    (sent_bytes as u64 * 8_000_000 / drain_bps.max(1)).clamp(100, gap_cap_us);
                 let gap = std::time::Duration::from_micros(drain_us).min(budget_each);
-                tokio::time::sleep(gap).await;
+                let t0 = std::time::Instant::now();
+                paced_gap(gap).await;
+                ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
             }
         }
+        self.note_pace_gaps(&ledger);
         Ok(())
+    }
+
+    /// Fold one delivered video sample into the route's arrival state:
+    /// time the chunk train it belongs to (same RTP timestamp), and when
+    /// a new train opens, finalize the previous one into the bandwidth
+    /// estimate, the delay-trend window, and the minute log (M3 + T1.1).
+    fn note_video_arrival(&self, route_id: &str, rtp_timestamp: u32, bytes: usize) {
+        let now = Instant::now();
+        let mut map = self.video_arrivals.lock();
+        let st = map
+            .entry(route_id.to_string())
+            .or_insert_with(|| ArrivalState {
+                ts: rtp_timestamp,
+                first: now,
+                last: now,
+                bytes: 0,
+                chunks: 0,
+                est_kbps: 0.0,
+                window: Vec::new(),
+                owd: std::collections::VecDeque::new(),
+                base: None,
+                last_log: now,
+            });
+        if st.ts != rtp_timestamp && st.chunks > 0 {
+            // Train complete. Dispersion needs ≥3 timed chunks and a
+            // non-degenerate spread to say anything about rate.
+            let spread_us = st.last.duration_since(st.first).as_micros() as u64;
+            if st.chunks >= 3 && spread_us >= 300 {
+                let mbps = (st.bytes as f64 * 8.0) / spread_us as f64;
+                st.window.push(mbps);
+                let kbps = mbps * 1000.0;
+                st.est_kbps = if st.est_kbps <= 0.0 {
+                    kbps
+                } else {
+                    st.est_kbps * 0.8 + kbps * 0.2
+                };
+            }
+            // One-way-delay trend: relative delay of this train's FIRST
+            // chunk vs the anchor, windowed to ~2 s.
+            let (base_wall, base_rtp) = *st.base.get_or_insert((st.first, st.ts));
+            let rtp_delta_us = i64::from(st.ts.wrapping_sub(base_rtp) as i32) * 1000 / 90;
+            let wall_delta_us = st.first.duration_since(base_wall).as_micros() as i64;
+            st.owd.push_back((st.first, wall_delta_us - rtp_delta_us));
+            while st
+                .owd
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(2))
+            {
+                st.owd.pop_front();
+            }
+            // Re-anchor every ~5 min: RTP u32 wraps at ~13 h, and the
+            // relative math must never straddle it.
+            if st.first.duration_since(base_wall) > Duration::from_secs(300) {
+                st.base = Some((st.first, st.ts));
+                st.owd.clear();
+            }
+            if st.last_log.elapsed() >= Duration::from_secs(60) && !st.window.is_empty() {
+                st.window.sort_by(f64::total_cmp);
+                let p = |q: f64| st.window[((st.window.len() - 1) as f64 * q) as usize];
+                tracing::info!(
+                    "video in {route_id}: chunk-trains {} · implied p5 {:.1} · p50 {:.1} Mbps · est {:.1} Mbps · delay trend {:+} µs/s",
+                    st.window.len(),
+                    p(0.05),
+                    p(0.50),
+                    st.est_kbps / 1000.0,
+                    Self::owd_trend_us_per_s(&st.owd),
+                );
+                st.window.clear();
+                st.last_log = now;
+            }
+            (st.ts, st.first, st.bytes, st.chunks) = (rtp_timestamp, now, 0, 0);
+        } else if st.chunks == 0 {
+            (st.ts, st.first) = (rtp_timestamp, now);
+        }
+        st.last = now;
+        st.bytes += bytes;
+        st.chunks += 1;
+    }
+
+    /// The delay-trend slope over the window: µs of added one-way delay
+    /// per second, endpoint-to-endpoint. Coarse on purpose — the signal
+    /// that matters is "tens of milliseconds per second", not noise.
+    fn owd_trend_us_per_s(owd: &std::collections::VecDeque<(Instant, i64)>) -> i32 {
+        let (Some((t0, d0)), Some((t1, d1))) = (owd.front(), owd.back()) else {
+            return 0;
+        };
+        let span = t1.duration_since(*t0).as_secs_f64();
+        if span < 0.5 {
+            return 0;
+        }
+        (((d1 - d0) as f64) / span) as i32
+    }
+
+    /// The estimator's current answer for a route: `(est_kbps, trend)`,
+    /// zeros when unknown — what [`Self::send_video_feedback`] attaches.
+    fn route_link_estimate(&self, route_id: &str) -> (u32, i32) {
+        let map = self.video_arrivals.lock();
+        let Some(st) = map.get(route_id) else {
+            return (0, 0);
+        };
+        (st.est_kbps as u32, Self::owd_trend_us_per_s(&st.owd))
+    }
+
+    /// Fold one AU's gap measurements into the minute ledger and emit the
+    /// `pace gaps` line when it's due — M2's honesty check on the pacer.
+    fn note_pace_gaps(&self, ledger: &[(u64, u64)]) {
+        if ledger.is_empty() {
+            return;
+        }
+        let mut g = self.pace_gaps.lock();
+        for &(req, act) in ledger {
+            g.n += 1;
+            g.req_us += req;
+            g.act_us += act;
+            let over = act.saturating_sub(req);
+            g.worst_over_us = g.worst_over_us.max(over);
+            if over > 1_000 {
+                g.over_1ms += 1;
+            }
+        }
+        let due = g
+            .last_log
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+            .unwrap_or(true);
+        if due && g.n > 0 {
+            tracing::info!(
+                "pace gaps: {} gaps · requested avg {} µs → actual avg {} µs · worst +{:.1} ms · >1 ms err {:.2}%",
+                g.n,
+                g.req_us / g.n,
+                g.act_us / g.n,
+                g.worst_over_us as f64 / 1000.0,
+                g.over_1ms as f64 * 100.0 / g.n as f64,
+            );
+            *g = PaceGapStats {
+                last_log: Some(std::time::Instant::now()),
+                ..PaceGapStats::default()
+            };
+        }
     }
 
     /// Send one H.264 access unit to `peer` over the daemon's video track
@@ -2642,6 +2887,9 @@ impl Mesh {
         // this way all along).
         let first = !self.video_in_stats.lock().contains_key(&route_id);
         self.note_video_in(&route_id, "H.264", data.len());
+        // Time the pacer's chunk trains as they land — the bandwidth
+        // estimate + delay trend the feedback loop reports back (M3/T1.1).
+        self.note_video_arrival(&route_id, rtp_timestamp, data.len());
         let wants_decode = self
             .video_watchers
             .lock()
@@ -4466,6 +4714,8 @@ impl Mesh {
                     decode_fails,
                     queue_depth,
                     lost_ts_us,
+                    est_kbps,
+                    delay_trend_us_per_s,
                 } => {
                     if let Some(ts) = lost_ts_us {
                         // Frame health: the viewer named the AU that died.
@@ -4480,8 +4730,14 @@ impl Mesh {
                         );
                         self.video.route_wave_or_refresh(&route_id);
                     }
-                    self.video
-                        .note_feedback(&route_id, recv_fps, decode_fails, queue_depth)
+                    self.video.note_feedback(
+                        &route_id,
+                        recv_fps,
+                        decode_fails,
+                        queue_depth,
+                        est_kbps,
+                        delay_trend_us_per_s,
+                    )
                 }
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
@@ -9974,6 +10230,11 @@ impl Mesh {
         lost_ts_us: Option<u64>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        // Enrich with what this end measured about the link itself: the
+        // chunk-train bandwidth estimate + delay trend (T1.1). Rides the
+        // same control channel on the ICE datapath as the report always
+        // did — zeros for routes with no timed trains yet.
+        let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::VideoFeedback {
@@ -9982,6 +10243,8 @@ impl Mesh {
                 decode_fails,
                 queue_depth,
                 lost_ts_us,
+                est_kbps,
+                delay_trend_us_per_s,
             }),
         )
         .await

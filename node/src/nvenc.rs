@@ -663,7 +663,9 @@ pub struct NvencH264 {
     hevc: bool,
     /// Frame health asked for a refresh-wave restart before the next
     /// encode (GDR only) — consumed by [`Self::encode_texture`].
-    pending_wave: bool,
+    /// Armed wave restart: the length in frames to write into the next
+    /// picture's force-intra-refresh field (None = idle).
+    pending_wave: Option<u32>,
     label: String,
 }
 
@@ -774,7 +776,7 @@ impl NvencH264 {
                 studio,
                 lossless,
                 hevc,
-                pending_wave: false,
+                pending_wave: None,
                 label: if lossless && hevc {
                     "NVENC SDK (HEVC, studio-lossless)".to_string()
                 } else if lossless {
@@ -1072,11 +1074,15 @@ impl NvencH264 {
 
     /// Frame health's targeted heal on a GDR session: restart the
     /// refresh wave at the next encode — spread intra, no IDR wall —
-    /// so a viewer's reported loss converges in ~5 frames without the
-    /// keyframe spike loss recovery used to cost. No-op off GDR.
-    pub fn arm_wave(&mut self) {
+    /// so a viewer's reported loss converges without the keyframe spike
+    /// loss recovery used to cost. `frames` is the wave's length: the
+    /// loss chooser sends 3 for a fast heal on a lossy spell (bigger
+    /// per-frame intra share, ~50 ms artifact window) or the smooth
+    /// steady-state default otherwise. A second arm mid-wave restarts
+    /// with the newer length. No-op off GDR.
+    pub fn arm_wave(&mut self, frames: u32) {
         if self.intra_refresh {
-            self.pending_wave = true;
+            self.pending_wave = Some(frames.clamp(1, 60));
         }
     }
 
@@ -1125,18 +1131,19 @@ impl NvencH264 {
             pic.input_time_stamp = input_ts;
             pic.input_duration = duration;
             self.frame_index += 1;
-            if self.intra_refresh && self.pending_wave && !force_idr {
-                // Frame health: wave-only restart — intra spreads over
-                // the next ~5 frames with no IDR in the stream at all.
-                self.pending_wave = false;
-                let words = std::slice::from_raw_parts_mut(
-                    pic.codec_pic_params.as_mut_ptr() as *mut u32,
-                    8,
-                );
-                words[H264_PIC_FORCE_INTRA_REFRESH_IDX] = ((self.fps / 2).max(15) / 5).max(3);
+            if !force_idr && self.intra_refresh {
+                if let Some(frames) = self.pending_wave.take() {
+                    // Frame health: wave-only restart — intra spreads over
+                    // the requested frames with no IDR in the stream at all.
+                    let words = std::slice::from_raw_parts_mut(
+                        pic.codec_pic_params.as_mut_ptr() as *mut u32,
+                        8,
+                    );
+                    words[H264_PIC_FORCE_INTRA_REFRESH_IDX] = frames;
+                }
             }
             if force_idr {
-                self.pending_wave = false;
+                self.pending_wave = None;
                 pic.encode_pic_flags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
                 if self.intra_refresh {
                     // An IDR mid-GDR: restart the refresh wave after it so
@@ -1944,7 +1951,7 @@ pub(crate) mod tests_support {
                 studio: true,
                 lossless: true,
                 hevc: false,
-                pending_wave: false,
+                pending_wave: None,
                 label: "NVENC SDK (AV1 probe)".to_string(),
             };
             let mut doc = vec![0u8; wu * (hu + 300) * 4];

@@ -192,6 +192,10 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    /// Wire-parity with the real bridge: the viewer's link estimate and
+    /// delay trend still arrive; recorded, never acted on (no encoder).
+    pub est_kbps: u32,
+    pub delay_trend_us_per_s: i32,
     pub at: Instant,
 }
 
@@ -268,12 +272,20 @@ impl VideoBridge {
         false
     }
 
+    /// Mirror of the real bridge's pacing read — nothing streams here,
+    /// so the pacer keeps its constants.
+    pub fn route_pace(&self, _route_id: &str) -> (bool, bool, u32) {
+        (false, false, 0)
+    }
+
     pub fn note_feedback(
         &self,
         route_id: &str,
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        est_kbps: u32,
+        delay_trend_us_per_s: i32,
     ) {
         self.feedback.lock().insert(
             route_id.to_string(),
@@ -281,6 +293,8 @@ impl VideoBridge {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                est_kbps,
+                delay_trend_us_per_s,
                 at: Instant::now(),
             },
         );

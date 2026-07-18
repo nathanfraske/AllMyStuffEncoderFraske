@@ -185,6 +185,11 @@ pub fn video_feedback(
         recv_fps,
         decode_fails,
         queue_depth,
+        // The phone's decoder is opaque (no per-AU loss naming) and it
+        // runs no chunk-train estimator yet — absent-as-zero on the wire.
+        lost_ts_us: None,
+        est_kbps: 0,
+        delay_trend_us_per_s: 0,
     })
 }
 

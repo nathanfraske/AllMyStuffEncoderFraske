@@ -681,6 +681,13 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    /// The viewer's chunk-train bottleneck estimate (kbps; 0 = none yet) —
+    /// dispersion of the pacer's own timed bursts, measured at arrival.
+    pub est_kbps: u32,
+    /// One-way-delay trend (µs of added delay per second, signed): a
+    /// sustained positive slope is a standing queue growing *before* loss
+    /// says so. 0 = flat/unknown.
+    pub delay_trend_us_per_s: i32,
     pub at: Instant,
 }
 
@@ -827,6 +834,10 @@ pub struct VideoBridge {
     routes: Mutex<HashMap<String, RouteVideo>>,
     /// Per-route receiver health, keyed by route id (see [`RecvFeedback`]).
     feedback: Mutex<HashMap<String, RecvFeedback>>,
+    /// Recent loss-report instants per route — the density signal the GDR
+    /// wave chooser reads (a lossy spell heals with a short, fat wave; a
+    /// one-off keeps the smooth default).
+    loss_marks: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
 }
 
 impl VideoBridge {
@@ -1042,17 +1053,68 @@ impl VideoBridge {
     }
 
     /// Frame health's targeted heal: a GDR lane restarts its refresh
-    /// wave — spread intra over ~5 frames, no keyframe wall, no smear
-    /// left behind — and any route without a registered wave falls back
-    /// to the IDR refresh. The wave is strictly cheaper than what the
-    /// viewer's own rate-limited refresh ask would force moments later.
+    /// wave — spread intra, no keyframe wall, no smear left behind — and
+    /// any route without a registered wave falls back to the IDR refresh.
+    /// The wave's LENGTH is chosen from loss density: a second report
+    /// within ten seconds says the link is in a lossy spell, so the heal
+    /// shortens to 3 frames (~50 ms artifact window, fatter per-frame
+    /// intra the single-frame VBV smooths); a one-off keeps the smooth
+    /// default. A store over an in-flight request restarts it — a second
+    /// loss mid-wave must re-heal, not be absorbed silently.
     pub fn route_wave_or_refresh(&self, route_id: &str) {
+        let now = Instant::now();
+        let lossy_spell = {
+            let mut marks = self.loss_marks.lock();
+            let q = marks.entry(route_id.to_string()).or_default();
+            q.push_back(now);
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10))
+            {
+                q.pop_front();
+            }
+            q.len() >= 2
+        };
         if let Some(flag) = wave_flags().lock().get(route_id) {
-            flag.store(true, Ordering::SeqCst);
-            tracing::debug!("wave restart requested for {route_id}");
+            let fps = self
+                .routes
+                .lock()
+                .get(route_id)
+                .map(|r| r.tune.fps())
+                .unwrap_or(60);
+            let frames = if lossy_spell {
+                3
+            } else {
+                default_wave_frames(fps)
+            };
+            flag.store(frames, Ordering::SeqCst);
+            tracing::debug!(
+                "wave restart requested for {route_id} ({frames} frames{})",
+                if lossy_spell { ", lossy spell" } else { "" }
+            );
             return;
         }
         self.force_idr(route_id);
+    }
+
+    /// What the mesh forwarder needs to pace this route's bursts: the
+    /// posture (game trims the budget), whether the nominated path is
+    /// WAN-class (Unknown counts — conservative until ICE says LAN), and
+    /// the current send rate in bps (0 = no live encode lane; the pacer
+    /// keeps its LAN constants).
+    pub fn route_pace(&self, route_id: &str) -> (bool, bool, u32) {
+        let (game, wan) = self
+            .routes
+            .lock()
+            .get(route_id)
+            .map(|r| (r.tune.game(), r.tune.link != LinkClass::Lan))
+            .unwrap_or((false, false));
+        let rate = route_rates()
+            .lock()
+            .get(route_id)
+            .map(|r| r.target.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        (game, wan, rate)
     }
 
     /// Record the decode health a viewer reported for one of our streams
@@ -1066,22 +1128,75 @@ impl VideoBridge {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        est_kbps: u32,
+        delay_trend_us_per_s: i32,
     ) {
         let fb = RecvFeedback {
             recv_fps,
             decode_fails,
             queue_depth,
+            est_kbps,
+            delay_trend_us_per_s,
             at: Instant::now(),
         };
         self.feedback.lock().insert(route_id.to_string(), fb);
         if decode_fails > 0 || queue_depth > 8 {
             tracing::info!(
-                "video feedback {route_id}: viewer {recv_fps} fps · {decode_fails} decode-fail · queue {queue_depth}"
+                "video feedback {route_id}: viewer {recv_fps} fps · {decode_fails} decode-fail · queue {queue_depth}{}",
+                if est_kbps > 0 {
+                    format!(" · est {:.1} Mbps", est_kbps as f64 / 1000.0)
+                } else {
+                    String::new()
+                }
             );
         } else {
             tracing::debug!(
                 "video feedback {route_id}: viewer {recv_fps} fps · queue {queue_depth}"
             );
+        }
+        // Closed-loop bitrate: AIMD against the posture lane's budget,
+        // applied by the encode thread through the in-place reconfigure
+        // (no reset, no IDR, no visible seam). Skips: user-pinned
+        // bitrates (their wire to own), lossless (no rate to move), and
+        // routes with no live rate registration (CPU lane, MJPEG floor).
+        if rate_adapt_enabled() {
+            let (pinned, target_fps) = {
+                let routes = self.routes.lock();
+                routes
+                    .get(route_id)
+                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps()))
+                    .unwrap_or((true, 0))
+            };
+            if !pinned {
+                if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+                    let current = rate.target.load(Ordering::Relaxed);
+                    let ceiling = rate.ceiling.load(Ordering::Relaxed);
+                    if current > 0 && ceiling > 0 {
+                        let step = rate_adapt_step(
+                            &mut rate.adapt.lock(),
+                            &fb,
+                            target_fps,
+                            current,
+                            ceiling,
+                            Instant::now(),
+                        );
+                        if let Some(next) = step {
+                            rate.target.store(next, Ordering::Relaxed);
+                            tracing::info!(
+                                "video rate {route_id}: {:.1} → {:.1} Mbps (ceiling {:.1}) — {}",
+                                current as f64 / 1e6,
+                                next as f64 / 1e6,
+                                ceiling as f64 / 1e6,
+                                if next < current {
+                                    "congestion evidence"
+                                } else {
+                                    "sustained health"
+                                }
+                            );
+                        }
+                    }
+                }
+            }
         }
         // Adapt the H.264 forced-IDR cadence for this route: relax it when the
         // viewer is keeping up cleanly, tighten it the moment it isn't. The
@@ -2128,6 +2243,16 @@ impl GpuCodec {
             GpuCodec::Mf(e) => e.label(),
         }
     }
+
+    /// Re-aim the rate controller in place. NVENC moves mean/peak/VBV
+    /// with no reset; the MF rung honors what its codec API exposes
+    /// (partial on some drivers — `false` means nothing moved).
+    fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        match self {
+            GpuCodec::Nvenc(e) => e.set_bitrate(bitrate),
+            GpuCodec::Mf(e) => e.set_bitrate(bitrate),
+        }
+    }
 }
 
 /// Open the best hardware H.264 MFT **on the lane's adapter**, bound to
@@ -2298,8 +2423,9 @@ fn run_gpu_lane(
     let mut gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
     // Frame health's wave flag: registered while this GDR lane lives so
     // a viewer's loss report heals with a wave instead of an IDR wall;
-    // the guard unregisters on every lane exit path.
-    let wave = std::sync::Arc::new(AtomicBool::new(false));
+    // the guard unregisters on every lane exit path. The value carries
+    // the requested wave length (frames; 0 = idle).
+    let wave = std::sync::Arc::new(AtomicU32::new(0));
     struct WaveReg(Option<String>);
     impl Drop for WaveReg {
         fn drop(&mut self) {
@@ -2314,6 +2440,32 @@ fn run_gpu_lane(
             .insert(route_id.to_string(), wave.clone());
         route_id.to_string()
     }));
+    // The route's rate seam: the AIMD controller (feedback path) writes
+    // `target`, this thread applies it through the in-place reconfigure,
+    // and the mesh pacer reads it to spread bursts at the rate the link
+    // is actually asked to carry. Not registered for lossless — constQP
+    // has no rate to move, and the pacer's lossless shaping is the
+    // LAN-tuned path on purpose.
+    let rate = std::sync::Arc::new(RouteRate {
+        target: AtomicU32::new(bitrate),
+        ceiling: AtomicU32::new(bitrate),
+        adapt: Mutex::new(RateAdaptState::default()),
+    });
+    struct RateReg(Option<String>);
+    impl Drop for RateReg {
+        fn drop(&mut self) {
+            if let Some(id) = self.0.take() {
+                route_rates().lock().remove(&id);
+            }
+        }
+    }
+    let _rate_reg = RateReg((!lossless).then(|| {
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), rate.clone());
+        route_id.to_string()
+    }));
+    let mut applied_rate = bitrate;
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
         enc.label(),
@@ -2391,9 +2543,28 @@ fn run_gpu_lane(
                 stats.add_scale(frame.spent);
                 (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
-                if gdr && wave.swap(false, Ordering::SeqCst) {
+                let wave_frames = wave.swap(0, Ordering::SeqCst);
+                if gdr && wave_frames > 0 {
                     if let GpuCodec::Nvenc(n) = &mut enc {
-                        n.arm_wave();
+                        n.arm_wave(wave_frames);
+                    }
+                }
+                // Closed-loop bitrate: apply the controller's target in
+                // place. A rung that can't move (MF partial coverage
+                // mid-heal) pins the target back so the controller never
+                // chases a knob wired to nothing.
+                let want_rate = rate.target.load(Ordering::Relaxed);
+                if want_rate != applied_rate && want_rate > 0 && !lossless {
+                    if enc.set_bitrate(want_rate) {
+                        tracing::info!(
+                            "{}: rate re-aimed {:.1} → {:.1} Mbps in place for {route_id}",
+                            enc.label(),
+                            applied_rate as f64 / 1e6,
+                            want_rate as f64 / 1e6,
+                        );
+                        applied_rate = want_rate;
+                    } else {
+                        rate.target.store(applied_rate, Ordering::Relaxed);
                     }
                 }
                 let idr_every = Duration::from_millis(idr_ms.load(Ordering::Relaxed));
@@ -3695,12 +3866,148 @@ pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 /// GDR lanes register their wave-restart flag here, keyed by route — the
 /// module-global seam between the encode lane and the feedback path,
 /// which meet nowhere else. Entries are lane-lifetime (RAII-removed).
+/// The value is the requested wave length in frames (0 = idle): the loss
+/// chooser writes 3 for a fast heal on a lossy spell or the smooth
+/// default on a one-off; the encode thread swaps it back to 0 as it arms.
 pub(crate) fn wave_flags(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicBool>>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicU32>>> {
     static FLAGS: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicBool>>>,
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicU32>>>,
     > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     &FLAGS
+}
+
+/// The steady-state wave length for `fps` — the same shape init
+/// configures: the refresh period spread over a fifth, floored at 3.
+pub(crate) fn default_wave_frames(fps: u32) -> u32 {
+    ((fps / 2).max(15) / 5).max(3)
+}
+
+/// Per-route rate state shared between the encode lane (which applies the
+/// target via in-place reconfigure and never restarts the stream), the
+/// feedback path (the AIMD controller below), and the mesh forwarder (the
+/// pacer's drain model) — the same module-global seam pattern as
+/// [`wave_flags`], and like it, entries are lane-lifetime (RAII-removed).
+pub(crate) struct RouteRate {
+    /// The current target (bps). The encode thread reads it every frame
+    /// and re-aims the rate controller when it moves; the mesh pacer
+    /// reads it to spread bursts at a rate the link is actually being
+    /// asked to carry.
+    pub target: AtomicU32,
+    /// The posture lane's full budget — where AIMD climbs back to.
+    pub ceiling: AtomicU32,
+    adapt: Mutex<RateAdaptState>,
+}
+
+#[derive(Default)]
+struct RateAdaptState {
+    bad: u32,
+    good: u32,
+    last_step: Option<Instant>,
+}
+
+pub(crate) fn route_rates(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<RouteRate>>> {
+    static RATES: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<RouteRate>>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    &RATES
+}
+
+/// Closed-loop bitrate: **on by default** (`ALLMYSTUFF_RATE_ADAPT=0`
+/// disables) — unlike the resolution auto-scale, a bitrate step is
+/// invisible (no mode change, no IDR, no size change), so the
+/// native-quality contract that keeps [`auto_adapt_enabled`] opt-in
+/// doesn't apply. Routes with a user-pinned bitrate are never touched.
+fn rate_adapt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let off = std::env::var("ALLMYSTUFF_RATE_ADAPT")
+            .map(|v| matches!(v.trim(), "0" | "off" | "false"))
+            .unwrap_or(false);
+        if off {
+            tracing::info!("ALLMYSTUFF_RATE_ADAPT=0 — closed-loop bitrate disabled");
+        }
+        !off
+    });
+    *ON
+}
+
+/// Consecutive struggling reports (~2 s apart) before a cut — one report
+/// can be a scheduler hiccup; two is a trend at this cadence.
+const RATE_BAD_STREAK: u32 = 2;
+/// Consecutive clean reports before a climb — slow up, mirroring the
+/// auto-adapt discipline (stepping up too eagerly re-breaks the viewer).
+const RATE_GOOD_STREAK: u32 = 5;
+/// Settle time after any step before the next move in either direction:
+/// the reconfigure and the viewer's queue need a beat to show up in the
+/// feedback before it's evidence about the new rate.
+const RATE_HOLD: Duration = Duration::from_secs(6);
+/// The floor AIMD never cuts through — the existing stream budget floor.
+const RATE_FLOOR: u32 = 8_000_000;
+
+/// One AIMD step from one feedback report: multiplicative down on
+/// congestion evidence, additive up on sustained health, `None` to hold.
+/// Pure — the unit tests drive it with synthetic reports.
+fn rate_adapt_step(
+    state: &mut RateAdaptState,
+    fb: &RecvFeedback,
+    target_fps: u32,
+    current: u32,
+    ceiling: u32,
+    now: Instant,
+) -> Option<u32> {
+    // Congestion evidence, most-direct first: the viewer's decode queue
+    // backing up, decode failures (loss), the arrival-rate estimate
+    // sagging below what we send, a sustained one-way-delay ramp, or the
+    // rendered cadence collapsing versus target.
+    let est_sagging = fb.est_kbps > 0 && (fb.est_kbps as u64 * 1000) < (current as u64 * 85 / 100);
+    let delay_ramping = fb.delay_trend_us_per_s > 20_000; // +20 ms of queue per second
+    let struggling = fb.queue_depth > 8
+        || fb.decode_fails > 0
+        || est_sagging
+        || delay_ramping
+        || (target_fps > 0 && fb.recv_fps > 0 && fb.recv_fps * 10 < target_fps * 7);
+    let held = state
+        .last_step
+        .is_some_and(|t| now.duration_since(t) < RATE_HOLD);
+    if struggling {
+        state.good = 0;
+        state.bad += 1;
+        if state.bad >= RATE_BAD_STREAK && !held {
+            // Cut toward the evidence: 0.7×, or straight to just under
+            // the measured arrival rate when the estimate is the witness
+            // (converges in one step instead of several blind ones).
+            let mut next = (current as u64 * 7 / 10) as u32;
+            if fb.est_kbps > 0 {
+                let est_bps = (fb.est_kbps as u64 * 1000 * 85 / 100) as u32;
+                next = next.min(est_bps);
+            }
+            let next = next.clamp(RATE_FLOOR, ceiling);
+            if next < current {
+                state.bad = 0;
+                state.last_step = Some(now);
+                return Some(next);
+            }
+        }
+        return None;
+    }
+    state.bad = 0;
+    if current >= ceiling {
+        state.good = 0;
+        return None;
+    }
+    state.good += 1;
+    if state.good >= RATE_GOOD_STREAK && !held {
+        // Additive climb: 8% of the ceiling per step — reaches full rate
+        // from half in ~6 clean cycles (~a minute) without overshooting.
+        let next = current
+            .saturating_add((ceiling / 12).max(500_000))
+            .min(ceiling);
+        state.good = 0;
+        state.last_step = Some(now);
+        return Some(next);
+    }
+    None
 }
 
 pub(crate) fn paced_slices_enabled() -> bool {
@@ -4407,8 +4714,107 @@ mod tests {
             recv_fps,
             decode_fails,
             queue_depth,
+            est_kbps: 0,
+            delay_trend_us_per_s: 0,
             at: Instant::now(),
         }
+    }
+
+    /// The AIMD contract: two congested reports cut multiplicatively
+    /// (jumping to just under a measured estimate when one exists), the
+    /// hold window damps oscillation, and recovery climbs additively
+    /// only after a sustained clean streak.
+    #[test]
+    fn rate_adapt_cuts_fast_climbs_slow_and_respects_the_estimate() {
+        let ceiling = 40_000_000u32;
+        let congested = RecvFeedback {
+            queue_depth: 12,
+            ..fb(60, 0, 12)
+        };
+        let mut st = RateAdaptState::default();
+        let t0 = Instant::now();
+        // One bad report is a hiccup, not a verdict.
+        assert_eq!(
+            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            None
+        );
+        // The second cuts ×0.7.
+        assert_eq!(
+            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            Some(28_000_000)
+        );
+        // Inside the hold window nothing moves, evidence or not.
+        assert_eq!(
+            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            None
+        );
+        assert_eq!(
+            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            None
+        );
+        // Past the hold, with a measured estimate as the witness, the cut
+        // lands just under it instead of feeling its way down in steps.
+        let est = RecvFeedback {
+            est_kbps: 10_000,
+            ..fb(60, 0, 12)
+        };
+        // The bad streak carried through the hold, so the first post-hold
+        // report with congestion evidence steps immediately.
+        let t1 = t0 + RATE_HOLD + Duration::from_secs(1);
+        let cut = rate_adapt_step(&mut st, &est, 60, 28_000_000, ceiling, t1)
+            .expect("estimate-guided cut");
+        assert_eq!(cut, 8_500_000, "85% of the measured 10 Mbps");
+        // Clean reports climb additively — and only after the streak.
+        let clean = fb(60, 0, 0);
+        let t2 = t1 + RATE_HOLD + Duration::from_secs(1);
+        let mut up = None;
+        for _ in 0..RATE_GOOD_STREAK {
+            up = rate_adapt_step(&mut st, &clean, 60, cut, ceiling, t2);
+        }
+        let up = up.expect("climb after the streak");
+        assert_eq!(up, cut + (ceiling / 12).max(500_000));
+        assert!(up < ceiling, "climb is additive, not a jump home");
+        // A delay ramp alone (queue growing before loss) counts as
+        // congestion evidence.
+        let ramping = RecvFeedback {
+            delay_trend_us_per_s: 30_000,
+            ..fb(60, 0, 0)
+        };
+        let mut st2 = RateAdaptState::default();
+        let t3 = t2 + RATE_HOLD + Duration::from_secs(1);
+        assert_eq!(
+            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            None
+        );
+        assert_eq!(
+            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            Some(28_000_000)
+        );
+    }
+
+    /// The wave chooser: a first loss heals with the smooth default; a
+    /// second within the spell window shortens the heal to 3 frames; the
+    /// flag write itself restarts an in-flight wave.
+    #[test]
+    fn wave_length_shortens_in_a_lossy_spell() {
+        let vb = VideoBridge::new();
+        let flag = std::sync::Arc::new(AtomicU32::new(0));
+        wave_flags()
+            .lock()
+            .insert("wave-spell-test".into(), flag.clone());
+        vb.route_wave_or_refresh("wave-spell-test");
+        assert_eq!(
+            flag.load(Ordering::SeqCst),
+            default_wave_frames(60),
+            "one-off loss keeps the smooth default"
+        );
+        vb.route_wave_or_refresh("wave-spell-test");
+        assert_eq!(
+            flag.load(Ordering::SeqCst),
+            3,
+            "a second loss inside the window shortens the heal"
+        );
+        wave_flags().lock().remove("wave-spell-test");
     }
 
     #[test]
@@ -4751,6 +5157,8 @@ mod tests {
                 recv_fps: 30,
                 decode_fails,
                 queue_depth,
+                est_kbps: 0,
+                delay_trend_us_per_s: 0,
                 at: Instant::now(),
             })
         };
@@ -4768,6 +5176,8 @@ mod tests {
             recv_fps: 30,
             decode_fails: 0,
             queue_depth: 0,
+            est_kbps: 0,
+            delay_trend_us_per_s: 0,
             at: Instant::now() - (FEEDBACK_FRESH + Duration::from_secs(1)),
         });
         assert_eq!(adaptive_idr_ms(stale), IDR_MS_TIGHT);
@@ -4777,11 +5187,11 @@ mod tests {
     fn receiver_feedback_is_recorded_latest_wins_and_clears_with_the_route() {
         let vb = VideoBridge::new();
         assert!(vb.latest_feedback("r1").is_none());
-        vb.note_feedback("r1", 28, 3, 1);
+        vb.note_feedback("r1", 28, 3, 1, 0, 0);
         let fb = vb.latest_feedback("r1").expect("recorded");
         assert_eq!((fb.recv_fps, fb.decode_fails, fb.queue_depth), (28, 3, 1));
         // A fresher report replaces the old one.
-        vb.note_feedback("r1", 30, 0, 0);
+        vb.note_feedback("r1", 30, 0, 0, 0, 0);
         assert_eq!(vb.latest_feedback("r1").map(|f| f.decode_fails), Some(0));
         // Tearing the route down drops its feedback (no unbounded growth).
         vb.stop("r1");

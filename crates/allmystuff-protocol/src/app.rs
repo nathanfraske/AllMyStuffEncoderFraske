@@ -918,6 +918,17 @@ pub enum RouteControl {
         /// wall. Old peers ignore it.
         #[serde(default)]
         lost_ts_us: Option<u64>,
+        /// The viewer's bandwidth estimate for this route's path (kbps;
+        /// 0 = none yet): arrival dispersion of the sender's own paced
+        /// chunk trains — what the closed-loop bitrate converges on.
+        /// Old peers ignore it; absent deserializes as 0.
+        #[serde(default)]
+        est_kbps: u32,
+        /// One-way-delay trend (µs of added delay per second, signed):
+        /// a sustained positive slope is a standing queue growing before
+        /// loss confirms it. Absent deserializes as 0 (flat/unknown).
+        #[serde(default)]
+        delay_trend_us_per_s: i32,
     },
     /// "Your inbound video for this route rides track lane N." The streaming
     /// (host) side tells the viewer which RTP track lane it pinned a
