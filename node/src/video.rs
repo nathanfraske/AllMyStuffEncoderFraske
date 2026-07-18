@@ -517,6 +517,13 @@ pub enum Posture {
     Balanced,
     Game,
     Studio,
+    /// Studio's top shelf: mathematically lossless HEVC (constQP-0,
+    /// transquant bypass) on the NVENC rung, decoded by the viewer's
+    /// NVDEC lane. No rate control exists in this posture — bandwidth is
+    /// content entropy (measured: ~0.1 Mbps idle · 65–95 Mbps desktop ·
+    /// Gbps-class on noise, which the in-lane guard catches). Falls soft
+    /// to lossy Studio wherever the HEVC rung can't open.
+    StudioLossless,
 }
 
 /// The wire name → posture parse, at the tune boundary. Unknown names
@@ -526,6 +533,7 @@ pub fn parse_posture(s: &str) -> Option<Posture> {
     match s {
         "game" => Some(Posture::Game),
         "studio" => Some(Posture::Studio),
+        "studio-lossless" => Some(Posture::StudioLossless),
         "balanced" => Some(Posture::Balanced),
         _ => None,
     }
@@ -2198,7 +2206,7 @@ fn run_gpu_lane(
     let (dw, dh) = lane.out_size;
     let bitrate = tuned_bitrate(tune, dw, dh, fps);
     let posture = tune.posture();
-    if posture == Posture::Studio && tune.link != LinkClass::Lan {
+    if matches!(posture, Posture::Studio | Posture::StudioLossless) && tune.link != LinkClass::Lan {
         tracing::info!(
             "studio mode for {route_id} on a {:?} link — honoring the viewer's ask at {:.0} Mbps (their wire to own)",
             tune.link,
@@ -2206,8 +2214,23 @@ fn run_gpu_lane(
         );
     }
     let game = posture == Posture::Game;
-    let studio = posture == Posture::Studio;
+    let lossless = posture == Posture::StudioLossless;
+    // The lossy-fallback opens (rung unavailable, noise guard) run as
+    // plain Studio — the posture's spirit with rate control back on.
+    let studio = posture == Posture::Studio || lossless;
     let mut enc = 'open: {
+        if lossless && nvenc_opt_in() {
+            // Studio·Lossless: the HEVC constQP-0 rung. Anything short of
+            // a clean open degrades to lossy Studio below — the viewer
+            // asked for fidelity, and 150 Mbps VBR is the honest next
+            // rung, not a torn-down route.
+            match crate::nvenc::NvencH264::open_lossless_hevc_on_device(&lane.device, dw, dh, fps) {
+                Ok(n) => break 'open GpuCodec::Nvenc(n),
+                Err(e) => tracing::warn!(
+                    "lossless HEVC rung unavailable for {route_id} ({e}); running lossy studio"
+                ),
+            }
+        }
         if nvenc_opt_in() {
             // The SDK rung first: same textures, direct session, the
             // game-mode levers (in game mode: GDR instead of IDR walls).
@@ -2231,6 +2254,16 @@ fn run_gpu_lane(
             None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
         }
     };
+    // Studio·Lossless noise guard: constQP-0 has no rate control, so
+    // content the codec can't predict (full-screen confetti, static)
+    // produces raw-sized frames at Gbps rates and ~2× encode latency.
+    // Sustained oversize — most of the last two seconds above ~half a
+    // byte per pixel (≈884 Mbps at 1440p60) — swaps the session to lossy
+    // Studio in place. One-way: flapping back and forth would look worse
+    // than either mode; the posture re-arms on the next retune.
+    let noise_frame_bytes = (dw as usize * dh as usize) / 2;
+    let mut noise_window: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
+    let mut noise_guard_armed = lossless;
     // GDR streams have no periodic-IDR cadence by design — the refresh
     // wave is the convergence mechanism; only explicit asks (viewer join,
     // quiesce rescue) force an IDR through.
@@ -2347,6 +2380,53 @@ fn run_gpu_lane(
                             }
                         } else {
                             units_ever = true;
+                        }
+                        if noise_guard_armed {
+                            let frame_bytes: usize =
+                                outcome.units.iter().map(|(d, _)| d.len()).sum();
+                            noise_window.push_back(frame_bytes > noise_frame_bytes);
+                            if noise_window.len() > 120 {
+                                noise_window.pop_front();
+                            }
+                            if noise_window.len() == 120
+                                && noise_window.iter().filter(|&&over| over).count() >= 90
+                            {
+                                noise_window.clear();
+                                noise_guard_armed = false;
+                                tracing::warn!(
+                                    "lossless noise guard for {route_id}: sustained \
+                                     incompressible content — swapping to lossy studio in place"
+                                );
+                                match crate::nvenc::NvencH264::open_on_device(
+                                    &lane.device,
+                                    dw,
+                                    dh,
+                                    fps,
+                                    bitrate,
+                                    false,
+                                    true,
+                                ) {
+                                    Ok(n) => {
+                                        // The codec morphs HEVC→H.264 on the
+                                        // wire; the viewer's bridge re-sniffs
+                                        // at the forced IDR and rebuilds its
+                                        // decoder — the same seam a posture
+                                        // retune crosses.
+                                        enc = GpuCodec::Nvenc(n);
+                                        refresh.store(true, Ordering::SeqCst);
+                                    }
+                                    Err(e) => {
+                                        // Couldn't degrade: keep streaming
+                                        // lossless (correct, just heavy) and
+                                        // let the window re-arm for another
+                                        // try.
+                                        tracing::warn!(
+                                            "noise-guard studio reopen failed ({e}); staying lossless"
+                                        );
+                                        noise_guard_armed = true;
+                                    }
+                                }
+                            }
                         }
                         let packets = packetize_units(
                             outcome.units,
@@ -3573,16 +3653,21 @@ pub(crate) fn paced_slices_enabled() -> bool {
 }
 
 /// Split one Annex-B access unit into paced chunks of at most `max_chunk`
-/// bytes, cutting **only** at slice-NAL boundaries (types 1 and 5) so
-/// every chunk is independently feedable to a decoder, and gluing any
-/// parameter-set/SEI run (SPS/PPS/AUD/SEI) to the slice that follows it
-/// — a chunk never strands a slice from its headers. Returns contiguous
-/// ranges that concatenate back to `data` byte-identically; a unit whose
-/// single slice exceeds the cap stays whole (slice granularity is the
-/// floor — the encoder-side slice cap is what makes real splits exist).
+/// bytes, cutting **only** at slice-NAL boundaries so every chunk is
+/// independently feedable to a decoder, and gluing any parameter-set/SEI
+/// run to the slice that follows it — a chunk never strands a slice from
+/// its headers. Speaks both codecs: an AU carrying HEVC parameter sets
+/// (VPS/SPS/PPS — byte values no H.264 key unit leads with) cuts at HEVC
+/// VCL NALs; anything else cuts at H.264 slice types 1/5, which for a
+/// paramless HEVC delta AU means "no cut" — correct, just unpaced, and
+/// the keyframe walls the pacer exists for always carry their parameter
+/// sets. Returns contiguous ranges that concatenate back to `data`
+/// byte-identically; a unit whose single slice exceeds the cap stays
+/// whole (slice granularity is the floor — the encoder-side slice count
+/// is what makes real splits exist).
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
     // Walk the start codes (00 00 01 and 00 00 00 01), recording each
-    // NAL's offset and type.
+    // NAL's offset and header byte.
     let mut nals: Vec<(usize, u8)> = Vec::new();
     let mut i = 0usize;
     while i + 3 <= data.len() {
@@ -3596,20 +3681,31 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
                 continue;
             };
             if hdr < data.len() {
-                nals.push((i, data[hdr] & 0x1f));
+                nals.push((i, data[hdr]));
             }
             i = hdr + 1;
         } else {
             i += 1;
         }
     }
+    // Exact parameter-set bytes (0x40/0x42/0x44 = VPS/SPS/PPS, layer 0)
+    // — a masked type test would also match 0x41, the H.264 referenced
+    // P-slice byte, and misread whole H.264 streams as HEVC.
+    let hevc = nals.iter().any(|&(_, b)| matches!(b, 0x40 | 0x42 | 0x44));
+    let is_slice = |b: u8| {
+        if hevc {
+            b & 0x80 == 0 && ((b >> 1) & 0x3F) <= 21 // any VCL NAL
+        } else {
+            matches!(b & 0x1F, 1 | 5)
+        }
+    };
     // One decodable unit per slice NAL, absorbing the non-slice run
     // before it; anything before the first slice belongs to the first
     // unit, anything after the last slice's data to the last.
     let mut unit_starts: Vec<usize> = Vec::new();
     let mut pending: Option<usize> = None;
-    for &(off, ty) in &nals {
-        if ty == 1 || ty == 5 {
+    for &(off, b) in &nals {
+        if is_slice(b) {
             unit_starts.push(pending.take().unwrap_or(off));
         } else if pending.is_none() {
             pending = Some(off);
@@ -3655,7 +3751,10 @@ fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
     //    (150 Mbps auto floor); the viewer's warning gates it, then the
     //    user owns the wire.
     let (floor, ceiling) = match tune.posture() {
-        Posture::Studio => (auto.max(150_000_000), 500_000_000),
+        // Lossless has no rate control — this number only steers the
+        // lossy-Studio fallback when the HEVC rung can't open (and the
+        // noise guard's landing spot), so it mirrors Studio.
+        Posture::Studio | Posture::StudioLossless => (auto.max(150_000_000), 500_000_000),
         Posture::Game => (auto, 200_000_000),
         Posture::Balanced => (auto, 80_000_000),
     };

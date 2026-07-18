@@ -222,6 +222,8 @@ struct Cuda {
     primary_ctx_release: unsafe extern "system" fn(i32) -> CuResult,
     ctx_set_current: unsafe extern "system" fn(CuContext) -> CuResult,
     memcpy_2d: unsafe extern "system" fn(*const CudaMemcpy2d) -> CuResult,
+    mem_host_alloc: unsafe extern "system" fn(*mut *mut c_void, usize, u32) -> CuResult,
+    mem_free_host: unsafe extern "system" fn(*mut c_void) -> CuResult,
 }
 
 /// The `nvcuvid.dll` subset.
@@ -264,6 +266,8 @@ fn tables() -> Result<&'static Tables, String> {
             primary_ctx_release: load_fn!(cuda_dll, "cuDevicePrimaryCtxRelease_v2", _),
             ctx_set_current: load_fn!(cuda_dll, "cuCtxSetCurrent", _),
             memcpy_2d: load_fn!(cuda_dll, "cuMemcpy2D_v2", _),
+            mem_host_alloc: load_fn!(cuda_dll, "cuMemHostAlloc", _),
+            mem_free_host: load_fn!(cuda_dll, "cuMemFreeHost", _),
         };
         let cuvid = Cuvid {
             create_parser: load_fn!(cuvid_dll, "cuvidCreateVideoParser", _),
@@ -310,6 +314,12 @@ struct State {
     /// Display-order pictures ready after the current parse call:
     /// `(picture_index, timestamp)`.
     ready: Vec<(i32, i64)>,
+    /// Page-locked staging for the device→host copy — DMA lands here at
+    /// full PCIe rate (a pageable destination forces the driver through
+    /// an internal bounce buffer), then one memcpy fills the caller's
+    /// `Vec`. Allocated at sequence time, freed in `Drop`.
+    pinned: *mut u8,
+    pinned_len: usize,
     error: Option<String>,
 }
 
@@ -394,6 +404,17 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
         state.error = Some(format!("cuvidCreateDecoder: {status}"));
         return 0;
     }
+    let need = (state.display_width as usize) * (state.display_height as usize) * 3 / 2;
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if (state.tables.cuda.mem_host_alloc)(&mut p, need, 0) == CUDA_SUCCESS {
+        state.pinned = p as *mut u8;
+        state.pinned_len = need;
+    } else {
+        // Pinned staging is an optimization, not a dependency — the copy
+        // path falls back to the pageable destination.
+        state.pinned = std::ptr::null_mut();
+        state.pinned_len = 0;
+    }
     surfaces as i32
 }
 
@@ -450,6 +471,8 @@ impl NvdecHevc {
                 display_width: 0,
                 display_height: 0,
                 ready: Vec::new(),
+                pinned: std::ptr::null_mut(),
+                pinned_len: 0,
                 error: None,
             });
             let mut params: ParserParams = std::mem::zeroed();
@@ -533,7 +556,16 @@ impl NvdecHevc {
         if status != CUDA_SUCCESS {
             return Err(format!("cuvidMapVideoFrame64: {status}"));
         }
-        let mut nv12 = vec![0u8; (w as usize) * (h as usize) * 3 / 2];
+        let need = (w as usize) * (h as usize) * 3 / 2;
+        let mut nv12 = vec![0u8; need];
+        // DMA into the page-locked staging when we have it (full-rate
+        // transfer), one memcpy out; else straight into the Vec.
+        let staged = !self.state.pinned.is_null() && self.state.pinned_len >= need;
+        let dst_base = if staged {
+            self.state.pinned
+        } else {
+            nv12.as_mut_ptr()
+        };
         let copy = |src_dev: u64, dst: *mut u8, rows: usize| -> CuResult {
             let desc = CudaMemcpy2d {
                 src_x_in_bytes: 0,
@@ -557,10 +589,10 @@ impl NvdecHevc {
         };
         // NV12 in the mapped surface: luma plane, then interleaved chroma
         // at `pitch * target_height` (the create-info target height).
-        let luma = copy(dptr, nv12.as_mut_ptr(), h as usize);
+        let luma = copy(dptr, dst_base, h as usize);
         let chroma = copy(
             dptr + (pitch as u64) * (surface_h as u64),
-            nv12.as_mut_ptr().add((w as usize) * (h as usize)),
+            unsafe { dst_base.add((w as usize) * (h as usize)) },
             (h as usize) / 2,
         );
         let status = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
@@ -569,6 +601,11 @@ impl NvdecHevc {
         }
         if status != CUDA_SUCCESS {
             return Err(format!("cuvidUnmapVideoFrame64: {status}"));
+        }
+        if staged {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.state.pinned, nv12.as_mut_ptr(), need);
+            }
         }
         Ok(NvFrame {
             width: w,
@@ -589,30 +626,82 @@ impl Drop for NvdecHevc {
             if !self.state.decoder.is_null() {
                 let _ = (self.tables.cuvid.destroy_decoder)(self.state.decoder);
             }
+            if !self.state.pinned.is_null() {
+                let _ = (self.tables.cuda.mem_free_host)(self.state.pinned as *mut c_void);
+            }
             let _ = (self.tables.cuda.primary_ctx_release)(self.device);
         }
     }
 }
 
 /// NV12 → RGBA, BT.709 limited range — the colorimetry the capture lane's
-/// VideoProcessor conversion feeds the encoder for HD content. Scalar
-/// integer math; ~2–5 ms at 1440p, on par with the openh264 lane's own
-/// YUV→RGBA step.
+/// VideoProcessor conversion feeds the encoder for HD content.
+///
+/// Shaped for the decode thread's frame budget: each 2×2 quad shares one
+/// (U,V) pair, so the three chroma terms are computed once and applied to
+/// four luma samples, and every row is a bounds-checked-once slice so the
+/// hot loop stays branch-free. `w` and `h` must be even (NV12 guarantees
+/// it; the decoder's display crop keeps it so).
 pub fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut [u8]) {
-    let (luma, chroma) = nv12.split_at(w * h);
-    for y in 0..h {
-        let crow = &chroma[(y / 2) * w..];
-        for x in 0..w {
-            let yy = 298 * (i32::from(luma[y * w + x]) - 16);
-            let u = i32::from(crow[x & !1]) - 128;
-            let v = i32::from(crow[(x & !1) | 1]) - 128;
-            let idx = (y * w + x) * 4;
-            out[idx] = ((yy + 459 * v) >> 8).clamp(0, 255) as u8;
-            out[idx + 1] = ((yy - 55 * u - 136 * v) >> 8).clamp(0, 255) as u8;
-            out[idx + 2] = ((yy + 541 * u) >> 8).clamp(0, 255) as u8;
-            out[idx + 3] = 255;
+    #[inline(always)]
+    fn px(y: u8, tr: i32, tg: i32, tb: i32, o: &mut [u8]) {
+        let yy = 298 * (i32::from(y) - 16);
+        o[0] = ((yy + tr) >> 8).clamp(0, 255) as u8;
+        o[1] = ((yy + tg) >> 8).clamp(0, 255) as u8;
+        o[2] = ((yy + tb) >> 8).clamp(0, 255) as u8;
+        o[3] = 255;
+    }
+    fn band(
+        luma: &[u8],
+        chroma: &[u8],
+        w: usize,
+        yp_range: std::ops::Range<usize>,
+        out: &mut [u8],
+    ) {
+        let yp0 = yp_range.start;
+        for yp in yp_range {
+            let crow = &chroma[yp * w..][..w];
+            let l0 = &luma[(yp * 2) * w..][..w];
+            let l1 = &luma[(yp * 2 + 1) * w..][..w];
+            let (o0, rest) = out[(yp - yp0) * 2 * w * 4..].split_at_mut(w * 4);
+            let o1 = &mut rest[..w * 4];
+            for xp in 0..w / 2 {
+                let u = i32::from(crow[xp * 2]) - 128;
+                let v = i32::from(crow[xp * 2 + 1]) - 128;
+                let (tr, tg, tb) = (459 * v, -55 * u - 136 * v, 541 * u);
+                let x0 = xp * 8;
+                px(l0[xp * 2], tr, tg, tb, &mut o0[x0..x0 + 4]);
+                px(l0[xp * 2 + 1], tr, tg, tb, &mut o0[x0 + 4..x0 + 8]);
+                px(l1[xp * 2], tr, tg, tb, &mut o1[x0..x0 + 4]);
+                px(l1[xp * 2 + 1], tr, tg, tb, &mut o1[x0 + 4..x0 + 8]);
+            }
         }
     }
+    let (luma, chroma) = nv12.split_at(w * h);
+    let quads = h / 2;
+    // Band the work across a few scoped threads at real frame sizes —
+    // identical output to the single-thread path (bands split at chroma
+    // rows), ~3–4× on the wall clock for the cost of four short-lived
+    // spawns per frame. Small frames stay single-threaded.
+    let workers = if quads >= 128 { 4 } else { 1 };
+    if workers == 1 {
+        band(luma, chroma, w, 0..quads, out);
+        return;
+    }
+    let per = quads.div_ceil(workers);
+    std::thread::scope(|s| {
+        let mut rest = out;
+        for k in 0..workers {
+            let range = (k * per).min(quads)..((k + 1) * per).min(quads);
+            if range.is_empty() {
+                break;
+            }
+            let bytes = (range.end - range.start) * 2 * w * 4;
+            let (mine, tail) = rest.split_at_mut(bytes);
+            rest = tail;
+            s.spawn(move || band(luma, chroma, w, range, mine));
+        }
+    });
 }
 
 #[cfg(test)]

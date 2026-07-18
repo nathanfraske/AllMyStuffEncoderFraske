@@ -85,6 +85,7 @@ pub enum Posture {
     Balanced,
     Game,
     Studio,
+    StudioLossless,
 }
 
 /// Mirror of the real module's wire-name parse.
@@ -92,9 +93,91 @@ pub fn parse_posture(s: &str) -> Option<Posture> {
     match s {
         "game" => Some(Posture::Game),
         "studio" => Some(Posture::Studio),
+        "studio-lossless" => Some(Posture::StudioLossless),
         "balanced" => Some(Posture::Balanced),
         _ => None,
     }
+}
+
+/// Mirror of the real module's pacer grain (the send path in `mesh.rs`
+/// is compiled on capture-less builds too — a viewer node still forwards
+/// what it's asked to).
+pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
+
+/// Mirror of the real module's pacer dial — same env, same default-on.
+pub(crate) fn paced_slices_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("ALLMYSTUFF_PACED_SLICES")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
+            .unwrap_or(false)
+    });
+    *ON
+}
+
+/// Mirror of the real module's paced splitter — pure byte logic, kept
+/// identical (both codecs, glue rules, byte-exact concatenation).
+pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
+    let mut nals: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let hdr = if data[i + 2] == 1 {
+                i + 3
+            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if hdr < data.len() {
+                nals.push((i, data[hdr]));
+            }
+            i = hdr + 1;
+        } else {
+            i += 1;
+        }
+    }
+    // Exact parameter-set bytes — see the real module's comment: a masked
+    // type test collides with H.264's 0x41 referenced P slice.
+    let hevc = nals.iter().any(|&(_, b)| matches!(b, 0x40 | 0x42 | 0x44));
+    let is_slice = |b: u8| {
+        if hevc {
+            b & 0x80 == 0 && ((b >> 1) & 0x3F) <= 21
+        } else {
+            matches!(b & 0x1F, 1 | 5)
+        }
+    };
+    let mut unit_starts: Vec<usize> = Vec::new();
+    let mut pending: Option<usize> = None;
+    for &(off, b) in &nals {
+        if is_slice(b) {
+            unit_starts.push(pending.take().unwrap_or(off));
+        } else if pending.is_none() {
+            pending = Some(off);
+        }
+    }
+    if unit_starts.len() < 2 {
+        return std::iter::once(0..data.len()).collect();
+    }
+    unit_starts[0] = 0;
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_end = 0usize;
+    for (k, &s) in unit_starts.iter().enumerate() {
+        let e = unit_starts.get(k + 1).copied().unwrap_or(data.len());
+        if chunk_end > chunk_start && e - chunk_start > max_chunk {
+            out.push(chunk_start..chunk_end);
+            chunk_start = s;
+        }
+        chunk_end = e;
+    }
+    out.push(chunk_start..chunk_end);
+    out
 }
 
 /// The host side of a capture-status report: state + optional OS error text.

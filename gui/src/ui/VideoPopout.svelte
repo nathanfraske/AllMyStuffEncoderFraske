@@ -177,37 +177,54 @@
   // Res/FPS/Rate pills stay as expert overrides on top. The legacy
   // `game` bool rides along so hosts that predate the tri-state still
   // honor the Game step.
-  const MODES = ["balanced", "game", "studio"] as const;
-  const MODE_LABEL = { balanced: "Balanced", game: "Game", studio: "Studio" } as const;
+  const MODES = ["balanced", "game", "studio", "studio-ll"] as const;
+  const MODE_LABEL = {
+    balanced: "Balanced",
+    game: "Game",
+    studio: "Studio",
+    "studio-ll": "Studio · LL",
+  } as const;
+  type ModeKey = (typeof MODES)[number];
+  // "studio-ll" is the pill's name for the wire posture "studio-lossless"
+  // (mathematically lossless HEVC — needs NVIDIA on both ends; the
+  // streamer falls soft to regular Studio anywhere it can't run).
+  const modeKey = (): ModeKey =>
+    tune.mode === "studio-lossless"
+      ? "studio-ll"
+      : ((tune.mode as ModeKey | undefined) ?? (tune.game ? "game" : "balanced"));
   // Studio spends a lot of bandwidth — one confirmation the first time,
-  // with a persisted "don't warn again". Only the transition INTO studio
-  // gates; cycling past it later never re-warns.
+  // with a persisted "don't warn again" shared by both Studio flavors.
+  // Only the transition INTO studio gates; cycling past never re-warns.
   const STUDIO_ACK_KEY = "ams.studioBandwidthAck";
-  let studioPrompt = $state(false);
-  function applyMode(next: (typeof MODES)[number]) {
+  let studioPrompt = $state<ModeKey | null>(null);
+  function applyMode(next: ModeKey) {
     tune = {
       ...tune,
-      mode: next === "balanced" ? undefined : next,
+      mode:
+        next === "balanced" ? undefined : next === "studio-ll" ? "studio-lossless" : next,
       game: next === "game" ? true : undefined,
     };
     openPill = null;
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
   function cycleMode() {
-    const cur = tune.mode ?? (tune.game ? "game" : "balanced");
-    const next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
-    if (next === "studio" && localStorage.getItem(STUDIO_ACK_KEY) !== "1") {
-      studioPrompt = true;
+    const next = MODES[(MODES.indexOf(modeKey()) + 1) % MODES.length];
+    if (
+      (next === "studio" || next === "studio-ll") &&
+      localStorage.getItem(STUDIO_ACK_KEY) !== "1"
+    ) {
+      studioPrompt = next;
       return;
     }
     applyMode(next);
   }
   function confirmStudio(dontAskAgain: boolean) {
     if (dontAskAgain) localStorage.setItem(STUDIO_ACK_KEY, "1");
-    studioPrompt = false;
-    applyMode("studio");
+    const next = studioPrompt ?? "studio";
+    studioPrompt = null;
+    applyMode(next);
   }
-  const modeLabel = () => MODE_LABEL[tune.mode ?? (tune.game ? "game" : "balanced")];
+  const modeLabel = () => MODE_LABEL[modeKey()];
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -620,8 +637,8 @@
       class="studio-scrim"
       role="presentation"
       onpointerdown={(e) => e.stopPropagation()}
-      onclick={() => (studioPrompt = false)}
-      onkeydown={(e) => e.key === "Escape" && (studioPrompt = false)}
+      onclick={() => (studioPrompt = null)}
+      onkeydown={(e) => e.key === "Escape" && (studioPrompt = null)}
     >
       <div
         class="studio-dialog"
@@ -631,7 +648,18 @@
         tabindex="-1"
         onclick={(e) => e.stopPropagation()}
       >
-        <h3 id="studio-title">Turn on Studio mode?</h3>
+        <h3 id="studio-title">
+          {studioPrompt === "studio-ll" ? "Turn on Studio · Lossless?" : "Turn on Studio mode?"}
+        </h3>
+        {#if studioPrompt === "studio-ll"}
+          <p>
+            Lossless sends <strong>every pixel exactly</strong> over HEVC —
+            bandwidth follows what's on screen: near-zero when idle, tens of
+            Mbps for desktop work, and it can spike far higher on busy video.
+            It needs NVIDIA hardware on both machines; anywhere it can't run,
+            the stream continues as regular Studio automatically.
+          </p>
+        {/if}
         <p>
           Studio streams at maximum fidelity and can use <strong>150 Mbps
           and up</strong> — it's built for a fast local network. It runs
@@ -639,14 +667,14 @@
           expect stutter until you lower the Rate.
         </p>
         <div class="studio-actions">
-          <button class="studio-btn ghost" onclick={() => (studioPrompt = false)}
+          <button class="studio-btn ghost" onclick={() => (studioPrompt = null)}
             >Cancel</button
           >
           <button class="studio-btn ghost" onclick={() => confirmStudio(true)}
             >Don't ask again</button
           >
           <button class="studio-btn primary" onclick={() => confirmStudio(false)}
-            >Use Studio</button
+            >{studioPrompt === "studio-ll" ? "Use Lossless" : "Use Studio"}</button
           >
         </div>
       </div>

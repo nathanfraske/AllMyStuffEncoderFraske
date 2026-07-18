@@ -64,11 +64,14 @@ fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
         }
         i += 1;
     };
-    if b & 0x80 != 0 {
-        return None;
-    }
-    match (b >> 1) & 0x3F {
-        32 | 33 | 34 => Some(AuCodec::Hevc), // VPS · SPS · PPS
+    // Exact bytes, not masked types: HEVC VPS/SPS/PPS at layer 0 are
+    // precisely 0x40/0x42/0x44. A masked `(b>>1)&0x3F == 32` test would
+    // also catch 0x41 — an H.264 P slice with nal_ref_idc 2, the byte
+    // most delta AUs lead with — and flip a healthy H.264 stream's
+    // decoder on every frame. (Caught in review; the byte-exact match is
+    // collision-free because H.264 types 0/2/4 never lead an AU.)
+    match b {
+        0x40 | 0x42 | 0x44 => Some(AuCodec::Hevc), // VPS · SPS · PPS
         _ => match b & 0x1F {
             5 | 7 | 8 => Some(AuCodec::H264), // IDR · SPS · PPS
             _ => None,

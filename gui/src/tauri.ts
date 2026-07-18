@@ -233,8 +233,10 @@ export interface StreamTune {
   /** The stream posture by name. Balanced favors stability and quality;
    *  Game favors latency and instant recovery; Studio is the LAN
    *  fidelity mode — a high-bitrate quality-first encode for links with
-   *  bandwidth to spend (degrades to Balanced off-LAN, host-side). */
-  mode?: "balanced" | "game" | "studio";
+   *  bandwidth to spend; Studio-Lossless is its top shelf — bit-exact
+   *  HEVC on NVIDIA hardware, falling soft to Studio anywhere the rung
+   *  can't run (old hosts read it as no named ask). */
+  mode?: "balanced" | "game" | "studio" | "studio-lossless";
 }
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
