@@ -177,6 +177,9 @@
   ];
   const FPS_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "144", value: 144 },
+    { label: "120", value: 120 },
+    { label: "90", value: 90 },
     { label: "60", value: 60 },
     { label: "30", value: 30 },
     { label: "24", value: 24 },

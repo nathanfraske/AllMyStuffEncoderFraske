@@ -141,6 +141,20 @@
   // updateCrosshair) since `virt` isn't reactive state.
   let crosshairEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
+  // A monitor/input switch in progress: the old picture stays on the
+  // (still-mounted) canvas, dimmed under a "Switching…" chip, instead of
+  // flashing to the placeholder and back — the switch reads as a
+  // crossfade, not a teardown. Cleared by the first fresh frame; a 5 s
+  // timeout falls back to the honest placeholder (host status text) if
+  // the new stream never comes. Input stays gated on hasFrame the whole
+  // time, so pointer mapping can never land on the stale picture.
+  let switching = $state(false);
+  let switchingTimer: ReturnType<typeof setTimeout> | undefined;
+  function armSwitching() {
+    switching = true;
+    clearTimeout(switchingTimer);
+    switchingTimer = setTimeout(() => (switching = false), 5000);
+  }
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
   // stalls after one. Null = no condition reported (or it cleared).
@@ -204,6 +218,9 @@
   ];
   const FPS_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "144", value: 144 },
+    { label: "120", value: 120 },
+    { label: "90", value: 90 },
     { label: "60", value: 60 },
     { label: "30", value: 30 },
     { label: "24", value: 24 },
@@ -670,6 +687,13 @@
     // Reading this here makes the ladder's last rung re-run the effect:
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
+    // A route CHANGE (screen tab, camera tab, or the teardown between
+    // them) with a picture on the glass = a switch: hold the old frame
+    // dimmed instead of flashing the placeholder. A decode-mode re-wire
+    // on the SAME route keeps today's behavior.
+    if (hasFrame && route !== lastRoute) {
+      untrack(armSwitching);
+    }
     hasFrame = false;
     // Clear the previous stream's frame dimensions too: normPoint letterboxes
     // against frameW/frameH, so leaving them live would map pointer events onto
@@ -840,6 +864,11 @@
       frameW = w;
       frameH = h;
       hasFrame = true;
+      // The fresh picture ends any switch crossfade.
+      if (switching) {
+        switching = false;
+        clearTimeout(switchingTimer);
+      }
       frameCount += 1;
     };
 
@@ -1767,11 +1796,15 @@
             </button>
           </div>
         {:else}
-          {#if app.consoleVideoLive}
+          {#if app.consoleVideoLive || switching}
+            <!-- Kept mounted through a switch: the canvas retains the old
+                 picture (dimmed, under the chip) so changing monitors
+                 reads as a crossfade instead of a placeholder flash. -->
             <canvas
               bind:this={canvasEl}
               class="live"
-              class:waiting={!hasFrame}
+              class:waiting={!hasFrame && !switching}
+              class:switching={!hasFrame && switching}
               style:transform={view.scale !== 1 || view.x !== 0 || view.y !== 0
                 ? `translate(${view.x}px, ${view.y}px) scale(${view.scale})`
                 : undefined}
@@ -1779,6 +1812,11 @@
                 node,
               )}"
             ></canvas>
+          {/if}
+          {#if switching && !hasFrame}
+            <div class="switching-chip" aria-live="polite">
+              Switching view…{hostStatus ? ` (${hostStatusText(hostStatus)})` : ""}
+            </div>
           {/if}
           {#if hasFrame && stagePointerActive && mobileShell}
             <!-- Thin aiming crosshair at the commanded position (crosshairEl):
@@ -2380,6 +2418,26 @@
   .live.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* A switch in progress: the retained previous picture, dimmed under
+     the switching chip. Input never maps onto it (hasFrame gates). */
+  .live.switching {
+    opacity: 0.45;
+    filter: saturate(0.55);
+    transition: opacity 160ms ease;
+  }
+  .switching-chip {
+    position: absolute;
+    top: 0.8rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    color: #f0ecff;
+    border-radius: var(--r-pill);
+    padding: 0.35rem 0.9rem;
+    font-size: 0.8rem;
+    z-index: 3;
   }
   /* The aiming crosshair. Absolutely placed within the stage (never
      position:fixed — a windowed console's own transform would reparent that),

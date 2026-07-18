@@ -391,7 +391,7 @@ pub(crate) fn game_mode() -> bool {
 pub(crate) fn target_fps_for(link: LinkClass, game: bool) -> u32 {
     static FPS: std::sync::LazyLock<Option<u32>> =
         std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
-    FPS.unwrap_or(auto_fps(link, game)).clamp(1, 120)
+    FPS.unwrap_or(auto_fps(link, game)).clamp(1, 240)
 }
 
 /// The automatic cadence: 60 on a LAN — this is a Parsec-tier 4K60 stream;
@@ -604,7 +604,7 @@ impl Tune {
     fn fps(&self) -> u32 {
         self.fps
             .unwrap_or_else(|| target_fps_for(self.link, self.game()))
-            .clamp(1, 120)
+            .clamp(1, 240)
     }
     fn h264_edge(&self) -> u32 {
         self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
