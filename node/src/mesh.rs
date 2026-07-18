@@ -466,7 +466,8 @@ struct State {
     profile: Option<NodeProfile>,
 }
 
-/// M2 — the pacer's requested-vs-actual gap ledger (a minute at a time).
+/// M2 — the pacer's requested-vs-actual gap ledger (a minute at a time),
+/// plus M1's daemon-write span (the pipe await per chunk).
 #[derive(Default)]
 struct PaceGapStats {
     n: u64,
@@ -474,6 +475,8 @@ struct PaceGapStats {
     act_us: u64,
     worst_over_us: u64,
     over_1ms: u64,
+    write_us: u64,
+    writes: u64,
     last_log: Option<Instant>,
 }
 
@@ -832,11 +835,18 @@ impl Mesh {
         let budget_each = std::time::Duration::from_millis(budget_ms) / (chunks.len() as u32 - 1);
         let last = chunks.len() - 1;
         let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(last);
+        // M1's pace+write split: gap time is the ledger above; this is
+        // the daemon-pipe await itself — if the daemon ever backpressures
+        // (wedged reader, saturated socket), it shows here first.
+        let (mut write_us, mut writes) = (0u64, 0u64);
         for (i, range) in chunks.into_iter().enumerate() {
             let dur = if i == last { duration_us } else { 0 };
             let sent_bytes = range.len();
+            let tw = Instant::now();
             self.send_video_track(peer, lane, data[range].to_vec(), dur)
                 .await?;
+            write_us += tw.elapsed().as_micros() as u64;
+            writes += 1;
             if i != last {
                 let drain_us =
                     (sent_bytes as u64 * 8_000_000 / drain_bps.max(1)).clamp(100, gap_cap_us);
@@ -846,7 +856,7 @@ impl Mesh {
                 ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
             }
         }
-        self.note_pace_gaps(&ledger);
+        self.note_pace_gaps(&ledger, write_us, writes);
         Ok(())
     }
 
@@ -951,10 +961,11 @@ impl Mesh {
         (st.est_kbps as u32, Self::owd_trend_us_per_s(&st.owd))
     }
 
-    /// Fold one AU's gap measurements into the minute ledger and emit the
-    /// `pace gaps` line when it's due — M2's honesty check on the pacer.
-    fn note_pace_gaps(&self, ledger: &[(u64, u64)]) {
-        if ledger.is_empty() {
+    /// Fold one AU's gap + daemon-write measurements into the minute
+    /// ledger and emit the `pace gaps` line when it's due — M2's honesty
+    /// check on the pacer plus M1's pace/write split.
+    fn note_pace_gaps(&self, ledger: &[(u64, u64)], write_us: u64, writes: u64) {
+        if ledger.is_empty() && writes == 0 {
             return;
         }
         let mut g = self.pace_gaps.lock();
@@ -968,18 +979,21 @@ impl Mesh {
                 g.over_1ms += 1;
             }
         }
+        g.write_us += write_us;
+        g.writes += writes;
         let due = g
             .last_log
             .map(|t| t.elapsed() >= std::time::Duration::from_secs(60))
             .unwrap_or(true);
         if due && g.n > 0 {
             tracing::info!(
-                "pace gaps: {} gaps · requested avg {} µs → actual avg {} µs · worst +{:.1} ms · >1 ms err {:.2}%",
+                "pace gaps: {} gaps · requested avg {} µs → actual avg {} µs · worst +{:.1} ms · >1 ms err {:.2}% · daemon write avg {} µs/chunk",
                 g.n,
                 g.req_us / g.n,
                 g.act_us / g.n,
                 g.worst_over_us as f64 / 1000.0,
                 g.over_1ms as f64 * 100.0 / g.n as f64,
+                g.write_us / g.writes.max(1),
             );
             *g = PaceGapStats {
                 last_log: Some(std::time::Instant::now()),

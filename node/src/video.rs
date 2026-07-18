@@ -133,6 +133,11 @@ pub struct StreamStats {
     /// with a 40 ms p95 *is* the stutter the viewer feels.
     scale_ms: Vec<f32>,
     encode_ms: Vec<f32>,
+    /// M1 capture-age samples (ms): compositor present → encode start —
+    /// the pixels' staleness before the encoder ever saw them (channel
+    /// wait and freshest-wins displacement included). GPU lane only;
+    /// empty elsewhere and the line omits the span.
+    age_ms: Vec<f32>,
     out_w: u32,
     out_h: u32,
 }
@@ -155,9 +160,16 @@ impl StreamStats {
             encode: Duration::ZERO,
             scale_ms: Vec::new(),
             encode_ms: Vec::new(),
+            age_ms: Vec::new(),
             out_w: 0,
             out_h: 0,
         }
+    }
+
+    /// Record one frame's capture age (present → encode start), M1's
+    /// first span.
+    fn add_age(&mut self, d: Duration) {
+        self.age_ms.push(d.as_secs_f32() * 1000.0);
     }
 
     /// Record one conversion's cost: the total feeds the window average,
@@ -207,8 +219,16 @@ impl StreamStats {
         // before RTP overhead).
         let raw_mbps =
             self.sent as f64 * self.out_w as f64 * self.out_h as f64 * 1.5 * 8.0 / secs / 1e6;
+        // M1's first span, when the lane carries it: how old the pixels
+        // already were at encode start.
+        let age = if self.age_ms.is_empty() {
+            String::new()
+        } else {
+            let avg = self.age_ms.iter().sum::<f32>() / self.age_ms.len() as f32;
+            format!(" · age {avg:.1}ms (p95 {:.1})", Self::p95(&mut self.age_ms))
+        };
         let line = format!(
-            "video out {}: {:.1} fps {} {}×{} · raw {:.0} Mbps → wire {:.1} Mbps · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
+            "video out {}: {:.1} fps {} {}×{} · raw {:.0} Mbps → wire {:.1} Mbps{age} · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
@@ -237,6 +257,7 @@ impl StreamStats {
         self.encode = Duration::ZERO;
         self.scale_ms.clear();
         self.encode_ms.clear();
+        self.age_ms.clear();
     }
 }
 
@@ -2552,6 +2573,10 @@ fn run_gpu_lane(
                 refines_left = 0;
                 refine_at = None;
                 stats.add_scale(frame.spent);
+                // M1: how stale the pixels are as encoding begins.
+                if let Some(presented) = frame.presented {
+                    stats.add_age(presented.elapsed());
+                }
                 (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
                 let wave_frames = wave.swap(0, Ordering::SeqCst);

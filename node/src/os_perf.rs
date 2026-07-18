@@ -234,9 +234,69 @@ fn mmcss_join() {
     }
 }
 
+/// Raise this process's WDDM GPU-scheduling class to High — the queue
+/// our per-frame `VideoProcessorBlt` and encode submits ride, which a
+/// foreground game can otherwise flood (zero effect uncontended;
+/// ms-class under a saturated 3D engine — the telemetry line's
+/// "3d 99%" signature). **Opt-in** (`ALLMYSTUFF_GPU_SCHED=1`) like
+/// MMCSS: on a host that IS the game box, raising our class taxes the
+/// game's own submits, and that trade belongs to the operator. Realtime
+/// needs privilege and starves compositors — deliberately not offered.
+/// Semi-documented gdi32 export, runtime-loaded, best-effort like every
+/// lever in this file.
+fn raise_gpu_scheduling_class() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let on = std::env::var("ALLMYSTUFF_GPU_SCHED").is_ok_and(|v| !v.is_empty() && v != "0");
+            if !on {
+                return;
+            }
+            type SetClass =
+                unsafe extern "system" fn(windows_sys::Win32::Foundation::HANDLE, i32) -> i32;
+            let set: Option<SetClass> = unsafe {
+                use windows::core::PCSTR;
+                use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+                LoadLibraryA(PCSTR(c"gdi32.dll".as_ptr() as *const u8))
+                    .ok()
+                    .and_then(|dll| {
+                        GetProcAddress(
+                            dll,
+                            PCSTR(c"D3DKMTSetProcessSchedulingPriorityClass".as_ptr() as *const u8),
+                        )
+                    })
+                    .map(|p| {
+                        std::mem::transmute::<unsafe extern "system" fn() -> isize, SetClass>(p)
+                    })
+            };
+            let Some(set) = set else {
+                tracing::debug!("D3DKMTSetProcessSchedulingPriorityClass unavailable");
+                return;
+            };
+            // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH = 4.
+            let status = unsafe {
+                set(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    4,
+                )
+            };
+            tracing::info!(
+                "ALLMYSTUFF_GPU_SCHED on: WDDM scheduling class High {}",
+                if status == 0 {
+                    "armed"
+                } else {
+                    "refused (NTSTATUS != 0)"
+                }
+            );
+        });
+    }
+}
+
 pub(crate) fn boost_media_thread() {
     opt_out_process_throttling();
     mmcss_join();
+    raise_gpu_scheduling_class();
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;

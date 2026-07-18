@@ -672,6 +672,28 @@ mod gpu_lane {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 
+    /// Map a QPC stamp (DXGI's `LastPresentTime`) onto the monotonic
+    /// clock: age = (now_qpc − stamp)/frequency, subtracted from a
+    /// paired `Instant::now()`. Windows' `Instant` IS QPC underneath, so
+    /// the pairing error is the nanoseconds between the two reads.
+    /// Degenerate stamps (future/zero frequency) clamp to "now".
+    fn qpc_to_instant(stamp: i64) -> Instant {
+        use windows_sys::Win32::System::Performance::{
+            QueryPerformanceCounter, QueryPerformanceFrequency,
+        };
+        let now = Instant::now();
+        let (mut qpc_now, mut freq) = (0i64, 0i64);
+        unsafe {
+            QueryPerformanceCounter(&mut qpc_now);
+            QueryPerformanceFrequency(&mut freq);
+        }
+        if freq <= 0 || qpc_now <= stamp {
+            return now;
+        }
+        let age_ns = (qpc_now - stamp) as u128 * 1_000_000_000 / freq as u128;
+        now - Duration::from_nanos(age_ns.min(u64::MAX as u128) as u64)
+    }
+
     /// One GPU-lane frame: a checked-out NV12 ring texture the encoder
     /// reads in place. `slot` rides back on [`GpuLane::release`] once
     /// nothing downstream can still read the texture.
@@ -685,6 +707,14 @@ mod gpu_lane {
         /// queue + cursor patch + blt queue) — the lane's analog of the
         /// CPU lane's convert column.
         pub spent: Duration,
+        /// When the compositor PRESENTED the desktop pixels this frame
+        /// carries (`LastPresentTime`, mapped onto the monotonic clock at
+        /// acquire) — the anchor of the M1 capture-age span: encode
+        /// start minus this is how stale the pixels already were before
+        /// the encoder ever saw them (queue wait + freshest-wins
+        /// displacement included). `None` only for cursor-only re-emits
+        /// before the first clean desktop.
+        pub presented: Option<Instant>,
     }
 
     // SAFETY: the texture lives on a multithread-protected device (see
@@ -771,6 +801,7 @@ mod gpu_lane {
             ptr_y: 0,
             ptr_visible: false,
             have_clean: false,
+            presented: None,
             last_emit: Instant::now(),
             release: release_rx,
         };
@@ -846,6 +877,12 @@ mod gpu_lane {
         ptr_y: i32,
         ptr_visible: bool,
         have_clean: bool,
+        /// When the clean desktop's pixels were PRESENTED by the
+        /// compositor (QPC `LastPresentTime` mapped to the monotonic
+        /// clock at acquire) — carried onto every frame composed from
+        /// them, cursor-only re-emits included (the desktop really is
+        /// that old).
+        presented: Option<Instant>,
         /// Rate limit for pointer-only re-emits (see [`Duplication`]).
         last_emit: Instant,
         release: mpsc::Receiver<usize>,
@@ -965,6 +1002,11 @@ mod gpu_lane {
                         return Ok(());
                     }
                     self.have_clean = true;
+                    // M1 capture-age anchor: map the compositor's QPC
+                    // present stamp onto the monotonic clock, so the
+                    // encode side can say how stale these pixels were by
+                    // the time it saw them.
+                    self.presented = Some(qpc_to_instant(info.LastPresentTime));
                 } else {
                     let _ = self.dup.ReleaseFrame();
                     // Pointer-only update: re-emit the retained clean
@@ -1033,6 +1075,7 @@ mod gpu_lane {
                 out_w,
                 out_h,
                 spent: t0.elapsed(),
+                presented: self.presented,
             };
             if tx.try_send(frame).is_err() {
                 // Full channel = consumer behind; reclaim the slot at once.
