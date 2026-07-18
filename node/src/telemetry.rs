@@ -198,8 +198,16 @@ pub fn start() {
             // per registered handle.
             let mut thread_last: std::collections::HashMap<isize, u64> =
                 std::collections::HashMap::new();
+            // 1 Hz default — the cadence clock transitions and burst
+            // stalls actually happen at; `ALLMYSTUFF_TELEMETRY_SECS`
+            // stretches it for long soaks.
+            let period = std::env::var("ALLMYSTUFF_TELEMETRY_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1u64)
+                .clamp(1, 60);
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_secs(period));
                 let _ = PdhCollectQueryData(query);
                 let (mut ct, mut et, mut kt, mut ut) = (zero, zero, zero, zero);
                 let _ = GetProcessTimes(proc_handle, &mut ct, &mut et, &mut kt, &mut ut);
