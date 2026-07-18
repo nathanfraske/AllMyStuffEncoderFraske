@@ -1195,11 +1195,15 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(360);
-        // The lossless row's soak content (the per-byte rolling gradient
-        // below) is near-adversarial for constQP-0 — every byte moves
-        // every frame — so read its Mbps as the *stress ceiling* under
-        // sustained worst-case load, and the content-classed bench
-        // (`bench_nvenc_lossless_content`) for realistic numbers.
+        // A measured surprise worth keeping: the per-byte rolling
+        // gradient below *looks* adversarial (every byte changes every
+        // frame) but is actually a smooth ~1.75 px/frame pan — value(j,
+        // i+1) = value(j+7, i) — which quarter-pel motion search tracks
+        // almost perfectly, so the lossless row soaks at single-digit
+        // Mbps. Read that row as lossless's *sustained-motion floor* and
+        // its latency under continuous full-frame motion; the
+        // content-classed bench (`bench_nvenc_lossless_content`) brackets
+        // the realistic and worst-case bandwidth.
         const MATRIX: [(&str, bool, bool, bool, u32); 5] = [
             ("balanced 30M", false, false, false, 30_000_000),
             ("game 30M", true, false, false, 30_000_000),
