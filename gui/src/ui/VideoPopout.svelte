@@ -124,6 +124,16 @@
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
 
+  // Mode is the headline control now: Balanced is the stability-first
+  // default; Game asks the streamer for the latency-first posture
+  // (gradual intra-refresh instead of keyframe walls, 60 fps floor
+  // off-LAN). The Res/FPS/Rate pills stay as expert overrides on top.
+  function toggleGame() {
+    tune = { ...tune, game: tune.game ? undefined : true };
+    openPill = null;
+    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
+  }
+
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
     const fpsTimer = setInterval(() => {
@@ -445,6 +455,19 @@
           {/if}
         </span>
       {/snippet}
+      <button
+        class="pill"
+        class:tuned={tune.game === true}
+        title="Balanced favors stability and quality; Game favors latency and instant recovery"
+        onpointerdown={(e) => e.stopPropagation()}
+        onpointerup={(e) => e.stopPropagation()}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleGame();
+        }}
+      >
+        Mode · {tune.game ? "Game" : "Balanced"}
+      </button>
       {@render pillMenu("res", "Res", RES_CHOICES, tune.maxEdge, "maxEdge")}
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}
       {@render pillMenu("rate", "Rate", RATE_CHOICES, tune.bitrate, "bitrate")}

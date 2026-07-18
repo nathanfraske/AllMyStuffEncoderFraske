@@ -1,17 +1,17 @@
-//! The video media plane: capture of this machine's screens **and
+﻿//! The video media plane: capture of this machine's screens **and
 //! cameras**, so an active display or camera route actually streams
-//! pixels — H.264 on the mesh's track lane, MJPEG as the compatibility
+//! pixels â€” H.264 on the mesh's track lane, MJPEG as the compatibility
 //! floor (the piKVM transport: every frame a standalone JPEG, no codec
 //! state to desync).
 //!
 //! Mirrors [`crate::audio::AudioBridge`]'s shape: each sourcing route runs
 //! a dedicated thread that captures **what its source capability names**
 //! (the synthetic `screen` is the primary monitor, `screen:<id>` one of
-//! the others, a camera capability the OS camera it scanned — see
+//! the others, a camera capability the OS camera it scanned â€” see
 //! [`VideoSource`]), fits it to the transport's ceiling, encodes, and
 //! hands the packet to a callback the mesh forwards. Everything from the
-//! encoder down — transports, tuning, refresh asks, stats, the status
-//! reports — is one pipeline; only the frame *source* differs, and camera
+//! encoder down â€” transports, tuning, refresh asks, stats, the status
+//! reports â€” is one pipeline; only the frame *source* differs, and camera
 //! frames enter through the same pump the persistent screen sessions use
 //! ([`crate::camera_capture`]).
 //!
@@ -20,13 +20,13 @@
 //! recorder can't carry it), `xcap`'s `VideoRecorder` elsewhere (PipeWire
 //! ScreenCast on Wayland, AVFoundation on macOS). The OS negotiates the
 //! stream once per route and pushes frames, often only on damage. The
-//! alternative — one `capture_image()` screenshot per tick — pays the
+//! alternative â€” one `capture_image()` screenshot per tick â€” pays the
 //! platform's full one-shot cost every frame (the Wayland portal literally
 //! has the compositor write a PNG to disk per call), which is what made
 //! v1's framerate so dire. The paced one-shot loop remains as the X11 path
 //! (xcap's X11 "recorder" is that same screenshot in an unpaced hot loop)
 //! and as the fallback wherever a session can't start (denied portal,
-//! headless session, an output another session holds) — so the stream
+//! headless session, an output another session holds) â€” so the stream
 //! degrades to v1 behaviour, never to nothing.
 //!
 //! The H.264 encoder budgets its bitrate from the monitor's true pixel
@@ -45,18 +45,18 @@
 //!
 //!  * **A sleeping display.** Hosting a route holds a keep-awake guard
 //!    and nudges an already-asleep display at start (see [`crate::wake`])
-//!    — damage-driven backends produce nothing from a dark screen, and a
+//!    â€” damage-driven backends produce nothing from a dark screen, and a
 //!    deep-sleeping DisplayPort monitor detaches from the desktop
 //!    entirely (which is why a failed monitor lookup gets one retry
 //!    after the nudge has had a beat to re-attach things).
 //!  * **Wayland consent.** Route starts ride a portal session with a
 //!    **restore token** ([`crate::wayland_capture`]): the compositor's
 //!    share-picker is a once-per-machine event, and every start after it
-//!    is silent — which is what an unattended host needs.
+//!    is silent â€” which is what an unattended host needs.
 //!  * **Silence with no explanation.** Capture state changes travel to
 //!    the viewer in-band (`vstat` media frames, [`StatusReporter`]):
 //!    "waiting for consent", "display asleep", "no monitor", "grabs
-//!    failing" — so the far end reads the real condition, never a
+//!    failing" â€” so the far end reads the real condition, never a
 //!    wordless black stage.
 
 use std::collections::HashMap;
@@ -71,34 +71,34 @@ use allmystuff_session::{VideoFrame, VideoStatusState};
 
 use crate::wake;
 
-/// Which transport a video-carrying route's stream encodes for — picked
+/// Which transport a video-carrying route's stream encodes for â€” picked
 /// by the mesh from the offer's `video` accepts (see `RouteControl::Offer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
-    /// Standalone JPEG frames over the media channel — the v1 transport
+    /// Standalone JPEG frames over the media channel â€” the v1 transport
     /// and the universal fallback.
     Mjpeg,
     /// H.264 access units for the mesh's RTP track lane.
     H264,
 }
 
-/// What a route's capture thread points at — the one place a display
+/// What a route's capture thread points at â€” the one place a display
 /// route and a camera route differ. Everything downstream (encoder,
 /// transport, tune/refresh, status) is shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoSource {
     /// A monitor: `None` = the primary (the synthetic `screen`
     /// capability), `Some(id)` = the monitor with that enumeration id
-    /// (a `screen:<id>` capability — see [`extra_screens`]).
+    /// (a `screen:<id>` capability â€” see [`extra_screens`]).
     Screen(Option<u32>),
     /// A camera, by the inventory device id its capability embeds
-    /// (`cam:video0`) — resolved back to the OS device by
+    /// (`cam:video0`) â€” resolved back to the OS device by
     /// [`crate::camera_capture`].
     Camera(String),
 }
 
 /// One capture tick's output, headed for the forwarder. (H.264 units
-/// carry no key flag — the receiving daemon re-derives IDR-ness from the
+/// carry no key flag â€” the receiving daemon re-derives IDR-ness from the
 /// NAL stream itself when it reassembles units off RTP.)
 #[derive(Debug, Clone)]
 pub enum VideoPacket {
@@ -112,7 +112,7 @@ pub enum VideoPacket {
 }
 
 /// Pipeline counters for one outbound stream, logged every
-/// [`STATS_EVERY`] — the dial-in line: effective fps out, where each
+/// [`STATS_EVERY`] â€” the dial-in line: effective fps out, where each
 /// frame's milliseconds went (scale vs encode), payload bitrate, and the
 /// three ways a tick can produce nothing (unchanged screen, downstream
 /// drop, rate-control skip). Times accumulate; the log shows per-frame
@@ -128,7 +128,7 @@ pub struct StreamStats {
     bytes: u64,
     scale: Duration,
     encode: Duration,
-    /// Per-frame samples (ms) inside the current window, for the p95s —
+    /// Per-frame samples (ms) inside the current window, for the p95s â€”
     /// smoothness lives in the tail, not the average: a clean 8 ms mean
     /// with a 40 ms p95 *is* the stutter the viewer feels.
     scale_ms: Vec<f32>,
@@ -167,7 +167,7 @@ impl StreamStats {
         self.scale_ms.push(d.as_secs_f32() * 1000.0);
     }
 
-    /// Record one encode call's cost — see [`Self::add_scale`].
+    /// Record one encode call's cost â€” see [`Self::add_scale`].
     fn add_encode(&mut self, d: Duration) {
         self.encode += d;
         self.encode_ms.push(d.as_secs_f32() * 1000.0);
@@ -200,7 +200,7 @@ impl StreamStats {
         let scale_p95 = Self::p95(&mut self.scale_ms);
         let encode_p95 = Self::p95(&mut self.encode_ms);
         let line = format!(
-            "video out {}: {:.1} fps {} {}×{} · {:.1} Mbps · scale {:.1}ms (p95 {scale_p95:.1}) · encode {:.1}ms (p95 {encode_p95:.1}) · {} key · {} static-skip · {} dropped",
+            "video out {}: {:.1} fps {} {}Ã—{} Â· {:.1} Mbps Â· scale {:.1}ms (p95 {scale_p95:.1}) Â· encode {:.1}ms (p95 {encode_p95:.1}) Â· {} key Â· {} static-skip Â· {} dropped",
             self.route_id,
             self.sent as f64 / secs,
             self.label,
@@ -232,7 +232,7 @@ impl StreamStats {
 }
 
 /// MJPEG ceiling on the longest frame edge. Defaults to **1920** so a 1080p
-/// desktop streams at native HD — at 1280 a 1080p screen was downscaled to
+/// desktop streams at native HD â€” at 1280 a 1080p screen was downscaled to
 /// 720p, too soft to read text. JPEG frames are chunked under the 64 KiB
 /// data-channel ceiling, so a higher edge costs bandwidth, not correctness.
 /// (MJPEG is the compatibility floor; the H.264 path carries the full
@@ -242,49 +242,49 @@ fn mjpeg_max_edge() -> u32 {
         std::sync::LazyLock::new(|| env_u32("ALLMYSTUFF_MJPEG_MAX_EDGE", 1920).clamp(320, 3840));
     *EDGE
 }
-/// Mid-range JPEG quality — piKVM's default neighbourhood; text stays
+/// Mid-range JPEG quality â€” piKVM's default neighbourhood; text stays
 /// legible, photos stay cheap.
 const JPEG_QUALITY: u8 = 60;
 /// An unchanged screen still re-sends one frame this often, so a viewer
 /// that lost a frame (or joined a quiet stream) is never stranded on a
 /// stale picture. Every tick in between costs one buffer compare.
 const STATIC_REFRESH: Duration = Duration::from_secs(2);
-/// Forced-IDR cadence floor (ms) — bounds how long a viewer that joined
+/// Forced-IDR cadence floor (ms) â€” bounds how long a viewer that joined
 /// mid-stream, lost an unrepaired packet, or rebuilt its decoder waits for a
 /// clean decode entry. The cadence when a viewer reports trouble (or hasn't
 /// reported), i.e. today's behaviour, and the default the adaptation starts
 /// from. 2 s costs a fraction of the stream: cheap insurance next to a
 /// multi-second freeze.
 const IDR_MS_TIGHT: u64 = 2000;
-/// The forced-IDR ceiling (ms) — the relaxed cadence for a viewer that's
+/// The forced-IDR ceiling (ms) â€” the relaxed cadence for a viewer that's
 /// keeping up cleanly. A keyframe is the costliest, most loss-exposed thing
 /// on the wire (hundreds of packets, all-or-nothing); a healthy link doesn't
 /// need one every 2 s, since the viewer asks for a fresh entry the instant it
-/// actually glitches. Stretching cuts keyframe bursts → less loss exposure
+/// actually glitches. Stretching cuts keyframe bursts â†’ less loss exposure
 /// and bandwidth, without slowing real recovery.
 const IDR_MS_RELAXED: u64 = 8000;
-/// Feedback older than this is treated as absent — a viewer that went quiet
+/// Feedback older than this is treated as absent â€” a viewer that went quiet
 /// (or whose link died) must not hold the cadence relaxed.
 const FEEDBACK_FRESH: Duration = Duration::from_secs(6);
 /// Post-quiesce quality refinement: after the convergence IDR, this many
 /// spaced, **non-IDR** re-encodes of the retained picture run. The motion
 /// burst that precedes a quiet spell typically leaves the last picture
-/// coarsely quantized — rate control absorbed a scene change with the VBV
-/// drained — and with damage-driven capture delivering nothing while the
+/// coarsely quantized â€” rate control absorbed a scene change with the VBV
+/// drained â€” and with damage-driven capture delivering nothing while the
 /// user reads the new window, nothing would ever sharpen it ("the classic
 /// low-bitrate transition, in slow motion"). Re-encoding identical input
 /// lets the encoder spend idle bandwidth on exactly the pixels the viewer
-/// is now staring at. H.264 only — an MJPEG re-encode of identical pixels
+/// is now staring at. H.264 only â€” an MJPEG re-encode of identical pixels
 /// is byte-identical, pure waste.
 const REFINE_PASSES: u8 = 2;
-/// Delay from the convergence IDR to the first refinement — a beat for the
+/// Delay from the convergence IDR to the first refinement â€” a beat for the
 /// rate control's budget to breathe after the burst.
 const REFINE_AFTER: Duration = Duration::from_millis(350);
 /// Spacing between refinement passes.
 const REFINE_SPACING: Duration = Duration::from_millis(800);
 /// How long a degraded (screenshot-fallback) spell runs before the route
 /// re-attempts a DXGI duplication session. Duplication failures are usually
-/// transient — a fullscreen-exclusive app, the UAC desktop, a driver reset —
+/// transient â€” a fullscreen-exclusive app, the UAC desktop, a driver reset â€”
 /// and without this a route stayed pinned on soft, CPU-hungry GDI grabs for
 /// its whole life once it fell.
 #[cfg(windows)]
@@ -293,7 +293,7 @@ const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(30);
 /// The forced-IDR interval (ms) the latest receiver feedback implies. The
 /// conservative half of the adaptation: relax to [`IDR_MS_RELAXED`] only on
 /// *confirmed* health (recent report, no decode failures, queue draining);
-/// anything else — no feedback, stale feedback, any glitch — stays at the
+/// anything else â€” no feedback, stale feedback, any glitch â€” stays at the
 /// [`IDR_MS_TIGHT`] floor, i.e. exactly today's behaviour.
 fn adaptive_idr_ms(fb: Option<RecvFeedback>) -> u64 {
     match fb {
@@ -305,7 +305,7 @@ fn adaptive_idr_ms(fb: Option<RecvFeedback>) -> u64 {
         _ => IDR_MS_TIGHT,
     }
 }
-/// How often each stream logs its pipeline counters — the dial-in line:
+/// How often each stream logs its pipeline counters â€” the dial-in line:
 /// effective fps, where the per-frame milliseconds go, and the bitrate.
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
@@ -314,18 +314,18 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 // fidelity": H.264 carries up to a native 4K frame at a rate budgeted
 // from its true pixel count.
 
-/// How the ICE-nominated path to the stream's viewer actually flows —
+/// How the ICE-nominated path to the stream's viewer actually flows â€”
 /// the daemon's own LAN/STUN/TURN taxonomy (`PeerInfo.selected_pair`,
-/// host↔host = LAN), carried into the stream so the *automatic* dials
+/// hostâ†”host = LAN), carried into the stream so the *automatic* dials
 /// can be generous exactly where generosity is free. Explicit viewer
 /// Tune fields and the env dials always win over this gate. `Unknown`
 /// (ICE not settled yet, or an old daemon that doesn't report the pair)
-/// is treated as WAN — start conservative, upgrade when the class lands.
+/// is treated as WAN â€” start conservative, upgrade when the class lands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LinkClass {
-    /// The nominated candidate pair is host↔host — a direct local link.
+    /// The nominated candidate pair is hostâ†”host â€” a direct local link.
     Lan,
-    /// Reflexive or relayed — real internet between the ends.
+    /// Reflexive or relayed â€” real internet between the ends.
     Wan,
     /// No nominated pair reported (yet). Conservative until known.
     #[default]
@@ -333,12 +333,12 @@ pub enum LinkClass {
 }
 
 /// Game mode (`ALLMYSTUFF_GAME_MODE=1`): the cadence-and-latency-first
-/// posture for driving a game over the stream. Two automatic dials move —
+/// posture for driving a game over the stream. Two automatic dials move â€”
 /// the off-LAN fps floor rises to 60 ([`auto_fps`]) and the encoder's burst
 /// headroom tightens ([`burst_bounds`]) so a scene change queues for half
 /// the time. The caveat is documented honestly: the transport is still
 /// open-loop (no pacer/BWE), so 60 fps over a weak WAN link is the
-/// operator's deliberate trade until the transport work lands — which is
+/// operator's deliberate trade until the transport work lands â€” which is
 /// exactly why this is an explicit opt-in and not the default.
 pub(crate) fn game_mode() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -352,22 +352,24 @@ pub(crate) fn game_mode() -> bool {
     *ON
 }
 
-/// Capture cadence to aim for — a ceiling, not a promise. Session capture
+/// Capture cadence to aim for â€” a ceiling, not a promise. Session capture
 /// sustains it (damage-driven backends produce less on quiet screens);
 /// the one-shot fallback runs at whatever the platform's screenshot path
 /// allows. Override: `ALLMYSTUFF_VIDEO_FPS`.
-pub(crate) fn target_fps(link: LinkClass) -> u32 {
+/// The automatic fps target with an explicit game posture â€” the per-route
+/// dial (already OR'd with the env override by [`Tune::game`]).
+pub(crate) fn target_fps_for(link: LinkClass, game: bool) -> u32 {
     static FPS: std::sync::LazyLock<Option<u32>> =
         std::sync::LazyLock::new(|| env_u32_opt("ALLMYSTUFF_VIDEO_FPS"));
-    FPS.unwrap_or(auto_fps(link, game_mode())).clamp(1, 120)
+    FPS.unwrap_or(auto_fps(link, game)).clamp(1, 120)
 }
 
-/// The automatic cadence: 60 on a LAN — this is a Parsec-tier 4K60 stream;
+/// The automatic cadence: 60 on a LAN â€” this is a Parsec-tier 4K60 stream;
 /// 30 made fast motion look choppy. It's a ceiling, not a promise
 /// (damage-driven backends produce less on quiet screens). Off-LAN (or
 /// before the path class is known) the default steps back to 30: the
 /// transport is still open-loop (no pacer/BWE yet), and doubling the
-/// cadence there buys queueing latency, not smoothness — unless
+/// cadence there buys queueing latency, not smoothness â€” unless
 /// [`game_mode`] pins the cadence-first trade deliberately. The env dial
 /// overrides everything; an explicit viewer Tune never reaches this.
 fn auto_fps(link: LinkClass, game: bool) -> u32 {
@@ -380,9 +382,9 @@ fn auto_fps(link: LinkClass, game: bool) -> u32 {
 
 /// The rate controller's burst posture: `(peak, vbv_window)` for a target
 /// bitrate. The standard posture gives a fast-motion / scene-change frame
-/// ~2× headroom over a ~1 s window — quality-first, and bare mean-rate CBR
+/// ~2Ã— headroom over a ~1 s window â€” quality-first, and bare mean-rate CBR
 /// (the setting before it) was exactly the "blocky on fast motion" symptom.
-/// Game mode trims to 1.5× over ~½ s: a burst that queues for a full second
+/// Game mode trims to 1.5Ã— over ~Â½ s: a burst that queues for a full second
 /// is *felt* as input lag mid-game, and the post-quiesce refinement passes
 /// now repair what the tighter budget costs a transition. Shared by every
 /// backend that exposes peak/VBV (MF on Windows, the FFmpeg vendor
@@ -395,9 +397,9 @@ pub(crate) fn burst_bounds(bitrate: u32, game: bool) -> (u32, u32) {
     }
 }
 
-/// H.264 ceiling on the longest edge. 3840 means "native up to 4K" — no
+/// H.264 ceiling on the longest edge. 3840 means "native up to 4K" â€” no
 /// downscale on anything up to a UHD monitor (openh264's own hard limit
-/// is 3840×2160). Dimensions are forced even (4:2:0 chroma needs it).
+/// is 3840Ã—2160). Dimensions are forced even (4:2:0 chroma needs it).
 /// Override: `ALLMYSTUFF_VIDEO_MAX_EDGE`.
 fn h264_max_edge() -> u32 {
     static EDGE: std::sync::LazyLock<u32> =
@@ -406,10 +408,10 @@ fn h264_max_edge() -> u32 {
 }
 
 /// Target bitrate for one stream's encode, budgeted from what it actually
-/// carries: ~0.16 bits per pixel per frame — the density 1080p30 was
-/// tuned crisp at (10 Mbps) — clamped to 8 Mbps up to a cap the link
+/// carries: ~0.16 bits per pixel per frame â€” the density 1080p30 was
+/// tuned crisp at (10 Mbps) â€” clamped to 8 Mbps up to a cap the link
 /// class earns. On a LAN pair the cap is 80 Mbps, so a 4K60 desktop
-/// (~80 Mbps at this density) and a 3440×1440@60 ultrawide (~48 Mbps)
+/// (~80 Mbps at this density) and a 3440Ã—1440@60 ultrawide (~48 Mbps)
 /// reach their budget instead of being pinned at the old 40 Mbps
 /// ceiling, which was *itself* the QP wall that blocked fast motion.
 /// Off-LAN (and before the class is known) the cap stays 40 Mbps: the
@@ -432,7 +434,7 @@ fn h264_bitrate_for(w: u32, h: u32, fps: u32, link: LinkClass) -> u32 {
     bps.clamp(8_000_000, cap) as u32
 }
 
-/// A `u32` env dial with no default — `None` when unset/unparseable, so
+/// A `u32` env dial with no default â€” `None` when unset/unparseable, so
 /// the caller can distinguish "operator pinned it" from "use the gate".
 fn env_u32_opt(key: &str) -> Option<u32> {
     match std::env::var(key) {
@@ -442,7 +444,7 @@ fn env_u32_opt(key: &str) -> Option<u32> {
                 Some(n)
             }
             Err(_) => {
-                tracing::warn!("{key}={v} isn't a number — using the automatic dial");
+                tracing::warn!("{key}={v} isn't a number â€” using the automatic dial");
                 None
             }
         },
@@ -459,7 +461,7 @@ fn env_u32(key: &str, default: u32) -> u32 {
                 n
             }
             Err(_) => {
-                tracing::warn!("{key}={v} isn't a number — using {default}");
+                tracing::warn!("{key}={v} isn't a number â€” using {default}");
                 default
             }
         },
@@ -467,7 +469,7 @@ fn env_u32(key: &str, default: u32) -> u32 {
     }
 }
 
-/// Whether the periodic pipeline stats print at info. Off by default —
+/// Whether the periodic pipeline stats print at info. Off by default â€”
 /// steady-state runs stay quiet; set `ALLMYSTUFF_VIDEO_STATS=1` while
 /// dialing performance in (without it the same lines land at debug, so
 /// the `ALLMYSTUFF_GUI_LOG` filter can also reach them).
@@ -487,6 +489,10 @@ pub struct Tune {
     pub max_edge: Option<u32>,
     pub bitrate: Option<u32>,
     pub fps: Option<u32>,
+    /// The viewer's per-route game-mode ask (latency-first posture: GDR
+    /// on the SDK rung, 60 fps floor off-LAN). `ALLMYSTUFF_GAME_MODE=1`
+    /// still forces it node-wide; this is the wire dial.
+    pub game: bool,
     /// How the path to this stream's viewer flows (host side fills it
     /// from the daemon's nominated-pair class). Not a viewer dial: it
     /// gates only what the AUTOMATIC fps/bitrate fall back to.
@@ -494,16 +500,22 @@ pub struct Tune {
 }
 
 impl Tune {
+    /// The route's effective game posture: the viewer's wire dial, or the
+    /// node-wide env override.
+    pub(crate) fn game(&self) -> bool {
+        self.game || game_mode()
+    }
+
     fn fps(&self) -> u32 {
         self.fps
-            .unwrap_or_else(|| target_fps(self.link))
+            .unwrap_or_else(|| target_fps_for(self.link, self.game()))
             .clamp(1, 120)
     }
     fn h264_edge(&self) -> u32 {
         self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
     }
-    /// MJPEG honours the Res control the same way H.264 does — up to a 4K
-    /// hard cap (chunked under the 64 KiB data channel) — so the pill moves
+    /// MJPEG honours the Res control the same way H.264 does â€” up to a 4K
+    /// hard cap (chunked under the 64 KiB data channel) â€” so the pill moves
     /// both encodings. Untuned it defaults to HD ([`mjpeg_max_edge`], 1920)
     /// rather than 4K, since a JPEG frame is far heavier than an H.264 one.
     fn mjpeg_edge(&self) -> u32 {
@@ -511,7 +523,7 @@ impl Tune {
             .unwrap_or_else(mjpeg_max_edge)
             .clamp(320, 3840)
     }
-    /// MJPEG has no bitrate, so the Rate control maps to JPEG quality — the
+    /// MJPEG has no bitrate, so the Rate control maps to JPEG quality â€” the
     /// same pill means something on both encodings. `None` (auto) keeps the
     /// neutral [`JPEG_QUALITY`] default.
     fn jpeg_quality(&self) -> u8 {
@@ -519,8 +531,8 @@ impl Tune {
     }
 }
 
-/// Map a target bitrate (the console's Rate pill: 4–40 Mbps) to a JPEG
-/// quality. Higher rate → crisper frames; the curve spans the pill range so
+/// Map a target bitrate (the console's Rate pill: 4â€“40 Mbps) to a JPEG
+/// quality. Higher rate â†’ crisper frames; the curve spans the pill range so
 /// "Speed" reads softer and "Quality" reads sharp.
 fn mjpeg_quality_for(bps: u32) -> u8 {
     if bps <= 5_000_000 {
@@ -558,7 +570,7 @@ impl StatusReporter {
         }
         self.last = Some(state);
         // The injector pulses the display awake on inbound clicks only
-        // while a stream is dark — this transition is what tells it.
+        // while a stream is dark â€” this transition is what tells it.
         wake::set_stream_dark(!matches!(state, VideoStatusState::Ok));
         (self.cb)(state, detail);
     }
@@ -576,10 +588,10 @@ struct RouteVideo {
     /// consumes (IDR for H.264, an immediate resend for MJPEG).
     refresh: Arc<AtomicBool>,
     /// The H.264 forced-IDR interval (ms), adapted from receiver feedback
-    /// ([`note_feedback`] → [`adaptive_idr_ms`]); the encode thread reads it
+    /// ([`note_feedback`] â†’ [`adaptive_idr_ms`]); the encode thread reads it
     /// each frame. Default [`IDR_MS_TIGHT`] = today's fixed cadence.
     idr_ms: Arc<AtomicU64>,
-    /// The tune this capture was started with — the controller compares the
+    /// The tune this capture was started with â€” the controller compares the
     /// viewer's reported fps against its fps target.
     tune: Tune,
     /// The receiver-driven resolution cap (see [`AutoAdapt`]); fresh per
@@ -597,8 +609,8 @@ impl Drop for RouteVideo {
 }
 
 /// The latest decode health a viewer reported for one of our outbound
-/// streams (receiver → sender). Observability today; the signal the stream
-/// adaptation — recovery cadence, then bitrate/res auto-scaling — reads next.
+/// streams (receiver â†’ sender). Observability today; the signal the stream
+/// adaptation â€” recovery cadence, then bitrate/res auto-scaling â€” reads next.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvFeedback {
     pub recv_fps: u32,
@@ -612,8 +624,8 @@ pub struct RecvFeedback {
 // The viewer reports its decode health every couple of seconds
 // (`RouteControl::VideoFeedback`); [`adaptive_idr_ms`] already reads it for
 // the recovery cadence. This is the other half that was marked "auto-scaling
-// later": when the viewer demonstrably can't keep up — a 60 fps encode
-// arriving at 0–6 fps, the exact "console shows a slideshow" failure — the
+// later": when the viewer demonstrably can't keep up â€” a 60 fps encode
+// arriving at 0â€“6 fps, the exact "console shows a slideshow" failure â€” the
 // sender steps its encode **resolution** down one rung, and steps back up
 // once the viewer has been healthy for a sustained stretch (fast down, slow
 // up, so the picture never oscillates).
@@ -622,17 +634,17 @@ pub struct RecvFeedback {
 // fits every frame to the effective edge per frame, and a changed fit
 // re-inits the encoder through the existing budget-size rebuild (bitrate
 // re-budgets from the smaller frame automatically; the next unit out is an
-// IDR). A manual retune replaces the route and so resets the cap — the
+// IDR). A manual retune replaces the route and so resets the cap â€” the
 // viewer's new picks change the conditions, and the controller re-learns.
 
 /// Master switch for the receiver-driven resolution auto-adaptation:
-/// **OFF by default** — set `ALLMYSTUFF_AUTO_ADAPT=1` to opt in. The stream
+/// **OFF by default** â€” set `ALLMYSTUFF_AUTO_ADAPT=1` to opt in. The stream
 /// runs at its full requested resolution and never silently steps itself
 /// down: the deal is native quality, and quality is the user's to pick (the
-/// Speed↔Quality slider / Res pills), not the stream's to quietly lower. The
+/// Speedâ†”Quality slider / Res pills), not the stream's to quietly lower. The
 /// real cause of the "standing behind" feed was the viewer-side canvas
 /// demotion (fixed) and a too-aggressive decode-queue valve (removed), not
-/// the absence of this lever — so it earns its keep only as an explicit
+/// the absence of this lever â€” so it earns its keep only as an explicit
 /// opt-in, never as a default that can soften a healthy 4K60. The
 /// [`AutoAdapt`] logic below stays intact and unit-tested for when it's
 /// turned on. The adaptive **IDR cadence** ([`adaptive_idr_ms`]) is a
@@ -647,10 +659,10 @@ fn auto_adapt_enabled() -> bool {
 const AUTO_EDGES: &[u32] = &[2560, 1920, 1280, 960];
 /// Consecutive struggling reports (~2 s apart) before a step down.
 const AUTO_BAD_STREAK: u32 = 3;
-/// Consecutive healthy reports before a step back up — deliberately long:
+/// Consecutive healthy reports before a step back up â€” deliberately long:
 /// stepping up too eagerly re-breaks the viewer and oscillates.
 const AUTO_GOOD_STREAK: u32 = 20;
-/// Settle time after any step before another *down* step — the encoder
+/// Settle time after any step before another *down* step â€” the encoder
 /// rebuild and the viewer's pipeline refill need a beat to show up in the
 /// feedback before it's evidence about the new rung.
 const AUTO_DOWN_HOLD: Duration = Duration::from_secs(8);
@@ -694,10 +706,10 @@ impl AutoAdapt {
     /// the streak/hold logic is unit-testable.
     fn observe(&self, fb: &RecvFeedback, fps_target: u32, now: Instant) -> Option<(u32, u32)> {
         // Struggling: arriving at under a quarter of the encode rate (the
-        // field failure was 0–6 fps of 60), or a queue backing far up.
+        // field failure was 0â€“6 fps of 60), or a queue backing far up.
         // Healthy: at least three quarters of it, decoding cleanly, queue
-        // drained. The band between counts as neither — streaks reset, no
-        // step. Decode failures alone are corruption, not overload — the
+        // drained. The band between counts as neither â€” streaks reset, no
+        // step. Decode failures alone are corruption, not overload â€” the
         // adaptive IDR cadence owns those.
         let bad = fb.recv_fps * 4 < fps_target || fb.queue_depth > 24;
         let good = fb.recv_fps * 4 >= fps_target * 3 && fb.decode_fails == 0 && fb.queue_depth <= 8;
@@ -717,9 +729,9 @@ impl AutoAdapt {
             st.last_step.is_none_or(|t| now.duration_since(t) >= hold)
         };
         if st.bad >= AUTO_BAD_STREAK && held_for(AUTO_DOWN_HOLD, &st) {
-            // Next rung strictly below the current cap (uncapped → first).
+            // Next rung strictly below the current cap (uncapped â†’ first).
             let Some(next) = AUTO_EDGES.iter().copied().find(|&e| cur == 0 || e < cur) else {
-                st.bad = 0; // already at the floor — nothing left to give
+                st.bad = 0; // already at the floor â€” nothing left to give
                 return None;
             };
             self.edge.store(next, Ordering::Relaxed);
@@ -757,10 +769,10 @@ impl VideoBridge {
         Self::default()
     }
 
-    /// Begin streaming `source` for `route_id`, encoding for `mode` — a
+    /// Begin streaming `source` for `route_id`, encoding for `mode` â€” a
     /// monitor for a display route, a camera for a video one. `on_packet`
     /// is called with each encoded packet; it returns `false` when the
-    /// packet was dropped downstream (backpressure), which is fine — the
+    /// packet was dropped downstream (backpressure), which is fine â€” the
     /// next capture simply carries the newer picture. `on_status` is
     /// called on capture-state transitions, for the viewer's benefit (see
     /// [`StatusReporter`]).
@@ -778,7 +790,7 @@ impl VideoBridge {
     {
         // Exactly one capture pump per route. A duplicate `StartMedia` (the
         // daemon redelivers an Offer once per shared network) must not start a
-        // second capture for a route that already has one — two backends bound
+        // second capture for a route that already has one â€” two backends bound
         // to one monitor, and with the release profile's `panic = "abort"` a
         // panic on either aborts the host. A genuine restart (a viewer's
         // retune) goes through `spawn_route` directly, which is allowed to
@@ -799,14 +811,14 @@ impl VideoBridge {
         );
     }
 
-    /// The route ids with a live capture pump — for the mesh to sweep
+    /// The route ids with a live capture pump â€” for the mesh to sweep
     /// when a peer's link class changes.
     pub fn route_ids(&self) -> Vec<String> {
         self.routes.lock().keys().cloned().collect()
     }
 
     /// A viewer's Tune (the console pills/slider): the dials change, the
-    /// link class the gate learned stays — a viewer retune must not
+    /// link class the gate learned stays â€” a viewer retune must not
     /// quietly reset a LAN stream to the conservative Unknown dials.
     pub fn retune_dials(
         &self,
@@ -814,6 +826,7 @@ impl VideoBridge {
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
+        game: bool,
     ) {
         let link = self
             .routes
@@ -828,13 +841,14 @@ impl VideoBridge {
                 bitrate,
                 fps,
                 link,
+                game,
             },
         );
     }
 
     /// Re-class a live route's link (the LAN gate learning the truth after
     /// the stream started): respawns the capture only when the class
-    /// actually changed AND no viewer dial pins the affected knobs — a
+    /// actually changed AND no viewer dial pins the affected knobs â€” a
     /// restart costs one IDR hiccup, so a no-op reclassification must cost
     /// nothing. Returns whether a retune happened.
     pub fn retune_link(&self, route_id: &str, link: LinkClass) -> bool {
@@ -844,17 +858,17 @@ impl VideoBridge {
             return false;
         }
         // With BOTH automatic dials pinned by the viewer, the class change
-        // can't alter the stream — skip the restart entirely.
+        // can't alter the stream â€” skip the restart entirely.
         if t.fps.is_some() && t.bitrate.is_some() {
             return false;
         }
-        // Instrumented: a capped stream's whole story is often this line — a
+        // Instrumented: a capped stream's whole story is often this line â€” a
         // CEC dial that never leaves Unknown/Wan stays at the 30fps cap, while
         // a direct LAN dial flips to Lan and unlocks 60. Posted logs then show
         // exactly which happened on each path.
         let new_t = Tune { link, ..t };
         tracing::info!(
-            "video relink {route_id}: {:?} → {:?} · fps cap {} → {}",
+            "video relink {route_id}: {:?} â†’ {:?} Â· fps cap {} â†’ {}",
             t.link,
             link,
             t.fps(),
@@ -889,7 +903,7 @@ impl VideoBridge {
         let src = source.clone();
         let thread = std::thread::spawn(move || {
             // This thread exists for the moments the machine is loaded, and
-            // its sleeps pace a 60 fps budget — hold the 1 ms timer quantum
+            // its sleeps pace a 60 fps budget â€” hold the 1 ms timer quantum
             // and boost the thread (priority, EcoQoS opt-out, P-core
             // preference) for the stream's lifetime.
             let _timer = crate::os_perf::TimerResolutionGuard::hold();
@@ -932,7 +946,7 @@ impl VideoBridge {
             )
         };
         // Join any displaced capture thread (RouteVideo::drop) only after the
-        // routes lock is released — joining a thread under the lock would
+        // routes lock is released â€” joining a thread under the lock would
         // block every other route op, and on the async start path stall a
         // tokio worker. `start_capture` dedupes so this is normally `None`;
         // the explicit drop keeps the off-lock guarantee for any caller.
@@ -940,7 +954,7 @@ impl VideoBridge {
     }
 
     /// Ask `route_id`'s encoder for a clean decode entry on its next
-    /// frame — the viewer's decoder lost its place. No-op for a route
+    /// frame â€” the viewer's decoder lost its place. No-op for a route
     /// this machine isn't streaming.
     pub fn force_idr(&self, route_id: &str) {
         if let Some(r) = self.routes.lock().get(route_id) {
@@ -950,7 +964,7 @@ impl VideoBridge {
     }
 
     /// Record the decode health a viewer reported for one of our streams
-    /// (receiver → sender). Logged at info when the link looks unhealthy
+    /// (receiver â†’ sender). Logged at info when the link looks unhealthy
     /// (decode failures, or the queue backing up) so a struggling stream is
     /// visible from the *sender's* logs, and stored for the stream
     /// adaptation to read.
@@ -970,11 +984,11 @@ impl VideoBridge {
         self.feedback.lock().insert(route_id.to_string(), fb);
         if decode_fails > 0 || queue_depth > 8 {
             tracing::info!(
-                "video feedback {route_id}: viewer {recv_fps} fps · {decode_fails} decode-fail · queue {queue_depth}"
+                "video feedback {route_id}: viewer {recv_fps} fps Â· {decode_fails} decode-fail Â· queue {queue_depth}"
             );
         } else {
             tracing::debug!(
-                "video feedback {route_id}: viewer {recv_fps} fps · queue {queue_depth}"
+                "video feedback {route_id}: viewer {recv_fps} fps Â· queue {queue_depth}"
             );
         }
         // Adapt the H.264 forced-IDR cadence for this route: relax it when the
@@ -988,19 +1002,19 @@ impl VideoBridge {
             };
             let was = r.idr_ms.swap(want, Ordering::Relaxed);
             if was != want {
-                tracing::debug!("video {route_id}: forced-IDR cadence {was}ms → {want}ms");
+                tracing::debug!("video {route_id}: forced-IDR cadence {was}ms â†’ {want}ms");
             }
             (r.auto.clone(), r.tune)
         };
         // The auto-scale half: step the encode resolution down when the
         // viewer demonstrably can't keep up, back up when it recovers
-        // (see [`AutoAdapt`]). Run outside the routes lock — the observe
+        // (see [`AutoAdapt`]). Run outside the routes lock â€” the observe
         // takes its own.
         let (auto, tune) = adapt;
         // Auto-scale governs only the AUTOMATIC Res dial: a viewer that
         // pinned `max_edge` (the slider / Res pill) said exactly what it
         // wants, so the controller stands down for that stream instead of
-        // re-tuning under the user's hands — that fight is why this valve
+        // re-tuning under the user's hands â€” that fight is why this valve
         // was once disabled outright (and the console's standing decode
         // backlog is what disabling it cost). `auto_adapt_enabled` is the
         // operator kill switch on top.
@@ -1012,11 +1026,11 @@ impl VideoBridge {
                 if e == 0 {
                     "native".to_string()
                 } else {
-                    format!("≤{e}")
+                    format!("â‰¤{e}")
                 }
             };
             tracing::info!(
-                "video auto-adapt {route_id}: viewer at {recv_fps} fps of {} — encode edge {} → {}                  (bitrate re-budgets at the new size; next unit is an IDR)",
+                "video auto-adapt {route_id}: viewer at {recv_fps} fps of {} â€” encode edge {} â†’ {}                  (bitrate re-budgets at the new size; next unit is an IDR)",
                 tune.fps(),
                 name(from),
                 name(to),
@@ -1024,7 +1038,7 @@ impl VideoBridge {
         }
     }
 
-    /// The most recent feedback a viewer reported for `route_id`, if any —
+    /// The most recent feedback a viewer reported for `route_id`, if any â€”
     /// the hook the stream adaptation (recovery cadence, auto-scale) reads.
     pub fn latest_feedback(&self, route_id: &str) -> Option<RecvFeedback> {
         self.feedback.lock().get(route_id).copied()
@@ -1032,7 +1046,7 @@ impl VideoBridge {
 
     /// Restart `route_id`'s capture with the viewer's quality picks.
     pub fn retune(&self, route_id: &str, tune: Tune) {
-        // A duplicate of the current dials must not pay a capture restart —
+        // A duplicate of the current dials must not pay a capture restart â€”
         // that's a thread teardown+join, a fresh encoder ladder, and an IDR
         // hiccup. Slider/pill UIs re-send their value on release, and the
         // session layer applies no debounce, so the dedupe lives here.
@@ -1056,7 +1070,7 @@ impl VideoBridge {
         );
         drop(old); // joins the old capture thread; its session releases
         tracing::info!(
-            "route {route_id} retuned: edge {} · bitrate {} · fps {}",
+            "route {route_id} retuned: edge {} Â· bitrate {} Â· fps {}",
             tune.max_edge.map_or("auto".into(), |v| v.to_string()),
             tune.bitrate
                 .map_or("auto".into(), |v| format!("{:.1} Mbps", v as f64 / 1e6)),
@@ -1074,7 +1088,7 @@ impl VideoBridge {
 
     pub fn stop(&self, route_id: &str) {
         // Bind the removed route so its Drop (the capture-thread join) runs
-        // after the routes lock guard is released, never under it — an
+        // after the routes lock guard is released, never under it â€” an
         // unbound `remove(..);` would drop the RouteVideo (and join) while the
         // guard is still held (temporary drop order), blocking the lock on a
         // thread join.
@@ -1102,12 +1116,12 @@ fn run_capture(
 
     // A camera source skips the whole monitor story: open the device,
     // pump its frames into the same encoder. Open failures are told to
-    // the viewer in-band, like every capture condition — "no camera"
+    // the viewer in-band, like every capture condition â€” "no camera"
     // when there's nothing to open, "camera failed" (with the OS text)
     // when there is but it won't stream: held by another app, or a
     // permission denial.
     if let VideoSource::Camera(device) = source {
-        // A hosted camera is active use the OS can't see — hold the
+        // A hosted camera is active use the OS can't see â€” hold the
         // machine awake like a hosted screen (without forcing the panel
         // on; the camera doesn't need the display lit).
         let _awake = wake::DisplayAwake::hold("hosting a camera stream");
@@ -1115,7 +1129,7 @@ fn run_capture(
         let mut encoder = HealingEncoder::new(route_id, mode, (0, 0), tune, refresh, idr_ms, auto)?;
         let mut stats = StreamStats::new(route_id, encoder.mode());
         tracing::info!(
-            "video stream start {route_id}: {} · link {:?} · fps cap {fps} · camera",
+            "video stream start {route_id}: {} Â· link {:?} Â· fps cap {fps} Â· camera",
             match mode {
                 VideoMode::H264 => "H.264",
                 VideoMode::Mjpeg => "MJPEG",
@@ -1164,7 +1178,7 @@ fn run_capture(
 
     // A hosted screen is active use the OS can't see: hold the display
     // awake for the stream's lifetime, and force one that's already dark
-    // back on — neither capture path can grab from a sleeping panel.
+    // back on â€” neither capture path can grab from a sleeping panel.
     let _awake = wake::DisplayAwake::hold("hosting a screen stream");
     wake::force_display_on();
     // The monitor up front: its resolution budgets the encoder's bitrate.
@@ -1194,16 +1208,16 @@ fn run_capture(
     // A physically-rotated monitor: Windows DXGI hands over the raw scan-out and
     // reports its own rotation per frame (the orient pass rotates it upright);
     // every other backend delivers the upright presentation image (rotation 0).
-    // `source_hint` is the monitor's reported size — it only pre-budgets the
+    // `source_hint` is the monitor's reported size â€” it only pre-budgets the
     // encoder's starting bitrate; the first real frame locks the true size.
     let fps = tune.fps();
     let mut stats = StreamStats::new(route_id, mode);
-    // One provenance line per stream — the numbers that explain a capped rate
+    // One provenance line per stream â€” the numbers that explain a capped rate
     // at a glance: codec, whether the path was classed LAN (60) or WAN/Unknown
     // (30 cap), the effective fps ceiling, and the source size. A posted CEC
     // dial's line vs a direct LAN dial's makes the cap self-evident.
     tracing::info!(
-        "video stream start {route_id}: {} · link {:?} · fps cap {fps} · source {}×{}",
+        "video stream start {route_id}: {} Â· link {:?} Â· fps cap {fps} Â· source {}Ã—{}",
         match mode {
             VideoMode::H264 => "H.264",
             VideoMode::Mjpeg => "MJPEG",
@@ -1216,15 +1230,15 @@ fn run_capture(
     // Windows, H.264: the GPU zero-copy lane runs INSTEAD of the CPU
     // pipeline when the whole chain comes up (duplication, cursor, and
     // colour conversion on one D3D11 device; the encoder MFT reading the
-    // NV12 textures in place — see `win_capture::start_gpu` and
+    // NV12 textures in place â€” see `win_capture::start_gpu` and
     // `run_gpu_lane`). It's tried before any CPU encoder exists, so a
     // GPU-lane route holds ONE hardware encoder session, not two. Every
-    // failure is soft — the reason is logged and the proven CPU path below
+    // failure is soft â€” the reason is logged and the proven CPU path below
     // takes over; a mode or edge-cap change restarts the lane with fresh
     // geometry, budgeted so a flapping driver can't loop forever. The
     // operator's adapter pin wins over the lane: pinning exists to encode
     // on a *different* GPU than the display's, which is inherently
-    // cross-adapter — the CPU lane's system-memory NV12 serves that.
+    // cross-adapter â€” the CPU lane's system-memory NV12 serves that.
     #[cfg(windows)]
     if mode == VideoMode::H264
         && gpu_lane_enabled()
@@ -1280,7 +1294,7 @@ fn run_capture(
     // the encoder fell to the MJPEG floor.
     stats.set_mode(encoder.mode());
 
-    // Windows: our own DXGI Output Duplication session — damage-driven,
+    // Windows: our own DXGI Output Duplication session â€” damage-driven,
     // per-monitor, releasable (see `win_capture` for why xcap's recorder
     // can't carry this). A failed start or a dead session falls back to the
     // screenshot loop, but only for [`DXGI_REPROMOTE_AFTER`] at a time:
@@ -1334,7 +1348,7 @@ fn run_capture(
                          falling back to per-frame screenshots"
                     ),
                 }
-                // A fresh monitor handle for the fallback — the duplication
+                // A fresh monitor handle for the fallback â€” the duplication
                 // may have died to a mode change that moved things around.
                 let monitor = select_monitor(monitor_id).inspect_err(|e| {
                     reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
@@ -1363,12 +1377,12 @@ fn run_capture(
         }
     }
 
-    // Linux Wayland: our own portal session — the only sanctioned capture
+    // Linux Wayland: our own portal session â€” the only sanctioned capture
     // there, run with a restore token so an unattended start is silent
     // (see `wayland_capture`). When no token is stored yet, the consent
-    // dialog needs a human at this machine — say so to the viewer before
+    // dialog needs a human at this machine â€” say so to the viewer before
     // the wait. A failed or refused session degrades to the per-grab
-    // path below, which keeps explaining itself in-band — and so does a
+    // path below, which keeps explaining itself in-band â€” and so does a
     // session that *opens* but never delivers a frame: a restored grant
     // can point at an output the compositor no longer paints (silent
     // token restores skip the initial frame some compositors only send
@@ -1416,7 +1430,7 @@ fn run_capture(
                             crate::wayland_capture::forget_token(monitor_id);
                             tracing::warn!(
                                 "wayland screencast for {route_id} delivered no frames; \
-                                 dropped its restore token — reconnect to re-consent"
+                                 dropped its restore token â€” reconnect to re-consent"
                             );
                         } else {
                             tracing::warn!("wayland screencast for {route_id} ended: {e}");
@@ -1433,7 +1447,7 @@ fn run_capture(
         // On Wayland the per-frame Screenshot fallback is *not* an acceptable
         // degrade: xcap's grab there routes through the xdg-desktop-portal
         // Screenshot API, and most compositors (GNOME especially) play their
-        // screenshot-flash animation on every single grab — the whole panel
+        // screenshot-flash animation on every single grab â€” the whole panel
         // strobes white at the capture rate, useless and alarming. The
         // ScreenCast portal is the only sane capture path on Wayland, so when
         // it can't run we surface that and stop rather than flash the screen.
@@ -1443,7 +1457,7 @@ fn run_capture(
     // macOS: xcap's AVFoundation session. Two attempts, each with a
     // freshly enumerated monitor: a route that restarts can hand the
     // session a stale display handle, and re-enumerating is exactly what
-    // heals that. Only then do we settle for per-frame screenshots — the
+    // heals that. Only then do we settle for per-frame screenshots â€” the
     // dire-framerate path of last resort.
     #[cfg(target_os = "macos")]
     for attempt in 0..2 {
@@ -1506,7 +1520,7 @@ fn wayland_session() -> bool {
 
 /// How long a just-started session may produce nothing before the
 /// viewer is told the display is dark. Only the *first* frame is held
-/// to this — once one arrived, a quiet channel is an idle desktop on a
+/// to this â€” once one arrived, a quiet channel is an idle desktop on a
 /// damage-driven backend, not a problem.
 const FIRST_FRAME_STALL: Duration = Duration::from_secs(5);
 
@@ -1528,8 +1542,8 @@ const WAYLAND_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(20);
 /// Drain a session's frame channel into the encoder, paced to the target
 /// rate: each tick encodes the *freshest* pending frame; a backlog is
 /// skipped, never transcoded late. Generic over the session's frame type
-/// (`raw` extracts RGBA + dimensions) so the platform backends — our DXGI
-/// duplication, xcap's recorders — share one pump. (The Wayland arm
+/// (`raw` extracts RGBA + dimensions) so the platform backends â€” our DXGI
+/// duplication, xcap's recorders â€” share one pump. (The Wayland arm
 /// calls [`pump_frames_with_stall`] directly: it's the one session a
 /// first-frame deadline applies to.)
 #[cfg(any(windows, target_os = "macos"))]
@@ -1583,14 +1597,14 @@ fn emit_packets(
 
 /// [`pump_frames`] with the first-frame-stall condition named by the
 /// caller: a frameless screen session is a dark display (worth wake
-/// pressure on the panel), a frameless camera is the camera failing —
+/// pressure on the panel), a frameless camera is the camera failing â€”
 /// different words to the viewer, and no point lighting the screen.
 /// `first_frame_deadline` bounds how long the session may stay
 /// frameless before the pump gives up with an error (so the caller can
 /// degrade to another capture path); `None` waits as long as the route
 /// lives. Only the first frame is ever held to it. `reclaim`, when the
 /// backend offers one, receives each source frame's buffer once the
-/// capture side is done with it — the backend copies the next frame into
+/// capture side is done with it â€” the backend copies the next frame into
 /// warm pages instead of a fresh demand-zeroed allocation.
 #[allow(clippy::too_many_arguments)]
 fn pump_frames_with_stall<T, X>(
@@ -1616,14 +1630,14 @@ where
 
     // The pump is a two-stage pipeline: THIS thread (capture side) drains
     // the backend, orients, and converts to the encode side's advertised
-    // layout, while a scoped encode thread runs the codec — so conversion
-    // of frame N overlaps the encode of frame N−1 instead of sharing one
+    // layout, while a scoped encode thread runs the codec â€” so conversion
+    // of frame N overlaps the encode of frame Nâˆ’1 instead of sharing one
     // 16.6 ms budget (the measured serial cost was the ~40 fps ceiling).
     // The stage channel is shallow and the encode side drains to freshest:
     // latency never accumulates, staleness is dropped. The encode side owns
     // the quiet-spell logic (quiesce IDR + refinement) since quiet is "no
     // staged frames", and publishes its input needs (layout + fit edge)
-    // through atomics the capture side reads per frame — a healing rebuild
+    // through atomics the capture side reads per frame â€” a healing rebuild
     // that changes either costs at most one dropped frame.
     let (initial_format, initial_edge) = encoder.current_needs();
     let need_format = AtomicU8::new(stage_need_to_u8(initial_format));
@@ -1631,7 +1645,7 @@ where
     let (stage_tx, stage_rx) = mpsc::sync_channel::<Staged>(2);
     // Spent multi-megabyte convert buffers ride back to the capture side for
     // reuse: steady state converts into already-touched pages instead of
-    // paying an OS large-allocation + demand-zeroing per frame per thread —
+    // paying an OS large-allocation + demand-zeroing per frame per thread â€”
     // the churn that measurably held the pipelined pump at the serial rate.
     let (spent_tx, spent_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     // Set by the encode side on ANY exit so the capture side never keeps
@@ -1664,7 +1678,7 @@ where
                 match stage_rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(mut staged) => {
                         // Freshest-wins: a backlog means we're behind; the
-                        // newest picture is the only one worth encoding —
+                        // newest picture is the only one worth encoding â€”
                         // and a displaced frame's buffer goes straight home.
                         // Displaced frames count as drops so the stats line
                         // shows "encode side behind" distinctly from frames
@@ -1693,8 +1707,8 @@ where
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         // The screen went QUIET (change-driven capture
                         // delivers nothing while nothing moves). Every
-                        // refresh mechanism — STATIC_REFRESH, the IDR
-                        // cadence, a viewer's refresh ask — lives inside
+                        // refresh mechanism â€” STATIC_REFRESH, the IDR
+                        // cadence, a viewer's refresh ask â€” lives inside
                         // `encode`, which no longer runs; so if the
                         // transport dropped the tail of the last motion
                         // burst, the viewer stays frozen BEHIND the true
@@ -1702,7 +1716,7 @@ where
                         // from the encoder's retained last picture: one
                         // clean re-emit per quiet spell (this first ~250 ms
                         // timeout is the quiesce debounce), plus one per
-                        // refresh ask that lands while quiet — then the
+                        // refresh ask that lands while quiet â€” then the
                         // refinement passes sharpen what the burst left
                         // coarse.
                         if !quiesced || encoder.wants_refresh() {
@@ -1757,7 +1771,7 @@ where
                     // from a sleeping screen, and even a still desktop hands
                     // over its first frame on connect. Keep wake pressure on
                     // the panel the whole frameless window (the pulse
-                    // rate-limits itself) — one polite wiggle at start
+                    // rate-limits itself) â€” one polite wiggle at start
                     // demonstrably isn't enough on Windows.
                     if !got_any {
                         if from_screen {
@@ -1798,7 +1812,7 @@ where
                     scale_spent: Duration::ZERO,
                 },
                 Some(format) => {
-                    // The convert indexes by dims — a short backend buffer
+                    // The convert indexes by dims â€” a short backend buffer
                     // must be dropped here, not panicked on (the encode
                     // side's own guard covers the RGBA lane).
                     if rgba.len() < (sw as usize) * (sh as usize) * 4 {
@@ -1821,7 +1835,7 @@ where
                         YuvFormat::Nv12 => scale_rgba_to_nv12_into(&rgba, sw, sh, dw, dh, &mut buf),
                     }
                     let scale_spent = t0.elapsed();
-                    // The source frame is spent — hand its pages back to the
+                    // The source frame is spent â€” hand its pages back to the
                     // capture backend if it runs a reclaim lane.
                     if let Some(reclaim) = reclaim {
                         reclaim(rgba);
@@ -1838,7 +1852,7 @@ where
             };
             // try_send: a full stage means the encode side is behind; this
             // frame is stale by definition and the next conversion carries
-            // a fresher picture — but its buffer is worth keeping.
+            // a fresher picture â€” but its buffer is worth keeping.
             if let Err(refused) = stage_tx.try_send(staged) {
                 let staged = match refused {
                     mpsc::TrySendError::Full(st) | mpsc::TrySendError::Disconnected(st) => st,
@@ -1854,7 +1868,7 @@ where
             }
         };
         // Hang up the stage so the encode side drains out, then surface its
-        // verdict — an encode-side death outranks a clean capture exit, and
+        // verdict â€” an encode-side death outranks a clean capture exit, and
         // the viewer hears why instead of a frozen frame.
         drop(stage_tx);
         let encoded = encode_side
@@ -1885,7 +1899,7 @@ where
 /// whenever the monitor library reported native (unrotated) dimensions, so the
 /// mismatch never fired. DXGI's rotation is the actual scan-out orientation and
 /// does not under-report, so it is trusted exclusively. Quarter-turns = deg/90,
-/// clockwise (`rotate_rgba`'s convention): ROTATE90→1, ROTATE270→3 — undoing
+/// clockwise (`rotate_rgba`'s convention): ROTATE90â†’1, ROTATE270â†’3 â€” undoing
 /// the display's counter-clockwise rotation (direction verified against the
 /// canonical DXGI Desktop Duplication sample's vertex transform).
 fn orient_to_monitor(rgba: Vec<u8>, bw: u32, bh: u32, rotation_deg: u32) -> (Vec<u8>, u32, u32) {
@@ -1895,12 +1909,12 @@ fn orient_to_monitor(rgba: Vec<u8>, bw: u32, bh: u32, rotation_deg: u32) -> (Vec
         return (rgba, bw, bh);
     }
     // A short buffer must never reach the rotator's indexing (a panic
-    // aborts the node under the release profile). Hand it back unrotated —
+    // aborts the node under the release profile). Hand it back unrotated â€”
     // the encoder's own length guard rejects it as a stream error.
     if rgba.len() < (bw as usize) * (bh as usize) * 4 {
         return (rgba, bw, bh);
     }
-    // rotate_rgba swaps dims for odd quarter-turns and preserves them for 180°.
+    // rotate_rgba swaps dims for odd quarter-turns and preserves them for 180Â°.
     let (rotated, ow, oh) = allmystuff_pixels::rotate_rgba(&rgba, bw, bh, turns);
     log_orient(rotation_deg, bw, bh, turns, ow, oh);
     (rotated, ow, oh)
@@ -1946,29 +1960,29 @@ fn gpu_lane_enabled() -> bool {
             })
             .unwrap_or(false);
         if off {
-            tracing::info!("ALLMYSTUFF_GPU_LANE off — GPU zero-copy lane disabled");
+            tracing::info!("ALLMYSTUFF_GPU_LANE off â€” GPU zero-copy lane disabled");
         }
         !off
     });
     *ON
 }
 
-/// How a GPU-lane run ended. Hard errors fold into `Fallback`'s reason —
+/// How a GPU-lane run ended. Hard errors fold into `Fallback`'s reason â€”
 /// the lane never takes the route down; the CPU path always gets its turn.
 #[cfg(windows)]
 enum GpuEnd {
-    /// The route was stopped — done.
+    /// The route was stopped â€” done.
     Stopped,
-    /// The lane's geometry went stale (mode change, edge-cap change) —
+    /// The lane's geometry went stale (mode change, edge-cap change) â€”
     /// start a fresh lane.
     Restart,
     /// The lane can't run here (rotated output, no capable MFT, persistent
-    /// encoder failure…) — use the CPU path, and say why.
+    /// encoder failureâ€¦) â€” use the CPU path, and say why.
     Fallback(String),
 }
 
 /// Opt-in for the direct-NVENC rung of the GPU lane
-/// (`ALLMYSTUFF_NVENC=1`). Default OFF until soaked — the MF rung is the
+/// (`ALLMYSTUFF_NVENC=1`). Default OFF until soaked â€” the MF rung is the
 /// proven default; flipping this on puts the SDK session first with the
 /// MF rung as its in-lane fallback.
 #[cfg(windows)]
@@ -1978,7 +1992,7 @@ fn nvenc_opt_in() -> bool {
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
             .unwrap_or(false);
         if on {
-            tracing::info!("ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled");
+            tracing::info!("ALLMYSTUFF_NVENC=1 â€” direct NVENC rung enabled");
         }
         on
     });
@@ -2016,7 +2030,7 @@ impl GpuCodec {
 }
 
 /// Open the best hardware H.264 MFT **on the lane's adapter**, bound to
-/// its device manager — the encoder must live where the textures live.
+/// its device manager â€” the encoder must live where the textures live.
 /// `None` when no MFT on that adapter accepts the manager and types.
 #[cfg(windows)]
 fn open_gpu_encoder(
@@ -2038,7 +2052,7 @@ fn open_gpu_encoder(
 
 /// One GPU-lane encoder error: skip, reopen, or give up per the shared
 /// [`RebuildPolicy`]. `Ok(Some(_))` = a fresh encoder (the caller arms the
-/// refresh flag — its first unit is an IDR); `Ok(None)` = skip this frame;
+/// refresh flag â€” its first unit is an IDR); `Ok(None)` = skip this frame;
 /// `Err(why)` = the lane is done, fall back.
 #[cfg(windows)]
 fn gpu_heal(
@@ -2070,7 +2084,7 @@ fn gpu_heal(
 /// The GPU zero-copy screen pump: frames arrive as NV12 *textures* from
 /// [`crate::win_capture::start_gpu`] (duplication, cursor composite, and
 /// colour conversion all on one D3D11 device) and go to a
-/// device-manager-bound hardware MFT that reads them in place — no CPU
+/// device-manager-bound hardware MFT that reads them in place â€” no CPU
 /// pixel work anywhere on the lane. Runs INSTEAD of the CPU pump when the
 /// chain comes up; every failure is soft (the caller falls back to the
 /// proven CPU path, which keeps its own healing ladder).
@@ -2107,7 +2121,7 @@ fn run_gpu_lane(
         .bitrate
         .unwrap_or_else(|| h264_bitrate_for(dw, dh, fps, tune.link))
         .clamp(250_000, 80_000_000);
-    let game = game_mode();
+    let game = tune.game();
     let mut enc = 'open: {
         if nvenc_opt_in() {
             // The SDK rung first: same textures, direct session, the
@@ -2125,12 +2139,12 @@ fn run_gpu_lane(
             None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
         }
     };
-    // GDR streams have no periodic-IDR cadence by design — the refresh
+    // GDR streams have no periodic-IDR cadence by design â€” the refresh
     // wave is the convergence mechanism; only explicit asks (viewer join,
     // quiesce rescue) force an IDR through.
     let gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
     tracing::info!(
-        "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
+        "GPU zero-copy lane for {route_id}: {} Â· {}Ã—{} fitted to {dw}Ã—{dh} Â· {:.1} Mbps @ {fps} fps",
         enc.label(),
         lane.src_size.0,
         lane.src_size.1,
@@ -2142,10 +2156,14 @@ fn run_gpu_lane(
     let started = Instant::now();
     let mut got_any = false;
     let mut policy = RebuildPolicy::new();
-    // The last successfully encoded frame, kept checked out so the quiet
-    // path can re-encode its texture (the slot only goes home when a newer
-    // frame replaces it — the capture side can't blt over it meanwhile).
-    let mut retained: Option<crate::win_capture::GpuFrame> = None;
+    // The last TWO successfully encoded frames, kept checked out: the
+    // newest is the quiet path's re-emit picture, and the depth-2
+    // retirement is the slot-race fix â€” the async MFT can still be
+    // reading frame Nâˆ’1's texture when N is fed, so Nâˆ’1's slot must not
+    // re-enter rotation until N+1 is consumed (the field symptom of the
+    // old one-deep hold was torn bands on window-open damage bursts).
+    let mut retained: std::collections::VecDeque<crate::win_capture::GpuFrame> =
+        std::collections::VecDeque::with_capacity(3);
     let mut last_idr: Option<Instant> = None;
     let mut last_emit: Option<Instant> = None;
     // Watchdog: an MFT that consumes frames but never produces a unit is a
@@ -2183,7 +2201,7 @@ fn run_gpu_lane(
                 );
                 if want != lane.out_size {
                     tracing::info!(
-                        "GPU lane for {route_id}: fitted size {}×{} -> {}×{} — rebuilding lane",
+                        "GPU lane for {route_id}: fitted size {}Ã—{} -> {}Ã—{} â€” rebuilding lane",
                         lane.out_size.0,
                         lane.out_size.1,
                         want.0,
@@ -2205,13 +2223,16 @@ fn run_gpu_lane(
                     Ok(outcome) => {
                         stats.add_encode(t1.elapsed());
                         if outcome.consumed {
-                            if let Some(old) = retained.replace(frame) {
-                                let _ = lane.release.try_send(old.slot);
+                            retained.push_back(frame);
+                            while retained.len() > 2 {
+                                if let Some(old) = retained.pop_front() {
+                                    let _ = lane.release.try_send(old.slot);
+                                }
                             }
                         } else {
                             let _ = lane.release.try_send(frame.slot);
                             if refresh_asked {
-                                // Not served — re-arm for the next tick
+                                // Not served â€” re-arm for the next tick
                                 // (see `encode_prepared`'s twin).
                                 refresh.store(true, Ordering::SeqCst);
                             }
@@ -2245,7 +2266,7 @@ fn run_gpu_lane(
                             open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
                         }) {
                             Ok(Some(next)) => {
-                                // A heal always lands on the MF rung — a
+                                // A heal always lands on the MF rung â€” a
                                 // failing SDK session steps down rather
                                 // than retrying itself.
                                 enc = GpuCodec::Mf(next);
@@ -2272,11 +2293,11 @@ fn run_gpu_lane(
                     }
                     continue;
                 }
-                // Quiet spell: serve convergence from the retained last
-                // texture — one clean IDR per spell (plus any refresh ask
+                // Quiet spell: serve convergence from the newest retained
+                // texture â€” one clean IDR per spell (plus any refresh ask
                 // that lands while quiet), then the refinement passes
                 // sharpen what the burst left coarse (the CPU pump's twin).
-                let Some(kept) = &retained else {
+                let Some(kept) = retained.back() else {
                     continue;
                 };
                 if !quiesced || refresh.load(Ordering::SeqCst) {
@@ -2379,7 +2400,7 @@ fn run_gpu_lane(
 }
 
 /// Stream from xcap's persistent AVFoundation capture session. Set-up
-/// happens once; frames arrive as the OS produces them — damage-driven
+/// happens once; frames arrive as the OS produces them â€” damage-driven
 /// backends send nothing while the screen is still. (Wayland rides
 /// `wayland_capture` instead; X11 prefers the paced one-shot loop.)
 #[cfg(target_os = "macos")]
@@ -2413,11 +2434,11 @@ fn run_session_capture(
     result
 }
 
-/// One screenshot per tick — the X11 path and the universal fallback.
+/// One screenshot per tick â€” the X11 path and the universal fallback.
 /// Every grab pays the platform's full one-shot cost, so the effective
 /// rate is whatever that path allows; the encoder's unchanged-frame gate
 /// at least makes idle screens cheap to *send*. When `retry_capture_after`
-/// is set, the loop returns `Ok(true)` once that long has passed — the
+/// is set, the loop returns `Ok(true)` once that long has passed â€” the
 /// caller's cue to re-attempt a real capture session; `Ok(false)` means the
 /// route stopped.
 #[allow(clippy::too_many_arguments)]
@@ -2445,7 +2466,7 @@ fn run_oneshot_capture(
         // Grab failures and encoder failures are different conditions with
         // different fates: a failing grab (screen lock, denied permission)
         // loops in hope, while an encoder the healer gave up on ends the
-        // stream — looping full-rate screenshots into a dead encoder is the
+        // stream â€” looping full-rate screenshots into a dead encoder is the
         // zombie-stream failure this used to produce.
         match monitor.capture_image() {
             Ok(image) => {
@@ -2467,11 +2488,11 @@ fn run_oneshot_capture(
             Err(e) => {
                 let e = e.to_string();
                 // A transient grab failure (screen lock, monitor sleep)
-                // shouldn't end the stream — but a *persistent* one (a
+                // shouldn't end the stream â€” but a *persistent* one (a
                 // denied screen-recording permission, a Wayland portal
                 // that never granted) must be loud, not a debug whisper:
                 // it reads as "connected but no pixels" at the far end.
-                // The viewer hears it too, in-band — and the panel keeps
+                // The viewer hears it too, in-band â€” and the panel keeps
                 // getting wake pressure in case sleep is the whole story.
                 wake::force_display_on();
                 failures += 1;
@@ -2493,7 +2514,7 @@ fn run_oneshot_capture(
 
 /// The monitor a capture should run on: by enumeration id when the route
 /// names one, else the primary. A named monitor that's gone (unplugged
-/// since the scan) degrades to the primary with a note — a stream beats
+/// since the scan) degrades to the primary with a note â€” a stream beats
 /// an error.
 fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
@@ -2516,7 +2537,7 @@ fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
 }
 
 /// Every monitor beyond the primary, as `(id, label)` for the bridge's
-/// per-monitor `screen:<id>` capabilities — so a multi-monitor machine
+/// per-monitor `screen:<id>` capabilities â€” so a multi-monitor machine
 /// gets one console tab per screen. The primary stays the synthetic
 /// `screen` capability (and the universal fallback), so a single-monitor
 /// machine advertises exactly what it did before. Ids are xcap's own
@@ -2545,7 +2566,7 @@ pub fn extra_screens() -> Vec<allmystuff_bridge::ScreenSource> {
             let label = if name.is_empty() {
                 format!("Screen {}", i + 1)
             } else {
-                format!("Screen — {name}")
+                format!("Screen â€” {name}")
             };
             Some(allmystuff_bridge::ScreenSource { id, label })
         })
@@ -2555,7 +2576,7 @@ pub fn extra_screens() -> Vec<allmystuff_bridge::ScreenSource> {
 /// The downscale + JPEG stage of one route's stream, with the
 /// unchanged-frame gate: pixels identical to the last send (compared
 /// post-downscale, where the buffer is small) return `None` instead of
-/// burning an encode on a picture the viewer already has — refreshed every
+/// burning an encode on a picture the viewer already has â€” refreshed every
 /// [`STATIC_REFRESH`] regardless. Owns the stream's `seq`, which counts
 /// *sent* frames (the receiver logs its first frame as `seq == 0`).
 struct FrameEncoder {
@@ -2565,12 +2586,12 @@ struct FrameEncoder {
     prev_size: (u32, u32),
     last_sent: Option<Instant>,
     max_edge: u32,
-    /// JPEG quality this stream encodes at — the Rate pill, mapped through
+    /// JPEG quality this stream encodes at â€” the Rate pill, mapped through
     /// [`Tune::jpeg_quality`] (MJPEG's stand-in for a bitrate).
     quality: u8,
     /// The route's one-shot "resend now" flag (a viewer asked).
     refresh: Arc<AtomicBool>,
-    /// The receiver-driven resolution cap — read per frame, min'd with
+    /// The receiver-driven resolution cap â€” read per frame, min'd with
     /// `max_edge` (see [`AutoAdapt`]).
     auto: Arc<AutoAdapt>,
 }
@@ -2633,8 +2654,8 @@ impl FrameEncoder {
 
     /// Re-encode the retained last picture. The pump's rescue for a screen
     /// that has gone QUIET: change-driven capture delivers nothing, so
-    /// `encode` — and with it [`STATIC_REFRESH`] and any viewer refresh
-    /// ask — never runs. Consumes a pending ask; emits at most one frame.
+    /// `encode` â€” and with it [`STATIC_REFRESH`] and any viewer refresh
+    /// ask â€” never runs. Consumes a pending ask; emits at most one frame.
     fn re_emit(&mut self, stats: &mut StreamStats) -> Result<Option<VideoFrame>, String> {
         if self.prev.is_empty() || self.prev_size == (0, 0) {
             return Ok(None);
@@ -2656,7 +2677,7 @@ impl FrameEncoder {
 /// How many encoder rebuilds a stream may spend inside one
 /// [`REBUILD_WINDOW`] before the healer gives up and ends the route.
 const REBUILD_MAX: u32 = 3;
-/// The window rebuild attempts are counted in — long enough that a
+/// The window rebuild attempts are counted in â€” long enough that a
 /// once-in-a-while driver hiccup never exhausts the budget, short enough
 /// that a truly dead encoder stops burning rebuild cycles.
 const REBUILD_WINDOW: Duration = Duration::from_secs(120);
@@ -2665,7 +2686,7 @@ const REBUILD_WINDOW: Duration = Duration::from_secs(120);
 /// blocked on), keeping the capture thread responsive to stop.
 const REBUILD_SPACING: Duration = Duration::from_secs(2);
 
-/// What to do about one encoder error — pure state, unit-testable.
+/// What to do about one encoder error â€” pure state, unit-testable.
 struct RebuildPolicy {
     window_start: Option<Instant>,
     rebuilds_in_window: u32,
@@ -2675,9 +2696,9 @@ struct RebuildPolicy {
 enum PolicyVerdict {
     /// Rebuild the encoder now.
     Rebuild,
-    /// Too soon since the last rebuild — skip this frame, retry next tick.
+    /// Too soon since the last rebuild â€” skip this frame, retry next tick.
     SkipFrame,
-    /// The budget is spent — the stream ends with the error.
+    /// The budget is spent â€” the stream ends with the error.
     GiveUp,
 }
 
@@ -2715,7 +2736,7 @@ impl RebuildPolicy {
 
 /// [`StreamEncoder`] with self-healing: a backend error mid-stream rebuilds
 /// the codec through the full ladder (falling to the MJPEG floor if H.264
-/// can't come back) instead of ending — or worse, zombifying — the route.
+/// can't come back) instead of ending â€” or worse, zombifying â€” the route.
 /// The failure this buries: one transient MFT/driver error (a TDR under GPU
 /// load, a driver update) used to demote the stream to per-frame GDI
 /// screenshots fed into a permanently dead encoder, looping `GrabFailed`
@@ -2803,7 +2824,7 @@ impl HealingEncoder {
         }
     }
 
-    /// [`StreamEncoder::encode_staged`] with the healing wrap — the
+    /// [`StreamEncoder::encode_staged`] with the healing wrap â€” the
     /// pipelined pump's encode-side entry point.
     fn encode_staged(
         &mut self,
@@ -2821,7 +2842,7 @@ impl HealingEncoder {
         }
     }
 
-    /// See [`StreamEncoder::current_needs`] — republished by the encode
+    /// See [`StreamEncoder::current_needs`] â€” republished by the encode
     /// side after every encode so the capture side tracks rebuilds.
     fn current_needs(&self) -> (Option<YuvFormat>, u32) {
         self.enc.current_needs()
@@ -2874,7 +2895,7 @@ impl HealingEncoder {
     }
 }
 
-/// One route's encoder for the negotiated transport — with the rule that
+/// One route's encoder for the negotiated transport â€” with the rule that
 /// an encoder that can't init (openh264 build/runtime trouble) must cost
 /// quality, not the stream: fall back to MJPEG and say so.
 #[allow(clippy::too_many_arguments)]
@@ -2913,9 +2934,9 @@ enum Prepared {
     Yuv(YuvFormat, Vec<u8>),
 }
 
-/// One staged frame crossing the pipelined pump's channel — the seam that
+/// One staged frame crossing the pipelined pump's channel â€” the seam that
 /// lets the capture side convert frame N while the encode side encodes
-/// frame N−1.
+/// frame Nâˆ’1.
 struct Staged {
     frame: Prepared,
     /// Prepared-buffer dims (fitted for `Yuv`; the raw capture dims for
@@ -2925,7 +2946,7 @@ struct Staged {
     /// Raw capture dims.
     sw: u32,
     sh: u32,
-    /// Time the capture side spent converting — accounted into the encode
+    /// Time the capture side spent converting â€” accounted into the encode
     /// side's stats, which own the dial-in log line.
     scale_spent: Duration,
 }
@@ -2980,7 +3001,7 @@ impl StreamEncoder {
         auto: &Arc<AutoAdapt>,
     ) -> Result<Self, String> {
         match mode {
-            // MJPEG is stateless — no keyframes — so the adaptive IDR cadence
+            // MJPEG is stateless â€” no keyframes â€” so the adaptive IDR cadence
             // doesn't apply; only the H.264 stream reads `idr_ms`.
             VideoMode::Mjpeg => Ok(StreamEncoder::Mjpeg(FrameEncoder::new(
                 route_id,
@@ -3006,7 +3027,7 @@ impl StreamEncoder {
         stats: &mut StreamStats,
     ) -> Result<Vec<VideoPacket>, String> {
         // A backend that hands over fewer bytes than its stated dimensions
-        // imply must cost an error, not an out-of-bounds panic downstream —
+        // imply must cost an error, not an out-of-bounds panic downstream â€”
         // the release profile is `panic = "abort"`, so a panic on this
         // thread kills the whole node. The healer turns this into a skipped
         // frame / rebuild / clean route end instead.
@@ -3027,7 +3048,7 @@ impl StreamEncoder {
         }
     }
 
-    /// Whether a viewer's one-shot refresh ask is pending — peeked, not
+    /// Whether a viewer's one-shot refresh ask is pending â€” peeked, not
     /// consumed (`encode`/`re_emit` consume it). Lets the pump serve an ask
     /// that lands while the screen is quiet and no frames reach `encode`.
     fn wants_refresh(&self) -> bool {
@@ -3037,10 +3058,10 @@ impl StreamEncoder {
         }
     }
 
-    /// Re-emit the retained last picture — with `force_idr` the pump's
+    /// Re-emit the retained last picture â€” with `force_idr` the pump's
     /// convergence rescue for a quiet screen (a clean IDR on H.264, a plain
     /// resend on MJPEG), without it a post-quiesce quality-refinement pass
-    /// (H.264 only — re-encoding identical pixels to JPEG produces the same
+    /// (H.264 only â€” re-encoding identical pixels to JPEG produces the same
     /// bytes, so the MJPEG arm only answers the forced form).
     fn re_emit(
         &mut self,
@@ -3063,8 +3084,8 @@ impl StreamEncoder {
     }
 
     /// Encode one capture-side-staged frame. A staging that doesn't match
-    /// the current arm (a healing rebuild swapped H.264↔MJPEG, or a format
-    /// change raced the producer) drops that one frame — the producer
+    /// the current arm (a healing rebuild swapped H.264â†”MJPEG, or a format
+    /// change raced the producer) drops that one frame â€” the producer
     /// re-reads [`Self::current_needs`] and the next frame lands right.
     fn encode_staged(
         &mut self,
@@ -3104,7 +3125,7 @@ impl StreamEncoder {
         }
     }
 
-    /// What the capture side should stage next: `(layout, fit edge)` —
+    /// What the capture side should stage next: `(layout, fit edge)` â€”
     /// `None` = raw RGBA (the MJPEG floor), else the 4:2:0 layout the
     /// backend ingests plus the effective edge to fit to.
     fn current_needs(&self) -> (Option<YuvFormat>, u32) {
@@ -3115,7 +3136,7 @@ impl StreamEncoder {
     }
 }
 
-/// The H.264 encode stage of one route's stream — openh264 in
+/// The H.264 encode stage of one route's stream â€” openh264 in
 /// screen-content mode, scaled to the [`h264_max_edge`] ceiling (even
 /// dimensions for 4:2:0, native up to 4K by default), with the same
 /// unchanged-frame gate as MJPEG and a forced IDR on an adaptive cadence
@@ -3123,16 +3144,16 @@ impl StreamEncoder {
 /// a decode entry point within seconds. A resolution change (monitor swap)
 /// re-initializes the encoder inside openh264; the next unit out is an IDR.
 struct H264Stream {
-    /// The active H.264 backend — a hardware encoder (Media Foundation's GPU
+    /// The active H.264 backend â€” a hardware encoder (Media Foundation's GPU
     /// H.264 MFT on Windows; NVENC/AMF/QSV/VideoToolbox/VA-API via FFmpeg on
     /// Linux/macOS) when one passed the frame-send test, else software openh264.
     /// Rebuilt (re-laddered) on a resize.
     codec: Box<dyn H264Codec>,
     /// The fitted size the current encoder's bitrate was budgeted for.
     /// The first real frame (or a monitor swap) that fits to a different
-    /// size rebuilds the encoder with a corrected budget — monitor
+    /// size rebuilds the encoder with a corrected budget â€” monitor
     /// *reports* are logical pixels on HiDPI while captures are physical,
-    /// and a 4× pixel gap on the same budget is a mush stream.
+    /// and a 4Ã— pixel gap on the same budget is a mush stream.
     budget_size: (u32, u32),
     tune: Tune,
     fps: u32,
@@ -3141,7 +3162,7 @@ struct H264Stream {
     last_sent: Option<Instant>,
     last_idr: Option<Instant>,
     /// Wall-clock instant of the last *emitted* access unit. The RTP duration of
-    /// the next unit is the real gap since this — not a nominal 1/fps — so the
+    /// the next unit is the real gap since this â€” not a nominal 1/fps â€” so the
     /// 90 kHz clock tracks wall-clock across static-skip gaps (a 2 s idle then
     /// motion gets a ~2 s duration, not 1/fps), instead of lagging and churning
     /// the viewer's jitter buffer on motion onset.
@@ -3153,7 +3174,7 @@ struct H264Stream {
     /// [`IDR_MS_TIGHT`].
     idr_ms: Arc<AtomicU64>,
     /// The receiver-driven resolution cap ([`AutoAdapt`]), min'd with the
-    /// tuned edge per frame — a changed fit re-inits the encoder through the
+    /// tuned edge per frame â€” a changed fit re-inits the encoder through the
     /// budget-size rebuild below, no capture restart.
     auto: Arc<AutoAdapt>,
 }
@@ -3168,7 +3189,7 @@ impl H264Stream {
     ) -> Result<Self, String> {
         let fps = tune.fps();
         // Pre-budget from the monitor's report fitted to the edge
-        // ceiling (unknown → 1080p, the old fixed default's density);
+        // ceiling (unknown â†’ 1080p, the old fixed default's density);
         // the first real frame corrects it if the capture's true size
         // differs.
         let auto_capped_edge = match auto.edge_cap() {
@@ -3215,7 +3236,7 @@ impl H264Stream {
         }
         let (dw, dh) = fit_within_even(sw, sh, self.effective_edge());
         // Downscale and convert straight to the backend's native 4:2:0
-        // layout in one fused pass — no RGB intermediate, no encoder-side
+        // layout in one fused pass â€” no RGB intermediate, no encoder-side
         // re-interleave (hardware MFTs ingest NV12 directly). The
         // unchanged-frame compare also runs on the small 1.5-byte/pixel
         // buffer instead of 3-byte RGB.
@@ -3234,11 +3255,11 @@ impl H264Stream {
     /// pipelined pump converts on the capture side and feeds this directly,
     /// overlapping conversion with the previous frame's encode; the
     /// single-threaded paths go through [`Self::encode`]. `format` names
-    /// the layout `yuv` was converted for — if a rebuild inside this call
+    /// the layout `yuv` was converted for â€” if a rebuild inside this call
     /// (or a producer race) leaves the backend wanting a different layout,
     /// the frame is dropped rather than fed as the wrong chroma order.
-    /// Every buffer this call is finished with — a skipped frame, or the
-    /// previous retained picture a consumed frame displaces — goes to
+    /// Every buffer this call is finished with â€” a skipped frame, or the
+    /// previous retained picture a consumed frame displaces â€” goes to
     /// `recycle`, which the pipelined pump routes back to the capture side
     /// so steady state converts into reused pages instead of allocating
     /// megabytes per frame.
@@ -3255,7 +3276,7 @@ impl H264Stream {
             recycle(yuv);
             return Ok(Vec::new());
         }
-        // The real fitted size is known now — if it differs from what the
+        // The real fitted size is known now â€” if it differs from what the
         // bitrate was budgeted for (HiDPI monitors *report* logical pixels
         // but *capture* physical ones), rebuild the encoder on a corrected
         // budget. Its first unit out is an IDR. The retained compare buffer
@@ -3292,7 +3313,7 @@ impl H264Stream {
         // (see `adaptive_idr_ms`). Default `IDR_MS_TIGHT` = the old fixed 2 s.
         let idr_every = Duration::from_millis(self.idr_ms.load(Ordering::Relaxed));
         let force_idr = refresh_asked || self.last_idr.is_none_or(|idr| idr.elapsed() >= idr_every);
-        // Hand the frame to whichever backend the ladder selected — hardware
+        // Hand the frame to whichever backend the ladder selected â€” hardware
         // or software. It returns every access unit it had ready (a loaded
         // hardware pipeline may hand back a small backlog) and whether it
         // actually accepted this frame.
@@ -3309,7 +3330,7 @@ impl H264Stream {
             recycle(yuv);
             if refresh_asked {
                 // The frame never entered a stalled encoder, so the viewer's
-                // ask wasn't served — re-arm it for the next tick instead of
+                // ask wasn't served â€” re-arm it for the next tick instead of
                 // silently eating it. (`prev` deliberately stays untouched:
                 // the same content must not be static-skipped on the retry.)
                 self.refresh.store(true, Ordering::SeqCst);
@@ -3318,11 +3339,11 @@ impl H264Stream {
         Ok(self.packetize(outcome.units, stats))
     }
 
-    /// Re-encode the retained last picture — a forced, clean IDR when
+    /// Re-encode the retained last picture â€” a forced, clean IDR when
     /// `force_idr` (the pump's convergence rescue for a screen that went
     /// QUIET: change-driven capture delivers nothing while nothing moves, so
-    /// `encode` — and with it [`STATIC_REFRESH`], the IDR cadence and any
-    /// viewer refresh ask — never runs, and whatever the transport dropped at
+    /// `encode` â€” and with it [`STATIC_REFRESH`], the IDR cadence and any
+    /// viewer refresh ask â€” never runs, and whatever the transport dropped at
     /// the tail of the last burst stays wrong on the viewer until the next
     /// motion), or a plain re-encode otherwise (the post-quiesce quality
     /// refinement: identical input lets rate control spend idle bandwidth
@@ -3351,7 +3372,7 @@ impl H264Stream {
         Ok(self.packetize(outcome.units, stats))
     }
 
-    /// See [`packetize_units`] — bound to this stream's clock state.
+    /// See [`packetize_units`] â€” bound to this stream's clock state.
     fn packetize(
         &mut self,
         units: Vec<(Vec<u8>, bool)>,
@@ -3368,7 +3389,7 @@ impl H264Stream {
 }
 
 /// Stamp drained units into wire packets: keyframe/byte accounting, and
-/// the RTP duration — the real wall-clock gap since the last emitted unit
+/// the RTP duration â€” the real wall-clock gap since the last emitted unit
 /// (so the 90 kHz clock tracks wall-clock across static-skip gaps),
 /// clamped to [1/2fps, 5 s] and split evenly across a drained backlog.
 /// First-ever unit uses the nominal 1/fps. Free-standing because two
@@ -3410,28 +3431,28 @@ fn packetize_units(
         .collect()
 }
 
-/// Byte cap for one paced burst — the slice pacer's grain. Encoders are
+/// Byte cap for one paced burst â€” the slice pacer's grain. Encoders are
 /// asked to cap slices at this (NVENC `sliceMode=1`, the MF codec API,
 /// openh264 `max_slice_len`), and the send-side splitter groups NALs into
-/// chunks of at most this many bytes. ≈20 RTP packets ≈ 0.25 ms of line
-/// rate per burst — the shape a shallow bottleneck queue absorbs without
+/// chunks of at most this many bytes. â‰ˆ20 RTP packets â‰ˆ 0.25 ms of line
+/// rate per burst â€” the shape a shallow bottleneck queue absorbs without
 /// tail drops.
 pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 
 /// Opt-in for the app-side slice pacer (`ALLMYSTUFF_PACED_SLICES=1`),
 /// default OFF until soaked. When on: encoders emit byte-capped slices
 /// and the mesh forwarder writes each slice group as its own track send
-/// with a small gap — one keyframe's 200-packet wall becomes a handful
+/// with a small gap â€” one keyframe's 200-packet wall becomes a handful
 /// of spaced ~20-packet bursts, with zero MyOwnMesh involvement (its
 /// reassembler emits per marker and its contiguity anchor spans the
-/// split writes — verified against the daemon's `H264AuAssembler`).
+/// split writes â€” verified against the daemon's `H264AuAssembler`).
 pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let on = std::env::var("ALLMYSTUFF_PACED_SLICES")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
             .unwrap_or(false);
         if on {
-            tracing::info!("ALLMYSTUFF_PACED_SLICES=1 — app-side slice pacing enabled");
+            tracing::info!("ALLMYSTUFF_PACED_SLICES=1 â€” app-side slice pacing enabled");
         }
         on
     });
@@ -3442,10 +3463,10 @@ pub(crate) fn paced_slices_enabled() -> bool {
 /// bytes, cutting **only** at slice-NAL boundaries (types 1 and 5) so
 /// every chunk is independently feedable to a decoder, and gluing any
 /// parameter-set/SEI run (SPS/PPS/AUD/SEI) to the slice that follows it
-/// — a chunk never strands a slice from its headers. Returns contiguous
+/// â€” a chunk never strands a slice from its headers. Returns contiguous
 /// ranges that concatenate back to `data` byte-identically; a unit whose
 /// single slice exceeds the cap stays whole (slice granularity is the
-/// floor — the encoder-side slice cap is what makes real splits exist).
+/// floor â€” the encoder-side slice cap is what makes real splits exist).
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
     // Walk the start codes (00 00 01 and 00 00 00 01), recording each
     // NAL's offset and type.
@@ -3505,7 +3526,7 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
 
 /// The H.264 edge a frame fits to right now: the tuned ceiling, capped by
 /// the receiver-driven auto-adapt when it's active. Shared by
-/// [`H264Stream`] and the GPU lane (which re-fits — and rebuilds — when
+/// [`H264Stream`] and the GPU lane (which re-fits â€” and rebuilds â€” when
 /// this changes under it).
 fn effective_h264_edge(tune: Tune, auto: &AutoAdapt) -> u32 {
     match auto.edge_cap() {
@@ -3515,8 +3536,8 @@ fn effective_h264_edge(tune: Tune, auto: &AutoAdapt) -> u32 {
 }
 
 /// A borrowing view over a contiguous I420 buffer (Y, then U, then V) that
-/// satisfies openh264's `YUVSource` — lets [`H264Stream::encode`] hand the
-/// planes straight to the encoder with no copy and no RGB→YUV step.
+/// satisfies openh264's `YUVSource` â€” lets [`H264Stream::encode`] hand the
+/// planes straight to the encoder with no copy and no RGBâ†’YUV step.
 struct I420Frame<'a> {
     buf: &'a [u8],
     w: usize,
@@ -3546,17 +3567,17 @@ impl openh264::formats::YUVSource for I420Frame<'_> {
 }
 
 /// One encode call's outcome from a backend: every access unit it had ready
-/// (**oldest first** — a loaded hardware encoder may hand back a small
+/// (**oldest first** â€” a loaded hardware encoder may hand back a small
 /// backlog), and whether THIS call's input frame actually entered the
 /// encoder.
 ///
 /// The two fields exist because hardware pipelines decouple input from
 /// output. Returning *all* drained units is what keeps the P-frame chain
-/// intact — the old single-unit seam made a backlogged pump overwrite (and
+/// intact â€” the old single-unit seam made a backlogged pump overwrite (and
 /// so silently drop) reference frames, which the viewer experienced as
 /// smearing until the next IDR. `consumed: false` means a stalled input
 /// queue accepted nothing: the caller must not treat the frame's content as
-/// sent (or a pending refresh ask as served) — the next capture re-offers
+/// sent (or a pending refresh ask as served) â€” the next capture re-offers
 /// the same pixels.
 pub(crate) struct EncodeOutcome {
     /// Drained Annex-B access units + their keyframe flags, oldest first.
@@ -3578,13 +3599,13 @@ impl EncodeOutcome {
 }
 
 /// The 4:2:0 layout a backend ingests. The stream converts captured RGBA
-/// straight to this in one fused pass — producing the backend's native
+/// straight to this in one fused pass â€” producing the backend's native
 /// layout directly deletes a whole per-frame chroma re-interleave.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum YuvFormat {
-    /// Y plane, then U, then V — openh264's shape.
+    /// Y plane, then U, then V â€” openh264's shape.
     I420,
-    /// Y plane, then interleaved U/V — what hardware H.264 MFTs ingest.
+    /// Y plane, then interleaved U/V â€” what hardware H.264 MFTs ingest.
     Nv12,
 }
 
@@ -3602,7 +3623,7 @@ trait H264Codec: Send {
     /// Encode one contiguous 4:2:0 frame laid out per
     /// [`Self::input_format`]. `force_idr` requests a keyframe. Returns
     /// every unit the backend had ready plus whether the input was accepted
-    /// — see [`EncodeOutcome`].
+    /// â€” see [`EncodeOutcome`].
     fn encode_yuv(
         &mut self,
         yuv: &[u8],
@@ -3610,11 +3631,11 @@ trait H264Codec: Send {
         h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String>;
-    /// Human label for logs ("openh264 (software)", "h264_nvenc", …).
+    /// Human label for logs ("openh264 (software)", "h264_nvenc", â€¦).
     fn label(&self) -> &str;
 }
 
-/// Software openh264 — the guaranteed floor of the ladder.
+/// Software openh264 â€” the guaranteed floor of the ladder.
 struct OpenH264Codec(openh264::encoder::Encoder);
 
 impl H264Codec for OpenH264Codec {
@@ -3645,7 +3666,7 @@ impl H264Codec for OpenH264Codec {
 }
 
 /// Media Foundation hardware backend (NVENC/QuickSync/AMD via the OS's H.264
-/// MFT) — the Windows hardware path, no FFmpeg toolchain. Thin wrapper so the
+/// MFT) â€” the Windows hardware path, no FFmpeg toolchain. Thin wrapper so the
 /// inherent methods on `mediafoundation::MediaFoundationH264` don't clash with
 /// the trait.
 #[cfg(windows)]
@@ -3653,7 +3674,7 @@ struct MfCodec(crate::mediafoundation::MediaFoundationH264);
 
 #[cfg(windows)]
 impl H264Codec for MfCodec {
-    /// NV12 straight from the fused scaler — the MFT's native layout, no
+    /// NV12 straight from the fused scaler â€” the MFT's native layout, no
     /// encoder-side re-interleave.
     fn input_format(&self) -> YuvFormat {
         YuvFormat::Nv12
@@ -3665,7 +3686,7 @@ impl H264Codec for MfCodec {
         _h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String> {
-        // The MFT is fixed to the size it was opened at — the same (dw, dh) the
+        // The MFT is fixed to the size it was opened at â€” the same (dw, dh) the
         // ladder built it for; `H264Stream` rebuilds on resize.
         self.0.encode_nv12(yuv, force_idr)
     }
@@ -3674,7 +3695,7 @@ impl H264Codec for MfCodec {
     }
 }
 
-/// VideoToolbox hardware backend — the Mac's media engine, no FFmpeg
+/// VideoToolbox hardware backend â€” the Mac's media engine, no FFmpeg
 /// toolchain (see `videotoolbox.rs`). Thin wrapper so the inherent methods
 /// don't clash with the trait.
 #[cfg(target_os = "macos")]
@@ -3689,7 +3710,7 @@ impl H264Codec for VtCodec {
         _h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String> {
-        // The session is fixed to the size it was opened at — the same
+        // The session is fixed to the size it was opened at â€” the same
         // (dw, dh) the ladder built it for; `H264Stream` rebuilds on resize.
         // Input stays I420 (the default `input_format`): the CVPixelBuffer
         // is planar y420.
@@ -3715,7 +3736,7 @@ impl H264Codec for FfmpegCodec {
         _h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String> {
-        // The FFmpeg encoder is fixed to the size it was opened at — the same
+        // The FFmpeg encoder is fixed to the size it was opened at â€” the same
         // (dw, dh) the ladder built it for; `H264Stream` rebuilds on resize.
         // Input stays I420 (the default `input_format`): the AVFrame planes
         // are planar YUV420P.
@@ -3726,8 +3747,8 @@ impl H264Codec for FfmpegCodec {
     }
 }
 
-/// Build the best H.264 backend for `bw`×`bh` at `fps`: walk the platform's
-/// hardware candidates (NVENC first), open each and **frame-send-test** it —
+/// Build the best H.264 backend for `bw`Ã—`bh` at `fps`: walk the platform's
+/// hardware candidates (NVENC first), open each and **frame-send-test** it â€”
 /// the first that actually emits an access unit wins. Anything that won't open
 /// or won't produce a frame (no GPU, driver/permission/session-cap trouble) is
 /// stepped over, down to software openh264, which is the guaranteed floor.
@@ -3751,14 +3772,14 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                     let mut codec = MfCodec(enc);
                     if codec_emits_frame(&mut codec, bw, bh) {
                         tracing::info!(
-                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps (Media Foundation)",
+                            "H.264 hardware encoder: {} Â· {bw}Ã—{bh} Â· {:.1} Mbps @ {fps} fps (Media Foundation)",
                             codec.label(),
                             bitrate as f64 / 1e6
                         );
                         return Ok(Box::new(codec));
                     }
                     tracing::info!(
-                        "H.264 encoder {} opened but produced no frame in the send test — stepping down",
+                        "H.264 encoder {} opened but produced no frame in the send test â€” stepping down",
                         codec.label()
                     );
                 }
@@ -3766,7 +3787,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
             }
         }
     }
-    // macOS: the media engine via VideoToolbox — hardware required (its
+    // macOS: the media engine via VideoToolbox â€” hardware required (its
     // software fallback would just be a slower openh264), frame-send-tested
     // like every rung. This is what takes a Retina Mac host off software
     // openh264, the encoder the viewer experienced as a slideshow.
@@ -3781,14 +3802,14 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                 let mut codec = VtCodec(enc);
                 if codec_emits_frame(&mut codec, bw, bh) {
                     tracing::info!(
-                        "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                        "H.264 hardware encoder: {} Â· {bw}Ã—{bh} Â· {:.1} Mbps @ {fps} fps",
                         codec.label(),
                         bitrate as f64 / 1e6
                     );
                     return Ok(Box::new(codec));
                 }
                 tracing::info!(
-                    "VideoToolbox opened but produced no frame in the send test — stepping down"
+                    "VideoToolbox opened but produced no frame in the send test â€” stepping down"
                 );
             }
             Err(e) => tracing::debug!("VideoToolbox H.264 unavailable: {e}"),
@@ -3806,14 +3827,14 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                     let mut codec = FfmpegCodec(enc);
                     if codec_emits_frame(&mut codec, bw, bh) {
                         tracing::info!(
-                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                            "H.264 hardware encoder: {} Â· {bw}Ã—{bh} Â· {:.1} Mbps @ {fps} fps",
                             codec.label(),
                             bitrate as f64 / 1e6
                         );
                         return Ok(Box::new(codec));
                     }
                     tracing::info!(
-                        "H.264 encoder {name} opened but produced no frame in the send test — stepping down"
+                        "H.264 encoder {name} opened but produced no frame in the send test â€” stepping down"
                     );
                 }
                 Err(e) => tracing::debug!("H.264 encoder {name} unavailable: {e}"),
@@ -3822,7 +3843,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     }
     let codec: Box<dyn H264Codec> = Box::new(OpenH264Codec(make_h264_encoder(bw, bh, fps, tune)?));
     tracing::info!(
-        "H.264 software encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+        "H.264 software encoder: {} Â· {bw}Ã—{bh} Â· {:.1} Mbps @ {fps} fps",
         codec.label(),
         tune.bitrate
             .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
@@ -3842,14 +3863,14 @@ fn codec_emits_frame(codec: &mut dyn H264Codec, w: u32, h: u32) -> bool {
     // Generous attempt count: each call waits only the short async grace, so
     // on a GPU that's busy with other work (the very situation the stream is
     // for) output can lag several calls behind. The probe runs once per
-    // stream start — a few hundred slow-path ms here is cheap next to
+    // stream start â€” a few hundred slow-path ms here is cheap next to
     // wrongly demoting a loaded-but-working hardware encoder to software.
     for _ in 0..10 {
         // All-128 bytes are a valid neutral-grey frame in both 4:2:0
         // layouts, so the probe needn't care which the backend ingests.
         match codec.encode_yuv(&grey, w, h, true) {
             Ok(o) if o.units.iter().any(|(d, _)| !d.is_empty()) => return true,
-            Ok(_) => continue, // buffering — try another frame
+            Ok(_) => continue, // buffering â€” try another frame
             Err(_) => return false,
         }
     }
@@ -3877,7 +3898,7 @@ fn make_h264_encoder(
         .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(fps as f32));
     if paced_slices_enabled() {
-        // Byte-capped slices give the send-side pacer real cut points —
+        // Byte-capped slices give the send-side pacer real cut points â€”
         // a keyframe becomes several independently-decodable slices
         // instead of one wall (see [`split_annexb_paced`]).
         config = config.max_slice_len(PACE_SLICE_BYTES as u32);
@@ -3925,7 +3946,7 @@ fn fit_within(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
 }
 
 // The scalers live in `allmystuff-pixels` (path crate) purely so dev
-// builds run them at opt-level 3 — at opt 0 they alone cap the stream at
+// builds run them at opt-level 3 â€” at opt 0 they alone cap the stream at
 // single-digit fps on a Retina/4K source.
 use allmystuff_pixels::{
     scale_rgba, scale_rgba_to_i420, scale_rgba_to_i420_into, scale_rgba_to_nv12,
@@ -3983,7 +4004,7 @@ mod tests {
             );
         }
         // A unit with one oversized slice can't split below slice
-        // granularity — it ships whole.
+        // granularity â€” it ships whole.
         let solo = [nal(7, 10, true), nal(8, 4, true), nal(5, 5000, false)].concat();
         let whole = split_annexb_paced(&solo, 1000);
         assert_eq!(whole.len(), 1);
@@ -3995,8 +4016,8 @@ mod tests {
 
     /// The pacer's core claim on a REAL bitstream: an openh264 encoder
     /// with a slice cap emits multi-slice units, the splitter cuts them,
-    /// and a decoder fed **chunk by chunk** — exactly how the far side
-    /// sees paced sends arrive as separate samples — still decodes every
+    /// and a decoder fed **chunk by chunk** â€” exactly how the far side
+    /// sees paced sends arrive as separate samples â€” still decodes every
     /// picture cleanly. No hardware needed, so this holds on every CI
     /// platform.
     #[test]
@@ -4026,7 +4047,7 @@ mod tests {
             // Encodable-but-busy content (marching stripes + texture) so
             // rate control never frame-skips, while slices still fill to
             // the cap. (Pure noise at this bitrate makes openh264 skip
-            // alternate frames entirely — a rate-control artifact that
+            // alternate frames entirely â€” a rate-control artifact that
             // says nothing about chunked feeding.)
             for (j, v) in yuv[..w * h].iter_mut().enumerate() {
                 let row = j / w;
@@ -4072,7 +4093,7 @@ mod tests {
         );
         // The zero-added-latency property: openh264 completes a picture by
         // macroblock accounting, so it surfaces on the SAME frame's final
-        // chunk — never held for the next AU. This is what lets the live
+        // chunk â€” never held for the next AU. This is what lets the live
         // viewer decode paced chunks as they arrive, no coalescing stage.
         assert!(
             on_last_chunk >= decoded.saturating_sub(1),
@@ -4091,7 +4112,7 @@ mod tests {
 
     #[test]
     fn auto_adapt_steps_down_after_a_sustained_stall_and_holds_between_steps() {
-        // The field failure: a 60 fps encode arriving at 0–6 fps for tens of
+        // The field failure: a 60 fps encode arriving at 0â€“6 fps for tens of
         // seconds while the sender kept pushing full resolution.
         let auto = AutoAdapt::new();
         let t0 = Instant::now();
@@ -4102,7 +4123,7 @@ mod tests {
         // Third consecutive: step down one rung.
         assert_eq!(auto.observe(&fb(4, 0, 0), 60, t0), Some((0, 2560)));
         assert_eq!(auto.edge_cap(), Some(2560));
-        // Still struggling immediately after — held by the settle window,
+        // Still struggling immediately after â€” held by the settle window,
         // no second step until it has had time to show up in feedback.
         for _ in 0..5 {
             assert_eq!(auto.observe(&fb(0, 0, 0), 60, t0), None);
@@ -4110,7 +4131,7 @@ mod tests {
         // Past the hold, the sustained stall steps again.
         let t1 = t0 + AUTO_DOWN_HOLD;
         assert_eq!(auto.observe(&fb(0, 0, 0), 60, t1), Some((2560, 1920)));
-        // A healthy report in a bad streak resets it — no flappy verdicts.
+        // A healthy report in a bad streak resets it â€” no flappy verdicts.
         let t2 = t1 + AUTO_DOWN_HOLD;
         assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
         assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
@@ -4139,7 +4160,7 @@ mod tests {
             assert_eq!(auto.observe(&fb(0, 0, 40), 60, t), None);
         }
         // Sustained health past the up-hold steps back up exactly one rung
-        // per streak — slow up, so the picture never oscillates.
+        // per streak â€” slow up, so the picture never oscillates.
         t += AUTO_UP_HOLD;
         let mut stepped = None;
         for _ in 0..AUTO_GOOD_STREAK {
@@ -4165,14 +4186,14 @@ mod tests {
     #[test]
     fn h264_ladder_picks_a_backend_that_emits_a_frame() {
         // Runs the real step-down ladder: it tries each hardware encoder
-        // (NVENC/VA-API/…) and frame-send-tests it; on a box without a GPU
+        // (NVENC/VA-API/â€¦) and frame-send-tests it; on a box without a GPU
         // those open or test-fail and it lands on software openh264. Either
-        // way the returned backend must actually encode a frame — that's the
+        // way the returned backend must actually encode a frame â€” that's the
         // contract the whole ladder exists to guarantee.
         let (w, h) = (640u32, 480u32);
         let mut codec = make_h264_codec(w, h, 30, Tune::default()).expect("a working backend");
         let grey = vec![128u8; (w * h) as usize + 2 * ((w / 2 * h / 2) as usize)];
-        // Forced as an IDR — a keyframe unit must come out within a bounded
+        // Forced as an IDR â€” a keyframe unit must come out within a bounded
         // run of calls. An async hardware backend delivers on a later call's
         // drain by design, and under parallel test load (another test holding
         // the same GPU encoder) output can lag several grace windows.
@@ -4197,7 +4218,7 @@ mod tests {
     fn fit_within_caps_the_long_edge_and_keeps_aspect() {
         assert_eq!(fit_within(3840, 2160, 1280), (1280, 720));
         assert_eq!(fit_within(1080, 1920, 1280), (720, 1280));
-        // Already small → untouched (never upscaled).
+        // Already small â†’ untouched (never upscaled).
         assert_eq!(fit_within(800, 600, 1280), (800, 600));
         assert_eq!(fit_within(0, 0, 1280), (0, 0));
     }
@@ -4220,8 +4241,8 @@ mod tests {
 
     #[test]
     fn orient_rotates_90_and_270_clockwise_swapping_dims() {
-        // Raw DXGI landscape scan-out (4×2) of a portrait panel: a 90 or 270
-        // report drives one/three clockwise quarter-turns → 2×4 upright.
+        // Raw DXGI landscape scan-out (4Ã—2) of a portrait panel: a 90 or 270
+        // report drives one/three clockwise quarter-turns â†’ 2Ã—4 upright.
         let buf = distinct_rgba(4, 2);
 
         let (cw90, ow, oh) = orient_to_monitor(buf.clone(), 4, 2, 90);
@@ -4249,7 +4270,7 @@ mod tests {
     #[test]
     fn orient_maps_degrees_to_clockwise_turns() {
         // The committed DXGI mapping, end to end: turns = (deg/90) mod 4,
-        // clockwise. 90→1, 180→2, 270→3 — the inverse of the display's CCW
+        // clockwise. 90â†’1, 180â†’2, 270â†’3 â€” the inverse of the display's CCW
         // rotation, matching the canonical Desktop Duplication sample.
         let buf = distinct_rgba(4, 2);
         for (deg, turns) in [(0u32, 0u8), (90, 1), (180, 2), (270, 3)] {
@@ -4286,10 +4307,10 @@ mod tests {
             .unwrap()
             .expect("first sends");
         assert_eq!(first.seq, 0);
-        // Same pixels again, inside the refresh window → skipped.
+        // Same pixels again, inside the refresh window â†’ skipped.
         assert!(enc.encode(a.clone(), 8, 8, &mut stats).unwrap().is_none());
         assert_eq!(stats.static_skipped, 1, "the skip is counted");
-        // Changed pixels → sent, with the next seq (skips don't burn one).
+        // Changed pixels â†’ sent, with the next seq (skips don't burn one).
         let b = vec![200u8; 8 * 8 * 4];
         let second = enc
             .encode(b, 8, 8, &mut stats)
@@ -4340,6 +4361,7 @@ mod tests {
             bitrate: Some(12_000_000),
             fps: Some(60),
             link: LinkClass::default(),
+            game: false,
         };
         assert_eq!(t.fps(), 60);
         assert_eq!(t.h264_edge(), 800);
@@ -4355,7 +4377,7 @@ mod tests {
         assert_eq!(big.h264_edge(), 3840);
         assert_eq!(big.mjpeg_edge(), 3840);
         let auto = Tune::default();
-        assert_eq!(auto.fps(), target_fps(LinkClass::Unknown));
+        assert_eq!(auto.fps(), target_fps_for(LinkClass::Unknown, false));
         assert_eq!(auto.h264_edge(), h264_max_edge());
         // Untuned MJPEG defaults to HD, and untuned quality is neutral.
         assert_eq!(auto.mjpeg_edge(), mjpeg_max_edge());
@@ -4366,7 +4388,7 @@ mod tests {
     fn lan_gate_raises_only_the_automatic_dials() {
         // A LAN link earns the 60 fps / 80 Mbps automatic dials; off-LAN
         // (and unknown, i.e. ICE not settled or an old daemon) stays at
-        // the conservative 30 / 40 M — the open-loop-transport rule.
+        // the conservative 30 / 40 M â€” the open-loop-transport rule.
         let lan = Tune {
             link: LinkClass::Lan,
             ..Tune::default()
@@ -4392,7 +4414,7 @@ mod tests {
 
     #[test]
     fn rate_pill_maps_to_a_monotonic_jpeg_quality() {
-        // The console's Rate pills, softest → sharpest, never decreasing.
+        // The console's Rate pills, softest â†’ sharpest, never decreasing.
         let q: Vec<u8> = [4, 8, 15, 25, 40]
             .iter()
             .map(|m| mjpeg_quality_for(m * 1_000_000))
@@ -4415,7 +4437,7 @@ mod tests {
             "game mode floors 60 off-LAN"
         );
         assert_eq!(auto_fps(LinkClass::Unknown, true), 60);
-        // Standard posture: 2× peak over ~1 s; game mode: 1.5× over ~½ s.
+        // Standard posture: 2Ã— peak over ~1 s; game mode: 1.5Ã— over ~Â½ s.
         assert_eq!(burst_bounds(40_000_000, false), (80_000_000, 40_000_000));
         assert_eq!(burst_bounds(40_000_000, true), (60_000_000, 20_000_000));
     }
@@ -4430,16 +4452,16 @@ mod tests {
                 at: Instant::now(),
             })
         };
-        // No feedback at all → the tight floor (today's behaviour).
+        // No feedback at all â†’ the tight floor (today's behaviour).
         assert_eq!(adaptive_idr_ms(None), IDR_MS_TIGHT);
-        // Clean + draining → relax.
+        // Clean + draining â†’ relax.
         assert_eq!(adaptive_idr_ms(fresh(0, 0)), IDR_MS_RELAXED);
         assert_eq!(adaptive_idr_ms(fresh(0, 8)), IDR_MS_RELAXED);
-        // Any decode failure → tighten.
+        // Any decode failure â†’ tighten.
         assert_eq!(adaptive_idr_ms(fresh(1, 0)), IDR_MS_TIGHT);
-        // A backed-up queue → tighten.
+        // A backed-up queue â†’ tighten.
         assert_eq!(adaptive_idr_ms(fresh(0, 9)), IDR_MS_TIGHT);
-        // Stale feedback (viewer went quiet) → never holds it relaxed.
+        // Stale feedback (viewer went quiet) â†’ never holds it relaxed.
         let stale = Some(RecvFeedback {
             recv_fps: 30,
             decode_fails: 0,
@@ -4508,7 +4530,7 @@ mod tests {
             AutoAdapt::new(),
         )
         .expect("openh264 init");
-        // A 64×64 solid frame → first unit out must be a key (IDR + SPS/PPS
+        // A 64Ã—64 solid frame â†’ first unit out must be a key (IDR + SPS/PPS
         // in-band), Annex-B framed.
         let rgba = vec![128u8; 64 * 64 * 4];
         let packet = enc
@@ -4532,7 +4554,7 @@ mod tests {
     struct ScriptedCodec {
         script: std::collections::VecDeque<Result<EncodeOutcome, String>>,
         calls: Arc<AtomicU32>,
-        /// Every call's `force_idr` flag, in order — lets tests assert which
+        /// Every call's `force_idr` flag, in order â€” lets tests assert which
         /// re-encodes were IDRs and which were refinement passes.
         forced: Arc<Mutex<Vec<bool>>>,
     }
@@ -4567,7 +4589,7 @@ mod tests {
         }
     }
 
-    /// An [`H264Stream`] around an injected codec, budget-sized so a 64×64
+    /// An [`H264Stream`] around an injected codec, budget-sized so a 64Ã—64
     /// test frame never triggers the real-ladder rebuild.
     fn h264_stream_with(codec: Box<dyn H264Codec>) -> H264Stream {
         H264Stream {
@@ -4589,7 +4611,7 @@ mod tests {
     #[test]
     fn h264_stream_emits_every_drained_unit_in_order() {
         // A loaded hardware encoder can hand back a small backlog in one
-        // call. Every unit must reach the wire, in order — the old seam kept
+        // call. Every unit must reach the wire, in order â€” the old seam kept
         // only the newest, which snapped the viewer's reference chain.
         let mut stats = StreamStats::new("r", VideoMode::H264);
         let backlog = Ok(EncodeOutcome {
@@ -4614,7 +4636,7 @@ mod tests {
     #[test]
     fn h264_stream_does_not_mark_unconsumed_frames_as_sent() {
         // A stalled hardware input queue refuses a frame. Its content must
-        // NOT be remembered as sent — the same pixels next tick have to reach
+        // NOT be remembered as sent â€” the same pixels next tick have to reach
         // the encoder instead of being static-skipped into a stale viewer.
         let mut stats = StreamStats::new("r", VideoMode::H264);
         let outcomes = vec![
@@ -4752,15 +4774,15 @@ mod tests {
         let rgba = vec![128u8; 64 * 64 * 4];
         let err = he
             .encode(rgba, 64, 64, &mut stats)
-            .expect_err("budget spent → the stream ends with the reason");
+            .expect_err("budget spent â†’ the stream ends with the reason");
         assert!(err.contains("failed permanently"), "{err}");
     }
 
     #[test]
     fn a_quiet_h264_stream_gets_an_idr_then_refinement_passes() {
         // One real frame, then silence. The pump must emit the convergence
-        // IDR (~250 ms in) and then REFINE_PASSES *non-IDR* refinements —
-        // the post-transition sharpening — and then go fully quiet.
+        // IDR (~250 ms in) and then REFINE_PASSES *non-IDR* refinements â€”
+        // the post-transition sharpening â€” and then go fully quiet.
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<(Vec<u8>, u32, u32)>();
         let mut stats = StreamStats::new("r", VideoMode::H264);
@@ -4827,7 +4849,7 @@ mod tests {
 
     #[test]
     fn a_quiet_mjpeg_stream_resends_once_and_never_refines() {
-        // MJPEG's quiesce resend stays a single frame — re-encoding
+        // MJPEG's quiesce resend stays a single frame â€” re-encoding
         // identical pixels to JPEG is byte-identical, so refinement is
         // H.264-only by design.
         let stop = Arc::new(AtomicBool::new(false));
@@ -4901,11 +4923,11 @@ mod tests {
         (avg, p95, *ms.last().unwrap())
     }
 
-    /// How coarse `thread::sleep` actually is on this box — the quantum every
+    /// How coarse `thread::sleep` actually is on this box â€” the quantum every
     /// pacing loop (frame budget, MF poll) inherits. The timer-resolution
     /// phase re-runs this with the guard held.
     #[test]
-    #[ignore = "bench — run with --ignored --nocapture"]
+    #[ignore = "bench â€” run with --ignored --nocapture"]
     fn bench_sleep_granularity() {
         // Note: without the guard the numbers depend on whatever ELSE holds
         // the system timer resolution (a browser usually does on a desktop);
@@ -4926,10 +4948,10 @@ mod tests {
 
     /// Per-call latency of the hardware MF encoder at 1440p with real work
     /// per frame (shifting luma), plus the units-out vs frames-in conservation
-    /// count — the metric the lossless-drain rewrite must hold at 100%.
+    /// count â€” the metric the lossless-drain rewrite must hold at 100%.
     #[cfg(windows)]
     #[test]
-    #[ignore = "bench — run with --ignored --nocapture"]
+    #[ignore = "bench â€” run with --ignored --nocapture"]
     fn bench_mf_encode_call_latency() {
         let (w, h) = (2560u32, 1440u32);
         let hw = crate::mediafoundation::hardware_h264_mfts();
@@ -4971,22 +4993,22 @@ mod tests {
         }
         let (avg, p95, max) = dur_stats(&lat);
         println!(
-            "bench MF encode call 1440p: avg {avg:6.2} ms · p95 {p95:6.2} ms · max {max:6.2} ms"
+            "bench MF encode call 1440p: avg {avg:6.2} ms Â· p95 {p95:6.2} ms Â· max {max:6.2} ms"
         );
         println!(
-            "bench MF units conservation: {units} units out of {fed} frames fed · {bytes} bytes"
+            "bench MF units conservation: {units} units out of {fed} frames fed Â· {bytes} bytes"
         );
     }
 
     /// End-to-end throughput of the pipelined pump: synthetic 1440p frames
     /// supplied as fast as the pipeline drains them, packets counted out the
-    /// far side. This is the number the capture/encode split moves — the
+    /// far side. This is the number the capture/encode split moves â€” the
     /// serial pump's ceiling was 1/(convert+encode); the pipelined pump's is
     /// 1/max(convert, encode). (The decomposition bench above measures the
     /// stages themselves and is deliberately serial.)
     #[cfg(windows)]
     #[test]
-    #[ignore = "bench — run with --ignored --nocapture"]
+    #[ignore = "bench â€” run with --ignored --nocapture"]
     fn bench_pump_pipelined_throughput() {
         let (w, h) = (2560u32, 1440u32);
         let stop = Arc::new(AtomicBool::new(false));
@@ -5016,7 +5038,7 @@ mod tests {
         let (pool_tx, pool_rx) = mpsc::sync_channel::<Vec<u8>>(4);
         let feeder = std::thread::spawn(move || {
             // A few distinct smooth-gradient patterns so every frame differs
-            // (no static skip) at a desktop-like encode complexity — byte
+            // (no static skip) at a desktop-like encode complexity â€” byte
             // noise would benchmark the encoder's worst case, not the
             // pipeline. `send` blocks on the shallow channel, so supply
             // tracks exactly what the pipeline drains.
@@ -5074,16 +5096,16 @@ mod tests {
         );
     }
 
-    /// The full real-screen pipeline, stage by stage: DXGI duplication →
-    /// orient → fused scale/convert → the ladder's chosen encoder. Read-only
-    /// on the desktop (a second duplication next to any running app is fine —
+    /// The full real-screen pipeline, stage by stage: DXGI duplication â†’
+    /// orient â†’ fused scale/convert â†’ the ladder's chosen encoder. Read-only
+    /// on the desktop (a second duplication next to any running app is fine â€”
     /// it skips if the output can't be duplicated). A quiet desktop delivers
-    /// few damage frames, so timeouts re-encode the last frame — the encode
+    /// few damage frames, so timeouts re-encode the last frame â€” the encode
     /// and convert columns fill either way; `arrival fps` is only meaningful
     /// while the screen is busy.
     #[cfg(windows)]
     #[test]
-    #[ignore = "bench — needs a monitor; run with --ignored --nocapture"]
+    #[ignore = "bench â€” needs a monitor; run with --ignored --nocapture"]
     fn bench_capture_encode_decomposition() {
         let Ok(monitor) = select_monitor(None) else {
             println!("SKIP: no monitor");
@@ -5138,7 +5160,7 @@ mod tests {
             if codec.is_none() || codec_size != (dw, dh) {
                 let built = make_h264_codec(dw, dh, 60, tune).expect("ladder backend");
                 println!(
-                    "pipeline codec: {} · {dw}x{dh} (source {sw}x{sh})",
+                    "pipeline codec: {} Â· {dw}x{dh} (source {sw}x{sh})",
                     built.label()
                 );
                 codec = Some(built);
@@ -5181,19 +5203,19 @@ mod tests {
             ("scale+convert", dur_stats(&converts)),
             ("encode", dur_stats(&encodes)),
         ];
-        println!("bench pipeline decomposition ({} encodes · {} damage frames · {reencodes} re-encodes · {:.1} s):",
+        println!("bench pipeline decomposition ({} encodes Â· {} damage frames Â· {reencodes} re-encodes Â· {:.1} s):",
             encodes.len(), waits.len(), elapsed);
         let busy: f64 = table[1..].iter().map(|(_, (avg, _, _))| avg).sum();
         for (name, (avg, p95, max)) in table {
             let share = if name == "capture wait" {
-                "     —".to_string()
+                "     â€”".to_string()
             } else {
                 format!("{:5.1}%", avg / busy.max(f64::EPSILON) * 100.0)
             };
-            println!("  {name:14} avg {avg:7.3} ms · p95 {p95:7.3} ms · max {max:7.3} ms · {share} of busy");
+            println!("  {name:14} avg {avg:7.3} ms Â· p95 {p95:7.3} ms Â· max {max:7.3} ms Â· {share} of busy");
         }
         println!(
-            "  output: {units} units · {keys} keys · {:.2} MB · arrival {:.1}/s",
+            "  output: {units} units Â· {keys} keys Â· {:.2} MB Â· arrival {:.1}/s",
             bytes as f64 / 1e6,
             waits.len() as f64 / elapsed,
         );

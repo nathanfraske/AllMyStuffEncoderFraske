@@ -48,14 +48,17 @@ use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGID
 
 /// How many NV12 output textures cycle in the ring. Slots are explicitly
 /// checked out ([`GpuConvert::convert`]) and released
-/// ([`GpuConvert::release`]) — the consumer holds at most one retained
-/// picture plus the shallow frame channel, so four never starves — and the
-/// release ordering guarantees the async MFT is ≥3 slot-reuses behind any
-/// texture it could still be reading (measured encode latency ≤ ~10 ms vs
-/// ≥20 ms to cycle three slots at 144 Hz damage). The end-to-end decode
-/// test is the corruption tripwire for that margin; the NVENC SDK rung
-/// replaces it with real completion events.
-pub(crate) const NV12_RING: usize = 4;
+/// ([`GpuConvert::release`]); the consumer holds the shallow frame
+/// channel plus its retirement queue of the last TWO consumed pictures —
+/// two, not one, because the async MFT can still be reading frame N−1's
+/// texture when frame N is fed (its bits haven't drained yet), and the
+/// field showed exactly that as torn bands on damage bursts when N−1's
+/// slot went back into rotation at N's consume. Depth-2 retirement means
+/// a slot returns only after the encoder has been fed two newer frames —
+/// by then its read is provably drained (the sync SDK rung never needed
+/// this, but runs the same discipline). Six slots = channel 2 + retired 2
+/// + in-flight 1, with one spare.
+pub(crate) const NV12_RING: usize = 6;
 
 /// The per-route GPU conversion stage: BGRA texture in, NV12 texture out,
 /// plus the device manager the encoder MFT opens with.

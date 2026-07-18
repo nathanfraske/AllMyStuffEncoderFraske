@@ -877,6 +877,12 @@ pub enum RouteControl {
         /// Capture rate ceiling; `None` = the streamer's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fps: Option<u32>,
+        /// Game mode: the latency-first posture (GDR intra-refresh on
+        /// capable streamers, 60 fps floor off-LAN, tight burst bounds).
+        /// Defaults off (balanced) and deserializes absent as off, so
+        /// peers that predate it interoperate untouched.
+        #[serde(default)]
+        game: bool,
     },
     /// "Here's how your stream is actually arriving" — the viewer reports its
     /// decode health back to the streamer, periodically, so the streamer can

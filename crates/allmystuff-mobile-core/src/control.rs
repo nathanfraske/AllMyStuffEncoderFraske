@@ -165,6 +165,7 @@ pub fn tune(
         max_edge,
         bitrate,
         fps,
+        game: false,
     })
 }
 

@@ -527,11 +527,47 @@ fn init_logging(as_service: bool) {
     });
     let stdout_layer = tracing_subscriber::fmt::layer().with_target(false);
 
+    // The field-test log: a second file, in the directory the node was
+    // launched from, at full debug verbosity for our crates regardless of
+    // the quiet console filter — targets kept ON so every line names its
+    // module (which device, which lane, which rung). This is what "send
+    // me the log" points at; soft-absent when the cwd isn't writable
+    // (Program Files installs), and `ALLMYSTUFF_CWD_LOG=0` turns it off.
+    let verbose_layer = cwd_log_writer().map(|make| {
+        tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(make)
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "warn,allmystuff_node=debug,allmystuff_serve=debug",
+            ))
+    });
+
     tracing_subscriber::registry()
-        .with(filter)
-        .with(stdout_layer)
-        .with(file_layer)
+        .with(verbose_layer)
+        .with(stdout_layer.and_then(file_layer).with_filter(filter))
         .init();
+}
+
+/// A `MakeWriter` over `./allmystuff-serve.log` — the launch directory's
+/// verbose field-test log, truncated once per start. `None` (layer simply
+/// absent) when the cwd isn't writable or `ALLMYSTUFF_CWD_LOG=0`.
+fn cwd_log_writer() -> Option<impl Fn() -> std::fs::File + Send + Sync + 'static> {
+    if std::env::var("ALLMYSTUFF_CWD_LOG").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        )
+    }) {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("allmystuff-serve.log")
+        .ok()?;
+    Some(move || file.try_clone().expect("clone cwd log file handle"))
 }
 
 /// A `MakeWriter` over `~/.myownmesh/logs/node.log` (honoring `MYOWNMESH_HOME`,

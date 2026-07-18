@@ -73,6 +73,7 @@ pub struct Tune {
     pub bitrate: Option<u32>,
     pub fps: Option<u32>,
     pub link: LinkClass,
+    pub game: bool,
 }
 
 /// The host side of a capture-status report: state + optional OS error text.

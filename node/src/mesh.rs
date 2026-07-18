@@ -4428,7 +4428,10 @@ impl Mesh {
                     max_edge,
                     bitrate,
                     fps,
-                } => self.video.retune_dials(&route_id, max_edge, bitrate, fps),
+                    game,
+                } => self
+                    .video
+                    .retune_dials(&route_id, max_edge, bitrate, fps, game),
                 Effect::VideoFeedback {
                     route_id,
                     recv_fps,
@@ -9891,12 +9894,13 @@ impl Mesh {
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
+        game: bool,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
         // The streaming side logs the retune it actually applies — one
         // line per pill change across the pair is plenty.
         tracing::debug!(
-            "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?}",
+            "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?} · game {game}",
             short_id(&peer)
         );
         self.send_control(
@@ -9906,6 +9910,7 @@ impl Mesh {
                 max_edge,
                 bitrate,
                 fps,
+                game,
             }),
         )
         .await

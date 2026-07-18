@@ -730,7 +730,18 @@ mod gpu_lane {
         let adapter_luid = unsafe {
             let dxgi: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
             let adapter: IDXGIAdapter = dxgi.GetAdapter().map_err(|e| e.to_string())?;
-            adapter.GetDesc().map_err(|e| e.to_string())?.AdapterLuid
+            let desc = adapter.GetDesc().map_err(|e| e.to_string())?;
+            let name = String::from_utf16_lossy(&desc.Description);
+            // The field-log identification line: which physical GPU this
+            // lane lives on, for which monitor, at what geometry.
+            tracing::info!(
+                "GPU lane device for monitor {monitor_id:#x}: {} (LUID {:08x}-{:08x}) · \
+                 desktop {sw}×{sh} → fitted {dw}×{dh}",
+                name.trim_end_matches('\0').trim(),
+                desc.AdapterLuid.HighPart,
+                desc.AdapterLuid.LowPart,
+            );
+            desc.AdapterLuid
         };
         let clean = bgra_default_texture(&device, sw, sh)?;
         let (tx, rx) = mpsc::sync_channel::<GpuFrame>(2);

@@ -124,6 +124,7 @@ pub enum Effect {
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
+        game: bool,
     },
     /// The viewer of a route this machine streams reported its decode health
     /// (receiver → sender). The backend records it per route to adapt the
@@ -497,6 +498,7 @@ impl Session {
                 max_edge,
                 bitrate,
                 fps,
+                game,
             } => {
                 if self
                     .routes
@@ -508,6 +510,7 @@ impl Session {
                         max_edge,
                         bitrate,
                         fps,
+                        game,
                     }];
                 }
                 Vec::new()

@@ -188,6 +188,7 @@ const _: () = assert!(std::mem::size_of::<ConfigH264>() == 1792);
 
 /// Bit positions inside [`ConfigH264::flags`] (header order).
 mod h264_flags {
+    pub const OUTPUT_RECOVERY_POINT_SEI: u32 = 1 << 9;
     pub const ENABLE_INTRA_REFRESH: u32 = 1 << 10;
     pub const REPEAT_SPSPPS: u32 = 1 << 12;
 }
@@ -493,6 +494,9 @@ fn api() -> Result<&'static FunctionList, String> {
                 "driver NVENC API {drv_major}.{drv_minor} < 12.0 (driver too old)"
             ));
         }
+        tracing::info!(
+            "NVENC driver API {drv_major}.{drv_minor} available (this build targets 12.0)"
+        );
         let create = GetProcAddress(
             module,
             PCSTR(c"NvEncodeAPICreateInstance".as_ptr() as *const u8),
@@ -635,7 +639,7 @@ impl NvencH264 {
         cfg.frame_interval_p = 1; // IPP…, never B (latency + LTR/invalidatable)
         cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_VBR;
         cfg.rc_params.average_bit_rate = bitrate;
-        let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+        let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
         cfg.rc_params.max_bit_rate = peak;
         cfg.rc_params.vbv_buffer_size = vbv;
         cfg.rc_params.vbv_initial_delay = 0;
@@ -651,14 +655,18 @@ impl NvencH264 {
         }
         if self.intra_refresh {
             // GDR: no automatic IDRs at all; intra data rides a refresh
-            // wave ~every 2 s, ~15% of the period long. A forced IDR (a
-            // viewer joining) still cuts through via the per-picture flag.
+            // wave every ~0.5 s (the field pass at 2 s left loss artifacts
+            // lingering visibly in-game — half a second bounds the heal to
+            // a blink while still spreading the intra cost). Recovery-point
+            // SEI marks each wave so a decoder knows where clean starts. A
+            // forced IDR (viewer join, quiesce rescue) still cuts through
+            // via the per-picture flag.
             cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
             h264.idr_period = NVENC_INFINITE_GOPLENGTH;
-            h264.flags |= h264_flags::ENABLE_INTRA_REFRESH;
-            let period = (self.fps * 2).max(30);
+            h264.flags |= h264_flags::ENABLE_INTRA_REFRESH | h264_flags::OUTPUT_RECOVERY_POINT_SEI;
+            let period = (self.fps / 2).max(15);
             h264.intra_refresh_period = period;
-            h264.intra_refresh_cnt = (period / 7).max(4);
+            h264.intra_refresh_cnt = (period / 5).max(3);
         } else {
             // Stable-arc shape: same ~4 s GOP backstop as the MF rung; the
             // stream's adaptive IDR cadence forces the real keyframes.
@@ -826,7 +834,7 @@ impl NvencH264 {
                 return false;
             };
             self.config.rc_params.average_bit_rate = bitrate;
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.intra_refresh);
             self.config.rc_params.max_bit_rate = peak;
             self.config.rc_params.vbv_buffer_size = vbv;
             let mut params: Box<ReconfigureParams> = Box::new(std::mem::zeroed());
