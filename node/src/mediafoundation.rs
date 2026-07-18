@@ -701,7 +701,11 @@ impl MediaFoundationH264 {
         while let Some(unit) = self.process_output()? {
             units.push(unit);
         }
-        Ok(EncodeOutcome { units, consumed })
+        Ok(EncodeOutcome {
+            units,
+            consumed,
+            input_ts: 0,
+        })
     }
 
     /// Async (hardware) MFT: drive the event model **losslessly**. Drain every
@@ -771,6 +775,7 @@ impl MediaFoundationH264 {
         Ok(EncodeOutcome {
             units,
             consumed: fed,
+            input_ts: 0,
         })
     }
 

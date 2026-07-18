@@ -3894,6 +3894,12 @@ pub(crate) struct EncodeOutcome {
     pub units: Vec<(Vec<u8>, bool)>,
     /// Whether the input frame entered the encoder this call.
     pub consumed: bool,
+    /// The encoder's own input timestamp for the frame consumed this call
+    /// — the key `nvEncInvalidateRefFrames` takes. The lane pairs it with
+    /// the frame's presentation time so a viewer's loss report (a wire
+    /// timestamp) maps back to the exact reference to invalidate. 0 on
+    /// backends without invalidation (MF, openh264).
+    pub input_ts: u64,
 }
 
 impl EncodeOutcome {
@@ -3903,6 +3909,7 @@ impl EncodeOutcome {
         EncodeOutcome {
             units: unit.into_iter().filter(|(d, _)| !d.is_empty()).collect(),
             consumed: true,
+            input_ts: 0,
         }
     }
 }
@@ -4877,6 +4884,7 @@ mod tests {
             self.script.pop_front().unwrap_or(Ok(EncodeOutcome {
                 units: Vec::new(),
                 consumed: true,
+                input_ts: 0,
             }))
         }
         fn label(&self) -> &str {
@@ -4912,6 +4920,7 @@ mod tests {
         let backlog = Ok(EncodeOutcome {
             units: vec![(vec![1, 1], false), (vec![2, 2], true), (vec![3, 3], false)],
             consumed: true,
+            input_ts: 0,
         });
         let mut enc = h264_stream_with(Box::new(ScriptedCodec::new(vec![backlog])));
         let rgba = vec![128u8; 64 * 64 * 4];
@@ -4938,14 +4947,17 @@ mod tests {
             Ok(EncodeOutcome {
                 units: vec![(vec![1], true)],
                 consumed: true,
+                input_ts: 0,
             }),
             Ok(EncodeOutcome {
                 units: Vec::new(),
                 consumed: false,
+                input_ts: 0,
             }),
             Ok(EncodeOutcome {
                 units: vec![(vec![2], false)],
                 consumed: true,
+                input_ts: 0,
             }),
         ];
         let codec = ScriptedCodec::new(outcomes);
@@ -5046,6 +5058,7 @@ mod tests {
                 ScriptedCodec::new(vec![Ok(EncodeOutcome {
                     units: vec![(vec![9], true)],
                     consumed: true,
+                    input_ts: 0,
                 })]),
             )))))
         }));
@@ -5085,18 +5098,22 @@ mod tests {
             Ok(EncodeOutcome {
                 units: vec![(vec![1], true)],
                 consumed: true,
+                input_ts: 0,
             }),
             Ok(EncodeOutcome {
                 units: vec![(vec![2], true)],
                 consumed: true,
+                input_ts: 0,
             }),
             Ok(EncodeOutcome {
                 units: vec![(vec![3], false)],
                 consumed: true,
+                input_ts: 0,
             }),
             Ok(EncodeOutcome {
                 units: vec![(vec![4], false)],
                 consumed: true,
+                input_ts: 0,
             }),
         ]);
         let forced = codec.forced.clone();
@@ -5189,6 +5206,7 @@ mod tests {
         let mut enc = h264_stream_with(Box::new(ScriptedCodec::new(vec![Ok(EncodeOutcome {
             units: Vec::new(),
             consumed: false,
+            input_ts: 0,
         })])));
         enc.refresh.store(true, Ordering::SeqCst);
         let rgba = vec![128u8; 64 * 64 * 4];
