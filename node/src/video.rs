@@ -2883,7 +2883,15 @@ impl HealingEncoder {
         if let Some(f) = &mut self.rebuild_override {
             return f();
         }
-        make_encoder(
+        // The negotiated transport is pinned for the route's life: a heal
+        // rebuilds the SAME mode or fails the route (which then restarts
+        // and renegotiates). The old path went through [`make_encoder`],
+        // whose MJPEG floor could morph a healing H.264 route into
+        // chunked MJPEG mid-stream — a quality lurch the viewer never
+        // asked for, and (Chris's field read) chunk-loss artifacts that
+        // present as tearing. The floor still applies at route START,
+        // where the viewer can see what it's getting from frame one.
+        StreamEncoder::new(
             &self.route_id,
             self.mode,
             source_hint,
