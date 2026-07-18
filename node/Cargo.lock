@@ -89,6 +89,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "libloading",
+ "memchr",
  "nokhwa",
  "openh264",
  "opus",

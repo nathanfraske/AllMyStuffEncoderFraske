@@ -109,6 +109,10 @@ anyhow = "1"
 dirs = "5"
 parking_lot = "0.12"
 
+# SIMD-accelerated byte scanning for the pacer's Annex-B start-code walk
+# (already in the tree transitively — this only makes it a direct dep).
+memchr = "2"
+
 # System RNG for minting a fleet's shared key (the owned-roster grouping
 # secret).
 getrandom = "0.2"

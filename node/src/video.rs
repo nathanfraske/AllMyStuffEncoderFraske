@@ -4091,24 +4091,26 @@ pub(crate) fn paced_slices_enabled() -> bool {
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
     // Walk the start codes (00 00 01 and 00 00 00 01), recording each
     // NAL's offset and header byte.
+    // SIMD-anchored: memchr sweeps for 0x01 at cache speed and the
+    // look-behind confirms the 00 00 prefix — the pacer runs this over
+    // every AU (a lossless IDR is ~1.4 MB), and the old byte-stepping
+    // loop paid a branch per byte. Equivalent to the forward scan: a
+    // start code's own bytes can never satisfy another match's [0,0]
+    // look-behind, and a run of ≥3 zeros anchors at p−3 exactly where
+    // the forward scan entered its 4-byte arm.
     let mut nals: Vec<(usize, u8)> = Vec::new();
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 {
-            let hdr = if data[i + 2] == 1 {
-                i + 3
-            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                i + 4
-            } else {
-                i += 1;
-                continue;
-            };
-            if hdr < data.len() {
-                nals.push((i, data[hdr]));
-            }
-            i = hdr + 1;
+    for p in memchr::memchr_iter(1, data) {
+        if p < 2 || data[p - 1] != 0 || data[p - 2] != 0 {
+            continue;
+        }
+        let i = if p >= 3 && data[p - 3] == 0 {
+            p - 3
         } else {
-            i += 1;
+            p - 2
+        };
+        let hdr = p + 1;
+        if hdr < data.len() {
+            nals.push((i, data[hdr]));
         }
     }
     // Exact parameter-set bytes (0x40/0x42/0x44 = VPS/SPS/PPS, layer 0)

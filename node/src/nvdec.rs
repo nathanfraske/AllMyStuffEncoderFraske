@@ -655,40 +655,6 @@ impl Drop for NvdecHevc {
 /// hot loop stays branch-free. `w` and `h` must be even (NV12 guarantees
 /// it; the decoder's display crop keeps it so).
 pub fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut [u8]) {
-    #[inline(always)]
-    fn px(y: u8, tr: i32, tg: i32, tb: i32, o: &mut [u8]) {
-        let yy = 298 * (i32::from(y) - 16);
-        o[0] = ((yy + tr) >> 8).clamp(0, 255) as u8;
-        o[1] = ((yy + tg) >> 8).clamp(0, 255) as u8;
-        o[2] = ((yy + tb) >> 8).clamp(0, 255) as u8;
-        o[3] = 255;
-    }
-    fn band(
-        luma: &[u8],
-        chroma: &[u8],
-        w: usize,
-        yp_range: std::ops::Range<usize>,
-        out: &mut [u8],
-    ) {
-        let yp0 = yp_range.start;
-        for yp in yp_range {
-            let crow = &chroma[yp * w..][..w];
-            let l0 = &luma[(yp * 2) * w..][..w];
-            let l1 = &luma[(yp * 2 + 1) * w..][..w];
-            let (o0, rest) = out[(yp - yp0) * 2 * w * 4..].split_at_mut(w * 4);
-            let o1 = &mut rest[..w * 4];
-            for xp in 0..w / 2 {
-                let u = i32::from(crow[xp * 2]) - 128;
-                let v = i32::from(crow[xp * 2 + 1]) - 128;
-                let (tr, tg, tb) = (459 * v, -55 * u - 136 * v, 541 * u);
-                let x0 = xp * 8;
-                px(l0[xp * 2], tr, tg, tb, &mut o0[x0..x0 + 4]);
-                px(l0[xp * 2 + 1], tr, tg, tb, &mut o0[x0 + 4..x0 + 8]);
-                px(l1[xp * 2], tr, tg, tb, &mut o1[x0..x0 + 4]);
-                px(l1[xp * 2 + 1], tr, tg, tb, &mut o1[x0 + 4..x0 + 8]);
-            }
-        }
-    }
     let (luma, chroma) = nv12.split_at(w * h);
     let quads = h / 2;
     // Band the work across a few scoped threads at real frame sizes —
@@ -697,7 +663,7 @@ pub fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut [u8]) {
     // spawns per frame. Small frames stay single-threaded.
     let workers = if quads >= 128 { 4 } else { 1 };
     if workers == 1 {
-        band(luma, chroma, w, 0..quads, out);
+        band_dispatch(luma, chroma, w, 0..quads, out);
         return;
     }
     let per = quads.div_ceil(workers);
@@ -711,14 +677,242 @@ pub fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut [u8]) {
             let bytes = (range.end - range.start) * 2 * w * 4;
             let (mine, tail) = rest.split_at_mut(bytes);
             rest = tail;
-            s.spawn(move || band(luma, chroma, w, range, mine));
+            s.spawn(move || band_dispatch(luma, chroma, w, range, mine));
         }
     });
+}
+
+#[inline(always)]
+fn px(y: u8, tr: i32, tg: i32, tb: i32, o: &mut [u8]) {
+    let yy = 298 * (i32::from(y) - 16);
+    o[0] = ((yy + tr) >> 8).clamp(0, 255) as u8;
+    o[1] = ((yy + tg) >> 8).clamp(0, 255) as u8;
+    o[2] = ((yy + tb) >> 8).clamp(0, 255) as u8;
+    o[3] = 255;
+}
+
+/// The scalar reference lane — the definition of correct. The AVX2 lane
+/// below performs the *identical* integer operations eight pixels at a
+/// time, so its output is byte-equal by construction (and pinned by the
+/// `simd_lane_matches_scalar` test, which is the real guarantee).
+fn band_scalar(
+    luma: &[u8],
+    chroma: &[u8],
+    w: usize,
+    yp_range: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
+    let yp0 = yp_range.start;
+    for yp in yp_range {
+        let crow = &chroma[yp * w..][..w];
+        let l0 = &luma[(yp * 2) * w..][..w];
+        let l1 = &luma[(yp * 2 + 1) * w..][..w];
+        let (o0, rest) = out[(yp - yp0) * 2 * w * 4..].split_at_mut(w * 4);
+        let o1 = &mut rest[..w * 4];
+        for xp in 0..w / 2 {
+            let u = i32::from(crow[xp * 2]) - 128;
+            let v = i32::from(crow[xp * 2 + 1]) - 128;
+            let (tr, tg, tb) = (459 * v, -55 * u - 136 * v, 541 * u);
+            let x0 = xp * 8;
+            px(l0[xp * 2], tr, tg, tb, &mut o0[x0..x0 + 4]);
+            px(l0[xp * 2 + 1], tr, tg, tb, &mut o0[x0 + 4..x0 + 8]);
+            px(l1[xp * 2], tr, tg, tb, &mut o1[x0..x0 + 4]);
+            px(l1[xp * 2 + 1], tr, tg, tb, &mut o1[x0 + 4..x0 + 8]);
+        }
+    }
+}
+
+/// Pick the widest lane the CPU carries. Detection is one cached load;
+/// narrow frames stay scalar (the vector body wants ≥8 luma columns).
+fn band_dispatch(
+    luma: &[u8],
+    chroma: &[u8],
+    w: usize,
+    yp_range: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+        if *AVX2 && w >= 8 {
+            // SAFETY: feature presence just checked; the fn upholds the
+            // same slice contracts as the scalar lane.
+            unsafe { band_avx2(luma, chroma, w, yp_range, out) };
+            return;
+        }
+    }
+    band_scalar(luma, chroma, w, yp_range, out);
+}
+
+/// The AVX2 lane: eight pixels per step across two luma rows, exactly
+/// the scalar math on i32 lanes — widen, multiply, add, arithmetic
+/// shift right 8, clamp 0..255 (`max`/`min`), pack `R | G<<8 | B<<16 |
+/// A<<24` and store 32 bytes. `vpermd` duplicates each (U,V) across its
+/// 2×2 quad, mirroring the scalar quad sharing. Any width remainder
+/// (<8 columns) runs the scalar quad — same `px`, same bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn band_avx2(
+    luma: &[u8],
+    chroma: &[u8],
+    w: usize,
+    yp_range: std::ops::Range<usize>,
+    out: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+    // One macro, not a closure: closures don't inherit `target_feature`,
+    // and an un-featured closure body would demote every intrinsic call.
+    macro_rules! clamp_term {
+        ($yy:expr, $t:expr, $zero:expr, $c255:expr) => {
+            _mm256_min_epi32(
+                $c255,
+                _mm256_max_epi32($zero, _mm256_srai_epi32::<8>(_mm256_add_epi32($yy, $t))),
+            )
+        };
+    }
+    let yp0 = yp_range.start;
+    let pairs = w / 2;
+    let vec_pairs = pairs & !3; // 4 chroma pairs = 8 luma columns per step
+                                // Non-temporal stores when alignment allows: the RGBA output is
+                                // ~3× the input and write-allocate (RFO) doubles its DRAM traffic —
+                                // at 1440p the kernel is memory-bound, so bypassing the cache on
+                                // the store side is worth more than any more arithmetic. 16-byte
+                                // alignment holds when the band's base is 16-aligned and the row
+                                // stride keeps it (w % 4 == 0 — every real frame); otherwise the
+                                // unaligned store path stands.
+    let streamable = (out.as_ptr() as usize) & 15 == 0 && w.is_multiple_of(4);
+    let idx_u = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
+    let idx_v = _mm256_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7);
+    let c16 = _mm256_set1_epi32(16);
+    let c128 = _mm256_set1_epi32(128);
+    let c298 = _mm256_set1_epi32(298);
+    let c459 = _mm256_set1_epi32(459);
+    let cm55 = _mm256_set1_epi32(-55);
+    let cm136 = _mm256_set1_epi32(-136);
+    let c541 = _mm256_set1_epi32(541);
+    let c255 = _mm256_set1_epi32(255);
+    let zero = _mm256_setzero_si256();
+    let alpha = _mm256_set1_epi32(0xFF00_0000u32 as i32);
+    for yp in yp_range {
+        let crow = &chroma[yp * w..][..w];
+        let l0 = &luma[(yp * 2) * w..][..w];
+        let l1 = &luma[(yp * 2 + 1) * w..][..w];
+        let (o0, rest) = out[(yp - yp0) * 2 * w * 4..].split_at_mut(w * 4);
+        let o1 = &mut rest[..w * 4];
+        let mut xp = 0usize;
+        while xp < vec_pairs {
+            let x = xp * 2;
+            let cbytes = _mm_loadl_epi64(crow.as_ptr().add(x) as *const __m128i);
+            let c = _mm256_cvtepu8_epi32(cbytes);
+            let u = _mm256_sub_epi32(_mm256_permutevar8x32_epi32(c, idx_u), c128);
+            let v = _mm256_sub_epi32(_mm256_permutevar8x32_epi32(c, idx_v), c128);
+            let tr = _mm256_mullo_epi32(c459, v);
+            let tg = _mm256_add_epi32(_mm256_mullo_epi32(cm55, u), _mm256_mullo_epi32(cm136, v));
+            let tb = _mm256_mullo_epi32(c541, u);
+
+            let y8 = _mm_loadl_epi64(l0.as_ptr().add(x) as *const __m128i);
+            let yy = _mm256_mullo_epi32(c298, _mm256_sub_epi32(_mm256_cvtepu8_epi32(y8), c16));
+            let r = clamp_term!(yy, tr, zero, c255);
+            let g = clamp_term!(yy, tg, zero, c255);
+            let b = clamp_term!(yy, tb, zero, c255);
+            let px0 = _mm256_or_si256(
+                _mm256_or_si256(r, _mm256_slli_epi32::<8>(g)),
+                _mm256_or_si256(_mm256_slli_epi32::<16>(b), alpha),
+            );
+            let d0 = o0.as_mut_ptr().add(x * 4);
+            if streamable {
+                _mm_stream_si128(d0 as *mut __m128i, _mm256_castsi256_si128(px0));
+                _mm_stream_si128(
+                    d0.add(16) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(px0),
+                );
+            } else {
+                _mm256_storeu_si256(d0 as *mut __m256i, px0);
+            }
+
+            let y8 = _mm_loadl_epi64(l1.as_ptr().add(x) as *const __m128i);
+            let yy = _mm256_mullo_epi32(c298, _mm256_sub_epi32(_mm256_cvtepu8_epi32(y8), c16));
+            let r = clamp_term!(yy, tr, zero, c255);
+            let g = clamp_term!(yy, tg, zero, c255);
+            let b = clamp_term!(yy, tb, zero, c255);
+            let px1 = _mm256_or_si256(
+                _mm256_or_si256(r, _mm256_slli_epi32::<8>(g)),
+                _mm256_or_si256(_mm256_slli_epi32::<16>(b), alpha),
+            );
+            let d1 = o1.as_mut_ptr().add(x * 4);
+            if streamable {
+                _mm_stream_si128(d1 as *mut __m128i, _mm256_castsi256_si128(px1));
+                _mm_stream_si128(
+                    d1.add(16) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(px1),
+                );
+            } else {
+                _mm256_storeu_si256(d1 as *mut __m256i, px1);
+            }
+            xp += 4;
+        }
+        for xp in vec_pairs..pairs {
+            let u = i32::from(crow[xp * 2]) - 128;
+            let v = i32::from(crow[xp * 2 + 1]) - 128;
+            let (tr, tg, tb) = (459 * v, -55 * u - 136 * v, 541 * u);
+            let x0 = xp * 8;
+            px(l0[xp * 2], tr, tg, tb, &mut o0[x0..x0 + 4]);
+            px(l0[xp * 2 + 1], tr, tg, tb, &mut o0[x0 + 4..x0 + 8]);
+            px(l1[xp * 2], tr, tg, tb, &mut o1[x0..x0 + 4]);
+            px(l1[xp * 2 + 1], tr, tg, tb, &mut o1[x0 + 4..x0 + 8]);
+        }
+    }
+    if streamable {
+        // Drain the write-combining buffers before anyone reads the
+        // frame — non-temporal stores are weakly ordered.
+        _mm_sfence();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SIMD lane's whole contract: byte-identical output to the
+    /// scalar reference on every size class — vector-width multiples,
+    /// tail widths, tiny frames, and the full value range (the LCG walks
+    /// well beyond video-legal Y/U/V, so the clamps are exercised on
+    /// both rails). Skips silently only where the CPU has no AVX2.
+    #[test]
+    fn simd_lane_matches_scalar_byte_for_byte() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                eprintln!("SKIP: no AVX2 on this CPU");
+                return;
+            }
+            let mut seed = 0x1234_5678u32;
+            let mut rng = move || {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            };
+            // Widths: multiple-of-8, tail-of-2/4/6 columns, minimum lane.
+            for (w, h) in [(64, 16), (100, 8), (102, 6), (1280, 24), (8, 2), (12, 4)] {
+                let nv12: Vec<u8> = (0..w * h * 3 / 2).map(|_| rng()).collect();
+                let mut scalar = vec![0u8; w * h * 4];
+                let mut simd = vec![0u8; w * h * 4];
+                let (luma, chroma) = nv12.split_at(w * h);
+                band_scalar(luma, chroma, w, 0..h / 2, &mut scalar);
+                unsafe { band_avx2(luma, chroma, w, 0..h / 2, &mut simd) };
+                assert_eq!(scalar, simd, "lane divergence at {w}×{h}");
+            }
+            // And through the public entry (threading + dispatch).
+            let (w, h) = (1440, 720);
+            let nv12: Vec<u8> = (0..w * h * 3 / 2).map(|_| rng()).collect();
+            let mut via_public = vec![0u8; w * h * 4];
+            nv12_to_rgba(&nv12, w, h, &mut via_public);
+            let mut reference = vec![0u8; w * h * 4];
+            let (luma, chroma) = nv12.split_at(w * h);
+            band_scalar(luma, chroma, w, 0..h / 2, &mut reference);
+            assert_eq!(reference, via_public, "threaded dispatch divergence");
+        }
+    }
 
     /// Read the exact NV12 bytes of a GPU-lane texture back to the CPU
     /// via a staging copy — the encoder's literal input, for byte-exact
