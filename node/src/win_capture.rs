@@ -77,11 +77,22 @@ impl Drop for Session {
 /// Fails fast on the caller's thread when the output can't be duplicated
 /// right now (someone else holds it, RDP session), so the caller can fall
 /// back without waiting on a channel.
-pub fn start(monitor_id: u32) -> Result<(Session, mpsc::Receiver<RawFrame>), String> {
-    let dup = Duplication::new(monitor_id)?;
+/// A live duplication: the session handle, its frame stream, and the
+/// reclaim lane spent frame buffers ride back on.
+pub type StartedDuplication = (Session, mpsc::Receiver<RawFrame>, mpsc::SyncSender<Vec<u8>>);
+
+pub fn start(monitor_id: u32) -> Result<StartedDuplication, String> {
+    let mut dup = Duplication::new(monitor_id)?;
     // A shallow channel: the consumer drains to the freshest frame each
     // tick; anything it hasn't taken by the time two more arrive is stale.
     let (tx, rx) = mpsc::sync_channel::<RawFrame>(2);
+    // The reclaim lane: the consumer hands spent frame buffers back so the
+    // per-frame copy-out lands in already-touched pages instead of a fresh
+    // multi-megabyte OS allocation (whose demand-zeroing costs more than
+    // the copy). Best-effort — an unused lane just means fresh allocations,
+    // exactly the old behaviour.
+    let (reclaim_tx, reclaim_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    dup.reclaim = Some(reclaim_rx);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let thread = std::thread::spawn(move || pump(dup, monitor_id, &stop_thread, &tx));
@@ -91,6 +102,7 @@ pub fn start(monitor_id: u32) -> Result<(Session, mpsc::Receiver<RawFrame>), Str
             thread: Some(thread),
         },
         rx,
+        reclaim_tx,
     ))
 }
 
@@ -117,7 +129,10 @@ fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::Syn
                         return;
                     }
                     match Duplication::new(monitor_id) {
-                        Ok(d) => {
+                        Ok(mut d) => {
+                            // The reclaim lane outlives the duplication —
+                            // carry it onto the rebuilt session.
+                            d.reclaim = dup.reclaim.take();
                             dup = d;
                             break;
                         }
@@ -197,6 +212,9 @@ struct Duplication {
     /// Rate limit for cursor-only re-emits so a fast mouse can't spin the
     /// pump faster than the capture cadence.
     last_cursor_emit: Instant,
+    /// Spent frame buffers handed back by the consumer (see [`start`]);
+    /// `None` until the session wires it.
+    reclaim: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl Duplication {
@@ -265,6 +283,7 @@ impl Duplication {
                     clean: Vec::new(),
                     clean_dims: (0, 0),
                     last_cursor_emit: Instant::now(),
+                    reclaim: None,
                 });
             }
         }
@@ -417,7 +436,14 @@ impl Duplication {
     /// move re-emits without re-capturing; compositing runs on the
     /// pre-rotation buffer, so the cursor rotates with the frame downstream.
     fn assemble_frame(&mut self, w: u32, h: u32) -> RawFrame {
-        let mut rgba = Vec::with_capacity(self.clean.len());
+        // Copy out into a reclaimed buffer when the consumer has returned
+        // one — warm pages instead of a fresh demand-zeroed allocation.
+        let mut rgba = self
+            .reclaim
+            .as_ref()
+            .and_then(|r| r.try_recv().ok())
+            .unwrap_or_default();
+        rgba.clear();
         rgba.extend_from_slice(&self.clean);
         if self.ptr_visible {
             if let Some(cur) = &self.cursor {
