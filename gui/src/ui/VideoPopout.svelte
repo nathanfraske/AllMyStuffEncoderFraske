@@ -20,6 +20,7 @@
   // `closed`, and the tab that popped it re-wires itself.
   import { onMount } from "svelte";
   import { Fsr1 } from "../fsr1";
+  import ModePill from "./ModePill.svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
@@ -177,54 +178,18 @@
   // Res/FPS/Rate pills stay as expert overrides on top. The legacy
   // `game` bool rides along so hosts that predate the tri-state still
   // honor the Game step.
-  const MODES = ["balanced", "game", "studio", "studio-ll"] as const;
-  const MODE_LABEL = {
-    balanced: "Balanced",
-    game: "Game",
-    studio: "Studio",
-    "studio-ll": "Studio · LL",
-  } as const;
-  type ModeKey = (typeof MODES)[number];
-  // "studio-ll" is the pill's name for the wire posture "studio-lossless"
-  // (mathematically lossless HEVC — needs NVIDIA on both ends; the
-  // streamer falls soft to regular Studio anywhere it can't run).
-  const modeKey = (): ModeKey =>
-    tune.mode === "studio-lossless"
-      ? "studio-ll"
-      : ((tune.mode as ModeKey | undefined) ?? (tune.game ? "game" : "balanced"));
-  // Studio spends a lot of bandwidth — one confirmation the first time,
-  // with a persisted "don't warn again" shared by both Studio flavors.
-  // Only the transition INTO studio gates; cycling past never re-warns.
-  const STUDIO_ACK_KEY = "ams.studioBandwidthAck";
-  let studioPrompt = $state<ModeKey | null>(null);
-  function applyMode(next: ModeKey) {
-    tune = {
-      ...tune,
-      mode:
-        next === "balanced" ? undefined : next === "studio-ll" ? "studio-lossless" : next,
-      game: next === "game" ? true : undefined,
-    };
+  // The Mode control (Balanced/Game/Studio/Studio · LL) + its bandwidth
+  // warning live in the shared ModePill component so the console strip
+  // and this bar are the same element. It hands back the resolved wire
+  // values; we fold them into the route's tune.
+  function applyModeWire(
+    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    gameFlag: boolean | undefined,
+  ) {
+    tune = { ...tune, mode: wireMode, game: gameFlag };
     openPill = null;
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
-  function cycleMode() {
-    const next = MODES[(MODES.indexOf(modeKey()) + 1) % MODES.length];
-    if (
-      (next === "studio" || next === "studio-ll") &&
-      localStorage.getItem(STUDIO_ACK_KEY) !== "1"
-    ) {
-      studioPrompt = next;
-      return;
-    }
-    applyMode(next);
-  }
-  function confirmStudio(dontAskAgain: boolean) {
-    if (dontAskAgain) localStorage.setItem(STUDIO_ACK_KEY, "1");
-    const next = studioPrompt ?? "studio";
-    studioPrompt = null;
-    applyMode(next);
-  }
-  const modeLabel = () => MODE_LABEL[modeKey()];
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -589,19 +554,7 @@
           {/if}
         </span>
       {/snippet}
-      <button
-        class="pill"
-        class:tuned={(tune.mode ?? (tune.game ? "game" : "balanced")) !== "balanced"}
-        title="Balanced favors stability and quality; Game favors latency and instant recovery; Studio spends LAN bandwidth on fidelity"
-        onpointerdown={(e) => e.stopPropagation()}
-        onpointerup={(e) => e.stopPropagation()}
-        onclick={(e) => {
-          e.stopPropagation();
-          cycleMode();
-        }}
-      >
-        Mode · {modeLabel()}
-      </button>
+      <ModePill mode={tune.mode} game={tune.game} onapply={applyModeWire} />
       <button
         class="pill"
         class:tuned={fsrShow}
@@ -631,125 +584,9 @@
       }}>{fullscreen ? "⤡" : "⛶"}</button
     >
   </footer>
-
-  {#if studioPrompt}
-    <div
-      class="studio-scrim"
-      role="presentation"
-      onpointerdown={(e) => e.stopPropagation()}
-      onclick={() => (studioPrompt = null)}
-      onkeydown={(e) => e.key === "Escape" && (studioPrompt = null)}
-    >
-      <div
-        class="studio-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="studio-title"
-        tabindex="-1"
-        onclick={(e) => e.stopPropagation()}
-      >
-        <h3 id="studio-title">
-          {studioPrompt === "studio-ll" ? "Turn on Studio · Lossless?" : "Turn on Studio mode?"}
-        </h3>
-        {#if studioPrompt === "studio-ll"}
-          <p>
-            Lossless sends <strong>every pixel exactly</strong> over HEVC —
-            bandwidth follows what's on screen: near-zero when idle, tens of
-            Mbps for desktop work, and it can spike far higher on busy video.
-            It needs NVIDIA hardware on both machines; anywhere it can't run,
-            the stream continues as regular Studio automatically.
-          </p>
-        {/if}
-        <p>
-          Studio streams at maximum fidelity and can use <strong>150 Mbps
-          and up</strong> — it's built for a fast local network. It runs
-          wherever you turn it on, so on a slow or metered connection
-          expect stutter until you lower the Rate.
-        </p>
-        <div class="studio-actions">
-          <button class="studio-btn ghost" onclick={() => (studioPrompt = null)}
-            >Cancel</button
-          >
-          <button class="studio-btn ghost" onclick={() => confirmStudio(true)}
-            >Don't ask again</button
-          >
-          <button class="studio-btn primary" onclick={() => confirmStudio(false)}
-            >{studioPrompt === "studio-ll" ? "Use Lossless" : "Use Studio"}</button
-          >
-        </div>
-      </div>
-    </div>
-  {/if}
 </div>
 
 <style>
-  .studio-scrim {
-    position: absolute;
-    inset: 0;
-    z-index: 40;
-    display: grid;
-    place-items: center;
-    background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(2px);
-  }
-  .studio-dialog {
-    width: min(30rem, calc(100vw - 3rem));
-    background: #16181d;
-    color: #e8ebf0;
-    border: 1px solid #2c323b;
-    border-radius: 10px;
-    padding: 1.25rem 1.35rem 1.1rem;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-  }
-  .studio-dialog h3 {
-    margin: 0 0 0.5rem;
-    font-size: 1.05rem;
-    font-weight: 640;
-  }
-  .studio-dialog p {
-    margin: 0 0 1.1rem;
-    font-size: 0.9rem;
-    line-height: 1.5;
-    color: #b6bdc8;
-  }
-  .studio-dialog strong {
-    color: #e8ebf0;
-    font-variant-numeric: tabular-nums;
-  }
-  .studio-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-  .studio-btn {
-    padding: 0.45rem 0.85rem;
-    border-radius: 7px;
-    font-size: 0.85rem;
-    font-weight: 560;
-    cursor: pointer;
-    border: 1px solid transparent;
-  }
-  .studio-btn.ghost {
-    background: transparent;
-    border-color: #363d47;
-    color: #c4cbd6;
-  }
-  .studio-btn.ghost:hover {
-    border-color: #4a525e;
-    color: #e8ebf0;
-  }
-  .studio-btn.primary {
-    background: #2f6fab;
-    color: #fff;
-  }
-  .studio-btn.primary:hover {
-    background: #3a7cbb;
-  }
-  .studio-btn:focus-visible {
-    outline: 2px solid #5b96cf;
-    outline-offset: 2px;
-  }
   .popout {
     position: relative;
     height: 100vh;

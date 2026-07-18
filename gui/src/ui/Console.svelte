@@ -52,6 +52,7 @@
     type MediaKind,
   } from "../types";
   import ConsoleKeys from "./ConsoleKeys.svelte";
+  import ModePill from "./ModePill.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
 
@@ -271,37 +272,16 @@
           : "h264",
   );
 
-  // The Speed↔Quality slider: one knob that snaps to a preset curve of
-  // res/fps/rate. Codec stays Auto here — forcing a codec is an
-  // advanced-rows-only choice. Each stop reuses the same values the rows
-  // offer.
-  const QUALITY_STOPS = [
-    { label: "Speed", maxEdge: 1280, fps: 24, bitrate: 4_000_000 },
-    { label: "Smooth", maxEdge: 1920, fps: 30, bitrate: 8_000_000 },
-    { label: "Balanced", maxEdge: 1920, fps: 60, bitrate: 15_000_000 },
-    { label: "Crisp", maxEdge: 2560, fps: 60, bitrate: 25_000_000 },
-    { label: "Quality", maxEdge: 3840, fps: 60, bitrate: 40_000_000 },
-  ];
-  // Where the slider sits for the live tune: the nearest stop by resolution,
-  // defaulting to Balanced when everything is Auto — so it reflects reality
-  // on open and on a source switch.
-  const sliderPos = $derived.by(() => {
-    const t = app.consoleTune;
-    if (t.maxEdge == null && t.fps == null && t.bitrate == null) return 2;
-    let best = 2;
-    let bestD = Infinity;
-    QUALITY_STOPS.forEach((s, i) => {
-      const d = Math.abs((t.maxEdge ?? s.maxEdge) - s.maxEdge);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    });
-    return best;
-  });
-  function pickQuality(i: number) {
-    const s = QUALITY_STOPS[i];
-    app.setConsoleTune({ maxEdge: s.maxEdge, fps: s.fps, bitrate: s.bitrate });
+  // The Mode control (shared with the popout via ModePill) is the video
+  // headline now — the Speed↔Quality slider it replaced could not reach
+  // Game/Studio/Lossless at all. Res/FPS/Rate stay as the Advanced rows.
+  // The shared control resolves the wire posture; fold it into the
+  // console's per-source tune (the same shape the popout applies).
+  function applyModeWire(
+    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    gameFlag: boolean | undefined,
+  ) {
+    app.setConsoleTune({ mode: wireMode, game: gameFlag });
   }
 
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
@@ -2161,23 +2141,16 @@
                 <div class="mempty">No video inputs advertised</div>
               {/if}
             {:else}
-              <!-- Video: the one knob, the advanced rows, the zoom. -->
+              <!-- Video: the Mode control (shared with the popout bar),
+                   the advanced rows, the zoom. -->
               {#if app.consoleVideoLive}
-                <div class="slider-row" role="group" aria-label="Stream quality">
-                  <span class="slider-end">Speed</span>
-                  <input
-                    class="quality-slider"
-                    type="range"
-                    min="0"
-                    max={QUALITY_STOPS.length - 1}
-                    step="1"
-                    value={sliderPos}
-                    oninput={(e) => pickQuality(+e.currentTarget.value)}
-                    aria-label="Quality"
-                    title="Drag toward Speed (lighter, faster) or Quality (sharper, heavier)"
+                <div class="mode-row" role="group" aria-label="Stream mode">
+                  <span class="mode-label">Mode</span>
+                  <ModePill
+                    mode={app.consoleTune.mode}
+                    game={app.consoleTune.game}
+                    onapply={applyModeWire}
                   />
-                  <span class="slider-end">Quality</span>
-                  <span class="slider-now">{QUALITY_STOPS[sliderPos].label}</span>
                 </div>
                 <button class="mrow" onclick={toggleAdv}>
                   <span class="micon">⚙</span>Advanced
@@ -2957,28 +2930,15 @@
   }
 
   /* ---- the video menu's guts ---- */
-  .slider-row {
+  .mode-row {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
-    padding: 0.5rem 0.55rem 0.3rem;
+    gap: 0.6rem;
+    padding: 0.5rem 0.55rem 0.4rem;
   }
-  .slider-end {
+  .mode-label {
     font-size: 0.72rem;
     color: #8a83a6;
-    flex-shrink: 0;
-  }
-  .quality-slider {
-    flex: 1;
-    min-width: 6rem;
-    accent-color: #7c6cff;
-    cursor: pointer;
-  }
-  .slider-now {
-    min-width: 4.2rem;
-    font-size: 0.74rem;
-    color: #c8c2e0;
-    text-align: right;
     flex-shrink: 0;
   }
   .vrow {
