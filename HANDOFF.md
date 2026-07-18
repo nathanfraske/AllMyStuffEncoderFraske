@@ -19,12 +19,20 @@ ladder: NVDEC first where the NVIDIA driver lives (measured faster:
 Four postures work end-to-end: **Balanced**, **Game** (GDR,
 latency-first), **Studio** (lossy high-bitrate), **Studio · Lossless**
 (bit-exact HEVC). Latest field build:
-`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\nsis\AllMyStuff_0.2.47_x64-setup.exe`
-(2026-07-18 evening; carries the D3D11VA rung AND the popout
-fullscreen-fit fix; sidecar staged manually per the recipe below —
-build.rs's "sidecar bundle skipped" warning is benign, the staged copy
-is what ships; `ALLMYSTUFF_SERVE_BIN=<path>` makes build.rs stage it
-itself). Two hardware arcs wait
+`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\nsis\AllMyStuff-PROTOTYPE-<hash>_0.2.46_x64-setup.exe`
+(2026-07-18 night; the closed WAN loop + OS scheduling honesty + the
+D3D11VA rung + popout fullscreen fit). **VERSIONING RULE (user,
+2026-07-18): versions are CHRIS'S to cut — the fork's builds are strict
+prototypes until his signoff, so every manifest stays at his last
+release (0.2.46, the merge-base `78b1c76`) and prototype installers are
+distinguished by the PROTOTYPE-<commit> file name, never by claiming
+0.2.47+.** (The earlier 0.2.47/0.2.48 bumps were reverted in-history by
+a follow-up commit; don't repeat them.) Sidecar staged manually per the
+recipe below — build.rs's "sidecar bundle skipped" warning is benign,
+the staged copy is what ships; `ALLMYSTUFF_SERVE_BIN=<path>` makes
+build.rs stage it itself. `docs/INTEGRATION-REPORT-2026-07.md` is the
+hand-to-Chris dossier (diffs, pipeline, blast radius). Two hardware
+arcs wait
 on boxes the user will provide: **AMF** (AMD encode) needs the Radeon
 9060 XT, **AV1** needs a 50-series. Next high-value item: the **viewer
 decode-capability handshake** (fail-soft before the AMD box lands).
@@ -79,8 +87,16 @@ decode-capability handshake** (fail-soft before the AMD box lands).
   - `mediafoundation.rs`: MF hardware H.264 MFT, adapter-pinned.
 - **App-side slice pacer** (`mesh.rs send_video_paced` + `video.rs
   split_annexb_paced`): keyframes leave as byte-capped slices with
-  rate-matched inter-chunk gaps (800 Mbps drain model). Speaks both
-  codecs (exact param-set byte detection). Lossless IDRs = 32 slices.
+  rate-matched inter-chunk gaps. Drain model is LINK-FITTED as of
+  0.2.48: LAN keeps the 800 Mbps shallow-buffer shape; WAN spreads at
+  the route's send rate ×1.5 over ≤1 frame interval (`route_pace` →
+  `RouteRate` seam). Gaps run deadline-based through
+  `os_perf::precise_sleep`. Speaks both codecs. Lossless IDRs = 32
+  slices. The closed loop: viewer times the chunk trains
+  (`note_video_arrival`) → BWE + delay trend ride `VideoFeedback` →
+  `note_feedback` AIMD (`rate_adapt_step`, unit-tested) → encode thread
+  applies via NVENC in-place reconfigure. Watch `pace gaps` and
+  `video in` minute lines; `video rate` logs every AIMD step.
 - **Decode lane** (`video_decode.rs`): per-route bridge; codec sniffed
   from the AU's first NAL byte (exact bytes 0x40/0x42/0x44/0x26 for
   HEVC — do NOT use masked types, collides with H.264 0x41). H.264 →
@@ -169,12 +185,32 @@ for the posture's codec+features; viewer has a decoder for that codec).
 
 - **Smoothness/pacing/latency idea bank** —
   `docs/SMOOTHNESS-IDEAS-2026-07.md` (deep-brainstorm pass, 2026-07-18):
-  19 graded ideas across industry-standard / novel / kernel-level tiers
-  + a measure-first plan (M1–M5) + an explicitly-rejected list that
-  encodes the frozen-daemon rule. Top of the stack by win÷effort:
-  link-fitted pacer drain, AIMD bitrate on the existing reconfigure
-  seam, the Win11 scheduling-honesty bundle, chunk-train BWE, LTR
-  recovery. Start with M2/M3 (~40 lines, they de-risk everything else).
+  19 graded ideas + the M1–M5 measure-first plan + an explicitly-
+  rejected list that encodes the frozen-daemon rule. **LANDED same day
+  (`a97678f` + `1a8d188`, in 0.2.48):** T3.2+T3.1 (process power/timer
+  opt-outs, `precise_sleep` — 435 µs worst overshoot measured — MMCSS
+  opt-in via `ALLMYSTUFF_MMCSS=1`), M2 (`pace gaps` minute line), M3
+  (`video in` chunk-train line), T2.1a (WAN pacer drain = route rate
+  ×1.5, one-frame budget; `ALLMYSTUFF_PACE_DRAIN_MBPS` A/B dial), T1.1
+  (chunk-train BWE + delay trend → serde-default `VideoFeedback`
+  fields), T1.2 (AIMD bitrate on the in-place reconfigure — **RESERVED
+  to Game by default** (`d100022`): the user's rule is that automatic
+  bitrate changers run only where they're beneficial in every case for
+  the mode's use case, and only Game qualifies; Balanced/Studio keep
+  the picked quality unless `ALLMYSTUFF_RATE_ADAPT=1` opts all lossy
+  postures in; `=0` kills; never lossless/pinned), T2.7 (loss-aware
+  wave length: 2 losses in 10 s → 3-frame heal). The Game-mode
+  "transport is open-loop" caveat is retired. Field logs carry
+  **per-layer bandwidth**: sender `raw → wire` Mbps on the `video out`
+  line, viewer `wire → nv12 → rgba` on the `video decode` line, plus
+  the `pace gaps` and `video in` (chunk-train) minute lines — end to
+  end, the log names where every megabit goes. **Field validation
+  pending on the 2-machine rig:** est accuracy vs `clumsy`-imposed
+  rates, freeze-seconds A/B, gap-fidelity before/after — the new log
+  lines are the kit. **Still open from the bank:** T1.4 LTR recovery +
+  T1.3 sample parity + T2.3 gap-NACK (all need M5's loss
+  characterization on the rig first), T2.2 sub-frame slices, T2.6
+  paint pacing, T2.8 zero-copy present, T2.5 damage-driven QP.
 
 - **#33 AMF rung (AMD encode)** — loader shipped (`f460b13`). NEXT: C-ABI
   vtable transcription from staged headers in the session scratchpad
@@ -224,7 +260,11 @@ for the posture's codec+features; viewer has a decoder for that codec).
 
 ## Commit trail (newest first)
 
-`91c5448` **D3D11VA decode rung** (+0.2.47 bundle) · `9341cf8` handoff ·
+`d100022` **auto-bitrate reserved to Game + per-layer bandwidth logs** ·
+`1a8d188` **closed WAN loop** (link-fitted pacer, BWE, AIMD, shaped
+waves, M2/M3 lines) · `a97678f` **OS scheduling honesty** ·
+`1a437f1` idea bank · `97803f7` 0.2.47 · `be32d3c` popout fullscreen
+fit · `91c5448` **D3D11VA decode rung** · `9341cf8` handoff ·
 `bcd06f8` shared Mode control · `e382997` ref-invalidation mechanism ·
 `55cec0e` log location · `3a00a4c` frame health · `becc220`/`5746ee8`/
 `fec7168`/`c77c7d0` telemetry · `4fd853e` preset defaults · `7f7084b`
