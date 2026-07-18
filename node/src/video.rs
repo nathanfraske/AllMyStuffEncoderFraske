@@ -956,6 +956,17 @@ impl VideoBridge {
     /// Ask `route_id`'s encoder for a clean decode entry on its next
     /// frame — the viewer's decoder lost its place. No-op for a route
     /// this machine isn't streaming.
+    /// Whether `route_id` is currently in the game posture (viewer dial
+    /// or env override) — the mesh forwarder reads this per access unit
+    /// to pick the pacing quanta. Unknown route = balanced.
+    pub fn route_game(&self, route_id: &str) -> bool {
+        self.routes
+            .lock()
+            .get(route_id)
+            .map(|r| r.tune.game())
+            .unwrap_or(false)
+    }
+
     pub fn force_idr(&self, route_id: &str) {
         if let Some(r) = self.routes.lock().get(route_id) {
             r.refresh.store(true, Ordering::SeqCst);
@@ -2189,7 +2200,12 @@ fn run_gpu_lane(
         if stop.load(Ordering::SeqCst) {
             return GpuEnd::Stopped;
         }
-        match lane.frames.recv_timeout(Duration::from_millis(250)) {
+        // Game mode wakes the quiet path 5× faster: the quiesce IDR (and
+        // with it the refinement ladder) lands within ~50 ms of motion
+        // stopping instead of ~250 — the "screen snaps crisp the moment
+        // you stop" feel. Balanced keeps the relaxed tick.
+        let quiet_tick = Duration::from_millis(if gdr || game { 50 } else { 250 });
+        match lane.frames.recv_timeout(quiet_tick) {
             Ok(mut frame) => {
                 let frame_start = Instant::now();
                 got_any = true;
@@ -3465,13 +3481,21 @@ pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 /// split writes — verified against the daemon's `H264AuAssembler`).
 pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var("ALLMYSTUFF_PACED_SLICES")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+        // Default ON: verified against the daemon's assembler and pinned
+        // by the chunk-decode test; `=0` pins the old single-write path
+        // for comparison runs.
+        let off = std::env::var("ALLMYSTUFF_PACED_SLICES")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
             .unwrap_or(false);
-        if on {
-            tracing::info!("ALLMYSTUFF_PACED_SLICES=1 — app-side slice pacing enabled");
+        if off {
+            tracing::info!("ALLMYSTUFF_PACED_SLICES=0 — app-side slice pacing disabled");
         }
-        on
+        !off
     });
     *ON
 }

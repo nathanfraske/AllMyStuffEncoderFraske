@@ -629,7 +629,9 @@ impl Mesh {
                         VideoPacket::H264 { data, duration_us } => {
                             match mesh.video_lane(&route_id, &peer, true) {
                                 Some(lane) => {
-                                    mesh.send_video_paced(&peer, lane, data, duration_us).await
+                                    let game = mesh.video.route_game(&route_id);
+                                    mesh.send_video_paced(&peer, lane, data, duration_us, game)
+                                        .await
                                 }
                                 // No lane for this route right now — it has
                                 // just torn down, or another of this peer's
@@ -704,6 +706,7 @@ impl Mesh {
         lane: u8,
         data: Vec<u8>,
         duration_us: u64,
+        game: bool,
     ) -> Result<(), String> {
         if !crate::video::paced_slices_enabled() {
             return self.send_video_track(peer, lane, data, duration_us).await;
@@ -712,11 +715,13 @@ impl Mesh {
         if chunks.len() < 2 {
             return self.send_video_track(peer, lane, data, duration_us).await;
         }
-        // Spread the whole unit over at most ~10 ms; 1.5 ms between
-        // bursts when the budget allows (libwebrtc's pacer operates in
-        // the same 5 ms-quanta regime).
-        let gap = std::time::Duration::from_micros(1500)
-            .min(std::time::Duration::from_millis(10) / (chunks.len() as u32 - 1));
+        // Spread the unit: balanced runs 1.5 ms gaps under a 10 ms cap
+        // (libwebrtc's 5 ms-quanta regime); game mode tightens to 1 ms
+        // under 6 ms — still burst-shaped for the queue, but the frame's
+        // tail lands ~4 ms sooner on the path latency rides on.
+        let (gap_us, cap_ms) = if game { (1000, 6) } else { (1500, 10) };
+        let gap = std::time::Duration::from_micros(gap_us)
+            .min(std::time::Duration::from_millis(cap_ms) / (chunks.len() as u32 - 1));
         let last = chunks.len() - 1;
         for (i, range) in chunks.into_iter().enumerate() {
             let dur = if i == last { duration_us } else { 0 };

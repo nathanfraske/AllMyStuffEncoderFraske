@@ -643,15 +643,31 @@ impl NvencH264 {
         cfg.rc_params.max_bit_rate = peak;
         cfg.rc_params.vbv_buffer_size = vbv;
         cfg.rc_params.vbv_initial_delay = 0;
+        if self.intra_refresh {
+            // Game posture: a single-frame VBV — every frame fits one
+            // frame interval's bit budget, so no frame can queue behind
+            // an oversized predecessor. GDR removes the IDR spikes that
+            // made a deep bucket necessary; what remains benefits from
+            // constant-latency framing far more than from burst headroom.
+            cfg.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
+        }
         let h264 = &mut cfg.encode_codec_config.h264;
         h264.flags |= h264_flags::REPEAT_SPSPPS;
         h264.entropy_coding_mode = 0; // autoselect (CABAC where allowed)
         if crate::video::paced_slices_enabled() {
-            // Byte-capped slices (sliceMode 1 = max bytes per slice): the
-            // send-side pacer's cut points — a keyframe leaves as several
-            // independently-decodable slices instead of one wall.
-            h264.slice_mode = 1;
-            h264.slice_mode_data = crate::video::PACE_SLICE_BYTES as u32;
+            // Slice-count mode (sliceMode 3): the send-side pacer's cut
+            // points — a keyframe leaves as several independently-
+            // decodable slices instead of one wall. Count, not bytes:
+            // byte-based slicing (mode 1) is rejected outright by real
+            // drivers in the field ("Byte based slice encoding is not
+            // supported"), while count mode is universal. 8 slices at
+            // ≥1080p ≈ the ~24 KB pacing grain on a worst-case keyframe.
+            h264.slice_mode = 3;
+            h264.slice_mode_data = if self.width * self.height >= 1920 * 1080 {
+                8
+            } else {
+                4
+            };
         }
         if self.intra_refresh {
             // GDR: no automatic IDRs at all; intra data rides a refresh
@@ -688,10 +704,22 @@ impl NvencH264 {
         init.enable_ptd = 1;
         init.tuning_info = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
         init.encode_config = &mut *self.config;
-        let status = (self.api.initialize_encoder.ok_or("no InitializeEncoder")?)(
-            self.encoder,
-            &mut *self.init,
-        );
+        let init_fn = self.api.initialize_encoder.ok_or("no InitializeEncoder")?;
+        let mut status = init_fn(self.encoder, &mut *self.init);
+        if status != NV_ENC_SUCCESS {
+            let h264 = &mut self.config.encode_codec_config.h264;
+            if h264.slice_mode != 0 {
+                // A driver that rejects our slice config must cost the
+                // pacer its cut points, never the whole SDK rung: retry
+                // once with default (single-slice) framing.
+                tracing::info!(
+                    "NVENC rejected slice config (status {status}); retrying single-slice"
+                );
+                h264.slice_mode = 0;
+                h264.slice_mode_data = 0;
+                status = init_fn(self.encoder, &mut *self.init);
+            }
+        }
         if status != NV_ENC_SUCCESS {
             return Err(self.err("InitializeEncoder", status));
         }
@@ -1013,6 +1041,15 @@ mod tests {
     #[test]
     #[ignore = "bench — run with --ignored --nocapture"]
     fn bench_nvenc_sdk_cycle() {
+        // Interleaved posture A/B: balanced (deep VBV, IDR cadence) vs
+        // game (GDR + single-frame VBV) — the decomposition of what the
+        // game kernel costs and buys at the encoder.
+        for (round, game) in [(1, false), (1, true), (2, false), (2, true)] {
+            bench_cycle_posture(round, game);
+        }
+    }
+
+    fn bench_cycle_posture(round: u32, game: bool) {
         use std::time::{Duration, Instant};
         let (w, h) = (2560u32, 1440u32);
         let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
@@ -1022,7 +1059,7 @@ mod tests {
                 return;
             }
         };
-        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, false) {
+        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, game) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("SKIP: {e}");
@@ -1057,7 +1094,10 @@ mod tests {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(n);
         let p95 = enc_ms[(enc_ms.len() * 95 / 100).min(enc_ms.len() - 1)];
         let max = enc_ms[enc_ms.len() - 1];
-        println!("bench NVENC SDK @1440p over {n} frames ({units} units):");
+        println!(
+            "bench NVENC SDK @1440p [round {round} · {}] over {n} frames ({units} units):",
+            if game { "GAME: gdr+1f-vbv" } else { "balanced" }
+        );
         println!("  upload (synthetic, not paid live): {:6.3} ms", ms(t_up));
         println!("  convert (blt queue)              : {:6.3} ms", ms(t_conv));
         println!(
