@@ -74,6 +74,27 @@ pub struct Tune {
     pub fps: Option<u32>,
     pub link: LinkClass,
     pub game: bool,
+    pub mode: Option<Posture>,
+}
+
+/// Mirror of the real module's posture dial (capture-less builds carry
+/// the type so `mesh.rs` compiles identically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Posture {
+    #[default]
+    Balanced,
+    Game,
+    Studio,
+}
+
+/// Mirror of the real module's wire-name parse.
+pub fn parse_posture(s: &str) -> Option<Posture> {
+    match s {
+        "game" => Some(Posture::Game),
+        "studio" => Some(Posture::Studio),
+        "balanced" => Some(Posture::Balanced),
+        _ => None,
+    }
 }
 
 /// The host side of a capture-status report: state + optional OS error text.
@@ -149,7 +170,15 @@ impl VideoBridge {
         _max_edge: Option<u32>,
         _bitrate: Option<u32>,
         _fps: Option<u32>,
+        _game: bool,
+        _mode: Option<&str>,
     ) {
+    }
+
+    /// Mirror of the real bridge's per-route posture read (the mesh
+    /// forwarder's pacing hint) — nothing streams here, so balanced.
+    pub fn route_game(&self, _route_id: &str) -> bool {
+        false
     }
 
     pub fn note_feedback(

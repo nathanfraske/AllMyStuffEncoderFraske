@@ -491,19 +491,72 @@ pub struct Tune {
     pub fps: Option<u32>,
     /// The viewer's per-route game-mode ask (latency-first posture: GDR
     /// on the SDK rung, 60 fps floor off-LAN). `ALLMYSTUFF_GAME_MODE=1`
-    /// still forces it node-wide; this is the wire dial.
+    /// still forces it node-wide; this is the wire dial. Kept alongside
+    /// [`Tune::mode`] for hosts/viewers that predate the tri-state.
     pub game: bool,
+    /// The named posture, when the viewer speaks the tri-state (parsed
+    /// at the wire boundary — [`parse_posture`]). Wins over `game`; see
+    /// [`Tune::posture`]. `Option<Posture>` (Copy) so `Tune` stays the
+    /// by-value dial bundle every retune path copies around.
+    pub mode: Option<Posture>,
     /// How the path to this stream's viewer flows (host side fills it
     /// from the daemon's nominated-pair class). Not a viewer dial: it
     /// gates only what the AUTOMATIC fps/bitrate fall back to.
     pub link: LinkClass,
 }
 
+/// A stream's tuned character — the three-way dial that replaced the
+/// old quality slider. Balanced is the stability/quality default; Game
+/// trades for latency and instant recovery (GDR, tight VBV, 1 ms
+/// pacing); Studio trades bandwidth for fidelity on links that have it
+/// (the LAN "full pipe" mode — high-bitrate quality-first encoding
+/// today; 4:4:4 chroma and lossless land with the hardware-decode
+/// viewer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posture {
+    Balanced,
+    Game,
+    Studio,
+}
+
+/// The wire name → posture parse, at the tune boundary. Unknown names
+/// (a future mode this build predates) read as "no named ask" so the
+/// legacy `game` bool still steers.
+pub fn parse_posture(s: &str) -> Option<Posture> {
+    match s {
+        "game" => Some(Posture::Game),
+        "studio" => Some(Posture::Studio),
+        "balanced" => Some(Posture::Balanced),
+        _ => None,
+    }
+}
+
 impl Tune {
-    /// The route's effective game posture: the viewer's wire dial, or the
-    /// node-wide env override.
+    /// The route's posture: the named wire dial when present, else the
+    /// legacy `game` bool, else the node-wide env override. Studio is
+    /// LAN-gated — asked for off-LAN it degrades to Balanced (a 200 Mbps
+    /// stream on a WAN path would be self-harm), logged at the use site.
+    pub(crate) fn posture(&self) -> Posture {
+        let p = self.mode.unwrap_or(if self.game {
+            Posture::Game
+        } else {
+            Posture::Balanced
+        });
+        match p {
+            Posture::Studio if self.link != LinkClass::Lan => Posture::Balanced,
+            Posture::Balanced if game_mode() => Posture::Game,
+            p => p,
+        }
+    }
+
+    /// The route's effective game posture (see [`Tune::posture`]).
     pub(crate) fn game(&self) -> bool {
-        self.game || game_mode()
+        self.posture() == Posture::Game
+    }
+
+    /// Studio fidelity active (named ask + a LAN path to spend it on).
+    pub(crate) fn studio(&self) -> bool {
+        self.posture() == Posture::Studio
     }
 
     fn fps(&self) -> u32 {
@@ -827,6 +880,7 @@ impl VideoBridge {
         bitrate: Option<u32>,
         fps: Option<u32>,
         game: bool,
+        mode: Option<&str>,
     ) {
         let link = self
             .routes
@@ -842,6 +896,7 @@ impl VideoBridge {
                 fps,
                 link,
                 game,
+                mode: mode.and_then(parse_posture),
             },
         );
     }
@@ -2137,17 +2192,28 @@ fn run_gpu_lane(
         Err(e) => return GpuEnd::Fallback(e),
     };
     let (dw, dh) = lane.out_size;
-    let bitrate = tune
-        .bitrate
-        .unwrap_or_else(|| h264_bitrate_for(dw, dh, fps, tune.link))
-        .clamp(250_000, 80_000_000);
-    let game = tune.game();
+    let bitrate = tuned_bitrate(tune, dw, dh, fps);
+    let posture = tune.posture();
+    if tune.mode == Some(Posture::Studio) && posture != Posture::Studio {
+        tracing::info!(
+            "studio asked for {route_id} but the path isn't LAN-classed; running balanced"
+        );
+    }
+    let game = posture == Posture::Game;
+    let studio = posture == Posture::Studio;
     let mut enc = 'open: {
         if nvenc_opt_in() {
             // The SDK rung first: same textures, direct session, the
             // game-mode levers (in game mode: GDR instead of IDR walls).
-            match crate::nvenc::NvencH264::open_on_device(&lane.device, dw, dh, fps, bitrate, game)
-            {
+            match crate::nvenc::NvencH264::open_on_device(
+                &lane.device,
+                dw,
+                dh,
+                fps,
+                bitrate,
+                game,
+                studio,
+            ) {
                 Ok(n) => break 'open GpuCodec::Nvenc(n),
                 Err(e) => tracing::info!(
                     "direct NVENC unavailable for {route_id} ({e}); using the MF rung"
@@ -3565,6 +3631,19 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
     out
 }
 
+/// The route's effective H.264 bitrate: the viewer's explicit Rate pill,
+/// else the pixel budget — floored to the Studio fidelity budget when
+/// that posture is active — clamped into the posture's lane. Studio may
+/// spend up to 250 Mbps on the LAN it's gated to; every other posture
+/// stays under the 80 Mbps stability ceiling.
+fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
+    let studio = tune.studio();
+    let auto = h264_bitrate_for(w, h, fps, tune.link);
+    let auto = if studio { auto.max(150_000_000) } else { auto };
+    let ceiling = if studio { 250_000_000 } else { 80_000_000 };
+    tune.bitrate.unwrap_or(auto).clamp(250_000, ceiling)
+}
+
 /// The H.264 edge a frame fits to right now: the tuned ceiling, capped by
 /// the receiver-driven auto-adapt when it's active. Shared by
 /// [`H264Stream`] and the GPU lane (which re-fits — and rebuilds — when
@@ -3803,10 +3882,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     // to the next (then to software) on any failure. No extra build toolchain.
     #[cfg(windows)]
     {
-        let bitrate = tune
-            .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
-            .clamp(250_000, 80_000_000);
+        let bitrate = tuned_bitrate(tune, bw, bh, fps);
         for hw in crate::mediafoundation::hardware_h264_mfts() {
             match hw.open(bw, bh, fps, bitrate) {
                 Ok(enc) => {
@@ -3834,10 +3910,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     // openh264, the encoder the viewer experienced as a slideshow.
     #[cfg(target_os = "macos")]
     {
-        let bitrate = tune
-            .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
-            .clamp(250_000, 80_000_000);
+        let bitrate = tuned_bitrate(tune, bw, bh, fps);
         match crate::videotoolbox::VideoToolboxH264::open(bw, bh, fps, bitrate) {
             Ok(enc) => {
                 let mut codec = VtCodec(enc);
@@ -3858,10 +3931,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     }
     #[cfg(feature = "hwenc")]
     {
-        let bitrate = tune
-            .bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
-            .clamp(250_000, 80_000_000);
+        let bitrate = tuned_bitrate(tune, bw, bh, fps);
         for &name in crate::hwenc::candidates() {
             match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate) {
                 Ok(enc) => {
@@ -3886,10 +3956,7 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     tracing::info!(
         "H.264 software encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
         codec.label(),
-        tune.bitrate
-            .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
-            .clamp(250_000, 80_000_000) as f64
-            / 1e6
+        tuned_bitrate(tune, bw, bh, fps) as f64 / 1e6
     );
     Ok(codec)
 }
@@ -3929,10 +3996,7 @@ fn make_h264_encoder(
     use openh264::encoder::{
         BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
     };
-    let bitrate = tune
-        .bitrate
-        .unwrap_or_else(|| h264_bitrate_for(bw, bh, fps, tune.link))
-        .clamp(250_000, 80_000_000);
+    let bitrate = tuned_bitrate(tune, bw, bh, fps);
     let mut config = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -4403,6 +4467,7 @@ mod tests {
             fps: Some(60),
             link: LinkClass::default(),
             game: false,
+            mode: None,
         };
         assert_eq!(t.fps(), 60);
         assert_eq!(t.h264_edge(), 800);

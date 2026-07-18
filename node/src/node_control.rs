@@ -988,9 +988,17 @@ pub async fn dispatch(
             let bitrate: Option<u32> = try_arg!(opt(a, "bitrate"));
             let fps: Option<u32> = try_arg!(opt(a, "fps"));
             let game: Option<bool> = try_arg!(opt(a, "game"));
+            let mode: Option<String> = try_arg!(opt(a, "mode"));
             json_result(
-                mesh.request_tune(route_id, max_edge, bitrate, fps, game.unwrap_or(false))
-                    .await,
+                mesh.request_tune(
+                    route_id,
+                    max_edge,
+                    bitrate,
+                    fps,
+                    game.unwrap_or(false),
+                    mode,
+                )
+                .await,
             )
         }
 

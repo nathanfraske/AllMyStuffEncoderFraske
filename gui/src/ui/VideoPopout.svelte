@@ -127,12 +127,25 @@
   // Mode is the headline control now: Balanced is the stability-first
   // default; Game asks the streamer for the latency-first posture
   // (gradual intra-refresh instead of keyframe walls, 60 fps floor
-  // off-LAN). The Res/FPS/Rate pills stay as expert overrides on top.
-  function toggleGame() {
-    tune = { ...tune, game: tune.game ? undefined : true };
+  // off-LAN); Studio is the LAN fidelity mode (high-bitrate
+  // quality-first — the streamer degrades it to Balanced off-LAN). The
+  // Res/FPS/Rate pills stay as expert overrides on top. The legacy
+  // `game` bool rides along so hosts that predate the tri-state still
+  // honor the Game step.
+  const MODES = ["balanced", "game", "studio"] as const;
+  const MODE_LABEL = { balanced: "Balanced", game: "Game", studio: "Studio" } as const;
+  function cycleMode() {
+    const cur = tune.mode ?? (tune.game ? "game" : "balanced");
+    const next = MODES[(MODES.indexOf(cur) + 1) % MODES.length];
+    tune = {
+      ...tune,
+      mode: next === "balanced" ? undefined : next,
+      game: next === "game" ? true : undefined,
+    };
     openPill = null;
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
+  const modeLabel = () => MODE_LABEL[tune.mode ?? (tune.game ? "game" : "balanced")];
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -497,16 +510,16 @@
       {/snippet}
       <button
         class="pill"
-        class:tuned={tune.game === true}
-        title="Balanced favors stability and quality; Game favors latency and instant recovery"
+        class:tuned={(tune.mode ?? (tune.game ? "game" : "balanced")) !== "balanced"}
+        title="Balanced favors stability and quality; Game favors latency and instant recovery; Studio spends LAN bandwidth on fidelity"
         onpointerdown={(e) => e.stopPropagation()}
         onpointerup={(e) => e.stopPropagation()}
         onclick={(e) => {
           e.stopPropagation();
-          toggleGame();
+          cycleMode();
         }}
       >
-        Mode · {tune.game ? "Game" : "Balanced"}
+        Mode · {modeLabel()}
       </button>
       {@render pillMenu("res", "Res", RES_CHOICES, tune.maxEdge, "maxEdge")}
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}

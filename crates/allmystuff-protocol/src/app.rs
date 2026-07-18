@@ -883,6 +883,12 @@ pub enum RouteControl {
         /// peers that predate it interoperate untouched.
         #[serde(default)]
         game: bool,
+        /// The stream posture by name — `"balanced"`, `"game"`, or
+        /// `"studio"` (the LAN fidelity mode: high-bitrate quality-first
+        /// encoding). Wins over `game` when present; `game` stays for
+        /// hosts that predate the tri-state. Absent = derive from `game`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     /// "Here's how your stream is actually arriving" — the viewer reports its
     /// decode health back to the streamer, periodically, so the streamer can

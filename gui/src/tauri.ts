@@ -227,8 +227,14 @@ export interface StreamTune {
   fps?: number;
   /** Game mode: the latency-first posture (gradual intra-refresh instead
    *  of keyframe walls on capable streamers, 60 fps floor off-LAN, tight
-   *  burst bounds). Absent/false = balanced. */
+   *  burst bounds). Absent/false = balanced. Kept for hosts that predate
+   *  the named tri-state below. */
   game?: boolean;
+  /** The stream posture by name. Balanced favors stability and quality;
+   *  Game favors latency and instant recovery; Studio is the LAN
+   *  fidelity mode — a high-bitrate quality-first encode for links with
+   *  bandwidth to spend (degrades to Balanced off-LAN, host-side). */
+  mode?: "balanced" | "game" | "studio";
 }
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
@@ -240,6 +246,7 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
     bitrate: tune.bitrate ?? null,
     fps: tune.fps ?? null,
     game: tune.game ?? null,
+    mode: tune.mode ?? null,
   });
 }
 

@@ -166,6 +166,7 @@ pub fn tune(
         bitrate,
         fps,
         game: false,
+        mode: None,
     })
 }
 

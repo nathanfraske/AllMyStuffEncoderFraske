@@ -76,6 +76,13 @@ const NV_ENC_PRESET_P4_GUID: GUID = GUID::from_values(
     0x4862,
     [0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81],
 );
+const NV_ENC_PRESET_P5_GUID: GUID = GUID::from_values(
+    0x21c6_e6b4,
+    0x297a,
+    0x4cba,
+    [0x99, 0x8f, 0xb6, 0xcb, 0xde, 0x72, 0xad, 0xe3],
+);
+const NV_ENC_TUNING_INFO_HIGH_QUALITY: u32 = 1;
 const NV_ENC_H264_PROFILE_MAIN_GUID: GUID = GUID::from_values(
     0x60b5_c1d4,
     0x67fe,
@@ -542,6 +549,7 @@ pub struct NvencH264 {
     fps: u32,
     frame_index: u64,
     intra_refresh: bool,
+    studio: bool,
     label: String,
 }
 
@@ -552,18 +560,21 @@ unsafe impl Send for NvencH264 {}
 
 impl NvencH264 {
     /// Open a session on `device` (the GPU lane's D3D11 device — input
-    /// textures must live on it). `intra_refresh` = game-mode GDR: an
-    /// infinite GOP whose intra data rides refresh waves (`period` ≈ 2 s,
-    /// `cnt` ≈ 15% of it) instead of IDR walls; forced IDRs still work
-    /// for viewer joins.
+    /// textures must live on it). `game` = GDR posture (infinite GOP,
+    /// refresh waves instead of IDR walls, single-frame VBV); `studio` =
+    /// the LAN fidelity posture (quality-tuned preset, deep VBV — 4:4:4
+    /// and lossless slot in here once the hardware-decode viewer lands).
+    /// The two are exclusive; `studio` wins if both arrive.
     pub fn open_on_device(
         device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
         width: u32,
         height: u32,
         fps: u32,
         bitrate: u32,
-        intra_refresh: bool,
+        game: bool,
+        studio: bool,
     ) -> Result<Self, String> {
+        let intra_refresh = game && !studio;
         let api = api()?;
         unsafe {
             let open = api.open_encode_session_ex.ok_or("no OpenEncodeSessionEx")?;
@@ -595,7 +606,10 @@ impl NvencH264 {
                 fps: fps.max(1),
                 frame_index: 0,
                 intra_refresh,
-                label: if intra_refresh {
+                studio,
+                label: if studio {
+                    "NVENC SDK (H.264, studio)".to_string()
+                } else if intra_refresh {
                     "NVENC SDK (H.264, intra-refresh)".to_string()
                 } else {
                     "NVENC SDK (H.264)".to_string()
@@ -616,14 +630,23 @@ impl NvencH264 {
             .api
             .get_encode_preset_config_ex
             .ok_or("no GetEncodePresetConfigEx")?;
+        // Balanced/game run P4 + ultra-low-latency tuning; studio runs
+        // P5 + high-quality tuning (a slower, better encode the LAN
+        // fidelity budget is meant to feed — still no B-frames, forced
+        // below, so latency stays interactive).
+        let (preset_guid, tuning) = if self.studio {
+            (NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY)
+        } else {
+            (NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
+        };
         let mut preset: Box<PresetConfig> = Box::new(std::mem::zeroed());
         preset.version = sv(4) | (1 << 31);
         preset.preset_cfg.version = sv(8) | (1 << 31);
         let status = preset_ex(
             self.encoder,
             NV_ENC_CODEC_H264_GUID,
-            NV_ENC_PRESET_P4_GUID,
-            NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            preset_guid,
+            tuning,
             &mut *preset,
         );
         if status != NV_ENC_SUCCESS {
@@ -643,6 +666,16 @@ impl NvencH264 {
         cfg.rc_params.max_bit_rate = peak;
         cfg.rc_params.vbv_buffer_size = vbv;
         cfg.rc_params.vbv_initial_delay = 0;
+        if self.studio {
+            // Studio: quality-first on a LAN that can carry it — a full
+            // second of VBV lets rate control spend where the picture
+            // needs it, and the peak stays close to the (already high)
+            // mean so the pacer's bursts stay predictable. 4:4:4 chroma
+            // and the lossless preset slot in here once the viewer
+            // decodes them (the hardware-decode epic).
+            cfg.rc_params.vbv_buffer_size = bitrate;
+            cfg.rc_params.max_bit_rate = bitrate + bitrate / 5;
+        }
         if self.intra_refresh {
             // Game posture: a single-frame VBV — every frame fits one
             // frame interval's bit budget, so no frame can queue behind
@@ -693,7 +726,7 @@ impl NvencH264 {
         let init = &mut *self.init;
         init.version = sv(5) | (1 << 31);
         init.encode_guid = NV_ENC_CODEC_H264_GUID;
-        init.preset_guid = NV_ENC_PRESET_P4_GUID;
+        init.preset_guid = preset_guid;
         init.encode_width = self.width;
         init.encode_height = self.height;
         init.dar_width = self.width;
@@ -702,7 +735,7 @@ impl NvencH264 {
         init.frame_rate_den = 1;
         init.enable_encode_async = 0;
         init.enable_ptd = 1;
-        init.tuning_info = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+        init.tuning_info = tuning;
         init.encode_config = &mut *self.config;
         let init_fn = self.api.initialize_encoder.ok_or("no InitializeEncoder")?;
         let mut status = init_fn(self.encoder, &mut *self.init);
@@ -970,13 +1003,14 @@ mod tests {
                 return;
             }
         };
-        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 30, 4_000_000, false) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("SKIP: NVENC session unavailable: {e}");
-                return;
-            }
-        };
+        let mut enc =
+            match NvencH264::open_on_device(&gpu.device(), w, h, 30, 4_000_000, false, false) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("SKIP: NVENC session unavailable: {e}");
+                    return;
+                }
+            };
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
         let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
@@ -1059,13 +1093,14 @@ mod tests {
                 return;
             }
         };
-        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, game) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
+        let mut enc =
+            match NvencH264::open_on_device(&gpu.device(), w, h, 60, 30_000_000, game, false) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("SKIP: {e}");
+                    return;
+                }
+            };
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
         let n = 150u32;
@@ -1120,13 +1155,14 @@ mod tests {
                 return;
             }
         };
-        let mut enc = match NvencH264::open_on_device(&gpu.device(), w, h, 30, 3_000_000, true) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("SKIP: NVENC session unavailable: {e}");
-                return;
-            }
-        };
+        let mut enc =
+            match NvencH264::open_on_device(&gpu.device(), w, h, 30, 3_000_000, true, false) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("SKIP: NVENC session unavailable: {e}");
+                    return;
+                }
+            };
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
         let mut units: Vec<(Vec<u8>, bool)> = Vec::new();

@@ -125,6 +125,7 @@ pub enum Effect {
         bitrate: Option<u32>,
         fps: Option<u32>,
         game: bool,
+        mode: Option<String>,
     },
     /// The viewer of a route this machine streams reported its decode health
     /// (receiver → sender). The backend records it per route to adapt the
@@ -499,6 +500,7 @@ impl Session {
                 bitrate,
                 fps,
                 game,
+                mode,
             } => {
                 if self
                     .routes
@@ -511,6 +513,7 @@ impl Session {
                         bitrate,
                         fps,
                         game,
+                        mode,
                     }];
                 }
                 Vec::new()
