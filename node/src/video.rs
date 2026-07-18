@@ -60,7 +60,7 @@
 //!    wordless black stage.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1458,121 +1458,218 @@ where
     let started = Instant::now();
     let from_screen = stall_state == VideoStatusState::DisplayAsleep;
     let mut got_any = false;
-    // Whether the current quiet spell already got its convergence re-emit
-    // (below). Re-armed by every real frame.
-    let mut quiesced = false;
-    // The post-quiesce quality refinement (see [`REFINE_PASSES`]): armed by
-    // the convergence IDR, disarmed by any real frame.
-    let mut refines_left: u8 = 0;
-    let mut refine_at: Option<Instant> = None;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        // A bounded wait keeps the stop flag responsive on idle screens.
-        let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
-            Ok(f) => f,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // A screen session that opened fine but never delivers is
-                // a dark display: damage-driven backends send nothing from
-                // a sleeping screen, and even a still desktop hands over
-                // its first frame on connect. Keep wake pressure on the
-                // panel the whole frameless window (the pulse rate-limits
-                // itself) — one polite wiggle at start demonstrably isn't
-                // enough on Windows.
-                if !got_any {
-                    if from_screen {
-                        wake::force_display_on();
+
+    // The pump is a two-stage pipeline: THIS thread (capture side) drains
+    // the backend, orients, and converts to the encode side's advertised
+    // layout, while a scoped encode thread runs the codec — so conversion
+    // of frame N overlaps the encode of frame N−1 instead of sharing one
+    // 16.6 ms budget (the measured serial cost was the ~40 fps ceiling).
+    // The stage channel is shallow and the encode side drains to freshest:
+    // latency never accumulates, staleness is dropped. The encode side owns
+    // the quiet-spell logic (quiesce IDR + refinement) since quiet is "no
+    // staged frames", and publishes its input needs (layout + fit edge)
+    // through atomics the capture side reads per frame — a healing rebuild
+    // that changes either costs at most one dropped frame.
+    let (initial_format, initial_edge) = encoder.current_needs();
+    let need_format = AtomicU8::new(stage_need_to_u8(initial_format));
+    let need_edge = AtomicU32::new(initial_edge);
+    let (stage_tx, stage_rx) = mpsc::sync_channel::<Staged>(2);
+    // Set by the encode side on ANY exit so the capture side never keeps
+    // converting into a dead stage; its error surfaces through the join.
+    let encode_done = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        let need_format = &need_format;
+        let need_edge = &need_edge;
+        let encode_done = &encode_done;
+        let encode_side = s.spawn(move || -> Result<(), String> {
+            crate::os_perf::boost_media_thread();
+            // Whether the current quiet spell already got its convergence
+            // re-emit. Re-armed by every staged frame.
+            let mut quiesced = false;
+            // The post-quiesce refinement (see [`REFINE_PASSES`]): armed by
+            // the convergence IDR, disarmed by any staged frame.
+            let mut refines_left: u8 = 0;
+            let mut refine_at: Option<Instant> = None;
+            let result = loop {
+                if stop.load(Ordering::SeqCst) {
+                    break Ok(());
+                }
+                match stage_rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(mut staged) => {
+                        // Freshest-wins: a backlog means we're behind; the
+                        // newest picture is the only one worth encoding.
+                        while let Ok(newer) = stage_rx.try_recv() {
+                            staged = newer;
+                        }
+                        quiesced = false;
+                        refines_left = 0;
+                        refine_at = None;
+                        stats.scale += staged.scale_spent;
+                        match encoder.encode_staged(staged, stats) {
+                            Ok(packets) => emit_packets(packets, on_packet, stats),
+                            Err(e) => break Err(e),
+                        }
+                        stats.maybe_log();
+                        let (format, edge) = encoder.current_needs();
+                        need_format.store(stage_need_to_u8(format), Ordering::Relaxed);
+                        need_edge.store(edge, Ordering::Relaxed);
                     }
-                    if started.elapsed() >= FIRST_FRAME_STALL {
-                        reporter.report(stall_state, None);
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // The screen went QUIET (change-driven capture
+                        // delivers nothing while nothing moves). Every
+                        // refresh mechanism — STATIC_REFRESH, the IDR
+                        // cadence, a viewer's refresh ask — lives inside
+                        // `encode`, which no longer runs; so if the
+                        // transport dropped the tail of the last motion
+                        // burst, the viewer stays frozen BEHIND the true
+                        // screen until the next motion. Serve convergence
+                        // from the encoder's retained last picture: one
+                        // clean re-emit per quiet spell (this first ~250 ms
+                        // timeout is the quiesce debounce), plus one per
+                        // refresh ask that lands while quiet — then the
+                        // refinement passes sharpen what the burst left
+                        // coarse.
+                        if !quiesced || encoder.wants_refresh() {
+                            quiesced = true;
+                            match encoder.re_emit(stats, true) {
+                                Ok(packets) => {
+                                    let emitted = !packets.is_empty();
+                                    emit_packets(packets, on_packet, stats);
+                                    if emitted && encoder.mode() == VideoMode::H264 {
+                                        refines_left = REFINE_PASSES;
+                                        refine_at = Some(Instant::now() + REFINE_AFTER);
+                                    }
+                                }
+                                Err(e) => break Err(e),
+                            }
+                            stats.maybe_log();
+                        } else if refines_left > 0 && refine_at.is_some_and(|t| Instant::now() >= t)
+                        {
+                            match encoder.re_emit(stats, false) {
+                                Ok(packets) => {
+                                    emit_packets(packets, on_packet, stats);
+                                    refines_left -= 1;
+                                    refine_at =
+                                        (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
+                                }
+                                Err(e) => break Err(e),
+                            }
+                            stats.maybe_log();
+                        }
                     }
-                    if let Some(deadline) = first_frame_deadline {
-                        if started.elapsed() >= deadline {
-                            return Err(format!(
-                                "no frame within {}s of session start",
-                                deadline.as_secs()
-                            ));
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                }
+            };
+            encode_done.store(true, Ordering::SeqCst);
+            result
+        });
+
+        // Capture side (this thread).
+        let captured: Result<(), String> = loop {
+            if stop.load(Ordering::SeqCst) || encode_done.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+            // A bounded wait keeps the stop flag responsive on idle screens.
+            let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
+                Ok(f) => f,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // A screen session that opened fine but never delivers
+                    // is a dark display: damage-driven backends send nothing
+                    // from a sleeping screen, and even a still desktop hands
+                    // over its first frame on connect. Keep wake pressure on
+                    // the panel the whole frameless window (the pulse
+                    // rate-limits itself) — one polite wiggle at start
+                    // demonstrably isn't enough on Windows.
+                    if !got_any {
+                        if from_screen {
+                            wake::force_display_on();
+                        }
+                        if started.elapsed() >= FIRST_FRAME_STALL {
+                            reporter.report(stall_state, None);
+                        }
+                        if let Some(deadline) = first_frame_deadline {
+                            if started.elapsed() >= deadline {
+                                break Err(format!(
+                                    "no frame within {}s of session start",
+                                    deadline.as_secs()
+                                ));
+                            }
                         }
                     }
                     continue;
                 }
-                // The screen went QUIET (change-driven capture delivers
-                // nothing while nothing moves). Every refresh mechanism —
-                // STATIC_REFRESH, the IDR cadence, a viewer's refresh ask —
-                // lives inside `encode`, which no longer runs; so if the
-                // transport dropped the tail of the last motion burst, the
-                // viewer stays frozen BEHIND the true screen until the next
-                // motion. Serve convergence from the encoder's retained
-                // last picture: one clean re-emit per quiet spell (this
-                // first ~250 ms timeout is the quiesce debounce), plus one
-                // per refresh ask that lands while quiet.
-                if !quiesced || encoder.wants_refresh() {
-                    quiesced = true;
-                    match encoder.re_emit(stats, true) {
-                        Ok(packets) => {
-                            let emitted = !packets.is_empty();
-                            emit_packets(packets, on_packet, stats);
-                            // The convergence IDR heals *correctness* (a lost
-                            // burst tail); the refinement passes that follow
-                            // heal *quality* — see [`REFINE_PASSES`].
-                            if emitted && encoder.mode() == VideoMode::H264 {
-                                refines_left = REFINE_PASSES;
-                                refine_at = Some(Instant::now() + REFINE_AFTER);
-                            }
-                        }
-                        Err(e) => {
-                            // The healer gave up — the stream ends, and the
-                            // viewer hears why instead of a frozen frame.
-                            reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
-                            return Err(e);
-                        }
-                    }
-                    stats.maybe_log();
-                } else if refines_left > 0 && refine_at.is_some_and(|t| Instant::now() >= t) {
-                    match encoder.re_emit(stats, false) {
-                        Ok(packets) => {
-                            emit_packets(packets, on_packet, stats);
-                            refines_left -= 1;
-                            refine_at = (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
-                        }
-                        Err(e) => {
-                            reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
-                            return Err(e);
-                        }
-                    }
-                    stats.maybe_log();
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err("capture session ended".to_string());
                 }
-                continue;
+            };
+            got_any = true;
+            reporter.report(VideoStatusState::Ok, None);
+            let frame_start = Instant::now();
+            while let Ok(newer) = frames.try_recv() {
+                frame = newer;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("capture session ended".to_string());
+            let (rgba, sw, sh) = raw(frame);
+            let staged = match stage_need_from_u8(need_format.load(Ordering::Relaxed)) {
+                None => Staged {
+                    frame: Prepared::Rgba(rgba),
+                    dw: sw,
+                    dh: sh,
+                    sw,
+                    sh,
+                    scale_spent: Duration::ZERO,
+                },
+                Some(format) => {
+                    // The convert indexes by dims — a short backend buffer
+                    // must be dropped here, not panicked on (the encode
+                    // side's own guard covers the RGBA lane).
+                    if rgba.len() < (sw as usize) * (sh as usize) * 4 {
+                        tracing::debug!(
+                            "capture frame too short ({} bytes for {sw}x{sh}); dropped",
+                            rgba.len()
+                        );
+                        continue;
+                    }
+                    let edge = need_edge.load(Ordering::Relaxed).max(320);
+                    let (dw, dh) = fit_within_even(sw, sh, edge);
+                    let t0 = Instant::now();
+                    let buf = match format {
+                        YuvFormat::I420 => scale_rgba_to_i420(&rgba, sw, sh, dw, dh),
+                        YuvFormat::Nv12 => scale_rgba_to_nv12(&rgba, sw, sh, dw, dh),
+                    };
+                    Staged {
+                        frame: Prepared::Yuv(format, buf),
+                        dw,
+                        dh,
+                        sw,
+                        sh,
+                        scale_spent: t0.elapsed(),
+                    }
+                }
+            };
+            // try_send: a full stage means the encode side is behind; this
+            // frame is stale by definition and the next conversion carries
+            // a fresher picture.
+            let _ = stage_tx.try_send(staged);
+            if let Some(rest) = budget.checked_sub(frame_start.elapsed()) {
+                std::thread::sleep(rest);
             }
         };
-        got_any = true;
-        quiesced = false;
-        refines_left = 0;
-        refine_at = None;
-        reporter.report(VideoStatusState::Ok, None);
-        let started = Instant::now();
-        while let Ok(newer) = frames.try_recv() {
-            frame = newer;
-        }
-        let (rgba, w, h) = raw(frame);
-        match encoder.encode(rgba, w, h, stats) {
-            Ok(packets) => emit_packets(packets, on_packet, stats),
-            Err(e) => {
-                // The healer gave up — the stream ends, and the viewer hears
-                // why instead of a frozen frame.
+        // Hang up the stage so the encode side drains out, then surface its
+        // verdict — an encode-side death outranks a clean capture exit, and
+        // the viewer hears why instead of a frozen frame.
+        drop(stage_tx);
+        let encoded = encode_side
+            .join()
+            .unwrap_or_else(|_| Err("encode stage panicked".to_string()));
+        if let Err(e) = encoded {
+            if !stop.load(Ordering::SeqCst) {
                 reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
-                return Err(e);
             }
+            return Err(e);
         }
-        stats.maybe_log();
-        if let Some(rest) = budget.checked_sub(started.elapsed()) {
-            std::thread::sleep(rest);
-        }
-    }
+        captured
+    })
 }
 
 /// Bring a captured frame upright to match a **physically-rotated** monitor.
@@ -2050,6 +2147,29 @@ impl HealingEncoder {
         }
     }
 
+    /// [`StreamEncoder::encode_staged`] with the healing wrap — the
+    /// pipelined pump's encode-side entry point.
+    fn encode_staged(
+        &mut self,
+        staged: Staged,
+        stats: &mut StreamStats,
+    ) -> Result<Vec<VideoPacket>, String> {
+        let hint = (staged.sw, staged.sh);
+        match self.enc.encode_staged(staged, stats) {
+            Ok(packets) => Ok(packets),
+            Err(e) => {
+                self.heal(&e, hint)?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// See [`StreamEncoder::current_needs`] — republished by the encode
+    /// side after every encode so the capture side tracks rebuilds.
+    fn current_needs(&self) -> (Option<YuvFormat>, u32) {
+        self.enc.current_needs()
+    }
+
     /// One encoder error: rebuild, skip, or give up per the policy. `Ok(())`
     /// means the stream carries on (this frame is simply dropped); `Err`
     /// ends the route with the reason.
@@ -2124,6 +2244,50 @@ fn make_encoder(
                 auto,
             )
         }
+    }
+}
+
+/// A capture-side-prepared frame headed for the encode stage: raw RGBA for
+/// the MJPEG floor (which scales/encodes internally), or a 4:2:0 buffer
+/// converted to the layout the encode side advertised via
+/// [`HealingEncoder::current_needs`].
+enum Prepared {
+    Rgba(Vec<u8>),
+    Yuv(YuvFormat, Vec<u8>),
+}
+
+/// One staged frame crossing the pipelined pump's channel — the seam that
+/// lets the capture side convert frame N while the encode side encodes
+/// frame N−1.
+struct Staged {
+    frame: Prepared,
+    /// Prepared-buffer dims (fitted for `Yuv`; the raw capture dims for
+    /// `Rgba`).
+    dw: u32,
+    dh: u32,
+    /// Raw capture dims.
+    sw: u32,
+    sh: u32,
+    /// Time the capture side spent converting — accounted into the encode
+    /// side's stats, which own the dial-in log line.
+    scale_spent: Duration,
+}
+
+/// The wire encoding of [`HealingEncoder::current_needs`]'s layout half for
+/// the producer-visible atomic: 0 = raw RGBA, 1 = I420, 2 = NV12.
+fn stage_need_to_u8(need: Option<YuvFormat>) -> u8 {
+    match need {
+        None => 0,
+        Some(YuvFormat::I420) => 1,
+        Some(YuvFormat::Nv12) => 2,
+    }
+}
+
+fn stage_need_from_u8(v: u8) -> Option<YuvFormat> {
+    match v {
+        1 => Some(YuvFormat::I420),
+        2 => Some(YuvFormat::Nv12),
+        _ => None,
     }
 }
 
@@ -2240,6 +2404,52 @@ impl StreamEncoder {
             StreamEncoder::H264(enc) => enc.re_emit(stats, force_idr),
         }
     }
+
+    /// Encode one capture-side-staged frame. A staging that doesn't match
+    /// the current arm (a healing rebuild swapped H.264↔MJPEG, or a format
+    /// change raced the producer) drops that one frame — the producer
+    /// re-reads [`Self::current_needs`] and the next frame lands right.
+    fn encode_staged(
+        &mut self,
+        staged: Staged,
+        stats: &mut StreamStats,
+    ) -> Result<Vec<VideoPacket>, String> {
+        match (self, staged.frame) {
+            (StreamEncoder::Mjpeg(enc), Prepared::Rgba(rgba)) => {
+                let need = (staged.sw as usize) * (staged.sh as usize) * 4;
+                if rgba.len() < need {
+                    return Err(format!(
+                        "capture frame too short: {} bytes for {}x{} RGBA (need {need})",
+                        rgba.len(),
+                        staged.sw,
+                        staged.sh
+                    ));
+                }
+                Ok(enc
+                    .encode(rgba, staged.sw, staged.sh, stats)?
+                    .map(VideoPacket::Jpeg)
+                    .into_iter()
+                    .collect())
+            }
+            (StreamEncoder::H264(enc), Prepared::Yuv(format, yuv)) => {
+                enc.encode_prepared(yuv, format, staged.dw, staged.dh, stats)
+            }
+            _ => {
+                stats.dropped += 1;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// What the capture side should stage next: `(layout, fit edge)` —
+    /// `None` = raw RGBA (the MJPEG floor), else the 4:2:0 layout the
+    /// backend ingests plus the effective edge to fit to.
+    fn current_needs(&self) -> (Option<YuvFormat>, u32) {
+        match self {
+            StreamEncoder::Mjpeg(_) => (None, 0),
+            StreamEncoder::H264(enc) => (Some(enc.codec.input_format()), enc.effective_edge()),
+        }
+    }
 }
 
 /// The H.264 encode stage of one route's stream — openh264 in
@@ -2344,6 +2554,40 @@ impl H264Stream {
             return Ok(Vec::new());
         }
         let (dw, dh) = fit_within_even(sw, sh, self.effective_edge());
+        // Downscale and convert straight to the backend's native 4:2:0
+        // layout in one fused pass — no RGB intermediate, no encoder-side
+        // re-interleave (hardware MFTs ingest NV12 directly). The
+        // unchanged-frame compare also runs on the small 1.5-byte/pixel
+        // buffer instead of 3-byte RGB.
+        let format = self.codec.input_format();
+        let t0 = Instant::now();
+        let yuv = match format {
+            YuvFormat::I420 => scale_rgba_to_i420(&rgba, sw, sh, dw, dh),
+            YuvFormat::Nv12 => scale_rgba_to_nv12(&rgba, sw, sh, dw, dh),
+        };
+        stats.scale += t0.elapsed();
+        self.encode_prepared(yuv, format, dw, dh, stats)
+    }
+
+    /// The post-conversion half of [`Self::encode`]: budget rebuild,
+    /// unchanged-frame gate, IDR cadence, the backend call, packetize. The
+    /// pipelined pump converts on the capture side and feeds this directly,
+    /// overlapping conversion with the previous frame's encode; the
+    /// single-threaded paths go through [`Self::encode`]. `format` names
+    /// the layout `yuv` was converted for — if a rebuild inside this call
+    /// (or a producer race) leaves the backend wanting a different layout,
+    /// the frame is dropped rather than fed as the wrong chroma order.
+    fn encode_prepared(
+        &mut self,
+        yuv: Vec<u8>,
+        format: YuvFormat,
+        dw: u32,
+        dh: u32,
+        stats: &mut StreamStats,
+    ) -> Result<Vec<VideoPacket>, String> {
+        if dw == 0 || dh == 0 {
+            return Ok(Vec::new());
+        }
         // The real fitted size is known now — if it differs from what the
         // bitrate was budgeted for (HiDPI monitors *report* logical pixels
         // but *capture* physical ones), rebuild the encoder on a corrected
@@ -2357,17 +2601,13 @@ impl H264Stream {
             self.prev = Vec::new();
             self.prev_size = (0, 0);
         }
-        // Downscale and convert straight to the backend's native 4:2:0
-        // layout in one fused pass — no RGB intermediate, no encoder-side
-        // re-interleave (hardware MFTs ingest NV12 directly). The
-        // unchanged-frame compare also runs on the small 1.5-byte/pixel
-        // buffer instead of 3-byte RGB.
-        let t0 = Instant::now();
-        let yuv = match self.codec.input_format() {
-            YuvFormat::I420 => scale_rgba_to_i420(&rgba, sw, sh, dw, dh),
-            YuvFormat::Nv12 => scale_rgba_to_nv12(&rgba, sw, sh, dw, dh),
-        };
-        stats.scale += t0.elapsed();
+        if format != self.codec.input_format() {
+            // Converted for a backend the rebuild just replaced (or the
+            // pipelined producer raced a needs change): one dropped frame;
+            // the producer re-reads the needs and the next one lands right.
+            stats.dropped += 1;
+            return Ok(Vec::new());
+        }
         (stats.out_w, stats.out_h) = (dw, dh);
         let refresh_asked = self.refresh.swap(false, Ordering::SeqCst);
         let refresh_due = refresh_asked
@@ -3784,6 +4024,92 @@ mod tests {
         );
         println!(
             "bench MF units conservation: {units} units out of {fed} frames fed · {bytes} bytes"
+        );
+    }
+
+    /// End-to-end throughput of the pipelined pump: synthetic 1440p frames
+    /// supplied as fast as the pipeline drains them, packets counted out the
+    /// far side. This is the number the capture/encode split moves — the
+    /// serial pump's ceiling was 1/(convert+encode); the pipelined pump's is
+    /// 1/max(convert, encode). (The decomposition bench above measures the
+    /// stages themselves and is deliberately serial.)
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_pump_pipelined_throughput() {
+        let (w, h) = (2560u32, 1440u32);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, u32, u32)>(2);
+        let mut stats = StreamStats::new("bench", VideoMode::H264);
+        let tune = Tune {
+            bitrate: Some(40_000_000),
+            fps: Some(120),
+            ..Tune::default()
+        };
+        let mut enc = HealingEncoder::new(
+            "bench",
+            VideoMode::H264,
+            (w, h),
+            tune,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+            &AutoAdapt::new(),
+        )
+        .expect("encoder");
+        let sent = Arc::new(Mutex::new(0u32));
+        let sent_cb = sent.clone();
+        let mut reporter = StatusReporter::new(Arc::new(|_, _| {}));
+        let feeder_stop = stop.clone();
+        let feeder = std::thread::spawn(move || {
+            // A few distinct smooth-gradient patterns so every frame differs
+            // (no static skip) at a desktop-like encode complexity — byte
+            // noise would benchmark the encoder's worst case, not the
+            // pipeline. `send` blocks on the shallow channel, so supply
+            // tracks exactly what the pipeline drains.
+            let frames: Vec<Vec<u8>> = (0..3u32)
+                .map(|i| {
+                    (0..(w * h * 4) as usize)
+                        .map(|j| (((j / 512) as u32).wrapping_add(i * 37) % 251) as u8)
+                        .collect()
+                })
+                .collect();
+            let mut i = 0usize;
+            while !feeder_stop.load(Ordering::SeqCst) {
+                if tx.send((frames[i % frames.len()].clone(), w, h)).is_err() {
+                    break;
+                }
+                i += 1;
+            }
+        });
+        let stopper = stop.clone();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            stopper.store(true, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        pump_frames_with_stall(
+            &stop,
+            120,
+            &rx,
+            |f: (Vec<u8>, u32, u32)| f,
+            &move |_p| {
+                *sent_cb.lock() += 1;
+                true
+            },
+            &mut enc,
+            &mut stats,
+            &mut reporter,
+            VideoStatusState::DisplayAsleep,
+            None,
+        )
+        .expect("pump");
+        let secs = t0.elapsed().as_secs_f64();
+        killer.join().expect("killer");
+        drop(rx);
+        feeder.join().expect("feeder");
+        println!(
+            "bench pump pipelined 1440p end-to-end: {:.1} packets/s over {secs:.1}s",
+            f64::from(*sent.lock()) / secs
         );
     }
 
