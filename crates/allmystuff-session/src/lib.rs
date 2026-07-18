@@ -135,6 +135,7 @@ pub enum Effect {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        lost_ts_us: Option<u64>,
     },
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
@@ -523,6 +524,7 @@ impl Session {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                lost_ts_us,
             } => {
                 // Only the route's own viewer reports on it, and only while
                 // it's live — same gate as a refresh/tune ask.
@@ -536,6 +538,7 @@ impl Session {
                         recv_fps,
                         decode_fails,
                         queue_depth,
+                        lost_ts_us,
                     }];
                 }
                 Vec::new()
@@ -1072,11 +1075,18 @@ mod tests {
                 recv_fps: 28,
                 decode_fails: 3,
                 queue_depth: 1,
+                lost_ts_us: Some(123_456),
             }),
         );
         assert!(matches!(
             fx.as_slice(),
-            [Effect::VideoFeedback { route_id, recv_fps: 28, decode_fails: 3, queue_depth: 1 }]
+            [Effect::VideoFeedback {
+                route_id,
+                recv_fps: 28,
+                decode_fails: 3,
+                queue_depth: 1,
+                lost_ts_us: Some(123_456),
+            }]
                 if route_id == "r1"
         ));
         // A bystander may not.

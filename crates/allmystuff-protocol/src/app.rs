@@ -911,6 +911,13 @@ pub enum RouteControl {
         /// large = the viewer can't drain as fast as frames arrive).
         #[serde(default)]
         queue_depth: u32,
+        /// Frame health: the presentation timestamp (µs) of the most
+        /// recent access unit that failed to decode, when one did — lets
+        /// a capable host heal with a targeted refresh (GDR wave restart
+        /// today, reference invalidation next) instead of a keyframe
+        /// wall. Old peers ignore it.
+        #[serde(default)]
+        lost_ts_us: Option<u64>,
     },
     /// "Your inbound video for this route rides track lane N." The streaming
     /// (host) side tells the viewer which RTP track lane it pinned a

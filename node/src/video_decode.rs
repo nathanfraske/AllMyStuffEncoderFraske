@@ -136,7 +136,7 @@ impl DecodeBridge {
     pub fn feed<F, G>(&self, route_id: &str, au: Au, on_frame: F, on_glitch: G)
     where
         F: Fn(Vec<u8>) + Send + 'static,
-        G: Fn() + Send + 'static,
+        G: Fn(Option<u64>) + Send + 'static,
     {
         let mut routes = self.routes.lock();
         let entry = routes.entry(route_id.to_string()).or_insert_with(|| {
@@ -187,7 +187,7 @@ fn run_decode<F, G>(
     on_glitch: G,
 ) where
     F: Fn(Vec<u8>),
-    G: Fn(),
+    G: Fn(Option<u64>),
 {
     use openh264::decoder::{Decoder, DecoderConfig};
     use openh264::formats::YUVSource as _;
@@ -227,7 +227,7 @@ fn run_decode<F, G>(
             // the sender's next IDR — same recovery as a decode error.
             while rx.try_recv().is_ok() {}
             waiting_key = true;
-            on_glitch();
+            on_glitch(None);
         }
         // A parameter-set-led unit is a decode entry in both codecs and
         // carries the stream's codec declaration — trusted over `au.key`,
@@ -341,7 +341,9 @@ fn run_decode<F, G>(
             }
             decoder = None;
             waiting_key = true;
-            on_glitch();
+            // Frame health: name the AU that broke — a capable sender
+            // heals with a wave instead of a keyframe wall.
+            on_glitch(Some(au.ts_us));
         }
         let elapsed = since.elapsed();
         if elapsed >= STATS_EVERY && frames > 0 {
@@ -412,7 +414,7 @@ mod tests {
                 move |packet| {
                     let _ = tx.send(packet);
                 },
-                || {},
+                |_| {},
             );
         }
 
@@ -497,7 +499,7 @@ mod tests {
                         data: d,
                     },
                     move |p| sink.lock().push(p),
-                    || {},
+                    |_| {},
                 );
             }
             // Stay under the bounded queue — the decoder runs ~1 ms/frame.

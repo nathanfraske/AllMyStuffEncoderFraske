@@ -661,6 +661,9 @@ pub struct NvencH264 {
     studio: bool,
     lossless: bool,
     hevc: bool,
+    /// Frame health asked for a refresh-wave restart before the next
+    /// encode (GDR only) — consumed by [`Self::encode_texture`].
+    pending_wave: bool,
     label: String,
 }
 
@@ -771,6 +774,7 @@ impl NvencH264 {
                 studio,
                 lossless,
                 hevc,
+                pending_wave: false,
                 label: if lossless && hevc {
                     "NVENC SDK (HEVC, studio-lossless)".to_string()
                 } else if lossless {
@@ -1055,6 +1059,16 @@ impl NvencH264 {
         &self.label
     }
 
+    /// Frame health's targeted heal on a GDR session: restart the
+    /// refresh wave at the next encode — spread intra, no IDR wall —
+    /// so a viewer's reported loss converges in ~5 frames without the
+    /// keyframe spike loss recovery used to cost. No-op off GDR.
+    pub fn arm_wave(&mut self) {
+        if self.intra_refresh {
+            self.pending_wave = true;
+        }
+    }
+
     /// Encode one NV12 texture (on the session's device) synchronously,
     /// returning the produced access unit. `force_idr` = clean entry now
     /// (works in both GOP shapes). Speaks the ladder's
@@ -1096,7 +1110,18 @@ impl NvencH264 {
             pic.input_time_stamp = self.frame_index * duration;
             pic.input_duration = duration;
             self.frame_index += 1;
+            if self.intra_refresh && self.pending_wave && !force_idr {
+                // Frame health: wave-only restart — intra spreads over
+                // the next ~5 frames with no IDR in the stream at all.
+                self.pending_wave = false;
+                let words = std::slice::from_raw_parts_mut(
+                    pic.codec_pic_params.as_mut_ptr() as *mut u32,
+                    8,
+                );
+                words[H264_PIC_FORCE_INTRA_REFRESH_IDX] = ((self.fps / 2).max(15) / 5).max(3);
+            }
             if force_idr {
+                self.pending_wave = false;
                 pic.encode_pic_flags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
                 if self.intra_refresh {
                     // An IDR mid-GDR: restart the refresh wave after it so
@@ -1879,6 +1904,7 @@ pub(crate) mod tests_support {
                 studio: true,
                 lossless: true,
                 hevc: false,
+                pending_wave: false,
                 label: "NVENC SDK (AV1 probe)".to_string(),
             };
             let mut doc = vec![0u8; wu * (hu + 300) * 4];

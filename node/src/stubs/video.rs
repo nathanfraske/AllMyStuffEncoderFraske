@@ -231,6 +231,10 @@ impl VideoBridge {
 
     pub fn force_idr(&self, _route_id: &str) {}
 
+    /// Mirror of the real bridge's frame-health heal — no capture routes
+    /// exist on this build, so there is never a lane to wave.
+    pub fn route_wave_or_refresh(&self, _route_id: &str) {}
+
     /// No capture routes exist on this build, so there are never any ids to
     /// re-class. Present for surface parity with the real bridge (the LAN
     /// gate sweeps this in `refresh_peer_networks`).

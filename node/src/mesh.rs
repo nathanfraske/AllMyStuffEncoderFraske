@@ -2669,13 +2669,21 @@ impl Mesh {
                         mesh.enqueue_decoded(&rid, packet);
                     }
                 },
-                move || {
+                move |lost_ts_us| {
                     // The native decoder hit a corrupt unit or dumped its
-                    // queue: ask the sender to re-key rather than waiting
-                    // out the periodic IDR (rate-limited inside).
+                    // queue: name the broken AU in feedback (a capable
+                    // sender heals with a GDR wave, no keyframe wall) AND
+                    // keep the rate-limited re-key ask — old senders need
+                    // it, and for new ones the wave lands first so the
+                    // wall it forces is the same one today's path forced.
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
                         crate::spawn(async move {
+                            if lost_ts_us.is_some() {
+                                let _ = mesh
+                                    .send_video_feedback(rid.clone(), 0, 1, 0, lost_ts_us)
+                                    .await;
+                            }
                             let _ = mesh.request_refresh(rid).await;
                         });
                     }
@@ -4457,9 +4465,24 @@ impl Mesh {
                     recv_fps,
                     decode_fails,
                     queue_depth,
-                } => self
-                    .video
-                    .note_feedback(&route_id, recv_fps, decode_fails, queue_depth),
+                    lost_ts_us,
+                } => {
+                    if let Some(ts) = lost_ts_us {
+                        // Frame health: the viewer named the AU that died.
+                        // A GDR (game) route heals with an immediate
+                        // refresh-wave restart — spread intra, no keyframe
+                        // wall; everything else keeps the IDR refresh the
+                        // feedback path already drives. (Targeted
+                        // reference invalidation rides the ts-mapping
+                        // follow-up.)
+                        tracing::info!(
+                            "frame health {route_id}: viewer lost AU at {ts} µs — targeted refresh"
+                        );
+                        self.video.route_wave_or_refresh(&route_id);
+                    }
+                    self.video
+                        .note_feedback(&route_id, recv_fps, decode_fails, queue_depth)
+                }
                 Effect::StopMedia(id) => {
                     self.audio.stop(&id);
                     self.video.stop(&id);
@@ -9948,6 +9971,7 @@ impl Mesh {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        lost_ts_us: Option<u64>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
         self.send_control(
@@ -9957,6 +9981,7 @@ impl Mesh {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                lost_ts_us,
             }),
         )
         .await

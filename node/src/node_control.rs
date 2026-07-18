@@ -977,8 +977,11 @@ pub async fn dispatch(
             let recv_fps: u32 = try_arg!(arg(a, "recv_fps"));
             let decode_fails: u32 = try_arg!(arg(a, "decode_fails"));
             let queue_depth: u32 = try_arg!(arg(a, "queue_depth"));
+            // The webview decode ladder can't name the failed AU (its
+            // decoder is opaque); the native lane's glitch path reports
+            // the timestamp itself.
             json_result(
-                mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth)
+                mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth, None)
                     .await,
             )
         }

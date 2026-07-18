@@ -1041,6 +1041,20 @@ impl VideoBridge {
         }
     }
 
+    /// Frame health's targeted heal: a GDR lane restarts its refresh
+    /// wave — spread intra over ~5 frames, no keyframe wall, no smear
+    /// left behind — and any route without a registered wave falls back
+    /// to the IDR refresh. The wave is strictly cheaper than what the
+    /// viewer's own rate-limited refresh ask would force moments later.
+    pub fn route_wave_or_refresh(&self, route_id: &str) {
+        if let Some(flag) = wave_flags().lock().get(route_id) {
+            flag.store(true, Ordering::SeqCst);
+            tracing::debug!("wave restart requested for {route_id}");
+            return;
+        }
+        self.force_idr(route_id);
+    }
+
     /// Record the decode health a viewer reported for one of our streams
     /// (receiver → sender). Logged at info when the link looks unhealthy
     /// (decode failures, or the queue backing up) so a struggling stream is
@@ -2282,6 +2296,24 @@ fn run_gpu_lane(
     // onto the MF rung loses GDR, and the cadence must come back with it
     // (red team, encoder finding 4).
     let mut gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
+    // Frame health's wave flag: registered while this GDR lane lives so
+    // a viewer's loss report heals with a wave instead of an IDR wall;
+    // the guard unregisters on every lane exit path.
+    let wave = std::sync::Arc::new(AtomicBool::new(false));
+    struct WaveReg(Option<String>);
+    impl Drop for WaveReg {
+        fn drop(&mut self) {
+            if let Some(id) = self.0.take() {
+                wave_flags().lock().remove(&id);
+            }
+        }
+    }
+    let _wave_reg = WaveReg(gdr.then(|| {
+        wave_flags()
+            .lock()
+            .insert(route_id.to_string(), wave.clone());
+        route_id.to_string()
+    }));
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
         enc.label(),
@@ -2359,6 +2391,11 @@ fn run_gpu_lane(
                 stats.add_scale(frame.spent);
                 (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
+                if gdr && wave.swap(false, Ordering::SeqCst) {
+                    if let GpuCodec::Nvenc(n) = &mut enc {
+                        n.arm_wave();
+                    }
+                }
                 let idr_every = Duration::from_millis(idr_ms.load(Ordering::Relaxed));
                 let force_idr = refresh_asked
                     || (!gdr && last_idr.is_none_or(|idr| idr.elapsed() >= idr_every));
@@ -3655,6 +3692,17 @@ pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
 /// of spaced ~20-packet bursts, with zero MyOwnMesh involvement (its
 /// reassembler emits per marker and its contiguity anchor spans the
 /// split writes — verified against the daemon's `H264AuAssembler`).
+/// GDR lanes register their wave-restart flag here, keyed by route — the
+/// module-global seam between the encode lane and the feedback path,
+/// which meet nowhere else. Entries are lane-lifetime (RAII-removed).
+pub(crate) fn wave_flags(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicBool>>> {
+    static FLAGS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicBool>>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    &FLAGS
+}
+
 pub(crate) fn paced_slices_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         // Default ON: verified against the daemon's assembler and pinned
