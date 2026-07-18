@@ -1589,6 +1589,226 @@ mod tests {
 /// the two sides must feed identical pixels to compare fairly.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use super::*;
+
+    /// The AV1 feasibility probe: what this GPU's NVENC will and won't
+    /// do for the AV1 arc, asked of the driver directly. AV1 lossless is
+    /// profile-0 syntax (qindex 0 ⇒ lossless transform — no special
+    /// profile like H.264's, no tier question like HEVC's), so if the
+    /// encoder side opens, hardware decode is broadly conformant; this
+    /// probe therefore interrogates the encoder: is AV1 present at all
+    /// (Ada-class NVENC), which tunings the preset system accepts, and —
+    /// if lossless or constQP-0 opens — what an actual encode of the
+    /// document content produces (lossless-class bytes ≈ HEVC-LL's
+    /// ~190 KB/frame at 1440p; lossy-class ≈ tens of KB — the size class
+    /// is itself the verdict). Run:
+    /// `cargo test --release -- --ignored probe_nvenc_av1 --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "diagnostic probe — run with --ignored --nocapture"]
+    fn probe_nvenc_av1_lossless() {
+        const NV_ENC_CODEC_AV1_GUID: GUID = GUID::from_values(
+            0x0a35_2289,
+            0x0aa7,
+            0x4759,
+            [0x86, 0x2d, 0x5d, 0x15, 0xcd, 0x16, 0xd2, 0x54],
+        );
+        let (w, h) = (2560u32, 1440u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let api = match super::api() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("SKIP: NVENC unavailable: {e}");
+                return;
+            }
+        };
+        unsafe {
+            let open = api.open_encode_session_ex.expect("open fn");
+            let mut session = SessionExParams {
+                version: sv(1),
+                device_type: NV_ENC_DEVICE_TYPE_DIRECTX,
+                device: gpu.device().as_raw(),
+                reserved: std::ptr::null_mut(),
+                api_version: API_VERSION,
+                reserved1: [0; 253],
+                reserved2: [std::ptr::null_mut(); 64],
+            };
+            let mut encoder: Enc = std::ptr::null_mut();
+            let status = open(&mut session, &mut encoder);
+            assert_eq!(status, NV_ENC_SUCCESS, "session open");
+            let preset_ex = api.get_encode_preset_config_ex.expect("preset fn");
+            let mut lossless_cfg: Option<Box<PresetConfig>> = None;
+            for (name, tuning) in [
+                ("high-quality", NV_ENC_TUNING_INFO_HIGH_QUALITY),
+                ("ultra-low-latency", NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY),
+                ("lossless", NV_ENC_TUNING_INFO_LOSSLESS),
+            ] {
+                let mut preset: Box<PresetConfig> = Box::new(std::mem::zeroed());
+                preset.version = sv(4) | (1 << 31);
+                preset.preset_cfg.version = sv(8) | (1 << 31);
+                let status = preset_ex(
+                    encoder,
+                    NV_ENC_CODEC_AV1_GUID,
+                    NV_ENC_PRESET_P5_GUID,
+                    tuning,
+                    &mut *preset,
+                );
+                println!(
+                    "AV1 preset P5 + {name}: {}",
+                    if status == NV_ENC_SUCCESS {
+                        "SUPPORTED".to_string()
+                    } else {
+                        format!("rejected (status {status})")
+                    }
+                );
+                if status == NV_ENC_SUCCESS && tuning == NV_ENC_TUNING_INFO_LOSSLESS {
+                    lossless_cfg = Some(preset);
+                }
+            }
+            // If the lossless tuning didn't open, try the HEVC trick by
+            // hand: high-quality preset forced to constQP 0 — in AV1,
+            // qindex 0 *is* lossless by definition, if the driver will
+            // carry it.
+            let attempt = lossless_cfg.or_else(|| {
+                let mut preset: Box<PresetConfig> = Box::new(std::mem::zeroed());
+                preset.version = sv(4) | (1 << 31);
+                preset.preset_cfg.version = sv(8) | (1 << 31);
+                let status = preset_ex(
+                    encoder,
+                    NV_ENC_CODEC_AV1_GUID,
+                    NV_ENC_PRESET_P5_GUID,
+                    NV_ENC_TUNING_INFO_HIGH_QUALITY,
+                    &mut *preset,
+                );
+                if status != NV_ENC_SUCCESS {
+                    return None;
+                }
+                println!("trying high-quality preset overridden to constQP 0…");
+                preset.preset_cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_CONSTQP;
+                preset.preset_cfg.rc_params.const_qp = NvEncQp {
+                    qp_inter_p: 0,
+                    qp_inter_b: 0,
+                    qp_intra: 0,
+                };
+                Some(preset)
+            });
+            let Some(mut preset) = attempt else {
+                println!("VERDICT: no AV1 encode on this NVENC (pre-Ada silicon) — arc needs 40-series hosts");
+                let _ = (api.destroy_encoder.expect("destroy"))(encoder);
+                return;
+            };
+            // Full init with the preset config passed back untouched
+            // (codec-specific fields stay driver-default), then encode
+            // real content and read the size class.
+            let mut config: Box<NvEncConfig> = Box::new(std::mem::zeroed());
+            std::ptr::copy_nonoverlapping(&preset.preset_cfg, &mut *config, 1);
+            config.version = sv(8) | (1 << 31);
+            config.rc_params.average_bit_rate = 0;
+            config.rc_params.max_bit_rate = 0;
+            config.rc_params.vbv_buffer_size = 0;
+            config.rc_params.vbv_initial_delay = 0;
+            let mut init: Box<InitializeParams> = Box::new(std::mem::zeroed());
+            init.version = sv(5) | (1 << 31);
+            init.encode_guid = NV_ENC_CODEC_AV1_GUID;
+            init.preset_guid = NV_ENC_PRESET_P5_GUID;
+            init.encode_width = w;
+            init.encode_height = h;
+            init.dar_width = w;
+            init.dar_height = h;
+            init.frame_rate_num = 60;
+            init.frame_rate_den = 1;
+            init.enable_encode_async = 0;
+            init.enable_ptd = 1;
+            init.tuning_info = NV_ENC_TUNING_INFO_LOSSLESS;
+            init.encode_config = &mut *config;
+            let init_fn = api.initialize_encoder.expect("init fn");
+            let mut status = init_fn(encoder, &mut *init);
+            if status != NV_ENC_SUCCESS {
+                init.tuning_info = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+                status = init_fn(encoder, &mut *init);
+            }
+            if status != NV_ENC_SUCCESS {
+                println!("VERDICT: AV1 present but constQP-0 init rejected (status {status}) — lossless AV1 closed on this driver");
+                let _ = (api.destroy_encoder.expect("destroy"))(encoder);
+                return;
+            }
+            println!("AV1 constQP-0 session initialized — encoding 60 frames of document scroll…");
+            // From here reuse the normal encode plumbing by dressing the
+            // raw session as an NvencH264 (same struct, AV1 config inside).
+            let mut create = CreateBitstreamBuffer {
+                version: sv(1),
+                size: 0,
+                memory_heap: 0,
+                reserved: 0,
+                bitstream_buffer: std::ptr::null_mut(),
+                bitstream_buffer_ptr: std::ptr::null_mut(),
+                reserved1: [0; 58],
+                reserved2: [std::ptr::null_mut(); 64],
+            };
+            let status = (api.create_bitstream_buffer.expect("bitstream fn"))(encoder, &mut create);
+            assert_eq!(status, NV_ENC_SUCCESS, "bitstream buffer");
+            let mut me = NvencH264 {
+                api,
+                encoder,
+                bitstream: create.bitstream_buffer,
+                registered: Vec::new(),
+                config,
+                init,
+                width: w,
+                height: h,
+                fps: 60,
+                frame_index: 0,
+                intra_refresh: false,
+                studio: true,
+                lossless: true,
+                hevc: false,
+                label: "NVENC SDK (AV1 probe)".to_string(),
+            };
+            let mut doc = vec![0u8; wu * (hu + 300) * 4];
+            super::tests_support::paint_document(&mut doc, wu, hu + 300);
+            let mut bgra = vec![0u8; wu * hu * 4];
+            let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
+            let (mut bytes, mut units, mut enc_ms) = (0u64, 0u32, Vec::<f32>::new());
+            let mut first_obu = Vec::new();
+            for i in 0..60u64 {
+                let off = (i as usize) * 3;
+                bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
+                gpu.update_bgra(&tex, &bgra, w, h);
+                let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("slot");
+                let t = std::time::Instant::now();
+                let out = me.encode_texture(&nv12, i == 0).expect("encode");
+                enc_ms.push(t.elapsed().as_secs_f32() * 1000.0);
+                gpu.release(slot);
+                for (d, _) in out.units {
+                    units += 1;
+                    bytes += d.len() as u64;
+                    if first_obu.is_empty() {
+                        first_obu = d[..d.len().min(8)].to_vec();
+                    }
+                }
+            }
+            enc_ms.sort_by(f32::total_cmp);
+            let n = enc_ms.len();
+            println!(
+                "AV1 constQP-0 · 1440p doc scroll: {units} units · {:.1} KB/frame avg · {:.1} Mbps@60 · enc avg {:.2} ms · p95 {:.2} · first bytes {:02x?}",
+                bytes as f64 / 60.0 / 1024.0,
+                bytes as f64 * 8.0 * 60.0 / 60.0 / 1e6,
+                enc_ms.iter().sum::<f32>() / n as f32,
+                enc_ms[(n * 95 / 100).min(n - 1)],
+                first_obu
+            );
+            println!(
+                "size class: HEVC-lossless ≈ 190 KB/frame on this content; lossy studio ≈ 110 — read the verdict from the line above"
+            );
+        }
+    }
+
     /// Deterministic LCG — the benches must not vary run to run.
     pub(crate) fn lcg(s: &mut u64) -> u32 {
         *s = (*s)

@@ -427,7 +427,7 @@ mod tests {
             (0x1b81be68_a0c7_11d3_b984_00c04f2e73c5, "H264 VLD NoFGT"),
             (0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0, "HEVC VLD Main"),
             (0x107af0e0_ef1a_4d19_aba8_67a163073d13, "HEVC VLD Main10"),
-            (0x8c56eb1e_2b47_466f_8d33_7dbcd63f3df2, "AV1 VLD Profile0"),
+            (0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a, "AV1 VLD Profile0"),
             (0x463707f8_a1d0_4585_876d_83aa6d60b89e, "VP9 VLD Profile0"),
             (
                 0xa4c749ef_6ecf_48aa_8448_50a7a1165ff7,
