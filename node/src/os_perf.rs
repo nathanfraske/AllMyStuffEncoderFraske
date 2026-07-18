@@ -70,7 +70,173 @@ impl Drop for TimerResolutionGuard {
 pub(crate) static MEDIA_THREADS: std::sync::Mutex<Vec<(String, isize)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Process-wide scheduling honesty, once per process (first media thread
+/// arms it). Two opt-outs that exist because Windows 11 quietly
+/// second-guesses background processes:
+///
+///  1. **Execution-speed throttling** — the per-thread EcoQoS opt-out in
+///     [`boost_media_thread`] covers the *named* media threads, but the
+///     pacer's microsecond gaps run on tokio worker threads and the
+///     control plane on others; the process-wide bit covers them all.
+///  2. **Timer-resolution honesty** — since Windows 11, the kernel
+///     IGNORES `timeBeginPeriod` for processes it classifies as
+///     background/occluded. `allmystuff-serve` is a windowless sidecar —
+///     exactly the shape at risk — so without this bit the 1 ms guard can
+///     be a silent no-op and every sleep in the pipeline quantizes at up
+///     to 15.6 ms on a stock field box.
+///
+/// Best-effort like every lever here; pre-Win11 boxes simply don't know
+/// the second flag and honor the first.
+fn opt_out_process_throttling() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+                PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+            };
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                    | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                StateMask: 0, // "never throttle, never ignore my timer raise"
+            };
+            let ok = SetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                &state as *const PROCESS_POWER_THROTTLING_STATE as *const core::ffi::c_void,
+                core::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+            tracing::info!(
+                "process scheduling honesty: power-throttling + timer-resolution opt-outs {}",
+                if ok != 0 {
+                    "armed"
+                } else {
+                    "unavailable (pre-Win11 — fine)"
+                }
+            );
+        });
+    }
+}
+
+/// Sleep `d` with ~50–100 µs accuracy instead of the timer-wheel/quantum
+/// milliseconds: a high-resolution waitable timer carries the wait to
+/// within a short tail, and a bounded spin walks the rest on the
+/// monotonic clock. The pacer's inter-chunk gaps are 100–1500 µs — on the
+/// plain sleep paths those all round up to a millisecond or more, which
+/// silently triples a keyframe's designed spread (measured by the
+/// `pace gaps` line). The spin tail costs one core for ≤200 µs per call;
+/// callers only use this for sub-2 ms pacing gaps, never bulk waits.
+/// Never returns early — the spin's exit is the monotonic elapsed test.
+pub(crate) fn precise_sleep(d: std::time::Duration) {
+    let start = std::time::Instant::now();
+    const SPIN_TAIL: std::time::Duration = std::time::Duration::from_micros(200);
+    if d > SPIN_TAIL {
+        let coarse = d - SPIN_TAIL;
+        #[cfg(windows)]
+        {
+            use std::cell::Cell;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::System::Threading::{
+                CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+            };
+            thread_local! {
+                // One timer per thread, created on first use; 0 = tried
+                // and unavailable (pre-1803), fall through to plain sleep.
+                static TIMER: Cell<Option<HANDLE>> = const { Cell::new(None) };
+            }
+            let handle = TIMER.with(|t| match t.get() {
+                Some(h) => h,
+                None => {
+                    let h = unsafe {
+                        CreateWaitableTimerExW(
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                            TIMER_ALL_ACCESS,
+                        )
+                    };
+                    t.set(Some(h));
+                    h
+                }
+            });
+            if !handle.is_null() {
+                // Negative due time = relative, in 100 ns units.
+                let due = -i64::try_from(coarse.as_nanos() / 100).unwrap_or(i64::MAX);
+                unsafe {
+                    if SetWaitableTimer(handle, &due, 0, None, std::ptr::null(), 0) != 0 {
+                        WaitForSingleObject(handle, INFINITE);
+                    } else {
+                        std::thread::sleep(coarse);
+                    }
+                }
+            } else {
+                std::thread::sleep(coarse);
+            }
+        }
+        #[cfg(not(windows))]
+        std::thread::sleep(coarse);
+    }
+    while start.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+/// Join this thread to the Multimedia Class Scheduler ("Games" class) —
+/// the 16–26 priority band with a scheduler-managed quota, far above
+/// `ABOVE_NORMAL` without `REALTIME`'s starvation hazard. Zero effect on
+/// an idle box; under real contention (a game pegging every core — the
+/// Game posture's whole environment) it is what keeps scheduling-latency
+/// tails sub-millisecond. **Opt-in** (`ALLMYSTUFF_MMCSS=1`) until field
+/// soak: MMCSS's companion network throttle (`NetworkThrottlingIndex`,
+/// default ~120 Mbps of DPCs) can clip Studio-class rates while an MMCSS
+/// task runs — the field checklist documents the registry pairing.
+/// Runtime-loaded from avrt.dll like every driver-adjacent dependency;
+/// the handle is deliberately kept for the thread's life.
+fn mmcss_join() {
+    #[cfg(windows)]
+    {
+        static WANT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var("ALLMYSTUFF_MMCSS").is_ok_and(|v| !v.is_empty() && v != "0");
+            if on {
+                tracing::info!("ALLMYSTUFF_MMCSS on: media threads join the MMCSS Games class");
+            }
+            on
+        });
+        if !*WANT {
+            return;
+        }
+        type AvSet = unsafe extern "system" fn(*const u16, *mut u32) -> isize;
+        static AV_SET: std::sync::LazyLock<Option<AvSet>> = std::sync::LazyLock::new(|| unsafe {
+            use windows::core::PCSTR;
+            use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+            let dll = LoadLibraryA(PCSTR(c"avrt.dll".as_ptr() as *const u8)).ok()?;
+            let p = GetProcAddress(
+                dll,
+                PCSTR(c"AvSetMmThreadCharacteristicsW".as_ptr() as *const u8),
+            )?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                AvSet,
+            >(p))
+        });
+        if let Some(join) = *AV_SET {
+            let task: Vec<u16> = "Games\0".encode_utf16().collect();
+            let mut index = 0u32;
+            let handle = unsafe { join(task.as_ptr(), &mut index) };
+            if handle == 0 {
+                tracing::debug!("MMCSS join failed for {:?}", std::thread::current().name());
+            }
+        }
+    }
+}
+
 pub(crate) fn boost_media_thread() {
+    opt_out_process_throttling();
+    mmcss_join();
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
@@ -223,6 +389,32 @@ mod tests {
         })
         .join()
         .expect("boost thread");
+    }
+
+    /// The precise sleep must never return early, and its overshoot must
+    /// be micro-scale, not quantum-scale — the property the pacer's
+    /// sub-millisecond gaps lean on. The bound is deliberately lenient
+    /// (2 ms) so a loaded CI box can't flake it; what it catches is the
+    /// 15.6 ms-quantum disaster and a broken waitable-timer path.
+    #[test]
+    fn precise_sleep_holds_sub_quantum_accuracy() {
+        let _guard = TimerResolutionGuard::hold();
+        let mut worst = std::time::Duration::ZERO;
+        for req_us in [300u64, 500, 900, 1500] {
+            let req = std::time::Duration::from_micros(req_us);
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                precise_sleep(req);
+                let got = t.elapsed();
+                assert!(got >= req, "returned early: {got:?} < {req:?}");
+                worst = worst.max(got - req);
+            }
+        }
+        assert!(
+            worst < std::time::Duration::from_millis(2),
+            "overshoot {worst:?} looks quantized, not precise"
+        );
+        println!("precise_sleep worst overshoot: {worst:?}");
     }
 
     #[test]
