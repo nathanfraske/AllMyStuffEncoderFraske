@@ -58,6 +58,13 @@ pub mod clipboard;
 pub mod control_client;
 pub mod daemon_spawn;
 pub mod files;
+/// The GPU frame lane — D3D11 VideoProcessor colour conversion + a DXGI
+/// device-manager encoder feed, keeping frames on the GPU end to end.
+/// Proven by its own end-to-end test; the capture/pump integration slice
+/// switches the live path onto it. Windows + host, like the MF backend it
+/// pairs with.
+#[cfg(all(windows, feature = "host"))]
+pub mod gpu_pipeline;
 /// Hardware H.264 encode via FFmpeg vendor encoders. Only built with the
 /// `hwenc` feature (which pulls FFmpeg); the encoder ladder in [`video`] skips
 /// it otherwise and runs software openh264.

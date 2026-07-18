@@ -91,8 +91,22 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<MediaFoundationH264, String> {
+        self.open_with_manager(width, height, fps, bitrate, None)
+    }
+
+    /// [`Self::open`] bound to a DXGI device manager — the GPU lane: the MFT
+    /// joins the shared device and accepts NV12 *textures*
+    /// ([`MediaFoundationH264::encode_texture`]) with zero CPU pixel work.
+    pub fn open_with_manager(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
+    ) -> Result<MediaFoundationH264, String> {
         ensure_com_thread();
-        unsafe { self.open_inner(width, height, fps, bitrate) }
+        unsafe { self.open_inner(width, height, fps, bitrate, manager) }
     }
 
     unsafe fn open_inner(
@@ -101,6 +115,7 @@ impl HwEncoder {
         height: u32,
         fps: u32,
         bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<MediaFoundationH264, String> {
         let name = self.name.clone();
 
@@ -125,6 +140,17 @@ impl HwEncoder {
             // Low-latency mode: no reordering/lookahead buffering — what a live
             // screen stream needs. Best-effort (older MFTs may ignore it).
             let _ = a.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
+
+        // The GPU lane hands over the DXGI device manager before any media
+        // types — but strictly AFTER the async unlock above: an async MFT
+        // refuses every message (MF_E_TRANSFORM_ASYNC_LOCKED) until the
+        // caller declares async support. CPU-lane opens skip this and feed
+        // system memory exactly as before.
+        if let Some(m) = manager {
+            transform
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)
+                .map_err(mferr(&name, "set D3D manager"))?;
         }
 
         // H.264 encoders require the OUTPUT type set before the input type.
@@ -525,6 +551,51 @@ impl MediaFoundationH264 {
         unsafe {
             let sample = make_input_sample(&nv12[..need], time, duration)
                 .map_err(|e| format!("{}: input sample: {e}", self.name))?;
+            if force_idr {
+                self.force_keyframe();
+            }
+            if self.is_async {
+                self.pump_async(&sample)
+            } else {
+                self.pump_sync(&sample)
+            }
+        }
+    }
+
+    /// Encode one NV12 **texture** — the GPU lane's zero-copy input. The
+    /// MFT must have been opened with the same device manager the texture's
+    /// device is registered in ([`HwEncoder::open_with_manager`]); the
+    /// encoder reads the surface in place — no CPU pixel work anywhere on
+    /// this path.
+    // The capture/pump integration slice consumes this; until it lands the
+    // only caller is gpu_pipeline's end-to-end test.
+    #[allow(dead_code)]
+    pub(crate) fn encode_texture(
+        &mut self,
+        nv12: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        force_idr: bool,
+    ) -> Result<EncodeOutcome, String> {
+        let duration = 10_000_000i64 / i64::from(self.fps);
+        let time = self.frame_index * duration;
+        self.frame_index += 1;
+        unsafe {
+            let buffer = MFCreateDXGISurfaceBuffer(
+                &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::IID,
+                nv12,
+                0,
+                false,
+            )
+            .map_err(|e| format!("{}: DXGI surface buffer: {e}", self.name))?;
+            let sample = MFCreateSample().map_err(|e| format!("{}: sample: {e}", self.name))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|e| format!("{}: add buffer: {e}", self.name))?;
+            sample
+                .SetSampleTime(time)
+                .map_err(|e| format!("{}: sample time: {e}", self.name))?;
+            sample
+                .SetSampleDuration(duration)
+                .map_err(|e| format!("{}: sample duration: {e}", self.name))?;
             if force_idr {
                 self.force_keyframe();
             }
