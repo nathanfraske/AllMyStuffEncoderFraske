@@ -542,8 +542,11 @@ impl Tune {
         } else {
             Posture::Balanced
         });
+        // Studio is NOT LAN-gated: the viewer's warning dialog is the
+        // guardrail and the user owns the trade — they asked to be able to
+        // slam the full pipe wherever they want it. The env override still
+        // promotes a bare Balanced to Game node-wide.
         match p {
-            Posture::Studio if self.link != LinkClass::Lan => Posture::Balanced,
             Posture::Balanced if game_mode() => Posture::Game,
             p => p,
         }
@@ -554,7 +557,8 @@ impl Tune {
         self.posture() == Posture::Game
     }
 
-    /// Studio fidelity active (named ask + a LAN path to spend it on).
+    /// Studio fidelity active.
+    #[allow(dead_code)]
     pub(crate) fn studio(&self) -> bool {
         self.posture() == Posture::Studio
     }
@@ -2194,9 +2198,11 @@ fn run_gpu_lane(
     let (dw, dh) = lane.out_size;
     let bitrate = tuned_bitrate(tune, dw, dh, fps);
     let posture = tune.posture();
-    if tune.mode == Some(Posture::Studio) && posture != Posture::Studio {
+    if posture == Posture::Studio && tune.link != LinkClass::Lan {
         tracing::info!(
-            "studio asked for {route_id} but the path isn't LAN-classed; running balanced"
+            "studio mode for {route_id} on a {:?} link — honoring the viewer's ask at {:.0} Mbps (their wire to own)",
+            tune.link,
+            bitrate as f64 / 1e6
         );
     }
     let game = posture == Posture::Game;
@@ -3637,11 +3643,23 @@ pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops:
 /// spend up to 250 Mbps on the LAN it's gated to; every other posture
 /// stays under the 80 Mbps stability ceiling.
 fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
-    let studio = tune.studio();
     let auto = h264_bitrate_for(w, h, fps, tune.link);
-    let auto = if studio { auto.max(150_000_000) } else { auto };
-    let ceiling = if studio { 250_000_000 } else { 80_000_000 };
-    tune.bitrate.unwrap_or(auto).clamp(250_000, ceiling)
+    // Posture sets the auto budget's floor and the ceiling the viewer's
+    // Rate pill can reach. Both Studio and Game uncork well past the
+    // Balanced stability ceiling:
+    //  - Game, because its single-frame VBV (see the NVENC kernel) turns
+    //    extra bits into constant-per-frame motion quality — crisp fast
+    //    pans — at NO latency cost, since every frame stays one frame
+    //    interval's size regardless of the budget.
+    //  - Studio, because it's the deliberate spend-the-pipe fidelity mode
+    //    (150 Mbps auto floor); the viewer's warning gates it, then the
+    //    user owns the wire.
+    let (floor, ceiling) = match tune.posture() {
+        Posture::Studio => (auto.max(150_000_000), 500_000_000),
+        Posture::Game => (auto, 200_000_000),
+        Posture::Balanced => (auto, 80_000_000),
+    };
+    tune.bitrate.unwrap_or(floor).clamp(250_000, ceiling)
 }
 
 /// The H.264 edge a frame fits to right now: the tuned ceiling, capped by

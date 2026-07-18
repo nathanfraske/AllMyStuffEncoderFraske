@@ -108,6 +108,9 @@
   ];
   const RATE_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "100 Mbps", value: 100_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
     { label: "40 Mbps", value: 40_000_000 },
     { label: "25 Mbps", value: 25_000_000 },
     { label: "15 Mbps", value: 15_000_000 },
@@ -573,9 +576,10 @@
       >
         <h3 id="studio-title">Turn on Studio mode?</h3>
         <p>
-          Studio streams at high fidelity and can use <strong>150–250 Mbps</strong> —
-          it's meant for a fast local network. On a slower or metered
-          connection the host keeps it on the balanced setting.
+          Studio streams at maximum fidelity and can use <strong>150 Mbps
+          and up</strong> — it's built for a fast local network. It runs
+          wherever you turn it on, so on a slow or metered connection
+          expect stutter until you lower the Rate.
         </p>
         <div class="studio-actions">
           <button class="studio-btn ghost" onclick={() => (studioPrompt = false)}
