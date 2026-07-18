@@ -88,15 +88,34 @@
     const base = canvasEl;
     const gl = glCanvasEl;
     if (!base || !gl) return;
+    // The base element now fills the window with the picture letterboxed
+    // inside it (object-fit: contain) — compute that content box, because
+    // the FSR pass stretches its whole source onto its whole target: the
+    // overlay must be exactly the picture's box or the bars get "scaled
+    // into" the image. Same fit math as `norm`.
     const dpr = window.devicePixelRatio || 1;
-    const dw = Math.round(base.clientWidth * dpr);
-    const dh = Math.round(base.clientHeight * dpr);
+    const bw = base.clientWidth;
+    const bh = base.clientHeight;
+    if (!bw || !bh || !w || !h) {
+      fsrShow = false;
+      return;
+    }
+    const scale = Math.min(bw / w, bh / h);
+    const cw = w * scale;
+    const ch = h * scale;
+    const dw = Math.round(cw * dpr);
+    const dh = Math.round(ch * dpr);
     if (!(fsrOn && !fsrDead && dw > w * 1.1)) {
       fsrShow = false;
       return;
     }
     try {
       fsrEngine ??= new Fsr1(gl);
+      // Explicit CSS size = the content box; `inset: 0; margin: auto`
+      // centers it over the letterboxed picture. The buffer is dpr-exact
+      // underneath, so hi-DPI monitors get a crisp 1:1 present.
+      gl.style.width = `${cw}px`;
+      gl.style.height = `${ch}px`;
       fsrEngine.render(base, w, h, dw, dh);
       fsrShow = true;
     } catch (e) {
@@ -110,6 +129,20 @@
     localStorage.setItem("ams.fsrOff", fsrOn ? "0" : "1");
     if (!fsrOn) fsrShow = false;
   }
+  // Fullscreen/resize refit: the base canvas rescales via CSS the instant
+  // the window changes shape, but the FSR overlay renders at fixed pixel
+  // sizes — re-present on any stage resize so entering fullscreen snaps
+  // to the new fit immediately, even on a static stream where no new
+  // frame would otherwise trigger a paint.
+  $effect(() => {
+    const stage = stageEl;
+    if (!stage) return undefined;
+    const ro = new ResizeObserver(() => {
+      if (hasFrame && frameW && frameH) presentFsr(frameW, frameH);
+    });
+    ro.observe(stage);
+    return () => ro.disconnect();
+  });
   // The role=application surface. Key forwarding lives on this element (not
   // `<svelte:window>`) so it fires whenever the element holds focus — and
   // hovering pins that focus (below), the reliable way to make a secondary
@@ -607,14 +640,16 @@
     outline: none;
   }
   canvas {
-    /* Element sized to the video's own box (see Console.svelte .live): keeps
-       the pointer normalizer (norm) free of an object-fit inset it could get
-       wrong by a letterbox-width. */
+    /* Fill the window and letterbox INSIDE the element: fullscreen on a
+       monitor larger than the stream scales the picture UP to fit (bars
+       where the aspect differs) instead of leaving it at native size in
+       a black field. The old auto-size-with-max-caps pattern only ever
+       shrank. `norm` computes the object-fit inset itself (same math as
+       Console's normPoint), so pointer mapping is inset-safe; the FSR
+       overlay is pinned to the computed content box in presentFsr. */
     display: block;
-    width: auto;
-    height: auto;
-    max-width: 100%;
-    max-height: 100%;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     user-select: none;
     -webkit-user-drag: none;

@@ -1,23 +1,29 @@
 # AllMyStuff encoder — engineering handoff
 
-_Last updated 2026-07-18. Branch `main` @ `bcd06f8`, tree clean. Fork:
+_Last updated 2026-07-18 (evening). Branch `main`. Fork:
 `github.com/nathanfraske/AllMyStuffEncoderFraske` (upstream
 `mrjeeves/AllMyStuff`, main dev "Chris"). This is nathanfraske's encoder
 line; commit to fork `main`._
 
 ## TL;DR for the next agent
 
-The GPU zero-copy encode/decode pipeline is built and shipping. Three
-stream postures work end-to-end on an all-NVIDIA pair: **Balanced**,
-**Game** (GDR/intra-refresh, latency-first), **Studio** (lossy
-high-bitrate), and **Studio · Lossless** (bit-exact HEVC, proven
-byte-exact NVENC→NVDEC). A latest field build sits at
-`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\AllMyStuff_0.2.46_x64-setup.exe`
-(2026-07-18 14:29). Two hardware arcs are staged and waiting on boxes
-the user will provide: **AMF** (AMD encode) needs a Radeon (9060 XT
-incoming), **AV1** needs a 50-series. The next high-value build item is
-a **D3D11VA vendor-neutral decode rung** so HEVC/Studio-LL works on
-non-NVIDIA and iGPU viewers.
+The GPU zero-copy encode/decode pipeline is built and shipping, and
+**Studio·Lossless decode is now cross-vendor**: the D3D11VA rung
+(`d3d11va.rs`, commit `91c5448`) drives `ID3D11VideoDecoder` on any
+Windows GPU — AMD/Intel/iGPU viewers included — and is proven byte-exact
+against NVENC on this box (60/60 at 1280×718 with a live conformance
+crop; 30/30 through real pacer chunking). The bridge's HEVC arm is a
+ladder: NVDEC first where the NVIDIA driver lives (measured faster:
+4.24 vs 5.76 ms avg decode+copy at 1440p), else D3D11VA;
+`ALLMYSTUFF_HEVC_DECODER=nvdec|d3d11va` pins a rung for demos/A-B.
+Four postures work end-to-end: **Balanced**, **Game** (GDR,
+latency-first), **Studio** (lossy high-bitrate), **Studio · Lossless**
+(bit-exact HEVC). Latest field build:
+`C:\Users\Admin\AppData\Local\Temp\amsgui\release\bundle\AllMyStuff_0.2.47_x64-setup.exe`
+(2026-07-18 evening, carries the D3D11VA rung). Two hardware arcs wait
+on boxes the user will provide: **AMF** (AMD encode) needs the Radeon
+9060 XT, **AV1** needs a 50-series. Next high-value item: the **viewer
+decode-capability handshake** (fail-soft before the AMD box lands).
 
 ## How to build & test on this box
 
@@ -74,9 +80,25 @@ non-NVIDIA and iGPU viewers.
 - **Decode lane** (`video_decode.rs`): per-route bridge; codec sniffed
   from the AU's first NAL byte (exact bytes 0x40/0x42/0x44/0x26 for
   HEVC — do NOT use masked types, collides with H.264 0x41). H.264 →
-  openh264 (universal). **HEVC → NVDEC only** (`nvdec.rs`, nvcuvid, FFI
-  from the dynlink headers). NV12→RGBA is a threaded/quad-shared fast
-  path (11.5→2.8 ms @1440p). Byte-exact round trip proven.
+  openh264 (universal). **HEVC → hardware ladder** (`HevcRung`): NVDEC
+  (`nvdec.rs`, nvcuvid) → **D3D11VA** (`d3d11va.rs`,
+  `ID3D11VideoDecoder`, vendor-neutral — see below). NV12→RGBA is a
+  threaded/quad-shared fast path (11.5→2.8 ms @1440p). Byte-exact round
+  trips proven on BOTH rungs.
+- **D3D11VA rung** (`d3d11va.rs`): stateless DXVA decode — a scoped
+  in-house HEVC header parser (SPS/PPS/slice, POC, RPS, DPB) feeds
+  hand-transcribed pack(1) DXVA structs (slice entry is 10 bytes).
+  Because the pacer delivers pictures as several samples, the rung
+  assembles pictures itself: close on first_slice flag | ts change |
+  learned slices-per-picture (a max-only ratchet — loss can't teach a
+  short count). Steady state adds zero latency. Config truth learned
+  the hard way: HEVC has ONE slice format; drivers report it as
+  `ConfigBitstreamRaw=1` (NVIDIA offers [1,1]; FFmpeg ships short-only
+  and accepts only 1 for HEVC — there is no HEVC long struct in any
+  SDK). Out-of-scope streams (10-bit, scaling lists, LT refs, B
+  slices) fail SOFT with a named reason → bridge re-keys.
+  `probe_d3d11va_hevc_configs` (ignored test) is the field kit to run
+  first on the Radeon box.
 - **Telemetry** (`telemetry.rs`, started by `serve`): 1 Hz line — CPU
   proc/total, per-thread media CPU, per-engine GPU busy (3d/enc/dec/
   copy), VRAM, monitor topology. Vendor-neutral WDDM counters, so a
@@ -89,7 +111,16 @@ non-NVIDIA and iGPU viewers.
   (Balanced/Game/Studio/Studio·LL + bandwidth warning) used by BOTH the
   console strip (`Console.svelte`) and the popped-out bar
   (`VideoPopout.svelte`) — do not re-fork it. `fsr1.ts` is the WebGL2
-  FSR1 upscaler on the popout stage.
+  FSR1 upscaler on the popout stage. The popout canvas now FILLS the
+  window (`width/height:100%` + `object-fit:contain`) so fullscreen
+  scales the picture up to the monitor with letterbox bars; `norm`
+  computes the object-fit inset (it always did), `presentFsr` pins the
+  FSR overlay to the computed content box (dpr-exact), and a
+  ResizeObserver re-presents on fullscreen/resize so a static stream
+  refits instantly. Console THEATER mode still has the old
+  never-upscale behavior — spawned task covers it (`updateCrosshair`/
+  `followCursor` map through the raw element rect and need the same
+  inset math first; `normPoint` is already inset-safe).
 
 ## Cross-GPU / inter-vendor matrix (the "inter-GPU probe")
 
@@ -103,30 +134,30 @@ for the posture's codec+features; viewer has a decoder for that codec).
   low-latency H.264). iGPU↔GPU↔iGPU all fine.
 - **Studio (lossy H.264):** fully cross-vendor today, any combo. Just
   high-bitrate H.264.
-- **Studio · Lossless (HEVC):** the only posture with real gaps.
+- **Studio · Lossless (HEVC):** encode is the remaining gap.
   - Encode: NVENC-only for lossless. Non-NVIDIA hosts auto-degrade to
     lossy Studio (works). AMD/Intel HEVC encode exists but not bit-exact
     lossless.
-  - Decode: **NVDEC-only in our code** (`video_decode.rs:259`) though
-    HEVC hardware decode exists on ALL vendors' silicon (proven via the
-    D3D11 decoder-profile probe — `probe_d3d11_decoder_profiles`). So
-    **NVIDIA host → AMD/Intel viewer FAILS at decode today** (no
-    software HEVC fallback).
+  - Decode: **SOLVED cross-vendor** — the ladder runs NVDEC on NVIDIA,
+    D3D11VA everywhere else, so **NVIDIA host → AMD/Intel/iGPU viewer
+    now decodes Studio-LL in hardware**. (Still no software HEVC floor:
+    a GPU-less viewer can't take HEVC — the capability handshake should
+    keep HEVC off such pairings.)
 - **Hybrid-laptop trap:** encode pins to the DISPLAY-owning adapter
   (zero-copy). On Optimus where the desktop is on the Intel iGPU, we
   encode via QSV even with an NVIDIA dGPU present → no GDR. Task #12
   territory; surface before laptop field runs.
 
 **The unlocks, in value order:**
-1. **D3D11VA decode rung** (`ID3D11VideoDecoder`) — vendor-neutral HEVC
-   (and H.264) decode on any GPU/iGPU. Single biggest move: converts
-   Studio-LL from NVIDIA-pair to any-Windows-GPU. ~size of the NVDEC
-   rung; partly testable on this box. **RECOMMENDED next build item.**
-2. **Viewer decode-capability handshake** — the host currently offers
+1. ~~**D3D11VA decode rung**~~ — **DONE** (`91c5448`, `d3d11va.rs`).
+   Studio-LL decode is any-Windows-GPU; byte-exact proven on this box;
+   run the probe + round-trip on the Radeon when it lands.
+2. **Viewer decode-capability handshake** — the host still offers
    HEVC-LL based on ITS hardware, blind to the viewer. Advertise viewer
    decode caps in presence/route negotiation so the host only sends HEVC
    where the viewer can decode it (else lossy Studio). Small; makes every
-   pairing fail SOFT instead of hard. Good to land before the AMD box.
+   pairing fail SOFT instead of hard. **RECOMMENDED next build item**
+   (the remaining hard-fail: HEVC at a GPU-less/ancient viewer).
 3. **Cross-vendor HEVC encode** (MF-HEVC / QSV / VCN) for HEVC Studio on
    non-NVIDIA hosts (visually-lossless, not bit-exact).
 
@@ -158,8 +189,8 @@ for the posture's codec+features; viewer has a decoder for that codec).
   lossless-class bytes, implementation is ~half a day on the existing
   rails (new GUIDs/config struct + parameterize NVDEC codec=11 + OBU-aware
   sniff/pacer branch since AV1 has no Annex-B start codes).
-- **#24 decode-side pass** — carries the D3D11VA rung (unlock #1 above)
-  and the 4:4:4 tier (red-text-fringe fix).
+- **#24 decode-side pass** — D3D11VA rung SHIPPED (`91c5448`); the
+  4:4:4 tier (red-text-fringe fix) remains on this task.
 - **#26 monitor-connect bug** — awaiting a field `allmystuff-serve.log`
   now that telemetry + `capture bound to …` logging lands; the monitor
   topology line + binding will show the cause.
@@ -173,14 +204,14 @@ for the posture's codec+features; viewer has a decoder for that codec).
 
 ## Awaiting user decision
 
-- Which to build first: the **D3D11VA decode rung** (biggest unlock) or
-  the **capability handshake** (fail-soft safety before the AMD box).
-- Console-bar unification (#done, `bcd06f8`) — verify on next smoke test
+- Green-light the **capability handshake** (unlock #2) as the next build.
+- Console-bar unification (`bcd06f8`) — verify on next smoke test
   that the main console Mode control cycles Balanced→Game→Studio→Studio·LL
   with the warning on first Studio entry.
 
-## Commit trail this session (newest first)
+## Commit trail (newest first)
 
+`91c5448` **D3D11VA decode rung** (+0.2.47 bundle) · `9341cf8` handoff ·
 `bcd06f8` shared Mode control · `e382997` ref-invalidation mechanism ·
 `55cec0e` log location · `3a00a4c` frame health · `becc220`/`5746ee8`/
 `fec7168`/`c77c7d0` telemetry · `4fd853e` preset defaults · `7f7084b`
