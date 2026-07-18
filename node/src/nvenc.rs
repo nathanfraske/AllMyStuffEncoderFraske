@@ -1581,8 +1581,16 @@ mod tests {
         }
     }
 
+    use super::tests_support::paint_document;
+}
+
+/// Deterministic synthetic-content painters shared by this module's
+/// benches and the decode twin's ([`crate::nvdec`]) round-trip tests —
+/// the two sides must feed identical pixels to compare fairly.
+#[cfg(test)]
+pub(crate) mod tests_support {
     /// Deterministic LCG — the benches must not vary run to run.
-    fn lcg(s: &mut u64) -> u32 {
+    pub(crate) fn lcg(s: &mut u64) -> u32 {
         *s = (*s)
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
@@ -1594,7 +1602,7 @@ mod tests {
     /// lines — the spatial statistics of UI text (sharp, high-contrast,
     /// fine grain) without shipping a font. Each dot's right column
     /// half-blends toward the page, faking the AA edge real glyphs carry.
-    fn paint_document(buf: &mut [u8], w: usize, rows: usize) {
+    pub(crate) fn paint_document(buf: &mut [u8], w: usize, rows: usize) {
         for px in buf.chunks_exact_mut(4) {
             px.copy_from_slice(&[0xEE, 0xEC, 0xE8, 0xFF]);
         }
@@ -1642,7 +1650,7 @@ mod tests {
     /// A photographic-ish master: smooth low-frequency color fields. The
     /// bench pans across it and floats a shaded disc over it — global
     /// motion plus occlusion, the two costs real video pays.
-    fn paint_video(buf: &mut [u8], w: usize, h: usize) {
+    pub(crate) fn paint_video(buf: &mut [u8], w: usize, h: usize) {
         for y in 0..h {
             for x in 0..w {
                 let (xf, yf) = (x as f64, y as f64);
@@ -1657,6 +1665,12 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests_bench {
+    use super::tests_support::{paint_document, paint_video};
+    use super::*;
 
     /// The lossless-economics bench: constQP-0 has **no rate control** —
     /// bandwidth is the content's entropy, full stop — so one synthetic

@@ -429,7 +429,10 @@ mod tests {
             (0x107af0e0_ef1a_4d19_aba8_67a163073d13, "HEVC VLD Main10"),
             (0x8c56eb1e_2b47_466f_8d33_7dbcd63f3df2, "AV1 VLD Profile0"),
             (0x463707f8_a1d0_4585_876d_83aa6d60b89e, "VP9 VLD Profile0"),
-            (0xa4c749ef_6ecf_48aa_8448_50a7a1165ff7, "VP9 VLD 10bit Profile2"),
+            (
+                0xa4c749ef_6ecf_48aa_8448_50a7a1165ff7,
+                "VP9 VLD 10bit Profile2",
+            ),
         ];
         unsafe {
             let n = video.GetVideoDecoderProfileCount();

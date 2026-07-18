@@ -86,6 +86,11 @@ pub mod mediafoundation;
 pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
+/// NVDEC (nvcuvid) HEVC decode — the receive twin of `nvenc`, feeding the
+/// native-decode lane the pictures the webview can't. Runtime-loaded from
+/// the NVIDIA driver's DLLs; absent driver = absent rung, softly.
+#[cfg(all(windows, feature = "host"))]
+pub mod nvdec;
 /// Direct NVENC (NVIDIA Video Codec SDK, runtime-loaded — no build
 /// toolchain): the game-mode encoder rung with intra-refresh/GDR and
 /// guaranteed in-place reconfigure, fed the GPU lane's NV12 textures.
