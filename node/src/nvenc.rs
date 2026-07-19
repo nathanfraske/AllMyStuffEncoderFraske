@@ -138,6 +138,21 @@ const NV_ENC_CODEC_HEVC_GUID: GUID = GUID::from_values(
     0x4d7b,
     [0x94, 0x25, 0xbd, 0xa9, 0x97, 0x5f, 0x76, 0x03],
 );
+/// `NV_ENC_CODEC_AV1_GUID` — the AV1 encode codec (Ada/Blackwell; the
+/// user's RTX 5070 has it). Named now for the AV1 arc; unused until the
+/// AV1 encode config lands. AV1 lossless is plain profile-0 syntax
+/// (qindex 0), so `probe_nvenc_av1_lossless` (below) already asks the
+/// hardware whether it produces lossless-class bytes — run it on the
+/// 50-series first. Implementation reuses `open_on_device`'s flow with
+/// this GUID + `NV_ENC_CONFIG_AV1` (a distinct config union member) and
+/// an OBU-aware pacer/sniff branch (see docs/AV1-SEAMS.md).
+#[allow(dead_code)]
+const NV_ENC_CODEC_AV1_GUID: GUID = GUID::from_values(
+    0x0a35_2289,
+    0x0aa7,
+    0x4759,
+    [0x86, 0x2d, 0x5d, 0x15, 0xcd, 0x16, 0xd2, 0x54],
+);
 /// HEVC needs no special profile for lossless — transquant bypass is
 /// core syntax, reachable from Main — so the rung hands the driver
 /// autoselect and lets the lossless tuning steer.

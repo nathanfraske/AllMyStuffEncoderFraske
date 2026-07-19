@@ -34,25 +34,32 @@ pub struct Au {
     pub data: Vec<u8>,
 }
 
-/// Which codec an Annex-B access unit opens with, judged from its first
-/// NAL header byte — and only for *parameter-set-led* units (the decode
-/// entries both our encoders emit with repeated VPS/SPS/PPS), where the
-/// byte values are unambiguous: HEVC VPS/SPS/PPS read as H.264 types
-/// 0/2/4, which no H.264 key unit leads with, and H.264 SPS/PPS/IDR read
-/// as HEVC types 19/51/50/etc. outside the parameter-set range. Delta
-/// units return `None` — the stream's codec is a property carried from
-/// key to key, not re-judged per frame.
-#[derive(Clone, Copy, PartialEq)]
+/// Which codec an access unit opens with. H.264/HEVC are judged from the
+/// first NAL header byte of a *parameter-set-led* unit (the decode
+/// entries both encoders emit with repeated VPS/SPS/PPS); AV1 has no
+/// Annex-B start codes at all — it's OBUs — so it's judged from a
+/// leading sequence-header OBU instead ([`sniff_codec`]). Delta units
+/// return `None`: the stream's codec is a property carried key-to-key,
+/// not re-judged per frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum AuCodec {
     H264,
     Hevc,
+    /// AV1 (OBU bitstream). **Decode is a STUB** — see [`Av1Rung`]: the
+    /// sniff and dispatch seams exist so implementing AV1 is filling the
+    /// rung bodies, not hunting for the branch points. No encoder emits
+    /// AV1 yet, so this arm is dormant scaffolding.
+    Av1,
 }
 
 fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
+    // First: the Annex-B path (H.264/HEVC always lead with a start code).
     let mut i = 0usize;
-    let b = loop {
+    let start_byte = loop {
         if i + 3 >= data.len() {
-            return None;
+            // No start code anywhere — not H.264/HEVC. Fall through to the
+            // OBU check: AV1 access units carry no start codes.
+            return sniff_av1_obu(data);
         }
         if data[i] == 0 && data[i + 1] == 0 {
             if data[i + 2] == 1 {
@@ -70,7 +77,7 @@ fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
     // most delta AUs lead with — and flip a healthy H.264 stream's
     // decoder on every frame. (Caught in review; the byte-exact match is
     // collision-free because H.264 types 0/2/4 never lead an AU.)
-    match b {
+    match start_byte {
         // VPS · SPS · PPS, plus IDR_W_RADL (0x26): an H.264 SEI would
         // share that byte only with nal_ref_idc=1, which the H.264 spec
         // forbids for SEI — so a conformant stream leading with 0x26 is
@@ -79,11 +86,69 @@ fn sniff_codec(data: &[u8]) -> Option<AuCodec> {
         // IDR_N_LP (0x28) stays out: it collides with a legal H.264 PPS
         // byte, and our senders always lead IDRs with parameter sets.
         0x40 | 0x42 | 0x44 | 0x26 => Some(AuCodec::Hevc),
-        _ => match b & 0x1F {
+        _ => match start_byte & 0x1F {
             5 | 7 | 8 => Some(AuCodec::H264), // IDR · SPS · PPS
             _ => None,
         },
     }
+}
+
+/// AV1 codec detection from a start-code-less AU — the OBU-aware seam.
+/// An AV1 key access unit leads with a **sequence header OBU** (our
+/// encoders emit it on every key frame, the AV1 analog of repeated
+/// SPS/PPS). The low-overhead OBU header first byte is
+/// `forbidden(1)=0 | type(4) | extension(1) | has_size(1) |
+/// reserved(1)=0`; a leading temporal-delimiter (type 2) then
+/// sequence-header (type 1) is the conformant key opening. Conservative
+/// on purpose: only a genuine seq-header-led opening returns `Av1`, so a
+/// truncated/odd H.264 chunk that reached here (no start code found)
+/// stays `None` rather than being misread. Delta AUs (no seq header)
+/// return `None` — codec carries from the key, like the Annex-B path.
+///
+/// STUB status: correct enough to route the stream to [`Av1Rung`], which
+/// then reports "not yet implemented". Full OBU parsing lives in the
+/// decoder, not here — this only names the codec.
+fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
+    /// One OBU header at `data[at]`: `(obu_type, next_offset)` when the
+    /// header (and its optional leb128 size) parse; `None` past the end.
+    fn obu_at(data: &[u8], at: usize) -> Option<(u8, usize)> {
+        let hdr = *data.get(at)?;
+        if hdr & 0x80 != 0 {
+            return None; // forbidden bit set — not a valid OBU
+        }
+        let obu_type = (hdr >> 3) & 0x0f;
+        let has_ext = hdr & 0x04 != 0;
+        let has_size = hdr & 0x02 != 0;
+        let mut p = at + 1 + usize::from(has_ext);
+        if has_size {
+            // leb128 size — skip it to reach the next OBU.
+            let mut size = 0usize;
+            for shift in 0..8 {
+                let byte = *data.get(p)?;
+                p += 1;
+                size |= usize::from(byte & 0x7f) << (shift * 7);
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            p += size;
+        }
+        Some((obu_type, p))
+    }
+    // OBU_TEMPORAL_DELIMITER = 2, OBU_SEQUENCE_HEADER = 1. A key AU opens
+    // with a seq header, optionally behind a temporal delimiter.
+    let (t0, next) = obu_at(data, 0)?;
+    if t0 == 1 {
+        return Some(AuCodec::Av1); // seq-header-led
+    }
+    if t0 == 2 {
+        if let Some((t1, _)) = obu_at(data, next) {
+            if t1 == 1 {
+                return Some(AuCodec::Av1); // temporal-delimiter then seq header
+            }
+        }
+    }
+    None
 }
 
 /// Pending AUs per route before the overflow dump. Kept short (~200 ms at
@@ -235,6 +300,58 @@ impl HevcRung {
     }
 }
 
+/// The AV1 hardware ladder — **STUB**, the twin of [`HevcRung`]. When AV1
+/// lands, both boxes support it: NVDEC AV1 (`codec = 11`, Blackwell/Ada
+/// decode; every recent NVIDIA), D3D11VA AV1 (`AV1 VLD Profile0`, RDNA
+/// and Intel Xe), and a `dav1d` software floor for viewers without
+/// hardware. The dispatch shape is here so implementation fills the rung
+/// bodies (`crate::nvdec::NvdecAv1`, `crate::d3d11va::D3d11vaAv1`) rather
+/// than re-deriving the ladder. `ALLMYSTUFF_AV1_DECODER` will pin a rung
+/// exactly as HEVC's dial does. Today `open` reports the honest "not yet
+/// implemented" and the bridge falls soft (re-key ask), so a stray AV1
+/// stream never crashes a viewer — it just doesn't paint.
+#[cfg(all(windows, feature = "host"))]
+enum Av1Rung {
+    Nvdec(crate::nvdec::NvdecAv1),
+    Dxva(Box<crate::d3d11va::D3d11vaAv1>),
+}
+
+#[cfg(all(windows, feature = "host"))]
+impl Av1Rung {
+    fn open() -> Result<Self, String> {
+        let force = std::env::var("ALLMYSTUFF_AV1_DECODER")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match force.as_str() {
+            "nvdec" => crate::nvdec::NvdecAv1::open().map(Self::Nvdec),
+            "d3d11va" | "dxva" => {
+                crate::d3d11va::D3d11vaAv1::open().map(|d| Self::Dxva(Box::new(d)))
+            }
+            _ => crate::nvdec::NvdecAv1::open()
+                .map(Self::Nvdec)
+                .or_else(|nv| {
+                    crate::d3d11va::D3d11vaAv1::open()
+                        .map(|d| Self::Dxva(Box::new(d)))
+                        .map_err(|dx| format!("NVDEC-AV1: {nv}; D3D11VA-AV1: {dx}"))
+                }),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Nvdec(d) => d.label(),
+            Self::Dxva(d) => d.label(),
+        }
+    }
+
+    fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<crate::nvdec::NvFrame>, String> {
+        match self {
+            Self::Nvdec(d) => d.decode(au, ts_us),
+            Self::Dxva(d) => d.decode(au, ts_us),
+        }
+    }
+}
+
 fn run_decode<F, G>(
     stop: &AtomicBool,
     need_key: &AtomicBool,
@@ -263,6 +380,10 @@ fn run_decode<F, G>(
         H264(Decoder),
         #[cfg(all(windows, feature = "host"))]
         Hevc(HevcRung),
+        /// AV1 — STUB rung (see [`Av1Rung`]); the arm exists so the codec
+        /// threads through decode cleanly, and reports "not implemented".
+        #[cfg(all(windows, feature = "host"))]
+        Av1(Av1Rung),
     }
     let mut decoder: Option<Active> = None;
     let mut stream_codec = AuCodec::H264;
@@ -325,6 +446,16 @@ fn run_decode<F, G>(
                     }),
                     #[cfg(not(all(windows, feature = "host")))]
                     AuCodec::Hevc => Err("no HEVC decoder on this platform".to_string()),
+                    // AV1 — STUB: opens the ladder, which reports not-yet-
+                    // implemented; the bridge falls soft. Dormant until an
+                    // encoder emits AV1 (see docs/AV1-SEAMS.md).
+                    #[cfg(all(windows, feature = "host"))]
+                    AuCodec::Av1 => Av1Rung::open().map(|dec| {
+                        tracing::info!("AV1 decoder for {route_id}: {}", dec.label());
+                        Active::Av1(dec)
+                    }),
+                    #[cfg(not(all(windows, feature = "host")))]
+                    AuCodec::Av1 => Err("no AV1 decoder on this platform".to_string()),
                 };
                 match built {
                     Ok(d) => decoder.insert(d),
@@ -396,6 +527,39 @@ fn run_decode<F, G>(
                 }
                 Err(e) => broke = Some(format!("HEVC: {e}")),
             },
+            // AV1 shares HEVC's NV12→RGBA output shape (the rung returns
+            // `NvFrame`), so the paint path is identical — only the rung
+            // body differs. STUB today: `decode` returns Err, the stream
+            // re-keys, nothing paints. Fill `Av1Rung`'s bodies to light
+            // this up.
+            #[cfg(all(windows, feature = "host"))]
+            Active::Av1(dec) => match dec.decode(&au.data, au.ts_us) {
+                Ok(pics) => {
+                    waiting_key = false;
+                    let mut emitted = false;
+                    for f in pics {
+                        let (w, h) = (f.width as usize, f.height as usize);
+                        if w == 0 || h == 0 {
+                            continue;
+                        }
+                        let mut packet = raw_ipc_packet(f.ts_us, f.width, f.height);
+                        crate::nvdec::nv12_to_rgba(
+                            &f.nv12,
+                            w,
+                            h,
+                            &mut packet[crate::mesh::VIDEO_IPC_HEADER_LEN..],
+                        );
+                        frames += 1;
+                        emitted = true;
+                        out_dims = (w, h);
+                        on_frame(packet);
+                    }
+                    if emitted {
+                        spent += t0.elapsed();
+                    }
+                }
+                Err(e) => broke = Some(format!("AV1: {e}")),
+            },
         }
         if let Some(e) = broke {
             // Corrupt bitstream (a lost unit upstream): drop the decoder,
@@ -453,6 +617,38 @@ fn raw_ipc_packet(ts_us: u64, w: u32, h: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The codec sniff's three-way branch, including the AV1 OBU seam:
+    /// H.264/HEVC key units are detected from their start-code-led NAL
+    /// byte, an AV1 sequence-header OBU (start-code-less) is detected as
+    /// AV1, and — critically — an H.264/HEVC stream is NEVER misread as
+    /// AV1 (the OBU branch only fires when no start code exists at all).
+    #[test]
+    fn sniff_routes_h264_hevc_and_av1_obu() {
+        // H.264 IDR (00 00 01 65): type 5.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x65, 0x88]), Some(AuCodec::H264));
+        // H.264 SPS (67), PPS (68).
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x67, 0x42]), Some(AuCodec::H264));
+        // HEVC VPS (0x40), SPS (0x42), PPS (0x44).
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x40, 0x01]), Some(AuCodec::Hevc));
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x42, 0x01]), Some(AuCodec::Hevc));
+        // An H.264 delta P-slice (0x41) leads no key AU → None (codec
+        // carries from the key) and NEVER trips the AV1 branch.
+        assert_eq!(sniff_codec(&[0, 0, 1, 0x41, 0x9a]), None);
+        // AV1 sequence-header OBU: has_size set, type 1 → obu byte 0x0a
+        // (000 0001 0 1: type=1, ext=0, has_size=1), leb128 size 3, payload.
+        let seq = [0x0a, 0x03, 0x00, 0x00, 0x00];
+        assert_eq!(sniff_codec(&seq), Some(AuCodec::Av1));
+        // AV1 temporal delimiter (type 2, obu 0x12) then seq header.
+        let td_seq = [0x12, 0x00, 0x0a, 0x03, 0x00, 0x00, 0x00];
+        assert_eq!(sniff_codec(&td_seq), Some(AuCodec::Av1));
+        // An AV1 delta (a lone frame OBU type 6, obu 0x32) is not a key —
+        // no seq header → None, codec carries from the key.
+        assert_eq!(sniff_codec(&[0x32, 0x02, 0x10, 0x00]), None);
+        // Random start-code-less bytes that aren't a valid OBU opening
+        // stay None (the forbidden bit / wrong type guards).
+        assert_eq!(sniff_codec(&[0xff, 0xff, 0xff, 0xff]), None);
+    }
 
     /// Encode a couple of frames with the encoder the send side uses, feed
     /// them through the bridge, and check real RGBA frames come out — the

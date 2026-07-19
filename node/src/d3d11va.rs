@@ -68,6 +68,16 @@ use crate::nvdec::NvFrame;
 /// decoder-profile probe in `gpu_pipeline` prints it as "HEVC VLD Main").
 const HEVC_VLD_MAIN: GUID = GUID::from_u128(0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0);
 
+/// `D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0` — the 8/10-bit 4:2:0 AV1
+/// profile, present on RDNA/Xe/Ampere+ (the profile probe prints it as
+/// "AV1 VLD Profile0"). Named now for the AV1 rung; unused until
+/// [`D3d11vaAv1`] is implemented. NOTE: AV1's DXVA structures
+/// (`DXVA_PicParams_AV1`, tile buffers) are an entirely separate, larger
+/// transcription unit than HEVC's — that's the bulk of the AV1 D3D11VA
+/// work, not the plumbing here.
+#[allow(dead_code)]
+const AV1_VLD_PROFILE0: GUID = GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a);
+
 // ---------------------------------------------------------------------------
 // DXVA structures — transcribed from dxva.h (Windows SDK), inside its
 // `#pragma pack(1)`. Sizes pinned by asserts.
@@ -1527,6 +1537,35 @@ impl D3d11vaHevc {
             });
         }
         Ok(())
+    }
+}
+
+/// D3D11VA AV1 decode — **STUB**, the vendor-neutral AV1 receive rung
+/// (RDNA/Xe/Ampere+ via [`AV1_VLD_PROFILE0`]). It will reuse this file's
+/// `ID3D11VideoDecoder` plumbing (device open, config pick, surface
+/// pool, staging readback, picture assembly over the pacer's chunks),
+/// but AV1 needs a distinct, larger DXVA transcription — `DXVA_PicParams_
+/// AV1` plus tile buffers — and an OBU parser in place of the Annex-B
+/// SPS/PPS/slice parser here. Same `decode(au, ts_us) -> Vec<NvFrame>`
+/// seam as the HEVC twin. `open` reports the honest not-yet.
+pub struct D3d11vaAv1 {
+    _priv: (),
+}
+
+// SAFETY: will be owned+driven by one route-decode thread like D3d11vaHevc.
+unsafe impl Send for D3d11vaAv1 {}
+
+impl D3d11vaAv1 {
+    pub fn open() -> Result<Self, String> {
+        Err("D3D11VA AV1 decode not yet implemented (stub — see docs/AV1-SEAMS.md)".into())
+    }
+
+    pub fn label(&self) -> &'static str {
+        "D3D11VA (AV1, hardware, vendor-neutral) [stub]"
+    }
+
+    pub fn decode(&mut self, _au: &[u8], _ts_us: u64) -> Result<Vec<NvFrame>, String> {
+        Err("D3D11VA AV1 decode not yet implemented".into())
     }
 }
 

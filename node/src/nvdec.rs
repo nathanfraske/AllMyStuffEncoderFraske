@@ -44,6 +44,12 @@ type CuVideoParser = *mut c_void;
 type CuVideoDecoder = *mut c_void;
 
 const CUDA_VIDEO_CODEC_HEVC: i32 = 8;
+/// `cudaVideoCodec_AV1` — the codec id the AV1 rung will pass to
+/// `CreateVideoParser`/`CreateDecoder` (the whole HEVC path parameterizes
+/// on codec, so AV1 reuses most of it). Named now so the seam is obvious;
+/// unused until [`NvdecAv1`] is implemented.
+#[allow(dead_code)]
+const CUDA_VIDEO_CODEC_AV1: i32 = 11;
 const CUDA_VIDEO_CHROMA_420: i32 = 1;
 const CUDA_VIDEO_SURFACE_NV12: i32 = 0;
 const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
@@ -643,6 +649,39 @@ impl Drop for NvdecHevc {
             }
             let _ = (self.tables.cuda.primary_ctx_release)(self.device);
         }
+    }
+}
+
+/// NVDEC AV1 decode — **STUB**. The seam for the AV1 arc: it will mirror
+/// [`NvdecHevc`] almost exactly (nvcuvid's parser/decoder path
+/// parameterizes on codec, so most of this file is reused with
+/// [`CUDA_VIDEO_CODEC_AV1`]), with two AV1-specific differences the
+/// implementer should know: the parser's `flags` bit `bAnnexb` selects
+/// the temporal-unit framing AV1 uses (no start codes — see
+/// `sniff_av1_obu` in `video_decode.rs`), and AV1's film-grain synthesis
+/// is applied at map time. Same `decode(au, ts_us) -> Vec<NvFrame>` seam
+/// as the HEVC twin so the bridge treats it identically. `open` reports
+/// the honest not-yet so the ladder falls soft.
+pub struct NvdecAv1 {
+    // Fields land with the implementation (parser + decoder + State,
+    // like NvdecHevc). Empty stub keeps the type real for the dispatch.
+    _priv: (),
+}
+
+// SAFETY: will be owned+driven by one route-decode thread like NvdecHevc.
+unsafe impl Send for NvdecAv1 {}
+
+impl NvdecAv1 {
+    pub fn open() -> Result<Self, String> {
+        Err("NVDEC AV1 decode not yet implemented (stub — see docs/AV1-SEAMS.md)".into())
+    }
+
+    pub fn label(&self) -> &'static str {
+        "NVDEC (AV1, hardware) [stub]"
+    }
+
+    pub fn decode(&mut self, _au: &[u8], _ts_us: u64) -> Result<Vec<NvFrame>, String> {
+        Err("NVDEC AV1 decode not yet implemented".into())
     }
 }
 

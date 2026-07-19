@@ -59,6 +59,16 @@ const AMF_DX11_0: i32 = 110;
 /// `AMF_SURFACE_FORMAT::AMF_SURFACE_NV12`.
 const AMF_SURFACE_NV12: i32 = 1;
 
+/// The AV1 encoder component id — the AV1 arc's AMF seam (RDNA4, the
+/// user's 9060 XT, has AV1 encode). `CreateComponent` with this instead
+/// of `AMFVideoEncoderVCE_AVC`; the property NAMES differ (its own
+/// `components_VideoEncoderAV1.h` header — `Av1TargetBitrate` etc.), so
+/// AV1 gets its own config block, but the flow (context → component →
+/// SubmitInput DX11 surfaces → QueryOutput) is identical to AVC here.
+/// Named now so the seam is obvious; unused until AV1 encode lands.
+#[allow(dead_code)]
+const AMF_VIDEO_ENCODER_AV1: &str = "AMFVideoEncoder_AV1";
+
 // Encoder property enums (components_VideoEncoderVCE.h).
 const USAGE_TRANSCODING: i64 = 0;
 const USAGE_ULTRA_LOW_LATENCY: i64 = 1;

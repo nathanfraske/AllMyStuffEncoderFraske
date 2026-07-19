@@ -4369,6 +4369,16 @@ pub(crate) fn paced_slices_enabled() -> bool {
 /// byte-identically; a unit whose single slice exceeds the cap stays
 /// whole (slice granularity is the floor — the encoder-side slice count
 /// is what makes real splits exist).
+///
+/// **AV1 (future):** AV1 has no Annex-B start codes — it's OBUs with
+/// leb128 sizes — so this walk finds no cut points and returns the whole
+/// AU as one chunk. That is the correct SAFE fallback (AV1 rides unpaced,
+/// exactly like a paramless HEVC delta), so nothing breaks when AV1
+/// lands; but the pacer's burst-shaping is then off for AV1. The AV1-
+/// aware seam is here: an `obu_split` branch that cuts at tile-group /
+/// frame OBU boundaries (the AV1 analog of slice NALs) — walk OBU
+/// headers via leb128 like `sniff_av1_obu` in `video_decode.rs`, group
+/// to `max_chunk`. See docs/AV1-SEAMS.md.
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
     // Walk the start codes (00 00 01 and 00 00 00 01), recording each
     // NAL's offset and header byte.
