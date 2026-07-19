@@ -310,6 +310,16 @@ pub struct Mesh {
     /// it. The generation is never serialized: it only fences stale callbacks
     /// and queued work before they reach the existing media plane.
     video_route_generations: Mutex<VideoRouteGenerations>,
+    /// A very small, process-local guard around a screen switch. The viewer
+    /// tears the old display route down and offers the new one on separate
+    /// local node-control requests; a delayed duplicate teardown can therefore
+    /// land just after the successor activates. Route ids carry no incarnation,
+    /// so without this narrow fence that close tears down the brand-new
+    /// monitor and changing codec merely happens to start it again after the
+    /// race. Local duplicates are watch-confirmed inside 100 ms; inbound ones
+    /// wait a bounded 2.5 seconds for an existing ICE-path liveness control.
+    /// Nothing here is serialized and no new message is sent over any channel.
+    video_switch_guards: Mutex<VideoSwitchGuards>,
     /// **Viewer side:** the lane→route binding a streamer told us, per peer
     /// (canonical pubkey). Inbound H.264 on lane `L` from peer `P` belongs to
     /// `video_lane_binds[P][L]` — authoritative over the positional guess.
@@ -356,6 +366,10 @@ struct VideoWatcher {
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
     queue: std::collections::VecDeque<Vec<u8>>,
+    /// Updated by the window's 16 ms safety poll even when no frame arrived.
+    /// A post-disconnect-request poll is stronger liveness evidence than mere
+    /// watcher presence because `video_unwatch` is fire-and-forget.
+    last_poll: Instant,
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -444,10 +458,234 @@ impl VideoRouteGenerations {
         self.current.remove(route_id);
     }
 
+    fn current(&self, route_id: &str) -> Option<u64> {
+        self.current.get(route_id).copied()
+    }
+
     fn is_current(&self, route_id: &str, generation: u64) -> bool {
         self.current
             .get(route_id)
             .is_some_and(|current| *current == generation)
+    }
+}
+
+/// A predecessor remains eligible to arm a switch guard for this long. The
+/// real switch is normally a few milliseconds; the wider retention only makes
+/// the bookkeeping tolerant of a loaded viewer. It does not widen the actual
+/// teardown-ignore window below.
+const VIDEO_SWITCH_PREDECESSOR_AGE: Duration = Duration::from_secs(2);
+/// Fence closes this soon after a display-switch successor starts. 100 ms is
+/// well above the 7 ms field failure while remaining a narrow intent check.
+/// Every duplicate inside the same window is fenced; none consumes the guard.
+const VIDEO_SWITCH_TEARDOWN_GUARD: Duration = Duration::from_millis(100);
+/// A poll that was already in flight when disconnect began is not proof. The
+/// window's safety loop runs every 16 ms, so require a poll at least two ticks
+/// later and observe for long enough that an active loop can produce one.
+const VIDEO_LOCAL_POLL_PROOF_MIN_AGE: Duration = Duration::from_millis(32);
+const VIDEO_LOCAL_POLL_OBSERVE: Duration = Duration::from_millis(80);
+/// A first close that races a just-started display successor waits briefly for
+/// proof that the replacement is alive. Viewer feedback is emitted at most two
+/// seconds apart, so 2.5 seconds covers one full beat without letting a genuine
+/// one-shot close strand an encoder indefinitely.
+const VIDEO_INBOUND_TEARDOWN_QUARANTINE: Duration = Duration::from_millis(2_500);
+/// Ignore an immediate, possibly already-in-flight feedback beat. A periodic
+/// viewer report that arrives after this floor is evidence produced by the
+/// replacement route, not merely setup traffic queued beside its offer.
+const VIDEO_TEARDOWN_LIVENESS_MIN_AGE: Duration = Duration::from_millis(250);
+/// Lifecycle entries outlive the 2.5-second quarantine but are pruned during
+/// later route activity, bounding the bookkeeping on long-running nodes.
+const VIDEO_SWITCH_BOOK_RETENTION: Duration = Duration::from_secs(10);
+
+struct StoppedVideoRoute {
+    peer: String,
+    sink: String,
+    at: Instant,
+}
+
+struct StartedVideoRoute {
+    peer: String,
+    /// The recent route whose stop made this start a display switch. It remains
+    /// readable for the whole narrow guard window so duplicate local/backend
+    /// calls cannot defeat the fence merely by racing one another.
+    predecessor: Option<String>,
+    at: Instant,
+    incarnation: u64,
+}
+
+struct PendingVideoTeardown {
+    token: u64,
+    armed_at: Instant,
+    incarnation: u64,
+}
+
+#[derive(Default)]
+struct VideoSwitchGuards {
+    stopped: HashMap<String, StoppedVideoRoute>,
+    started: HashMap<String, StartedVideoRoute>,
+    /// Early inbound teardown quarantines, route → opaque local token. An
+    /// mature periodic viewer report cancels the token; duplicate closes
+    /// coalesce behind the same bounded timer.
+    pending: HashMap<String, PendingVideoTeardown>,
+    next_pending: u64,
+    next_incarnation: u64,
+}
+
+struct VideoSwitchGuardHit {
+    predecessor: String,
+    age: Duration,
+    incarnation: u64,
+}
+
+enum InboundVideoTeardownGate {
+    Commit,
+    CoalesceDuplicate {
+        token: u64,
+    },
+    Quarantine {
+        predecessor: String,
+        age: Duration,
+        token: u64,
+        incarnation: u64,
+    },
+}
+
+impl VideoSwitchGuards {
+    fn note_stop(&mut self, route_id: &str, peer: &str, sink: &str, now: Instant) {
+        self.started.remove(route_id);
+        self.pending.remove(route_id);
+        self.started.retain(|_, start| {
+            now.saturating_duration_since(start.at) <= VIDEO_SWITCH_BOOK_RETENTION
+        });
+        self.stopped.retain(|_, stop| {
+            now.saturating_duration_since(stop.at) <= VIDEO_SWITCH_PREDECESSOR_AGE
+        });
+        self.stopped.insert(
+            route_id.to_string(),
+            StoppedVideoRoute {
+                peer: pubkey_part(peer).to_string(),
+                sink: sink.to_string(),
+                at: now,
+            },
+        );
+    }
+
+    fn note_start(&mut self, route_id: &str, peer: &str, sink: &str, now: Instant) {
+        // A real re-offer supersedes any old delayed-close timer for this
+        // deterministic route id.
+        self.pending.remove(route_id);
+        self.started.retain(|_, start| {
+            now.saturating_duration_since(start.at) <= VIDEO_SWITCH_BOOK_RETENTION
+        });
+        self.stopped.retain(|_, stop| {
+            now.saturating_duration_since(stop.at) <= VIDEO_SWITCH_PREDECESSOR_AGE
+        });
+        let peer = pubkey_part(peer).to_string();
+        // Prefer the newest matching predecessor. The same-id case is a codec
+        // re-offer; a different id with the same sink is a monitor switch.
+        let predecessor = self
+            .stopped
+            .iter()
+            .filter(|(_, stop)| stop.peer == peer && stop.sink == sink)
+            .max_by_key(|(_, stop)| stop.at)
+            .map(|(id, _)| id.clone());
+        self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
+        let incarnation = self.next_incarnation;
+        self.started.insert(
+            route_id.to_string(),
+            StartedVideoRoute {
+                peer,
+                predecessor,
+                at: now,
+                incarnation,
+            },
+        );
+    }
+
+    fn take_early_teardown(
+        &mut self,
+        route_id: &str,
+        peer: &str,
+        now: Instant,
+    ) -> Option<VideoSwitchGuardHit> {
+        let start = self.started.get_mut(route_id)?;
+        if start.peer != pubkey_part(peer) {
+            return None;
+        }
+        let age = now.saturating_duration_since(start.at);
+        if age > VIDEO_SWITCH_TEARDOWN_GUARD {
+            return None;
+        }
+        let predecessor = start.predecessor.clone()?;
+        Some(VideoSwitchGuardHit {
+            predecessor,
+            age,
+            incarnation: start.incarnation,
+        })
+    }
+
+    fn gate_inbound_teardown(
+        &mut self,
+        route_id: &str,
+        peer: &str,
+        now: Instant,
+    ) -> InboundVideoTeardownGate {
+        if let Some(pending) = self.pending.get(route_id) {
+            return InboundVideoTeardownGate::CoalesceDuplicate {
+                token: pending.token,
+            };
+        }
+        let Some(hit) = self.take_early_teardown(route_id, peer, now) else {
+            return InboundVideoTeardownGate::Commit;
+        };
+        let token = self.arm_pending(route_id, hit.incarnation, now);
+        InboundVideoTeardownGate::Quarantine {
+            predecessor: hit.predecessor,
+            age: hit.age,
+            token,
+            incarnation: hit.incarnation,
+        }
+    }
+
+    fn arm_pending(&mut self, route_id: &str, incarnation: u64, now: Instant) -> u64 {
+        self.next_pending = self.next_pending.wrapping_add(1).max(1);
+        let token = self.next_pending;
+        self.pending.insert(
+            route_id.to_string(),
+            PendingVideoTeardown {
+                token,
+                armed_at: now,
+                incarnation,
+            },
+        );
+        token
+    }
+
+    fn cancel_pending(&mut self, route_id: &str) -> Option<u64> {
+        self.pending.remove(route_id).map(|pending| pending.token)
+    }
+
+    fn cancel_pending_on_mature_liveness(&mut self, route_id: &str, now: Instant) -> Option<u64> {
+        let pending = self.pending.get(route_id)?;
+        if now.saturating_duration_since(pending.armed_at) < VIDEO_TEARDOWN_LIVENESS_MIN_AGE {
+            return None;
+        }
+        self.cancel_pending(route_id)
+    }
+
+    fn take_pending_if_current(&mut self, route_id: &str, token: u64, incarnation: u64) -> bool {
+        let pending_matches = self
+            .pending
+            .get(route_id)
+            .is_some_and(|pending| pending.token == token && pending.incarnation == incarnation);
+        let incarnation_matches = self
+            .started
+            .get(route_id)
+            .is_some_and(|started| started.incarnation == incarnation);
+        if !pending_matches || !incarnation_matches {
+            return false;
+        }
+        self.pending.remove(route_id);
+        true
     }
 }
 
@@ -818,6 +1056,7 @@ impl Mesh {
             daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
             video_lane_pins: Mutex::new(HashMap::new()),
             video_route_generations: Mutex::new(VideoRouteGenerations::default()),
+            video_switch_guards: Mutex::new(VideoSwitchGuards::default()),
             video_lane_binds: Mutex::new(HashMap::new()),
             disabled_networks: Mutex::new(None),
             cec: crate::cec::Cec::new(crate::cec::consent_store_path()),
@@ -2679,6 +2918,153 @@ impl Mesh {
                             return;
                         }
                     }
+                    // Only a periodic viewer report produced after the close's
+                    // minimum age proves the replacement survived. One-shot
+                    // Offer/Accept/Tune/Lane controls can already be in flight
+                    // and are deliberately not treated as liveness.
+                    if let Some(route_id) = inbound_video_feedback_liveness_route_id(&msg) {
+                        if let Some(token) = self.cancel_pending_video_teardown(route_id, &from) {
+                            tracing::warn!(
+                                route = %route_id,
+                                from = %short_id(&from),
+                                network = %network,
+                                token,
+                                disposition = "quarantine_canceled_by_liveness",
+                                "inbound video route control"
+                            );
+                        }
+                    }
+
+                    // Teardown used to be the one destructive route control
+                    // that was not peer-checked. Authentication, guard choice,
+                    // and (when committing) Session mutation are one state-lock
+                    // transaction, so a same-id replacement cannot enter in
+                    // between and be killed by an old peer message.
+                    if let ControlMessage::Route(RouteControl::Teardown { route_id }) = &msg {
+                        let (facts, gate, effects) = {
+                            let mut st = self.state.lock();
+                            let Some(session) = st.session.as_mut() else {
+                                return;
+                            };
+                            let facts = session.route(route_id).map(|r| {
+                                (r.peer.as_str().to_string(), r.state.clone(), r.route.media)
+                            });
+                            if facts
+                                .as_ref()
+                                .is_some_and(|(peer, _, _)| pubkey_part(peer) != pubkey_part(&from))
+                            {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    expected = %facts.as_ref().map(|f| short_id(&f.0)).unwrap_or_default(),
+                                    disposition = "foreign_peer_refused",
+                                    "inbound route teardown"
+                                );
+                                return;
+                            }
+                            let eligible = facts.as_ref().is_some_and(|(_, state, media)| {
+                                *state == RouteState::Active
+                                    && matches!(media, MediaKind::Display | MediaKind::Video)
+                            });
+                            let gate = if eligible {
+                                self.video_switch_guards.lock().gate_inbound_teardown(
+                                    route_id,
+                                    &from,
+                                    Instant::now(),
+                                )
+                            } else {
+                                InboundVideoTeardownGate::Commit
+                            };
+                            let effects = if matches!(gate, InboundVideoTeardownGate::Commit) {
+                                session.handle(
+                                    NodeId::from(from.as_str()),
+                                    ControlMessage::Route(RouteControl::Teardown {
+                                        route_id: route_id.clone(),
+                                    }),
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            (facts, gate, effects)
+                        };
+                        let generation = self.video_route_generations.lock().current(route_id);
+                        let state_before = facts.as_ref().map(|(_, state, _)| state);
+                        let media = facts.as_ref().map(|(_, _, media)| media);
+                        match gate {
+                            InboundVideoTeardownGate::Quarantine {
+                                predecessor,
+                                age,
+                                token,
+                                incarnation,
+                            } => {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    predecessor = %predecessor,
+                                    age_us = age.as_micros(),
+                                    token,
+                                    incarnation,
+                                    quarantine_ms = VIDEO_INBOUND_TEARDOWN_QUARANTINE.as_millis(),
+                                    disposition = "quarantined",
+                                    "inbound route teardown"
+                                );
+                                let mesh = self.clone();
+                                let route_id = route_id.clone();
+                                crate::spawn(async move {
+                                    mesh.commit_quarantined_video_teardown(
+                                        route_id,
+                                        from,
+                                        network,
+                                        token,
+                                        incarnation,
+                                    )
+                                    .await;
+                                });
+                                return;
+                            }
+                            InboundVideoTeardownGate::CoalesceDuplicate { token } => {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    token,
+                                    disposition = "duplicate_coalesced",
+                                    "inbound route teardown"
+                                );
+                                return;
+                            }
+                            InboundVideoTeardownGate::Commit => {
+                                tracing::info!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    disposition = "commit",
+                                    "inbound route teardown"
+                                );
+                                self.process_effects(effects).await;
+                                self.emit_snapshot();
+                                return;
+                            }
+                        }
+                    } else if let ControlMessage::Route(RouteControl::Reject { route_id, reason }) =
+                        &msg
+                    {
+                        tracing::info!(
+                            "inbound route reject for {route_id} from {}: {reason}",
+                            short_id(&from)
+                        );
+                    }
                     // Site management (list a co-owned machine's sites,
                     // re-expose them) and the terminal-sessions picker plane
                     // (list this host's open shells, the host's answer) ride
@@ -2947,6 +3333,7 @@ impl Mesh {
     /// the host-side pinned track lane (freeing it for the next stream), and
     /// the viewer-side lane→route binding.
     fn release_video_lanes(self: &Arc<Self>, route_id: &str) {
+        self.note_video_route_stopped(route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
@@ -2967,6 +3354,174 @@ impl Mesh {
             per_peer.retain(|_, r| r != route_id);
         }
         binds.retain(|_, per_peer| !per_peer.is_empty());
+    }
+
+    /// Record both ends of a video route's local lifecycle. These timestamps
+    /// never leave this process; they only recognize the tiny old-screen →
+    /// new-screen handoff in which a duplicate close can otherwise kill the
+    /// successor before its first capture frame.
+    fn note_video_route_started(&self, route: &Route) {
+        if !matches!(route.media, MediaKind::Display | MediaKind::Video) {
+            return;
+        }
+        let Some(peer) = self.route_peer(&route.id) else {
+            return;
+        };
+        self.video_switch_guards.lock().note_start(
+            &route.id,
+            &peer,
+            route.to.as_str(),
+            Instant::now(),
+        );
+    }
+
+    fn note_video_route_stopped(&self, route_id: &str) {
+        let facts = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .and_then(|s| s.route(route_id))
+                .filter(|r| matches!(r.route.media, MediaKind::Display | MediaKind::Video))
+                .map(|r| (r.peer.as_str().to_string(), r.route.to.as_str().to_string()))
+        };
+        let Some((peer, sink)) = facts else { return };
+        self.video_switch_guards
+            .lock()
+            .note_stop(route_id, &peer, &sink, Instant::now());
+    }
+
+    /// Read the narrow switch guard for an authenticated, currently-live
+    /// display route. Call this before mutating the session to TornDown: after
+    /// that mutation the replacement is indistinguishable from its predecessor
+    /// by route id alone.
+    fn take_early_video_teardown_guard(&self, route_id: &str) -> Option<VideoSwitchGuardHit> {
+        let peer = {
+            let st = self.state.lock();
+            let route = st.session.as_ref()?.route(route_id)?;
+            if !matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                || route.state != RouteState::Active
+            {
+                return None;
+            }
+            route.peer.as_str().to_string()
+        };
+        self.video_switch_guards
+            .lock()
+            .take_early_teardown(route_id, &peer, Instant::now())
+    }
+
+    /// Cancel a quarantined close only when the same authenticated peer emits a
+    /// periodic report for the active route after the in-flight-control floor.
+    /// Feedback is an existing app control carried on the ICE data path; no new
+    /// wire or signaling message is introduced.
+    fn cancel_pending_video_teardown(&self, route_id: &str, from: &str) -> Option<u64> {
+        let st = self.state.lock();
+        let live = st
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .is_some_and(|route| {
+                route.state == RouteState::Active
+                    && matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                    && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+            });
+        live.then(|| {
+            self.video_switch_guards
+                .lock()
+                .cancel_pending_on_mature_liveness(route_id, Instant::now())
+        })
+        .flatten()
+    }
+
+    /// A new local offer is an explicit replacement action, not a duplicate
+    /// control delivery. Cancel its predecessor's delayed close before the
+    /// local Session overwrites the deterministic route id.
+    fn cancel_pending_video_teardown_replaced(&self, route_id: &str, from: &str) -> Option<u64> {
+        let st = self.state.lock();
+        let same_peer = st
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .is_some_and(|route| pubkey_part(route.peer.as_str()) == pubkey_part(from));
+        same_peer
+            .then(|| self.video_switch_guards.lock().cancel_pending(route_id))
+            .flatten()
+    }
+
+    /// Apply a quarantined peer close after its grace period. This folds the
+    /// original message through the session exactly once but deliberately does
+    /// not call `disconnect`: echoing a new Teardown would turn a receive-side
+    /// lifecycle decision into another wire message.
+    async fn commit_quarantined_video_teardown(
+        self: &Arc<Self>,
+        route_id: String,
+        from: String,
+        network: String,
+        token: u64,
+        incarnation: u64,
+    ) {
+        tokio::time::sleep(VIDEO_INBOUND_TEARDOWN_QUARANTINE).await;
+        let (effects, state_before, media) = {
+            let mut st = self.state.lock();
+            let Some(session) = st.session.as_mut() else {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            };
+            let Some(route) = session.route(&route_id) else {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            };
+            if route.state != RouteState::Active
+                || !matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                || pubkey_part(route.peer.as_str()) != pubkey_part(&from)
+            {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            }
+            if !self.video_switch_guards.lock().take_pending_if_current(
+                &route_id,
+                token,
+                incarnation,
+            ) {
+                return;
+            }
+            let state_before = route.state.clone();
+            let media = route.route.media;
+            let effects = session.handle(
+                NodeId::from(from.as_str()),
+                ControlMessage::Route(RouteControl::Teardown {
+                    route_id: route_id.clone(),
+                }),
+            );
+            (effects, state_before, media)
+        };
+        let generation = self.video_route_generations.lock().current(&route_id);
+        tracing::warn!(
+            route = %route_id,
+            from = %short_id(&from),
+            network = %network,
+            state_before = ?state_before,
+            media = ?media,
+            generation = ?generation,
+            token,
+            incarnation,
+            disposition = "quarantine_expired_commit",
+            "inbound route teardown"
+        );
+        self.process_effects(effects).await;
+        self.emit_snapshot();
     }
 
     /// Allocate this actual `StartMedia` effect's process-local incarnation.
@@ -3479,6 +4034,19 @@ impl Mesh {
             return Ok(route.id);
         }
 
+        if matches!(route.media, MediaKind::Display | MediaKind::Video) {
+            if let Some(token) =
+                self.cancel_pending_video_teardown_replaced(&route.id, peer.as_str())
+            {
+                tracing::warn!(
+                    route = %route.id,
+                    peer = %short_id(peer.as_str()),
+                    token,
+                    disposition = "quarantine_canceled_by_local_reoffer",
+                    "local video route control"
+                );
+            }
+        }
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
@@ -3566,6 +4134,7 @@ impl Mesh {
                 token,
                 decode,
                 queue: std::collections::VecDeque::new(),
+                last_poll: Instant::now(),
             },
         );
         token
@@ -3591,6 +4160,7 @@ impl Mesh {
         let Some(w) = map.get_mut(route_id) else {
             return Vec::new();
         };
+        w.last_poll = Instant::now();
         let total: usize = w.queue.iter().map(|p| 4 + p.len()).sum();
         let mut out = Vec::with_capacity(total);
         for packet in w.queue.drain(..) {
@@ -3601,10 +4171,53 @@ impl Mesh {
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
+            // Do not infer intent from watcher *presence*: unwatch is a
+            // separate fire-and-forget command and can lag. A window that polls
+            // after this disconnect began is positive proof the successor is
+            // still live; an intentional close stops its 16 ms poll loop even
+            // if cleanup delivery itself is delayed.
+            let guarded_at = Instant::now();
+            tokio::time::sleep(
+                VIDEO_SWITCH_TEARDOWN_GUARD
+                    .saturating_sub(hit.age)
+                    .max(VIDEO_LOCAL_POLL_OBSERVE),
+            )
+            .await;
+            let polled_after_request = self
+                .video_watchers
+                .lock()
+                .get(&route_id)
+                .is_some_and(|watcher| watcher_poll_proves_liveness(watcher.last_poll, guarded_at));
+            let still_nonterminal = self
+                .state
+                .lock()
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .is_some_and(|r| {
+                    matches!(
+                        r.state,
+                        RouteState::Offered | RouteState::Incoming | RouteState::Active
+                    )
+                });
+            if polled_after_request && still_nonterminal {
+                tracing::warn!(
+                    "ignored stale local video teardown for {route_id} after switch from {} — the successor window kept polling",
+                    hit.predecessor,
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                "early local video teardown for {route_id} confirmed after switch from {} (no successor poll) — committing",
+                hit.predecessor,
+            );
+        }
         let msg = {
             let mut st = self.state.lock();
             st.session.as_mut().and_then(|s| s.teardown(&route_id))
         };
+        tracing::info!("local route teardown committing for {route_id}");
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
@@ -5029,6 +5642,23 @@ impl Mesh {
                     // routes that carry a picture.
                     if matches!(route.media, MediaKind::Display | MediaKind::Video) {
                         self.await_video_bringup().await;
+                        let still_active = self
+                            .state
+                            .lock()
+                            .session
+                            .as_ref()
+                            .and_then(|s| s.route(&route.id))
+                            .is_some_and(|live| {
+                                live.state == RouteState::Active && live.route == route
+                            });
+                        if !still_active {
+                            tracing::warn!(
+                                "stale StartMedia for {} abandoned after video bring-up wait — route is no longer the active incarnation",
+                                route.id
+                            );
+                            continue;
+                        }
+                        self.note_video_route_started(&route);
                     }
                     self.start_media(&route)
                 }
@@ -5110,6 +5740,17 @@ impl Mesh {
                         );
                         continue;
                     }
+                    let stop_state = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&id))
+                        .map(|r| format!("{:?}", r.state))
+                        .unwrap_or_else(|| "absent".into());
+                    tracing::info!(
+                        "session StopMedia committing for {id} (route state {stop_state})"
+                    );
                     self.audio.stop(&id);
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
@@ -11658,6 +12299,21 @@ fn pubkey_part(id: &str) -> &str {
     id
 }
 
+/// Video feedback is generated repeatedly by a window that still owns the
+/// route, even for a static screen whose paint rate is zero. One-shot
+/// setup/tune controls are intentionally excluded: they can already be in
+/// flight beside the stale close we are fencing.
+fn inbound_video_feedback_liveness_route_id(msg: &ControlMessage) -> Option<&str> {
+    match msg {
+        ControlMessage::Route(RouteControl::VideoFeedback { route_id, .. }) => Some(route_id),
+        _ => None,
+    }
+}
+
+fn watcher_poll_proves_liveness(last_poll: Instant, disconnect_started: Instant) -> bool {
+    last_poll >= disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE
+}
+
 /// Fold one network's daemon peer list into the `pubkey → network` map that
 /// [`Mesh::network_for_peer`] addresses control/media with. Each peer the daemon
 /// reports **reachable** (`active`/`shelved` — the same cut the graph reads
@@ -11959,6 +12615,279 @@ mod tests {
         assert_eq!(replaced, None);
         assert_ne!(third, successor);
         assert!(generations.is_current("route:display", third));
+    }
+
+    #[test]
+    fn monitor_switch_fences_duplicate_early_teardowns() {
+        let mut guards = VideoSwitchGuards::default();
+        let now = Instant::now();
+        guards.note_stop("route:primary", "viewer-ABCDE", "viewer:display:0", now);
+        guards.note_start(
+            "route:secondary",
+            "viewer-ABCDE",
+            "viewer:display:0",
+            now + Duration::from_millis(8),
+        );
+
+        let hit = guards
+            .take_early_teardown(
+                "route:secondary",
+                "viewer-FGHIJ",
+                now + Duration::from_millis(15),
+            )
+            .expect("the first close inside the measured switch race is fenced");
+        assert_eq!(hit.predecessor, "route:primary");
+        assert_eq!(hit.age, Duration::from_millis(7));
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:secondary",
+                    "viewer-ABCDE",
+                    now + Duration::from_millis(16),
+                )
+                .is_some(),
+            "a concurrent duplicate cannot consume and defeat the guard"
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:secondary",
+                    "viewer-ABCDE",
+                    now + Duration::from_millis(8)
+                        + VIDEO_SWITCH_TEARDOWN_GUARD
+                        + Duration::from_millis(1),
+                )
+                .is_none(),
+            "the guard remains strictly time bounded"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_guard_is_sink_scoped_and_time_bounded() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:other-sink",
+            "viewer",
+            "viewer:display:1",
+            now + Duration::from_millis(5),
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:other-sink",
+                    "viewer",
+                    now + Duration::from_millis(10),
+                )
+                .is_none(),
+            "an unrelated video sink is not a monitor-switch successor"
+        );
+
+        guards.note_start(
+            "route:late",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:late",
+                    "viewer",
+                    now + Duration::from_millis(5)
+                        + VIDEO_SWITCH_TEARDOWN_GUARD
+                        + Duration::from_millis(1),
+                )
+                .is_none(),
+            "a deliberate close outside the narrow race window always wins"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_quarantine_is_canceled_or_committed_exactly_once() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old-a", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-a",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: canceled,
+            incarnation: canceled_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-a", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the early close should arm a quarantine");
+        };
+        assert_eq!(guards.cancel_pending("route:new-a"), Some(canceled));
+        assert!(!guards.take_pending_if_current("route:new-a", canceled, canceled_incarnation));
+
+        guards.note_stop("route:old-b", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-b",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: expires,
+            incarnation: expires_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-b", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the second route should independently arm a quarantine");
+        };
+        assert!(guards.take_pending_if_current("route:new-b", expires, expires_incarnation));
+        assert!(
+            !guards.take_pending_if_current("route:new-b", expires, expires_incarnation),
+            "an expired timer cannot commit the route twice"
+        );
+
+        guards.note_stop("route:old-c", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-c",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: first,
+            incarnation: first_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-c", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the first close should arm a quarantine");
+        };
+        assert!(matches!(
+            guards.gate_inbound_teardown(
+                "route:new-c",
+                "viewer",
+                now + Duration::from_millis(8),
+            ),
+            InboundVideoTeardownGate::CoalesceDuplicate { token } if token == first
+        ));
+        assert!(
+            guards.take_pending_if_current("route:new-c", first, first_incarnation),
+            "duplicate closes share the original bounded timer"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_reoffer_invalidates_an_old_quarantine_token() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:stable-id",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: old_token,
+            incarnation: old_incarnation,
+            ..
+        } = guards.gate_inbound_teardown(
+            "route:stable-id",
+            "viewer",
+            now + Duration::from_millis(7),
+        )
+        else {
+            panic!("the stale close should be initially eligible");
+        };
+
+        guards.note_start(
+            "route:stable-id",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(8),
+        );
+        assert!(
+            !guards.take_pending_if_current("route:stable-id", old_token, old_incarnation),
+            "a delayed timer from an older same-id incarnation is fenced"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_ignores_inflight_feedback_then_accepts_a_mature_heartbeat() {
+        let now = Instant::now();
+        let armed_at = now + Duration::from_millis(7);
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine { token, .. } =
+            guards.gate_inbound_teardown("route:new", "viewer", armed_at)
+        else {
+            panic!("the early close should arm a quarantine");
+        };
+        assert_eq!(
+            guards.cancel_pending_on_mature_liveness(
+                "route:new",
+                armed_at + VIDEO_TEARDOWN_LIVENESS_MIN_AGE - Duration::from_millis(1),
+            ),
+            None,
+            "control already in flight beside the close is not proof"
+        );
+        assert_eq!(
+            guards.cancel_pending_on_mature_liveness(
+                "route:new",
+                armed_at + VIDEO_TEARDOWN_LIVENESS_MIN_AGE,
+            ),
+            Some(token),
+            "the next periodic viewer heartbeat proves the successor is live"
+        );
+    }
+
+    #[test]
+    fn zero_fps_feedback_is_still_a_static_viewer_heartbeat() {
+        let feedback = ControlMessage::Route(RouteControl::VideoFeedback {
+            route_id: "route:static".into(),
+            recv_fps: 0,
+            decode_fails: 0,
+            queue_depth: 0,
+            lost_ts_us: None,
+            ext: Value::Null,
+        });
+        assert_eq!(
+            inbound_video_feedback_liveness_route_id(&feedback),
+            Some("route:static")
+        );
+        assert_eq!(
+            inbound_video_feedback_liveness_route_id(&ControlMessage::Route(
+                RouteControl::Refresh {
+                    route_id: "route:static".into(),
+                },
+            )),
+            None,
+            "one-shot setup/recovery controls are not liveness proof"
+        );
+    }
+
+    #[test]
+    fn local_switch_guard_requires_a_mature_post_disconnect_poll() {
+        let disconnect_started = Instant::now();
+        assert!(!watcher_poll_proves_liveness(
+            disconnect_started + Duration::from_millis(1),
+            disconnect_started,
+        ));
+        assert!(!watcher_poll_proves_liveness(
+            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE - Duration::from_millis(1),
+            disconnect_started,
+        ));
+        assert!(watcher_poll_proves_liveness(
+            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE,
+            disconnect_started,
+        ));
+        assert!(VIDEO_LOCAL_POLL_OBSERVE > VIDEO_LOCAL_POLL_PROOF_MIN_AGE);
     }
 
     #[test]
