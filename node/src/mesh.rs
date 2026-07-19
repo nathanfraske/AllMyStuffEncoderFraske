@@ -202,7 +202,7 @@ pub struct Mesh {
     /// the capture side drops frames instead of queueing stale ones (an
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
     /// next forced IDR).
-    video_out: mpsc::Sender<(String, String, VideoPacket)>,
+    video_out: mpsc::Sender<VideoOut>,
     /// The matching receivers, parked by [`Mesh::new`] and drained by the
     /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
     /// being spawned in `new` because the GUI builds the `Mesh` in a
@@ -210,7 +210,7 @@ pub struct Mesh {
     /// `start` is the first point guaranteed an async context, and on the
     /// same runtime everything else runs on.
     audio_rx: Mutex<Option<mpsc::Receiver<AudioOut>>>,
-    video_rx: Mutex<Option<mpsc::Receiver<(String, String, VideoPacket)>>>,
+    video_rx: Mutex<Option<mpsc::Receiver<VideoOut>>>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// Sequence for outbound clipboard frames (one stream per app run, like
@@ -415,6 +415,126 @@ const TERM_INIT_ROWS: u16 = 24;
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// One item on the shipped shared video queue. Recovery metadata is strictly
+/// process-local: the packet still reaches the same established media sender
+/// with the same bytes and duration as before.
+type VideoOut = (String, String, VideoPacket, u64, Arc<VideoRecovery>);
+
+/// Queue-local recovery state shared by capture and its sender worker. The
+/// epoch prevents an older keyframe from declaring recovery after a newer
+/// drop: only a key produced in the current damage epoch and successfully
+/// handed to the existing media pipe can release dependent deltas.
+struct VideoRecovery {
+    route_id: String,
+    diag_key: String,
+    /// `(epoch << 1) | awaiting_key`. Keeping both facts in one atomic makes a
+    /// drop and a delivered-key decision indivisible: a stale key cannot land
+    /// between separate epoch/awaiting writes and falsely release deltas.
+    state: AtomicU64,
+    drops: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl VideoRecovery {
+    fn new(route_id: &str) -> Self {
+        Self {
+            route_id: route_id.to_string(),
+            diag_key: format!("video-recovery:{route_id}"),
+            state: AtomicU64::new(0),
+            drops: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
+    fn suppresses(&self, key: Option<bool>) -> bool {
+        suppress_dependent_after_drop(self.state.load(Ordering::Acquire) & 1 != 0, key)
+    }
+
+    fn note_suppressed(&self, mesh: &Mesh) {
+        let suppressed = self.suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+        if mesh.diag_ok(&self.diag_key) {
+            tracing::warn!(
+                "video queue recovery for {}: {} total drops, {suppressed} total dependent deltas suppressed; awaiting delivered IDR",
+                self.route_id,
+                self.drops.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    fn note_drop(&self, mesh: &Mesh, key: Option<bool>, reason: &str) {
+        let (arm, dropped, _) = self.mark_drop(key);
+        // The first loss starts recovery. A keyframe that itself fails must
+        // re-arm it; suppressed deltas never do, avoiding an IDR storm.
+        if arm {
+            mesh.video.force_idr(&self.route_id);
+        }
+        if mesh.diag_ok(&self.diag_key) {
+            tracing::warn!(
+                "video queue recovery for {}: {dropped} total drops ({reason}); {}",
+                self.route_id,
+                if arm {
+                    "IDR armed"
+                } else {
+                    "awaiting delivered IDR"
+                }
+            );
+        }
+    }
+
+    /// Advance the damage epoch and enter recovery. Returns whether the
+    /// encoder must be armed, the episode drop count, and the new epoch.
+    fn mark_drop(&self, key: Option<bool>) -> (bool, u64, u64) {
+        let mut old = self.state.load(Ordering::Acquire);
+        let (arm, epoch) = loop {
+            let was_awaiting = old & 1 != 0;
+            // A dependent unit that raced into a send before recovery began
+            // is covered by the repair already in flight. Advancing its epoch
+            // would stale that repair without arming a replacement.
+            if was_awaiting && key == Some(false) {
+                break (false, old >> 1);
+            }
+            let next_epoch = (old >> 1).wrapping_add(1);
+            let new = (next_epoch << 1) | 1;
+            match self
+                .state
+                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break (!was_awaiting || key == Some(true), next_epoch),
+                Err(actual) => old = actual,
+            }
+        };
+        let dropped = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
+        (arm, dropped, epoch)
+    }
+
+    fn note_key_delivered(&self, packet_epoch: u64) -> bool {
+        let recovering = (packet_epoch << 1) | 1;
+        if self
+            .state
+            .compare_exchange(
+                recovering,
+                packet_epoch << 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let drops = self.drops.load(Ordering::Relaxed);
+        let suppressed = self.suppressed.load(Ordering::Relaxed);
+        tracing::info!(
+            "video queue recovery for {}: IDR delivered (lifetime totals: {drops} drops, {suppressed} suppressed deltas)",
+            self.route_id
+        );
+        true
+    }
+}
+
 /// Auto-re-map after a site route is rejected: how many times to retry, and the
 /// base backoff (grown by the attempt number). ~11s of retrying across 5 tries
 /// — enough to ride out a KVM reconnect, few enough to give up (not loop) if the
@@ -516,6 +636,17 @@ fn pace_budget(configured_ms: u64, fps: u32) -> std::time::Duration {
     std::time::Duration::from_micros(configured_us.min(frame_us).max(1))
 }
 
+/// Cap a requested gap to the AU's absolute pacing deadline. Pipe-lock and
+/// write waits consume the same budget, so contention can shorten or remove a
+/// later sleep but can never add a standing frame of deliberate pacing delay.
+fn pace_gap_until(
+    deadline: Instant,
+    now: Instant,
+    requested: std::time::Duration,
+) -> std::time::Duration {
+    requested.min(deadline.saturating_duration_since(now))
+}
+
 fn suppress_dependent_after_drop(awaiting_key: bool, key: Option<bool>) -> bool {
     awaiting_key && key == Some(false)
 }
@@ -554,7 +685,7 @@ impl Mesh {
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
         let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
+        let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -701,57 +832,10 @@ impl Mesh {
             let mesh = self.clone();
             crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, route_id, packet)) = video_rx.recv().await {
-                    let outcome = match packet {
-                        // An MJPEG frame above the data channel's message
-                        // ceiling travels as several chunks sharing a seq.
-                        VideoPacket::Jpeg(frame) => {
-                            let mut result = Ok(());
-                            for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
-                                let Ok(payload) = serde_json::to_value(&chunk) else {
-                                    continue;
-                                };
-                                if let Err(e) = mesh.send_media_value(&peer, payload).await {
-                                    result = Err(e);
-                                    break; // rest of this frame is pointless
-                                }
-                            }
-                            result
-                        }
-                        // An H.264 access unit rides the mesh's RTP track
-                        // lane — no size ceiling (RTP packetizes), but
-                        // optionally paced: see [`Mesh::send_video_paced`].
-                        VideoPacket::H264 {
-                            data,
-                            key: _,
-                            duration_us,
-                        } => {
-                            match mesh.video_lane(&route_id, &peer, true) {
-                                Some(lane) => {
-                                    let pace = mesh.video.route_pace(&route_id);
-                                    mesh.send_video_paced(&peer, lane, &data, duration_us, pace)
-                                        .await
-                                }
-                                // No lane for this route right now — it has
-                                // just torn down, or another of this peer's
-                                // streams pushed it past the lane pool. DROP
-                                // the unit: the old `.unwrap_or(0)` shipped it
-                                // on lane 0, the receiver's *first* route, so a
-                                // second monitor's pixels surfaced in the first
-                                // monitor's window (the intermittent
-                                // wrong-window flash). The decoder re-lands the
-                                // moment the route is back on a lane (next IDR).
-                                None => {
-                                    if mesh.diag_ok(&format!("nolane:{route_id}")) {
-                                        tracing::debug!(
-                                            "no video lane for {route_id} right now; dropping H.264 unit"
-                                        );
-                                    }
-                                    Ok(())
-                                }
-                            }
-                        }
-                    };
+                while let Some((peer, route_id, packet, epoch, recovery)) = video_rx.recv().await {
+                    let outcome = mesh
+                        .forward_video_packet(&peer, &route_id, packet, epoch, &recovery)
+                        .await;
                     if let Err(e) = outcome {
                         if last_warn.elapsed() >= WARN_EVERY {
                             last_warn = std::time::Instant::now();
@@ -778,6 +862,8 @@ impl Mesh {
         peer: &str,
         route_id: &str,
         packet: VideoPacket,
+        packet_epoch: u64,
+        recovery: &VideoRecovery,
     ) -> Result<(), String> {
         match packet {
             VideoPacket::Jpeg(frame) => {
@@ -791,23 +877,33 @@ impl Mesh {
             }
             VideoPacket::H264 {
                 data,
-                key: _,
+                key,
                 duration_us,
-            } => match self.video_lane(route_id, peer, true) {
-                Some(lane) => {
-                    let pace = self.video.route_pace(route_id);
-                    self.send_video_paced(peer, lane, &data, duration_us, pace)
-                        .await
+            } => {
+                // Capture cannot retract deltas already in the queue when a
+                // newer packet is dropped. Re-check at dequeue so none cross
+                // the missing reference before the delivered repair key.
+                if recovery.suppresses(Some(key)) {
+                    recovery.note_suppressed(self);
+                    return Ok(());
                 }
-                None => {
-                    if self.diag_ok(&format!("nolane:{route_id}")) {
-                        tracing::debug!(
-                            "no video lane for {route_id} right now; dropping H.264 unit"
-                        );
-                    }
-                    Ok(())
+                let Some(lane) = self.video_lane(route_id, peer, true) else {
+                    recovery.note_drop(self, Some(key), "no route lane");
+                    return Ok(());
+                };
+                let pace = self.video.route_pace(route_id);
+                if let Err(e) = self
+                    .send_video_paced(peer, lane, &data, duration_us, pace)
+                    .await
+                {
+                    recovery.note_drop(self, Some(key), "media send failed");
+                    return Err(e);
                 }
-            },
+                if key {
+                    recovery.note_key_delivered(packet_epoch);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -865,7 +961,7 @@ impl Mesh {
         if !crate::video::paced_slices_enabled() {
             return self.send_video_track(peer, lane, data, duration_us).await;
         }
-        let chunks = crate::video::split_annexb_paced(&data, crate::video::PACE_SLICE_BYTES);
+        let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
         if chunks.len() < 2 {
             return self.send_video_track(peer, lane, data, duration_us).await;
         }
@@ -891,7 +987,9 @@ impl Mesh {
         } else {
             (800_000_000, 1_500, 10)
         };
-        let budget_each = pace_budget(budget_ms, fps) / (chunks.len() as u32 - 1);
+        let total_budget = pace_budget(budget_ms, fps);
+        let budget_each = total_budget / (chunks.len() as u32 - 1);
+        let pace_deadline = Instant::now() + total_budget;
         let last = chunks.len() - 1;
         let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(last);
         // M1's pace+write split: gap time is the ledger above; this is
@@ -908,10 +1006,16 @@ impl Mesh {
             if i != last {
                 let drain_us =
                     (sent_bytes as u64 * 8_000_000 / drain_bps.max(1)).clamp(100, gap_cap_us);
-                let gap = std::time::Duration::from_micros(drain_us).min(budget_each);
-                let t0 = std::time::Instant::now();
-                paced_gap(gap).await;
-                ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
+                let requested = std::time::Duration::from_micros(drain_us).min(budget_each);
+                // The shared media writer is the final serialization point.
+                // Time waiting for it consumes this AU's pacing slot; never
+                // sleep the full nominal gap after that budget has elapsed.
+                let gap = pace_gap_until(pace_deadline, Instant::now(), requested);
+                if !gap.is_zero() {
+                    let t0 = std::time::Instant::now();
+                    paced_gap(gap).await;
+                    ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
+                }
             }
         }
         self.note_pace_gaps(&ledger, write_us, writes);
@@ -1076,7 +1180,7 @@ impl Mesh {
         // base64 video_send op (so an older daemon still streams).
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
             self.media_track_pipe
-                .send_video(&network, pubkey_part(peer), lane, duration_us, &data)
+                .send_video(&network, pubkey_part(peer), lane, duration_us, data)
                 .await
                 .map_err(|e| e.to_string())
         } else {
@@ -7985,20 +8089,30 @@ impl Mesh {
         let status_peer = peer.clone();
         let status_route = route.id.clone();
         let route_id = route.id.clone();
+        let recovery = Arc::new(VideoRecovery::new(&route_id));
         // V1 prototype: one bounded sender and worker per route removes
         // cross-route head-of-line blocking while retaining the shipped
         // global queue as the exact default-off path.
         let isolated_tx = if crate::labs::on(crate::labs::Feature::VideoSched) {
-            let (route_tx, mut route_rx) = mpsc::channel::<VideoPacket>(4);
+            let (route_tx, mut route_rx) = mpsc::channel::<(VideoPacket, u64)>(4);
             let worker_mesh = self.clone();
             let worker_peer = peer.clone();
             let worker_route = route_id.clone();
-            tracing::info!("labs state: isolated video sender for {worker_route}");
+            let worker_recovery = recovery.clone();
+            tracing::info!(
+                "labs state: isolated video sender for {worker_route} (sampled at route start; restart the route after toggling)"
+            );
             crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some(packet) = route_rx.recv().await {
+                while let Some((packet, epoch)) = route_rx.recv().await {
                     if let Err(e) = worker_mesh
-                        .forward_video_packet(&worker_peer, &worker_route, packet)
+                        .forward_video_packet(
+                            &worker_peer,
+                            &worker_route,
+                            packet,
+                            epoch,
+                            &worker_recovery,
+                        )
                         .await
                     {
                         if last_warn.elapsed() >= WARN_EVERY {
@@ -8040,18 +8154,12 @@ impl Mesh {
                 }
             });
         }
-        // When the outbound queue fills, packets get dropped — and on H.264
-        // every drop leaves the viewer's decoder referencing frames it never
-        // received (smear, or a freeze that outlives the burst). One forced
-        // IDR per gap heals it: set on the first send that SUCCEEDS after a
-        // drop, so the clean unit is asked for exactly when the queue has
-        // room again instead of being eaten by the same full queue.
-        let idr_mesh = Arc::downgrade(self);
-        let idr_route = route.id.clone();
-        let awaiting_key = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let recovery_drops = Arc::new(AtomicU64::new(0));
-        let recovery_suppressed = Arc::new(AtomicU64::new(0));
-        let recovery_diag = format!("video-recovery:{idr_route}");
+        // Queue admission is not delivery. Recovery begins on either a full
+        // producer queue or a downstream lane/write failure, holds dependent
+        // deltas at both sides of the queue, and ends only after the current
+        // epoch's IDR reaches the existing media pipe successfully.
+        let recovery_mesh = Arc::downgrade(self);
+        let capture_recovery = recovery;
         self.video.start_capture(
             route.id.clone(),
             mode,
@@ -8065,52 +8173,41 @@ impl Mesh {
                     VideoPacket::H264 { key, .. } => Some(*key),
                     VideoPacket::Jpeg(_) => None,
                 };
-                // Once any H.264 unit is dropped, dependent deltas are not
-                // useful to the decoder. Hold them locally until a real IDR
-                // is accepted by the queue; keep the encoder's refresh bit
-                // armed in case a requested keyframe is itself dropped.
-                if suppress_dependent_after_drop(awaiting_key.load(Ordering::SeqCst), key) {
-                    let suppressed = recovery_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(mesh) = idr_mesh.upgrade() {
-                        mesh.video.force_idr(&idr_route);
-                        if mesh.diag_ok(&recovery_diag) {
-                            tracing::warn!(
-                                "video queue recovery for {idr_route}: {} queue drops, {suppressed} dependent deltas suppressed; awaiting IDR",
-                                recovery_drops.load(Ordering::Relaxed)
-                            );
-                        }
+                if capture_recovery.suppresses(key) {
+                    if let Some(mesh) = recovery_mesh.upgrade() {
+                        capture_recovery.note_suppressed(&mesh);
                     }
                     return false;
                 }
-                // try_send: a full queue drops this packet; the next
-                // capture carries a fresher picture.
-                let ok = match &isolated_tx {
-                    Some(route_tx) => route_tx.try_send(packet).is_ok(),
-                    None => tx
-                        .try_send((peer.clone(), route_id.clone(), packet))
-                        .is_ok(),
+                let epoch = capture_recovery.epoch();
+                let failure = match &isolated_tx {
+                    Some(route_tx) => match route_tx.try_send((packet, epoch)) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(_)) => Some("route queue full"),
+                        Err(mpsc::error::TrySendError::Closed(_)) => Some("route queue closed"),
+                    },
+                    None => match tx.try_send((
+                        peer.clone(),
+                        route_id.clone(),
+                        packet,
+                        epoch,
+                        capture_recovery.clone(),
+                    )) {
+                        Ok(()) => None,
+                        Err(mpsc::error::TrySendError::Full(_)) => Some("shared queue full"),
+                        Err(mpsc::error::TrySendError::Closed(_)) => Some("shared queue closed"),
+                    },
                 };
-                if ok {
-                    if key == Some(true) && awaiting_key.swap(false, Ordering::SeqCst) {
-                        tracing::info!(
-                            "video queue recovery for {idr_route}: IDR accepted after {} drops and {} suppressed deltas",
-                            recovery_drops.load(Ordering::Relaxed),
-                            recovery_suppressed.load(Ordering::Relaxed)
-                        );
-                    }
-                } else if key.is_some() {
-                    awaiting_key.store(true, Ordering::SeqCst);
-                    let dropped = recovery_drops.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(mesh) = idr_mesh.upgrade() {
-                        mesh.video.force_idr(&idr_route);
-                        if mesh.diag_ok(&recovery_diag) {
-                            tracing::warn!(
-                                "video queue recovery for {idr_route}: {dropped} queue drops; IDR armed"
-                            );
+                if let Some(reason) = failure {
+                    if key.is_some() {
+                        if let Some(mesh) = recovery_mesh.upgrade() {
+                            capture_recovery.note_drop(&mesh, key, reason);
                         }
                     }
+                    false
+                } else {
+                    true
                 }
-                ok
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
@@ -11677,11 +11774,54 @@ mod tests {
     }
 
     #[test]
+    fn pipe_waits_consume_the_absolute_pacing_budget() {
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_millis(10);
+        let ask = std::time::Duration::from_millis(5);
+        assert_eq!(pace_gap_until(deadline, start, ask), ask);
+        assert_eq!(
+            pace_gap_until(deadline, start + std::time::Duration::from_millis(8), ask),
+            std::time::Duration::from_millis(2)
+        );
+        assert!(
+            pace_gap_until(deadline, start + std::time::Duration::from_millis(11), ask).is_zero()
+        );
+    }
+
+    #[test]
     fn dropped_h264_holds_deltas_until_an_accepted_keyframe() {
         assert!(suppress_dependent_after_drop(true, Some(false)));
         assert!(!suppress_dependent_after_drop(true, Some(true)));
         assert!(!suppress_dependent_after_drop(false, Some(false)));
         assert!(!suppress_dependent_after_drop(true, None));
+    }
+
+    #[test]
+    fn recovery_requires_a_delivered_key_from_the_current_epoch() {
+        let recovery = VideoRecovery::new("test:epoch");
+        let (arm, drops, first_epoch) = recovery.mark_drop(Some(false));
+        assert!(arm, "the first loss arms one IDR");
+        assert_eq!(drops, 1);
+        assert!(recovery.suppresses(Some(false)));
+
+        // A dependent send that raced with recovery is covered by the same
+        // repair: it neither advances the epoch nor creates an IDR storm.
+        let (arm, drops, current_epoch) = recovery.mark_drop(Some(false));
+        assert!(!arm, "dependent losses do not create an IDR storm");
+        assert_eq!(drops, 2);
+        assert_eq!(first_epoch, current_epoch);
+
+        // A failed key advances the epoch and always re-arms. The older key's
+        // eventual success cannot release deltas; only the newest one can.
+        let (arm, _, newest_epoch) = recovery.mark_drop(Some(true));
+        assert!(arm);
+        assert_ne!(current_epoch, newest_epoch);
+        assert!(!recovery.note_key_delivered(current_epoch));
+        assert!(recovery.suppresses(Some(false)));
+        assert!(recovery.note_key_delivered(newest_epoch));
+        assert!(!recovery.suppresses(Some(false)));
+        assert_eq!(recovery.drops.load(Ordering::Relaxed), 3);
+        assert_eq!(recovery.suppressed.load(Ordering::Relaxed), 0);
     }
 
     fn term_route(from: &str, to: &str, media: MediaKind) -> Route {

@@ -389,8 +389,10 @@ pub(crate) struct AmfAvc {
     game: bool,
     studio: bool,
     frame_index: u64,
-    backpressure_drains: u64,
+    full_submit_retries: u64,
+    full_submit_exhaustions: u64,
     backpressure_units: u64,
+    last_exhaustion_warning: Option<std::time::Instant>,
     label: String,
 }
 
@@ -568,8 +570,10 @@ impl AmfAvc {
                 game,
                 studio,
                 frame_index: 0,
-                backpressure_drains: 0,
+                full_submit_retries: 0,
+                full_submit_exhaustions: 0,
                 backpressure_units: 0,
+                last_exhaustion_warning: None,
                 label,
             })
         }
@@ -620,21 +624,34 @@ impl AmfAvc {
                 || std::thread::sleep(std::time::Duration::from_micros(500)),
             );
             ((*(*surface).vtbl).release)(surface);
-            let (submit_status, mut units, fulls) = submitted?;
-            if fulls > 0 {
-                let before = self.backpressure_drains;
-                self.backpressure_drains += u64::from(fulls);
+            let (submit_status, mut units, retries) = submitted?;
+            if retries > 0 {
+                let before = self.full_submit_retries;
+                self.full_submit_retries += u64::from(retries);
                 self.backpressure_units += units.len() as u64;
                 let log_every = u64::from(self.fps.max(1)) * 5;
-                if before == 0 || before / log_every != self.backpressure_drains / log_every {
-                    tracing::warn!(
-                        "AMF backpressure: {} relief drains, {} access units conserved",
-                        self.backpressure_drains,
+                if before == 0 || before / log_every != self.full_submit_retries / log_every {
+                    tracing::debug!(
+                        "AMF backpressure: {} full-submit retries, {} access units conserved",
+                        self.full_submit_retries,
                         self.backpressure_units
                     );
                 }
             }
             if submit_status == AMF_INPUT_FULL {
+                self.full_submit_exhaustions += 1;
+                let now = std::time::Instant::now();
+                let should_warn = self.last_exhaustion_warning.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= std::time::Duration::from_secs(5)
+                });
+                if should_warn {
+                    tracing::warn!(
+                        "AMF backpressure exhausted {retries} full-submit retries ({} exhaustion events, {} access units conserved); reporting input unconsumed for texture retry",
+                        self.full_submit_exhaustions,
+                        self.backpressure_units,
+                    );
+                    self.last_exhaustion_warning = Some(now);
+                }
                 return Ok(crate::video::EncodeOutcome {
                     units,
                     consumed: false,
@@ -774,15 +791,10 @@ mod tests {
 
     #[test]
     fn input_full_drain_preserves_every_access_unit_in_order() {
-        let mut submits = std::collections::VecDeque::from([
-            AMF_INPUT_FULL,
-            AMF_INPUT_FULL,
-            AMF_OK,
-        ]);
-        let mut drained = std::collections::VecDeque::from([
-            Some((vec![1], false)),
-            Some((vec![2], true)),
-        ]);
+        let mut submits =
+            std::collections::VecDeque::from([AMF_INPUT_FULL, AMF_INPUT_FULL, AMF_OK]);
+        let mut drained =
+            std::collections::VecDeque::from([Some((vec![1], false)), Some((vec![2], true))]);
         let mut backoffs = 0;
         let (status, units, fulls) = submit_preserving_output(
             || submits.pop_front().expect("scripted submit"),

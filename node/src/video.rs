@@ -2437,6 +2437,46 @@ impl GpuCodec {
     }
 }
 
+/// Number of capture-ring textures kept out of rotation behind the encoder.
+/// Direct SDK sessions need two; the asynchronous MF/AMF rungs need four.
+/// The override is diagnostic-only and remains clamped to the ring's safe
+/// operating range.
+#[cfg(windows)]
+fn gpu_retirement_depth(enc: &GpuCodec) -> usize {
+    static RETIRE: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var("ALLMYSTUFF_RING_RETIRE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    RETIRE
+        .unwrap_or(if matches!(enc, GpuCodec::Mf(_) | GpuCodec::Amf(_)) {
+            4
+        } else {
+            2
+        })
+        .clamp(1, crate::gpu_pipeline::NV12_RING - 4)
+}
+
+/// Retain the newest source texture and return every texture beyond the
+/// encoder rung's retirement depth to capture immediately. This is used for
+/// consumed frames, unconsumed submissions, and encoder errors alike: the
+/// latter two must keep their final pixels available for a quiet-path retry.
+#[cfg(windows)]
+fn retain_gpu_frame(
+    retained: &mut std::collections::VecDeque<crate::win_capture::GpuFrame>,
+    frame: crate::win_capture::GpuFrame,
+    enc: &GpuCodec,
+    release: &std::sync::mpsc::SyncSender<usize>,
+) {
+    retained.push_back(frame);
+    let depth = gpu_retirement_depth(enc);
+    while retained.len() > depth {
+        if let Some(old) = retained.pop_front() {
+            let _ = release.try_send(old.slot);
+        }
+    }
+}
+
 /// Open the best hardware H.264 MFT **on the lane's adapter**, bound to
 /// its device manager — the encoder must live where the textures live.
 /// `None` when no MFT on that adapter accepts the manager and types.
@@ -2612,12 +2652,12 @@ fn run_gpu_lane(
     // through before reacting (red team, pacing item 6).
     let mut noise_recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let noise_burst_bytes = noise_frame_bytes * 72; // 18 frames × 4×
-                                                    // Armed only when the lossless rung actually opened — a fallback
-                                                    // that already runs rate-controlled studio has nothing to guard
-                                                    // (red team, encoder finding 7).
-    // Runtime behavior follows what actually opened, not merely the requested
-    // posture. A failed lossless open has already landed on rate-controlled
-    // Studio and must immediately participate in rate adaptation and pacing.
+    // Armed only when the lossless rung actually opened — a fallback that
+    // already runs rate-controlled studio has nothing to guard (red team,
+    // encoder finding 7). Runtime behavior follows what actually opened, not
+    // merely the requested posture. A failed lossless open has already landed
+    // on rate-controlled Studio and must immediately participate in rate
+    // adaptation and pacing.
     let mut lossless_active = enc.label().contains("studio-lossless");
     let mut noise_guard_armed = lossless_active;
     // Hold boost clocks while this route streams — the encode engine's
@@ -2698,14 +2738,13 @@ fn run_gpu_lane(
     let started = Instant::now();
     let mut got_any = false;
     let mut policy = RebuildPolicy::new();
-    // The last TWO successfully encoded frames, kept checked out: the
-    // newest is the quiet path's re-emit picture, and the depth-2
-    // retirement is the slot-race fix — the async MFT can still be
-    // reading frame N−1's texture when N is fed, so N−1's slot must not
-    // re-enter rotation until N+1 is consumed (the field symptom of the
-    // old one-deep hold was torn bands on window-open damage bursts).
+    // The newest source texture plus the rung's bounded retirement tail,
+    // kept checked out. The newest is the quiet path's re-offer picture —
+    // including when SubmitInput did not consume it or an encoder error is
+    // about to heal onto MF. The tail is the slot-race fix: an asynchronous
+    // encoder can still be reading an older texture after a later submit.
     let mut retained: std::collections::VecDeque<crate::win_capture::GpuFrame> =
-        std::collections::VecDeque::with_capacity(3);
+        std::collections::VecDeque::with_capacity(gpu_retirement_depth(&enc));
     let mut last_idr: Option<Instant> = None;
     let mut last_emit: Option<Instant> = None;
     // Watchdog: an MFT that consumes frames but never produces a unit is a
@@ -2803,43 +2842,21 @@ fn run_gpu_lane(
                 match enc.encode_texture(&frame.tex, force_idr) {
                     Ok(outcome) => {
                         stats.add_encode(t1.elapsed());
-                        if outcome.consumed {
-                            retained.push_back(frame);
-                            // Retirement depth per rung: 2 proved out on
-                            // NVENC (sync) and the NVIDIA MFT; AMD's MFT
-                            // pipelines reads deeper and the 9060 XT
-                            // field run showed the depth-2 tear
-                            // signature — the MF rung holds 4.
-                            // `ALLMYSTUFF_RING_RETIRE` pins it for A/B
-                            // on the box (ring is sized for ≤4).
-                            static RETIRE: std::sync::LazyLock<Option<usize>> =
-                                std::sync::LazyLock::new(|| {
-                                    std::env::var("ALLMYSTUFF_RING_RETIRE")
-                                        .ok()
-                                        .and_then(|v| v.parse().ok())
-                                });
-                            let depth = RETIRE
-                                .unwrap_or(if matches!(&enc, GpuCodec::Mf(_) | GpuCodec::Amf(_)) {
-                                    4
-                                } else {
-                                    2
-                                })
-                                .clamp(1, crate::gpu_pipeline::NV12_RING - 4);
-                            while retained.len() > depth {
-                                if let Some(old) = retained.pop_front() {
-                                    let _ = lane.release.try_send(old.slot);
-                                }
-                            }
-                        } else {
-                            let _ = lane.release.try_send(frame.slot);
-                            if refresh_asked {
-                                // Not served — re-arm for the next tick
-                                // (see `encode_prepared`'s twin).
-                                refresh.store(true, Ordering::SeqCst);
-                            }
+                        let consumed = outcome.consumed;
+                        // Keep the submitted source in the same bounded
+                        // retirement deque even when the encoder reports it
+                        // unconsumed. A quiet tick can then re-offer those
+                        // exact pixels; a newer capture naturally supersedes
+                        // it at the back of the deque.
+                        retain_gpu_frame(&mut retained, frame, &enc, &lane.release);
+                        if !consumed {
+                            // Nothing served this input (including a forced
+                            // refresh), so retry until it is consumed or a
+                            // newer capture supersedes these pixels.
+                            refresh.store(true, Ordering::SeqCst);
                         }
                         if outcome.units.is_empty() {
-                            if !units_ever {
+                            if consumed && !units_ever {
                                 consumed_without_unit += 1;
                                 if consumed_without_unit > 90 {
                                     return GpuEnd::Fallback(format!(
@@ -2918,7 +2935,12 @@ fn run_gpu_lane(
                         emit_packets(packets, on_packet, stats);
                     }
                     Err(e) => {
-                        let _ = lane.release.try_send(frame.slot);
+                        // Preserve the final damaged picture before any heal
+                        // attempt. A successful MF reopen can re-offer it on
+                        // the next quiet tick instead of waiting for damage
+                        // capture to produce pixels that may never recur.
+                        retain_gpu_frame(&mut retained, frame, &enc, &lane.release);
+                        refresh.store(true, Ordering::SeqCst);
                         match gpu_heal(&mut policy, route_id, &e, || {
                             open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
                         }) {
@@ -2969,9 +2991,17 @@ fn run_gpu_lane(
                     match enc.encode_texture(&kept.tex, true) {
                         Ok(outcome) => {
                             stats.add_encode(t1.elapsed());
-                            if outcome.consumed && refresh_asked {
-                                refresh.store(false, Ordering::SeqCst);
+                            if outcome.consumed {
+                                if refresh_asked {
+                                    refresh.store(false, Ordering::SeqCst);
+                                }
+                            } else {
+                                // The retained texture is still the newest
+                                // source. Keep asking until this exact input
+                                // is consumed or a capture supersedes it.
+                                refresh.store(true, Ordering::SeqCst);
                             }
+                            let consumed = outcome.consumed;
                             let emitted = !outcome.units.is_empty();
                             let packets = packetize_units(
                                 outcome.units,
@@ -2981,12 +3011,15 @@ fn run_gpu_lane(
                                 stats,
                             );
                             emit_packets(packets, on_packet, stats);
-                            if emitted {
+                            if consumed && emitted {
                                 refines_left = REFINE_PASSES;
                                 refine_at = Some(Instant::now() + REFINE_AFTER);
                             }
                         }
                         Err(e) => {
+                            // The source is already retained; guarantee the
+                            // healed (or delayed-rebuild) encoder re-offers it.
+                            refresh.store(true, Ordering::SeqCst);
                             match gpu_heal(&mut policy, route_id, &e, || {
                                 open_gpu_encoder(
                                     lane.adapter_luid,
@@ -3015,6 +3048,10 @@ fn run_gpu_lane(
                     match enc.encode_texture(&kept.tex, false) {
                         Ok(outcome) => {
                             stats.add_encode(t1.elapsed());
+                            let consumed = outcome.consumed;
+                            if !consumed {
+                                refresh.store(true, Ordering::SeqCst);
+                            }
                             let packets = packetize_units(
                                 outcome.units,
                                 fps,
@@ -3023,10 +3060,14 @@ fn run_gpu_lane(
                                 stats,
                             );
                             emit_packets(packets, on_packet, stats);
-                            refines_left -= 1;
-                            refine_at = (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
+                            if consumed {
+                                refines_left -= 1;
+                                refine_at =
+                                    (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
+                            }
                         }
                         Err(e) => {
+                            refresh.store(true, Ordering::SeqCst);
                             match gpu_heal(&mut policy, route_id, &e, || {
                                 open_gpu_encoder(
                                     lane.adapter_luid,
@@ -4150,19 +4191,26 @@ pub(crate) fn wave_flags(
 /// control path: subsequent loss reports must request an IDR, never write a
 /// stale wave flag that no encoder will consume.
 #[cfg(windows)]
-fn disable_gdr_route(route_id: &str, gdr: &mut bool, wave: &Arc<AtomicU32>) {
-    *gdr = false;
+fn disable_gdr_route(route_id: &str, gdr: &mut bool, wave: &Arc<AtomicU32>) -> bool {
+    let was_gdr = std::mem::replace(gdr, false);
     wave.store(0, Ordering::SeqCst);
     let mut flags = wave_flags().lock();
-    if flags
+    let removed = if flags
         .get(route_id)
         .is_some_and(|registered| Arc::ptr_eq(registered, wave))
     {
         flags.remove(route_id);
+        true
+    } else {
+        false
+    };
+    let changed = was_gdr || removed;
+    if changed {
+        tracing::info!(
+            "video encoder fallback for {route_id}: GDR wave unregistered; IDR recovery restored"
+        );
     }
-    tracing::info!(
-        "video encoder fallback for {route_id}: GDR wave unregistered; IDR recovery restored"
-    );
+    changed
 }
 
 /// The steady-state wave length for `fps` — the same shape init
@@ -4969,9 +5017,21 @@ mod tests {
         let wave = Arc::new(AtomicU32::new(7));
         wave_flags().lock().insert(route.into(), wave.clone());
         let mut gdr = true;
-        disable_gdr_route(route, &mut gdr, &wave);
+        assert!(disable_gdr_route(route, &mut gdr, &wave));
         assert!(!gdr);
         assert_eq!(wave.load(Ordering::SeqCst), 0);
+        assert!(!wave_flags().lock().contains_key(route));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn balanced_fallback_does_not_claim_a_gdr_downgrade() {
+        let route = "test:balanced-to-mf";
+        wave_flags().lock().remove(route);
+        let wave = Arc::new(AtomicU32::new(0));
+        let mut gdr = false;
+        assert!(!disable_gdr_route(route, &mut gdr, &wave));
+        assert!(!gdr);
         assert!(!wave_flags().lock().contains_key(route));
     }
 
