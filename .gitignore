@@ -20,5 +20,3 @@ gui/src-tauri/binaries/
 .idea
 .vscode/*
 !.vscode/extensions.json
-# Local AI-tool config (not project source)
-.codex/
