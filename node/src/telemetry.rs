@@ -292,19 +292,3 @@ pub fn start() {
             }
         });
 }
-
-#[cfg(test)]
-mod tests {
-    /// Live PDH proof: start the sampler under a visible subscriber and
-    /// let two lines land — verifies the counter path on whatever GPU
-    /// this box carries (the whole point is that the same line works on
-    /// the next box's vendor). Run:
-    /// `cargo test --release -- --ignored telemetry_smoke --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "diagnostic — prints live telemetry for ~11 s"]
-    fn telemetry_smoke() {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        super::start();
-        std::thread::sleep(std::time::Duration::from_millis(11_500));
-    }
-}

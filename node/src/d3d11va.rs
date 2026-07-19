@@ -1711,7 +1711,7 @@ unsafe impl Send for D3d11vaAv1 {}
 
 impl D3d11vaAv1 {
     pub fn open() -> Result<Self, String> {
-        Err("D3D11VA AV1 decode not yet implemented (stub — see docs/fork/AV1-SEAMS.md)".into())
+        Err("D3D11VA AV1 decode not yet implemented".into())
     }
 
     pub fn label(&self) -> &'static str {
@@ -1825,48 +1825,6 @@ mod tests {
         assert_eq!(ndp, 1, "reference set's NumDeltaPocs");
         assert_eq!(rps.s0, vec![(-1, true), (-2, true)]);
         assert!(rps.s1.is_empty());
-    }
-
-    /// Diagnostic: what the adapter offers for HEVC Main decode — config
-    /// count and each config's slice format. The field kit for a new box
-    /// (run it on the Radeon when it lands). Run:
-    /// `cargo test --release -- --ignored probe_d3d11va --nocapture`
-    #[test]
-    #[ignore = "diagnostic probe — run with --ignored --nocapture"]
-    fn probe_d3d11va_hevc_configs() {
-        let dec = match D3d11vaHevc::open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
-        unsafe {
-            let desc = D3D11_VIDEO_DECODER_DESC {
-                Guid: HEVC_VLD_MAIN,
-                SampleWidth: 1920,
-                SampleHeight: 1088,
-                OutputFormat: DXGI_FORMAT_NV12,
-            };
-            let n = dec
-                .video_device
-                .GetVideoDecoderConfigCount(&desc)
-                .unwrap_or(0);
-            println!("HEVC Main @1080p: {n} decoder configs");
-            for i in 0..n {
-                let mut c: D3D11_VIDEO_DECODER_CONFIG = std::mem::zeroed();
-                if dec
-                    .video_device
-                    .GetVideoDecoderConfig(&desc, i, &mut c)
-                    .is_ok()
-                {
-                    println!(
-                        "  [{i}] ConfigBitstreamRaw={} (1 = HEVC's one slice format, ours) · MinRenderTargets={} · DecoderSpecific=0x{:x}",
-                        c.ConfigBitstreamRaw, c.ConfigMinRenderTargetBuffCount, c.ConfigDecoderSpecific
-                    );
-                }
-            }
-        }
     }
 
     /// The whole Studio·Lossless media plane across VENDOR-NEUTRAL glass:
@@ -2060,80 +2018,6 @@ mod tests {
         assert!(decoded >= 29, "decoded {decoded}/30 (first may straddle)");
         assert_eq!(decoded, exact, "every decoded picture byte-exact");
         println!("D3D11VA chunked-delivery: {exact}/{decoded} byte-exact across pacer splits");
-    }
-
-    /// Decode-side profiling at the field resolution through the
-    /// vendor-neutral rung — the number to put beside `bench_nvdec` on
-    /// any box. Run:
-    /// `cargo test --release -- --ignored bench_d3d11va --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "bench — run with --ignored --nocapture"]
-    fn bench_d3d11va_hevc_1440p() {
-        let (w, h) = (2560u32, 1440u32);
-        let (wu, hu) = (w as usize, h as usize);
-        let frames = 300u64;
-        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
-        let mut enc =
-            match crate::nvenc::NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("SKIP: {e}");
-                    return;
-                }
-            };
-        let mut dec = match D3d11vaHevc::open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
-        let mut doc = vec![0u8; wu * (hu + 912) * 4];
-        crate::nvenc::tests_support::paint_document(&mut doc, wu, hu + 912);
-        let mut bgra = vec![0u8; wu * hu * 4];
-        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
-        let mut rgba = vec![0u8; wu * hu * 4];
-        let (mut dec_ms, mut cvt_ms) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let mut decoded = 0u64;
-        for i in 0..frames {
-            let off = (i as usize) * 3;
-            bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
-            gpu.update_bgra(&tex, &bgra, w, h);
-            let (slot, nv12_tex) = gpu.convert(&tex).expect("convert").expect("slot");
-            let out = enc.encode_texture(&nv12_tex, i == 0).expect("encode");
-            gpu.release(slot);
-            for (au, _) in &out.units {
-                let t = std::time::Instant::now();
-                let pics = dec.decode(au, i * 16_667).expect("decode");
-                dec_ms.push(t.elapsed().as_secs_f32() * 1000.0);
-                for f in &pics {
-                    let t = std::time::Instant::now();
-                    crate::nvdec::nv12_to_rgba(&f.nv12, wu, hu, &mut rgba);
-                    cvt_ms.push(t.elapsed().as_secs_f32() * 1000.0);
-                    decoded += 1;
-                }
-            }
-        }
-        for (label, series) in [("decode+copy", &mut dec_ms), ("nv12→rgba", &mut cvt_ms)] {
-            series.sort_by(f32::total_cmp);
-            let n = series.len().max(1);
-            println!(
-                "bench D3D11VA 1440p [{label}] over {decoded} frames: avg {:.2} ms · p95 {:.2} · max {:.2}",
-                series.iter().sum::<f32>() / n as f32,
-                series[(n * 95 / 100).min(n - 1)],
-                series[n - 1],
-            );
-        }
-        assert!(
-            decoded >= frames - 1,
-            "a picture per frame (first may straddle)"
-        );
     }
 
     /// Read the exact NV12 bytes of a GPU-lane texture back to the CPU —

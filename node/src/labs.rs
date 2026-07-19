@@ -1,6 +1,5 @@
 //! The Experimental ("Labs") tier gate — one choke point for every
-//! out-of-the-box feature the field-trial arc adds
-//! (`docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md`).
+//! out-of-the-box feature the field-trial arc adds.
 //!
 //! The contract that lets the GUI be DONE and all future Labs work be
 //! pure pipeline: the Mode dropdown's Experimental toggle flips this
@@ -29,9 +28,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// `1` = forced on, `2` = forced off — the GUI toggle writes 1/2.
 static TIER: AtomicU8 = AtomicU8::new(0);
 
-/// Every Labs feature — one variant per dial in the Experimental arc
-/// plan (`docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md` §1.1), so the gate is
-/// complete and implementing a feature is filling its call site's
+/// Every Labs feature has one variant, so the gate is complete and
+/// implementing a feature is filling its call site's
 /// `if labs::on(Feature::X)` branch, never adding a gate. Adding a
 /// genuinely new experiment = a variant here + a line in [`slot`] and
 /// [`env_spec`].

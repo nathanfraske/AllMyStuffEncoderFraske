@@ -894,7 +894,7 @@ unsafe impl Send for NvdecAv1 {}
 
 impl NvdecAv1 {
     pub fn open() -> Result<Self, String> {
-        Err("NVDEC AV1 decode not yet implemented (stub — see docs/fork/AV1-SEAMS.md)".into())
+        Err("NVDEC AV1 decode not yet implemented".into())
     }
 
     pub fn label(&self) -> &'static str {
@@ -1181,69 +1181,6 @@ mod tests {
         }
     }
 
-    /// Compare the receive hot loop's current scoped-thread fanout at the
-    /// two resolutions seen in the paired field run. This deliberately calls
-    /// the same dispatch kernel as production while varying only the band
-    /// count, so it exposes both useful parallelism and per-frame thread
-    /// creation/scheduling tails. Run only on an otherwise-idle viewer:
-    ///
-    /// `cargo test --release --lib bench_nv12_worker_counts -- --ignored --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "bench — run with --ignored --nocapture on an idle viewer"]
-    fn bench_nv12_worker_counts() {
-        fn convert_with_workers(nv12: &[u8], w: usize, h: usize, out: &mut [u8], workers: usize) {
-            let (luma, chroma) = nv12.split_at(w * h);
-            let quads = h / 2;
-            if workers == 1 {
-                band_dispatch(luma, chroma, w, 0..quads, out);
-                return;
-            }
-            let per = quads.div_ceil(workers);
-            std::thread::scope(|scope| {
-                let mut rest = out;
-                for k in 0..workers {
-                    let range = (k * per).min(quads)..((k + 1) * per).min(quads);
-                    if range.is_empty() {
-                        break;
-                    }
-                    let bytes = (range.end - range.start) * 2 * w * 4;
-                    let (mine, tail) = rest.split_at_mut(bytes);
-                    rest = tail;
-                    scope.spawn(move || band_dispatch(luma, chroma, w, range, mine));
-                }
-            });
-        }
-
-        for (w, h) in [(2560usize, 1440usize), (3440, 1440)] {
-            let nv12: Vec<u8> = (0..w * h * 3 / 2)
-                .map(|i| (i.wrapping_mul(37).wrapping_add(i / 97) & 0xff) as u8)
-                .collect();
-            let mut reference = vec![0u8; w * h * 4];
-            convert_with_workers(&nv12, w, h, &mut reference, 1);
-
-            for workers in [1usize, 2, 4, 8] {
-                let mut out = vec![0u8; w * h * 4];
-                convert_with_workers(&nv12, w, h, &mut out, workers);
-                assert_eq!(out, reference, "{workers}-worker output at {w}x{h}");
-
-                let mut elapsed = Vec::with_capacity(120);
-                for _ in 0..120 {
-                    let started = std::time::Instant::now();
-                    convert_with_workers(&nv12, w, h, &mut out, workers);
-                    elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
-                    std::hint::black_box(out[w * h * 2]);
-                }
-                elapsed.sort_by(f64::total_cmp);
-                let avg = elapsed.iter().sum::<f64>() / elapsed.len() as f64;
-                let p95 = elapsed[elapsed.len() * 95 / 100];
-                let max = elapsed[elapsed.len() - 1];
-                println!(
-                    "bench NV12->RGBA {w}x{h} [{workers} workers]: avg {avg:.2} ms · p95 {p95:.2} · max {max:.2}"
-                );
-            }
-        }
-    }
-
     /// Read the exact NV12 bytes of a GPU-lane texture back to the CPU
     /// via a staging copy — the encoder's literal input, for byte-exact
     /// comparison against the decoder's output.
@@ -1497,51 +1434,6 @@ mod tests {
                         };
                         let (ln, lmax) = stat(&f.nv12[..plane], &reference[..plane]);
                         let (cn, cmax) = stat(&f.nv12[plane..], &reference[plane..]);
-                        if let Ok(dir) = std::env::var("ALLMYSTUFF_DIAG_DIR") {
-                            let bmp = |name: &str, luma: &[u8]| {
-                                let mut d = Vec::with_capacity(54 + wu * hu * 3);
-                                let size = 54 + wu * hu * 3;
-                                d.extend_from_slice(b"BM");
-                                d.extend_from_slice(&(size as u32).to_le_bytes());
-                                d.extend_from_slice(&[0; 4]);
-                                d.extend_from_slice(&54u32.to_le_bytes());
-                                d.extend_from_slice(&40u32.to_le_bytes());
-                                d.extend_from_slice(&(wu as i32).to_le_bytes());
-                                d.extend_from_slice(&(hu as i32).to_le_bytes());
-                                d.extend_from_slice(&1u16.to_le_bytes());
-                                d.extend_from_slice(&24u16.to_le_bytes());
-                                d.extend_from_slice(&[0; 24]);
-                                for row in (0..hu).rev() {
-                                    for &p in &luma[row * wu..][..wu] {
-                                        d.extend_from_slice(&[p, p, p]);
-                                    }
-                                }
-                                std::fs::write(format!("{dir}/{name}"), d).ok();
-                            };
-                            bmp("rt-ref.bmp", &reference[..plane]);
-                            bmp("rt-dec.bmp", &f.nv12[..plane]);
-                            let diff_map: Vec<u8> = f.nv12[..plane]
-                                .iter()
-                                .zip(&reference[..plane])
-                                .map(|(a, b)| if a == b { 0 } else { 255 })
-                                .collect();
-                            bmp("rt-diff.bmp", &diff_map);
-                            let per_row: Vec<usize> = (0..hu)
-                                .map(|y| {
-                                    (0..wu)
-                                        .filter(|&x| f.nv12[y * wu + x] != reference[y * wu + x])
-                                        .count()
-                                })
-                                .collect();
-                            let first = per_row.iter().position(|&n| n > 0);
-                            let clean = per_row.iter().filter(|&&n| n == 0).count();
-                            eprintln!(
-                                "diff rows: first {first:?} · {clean}/{hu} rows fully clean · row0 {} · row {} {}",
-                                per_row[0],
-                                hu / 2,
-                                per_row[hu / 2]
-                            );
-                        }
                         // Shift search: if decoded == reference displaced
                         // by (dx,dy), the mismatch is geometry, not
                         // fidelity — and the offset names the culprit.
@@ -1599,74 +1491,4 @@ mod tests {
         );
     }
 
-    /// Decode-side profiling at the field resolution: 300 frames of
-    /// 1440p scrolling-document HEVC lossless through NVDEC, reporting
-    /// decode+copy latency. Run:
-    /// `cargo test --release -- --ignored bench_nvdec --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "bench — run with --ignored --nocapture"]
-    fn bench_nvdec_hevc_1440p() {
-        let (w, h) = (2560u32, 1440u32);
-        let (wu, hu) = (w as usize, h as usize);
-        let frames = 300u64;
-        let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
-        let mut enc =
-            match crate::nvenc::NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("SKIP: {e}");
-                    return;
-                }
-            };
-        let mut dec = match NvdecHevc::open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("SKIP: {e}");
-                return;
-            }
-        };
-        let mut doc = vec![0u8; wu * (hu + 912) * 4];
-        crate::nvenc::tests_support::paint_document(&mut doc, wu, hu + 912);
-        let mut bgra = vec![0u8; wu * hu * 4];
-        let tex = gpu.bgra_texture_from(&bgra, w, h).expect("tex");
-        let mut rgba = vec![0u8; wu * hu * 4];
-        let (mut dec_ms, mut cvt_ms) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let mut decoded = 0u64;
-        for i in 0..frames {
-            let off = (i as usize) * 3;
-            bgra.copy_from_slice(&doc[off * wu * 4..][..wu * hu * 4]);
-            gpu.update_bgra(&tex, &bgra, w, h);
-            let (slot, nv12_tex) = gpu.convert(&tex).expect("convert").expect("slot");
-            let out = enc.encode_texture(&nv12_tex, i == 0).expect("encode");
-            gpu.release(slot);
-            for (au, _) in &out.units {
-                let t = std::time::Instant::now();
-                let pics = dec.decode(au, i * 16_667).expect("decode");
-                dec_ms.push(t.elapsed().as_secs_f32() * 1000.0);
-                for f in &pics {
-                    let t = std::time::Instant::now();
-                    nv12_to_rgba(&f.nv12, wu, hu, &mut rgba);
-                    cvt_ms.push(t.elapsed().as_secs_f32() * 1000.0);
-                    decoded += 1;
-                }
-            }
-        }
-        for (label, series) in [("decode+copy", &mut dec_ms), ("nv12→rgba", &mut cvt_ms)] {
-            series.sort_by(f32::total_cmp);
-            let n = series.len();
-            println!(
-                "bench NVDEC 1440p [{label}] over {decoded} frames: avg {:.2} ms · p95 {:.2} · max {:.2}",
-                series.iter().sum::<f32>() / n as f32,
-                series[(n * 95 / 100).min(n - 1)],
-                series[n - 1],
-            );
-        }
-        assert_eq!(decoded, frames, "a picture per frame");
-    }
 }

@@ -1,15 +1,15 @@
 # Integration report — the encoder fork line, for Chris's review
 
-_Prepared 2026-07-18 by nathanfraske's encoder line
-(`github.com/nathanfraske/AllMyStuffEncoderFraske`, branch `main`)
-against upstream `mrjeeves/AllMyStuff` at the shared merge-base
-`78b1c76` (`chore(release): 0.2.46`). **Everything here is a strict
-prototype until your signoff.** No version numbers were claimed: every
-manifest sits at your 0.2.46 (an early same-day 0.2.47/0.2.48 bump was
-reverted, `86615bd`); prototype installers are named
-`AllMyStuff-PROTOTYPE-<commit>_0.2.46_x64-setup.exe`._
+_Prepared from `nathanfraske/AllMyStuffEncoderFraske`, branch
+`codex/video-pipeline-upstream-pr`, for review against the current
+`mrjeeves/AllMyStuff` `main`. **Everything here is a prototype until
+maintainer signoff.** No version numbers are claimed: every manifest
+remains at the upstream 0.2.46 version._
 
-**The whole line: 53 commits · 41 files · +15,535 / −873.**
+The proposed tree is intentionally limited to production code,
+automated regression tests, CI, and these two maintainer documents.
+Fork handoffs, field probes, ignored benchmarks/soaks, generated output,
+and packaged fixtures are excluded from the PR diff.
 
 ---
 
@@ -105,16 +105,16 @@ handle_video_inbound                                          mesh.rs
          (pre-existing, still opt-in)
 ```
 
-### Observability (the field-log layers)
+### Observability (opt-in field diagnostics)
 
-Every layer's bandwidth is named in the standard log
-(`%LOCALAPPDATA%\AllMyStuff\logs\allmystuff-serve.log`):
-`video out` = `raw N Mbps → wire N Mbps` (pixels into the encoder →
-encoded bytes to the track lane) · `pace gaps` = requested-vs-actual
-gap fidelity per minute · viewer `video in` = chunk-train dispersion
-percentiles + estimate · `video decode` = `wire → nv12 → rgba Mbps` ·
-1 Hz telemetry = CPU (proc/total/per-thread), per-engine GPU busy,
-VRAM, monitor topology.
+Normal service logging remains available at
+`C:\ProgramData\AllMyStuff\logs\allmystuff-serve.log`. Verbose pipeline
+diagnostics are disabled by default and can be enabled with
+`ALLMYSTUFF_CWD_LOG=1` or the GUI preference. Field telemetry is also
+disabled by default; it requires the `field-telemetry` feature or
+`ALLMYSTUFF_TELEMETRY=1`. When enabled, the diagnostic layers name raw
+and wire video bandwidth, pacing fidelity, receiver arrival/decode
+rates, CPU usage, GPU-engine load, VRAM, and monitor topology.
 
 ## 3 · Blast radius — what was touched, ring by ring
 
@@ -122,16 +122,17 @@ VRAM, monitor topology.
 
 | File | What it is |
 |---|---|
-| `node/src/nvenc.rs` (+2463) | Direct NVENC SDK rung, runtime-loaded, FFI hand-transcribed from MIT ffnvcodec headers |
-| `node/src/nvdec.rs` (+1012) | NVDEC HEVC decode rung (nvcuvid), byte-exact-proven vs NVENC |
-| `node/src/d3d11va.rs` (+1960) | Vendor-neutral D3D11VA HEVC decode rung (stateless DXVA, in-house scoped parser) |
-| `node/src/gpu_pipeline.rs` (+739) | D3D11 VideoProcessor convert + NV12 ring + device manager + ClockKeeper |
-| `node/src/amf.rs` (+139) | AMD AMF loader/probe/vendor-gate (staged; Radeon box pending) |
-| `node/src/telemetry.rs` (+299) | 1 Hz vendor-neutral WDDM telemetry line |
-| `node/src/os_perf.rs` (+430) | Timer/priority/EcoQoS/CPU-set levers + Win11 process opt-outs + precise_sleep + MMCSS opt-in |
-| `gui/src/fsr1.ts` (+256), `gui/src/ui/ModePill.svelte` (+219) | Popout FSR1 upscaler; shared Mode control |
-| `.github/workflows/node-check.yml` | Soft cross-platform clippy CI |
-| `docs/*` (3 reports), `HANDOFF.md` | Engineering documentation |
+| `node/src/nvenc.rs` | Direct NVENC SDK rung, runtime-loaded, FFI hand-transcribed from MIT ffnvcodec headers |
+| `node/src/nvdec.rs` | NVDEC HEVC decode rung (nvcuvid), byte-exact-proven vs NVENC |
+| `node/src/d3d11va.rs` | Vendor-neutral D3D11VA HEVC decode rung (stateless DXVA, in-house scoped parser) |
+| `node/src/gpu_pipeline.rs` | D3D11 VideoProcessor convert + NV12 ring + device manager + ClockKeeper |
+| `node/src/amf.rs` | AMD AMF loader/probe/vendor-gate (staged; Radeon box pending) |
+| `node/src/telemetry.rs` | Opt-in vendor-neutral WDDM telemetry line |
+| `node/src/diagnostics.rs` | Runtime gate for opt-in verbose diagnostics |
+| `node/src/os_perf.rs` | Timer/priority/EcoQoS/CPU-set levers + Win11 process opt-outs + precise_sleep + MMCSS opt-in |
+| `gui/src/fsr1.ts`, `gui/src/ui/ModePill.svelte` | Popout FSR1 upscaler; shared Mode control |
+| `.github/workflows/node-check.yml` | Required cross-platform strict-clippy CI |
+| `docs/INTEGRATION-REPORT-2026-07.md`, `docs/TESTER-KIT-2026-07.md` | Maintainer review and validation documentation |
 
 ### Ring 1 — media-plane files substantially extended (the fork's purpose)
 
@@ -186,10 +187,8 @@ mediafoundation,gpu_pipeline,win_capture,labs,os_perf}.rs` + the
   `.myownmesh-rev` pin is unchanged. `H264AuAssembler` semantics
   (emit per RTP marker, contiguity anchor across split writes) are
   *depended on*, verified against, and unmodified.
-- **RTP/packetization/FEC/retransmission:** untouched (daemon's).
-  Explicitly rejected as out of bounds in
-  `docs/fork/SMOOTHNESS-IDEAS-2026-07.md` (fork-internal) §"Explicitly rejected", so future
-  sessions don't drift there either.
+- **RTP/packetization/FEC/retransmission:** untouched (daemon's) and
+  explicitly out of scope for this PR.
 - **Your CPU capture/encode pipeline:** intact and load-bearing — it
   is the fallback every new lane fails soft into, and the only path on
   non-Windows/adapter-pinned/duplication-denied routes.
@@ -218,107 +217,38 @@ Ranked by how much they act without being asked:
 | MMCSS scheduling class | OFF | `ALLMYSTUFF_MMCSS=1` |
 | HEVC decode rung choice | auto (NVDEC→D3D11VA) | `ALLMYSTUFF_HEVC_DECODER=nvdec\|d3d11va` |
 
-Full dial inventory: `AUTO_ADAPT, CWD_LOG, DIAG_DIR, GAME_MODE,
-GPU_HEARTBEAT[_MS|_PX], GPU_LANE, GUI_LOG, HEVC_DECODER, HEVC_DUMP,
-LOG, MJPEG_MAX_EDGE, MMCSS, NVENC, NVENC_PRESET, PACED_SLICES,
-PACE_DRAIN_MBPS, RATE_ADAPT, SERVE_BIN, SOAK_*, TELEMETRY[_SECS],
+Full dial inventory: `AUTO_ADAPT, CWD_LOG, GAME_MODE,
+GPU_HEARTBEAT[_MS|_PX], GPU_LANE, GUI_LOG, HEVC_DECODER, LOG,
+MJPEG_MAX_EDGE, MMCSS, NVENC, NVENC_PRESET, PACED_SLICES,
+PACE_DRAIN_MBPS, RATE_ADAPT, SERVE_BIN, TELEMETRY[_SECS],
 VIDEO_BITRATE, VIDEO_ENCODE_ADAPTER, VIDEO_FPS, VIDEO_MAX_EDGE,
 VIDEO_STATS`.
 
-## 6 · The full commit list (oldest → newest)
+## 6 · Verification contract
 
-Each is reviewable in isolation; conventional-commit messages carry the
-full reasoning.
+The exact proposed diff is always derived from the current upstream
+branch rather than a frozen historical merge-base:
 
-```
-b3b40c4 perf(video): encoder correctness + latency pass
-2e7aed8 docs: encoder-pass report (before/after profiles)
-cb66461 feat(video): game-mode slice 1 + QSV low-latency + macOS QoS + VT low-latency
-83d0b1c perf(video): pipeline the pump — capture/convert ∥ encode
-fa136b6 perf(video): buffer-reuse lanes (interleaved A/B adjudicated)
-9bf7485 fix(video): stable-arc hardening (pipe timeout, DXGI re-promotion)
-bb53784 feat(video): GPU zero-copy core (VideoProcessor + texture-fed MFT)
-b7aa331 feat(video): GPU zero-copy lane goes live (soft-fallback)
-1cba76a bench(gpu): matched A/B/C encode benches
-19e6429 feat(mf): in-place bitrate re-aim (downshift pilot)
-176c47b feat(nvenc): direct NVENC rung — SDK scaffold, GDR proven
-7c56cdf ci: cross-platform node check (soft)
-32d94a1 feat(video): app-side slice pacer — zero MyOwnMesh changes
-d46d06b bench(nvenc): SDK-vs-MF cycle bench
-47be07f feat(video,gui): v2 field round (slot-race fix, faster GDR heal)
-e45bf09 fix(video): pin negotiated transport through heals
-3aa2c2d feat(video): NVENC default-on (soft-fallback keeps MF)
-01ba54c chore(video): repair UTF-8 double-encoding
-2db15bd feat(video): game-kernel pass (1 ms quanta, single-frame VBV)
-91b8b7b feat(input,gui): fullscreen pointer lock (MouseMoveRel)
-b78f103 feat(video,gui): Studio mode framework (tri-state)
-7b50607 feat(gui): codec labels + Studio bandwidth confirmation
-83e2dcd feat(video,gui): uncap Studio; raise Game ceiling
-a1d86de bench(nvenc): four-posture matrix
-ecff5fa bench(nvenc): posture soak harness
-59e9197 feat(gui): FSR1-style viewer upscaling
-2e90097 feat(nvenc): lossless measurement rung + bandwidth bench
-57bd013 docs(nvenc): soak-gradient methodology note
-d895621 feat(nvenc): HEVC-lossless rung (hardware-decodable lossless)
-3e9c0fd feat(nvdec): NVDEC HEVC decode, byte-exact vs NVENC
-72c0467 feat(decode): native lane speaks HEVC (bridge wiring)
-3fe189b feat(video): Studio-Lossless as a mode
-cdea827 probe(av1): AV1-lossless hardware probe (50-series pending)
-f460b13 feat(amf): AMF loader/probe/vendor gate (Radeon pending)
-7f7084b feat+fix: pre-presentation hardening (red team ×3)
-4fd853e perf(nvenc): preset ladder measured (game P2, lossless P3)
-fec7168 feat(telemetry): field-test line (CPU/GPU-engines/VRAM)
-5746ee8 feat(telemetry): per-thread CPU + monitor topology
-c77c7d0 feat(capture): log datastream-to-monitor binding
-becc220 feat(telemetry): 1 Hz default cadence
-3a00a4c feat(video): frame health (loss names the frame; GDR wave heal)
-55cec0e fix(serve): guaranteed-writable log location
-e382997 feat(nvenc): reference-invalidation mechanism + scoping finding
-bcd06f8 refactor(gui): one shared Mode control
-9341cf8 docs: engineering handoff
-91c5448 feat(decode): D3D11VA rung — Studio·Lossless crosses vendors
-be32d3c fix(gui): fullscreen fits the popout picture to the monitor
-97803f7 build: 0.2.47 (REVERTED by 86615bd — versioning is yours)
-1a437f1 docs: smoothness/pacing/latency idea bank
-a97678f perf(os): scheduling honesty (Win11 opt-outs, precise sleep)
-1a8d188 feat(video): closed WAN loop (link-fitted pacer, BWE, AIMD, waves)
-d100022 feat(video): auto-bitrate reserved to Game; per-layer bandwidth logs
-86615bd build: hold versioning at 0.2.46 — versions are Chris's to cut
-f5f1f21 docs: this integration report
-b992776 perf(kernels): AVX2 + non-temporal NV12→RGBA; memchr start-code
-        scan — the viewer convert 3.5→1.8 ms avg @1440p (byte-exact
-        pinned by test); pacer's Annex-B walk memchr-anchored
+```bash
+git fetch upstream main
+git diff --stat upstream/main...HEAD
+git diff --check upstream/main...HEAD
 ```
 
-Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
-(41 files, +15,535/−873; the large four are the new FFI rungs
-`nvenc/nvdec/d3d11va` and `video.rs`).
+The required GitHub workflows cover strict Clippy on Windows, macOS,
+and Ubuntu, the default and hardware-feature node test matrices,
+no-default-features portability, the root workspace, the GUI check and
+build, Android mobile-core, and the Windows GUI backend. The companion
+tester kit contains the matching local commands and the current PR
+hygiene audit.
 
-## 7 · Verification status
+Hardware-dependent encoder/decoder paths retain automated regression
+tests that skip only when the relevant runtime or device is absent.
+Ad-hoc field probes, ignored timing benchmarks, long soaks, output-dump
+hooks, and benchmark-only pixel generators are deliberately not part
+of the upstream-facing tree.
 
-- **Unit + integration:** 165 passing in the node crate (0 failing;
-  audio module skipped on the dev box — environmental access
-  violation, pre-existing), 140 passing across the shared crates
-  (protocol/session/mobile-core round-trips include the new fields
-  both directions).
-- **Hardware-proven on the dev box (RTX, Ampere):** NVENC→NVDEC HEVC
-  lossless round trip 60/60 byte-exact; NVENC→**D3D11VA** 60/60
-  byte-exact at 1280×718 (conformance-window crop live) and 30/30
-  byte-exact through real pacer chunking; GDR produces zero IDR walls
-  and decodes clean; `precise_sleep` worst overshoot 435 µs.
-- **Benches:** NVDEC 4.24 ms vs D3D11VA 5.76 ms avg decode+copy at
-  1440p (ladder order is measured); preset grid (game P2 5.7 ms);
-  encode-path A/B/C columns in `docs/fork/ENCODER-PASS-2026-07.md` (fork-internal); the
-  NV12→RGBA viewer kernel 3.5 → 1.8 ms avg @1440p after the AVX2 +
-  non-temporal-store pass (`b992776`, byte-exact against the scalar
-  reference by test).
-- **Field-pending (2-machine rig):** BWE estimate accuracy vs imposed
-  rates, freeze-seconds A/B for the closed loop (Game posture),
-  pace-gap fidelity on a stock Win11 box, the D3D11VA rung on the
-  incoming Radeon 9060 XT (probe: `probe_d3d11va_hevc_configs`), and
-  the monitor-refuses-to-connect log capture.
-
-## 8 · Suggested review order
+## 7 · Suggested review order
 
 1. `crates/allmystuff-protocol/src/app.rs` — the only wire-visible
    surface (30 additive lines).
@@ -329,5 +259,5 @@ Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
 4. `node/src/nvenc.rs` / `nvdec.rs` / `d3d11va.rs` — self-contained
    FFI rungs, each with its proving tests at the bottom.
 5. `node/src/os_perf.rs` — the OS levers, all best-effort.
-6. `docs/fork/SMOOTHNESS-IDEAS-2026-07.md` (fork-internal) — where this is headed next and
-   what was explicitly rejected (the frozen-daemon rule, encoded).
+6. `docs/TESTER-KIT-2026-07.md` — reproducible validation and PR
+   hygiene checks.

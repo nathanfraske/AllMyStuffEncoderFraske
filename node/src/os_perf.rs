@@ -496,8 +496,8 @@ mod tests {
     #[test]
     fn timer_guard_is_balanced_and_reentrant() {
         // Two nested guards, dropped out of order — winmm refcounts, so the
-        // only observable contract is "no panic, no error"; the sleep bench
-        // (`bench_sleep_granularity`) shows the actual resolution effect.
+        // only observable contract is "no panic, no error"; the precise-sleep
+        // test above covers the timing floor separately.
         let a = TimerResolutionGuard::hold();
         let b = TimerResolutionGuard::hold();
         drop(a);
