@@ -213,8 +213,8 @@ Ranked by how much they act without being asked:
 | Adaptive IDR cadence | ON (pre-existing, benign recovery lever: 2 s↔8 s) | — |
 | GDR wave + loss-aware length | Game posture only (GDR streams) | posture-gated |
 | Link-fitted pacer drain | ON (LAN keeps original constants; WAN stops inheriting them) | `ALLMYSTUFF_PACED_SLICES=0` off · `ALLMYSTUFF_PACE_DRAIN_MBPS` pin |
-| Direct NVENC SDK rung | OFF for normal lossy postures; the vendor hardware MFT is the production default. Selecting Studio·Lossless explicitly permits its only const-QP-0 rung. | `ALLMYSTUFF_NVENC=1` enables direct SDK for normal postures · `0` pins the vendor MFT and disables direct lossless |
-| GPU zero-copy lane | OFF for normal lossy postures after production A/B isolated unbounded driver waits in live shared-texture submission; CPU-DXGI capture still feeds NVIDIA/Intel/AMD hardware encoders. Studio·Lossless explicitly enables the texture lane required by its const-QP-0 encoder. | `ALLMYSTUFF_GPU_LANE=1` enables the experimental lane · `0` is an unconditional kill switch |
+| Direct NVENC SDK rung | OFF in production; the vendor hardware MFT is the normal H.264 default. Studio·Lossless remains selectable but fails soft to high-bitrate lossy Studio until its HEVC media framing is implemented and gated. | `ALLMYSTUFF_NVENC=1` enables direct SDK for normal postures inside the experimental GPU lane · `0` pins the vendor MFT |
+| GPU zero-copy lane | OFF after production A/B isolated unbounded driver waits in live shared-texture submission; CPU-DXGI capture still feeds NVIDIA/Intel/AMD hardware encoders. The failing HEVC-over-H.264-track path is quarantined with it. | `ALLMYSTUFF_GPU_LANE=1` enables the experimental lane · `0` is an unconditional kill switch |
 | MMCSS scheduling class | OFF | `ALLMYSTUFF_MMCSS=1` |
 | HEVC decode rung choice | auto (NVDEC→D3D11VA) | `ALLMYSTUFF_HEVC_DECODER=nvdec\|d3d11va` |
 

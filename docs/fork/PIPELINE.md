@@ -47,10 +47,11 @@ opaque `ext` field on `RouteControl::VideoFeedback`/`Tune` (commit
 
 Capture and the BGRA→NV12 conversion feed a GPU texture straight into the
 encoder only when the experimental zero-copy lane is explicitly enabled
-(`ALLMYSTUFF_GPU_LANE=1`) or Studio·Lossless explicitly requests its required
-const-QP-0 texture path; normal production defaults to CPU-DXGI capture
-feeding the vendor hardware encoder through a CPU NV12 buffer. Everything
-from ENCODE rightward is what this guide covers.
+(`ALLMYSTUFF_GPU_LANE=1`); production defaults to CPU-DXGI capture feeding
+the vendor hardware encoder through a CPU NV12 buffer. Studio·Lossless stays
+selectable but fails soft to lossy Studio until the fork replaces the current
+H.264-only media-track framing with a gated HEVC data-plane contract.
+Everything from ENCODE rightward is what this guide covers.
 
 ## Encode — the ladder and how a rung is picked
 
@@ -142,7 +143,7 @@ elsewhere). Unset = the shipped default; every dial is fail-soft.
 | `ALLMYSTUFF_NVENC_PRESET` | preset override (P1–P5; P6/P7 refused) |
 | `ALLMYSTUFF_HEVC_DECODER` / `ALLMYSTUFF_AV1_DECODER` | pin a decode rung (`nvdec`/`d3d11va`) |
 | `ALLMYSTUFF_VIDEO_ENCODE_ADAPTER` | choose the encode GPU |
-| `ALLMYSTUFF_GPU_LANE` | `1` enables the experimental zero-copy capture→encode lane; unset uses CPU-DXGI + hardware encode except for explicit Studio·Lossless; `0` disables the lane unconditionally |
+| `ALLMYSTUFF_GPU_LANE` | `1` enables the experimental zero-copy capture→encode lane (including quarantined HEVC experiments); unset/`0` uses CPU-DXGI + hardware H.264 encode |
 
 **Posture / rate**
 | Dial | Effect |

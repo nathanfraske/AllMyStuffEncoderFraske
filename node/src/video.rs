@@ -1644,6 +1644,16 @@ fn run_capture(
     // cross-adapter — the CPU lane's system-memory NV12 serves that.
     #[cfg(windows)]
     if mode == VideoMode::H264
+        && tune.posture() == Posture::StudioLossless
+        && !gpu_lane_allowed(tune.posture())
+    {
+        tracing::warn!(
+            "Studio·Lossless requested for {route_id}, but its HEVC media framing is quarantined; \
+             falling back to high-bitrate lossy Studio H.264 (set ALLMYSTUFF_GPU_LANE=1 only for fork experiments)"
+        );
+    }
+    #[cfg(windows)]
+    if mode == VideoMode::H264
         && gpu_lane_allowed(tune.posture())
         && !crate::mediafoundation::adapter_pin_active()
     {
@@ -2365,9 +2375,12 @@ fn log_orient(rotation_deg: u32, bw: u32, bh: u32, turns: u8, ow: u32, oh: u32) 
 /// NVIDIA MFT blocking for hundreds of milliseconds on these live textures,
 /// while the same encoders stayed in the low milliseconds on CPU-DXGI input.
 /// Keep normal production postures on that bounded-latency path; the shared-
-/// texture lane remains available for explicit experimental runs. The one
-/// posture exception is Studio·Lossless: selecting it is an explicit request
-/// for the const-QP-0 encoder whose input contract is this texture lane.
+/// texture lane remains available for explicit experimental runs. This also
+/// quarantines Studio·Lossless in production: its direct encoder emits HEVC,
+/// while the existing negotiated media track is H.264-framed. Until the fork
+/// grows a data-plane HEVC track contract, the selected posture fails soft to
+/// high-bitrate lossy Studio instead of opening a stream the viewer cannot
+/// decode.
 #[cfg(windows)]
 fn gpu_lane_preference() -> Option<bool> {
     static CHOICE: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
@@ -2377,9 +2390,9 @@ fn gpu_lane_preference() -> Option<bool> {
             Some(true) => {
                 tracing::info!("ALLMYSTUFF_GPU_LANE=1 — experimental GPU zero-copy lane enabled")
             }
-            Some(false) => tracing::info!(
-                "ALLMYSTUFF_GPU_LANE=0 — using CPU-DXGI capture + hardware encode"
-            ),
+            Some(false) => {
+                tracing::info!("ALLMYSTUFF_GPU_LANE=0 — using CPU-DXGI capture + hardware encode")
+            }
             None => {}
         }
         choice
@@ -2388,29 +2401,13 @@ fn gpu_lane_preference() -> Option<bool> {
 }
 
 #[cfg(windows)]
-fn gpu_lane_policy(
-    posture: Posture,
-    gpu_lane_choice: Option<bool>,
-    nvenc_choice: Option<bool>,
-) -> bool {
-    match gpu_lane_choice {
-        Some(explicit) => explicit,
-        None => posture == Posture::StudioLossless && nvenc_choice.unwrap_or(true),
-    }
+fn gpu_lane_policy(_posture: Posture, gpu_lane_choice: Option<bool>) -> bool {
+    gpu_lane_choice.unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn gpu_lane_allowed(posture: Posture) -> bool {
-    let allowed = gpu_lane_policy(posture, gpu_lane_preference(), nvenc_preference());
-    if allowed
-        && posture == Posture::StudioLossless
-        && gpu_lane_preference().is_none()
-    {
-        tracing::info!(
-            "Studio·Lossless explicitly selected — enabling its direct HEVC texture lane"
-        );
-    }
-    allowed
+    gpu_lane_policy(posture, gpu_lane_preference())
 }
 
 /// How a GPU-lane run ended. Hard errors fold into `Fallback`'s reason —
@@ -5299,23 +5296,17 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn gpu_lane_policy_keeps_normal_modes_safe_and_lossless_honest() {
-        for posture in [Posture::Balanced, Posture::Game, Posture::Studio] {
-            assert!(!gpu_lane_policy(posture, None, None));
-            assert!(gpu_lane_policy(posture, Some(true), None));
-            assert!(!gpu_lane_policy(posture, Some(false), Some(true)));
+    fn gpu_lane_policy_quarantines_every_posture_unless_explicitly_enabled() {
+        for posture in [
+            Posture::Balanced,
+            Posture::Game,
+            Posture::Studio,
+            Posture::StudioLossless,
+        ] {
+            assert!(!gpu_lane_policy(posture, None));
+            assert!(gpu_lane_policy(posture, Some(true)));
+            assert!(!gpu_lane_policy(posture, Some(false)));
         }
-        assert!(gpu_lane_policy(Posture::StudioLossless, None, None));
-        assert!(!gpu_lane_policy(
-            Posture::StudioLossless,
-            None,
-            Some(false)
-        ));
-        assert!(!gpu_lane_policy(
-            Posture::StudioLossless,
-            Some(false),
-            Some(true)
-        ));
     }
 
     #[cfg(windows)]
