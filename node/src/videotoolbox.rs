@@ -429,6 +429,9 @@ impl VideoToolboxH264 {
         Ok(EncodeOutcome {
             units,
             consumed: true,
+            // No ref-invalidation on this rung (like MF): 0 = "no timestamp
+            // to invalidate against", per `EncodeOutcome::input_ts`.
+            input_ts: 0,
         })
     }
 

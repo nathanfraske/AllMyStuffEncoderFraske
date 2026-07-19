@@ -87,22 +87,6 @@ unsafe fn read_engine_counter(counter: PDH_HCOUNTER) -> Option<(f64, f64, f64, f
     Some((d3, enc, dec, copy))
 }
 
-#[cfg(test)]
-mod tests {
-    /// Live PDH proof: start the sampler under a visible subscriber and
-    /// let two lines land — verifies the counter path on whatever GPU
-    /// this box carries (the whole point is that the same line works on
-    /// the next box's vendor). Run:
-    /// `cargo test --release -- --ignored telemetry_smoke --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "diagnostic — prints live telemetry for ~11 s"]
-    fn telemetry_smoke() {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        super::start();
-        std::thread::sleep(std::time::Duration::from_millis(11_500));
-    }
-}
-
 /// One line describing the attached monitors: name, mode, refresh,
 /// desktop position, primary marker — the multi-monitor test's ground
 /// truth, logged at start and again whenever the topology changes
@@ -152,12 +136,23 @@ fn monitors_line() -> String {
     format!("monitors: {}", parts.join(" · "))
 }
 
+/// Whether the sampler should run. A field/prototype build carries the
+/// `field-telemetry` feature and defaults ON (unless `ALLMYSTUFF_TELEMETRY`
+/// is explicitly off); a stamped PROD build compiles without the feature
+/// and defaults OFF, so a released binary is silent unless an operator sets
+/// `ALLMYSTUFF_TELEMETRY=1` for on-demand debugging. The env dial always
+/// wins over the build stamp in both directions.
+fn telemetry_enabled() -> bool {
+    match std::env::var("ALLMYSTUFF_TELEMETRY") {
+        Ok(v) if matches!(v.trim(), "0" | "off" | "false") => false,
+        Ok(_) => true, // any explicit non-off value opts in, any build
+        Err(_) => cfg!(feature = "field-telemetry"), // unset → the build stamp decides
+    }
+}
+
 /// Start the sampler; returns quietly if disabled or unavailable.
 pub fn start() {
-    if std::env::var("ALLMYSTUFF_TELEMETRY")
-        .map(|v| matches!(v.trim(), "0" | "off" | "false"))
-        .unwrap_or(false)
-    {
+    if !telemetry_enabled() {
         return;
     }
     let _ = std::thread::Builder::new()
@@ -296,4 +291,20 @@ pub fn start() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Live PDH proof: start the sampler under a visible subscriber and
+    /// let two lines land — verifies the counter path on whatever GPU
+    /// this box carries (the whole point is that the same line works on
+    /// the next box's vendor). Run:
+    /// `cargo test --release -- --ignored telemetry_smoke --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "diagnostic — prints live telemetry for ~11 s"]
+    fn telemetry_smoke() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        super::start();
+        std::thread::sleep(std::time::Duration::from_millis(11_500));
+    }
 }

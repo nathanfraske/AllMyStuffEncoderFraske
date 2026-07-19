@@ -580,18 +580,31 @@ fn init_logging(as_service: bool) {
 ///
 /// Rotation, not truncation: the previous session survives as
 /// `allmystuff-serve.prev.log` — a restart used to wipe exactly the
-/// evidence a field report needed. `None` when nothing opens or
-/// `ALLMYSTUFF_CWD_LOG=0`.
+/// evidence a field report needed. `None` when nothing opens, when a
+/// stamped PROD build ships silent, or `ALLMYSTUFF_CWD_LOG=0`.
+///
+/// Build stamp: the verbose debug field log is field-test instrumentation,
+/// so it defaults ON only in builds carrying the `field-telemetry` feature
+/// (dev / prototype). A stamped prod build (`--no-default-features
+/// --features host`) ships without it and writes no debug field log unless
+/// an operator sets `ALLMYSTUFF_CWD_LOG=1`. The env dial wins either way.
 fn cwd_log_writer() -> Option<(
     impl Fn() -> TeeHandle + Send + Sync + 'static,
     Vec<std::path::PathBuf>,
 )> {
-    if std::env::var("ALLMYSTUFF_CWD_LOG").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false"
-        )
-    }) {
+    let want = match std::env::var("ALLMYSTUFF_CWD_LOG") {
+        Ok(v)
+            if matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false"
+            ) =>
+        {
+            false
+        }
+        Ok(_) => true, // any explicit non-off value opts in, any build
+        Err(_) => cfg!(feature = "field-telemetry"), // unset → the build stamp decides
+    };
+    if !want {
         return None;
     }
     fn open_rotating(dir: std::path::PathBuf) -> Option<(std::fs::File, std::path::PathBuf)> {

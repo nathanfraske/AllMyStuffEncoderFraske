@@ -880,8 +880,13 @@ impl AutoAdapt {
         // drained. The band between counts as neither — streaks reset, no
         // step. Decode failures alone are corruption, not overload — the
         // adaptive IDR cadence owns those.
-        let bad = fb.recv_fps * 4 < fps_target || fb.queue_depth > 24;
-        let good = fb.recv_fps * 4 >= fps_target * 3 && fb.decode_fails == 0 && fb.queue_depth <= 8;
+        // `recv_fps` is a raw peer-controlled u32 off the feedback wire;
+        // `saturating_mul` keeps a hostile value from wrapping (and from
+        // aborting outright if overflow-checks are ever enabled).
+        let bad = fb.recv_fps.saturating_mul(4) < fps_target || fb.queue_depth > 24;
+        let good = fb.recv_fps.saturating_mul(4) >= fps_target.saturating_mul(3)
+            && fb.decode_fails == 0
+            && fb.queue_depth <= 8;
         let mut st = self.state.lock();
         if bad {
             st.bad += 1;
@@ -4291,7 +4296,9 @@ fn rate_adapt_step(
         || fb.decode_fails > 0
         || est_sagging
         || delay_ramping
-        || (target_fps > 0 && fb.recv_fps > 0 && fb.recv_fps * 10 < target_fps * 7);
+        || (target_fps > 0
+            && fb.recv_fps > 0
+            && fb.recv_fps.saturating_mul(10) < target_fps.saturating_mul(7));
     let held = state
         .last_step
         .is_some_and(|t| now.duration_since(t) < RATE_HOLD);
@@ -4304,10 +4311,18 @@ fn rate_adapt_step(
             // (converges in one step instead of several blind ones).
             let mut next = (current as u64 * 7 / 10) as u32;
             if fb.est_kbps > 0 {
-                let est_bps = (fb.est_kbps as u64 * 1000 * 85 / 100) as u32;
+                // Bound the peer-supplied estimate in u64 before the cast:
+                // a huge `est_kbps` would otherwise truncate to garbage.
+                let est_bps = (fb.est_kbps as u64 * 1000 * 85 / 100).min(u64::from(ceiling)) as u32;
                 next = next.min(est_bps);
             }
-            let next = next.clamp(RATE_FLOOR, ceiling);
+            // `RATE_FLOOR.min(ceiling)` keeps the clamp self-consistent:
+            // `Ord::clamp` panics (→ abort under `panic = "abort"`) when
+            // min > max, which a route ceiling configured below the 8 Mbps
+            // floor (`ALLMYSTUFF_VIDEO_BITRATE` bypasses the floor) makes
+            // reachable via two peer congestion reports. When the ceiling
+            // is under the floor we simply don't cut below it.
+            let next = next.clamp(RATE_FLOOR.min(ceiling), ceiling);
             if next < current {
                 state.bad = 0;
                 state.last_step = Some(now);

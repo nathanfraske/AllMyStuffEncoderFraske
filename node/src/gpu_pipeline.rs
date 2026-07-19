@@ -135,7 +135,12 @@ impl ClockKeeper {
                 {
                     return;
                 }
-                let (a, b) = (a.unwrap(), b.unwrap());
+                // let-else, not unwrap: a driver returning Ok with a null
+                // out-param would otherwise abort this background thread
+                // (and, under panic=abort, the whole node).
+                let (Some(a), Some(b)) = (a, b) else {
+                    return;
+                };
                 tracing::info!("GPU heartbeat up ({period_ms} ms cadence) — holding boost clocks");
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                     // The copy is the work; the flush makes it a real

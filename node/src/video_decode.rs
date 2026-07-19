@@ -121,17 +121,21 @@ fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
         let has_size = hdr & 0x02 != 0;
         let mut p = at + 1 + usize::from(has_ext);
         if has_size {
-            // leb128 size — skip it to reach the next OBU.
-            let mut size = 0usize;
-            for shift in 0..8 {
+            // leb128 size — skip it to reach the next OBU. Accumulate in
+            // u64 (not usize): the final iteration shifts by 49, which
+            // overflows a 32-bit usize on riscv32/armv7 (panic in debug,
+            // masked-wrong in release) — u64 is valid on every target, and
+            // `checked_add` keeps the 32-bit pointer add from wrapping.
+            let mut size = 0u64;
+            for shift in 0..8u32 {
                 let byte = *data.get(p)?;
                 p += 1;
-                size |= usize::from(byte & 0x7f) << (shift * 7);
+                size |= u64::from(byte & 0x7f) << (shift * 7);
                 if byte & 0x80 == 0 {
                     break;
                 }
             }
-            p += size;
+            p = p.checked_add(usize::try_from(size).ok()?)?;
         }
         Some((obu_type, p))
     }

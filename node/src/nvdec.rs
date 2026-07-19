@@ -215,7 +215,13 @@ macro_rules! load_fn {
     ($module:expr, $name:literal, $ty:ty) => {{
         let p = GetProcAddress($module, PCSTR(concat!($name, "\0").as_ptr()))
             .ok_or(concat!($name, " missing"))?;
-        std::mem::transmute::<_, $ty>(p)
+        // The transmute is fully annotated — the source is the FARPROC fn
+        // pointer, the destination is the caller-supplied `$ty`. Clippy's
+        // `missing_transmute_annotations` can't see the destination through
+        // the macro metavariable, so allow it here at the one definition.
+        #[allow(clippy::missing_transmute_annotations)]
+        let f = std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(p);
+        f
     }};
 }
 
@@ -694,6 +700,13 @@ impl NvdecAv1 {
 /// hot loop stays branch-free. `w` and `h` must be even (NV12 guarantees
 /// it; the decoder's display crop keeps it so).
 pub fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut [u8]) {
+    // Defensive: every current caller sizes `out`/`nv12` from the same
+    // `w`×`h`, but `panic = "abort"` turns any mismatch (an odd dimension,
+    // a future caller) into a whole-node kill via the `split_at`/slice
+    // panics below. A bad frame should be dropped, not fatal.
+    if w == 0 || h == 0 || nv12.len() < w * h * 3 / 2 || out.len() < w * h * 4 {
+        return;
+    }
     let (luma, chroma) = nv12.split_at(w * h);
     let quads = h / 2;
     // Band the work across a few scoped threads at real frame sizes —

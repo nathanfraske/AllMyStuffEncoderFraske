@@ -46,23 +46,6 @@ impl Drop for TimerResolutionGuard {
     }
 }
 
-/// Boost the current thread for media work — called at the top of each
-/// capture/encode thread and the input-injector thread. Three levers, all
-/// best-effort:
-///
-///  1. **Priority** one step above normal — under load the stream must not
-///     degrade in lockstep with the load it exists to carry.
-///  2. **EcoQoS opt-out** — Windows 11 can classify a background process's
-///     threads as "efficiency" work and park them on E-cores at low clocks
-///     (the headless node is exactly the shape that gets tagged). The
-///     power-throttling opt-out declares this thread latency-sensitive.
-///  3. **Performance-core preference** on hybrid CPUs (Intel P+E) — a CPU-set
-///     hint listing the highest-efficiency-class cores. An encode/convert
-///     pass that fits a 16 ms budget on a P-core can blow it on a
-///     downclocked E-core; the hint keeps the media threads where the
-///     budget holds while the scheduler retains the right to overrule
-///     (CPU sets are a preference, unlike hard affinity — nothing starves
-///     if a game owns the P-cores; our raised priority arbitrates).
 /// Media threads registered for the telemetry line's per-thread CPU
 /// split: (label, real thread handle). Every media thread passes through
 /// [`boost_media_thread`], which makes this the one free hook.
@@ -293,6 +276,23 @@ fn raise_gpu_scheduling_class() {
     }
 }
 
+/// Boost the current thread for media work — called at the top of each
+/// capture/encode thread and the input-injector thread. Three levers, all
+/// best-effort:
+///
+///  1. **Priority** one step above normal — under load the stream must not
+///     degrade in lockstep with the load it exists to carry.
+///  2. **EcoQoS opt-out** — Windows 11 can classify a background process's
+///     threads as "efficiency" work and park them on E-cores at low clocks
+///     (the headless node is exactly the shape that gets tagged). The
+///     power-throttling opt-out declares this thread latency-sensitive.
+///  3. **Performance-core preference** on hybrid CPUs (Intel P+E) — a CPU-set
+///     hint listing the highest-efficiency-class cores. An encode/convert
+///     pass that fits a 16 ms budget on a P-core can blow it on a
+///     downclocked E-core; the hint keeps the media threads where the
+///     budget holds while the scheduler retains the right to overrule
+///     (CPU sets are a preference, unlike hard affinity — nothing starves
+///     if a game owns the P-cores; our raised priority arbitrates).
 pub(crate) fn boost_media_thread() {
     opt_out_process_throttling();
     mmcss_join();
@@ -350,7 +350,16 @@ pub(crate) fn boost_media_thread() {
         // priority offset stays 0. Apple's guidance reserves this tier for
         // work the user is actively perceiving — a live stream's capture,
         // encode, and input-injection threads are exactly that.
-        let _ = libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_USER_INTERACTIVE, 0);
+        // Declared locally (symbol lives in libSystem, linked by every
+        // macOS process): the libc crate's QoS bindings vary by vintage.
+        const QOS_CLASS_USER_INTERACTIVE: core::ffi::c_uint = 0x21; // <sys/qos.h>
+        extern "C" {
+            fn pthread_set_qos_class_self_np(
+                qos_class: core::ffi::c_uint,
+                relative_priority: core::ffi::c_int,
+            ) -> core::ffi::c_int;
+        }
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
@@ -392,7 +401,11 @@ fn performance_core_ids() -> &'static [u32] {
         // record's own Size.
         let mut sets: Vec<(u32, u8)> = Vec::new();
         let mut at = 0usize;
-        while at + core::mem::size_of::<u32>() * 2 <= needed as usize {
+        // Guard the FULL record size, not just the 8-byte Size/Type header:
+        // the reference below spans the whole struct, so a truncated final
+        // record (malformed OS buffer) would otherwise form a reference past
+        // the allocation (UB / OOB read of the CpuSet union).
+        while at + core::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>() <= needed as usize {
             let info = &*(buf.as_ptr().add(at) as *const SYSTEM_CPU_SET_INFORMATION);
             if info.Size == 0 {
                 break;

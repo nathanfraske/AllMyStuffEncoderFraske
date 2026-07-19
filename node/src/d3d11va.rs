@@ -456,11 +456,21 @@ fn parse_sps(rb: &[u8]) -> Result<Sps, String> {
     }
     let crop = if r.flag()? {
         // Conformance window, in chroma units — ×2 to luma for 4:2:0.
-        let l = r.ue()? * 2;
-        let rr = r.ue()? * 2;
-        let t = r.ue()? * 2;
-        let b = r.ue()? * 2;
-        if l + rr >= pic_width || t + b >= pic_height {
+        // Red team: each of these is later used INDIVIDUALLY as an
+        // absolute byte offset into the mapped surface (`read_surface`),
+        // so validating only the sum is not enough — a crafted SPS can
+        // make `l + rr` wrap under u32 past the guard while `l` alone is
+        // ~2 GB, turning the offset into an out-of-bounds read. Multiply
+        // and sum with checked arithmetic and reject any overflow; the
+        // `< pic_width/height` (≤ 8192) test then bounds each component.
+        let mul2 = |v: u32| v.checked_mul(2).ok_or("conformance window overflow");
+        let l = mul2(r.ue()?)?;
+        let rr = mul2(r.ue()?)?;
+        let t = mul2(r.ue()?)?;
+        let b = mul2(r.ue()?)?;
+        let w_off = l.checked_add(rr).ok_or("conformance window overflow")?;
+        let h_off = t.checked_add(b).ok_or("conformance window overflow")?;
+        if w_off >= pic_width || h_off >= pic_height {
             return Err("conformance window swallows the picture".into());
         }
         (l, rr, t, b)
@@ -488,10 +498,29 @@ fn parse_sps(rb: &[u8]) -> Result<Sps, String> {
         r.ue()?; // sps_max_num_reorder_pics
         r.ue()?; // sps_max_latency_increase_plus1
     }
+    // HEVC caps the DPB at 16 (minus1 ≤ 15). Bounding it here keeps the
+    // later `+ 3` (ensure_session) and `as u8` (pic-params fill) honest —
+    // an unbounded value would wrap under overflow-checks instead of
+    // relying on a distant clamp.
+    if max_dec_pic_buffering_minus1 > 15 {
+        return Err("sps_max_dec_pic_buffering out of range".into());
+    }
     let log2_min_cb_minus3 = r.ue()?;
     let log2_diff_max_min_cb = r.ue()?;
     let log2_min_tb_minus2 = r.ue()?;
     let log2_diff_max_min_tb = r.ue()?;
+    // These log2 coding/transform-block parameters feed left-shifts and
+    // coding-block-count geometry below. HEVC keeps each to a few bits
+    // (CTB ≤ 64, min CB ≥ 8); a crafted large value would produce a
+    // masked (wrong) shift in release and a shift-overflow panic under
+    // overflow-checks. Reject out-of-range rather than misdecode.
+    if log2_min_cb_minus3 > 8
+        || log2_diff_max_min_cb > 8
+        || log2_min_tb_minus2 > 8
+        || log2_diff_max_min_tb > 8
+    {
+        return Err("coding-block log2 parameters out of range".into());
+    }
     let max_th_depth_inter = r.ue()?;
     let max_th_depth_intra = r.ue()?;
     if r.flag()? {
@@ -1005,6 +1034,18 @@ impl D3d11vaHevc {
                     ts_us,
                     nal_type,
                 });
+                // Red team: a stream whose first picture never closes (every
+                // slice carries first_in_pic=0 with an unchanging ts) never
+                // teaches `learned_slices`, so without a cap `slices` grows
+                // per access unit until the heap is exhausted (abort). Real
+                // pictures have far fewer than this even at 8K; a stream that
+                // exceeds it is malformed — drop the picture and let the
+                // bridge re-key.
+                const MAX_SLICES_PER_PICTURE: usize = 4096;
+                if pend.slices.len() >= MAX_SLICES_PER_PICTURE {
+                    self.pending = None;
+                    return Err("slice count exceeds per-picture cap — dropping".into());
+                }
                 pend.slices.push(nal.to_vec());
                 // The learned count closes a picture on its final slice —
                 // the zero-latency steady state.

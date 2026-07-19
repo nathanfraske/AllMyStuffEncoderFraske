@@ -360,6 +360,9 @@ struct PresetConfig {
     reserved1: [u32; 255],
     reserved2: [*mut c_void; 64],
 }
+// Layout guard, like every sibling FFI struct: version(4)+pad(4)+
+// NvEncConfig(3840)+reserved1(1020)+pad(4)+reserved2(512).
+const _: () = assert!(std::mem::size_of::<PresetConfig>() == 5384);
 
 /// `NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE`.
 #[allow(dead_code)]
@@ -928,7 +931,7 @@ impl NvencH264 {
             // an oversized predecessor. GDR removes the IDR spikes that
             // made a deep bucket necessary; what remains benefits from
             // constant-latency framing far more than from burst headroom.
-            cfg.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
+            cfg.rc_params.vbv_buffer_size = (bitrate / self.fps.max(1)).max(50_000);
         }
         let paced = crate::video::paced_slices_enabled();
         // 8 slices sizes a lossy keyframe (~190 KB) to the 24 KB pacing
@@ -1287,7 +1290,7 @@ impl NvencH264 {
                 self.config.rc_params.max_bit_rate = bitrate + bitrate / 5;
             }
             if self.intra_refresh {
-                self.config.rc_params.vbv_buffer_size = (bitrate / self.fps).max(50_000);
+                self.config.rc_params.vbv_buffer_size = (bitrate / self.fps.max(1)).max(50_000);
             }
             let mut params: Box<ReconfigureParams> = Box::new(std::mem::zeroed());
             params.version = sv(1) | (1 << 31);

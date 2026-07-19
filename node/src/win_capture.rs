@@ -691,7 +691,12 @@ mod gpu_lane {
             return now;
         }
         let age_ns = (qpc_now - stamp) as u128 * 1_000_000_000 / freq as u128;
-        now - Duration::from_nanos(age_ns.min(u64::MAX as u128) as u64)
+        // `checked_sub`, not `-`: a pathological present-stamp (e.g. a
+        // negative `LastPresentTime` slipping past the `qpc_now <= stamp`
+        // guard) yields an `age` beyond the monotonic epoch, and
+        // `Instant - Duration` panics (→ abort) on underflow.
+        now.checked_sub(Duration::from_nanos(age_ns.min(u64::MAX as u128) as u64))
+            .unwrap_or(now)
     }
 
     /// One GPU-lane frame: a checked-out NV12 ring texture the encoder
