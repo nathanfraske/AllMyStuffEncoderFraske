@@ -19,6 +19,16 @@
     windows_subsystem = "windows"
 )]
 
+// A plain `cargo build --release` does not enable Tauri's production asset
+// protocol. It still produces a plausible-looking executable, but that
+// executable opens `devUrl` and leaves users staring at
+// ERR_CONNECTION_REFUSED on localhost. Fail the build instead; `tauri build`
+// enables `tauri/custom-protocol` and embeds `frontendDist` as intended.
+#[cfg(all(not(debug_assertions), dev))]
+compile_error!(
+    "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
+);
+
 use std::sync::Arc;
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
