@@ -49,19 +49,16 @@ path = "src/bin/serve.rs"
 # carries — bump it alongside a platform's bundled FFmpeg (the encode code
 # itself is version-agnostic). At runtime the ladder still falls back to
 # openh264 when no hardware encoder produces frames.
-default = ["host", "field-telemetry"]
+default = ["host"]
 hwenc = ["host", "dep:ffmpeg-next"]
 
 # Field-test instrumentation the fork added: the periodic telemetry line
-# (telemetry.rs — CPU/GPU-engine/VRAM every second) and the verbose cwd
-# debug log (allmystuff-serve.log at our-crates=debug). ON by default so
-# dev, `just dev`, and the PROTOTYPE field builds stay self-describing —
-# "send me the log" keeps working. A stamped PROD build drops it
-# (`cargo build --release --no-default-features --features host`) and ships
-# silent by default: no telemetry thread, no debug field log. The runtime
-# env dials still override either way — `ALLMYSTUFF_TELEMETRY=1` /
-# `ALLMYSTUFF_CWD_LOG=1` re-arm them on a prod box for on-demand debugging,
-# and `=0` silences them in a field build.
+# (telemetry.rs — CPU/GPU-engine/VRAM every second). Diagnostic/prototype
+# builds opt into that sampler with `--features field-telemetry`; ordinary dev
+# and release builds stay silent by default. Verbose file logging remains a
+# separate, runtime-only opt-in through the app setting or
+# `ALLMYSTUFF_CWD_LOG=1`. The environment dials always win, and `=0` silences
+# either diagnostic path.
 field-telemetry = []
 
 # The capture/inject planes — everything that touches THIS machine's screen,

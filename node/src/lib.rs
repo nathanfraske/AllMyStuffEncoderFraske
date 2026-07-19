@@ -68,6 +68,9 @@ pub mod control_client;
 #[cfg(all(windows, feature = "host"))]
 pub mod d3d11va;
 pub mod daemon_spawn;
+/// Local-only development diagnostics shared by the GUI setting and node
+/// startup. This never travels over the mesh or signaling layer.
+pub mod diagnostics;
 pub mod files;
 /// The GPU frame lane — D3D11 VideoProcessor colour conversion + a DXGI
 /// device-manager encoder feed, keeping frames on the GPU end to end.

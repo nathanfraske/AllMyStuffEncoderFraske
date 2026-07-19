@@ -1955,6 +1955,19 @@ export function serviceUninstall(): Promise<ServiceActionResult> {
   return serviceAction("service_uninstall");
 }
 
+/** Opt-in verbose diagnostics. The backend reads this local preference when it
+ * starts; changing it never changes mesh traffic and takes effect after the
+ * GUI/node backend is restarted. */
+export function debugLoggingGet(): Promise<boolean | null> {
+  return tryInvoke<boolean>("debug_logging_get");
+}
+
+export async function debugLoggingSet(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("debug_logging_set", { enabled })) as boolean;
+}
+
 /** Window/startup behaviour: whether closing / minimizing keeps AllMyStuff in
  *  the tray, and whether a login-item launch starts hidden. */
 export interface WindowBehavior {

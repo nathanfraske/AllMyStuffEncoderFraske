@@ -134,6 +134,8 @@ import {
   clipboardPaste,
   clipboardPull,
   sendInput,
+  debugLoggingGet,
+  debugLoggingSet,
   serviceInstall,
   serviceRestart,
   serviceStart,
@@ -1244,6 +1246,8 @@ class AppStore {
   /** Whether "Start with computer" (the OS login item) is registered. Null
    *  until read from the backend. */
   autostartEnabled = $state<boolean | null>(null);
+  /** Opt-in verbose node/GUI logging. Null until the local preference loads. */
+  debugLoggingEnabled = $state<boolean | null>(null);
 
   /** Safety-net poll that keeps the graph's mesh members fresh. */
   private meshPoll: ReturnType<typeof setInterval> | null = null;
@@ -7090,6 +7094,7 @@ class AppStore {
       void this.loadServiceStatus();
       void this.loadWindowBehavior();
       void this.loadAutostart();
+      void this.loadDebugLogging();
     }
     if (tab === "cec") void this.loadCec();
   }
@@ -7844,6 +7849,30 @@ class AppStore {
   }
   uninstallService() {
     return this.runServiceAction("uninstall", serviceUninstall);
+  }
+
+  // ---- "Always On": development diagnostics -------------------------
+
+  async loadDebugLogging() {
+    if (!isTauri()) return;
+    try {
+      this.debugLoggingEnabled = await debugLoggingGet();
+    } catch (e) {
+      this.toast("warn", `Couldn't read debug logging setting: ${errMsg(e)}`);
+    }
+  }
+
+  async setDebugLogging(enabled: boolean) {
+    if (!isTauri()) return;
+    const previous = this.debugLoggingEnabled;
+    this.debugLoggingEnabled = enabled;
+    try {
+      this.debugLoggingEnabled = await debugLoggingSet(enabled);
+      this.toast("info", "Debug logging setting saved; restart the app/backend to apply it.");
+    } catch (e) {
+      this.debugLoggingEnabled = previous;
+      this.toast("warn", `Couldn't save debug logging setting: ${errMsg(e)}`);
+    }
   }
 
   // ---- "Always On": window behaviour --------------------------------

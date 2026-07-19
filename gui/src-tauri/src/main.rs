@@ -2063,6 +2063,20 @@ async fn service_uninstall() -> Result<Value, String> {
     service_mutate("uninstall").await
 }
 
+/// Local development diagnostics only. The preference is read by the node at
+/// logging initialization, so changing it is deliberately restart-scoped and
+/// never sends anything through the mesh/control or signaling planes.
+#[tauri::command]
+fn debug_logging_get() -> bool {
+    allmystuff_node::diagnostics::debug_logging_enabled()
+}
+
+#[tauri::command]
+fn debug_logging_set(enabled: bool) -> Result<bool, String> {
+    allmystuff_node::diagnostics::set_debug_logging(enabled).map_err(|e| e.to_string())?;
+    Ok(allmystuff_node::diagnostics::debug_logging_enabled())
+}
+
 /// The persisted "Always On" window/startup behaviour (close/minimize to tray,
 /// start minimized).
 #[tauri::command]
@@ -2379,8 +2393,13 @@ fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_rendering();
 
-    let log_level = std::env::var("ALLMYSTUFF_GUI_LOG")
-        .unwrap_or_else(|_| "info,allmystuff_gui=info".to_string());
+    let log_level = std::env::var("ALLMYSTUFF_GUI_LOG").unwrap_or_else(|_| {
+        if allmystuff_node::diagnostics::debug_logging_enabled() {
+            "info,allmystuff_gui=debug,allmystuff_node=debug".to_string()
+        } else {
+            "info,allmystuff_gui=info".to_string()
+        }
+    });
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
         .with_target(false)
@@ -2541,6 +2560,8 @@ fn main() {
             service_stop,
             service_restart,
             service_uninstall,
+            debug_logging_get,
+            debug_logging_set,
             window_behavior_get,
             window_behavior_set,
             autostart_get,
