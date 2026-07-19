@@ -692,6 +692,16 @@ class AppStore {
   private consoleAudioRouteId: string | null = null;
   private consoleControlRouteId: string | null = null;
   private consoleClipboardRouteId: string | null = null;
+  /** Console legs the user has explicitly switched OFF this session. The
+   *  auto-legs — both the one-shot at open and the re-assert on every session
+   *  snapshot — only ever bring a leg *up*, and by the on/off flag alone they
+   *  can't tell "not wired yet" from "the user just turned it off": both read
+   *  as `false`. Tearing a leg down itself pushes a fresh snapshot, so without
+   *  this the re-assert would flip a just-silenced leg straight back on — the
+   *  "I can't turn off audio" bug (audio is the leg people actually switch off
+   *  mid-session). Reset on each console open; cleared for a leg the moment the
+   *  user turns it back on. */
+  private consoleUserOff = new Set<"audio" | "control" | "clipboard">();
   /** The *live* display route the console renders frames for — also set when
    *  the route pre-existed (owned-for-teardown is tracked separately). */
   consoleVideoLive = $state<string | null>(null);
@@ -2290,9 +2300,15 @@ class AppStore {
           }
         }
         const access = this.consoleAccess(this.consoleNode ?? undefined);
-        if (!this.consoleAudio && access.audio) this.toggleConsoleAudio();
-        if (!this.consoleControl && access.control) this.toggleConsoleControl();
-        if (!this.consoleClipboard && access.clipboard) this.toggleConsoleClipboard();
+        // Skip a leg the user deliberately switched off — otherwise this
+        // re-assert (which runs on every snapshot, including the one the
+        // teardown itself pushes) would flip it right back on.
+        if (!this.consoleAudio && access.audio && !this.consoleUserOff.has("audio"))
+          this.toggleConsoleAudio();
+        if (!this.consoleControl && access.control && !this.consoleUserOff.has("control"))
+          this.toggleConsoleControl();
+        if (!this.consoleClipboard && access.clipboard && !this.consoleUserOff.has("clipboard"))
+          this.toggleConsoleClipboard();
       }
     }
 
@@ -2961,6 +2977,9 @@ class AppStore {
     this.consoleVideoLive = null;
     this.consoleControlLive = null;
     this.consoleClipboardLive = null;
+    // A new session starts with no leg suppressed — the auto-legs bring up
+    // everything shared, and only a later user toggle-off re-populates this.
+    this.consoleUserOff.clear();
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodecBySource = {};
     this.consoleTuneBySource = {};
@@ -3030,9 +3049,15 @@ class AppStore {
     // granted, and nothing prompts; the toggles for the rest stay hidden
     // (Console.svelte gates them on the same access).
     const access = this.consoleAccess(this.consoleNode ?? undefined);
-    if (!this.consoleAudio && access.audio) this.toggleConsoleAudio();
-    if (!this.consoleControl && access.control) this.toggleConsoleControl();
-    if (!this.consoleClipboard && access.clipboard) this.toggleConsoleClipboard();
+    // Respect a leg the user already switched off (the fallback timer can land
+    // after an early toggle) — same "only turn on what wasn't turned off" rule
+    // the snapshot re-assert follows.
+    if (!this.consoleAudio && access.audio && !this.consoleUserOff.has("audio"))
+      this.toggleConsoleAudio();
+    if (!this.consoleControl && access.control && !this.consoleUserOff.has("control"))
+      this.toggleConsoleControl();
+    if (!this.consoleClipboard && access.clipboard && !this.consoleUserOff.has("clipboard"))
+      this.toggleConsoleClipboard();
   }
 
   /** The gate both console entries share: a known remote machine that runs
@@ -3206,8 +3231,12 @@ class AppStore {
       if (this.consoleAudioRouteId) this.disconnect(this.consoleAudioRouteId);
       this.consoleAudioRouteId = null;
       this.consoleAudio = false;
+      // Remember the user chose off, so the auto-legs stop bringing it back.
+      this.consoleUserOff.add("audio");
       return;
     }
+    // Turning it (back) on is intent to hear — the auto-legs may resume.
+    this.consoleUserOff.delete("audio");
     const from = matchEndpoint(this.catalog, remote, "audio", "provide");
     const to = matchEndpoint(this.catalog, this.localId, "audio", "consume");
     const leg = from && to ? this.ownedConnect(from.id, to.id) : null;
@@ -3233,8 +3262,10 @@ class AppStore {
       this.consoleControlRouteId = null;
       this.consoleControlLive = null;
       this.consoleControl = false;
+      this.consoleUserOff.add("control");
       return;
     }
+    this.consoleUserOff.delete("control");
     const mySrc = matchEndpoint(this.catalog, this.localId, "input", "provide");
     const remoteSink = matchEndpoint(this.catalog, remote, "input", "consume");
     const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
@@ -3260,8 +3291,10 @@ class AppStore {
       this.consoleClipboardRouteId = null;
       this.consoleClipboardLive = null;
       this.consoleClipboard = false;
+      this.consoleUserOff.add("clipboard");
       return;
     }
+    this.consoleUserOff.delete("clipboard");
     const mySrc = matchEndpoint(this.catalog, this.localId, "clipboard", "provide");
     const remoteSink = matchEndpoint(this.catalog, remote, "clipboard", "consume");
     const leg = mySrc && remoteSink ? this.ownedConnect(mySrc.id, remoteSink.id) : null;
