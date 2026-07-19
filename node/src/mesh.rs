@@ -1278,6 +1278,7 @@ impl Mesh {
     /// under the hood — the requested spacing is real now, not
     /// timer-wheel-rounded — and every gap is ledgered (the `pace gaps`
     /// line, one per minute).
+    #[allow(clippy::too_many_arguments)]
     async fn send_video_paced(
         &self,
         peer: &str,

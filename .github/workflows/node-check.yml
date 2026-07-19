@@ -1,9 +1,8 @@
 # Cross-platform compile check for the node engine — the encoder work is
 # developed on Windows, and the macOS (VideoToolbox) and Linux (Wayland/
 # PipeWire) arms are otherwise compile-blind until someone builds there.
-# check + clippy only (no hardware to run against); the Windows job mirrors
-# the local gate and is required, the other two surface breakage without
-# blocking while they stabilize.
+# check + clippy only (no hardware to run against); every desktop platform is
+# required so platform-gated video changes cannot merge compile-blind.
 name: node-check
 
 on:
@@ -22,6 +21,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # audiopus_sys/mozjpeg still declare a pre-3.5 CMake policy floor; CMake 4
+  # runners require the same compatibility shim as the main CI/release jobs.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   check:
@@ -30,13 +32,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            soft: false
           - os: macos-latest
-            soft: true
           - os: ubuntu-latest
-            soft: true
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.soft }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +46,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcb1-dev libxcb-randr0-dev \
             libxcb-shm0-dev libxcb-xfixes0-dev libdbus-1-dev libasound2-dev \
-            libpipewire-0.3-dev libwayland-dev cmake nasm
+            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgbm-dev \
+            libudev-dev libgtk-3-dev libegl-dev libegl1-mesa-dev cmake nasm
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: node

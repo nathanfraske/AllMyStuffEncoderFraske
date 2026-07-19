@@ -181,6 +181,7 @@ const MAX_PENDING: usize = 48;
 /// 8 ms inter-chunk cap, so 50 ms is the conservative last-picture fallback.
 /// An active stream does not pay that timeout: the following RTP timestamp
 /// closes the prior AU immediately. Each same-timestamp arrival resets it.
+#[cfg(all(windows, feature = "host"))]
 const NVDEC_CHUNK_IDLE: Duration = Duration::from_millis(50);
 
 /// How often each decoder logs its dial-in line (matches the encode side).
@@ -333,15 +334,18 @@ struct H264RuntimePolicy {
 impl H264RuntimePolicy {
     const DEMOTE_AFTER: u8 = 2;
 
+    #[cfg(all(windows, feature = "host"))]
     fn note_delta_failure(&mut self) -> u8 {
         self.delta_failures = self.delta_failures.saturating_add(1);
         self.delta_failures
     }
 
+    #[cfg(all(windows, feature = "host"))]
     fn note_delta_success(&mut self) {
         self.delta_failures = 0;
     }
 
+    #[cfg(all(windows, feature = "host"))]
     fn demote(&mut self) {
         self.delta_failures = Self::DEMOTE_AFTER;
     }
@@ -635,6 +639,7 @@ fn run_decode<F, G>(
     // the decoder's door (the nv12/rgba layers derive from frames×dims).
     let mut in_bytes = 0u64;
     let mut deferred_au: Option<Au> = None;
+    #[cfg(all(windows, feature = "host"))]
     let mut logged_nvdec_coalesce = false;
     let mut h264_runtime = H264RuntimePolicy::default();
     #[cfg(all(windows, feature = "host"))]
@@ -649,7 +654,7 @@ fn run_decode<F, G>(
 
     while !stop.load(Ordering::SeqCst) {
         // A bounded wait keeps the stop flag responsive on a quiet stream.
-        let mut au = if let Some(au) = deferred_au.take() {
+        let au = if let Some(au) = deferred_au.take() {
             au
         } else {
             match rx.recv_timeout(Duration::from_millis(250)) {
@@ -670,6 +675,8 @@ fn run_decode<F, G>(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
+        #[cfg(all(windows, feature = "host"))]
+        let mut au = au;
         in_bytes += au.data.len() as u64;
         if need_key.swap(false, Ordering::SeqCst) {
             // The feeder overflowed: drain the stale backlog and wait for
@@ -1213,6 +1220,7 @@ mod tests {
         bridge.stop("fresh-delta-route");
     }
 
+    #[cfg(all(windows, feature = "host"))]
     #[test]
     fn repeated_nvdec_delta_failure_demotes_until_route_restart() {
         let mut policy = H264RuntimePolicy::default();
