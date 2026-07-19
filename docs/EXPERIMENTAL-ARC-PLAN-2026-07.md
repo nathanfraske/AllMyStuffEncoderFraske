@@ -1,10 +1,42 @@
 # The Experimental arc — a gated Labs tier for latency/smoothness field trials (plan, 2026-07)
 
-_Planning document only — no source was modified for this plan. Repo state
-at writing: `main` @ `b992776` (AVX2+NT NV12→RGBA, memchr scan). Companion
-docs: `HANDOFF.md` (current state), `docs/SMOOTHNESS-IDEAS-2026-07.md` (the
-graded idea bank this arc draws from — T-numbers below refer to it),
-`docs/INTEGRATION-REPORT-2026-07.md` (blast-radius + wire-compat rules)._
+_Planning document. Repo state at writing: `main` @ `b992776`. Companion
+docs: `HANDOFF.md`, `docs/SMOOTHNESS-IDEAS-2026-07.md` (the graded idea
+bank; T-numbers refer to it), `docs/INTEGRATION-REPORT-2026-07.md`._
+
+## Reconciliation — what SHIPPED since this plan was written (read first)
+
+The plan was written before several of its own foundations landed. It is
+still correct in shape; these deltas keep an implementer from redoing
+done work or following a now-wrong instruction:
+
+- **The gate is BUILT** (`node/src/labs.rs`, commit shipping the
+  Experimental toggle). `labs::tier()` + `labs::on(Feature::X)` exist,
+  every dial in §1.1 has a `Feature` variant and `ALLMYSTUFF_X_*` env,
+  and the `labs_set` control op is wired. §1.1's "implement `labs.rs`"
+  is DONE — just call `labs::on(...)` at each feature's seam.
+- **The Experimental TOGGLE is BUILT**, and it lives IN `ModePill.svelte`
+  (a row under the postures), not a separate `LabsPill`. §1.2's tier
+  on/off is done; only the per-feature **Labs sheet with live counters**
+  remains (optional, demo polish) — build it as its own component reading
+  a `labs_stats` op, but the tier gate it toggles already exists.
+- **§1.4 is CORRECTED** (see that section): experimental handshake
+  signals ride the opaque `ext` bag (`video::PipelineFeedback` /
+  a `PipelineHints`), **never new typed protocol fields** — the
+  backend-only boundary (`docs/…INTEGRATION…` §3.5) is now in force.
+  Any feature that touches `crates/` or the GUI for a pipeline signal is
+  on the wrong path.
+- **T2.7 wave LENGTH shipped** (`arm_wave(frames)`, 3-frame lossy heal);
+  only the clean-link period *stretch* remains (§2.5 already says so).
+- **Seam renames since writing:** `wave_flags()` values are now
+  `Arc<AtomicU32>` (the wave length), not `AtomicBool`; `GpuCodec` gained
+  an `Amf` arm (the AMD rung) — feature match arms over `GpuCodec` must
+  cover it; `route_rates()`/`RouteRate.target` exist (the AIMD seam T2.x
+  reference); `Tune.mode` is a typed `Posture` enum now, not `String`.
+- **AV1 stubs are wired** (`docs/AV1-SEAMS.md`) — a Labs `Feature` for
+  AV1 selection slots in the same way; the codec sniff already OBU-aware.
+
+Everything else below stands.
 
 ## 0 · Inherited hard constraints (violating any disqualifies an item)
 
@@ -135,28 +167,37 @@ when tier + dial are on:
 | T2.4 rescue layer | ✖ | ✔ (WAN, opt-in) | ✖ | ✖ | Game's freeze-vs-blur trade only |
 | enc fence/async | ✔ | ✔ | ✔ | ✔ | Host-side, posture-blind |
 
-### 1.4 How peers learn (the experimental handshake, without new messages)
+### 1.4 How peers learn (the experimental handshake — via the `ext` bag, NOT new wire fields)
 
-Two additive `#[serde(default)]` fields carry everything:
+**CORRECTED 2026-07-18 (`8e1308c`):** this section originally proposed
+adding typed `caps: u32`, `last_good_ts_us`, and `labs: u32` fields to
+`RouteControl::VideoFeedback`/`Tune`. **Do not do that** — it would
+violate the backend-only boundary now in force. `VideoFeedback` and
+`Tune` each already carry an opaque `ext: serde_json::Value` the
+protocol/session crates relay verbatim; the node video backend owns its
+shape (`video::PipelineFeedback` for feedback; add a `PipelineHints` for
+tune). Every experimental handshake signal is a FIELD ON THOSE STRUCTS —
+backend-only, no protocol/session/mobile-core/GUI change.
 
-- **Viewer → host:** `RouteControl::VideoFeedback` gains `caps: u32`
-  (default 0 = a peer that predates it). Bits: `1<<0` damage-SEI-aware
-  (viewer parses/strips the SEI), `1<<1` rescue-lane-aware, `1<<2`
-  rides-frame_num-gaps (the `e382997` invalidate story), `1<<3` LTR-ack
-  (`last_good_ts_us` meaningful). Feedback already flows every ~2 s on the
-  existing CHANNEL_CONTROL message; a host simply never engages a
-  viewer-cooperative feature until it has seen the bit. `VideoFeedback`
-  also gains `last_good_ts_us: Option<u64>` for T1.4.
-- **Viewer → host intent:** `RouteControl::Tune` gains `labs: u32`
-  (default 0) — the viewer's Labs sheet requesting host-side features on
-  its route (mirrors how `game`/`mode` already ride Tune additively).
+- **Viewer → host:** add to `video::PipelineFeedback` (which serializes
+  to `VideoFeedback.ext`):
+  - `caps: u32` (default 0). Bits: `1<<0` damage-SEI-aware (viewer
+    parses/strips the SEI), `1<<1` rescue-lane-aware, `1<<2`
+    rides-frame_num-gaps (the `e382997` invalidate story), `1<<3` LTR-ack.
+    A host never engages a viewer-cooperative feature until it has seen
+    the bit (feedback flows every ~2 s on the existing CHANNEL_CONTROL
+    message — the ICE datapath, never signaling).
+  - `last_good_ts_us: Option<u64>` for T1.4 (highest cleanly-decoded AU).
+- **Viewer → host intent:** add a `PipelineHints { labs: u32 }` the node
+  packs into `Tune.ext` — the viewer's Labs sheet requesting host-side
+  features on its route.
 
-Both are field-additions to messages that already round-trip-test in the
-protocol crate — the exact `est_kbps`/`delay_trend_us_per_s` precedent. Old
-peer receiving new fields: serde ignores. New peer receiving old messages:
-defaults to 0 = everything off. **No new enum variants** (unknown variants
-are not tolerated by serde the way unknown fields are — `InputAction` had a
-catch-all; `RouteControl` is not assumed to).
+`PipelineFeedback` is `#[serde(default)]` throughout, so a peer that
+sends none reads as all-zero (everything off) — the exact old-peer story,
+now with **zero protocol-crate churn per feature**. `to_ext` already
+returns `Null` when nothing is set, so an all-default report adds no
+bytes. No new `RouteControl` variants (unknown variants aren't tolerated
+the way unknown fields/opaque ext are).
 
 ### 1.5 Telemetry — making an experimental session diagnosable after the fact
 

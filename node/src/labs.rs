@@ -29,8 +29,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// `1` = forced on, `2` = forced off — the GUI toggle writes 1/2.
 static TIER: AtomicU8 = AtomicU8::new(0);
 
-/// Every Labs feature. Adding a variant here + a line in [`slot`] is the
-/// whole cost of wiring a new experiment to the existing toggle.
+/// Every Labs feature — one variant per dial in the Experimental arc
+/// plan (`docs/EXPERIMENTAL-ARC-PLAN-2026-07.md` §1.1), so the gate is
+/// complete and implementing a feature is filling its call site's
+/// `if labs::on(Feature::X)` branch, never adding a gate. Adding a
+/// genuinely new experiment = a variant here + a line in [`slot`] and
+/// [`env_spec`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
     /// T2.9 — damage-metadata pixel grouping.
@@ -40,12 +44,23 @@ pub enum Feature {
     PaintPace,
     /// T2.2 — NVENC sub-frame slice streaming.
     SubFrame,
-    /// T2.5a/b — damage-QP emphasis + adaptive slice grain.
+    /// T2.5a — damage-QP emphasis.
     QpMap,
+    /// T2.5b — adaptive slice grain.
+    Grain,
+    /// T2.7 — steady-state wave-period stretch (the loss-aware wave
+    /// LENGTH already ships; this is the clean-link period stretch).
+    WaveStretch,
     /// T2.8 — viewer zero-copy present.
     Present,
-    /// T1.4 + T2.3 — LTR recovery + gap-NACK.
-    LossMatrix,
+    /// T1.4 — LTR-anchored recovery.
+    Ltr,
+    /// T2.3 — arrival-side loss inference (gap-NACK) + the recovery matrix.
+    GapNack,
+    /// T2.4 — speculative rescue layer.
+    Rescue,
+    /// Fence/async encode submit chain.
+    EncAsync,
 }
 
 /// One override slot per feature: `0` = follow env, `1` = on, `2` = off.
@@ -54,15 +69,25 @@ fn slot(f: Feature) -> &'static AtomicU8 {
     static PAINT_PACE: AtomicU8 = AtomicU8::new(0);
     static SUBFRAME: AtomicU8 = AtomicU8::new(0);
     static QPMAP: AtomicU8 = AtomicU8::new(0);
+    static GRAIN: AtomicU8 = AtomicU8::new(0);
+    static WAVE_STRETCH: AtomicU8 = AtomicU8::new(0);
     static PRESENT: AtomicU8 = AtomicU8::new(0);
-    static LOSS: AtomicU8 = AtomicU8::new(0);
+    static LTR: AtomicU8 = AtomicU8::new(0);
+    static GAP_NACK: AtomicU8 = AtomicU8::new(0);
+    static RESCUE: AtomicU8 = AtomicU8::new(0);
+    static ENC_ASYNC: AtomicU8 = AtomicU8::new(0);
     match f {
         Feature::Damage => &DAMAGE,
         Feature::PaintPace => &PAINT_PACE,
         Feature::SubFrame => &SUBFRAME,
         Feature::QpMap => &QPMAP,
+        Feature::Grain => &GRAIN,
+        Feature::WaveStretch => &WAVE_STRETCH,
         Feature::Present => &PRESENT,
-        Feature::LossMatrix => &LOSS,
+        Feature::Ltr => &LTR,
+        Feature::GapNack => &GAP_NACK,
+        Feature::Rescue => &RESCUE,
+        Feature::EncAsync => &ENC_ASYNC,
     }
 }
 
@@ -76,8 +101,13 @@ fn env_spec(f: Feature) -> (&'static str, bool) {
         Feature::PaintPace => ("ALLMYSTUFF_X_PAINT_PACE", false),
         Feature::SubFrame => ("ALLMYSTUFF_X_SUBFRAME", false),
         Feature::QpMap => ("ALLMYSTUFF_X_QPMAP", false),
+        Feature::Grain => ("ALLMYSTUFF_X_GRAIN", false),
+        Feature::WaveStretch => ("ALLMYSTUFF_X_WAVE_STRETCH", false),
         Feature::Present => ("ALLMYSTUFF_X_PRESENT", false),
-        Feature::LossMatrix => ("ALLMYSTUFF_X_LOSS_MATRIX", false),
+        Feature::Ltr => ("ALLMYSTUFF_X_LTR", false),
+        Feature::GapNack => ("ALLMYSTUFF_X_GAP_NACK", false),
+        Feature::Rescue => ("ALLMYSTUFF_X_RESCUE", false),
+        Feature::EncAsync => ("ALLMYSTUFF_X_ENC_ASYNC", false),
     }
 }
 
@@ -136,8 +166,13 @@ pub fn set_feature(name: &str, on: bool) {
         "paint_pace" => Feature::PaintPace,
         "subframe" => Feature::SubFrame,
         "qpmap" => Feature::QpMap,
+        "grain" => Feature::Grain,
+        "wave_stretch" => Feature::WaveStretch,
         "present" => Feature::Present,
-        "loss_matrix" => Feature::LossMatrix,
+        "ltr" => Feature::Ltr,
+        "gap_nack" => Feature::GapNack,
+        "rescue" => Feature::Rescue,
+        "enc_async" => Feature::EncAsync,
         _ => {
             tracing::debug!("labs_set: unknown feature {name}");
             return;
