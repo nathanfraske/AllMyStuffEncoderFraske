@@ -705,7 +705,13 @@
     // them) with a picture on the glass = a switch: hold the old frame
     // dimmed instead of flashing the placeholder. A decode-mode re-wire
     // on the SAME route keeps today's behavior.
-    if (hasFrame && route !== lastRoute) {
+    // `hasFrame` is paint output, not watch identity. Tracking it here made
+    // every first decoded frame invalidate this effect, tear down the watcher,
+    // clear its queue, and subscribe again. The viewer therefore oscillated
+    // between "window watching" and "no window is watching" while a healthy
+    // 60 fps stream flowed underneath it. Only route/decode-mode changes own
+    // this lifecycle; sample the paint state without subscribing to it.
+    if (untrack(() => hasFrame) && route !== lastRoute) {
       untrack(armSwitching);
     }
     hasFrame = false;
