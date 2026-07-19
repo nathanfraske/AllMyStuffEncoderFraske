@@ -25,8 +25,10 @@
 /// Holds the OS timer resolution at 1 ms for as long as any guard lives.
 /// winmm refcounts `timeBeginPeriod`/`timeEndPeriod` process-wide, so
 /// nested guards are fine and drop order is free.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct TimerResolutionGuard;
 
+#[cfg(any(feature = "host", test))]
 impl TimerResolutionGuard {
     pub(crate) fn hold() -> TimerResolutionGuard {
         #[cfg(windows)]
@@ -37,6 +39,7 @@ impl TimerResolutionGuard {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 impl Drop for TimerResolutionGuard {
     fn drop(&mut self) {
         #[cfg(windows)]

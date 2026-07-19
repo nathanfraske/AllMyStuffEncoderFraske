@@ -177,6 +177,7 @@ impl StreamStats {
 
     /// Record one frame's capture age (present → encode start), M1's
     /// first span.
+    #[cfg(windows)]
     fn add_age(&mut self, d: Duration) {
         self.age_ms.push(d.as_secs_f32() * 1000.0);
     }
@@ -209,6 +210,7 @@ impl StreamStats {
     /// NVENC/MF/AMF rung lives inside `run_gpu_lane`, which this pass leaves
     /// untouched — so this stays a best-effort label, never a claim about a
     /// specific silicon path.
+    #[cfg(windows)]
     fn set_encoder(&self, label: impl Into<String>) {
         *self.live.encoder.lock() = label.into();
     }
@@ -452,6 +454,7 @@ fn auto_fps(link: LinkClass, game: bool) -> u32 {
 /// now repair what the tighter budget costs a transition. Shared by every
 /// backend that exposes peak/VBV (MF on Windows, the FFmpeg vendor
 /// encoders; VideoToolbox manages its own and ignores these).
+#[cfg(any(windows, feature = "hwenc", test))]
 pub(crate) fn burst_bounds(bitrate: u32, game: bool) -> (u32, u32) {
     if game {
         (bitrate.saturating_mul(3) / 2, bitrate / 2)
@@ -3256,6 +3259,8 @@ fn run_oneshot_capture(
     reporter: &mut StatusReporter,
     retry_capture_after: Option<Duration>,
 ) -> Result<bool, String> {
+    #[cfg(not(windows))]
+    let _ = requested_monitor_id;
     let budget = Duration::from_secs(1) / fps.max(1);
     let began = Instant::now();
     let mut failures = 0u64;
@@ -4871,6 +4876,7 @@ pub(crate) struct EncodeOutcome {
     /// the frame's presentation time so a viewer's loss report (a wire
     /// timestamp) maps back to the exact reference to invalidate. 0 on
     /// backends without invalidation (MF, openh264).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub input_ts: u64,
 }
 
@@ -6499,6 +6505,7 @@ mod tests {
     // can't run them (no monitor, no hardware MFT).
 
     /// (avg, p95, max) in ms.
+    #[cfg(windows)]
     fn dur_stats(samples: &[Duration]) -> (f64, f64, f64) {
         if samples.is_empty() {
             return (0.0, 0.0, 0.0);
