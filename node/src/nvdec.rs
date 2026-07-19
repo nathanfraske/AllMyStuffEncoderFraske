@@ -1181,6 +1181,69 @@ mod tests {
         }
     }
 
+    /// Compare the receive hot loop's current scoped-thread fanout at the
+    /// two resolutions seen in the paired field run. This deliberately calls
+    /// the same dispatch kernel as production while varying only the band
+    /// count, so it exposes both useful parallelism and per-frame thread
+    /// creation/scheduling tails. Run only on an otherwise-idle viewer:
+    ///
+    /// `cargo test --release --lib bench_nv12_worker_counts -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture on an idle viewer"]
+    fn bench_nv12_worker_counts() {
+        fn convert_with_workers(nv12: &[u8], w: usize, h: usize, out: &mut [u8], workers: usize) {
+            let (luma, chroma) = nv12.split_at(w * h);
+            let quads = h / 2;
+            if workers == 1 {
+                band_dispatch(luma, chroma, w, 0..quads, out);
+                return;
+            }
+            let per = quads.div_ceil(workers);
+            std::thread::scope(|scope| {
+                let mut rest = out;
+                for k in 0..workers {
+                    let range = (k * per).min(quads)..((k + 1) * per).min(quads);
+                    if range.is_empty() {
+                        break;
+                    }
+                    let bytes = (range.end - range.start) * 2 * w * 4;
+                    let (mine, tail) = rest.split_at_mut(bytes);
+                    rest = tail;
+                    scope.spawn(move || band_dispatch(luma, chroma, w, range, mine));
+                }
+            });
+        }
+
+        for (w, h) in [(2560usize, 1440usize), (3440, 1440)] {
+            let nv12: Vec<u8> = (0..w * h * 3 / 2)
+                .map(|i| (i.wrapping_mul(37).wrapping_add(i / 97) & 0xff) as u8)
+                .collect();
+            let mut reference = vec![0u8; w * h * 4];
+            convert_with_workers(&nv12, w, h, &mut reference, 1);
+
+            for workers in [1usize, 2, 4, 8] {
+                let mut out = vec![0u8; w * h * 4];
+                convert_with_workers(&nv12, w, h, &mut out, workers);
+                assert_eq!(out, reference, "{workers}-worker output at {w}x{h}");
+
+                let mut elapsed = Vec::with_capacity(120);
+                for _ in 0..120 {
+                    let started = std::time::Instant::now();
+                    convert_with_workers(&nv12, w, h, &mut out, workers);
+                    elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
+                    std::hint::black_box(out[w * h * 2]);
+                }
+                elapsed.sort_by(f64::total_cmp);
+                let avg = elapsed.iter().sum::<f64>() / elapsed.len() as f64;
+                let p95 = elapsed[elapsed.len() * 95 / 100];
+                let max = elapsed[elapsed.len() - 1];
+                println!(
+                    "bench NV12->RGBA {w}x{h} [{workers} workers]: avg {avg:.2} ms · p95 {p95:.2} · max {max:.2}"
+                );
+            }
+        }
+    }
+
     /// Read the exact NV12 bytes of a GPU-lane texture back to the CPU
     /// via a staging copy — the encoder's literal input, for byte-exact
     /// comparison against the decoder's output.
