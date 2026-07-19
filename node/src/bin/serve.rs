@@ -527,11 +527,146 @@ fn init_logging(as_service: bool) {
     });
     let stdout_layer = tracing_subscriber::fmt::layer().with_target(false);
 
+    // The field-test log: a second file, in the directory the node was
+    // launched from, at full debug verbosity for our crates regardless of
+    // the quiet console filter — targets kept ON so every line names its
+    // module (which device, which lane, which rung). This is what "send
+    // me the log" points at; soft-absent when the cwd isn't writable
+    // (Program Files installs), and `ALLMYSTUFF_CWD_LOG=0` turns it off.
+    let (verbose_layer, verbose_paths) = match cwd_log_writer() {
+        Some((make, paths)) => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(make)
+                    .with_filter(tracing_subscriber::EnvFilter::new(
+                        "warn,allmystuff_node=debug,allmystuff_serve=debug",
+                    )),
+            ),
+            paths,
+        ),
+        None => (None, Vec::new()),
+    };
+
     tracing_subscriber::registry()
-        .with(filter)
-        .with(stdout_layer)
-        .with(file_layer)
+        .with(verbose_layer)
+        .with(stdout_layer.and_then(file_layer).with_filter(filter))
         .init();
+    // Name the log's homes IN the log (and on stdout/the GUI console):
+    // "where are the logs" must be answerable from any surface. The
+    // ProgramData path is the guaranteed machine-wide one.
+    for p in &verbose_paths {
+        tracing::info!("verbose field log: {}", p.display());
+    }
+    // The field-test telemetry line rides the log just initialized —
+    // CPU + per-engine GPU busy + VRAM every 5 s, vendor-neutral.
+    #[cfg(windows)]
+    allmystuff_node::telemetry::start();
+}
+
+/// A `MakeWriter` over the verbose field-test log, plus the paths it
+/// writes so the caller can announce them in-band once tracing is up.
+///
+/// **The guaranteed spot (Windows):
+/// `C:\ProgramData\AllMyStuff\logs\allmystuff-serve.log`** — machine-wide
+/// and identical whether serve runs from a console, as the GUI's
+/// sidecar, or as the installed SERVICE. The old per-user
+/// `%LOCALAPPDATA%` home is kept as a tee, but it was the field's
+/// "logs aren't showing up": a service resolves `%LOCALAPPDATA%` to the
+/// SYSTEM profile (`…\System32\config\systemprofile\AppData\Local`),
+/// which no one thinks to open. The launch-directory copy stays too
+/// when writable (the console-run habit).
+///
+/// Rotation, not truncation: the previous session survives as
+/// `allmystuff-serve.prev.log` — a restart used to wipe exactly the
+/// evidence a field report needed. `None` when nothing opens, when the local
+/// development toggle is off, or `ALLMYSTUFF_CWD_LOG=0`.
+///
+/// Ordinary builds default off. The in-app development setting persists a
+/// local opt-in for the next backend start; `ALLMYSTUFF_CWD_LOG` remains the
+/// highest-priority one-shot override. Compiling the `field-telemetry` feature
+/// does not implicitly enable this verbose file.
+fn cwd_log_writer() -> Option<(
+    impl Fn() -> TeeHandle + Send + Sync + 'static,
+    Vec<std::path::PathBuf>,
+)> {
+    if !allmystuff_node::diagnostics::debug_logging_enabled() {
+        return None;
+    }
+    fn open_rotating(dir: std::path::PathBuf) -> Option<(std::fs::File, std::path::PathBuf)> {
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("allmystuff-serve.log");
+        // Best-effort rotate; a locked/missing file just means no .prev.
+        let _ = std::fs::rename(&path, dir.join("allmystuff-serve.prev.log"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        eprintln!("verbose log: {}", path.display());
+        Some((file, path))
+    }
+    let mut files = Vec::new();
+    let mut paths = Vec::new();
+    #[cfg(windows)]
+    {
+        let program_data = std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+        if let Some((f, p)) = open_rotating(program_data.join("AllMyStuff").join("logs")) {
+            files.push(f);
+            paths.push(p);
+        }
+    }
+    if let Some(d) = dirs::data_local_dir() {
+        if let Some((f, p)) = open_rotating(d.join("AllMyStuff").join("logs")) {
+            files.push(f);
+            paths.push(p);
+        }
+    }
+    if let Some((f, p)) = open_rotating(std::path::PathBuf::from(".")) {
+        files.push(f);
+        paths.push(p);
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some((TeeWriter(files).into_make(), paths))
+}
+
+/// N file handles, one write — every open log location stays identical.
+struct TeeWriter(Vec<std::fs::File>);
+
+impl TeeWriter {
+    fn into_make(self) -> impl Fn() -> TeeHandle + Send + Sync + 'static {
+        move || TeeHandle(self.0.iter().filter_map(|f| f.try_clone().ok()).collect())
+    }
+}
+
+struct TeeHandle(Vec<std::fs::File>);
+
+impl std::io::Write for TeeHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut any = false;
+        for f in &mut self.0 {
+            if f.write_all(buf).is_ok() {
+                any = true;
+            }
+        }
+        if any {
+            Ok(buf.len())
+        } else {
+            Err(std::io::Error::other("no log sink accepted the write"))
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        for f in &mut self.0 {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
 }
 
 /// A `MakeWriter` over `~/.myownmesh/logs/node.log` (honoring `MYOWNMESH_HOME`,

@@ -45,6 +45,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
 use enigo::Coordinate;
@@ -124,6 +125,9 @@ impl Injector {
 }
 
 fn run_injector(rx: mpsc::Receiver<Cmd>) {
+    // Inbound control is what the user *feels* — keep the injector
+    // responsive under exactly the load that made them reach for it.
+    crate::os_perf::boost_media_thread();
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(e) => {
@@ -166,6 +170,12 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 let (gx, gy) = rect.denorm(x, y);
                 move_mouse_global(&mut enigo, gx, gy)
             }
+            // Pointer-lock deltas: raw relative motion, straight through —
+            // games read this as camera movement, so no screen resolve, no
+            // clamping, no coalescing beyond what the sender already did.
+            InputAction::MouseMoveRel { dx, dy } => enigo
+                .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
+                .map_err(|e| e.to_string()),
             InputAction::MouseButton { button, down } => match dom_button(button) {
                 Some(b) => enigo.button(b, direction(down)).map_err(|e| e.to_string()),
                 None => Ok(()),
@@ -298,26 +308,44 @@ impl ScreenRect {
 
 /// The monitor layout, refreshed when an event names a screen we don't
 /// know (hotplug since the last look).
+/// How stale the cached monitor layout may grow before `resolve` re-reads
+/// it. A resolution/DPI/layout change mid-session must reach the mapping
+/// within a beat — the old code refreshed only when a *named* screen id
+/// went missing, so the primary-screen path (the common case) denormalized
+/// against stale dimensions forever after a mode change, landing the
+/// cursor in the wrong place. Two seconds keeps the enumeration cost
+/// invisible at 60 events/s.
+const SCREENS_TTL: Duration = Duration::from_secs(2);
+
 struct ScreenMap {
     rects: Vec<ScreenRect>,
+    refreshed: Instant,
 }
 
 impl ScreenMap {
     fn load() -> Self {
         ScreenMap {
             rects: query_screens(),
+            refreshed: Instant::now(),
         }
     }
 
     /// The rectangle for `screen` — the primary when unnamed, a re-query
-    /// then the primary when the named one is gone. The fallback rect (no
-    /// monitors readable at all) keeps the old primary-screen behaviour.
+    /// then the primary when the named one is gone. The cache re-reads on
+    /// [`SCREENS_TTL`] regardless, so a mode change reaches the mapping.
+    /// The fallback rect (no monitors readable at all) keeps the old
+    /// primary-screen behaviour.
     fn resolve(&mut self, screen: Option<u32>) -> ScreenRect {
+        if self.refreshed.elapsed() >= SCREENS_TTL {
+            self.rects = query_screens();
+            self.refreshed = Instant::now();
+        }
         if let Some(id) = screen {
             if let Some(r) = self.rects.iter().find(|r| r.id == id) {
                 return *r;
             }
             self.rects = query_screens();
+            self.refreshed = Instant::now();
             if let Some(r) = self.rects.iter().find(|r| r.id == id) {
                 return *r;
             }
@@ -726,6 +754,7 @@ mod tests {
         };
         let mut map = ScreenMap {
             rects: vec![primary, right],
+            refreshed: Instant::now(),
         };
         assert_eq!(map.resolve(Some(7)), right);
         assert_eq!(map.resolve(None), primary);
@@ -733,6 +762,7 @@ mod tests {
         // primary of whatever the map now holds.
         let mut map = ScreenMap {
             rects: vec![primary, right],
+            refreshed: Instant::now(),
         };
         let fallback = map.resolve(Some(99));
         assert!(fallback.primary);

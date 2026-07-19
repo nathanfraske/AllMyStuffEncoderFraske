@@ -47,6 +47,20 @@
     app.openConsoleHere(node!.id);
   });
 
+  // The CEC support-console fix: this window pops the instant a customer
+  // approves, and their display capability can land AFTER `openConsoleHere`
+  // already ran with an empty catalog — leaving the stage blank forever
+  // (no stream ever established). Re-drive the input wire the moment a
+  // video input for the open target appears, whatever path it arrived by.
+  // Reading `consoleVideoInputs` here makes this effect re-run when the
+  // catalog gains one; `ensureConsoleInput` is idempotent (no-ops once an
+  // input is picked), so a normal console never re-wires.
+  $effect(() => {
+    const id = app.consoleNodeId;
+    if (!id || app.consoleInput) return;
+    if (app.consoleVideoInputs(id).length > 0) app.ensureConsoleInput();
+  });
+
   $effect(() => {
     const n = app.consoleNode;
     if (n) void setWindowTitle(`${displayName(n)} — AllMyStuff console`);

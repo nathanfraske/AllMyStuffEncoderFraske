@@ -19,6 +19,16 @@
     windows_subsystem = "windows"
 )]
 
+// A plain `cargo build --release` does not enable Tauri's production asset
+// protocol. It still produces a plausible-looking executable, but that
+// executable opens `devUrl` and leaves users staring at
+// ERR_CONNECTION_REFUSED on localhost. Fail the build instead; `tauri build`
+// enables `tauri/custom-protocol` and embeds `frontendDist` as intended.
+#[cfg(all(not(debug_assertions), dev))]
+compile_error!(
+    "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
+);
+
 use std::sync::Arc;
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
@@ -503,16 +513,50 @@ async fn tune_route(
     max_edge: Option<u32>,
     bitrate: Option<u32>,
     fps: Option<u32>,
+    game: Option<bool>,
+    mode: Option<String>,
 ) -> Result<(), String> {
     state
         .node
         .request(
             "tune_route",
-            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps }),
+            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps, "game": game, "mode": mode }),
         )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The effective encode dials for a route THIS machine is streaming — the
+/// "requested → effective" panel reads it ~1 Hz while open. Returns JSON
+/// null when this machine isn't the streamer (the ordinary remote-view
+/// case), so the viewer falls back to its own measured actuals. GUI-internal
+/// and read-only — no wire traffic.
+#[tauri::command]
+async fn route_dials(
+    state: State<'_, AppState>,
+    route_id: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("route_dials", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Flip the Experimental (Labs) tier — or one feature — on this node.
+/// GUI-internal, never wire-visible; the Mode dropdown's toggle.
+#[tauri::command]
+async fn labs_set(
+    state: State<'_, AppState>,
+    on: bool,
+    feature: Option<String>,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("labs_set", json!({ "on": on, "feature": feature }))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---- terminal (the mesh-native shell) ----------------------------------
@@ -2019,6 +2063,20 @@ async fn service_uninstall() -> Result<Value, String> {
     service_mutate("uninstall").await
 }
 
+/// Local development diagnostics only. The preference is read by the node at
+/// logging initialization, so changing it is deliberately restart-scoped and
+/// never sends anything through the mesh/control or signaling planes.
+#[tauri::command]
+fn debug_logging_get() -> bool {
+    allmystuff_node::diagnostics::debug_logging_enabled()
+}
+
+#[tauri::command]
+fn debug_logging_set(enabled: bool) -> Result<bool, String> {
+    allmystuff_node::diagnostics::set_debug_logging(enabled).map_err(|e| e.to_string())?;
+    Ok(allmystuff_node::diagnostics::debug_logging_enabled())
+}
+
 /// The persisted "Always On" window/startup behaviour (close/minimize to tray,
 /// start minimized).
 #[tauri::command]
@@ -2335,8 +2393,13 @@ fn main() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     workaround_pi_webkit_rendering();
 
-    let log_level = std::env::var("ALLMYSTUFF_GUI_LOG")
-        .unwrap_or_else(|_| "info,allmystuff_gui=info".to_string());
+    let log_level = std::env::var("ALLMYSTUFF_GUI_LOG").unwrap_or_else(|_| {
+        if allmystuff_node::diagnostics::debug_logging_enabled() {
+            "info,allmystuff_gui=debug,allmystuff_node=debug".to_string()
+        } else {
+            "info,allmystuff_gui=info".to_string()
+        }
+    });
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
         .with_target(false)
@@ -2410,6 +2473,8 @@ fn main() {
             video_refresh,
             video_feedback,
             tune_route,
+            route_dials,
+            labs_set,
             open_console_window,
             open_video_window,
             term_send,
@@ -2495,6 +2560,8 @@ fn main() {
             service_stop,
             service_restart,
             service_uninstall,
+            debug_logging_get,
+            debug_logging_set,
             window_behavior_get,
             window_behavior_set,
             autostart_get,

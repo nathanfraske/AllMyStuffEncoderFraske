@@ -35,9 +35,9 @@ use allmystuff_protocol::{
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
-    FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, Session, SiteEvent, SiteFrame,
-    TermEvent, TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame, CLIPBOARD_CHUNK_BYTES,
-    SITE_CHUNK_BYTES,
+    FileEvent, FileFrame, InputAction, InputEvent, MediaPayload, RouteState, Session, SiteEvent,
+    SiteFrame, TermEvent, TermFrame, VideoAssembler, VideoFrame, VideoStatusFrame,
+    CLIPBOARD_CHUNK_BYTES, SITE_CHUNK_BYTES,
 };
 
 use crate::audio::{AudioBridge, CaptureSource};
@@ -51,6 +51,7 @@ use crate::sites::{ClientMapping, SitesProxy};
 use crate::terminal::{OutMsg, TerminalHost};
 use crate::video::{VideoBridge, VideoMode, VideoPacket, VideoSource};
 use crate::video_decode::{Au, DecodeBridge};
+use std::time::{Duration, Instant};
 
 pub struct Mesh {
     client: Arc<ControlClient>,
@@ -74,6 +75,16 @@ pub struct Mesh {
     /// asked for ready-to-paint frames (no WebCodecs in its webview, or its
     /// decoder stalled out).
     video_decode: Arc<DecodeBridge>,
+    /// M2 — the pacer's requested-vs-actual gap ledger (one log line per
+    /// minute): the honesty check on every sub-millisecond spacing the
+    /// drain model asks for.
+    pace_gaps: Mutex<PaceGapStats>,
+    /// M3 + the chunk-train bandwidth estimator: per inbound video route,
+    /// arrival dispersion of the pacer's own timed bursts → a bottleneck
+    /// estimate and a one-way-delay trend, attached to every outbound
+    /// [`RouteControl::VideoFeedback`] (the ICE datapath's control
+    /// channel — never signaling).
+    video_arrivals: Mutex<HashMap<String, ArrivalState>>,
     /// Keyboard/mouse injection for input routes that sink here — gated on
     /// the sender being our owner or a fleet member.
     injector: Injector,
@@ -191,7 +202,7 @@ pub struct Mesh {
     /// the capture side drops frames instead of queueing stale ones (an
     /// MJPEG drop costs freshness only; an H.264 drop is healed by the
     /// next forced IDR).
-    video_out: mpsc::Sender<(String, String, VideoPacket)>,
+    video_out: mpsc::Sender<VideoOut>,
     /// The matching receivers, parked by [`Mesh::new`] and drained by the
     /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
     /// being spawned in `new` because the GUI builds the `Mesh` in a
@@ -199,7 +210,7 @@ pub struct Mesh {
     /// `start` is the first point guaranteed an async context, and on the
     /// same runtime everything else runs on.
     audio_rx: Mutex<Option<mpsc::Receiver<AudioOut>>>,
-    video_rx: Mutex<Option<mpsc::Receiver<(String, String, VideoPacket)>>>,
+    video_rx: Mutex<Option<mpsc::Receiver<VideoOut>>>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// Sequence for outbound clipboard frames (one stream per app run, like
@@ -293,6 +304,22 @@ pub struct Mesh {
     /// coming or going never renumbers a live stream's lane. The viewer is
     /// told the binding ([`RouteControl::VideoLane`]) and demuxes by it.
     video_lane_pins: Mutex<HashMap<String, u8>>,
+    /// Process-local incarnation of each outbound video route. Route ids are
+    /// intentionally stable across a rapid codec/source re-offer, so the id
+    /// alone cannot tell a queued AU from the capture instance that produced
+    /// it. The generation is never serialized: it only fences stale callbacks
+    /// and queued work before they reach the existing media plane.
+    video_route_generations: Mutex<VideoRouteGenerations>,
+    /// A very small, process-local guard around a screen switch. The viewer
+    /// tears the old display route down and offers the new one on separate
+    /// local node-control requests; a delayed duplicate teardown can therefore
+    /// land just after the successor activates. Route ids carry no incarnation,
+    /// so without this narrow fence that close tears down the brand-new
+    /// monitor and changing codec merely happens to start it again after the
+    /// race. Local duplicates are watch-confirmed inside 100 ms; inbound ones
+    /// wait a bounded 2.5 seconds for an existing ICE-path liveness control.
+    /// Nothing here is serialized and no new message is sent over any channel.
+    video_switch_guards: Mutex<VideoSwitchGuards>,
     /// **Viewer side:** the lane→route binding a streamer told us, per peer
     /// (canonical pubkey). Inbound H.264 on lane `L` from peer `P` belongs to
     /// `video_lane_binds[P][L]` — authoritative over the positional guess.
@@ -339,6 +366,10 @@ struct VideoWatcher {
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
     queue: std::collections::VecDeque<Vec<u8>>,
+    /// Updated by the window's 16 ms safety poll even when no frame arrived.
+    /// A post-disconnect-request poll is stronger liveness evidence than mere
+    /// watcher presence because `video_unwatch` is fire-and-forget.
+    last_poll: Instant,
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -404,6 +435,408 @@ const TERM_INIT_ROWS: u16 = 24;
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// One item on the shipped shared video queue. Generation and recovery
+/// metadata are strictly process-local: the packet still reaches the same
+/// established media sender with the same bytes and duration as before.
+type VideoOut = (String, String, u64, VideoPacket, u64, Arc<VideoRecovery>);
+
+#[derive(Default)]
+struct VideoRouteGenerations {
+    next: u64,
+    current: HashMap<String, u64>,
+}
+
+impl VideoRouteGenerations {
+    fn begin(&mut self, route_id: &str) -> (u64, Option<u64>) {
+        self.next = self.next.wrapping_add(1).max(1);
+        let generation = self.next;
+        let replaced = self.current.insert(route_id.to_string(), generation);
+        (generation, replaced)
+    }
+
+    fn retire(&mut self, route_id: &str) {
+        self.current.remove(route_id);
+    }
+
+    fn current(&self, route_id: &str) -> Option<u64> {
+        self.current.get(route_id).copied()
+    }
+
+    fn is_current(&self, route_id: &str, generation: u64) -> bool {
+        self.current
+            .get(route_id)
+            .is_some_and(|current| *current == generation)
+    }
+}
+
+/// A predecessor remains eligible to arm a switch guard for this long. The
+/// real switch is normally a few milliseconds; the wider retention only makes
+/// the bookkeeping tolerant of a loaded viewer. It does not widen the actual
+/// teardown-ignore window below.
+const VIDEO_SWITCH_PREDECESSOR_AGE: Duration = Duration::from_secs(2);
+/// Fence closes this soon after a display-switch successor starts. 100 ms is
+/// well above the 7 ms field failure while remaining a narrow intent check.
+/// Every duplicate inside the same window is fenced; none consumes the guard.
+const VIDEO_SWITCH_TEARDOWN_GUARD: Duration = Duration::from_millis(100);
+/// A poll that was already in flight when disconnect began is not proof. The
+/// window's safety loop runs every 16 ms, so require a poll at least two ticks
+/// later and observe for long enough that an active loop can produce one.
+const VIDEO_LOCAL_POLL_PROOF_MIN_AGE: Duration = Duration::from_millis(32);
+const VIDEO_LOCAL_POLL_OBSERVE: Duration = Duration::from_millis(80);
+/// A first close that races a just-started display successor waits briefly for
+/// proof that the replacement is alive. Viewer feedback is emitted at most two
+/// seconds apart, so 2.5 seconds covers one full beat without letting a genuine
+/// one-shot close strand an encoder indefinitely.
+const VIDEO_INBOUND_TEARDOWN_QUARANTINE: Duration = Duration::from_millis(2_500);
+/// Ignore an immediate, possibly already-in-flight feedback beat. A periodic
+/// viewer report that arrives after this floor is evidence produced by the
+/// replacement route, not merely setup traffic queued beside its offer.
+const VIDEO_TEARDOWN_LIVENESS_MIN_AGE: Duration = Duration::from_millis(250);
+/// Lifecycle entries outlive the 2.5-second quarantine but are pruned during
+/// later route activity, bounding the bookkeeping on long-running nodes.
+const VIDEO_SWITCH_BOOK_RETENTION: Duration = Duration::from_secs(10);
+
+struct StoppedVideoRoute {
+    peer: String,
+    sink: String,
+    at: Instant,
+}
+
+struct StartedVideoRoute {
+    peer: String,
+    /// The recent route whose stop made this start a display switch. It remains
+    /// readable for the whole narrow guard window so duplicate local/backend
+    /// calls cannot defeat the fence merely by racing one another.
+    predecessor: Option<String>,
+    at: Instant,
+    incarnation: u64,
+}
+
+struct PendingVideoTeardown {
+    token: u64,
+    armed_at: Instant,
+    incarnation: u64,
+}
+
+#[derive(Default)]
+struct VideoSwitchGuards {
+    stopped: HashMap<String, StoppedVideoRoute>,
+    started: HashMap<String, StartedVideoRoute>,
+    /// Early inbound teardown quarantines, route → opaque local token. An
+    /// mature periodic viewer report cancels the token; duplicate closes
+    /// coalesce behind the same bounded timer.
+    pending: HashMap<String, PendingVideoTeardown>,
+    next_pending: u64,
+    next_incarnation: u64,
+}
+
+struct VideoSwitchGuardHit {
+    predecessor: String,
+    age: Duration,
+    incarnation: u64,
+}
+
+enum InboundVideoTeardownGate {
+    Commit,
+    CoalesceDuplicate {
+        token: u64,
+    },
+    Quarantine {
+        predecessor: String,
+        age: Duration,
+        token: u64,
+        incarnation: u64,
+    },
+}
+
+impl VideoSwitchGuards {
+    fn note_stop(&mut self, route_id: &str, peer: &str, sink: &str, now: Instant) {
+        self.started.remove(route_id);
+        self.pending.remove(route_id);
+        self.started.retain(|_, start| {
+            now.saturating_duration_since(start.at) <= VIDEO_SWITCH_BOOK_RETENTION
+        });
+        self.stopped.retain(|_, stop| {
+            now.saturating_duration_since(stop.at) <= VIDEO_SWITCH_PREDECESSOR_AGE
+        });
+        self.stopped.insert(
+            route_id.to_string(),
+            StoppedVideoRoute {
+                peer: pubkey_part(peer).to_string(),
+                sink: sink.to_string(),
+                at: now,
+            },
+        );
+    }
+
+    fn note_start(&mut self, route_id: &str, peer: &str, sink: &str, now: Instant) {
+        // A real re-offer supersedes any old delayed-close timer for this
+        // deterministic route id.
+        self.pending.remove(route_id);
+        self.started.retain(|_, start| {
+            now.saturating_duration_since(start.at) <= VIDEO_SWITCH_BOOK_RETENTION
+        });
+        self.stopped.retain(|_, stop| {
+            now.saturating_duration_since(stop.at) <= VIDEO_SWITCH_PREDECESSOR_AGE
+        });
+        let peer = pubkey_part(peer).to_string();
+        // Prefer the newest matching predecessor. The same-id case is a codec
+        // re-offer; a different id with the same sink is a monitor switch.
+        let predecessor = self
+            .stopped
+            .iter()
+            .filter(|(_, stop)| stop.peer == peer && stop.sink == sink)
+            .max_by_key(|(_, stop)| stop.at)
+            .map(|(id, _)| id.clone());
+        self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
+        let incarnation = self.next_incarnation;
+        self.started.insert(
+            route_id.to_string(),
+            StartedVideoRoute {
+                peer,
+                predecessor,
+                at: now,
+                incarnation,
+            },
+        );
+    }
+
+    fn take_early_teardown(
+        &mut self,
+        route_id: &str,
+        peer: &str,
+        now: Instant,
+    ) -> Option<VideoSwitchGuardHit> {
+        let start = self.started.get_mut(route_id)?;
+        if start.peer != pubkey_part(peer) {
+            return None;
+        }
+        let age = now.saturating_duration_since(start.at);
+        if age > VIDEO_SWITCH_TEARDOWN_GUARD {
+            return None;
+        }
+        let predecessor = start.predecessor.clone()?;
+        Some(VideoSwitchGuardHit {
+            predecessor,
+            age,
+            incarnation: start.incarnation,
+        })
+    }
+
+    fn gate_inbound_teardown(
+        &mut self,
+        route_id: &str,
+        peer: &str,
+        now: Instant,
+    ) -> InboundVideoTeardownGate {
+        if let Some(pending) = self.pending.get(route_id) {
+            return InboundVideoTeardownGate::CoalesceDuplicate {
+                token: pending.token,
+            };
+        }
+        let Some(hit) = self.take_early_teardown(route_id, peer, now) else {
+            return InboundVideoTeardownGate::Commit;
+        };
+        let token = self.arm_pending(route_id, hit.incarnation, now);
+        InboundVideoTeardownGate::Quarantine {
+            predecessor: hit.predecessor,
+            age: hit.age,
+            token,
+            incarnation: hit.incarnation,
+        }
+    }
+
+    fn arm_pending(&mut self, route_id: &str, incarnation: u64, now: Instant) -> u64 {
+        self.next_pending = self.next_pending.wrapping_add(1).max(1);
+        let token = self.next_pending;
+        self.pending.insert(
+            route_id.to_string(),
+            PendingVideoTeardown {
+                token,
+                armed_at: now,
+                incarnation,
+            },
+        );
+        token
+    }
+
+    fn cancel_pending(&mut self, route_id: &str) -> Option<u64> {
+        self.pending.remove(route_id).map(|pending| pending.token)
+    }
+
+    fn cancel_pending_on_mature_liveness(&mut self, route_id: &str, now: Instant) -> Option<u64> {
+        let pending = self.pending.get(route_id)?;
+        if now.saturating_duration_since(pending.armed_at) < VIDEO_TEARDOWN_LIVENESS_MIN_AGE {
+            return None;
+        }
+        self.cancel_pending(route_id)
+    }
+
+    fn take_pending_if_current(&mut self, route_id: &str, token: u64, incarnation: u64) -> bool {
+        let pending_matches = self
+            .pending
+            .get(route_id)
+            .is_some_and(|pending| pending.token == token && pending.incarnation == incarnation);
+        let incarnation_matches = self
+            .started
+            .get(route_id)
+            .is_some_and(|started| started.incarnation == incarnation);
+        if !pending_matches || !incarnation_matches {
+            return false;
+        }
+        self.pending.remove(route_id);
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundVideoDisposition {
+    Accept,
+    /// The authenticated peer is sending for the correct display/video route,
+    /// but its first media beat outran Accept. Drop it quietly: rejecting a
+    /// stable route id here would tear down the same-id successor.
+    Pending,
+    Reject,
+}
+
+fn inbound_video_disposition_from_facts(
+    state: Option<&RouteState>,
+    video_media: bool,
+    sinks_here: bool,
+    sender_is_peer: bool,
+) -> InboundVideoDisposition {
+    if !video_media || !sinks_here || !sender_is_peer {
+        return InboundVideoDisposition::Reject;
+    }
+    match state {
+        Some(RouteState::Active) => InboundVideoDisposition::Accept,
+        Some(RouteState::Offered | RouteState::Incoming) => InboundVideoDisposition::Pending,
+        _ => InboundVideoDisposition::Reject,
+    }
+}
+
+/// The receiver's first sample must independently open a decoder reference
+/// chain. The daemon's `key` bit recognizes H.264 IDRs, while HEVC/AV1 entry
+/// AUs are identified by their parameter sets in the payload.
+fn should_hold_first_video_sample(first: bool, key: bool, data: &[u8]) -> bool {
+    first && !key && !crate::video_decode::is_decode_entry(data)
+}
+
+/// Queue-local recovery state shared by capture and its sender worker. The
+/// epoch prevents an older keyframe from declaring recovery after a newer
+/// drop: only a key produced in the current damage epoch and successfully
+/// handed to the existing media pipe can release dependent deltas.
+struct VideoRecovery {
+    route_id: String,
+    diag_key: String,
+    /// `(epoch << 1) | awaiting_key`. Keeping both facts in one atomic makes a
+    /// drop and a delivered-key decision indivisible: a stale key cannot land
+    /// between separate epoch/awaiting writes and falsely release deltas.
+    state: AtomicU64,
+    drops: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl VideoRecovery {
+    fn new(route_id: &str) -> Self {
+        Self {
+            route_id: route_id.to_string(),
+            diag_key: format!("video-recovery:{route_id}"),
+            state: AtomicU64::new(0),
+            drops: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
+    fn suppresses(&self, key: Option<bool>) -> bool {
+        suppress_dependent_after_drop(self.state.load(Ordering::Acquire) & 1 != 0, key)
+    }
+
+    fn note_suppressed(&self, mesh: &Mesh) {
+        let suppressed = self.suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+        if mesh.diag_ok(&self.diag_key) {
+            tracing::warn!(
+                "video queue recovery for {}: {} total drops, {suppressed} total dependent deltas suppressed; awaiting delivered IDR",
+                self.route_id,
+                self.drops.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    fn note_drop(&self, mesh: &Mesh, key: Option<bool>, reason: &str) {
+        let (arm, dropped, _) = self.mark_drop(key);
+        // The first loss starts recovery. A keyframe that itself fails must
+        // re-arm it; suppressed deltas never do, avoiding an IDR storm.
+        if arm {
+            mesh.video.force_idr(&self.route_id);
+        }
+        if mesh.diag_ok(&self.diag_key) {
+            tracing::warn!(
+                "video queue recovery for {}: {dropped} total drops ({reason}); {}",
+                self.route_id,
+                if arm {
+                    "IDR armed"
+                } else {
+                    "awaiting delivered IDR"
+                }
+            );
+        }
+    }
+
+    /// Advance the damage epoch and enter recovery. Returns whether the
+    /// encoder must be armed, the episode drop count, and the new epoch.
+    fn mark_drop(&self, key: Option<bool>) -> (bool, u64, u64) {
+        let mut old = self.state.load(Ordering::Acquire);
+        let (arm, epoch) = loop {
+            let was_awaiting = old & 1 != 0;
+            // A dependent unit that raced into a send before recovery began
+            // is covered by the repair already in flight. Advancing its epoch
+            // would stale that repair without arming a replacement.
+            if was_awaiting && key == Some(false) {
+                break (false, old >> 1);
+            }
+            let next_epoch = (old >> 1).wrapping_add(1);
+            let new = (next_epoch << 1) | 1;
+            match self
+                .state
+                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break (!was_awaiting || key == Some(true), next_epoch),
+                Err(actual) => old = actual,
+            }
+        };
+        let dropped = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
+        (arm, dropped, epoch)
+    }
+
+    fn note_key_delivered(&self, packet_epoch: u64) -> bool {
+        let recovering = (packet_epoch << 1) | 1;
+        if self
+            .state
+            .compare_exchange(
+                recovering,
+                packet_epoch << 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let drops = self.drops.load(Ordering::Relaxed);
+        let suppressed = self.suppressed.load(Ordering::Relaxed);
+        tracing::info!(
+            "video queue recovery for {}: IDR delivered (lifetime totals: {drops} drops, {suppressed} suppressed deltas)",
+            self.route_id
+        );
+        true
+    }
+}
+
 /// Auto-re-map after a site route is rejected: how many times to retry, and the
 /// base backoff (grown by the attempt number). ~11s of retrying across 5 tries
 /// — enough to ride out a KVM reconnect, few enough to give up (not loop) if the
@@ -455,13 +888,106 @@ struct State {
     profile: Option<NodeProfile>,
 }
 
+/// M2 — the pacer's requested-vs-actual gap ledger (a minute at a time),
+/// plus M1's daemon-write span (the pipe await per chunk).
+#[derive(Default)]
+struct PaceGapStats {
+    n: u64,
+    req_us: u64,
+    act_us: u64,
+    worst_over_us: u64,
+    over_1ms: u64,
+    write_us: u64,
+    writes: u64,
+    last_log: Option<Instant>,
+}
+
+/// M3 + T1.1 — one inbound video route's arrival measurement: the current
+/// chunk train being timed, the dispersion-derived bandwidth estimate,
+/// and the one-way-delay trend window.
+struct ArrivalState {
+    /// The train in progress (chunks sharing one RTP timestamp).
+    ts: u32,
+    first: Instant,
+    last: Instant,
+    bytes: usize,
+    chunks: u32,
+    /// EWMA of per-train dispersion samples (kbps); 0 = none yet. What a
+    /// timed train measures is min(sender's drain rate, bottleneck) —
+    /// exactly the number a closed loop can act on.
+    est_kbps: f64,
+    /// This minute's samples (Mbps) for the log line's percentiles.
+    window: Vec<f64>,
+    /// (arrival, relative one-way delay µs) over the last ~2 s — the
+    /// slope is a standing queue growing before loss says so. Clock skew
+    /// between the sender's RTP clock and our monotonic is ppm-scale,
+    /// two orders under the trend threshold.
+    owd: std::collections::VecDeque<(Instant, i64)>,
+    /// Wall/RTP anchor for the relative delay; re-anchored periodically
+    /// so u32 RTP wrap (~13 h) never crosses a window.
+    base: Option<(Instant, u32)>,
+    last_log: Instant,
+}
+
+/// Keep pacing inside the route's actual frame slot. The configured budget is
+/// still the ceiling at ordinary frame rates; high-refresh streams get 90% of
+/// one frame so pacing can never create a standing frame of sender latency.
+fn pace_budget(configured_ms: u64, fps: u32) -> std::time::Duration {
+    let configured_us = configured_ms.saturating_mul(1_000);
+    let frame_us = 900_000 / u64::from(fps.max(1));
+    std::time::Duration::from_micros(configured_us.min(frame_us).max(1))
+}
+
+/// Cap a requested gap to the AU's absolute pacing deadline. Pipe-lock and
+/// write waits consume the same budget, so contention can shorten or remove a
+/// later sleep but can never add a standing frame of deliberate pacing delay.
+fn pace_gap_until(
+    deadline: Instant,
+    now: Instant,
+    requested: std::time::Duration,
+) -> std::time::Duration {
+    requested.min(deadline.saturating_duration_since(now))
+}
+
+fn suppress_dependent_after_drop(awaiting_key: bool, key: Option<bool>) -> bool {
+    awaiting_key && key == Some(false)
+}
+
+/// Execute one pacing gap against a deadline: bulk asynchronously (the
+/// worker stays free for audio interleave), finish with the precise
+/// sleeper so 100–1500 µs requests are real instead of timer-wheel
+/// millisecond roundings. Falls back to the plain async sleep on a
+/// current-thread runtime (tests), where blocking a worker would deadlock.
+async fn paced_gap(gap: std::time::Duration) {
+    let deadline = Instant::now() + gap;
+    let precise_ok = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    loop {
+        let now = Instant::now();
+        let Some(rem) = deadline.checked_duration_since(now) else {
+            return;
+        };
+        if rem > std::time::Duration::from_millis(3) {
+            tokio::time::sleep(rem - std::time::Duration::from_millis(2)).await;
+            continue;
+        }
+        if precise_ok {
+            tokio::task::block_in_place(|| crate::os_perf::precise_sleep(rem));
+        } else {
+            tokio::time::sleep(rem).await;
+        }
+        return;
+    }
+}
+
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
         // Shallow queues both: at most a few frames in flight, so a slow
         // link sheds load by dropping captures rather than growing latency.
         // Audio's 8 buffers are ~160 ms of slack.
         let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, video_rx) = mpsc::channel::<(String, String, VideoPacket)>(4);
+        let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -470,6 +996,8 @@ impl Mesh {
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
             video_decode: Arc::new(DecodeBridge::new()),
+            pace_gaps: Mutex::new(PaceGapStats::default()),
+            video_arrivals: Mutex::new(HashMap::new()),
             injector: Injector::new(),
             terminal: TerminalHost::new(),
             term_seq: AtomicU64::new(0),
@@ -527,6 +1055,8 @@ impl Mesh {
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
             daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
             video_lane_pins: Mutex::new(HashMap::new()),
+            video_route_generations: Mutex::new(VideoRouteGenerations::default()),
+            video_switch_guards: Mutex::new(VideoSwitchGuards::default()),
             video_lane_binds: Mutex::new(HashMap::new()),
             disabled_networks: Mutex::new(None),
             cec: crate::cec::Cec::new(crate::cec::consent_store_path()),
@@ -606,50 +1136,14 @@ impl Mesh {
             let mesh = self.clone();
             crate::spawn(async move {
                 let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, route_id, packet)) = video_rx.recv().await {
-                    let outcome = match packet {
-                        // An MJPEG frame above the data channel's message
-                        // ceiling travels as several chunks sharing a seq.
-                        VideoPacket::Jpeg(frame) => {
-                            let mut result = Ok(());
-                            for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
-                                let Ok(payload) = serde_json::to_value(&chunk) else {
-                                    continue;
-                                };
-                                if let Err(e) = mesh.send_media_value(&peer, payload).await {
-                                    result = Err(e);
-                                    break; // rest of this frame is pointless
-                                }
-                            }
-                            result
-                        }
-                        // An H.264 access unit rides the mesh's RTP track
-                        // lane — no chunking (RTP packetizes), no ceiling.
-                        VideoPacket::H264 { data, duration_us } => {
-                            match mesh.video_lane(&route_id, &peer, true) {
-                                Some(lane) => {
-                                    mesh.send_video_track(&peer, lane, data, duration_us).await
-                                }
-                                // No lane for this route right now — it has
-                                // just torn down, or another of this peer's
-                                // streams pushed it past the lane pool. DROP
-                                // the unit: the old `.unwrap_or(0)` shipped it
-                                // on lane 0, the receiver's *first* route, so a
-                                // second monitor's pixels surfaced in the first
-                                // monitor's window (the intermittent
-                                // wrong-window flash). The decoder re-lands the
-                                // moment the route is back on a lane (next IDR).
-                                None => {
-                                    if mesh.diag_ok(&format!("nolane:{route_id}")) {
-                                        tracing::debug!(
-                                            "no video lane for {route_id} right now; dropping H.264 unit"
-                                        );
-                                    }
-                                    Ok(())
-                                }
-                            }
-                        }
-                    };
+                while let Some((peer, route_id, generation, packet, epoch, recovery)) =
+                    video_rx.recv().await
+                {
+                    let outcome = mesh
+                        .forward_video_packet(
+                            &peer, &route_id, generation, packet, epoch, &recovery,
+                        )
+                        .await;
                     if let Err(e) = outcome {
                         if last_warn.elapsed() >= WARN_EVERY {
                             last_warn = std::time::Instant::now();
@@ -667,6 +1161,81 @@ impl Mesh {
     /// message too large) still reaches a log — the pipe's response drain
     /// warns on refusals instead of this path stalling a round trip per
     /// chunk to hear them.
+    /// Deliver one packet through the same established media functions used by
+    /// the shipped shared worker. Labs scheduling changes only which bounded
+    /// queue owns the packet; it does not introduce a channel, request, or
+    /// signaling operation.
+    async fn forward_video_packet(
+        &self,
+        peer: &str,
+        route_id: &str,
+        generation: u64,
+        packet: VideoPacket,
+        packet_epoch: u64,
+        recovery: &VideoRecovery,
+    ) -> Result<(), String> {
+        if !self.video_generation_is_current(route_id, generation) {
+            tracing::debug!(
+                "discarding stale video AU for {route_id} generation {generation} before media send"
+            );
+            return Ok(());
+        }
+        match packet {
+            VideoPacket::Jpeg(frame) => {
+                for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
+                    // Teardown/re-offer can run while a large frame is being
+                    // chunked. Stop at the first generation change so the
+                    // predecessor cannot finish onto the successor's reused
+                    // fixed track.
+                    if !self.video_generation_is_current(route_id, generation) {
+                        tracing::debug!(
+                            "stopping stale JPEG AU for {route_id} generation {generation} during media send"
+                        );
+                        return Ok(());
+                    }
+                    let Ok(payload) = serde_json::to_value(&chunk) else {
+                        continue;
+                    };
+                    self.send_media_value(peer, payload).await?;
+                }
+                Ok(())
+            }
+            VideoPacket::H264 {
+                data,
+                key,
+                duration_us,
+            } => {
+                // Capture cannot retract deltas already in the queue when a
+                // newer packet is dropped. Re-check at dequeue so none cross
+                // the missing reference before the delivered repair key.
+                if recovery.suppresses(Some(key)) {
+                    recovery.note_suppressed(self);
+                    return Ok(());
+                }
+                let Some(lane) = self.video_lane(route_id, peer, true) else {
+                    recovery.note_drop(self, Some(key), "no route lane");
+                    return Ok(());
+                };
+                let pace = self.video.route_pace(route_id);
+                match self
+                    .send_video_paced(peer, route_id, generation, lane, &data, duration_us, pace)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(e) => {
+                        recovery.note_drop(self, Some(key), "media send failed");
+                        return Err(e);
+                    }
+                }
+                if key {
+                    recovery.note_key_delivered(packet_epoch);
+                }
+                Ok(())
+            }
+        }
+    }
+
     async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
@@ -682,13 +1251,272 @@ impl Mesh {
             .map_err(|e| e.to_string())
     }
 
+    /// Send one H.264 access unit, paced when the dial is on: the unit is
+    /// split at slice-NAL boundaries into ≤[`video::PACE_SLICE_BYTES`]
+    /// chunks and each chunk goes out as its own track send, spaced by a
+    /// small gap — on the wire, one keyframe's back-to-back packet wall
+    /// becomes a few ~20-packet bursts a shallow bottleneck queue can
+    /// absorb. Non-final chunks carry `duration_us = 0`, so every chunk
+    /// shares one RTP timestamp. These samples are fragments of one access
+    /// unit, not independent pictures; the feature is opt-in until every
+    /// receive path has complete-AU finality/reassembly. This task is the route's only video
+    /// sender, so chunk order is inherent; the gaps also release the
+    /// pipe's writer between chunks, letting audio frames interleave
+    /// instead of queueing behind a keyframe. A mid-unit send failure
+    /// surfaces like any send failure; receiver recovery must discard the
+    /// incomplete access unit and request a clean entry.
+    ///
+    /// The drain model is link-fitted: on a LAN the historical 800 Mbps
+    /// shape (shallow-buffer smoothing, budget 6/10 ms) stands; on a
+    /// WAN-class path the spread rate is the route's OWN send bitrate
+    /// ×1.5 with a one-frame-interval budget — spreading a wall across
+    /// its own frame slot adds zero pipeline latency by definition, while
+    /// the old constants handed a 40 Mbps path a ~2-frame standing queue
+    /// per keyframe (a ~190 KB wall in 1.7 ms is an instantaneous
+    /// ~890 Mbps). `ALLMYSTUFF_PACE_DRAIN_MBPS` pins the drain for A/B.
+    /// Gaps are executed against a deadline with [`os_perf::precise_sleep`]
+    /// under the hood — the requested spacing is real now, not
+    /// timer-wheel-rounded — and every gap is ledgered (the `pace gaps`
+    /// line, one per minute).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_video_paced(
+        &self,
+        peer: &str,
+        route_id: &str,
+        generation: u64,
+        lane: u8,
+        data: &[u8],
+        duration_us: u64,
+        pace: (bool, bool, u32, u32),
+    ) -> Result<bool, String> {
+        let current = || self.video_generation_is_current(route_id, generation);
+        if !crate::video::paced_slices_enabled() {
+            if !current() {
+                return Ok(false);
+            }
+            self.send_video_track(peer, lane, data, duration_us).await?;
+            return Ok(true);
+        }
+        let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
+        if chunks.len() < 2 {
+            if !current() {
+                return Ok(false);
+            }
+            self.send_video_track(peer, lane, data, duration_us).await?;
+            return Ok(true);
+        }
+        // (game posture, WAN-class path, current send rate bps) — the
+        // shape `VideoBridge::route_pace` hands the forwarder.
+        let (game, wan, rate_bps, fps) = pace;
+        static DRAIN_OVERRIDE_MBPS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            std::env::var("ALLMYSTUFF_PACE_DRAIN_MBPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        // (drain bps, per-gap cap µs, whole-AU budget ms).
+        let (drain_bps, gap_cap_us, budget_ms) = if *DRAIN_OVERRIDE_MBPS > 0 {
+            (*DRAIN_OVERRIDE_MBPS * 1_000_000, 8_000, 16)
+        } else if wan && rate_bps > 0 {
+            // The link is asked to carry `rate_bps` steady-state; walls
+            // spread at 1.5× that (peaks are real) across at most one
+            // frame interval.
+            ((rate_bps as u64) * 3 / 2, 8_000, 16)
+        } else if game {
+            (800_000_000, 1_000, 6)
+        } else {
+            (800_000_000, 1_500, 10)
+        };
+        let total_budget = pace_budget(budget_ms, fps);
+        let budget_each = total_budget / (chunks.len() as u32 - 1);
+        let pace_deadline = Instant::now() + total_budget;
+        let last = chunks.len() - 1;
+        let mut ledger: Vec<(u64, u64)> = Vec::with_capacity(last);
+        // M1's pace+write split: gap time is the ledger above; this is
+        // the daemon-pipe await itself — if the daemon ever backpressures
+        // (wedged reader, saturated socket), it shows here first.
+        let (mut write_us, mut writes) = (0u64, 0u64);
+        for (i, range) in chunks.into_iter().enumerate() {
+            if !current() {
+                tracing::debug!(
+                    "stopping stale H.264 AU for {route_id} generation {generation} during paced media send"
+                );
+                return Ok(false);
+            }
+            let dur = if i == last { duration_us } else { 0 };
+            let sent_bytes = range.len();
+            let tw = Instant::now();
+            self.send_video_track(peer, lane, &data[range], dur).await?;
+            write_us += tw.elapsed().as_micros() as u64;
+            writes += 1;
+            if i != last {
+                let drain_us =
+                    (sent_bytes as u64 * 8_000_000 / drain_bps.max(1)).clamp(100, gap_cap_us);
+                let requested = std::time::Duration::from_micros(drain_us).min(budget_each);
+                // The shared media writer is the final serialization point.
+                // Time waiting for it consumes this AU's pacing slot; never
+                // sleep the full nominal gap after that budget has elapsed.
+                let gap = pace_gap_until(pace_deadline, Instant::now(), requested);
+                if !gap.is_zero() {
+                    let t0 = std::time::Instant::now();
+                    paced_gap(gap).await;
+                    ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
+                }
+            }
+        }
+        self.note_pace_gaps(&ledger, write_us, writes);
+        Ok(true)
+    }
+
+    /// Fold one delivered video sample into the route's arrival state:
+    /// time the chunk train it belongs to (same RTP timestamp), and when
+    /// a new train opens, finalize the previous one into the bandwidth
+    /// estimate, the delay-trend window, and the minute log (M3 + T1.1).
+    fn note_video_arrival(&self, route_id: &str, rtp_timestamp: u32, bytes: usize) {
+        let now = Instant::now();
+        let mut map = self.video_arrivals.lock();
+        let st = map
+            .entry(route_id.to_string())
+            .or_insert_with(|| ArrivalState {
+                ts: rtp_timestamp,
+                first: now,
+                last: now,
+                bytes: 0,
+                chunks: 0,
+                est_kbps: 0.0,
+                window: Vec::new(),
+                owd: std::collections::VecDeque::new(),
+                base: None,
+                last_log: now,
+            });
+        if st.ts != rtp_timestamp && st.chunks > 0 {
+            // Train complete. Dispersion needs ≥3 timed chunks and a
+            // non-degenerate spread to say anything about rate.
+            let spread_us = st.last.duration_since(st.first).as_micros() as u64;
+            if st.chunks >= 3 && spread_us >= 300 {
+                let mbps = (st.bytes as f64 * 8.0) / spread_us as f64;
+                st.window.push(mbps);
+                let kbps = mbps * 1000.0;
+                st.est_kbps = if st.est_kbps <= 0.0 {
+                    kbps
+                } else {
+                    st.est_kbps * 0.8 + kbps * 0.2
+                };
+            }
+            // One-way-delay trend: relative delay of this train's FIRST
+            // chunk vs the anchor, windowed to ~2 s.
+            let (base_wall, base_rtp) = *st.base.get_or_insert((st.first, st.ts));
+            let rtp_delta_us = i64::from(st.ts.wrapping_sub(base_rtp) as i32) * 1000 / 90;
+            let wall_delta_us = st.first.duration_since(base_wall).as_micros() as i64;
+            st.owd.push_back((st.first, wall_delta_us - rtp_delta_us));
+            while st
+                .owd
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(2))
+            {
+                st.owd.pop_front();
+            }
+            // Re-anchor every ~5 min: RTP u32 wraps at ~13 h, and the
+            // relative math must never straddle it.
+            if st.first.duration_since(base_wall) > Duration::from_secs(300) {
+                st.base = Some((st.first, st.ts));
+                st.owd.clear();
+            }
+            if st.last_log.elapsed() >= Duration::from_secs(60) && !st.window.is_empty() {
+                st.window.sort_by(f64::total_cmp);
+                let p = |q: f64| st.window[((st.window.len() - 1) as f64 * q) as usize];
+                tracing::info!(
+                    "video in {route_id}: chunk-trains {} · implied p5 {:.1} · p50 {:.1} Mbps · est {:.1} Mbps · delay trend {:+} µs/s",
+                    st.window.len(),
+                    p(0.05),
+                    p(0.50),
+                    st.est_kbps / 1000.0,
+                    Self::owd_trend_us_per_s(&st.owd),
+                );
+                st.window.clear();
+                st.last_log = now;
+            }
+            (st.ts, st.first, st.bytes, st.chunks) = (rtp_timestamp, now, 0, 0);
+        } else if st.chunks == 0 {
+            (st.ts, st.first) = (rtp_timestamp, now);
+        }
+        st.last = now;
+        st.bytes += bytes;
+        st.chunks += 1;
+    }
+
+    /// The delay-trend slope over the window: µs of added one-way delay
+    /// per second, endpoint-to-endpoint. Coarse on purpose — the signal
+    /// that matters is "tens of milliseconds per second", not noise.
+    fn owd_trend_us_per_s(owd: &std::collections::VecDeque<(Instant, i64)>) -> i32 {
+        let (Some((t0, d0)), Some((t1, d1))) = (owd.front(), owd.back()) else {
+            return 0;
+        };
+        let span = t1.duration_since(*t0).as_secs_f64();
+        if span < 0.5 {
+            return 0;
+        }
+        (((d1 - d0) as f64) / span) as i32
+    }
+
+    /// The estimator's current answer for a route: `(est_kbps, trend)`,
+    /// zeros when unknown — what [`Self::send_video_feedback`] attaches.
+    fn route_link_estimate(&self, route_id: &str) -> (u32, i32) {
+        let map = self.video_arrivals.lock();
+        let Some(st) = map.get(route_id) else {
+            return (0, 0);
+        };
+        (st.est_kbps as u32, Self::owd_trend_us_per_s(&st.owd))
+    }
+
+    /// Fold one AU's gap + daemon-write measurements into the minute
+    /// ledger and emit the `pace gaps` line when it's due — M2's honesty
+    /// check on the pacer plus M1's pace/write split.
+    fn note_pace_gaps(&self, ledger: &[(u64, u64)], write_us: u64, writes: u64) {
+        if ledger.is_empty() && writes == 0 {
+            return;
+        }
+        let mut g = self.pace_gaps.lock();
+        for &(req, act) in ledger {
+            g.n += 1;
+            g.req_us += req;
+            g.act_us += act;
+            let over = act.saturating_sub(req);
+            g.worst_over_us = g.worst_over_us.max(over);
+            if over > 1_000 {
+                g.over_1ms += 1;
+            }
+        }
+        g.write_us += write_us;
+        g.writes += writes;
+        let due = g
+            .last_log
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+            .unwrap_or(true);
+        if due && g.n > 0 {
+            tracing::info!(
+                "pace gaps: {} gaps · requested avg {} µs → actual avg {} µs · worst +{:.1} ms · >1 ms err {:.2}% · daemon write avg {} µs/chunk",
+                g.n,
+                g.req_us / g.n,
+                g.act_us / g.n,
+                g.worst_over_us as f64 / 1000.0,
+                g.over_1ms as f64 * 100.0 / g.n as f64,
+                g.write_us / g.writes.max(1),
+            );
+            *g = PaceGapStats {
+                last_log: Some(std::time::Instant::now()),
+                ..PaceGapStats::default()
+            };
+        }
+    }
+
     /// Send one H.264 access unit to `peer` over the daemon's video track
     /// lane — raw binary on the control socket (no base64), RTP on the wire.
     async fn send_video_track(
         &self,
         peer: &str,
         lane: u8,
-        data: Vec<u8>,
+        data: &[u8],
         duration_us: u64,
     ) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
@@ -698,7 +1526,7 @@ impl Mesh {
         // base64 video_send op (so an older daemon still streams).
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
             self.media_track_pipe
-                .send_video(&network, pubkey_part(peer), lane, duration_us, &data)
+                .send_video(&network, pubkey_part(peer), lane, duration_us, data)
                 .await
                 .map_err(|e| e.to_string())
         } else {
@@ -709,7 +1537,7 @@ impl Mesh {
                     peer: pubkey_part(peer).to_string(),
                     stream: lane,
                     duration_us,
-                    data: base64::engine::general_purpose::STANDARD.encode(&data),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -2091,6 +2919,153 @@ impl Mesh {
                             return;
                         }
                     }
+                    // Only a periodic viewer report produced after the close's
+                    // minimum age proves the replacement survived. One-shot
+                    // Offer/Accept/Tune/Lane controls can already be in flight
+                    // and are deliberately not treated as liveness.
+                    if let Some(route_id) = inbound_video_feedback_liveness_route_id(&msg) {
+                        if let Some(token) = self.cancel_pending_video_teardown(route_id, &from) {
+                            tracing::warn!(
+                                route = %route_id,
+                                from = %short_id(&from),
+                                network = %network,
+                                token,
+                                disposition = "quarantine_canceled_by_liveness",
+                                "inbound video route control"
+                            );
+                        }
+                    }
+
+                    // Teardown used to be the one destructive route control
+                    // that was not peer-checked. Authentication, guard choice,
+                    // and (when committing) Session mutation are one state-lock
+                    // transaction, so a same-id replacement cannot enter in
+                    // between and be killed by an old peer message.
+                    if let ControlMessage::Route(RouteControl::Teardown { route_id }) = &msg {
+                        let (facts, gate, effects) = {
+                            let mut st = self.state.lock();
+                            let Some(session) = st.session.as_mut() else {
+                                return;
+                            };
+                            let facts = session.route(route_id).map(|r| {
+                                (r.peer.as_str().to_string(), r.state.clone(), r.route.media)
+                            });
+                            if facts
+                                .as_ref()
+                                .is_some_and(|(peer, _, _)| pubkey_part(peer) != pubkey_part(&from))
+                            {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    expected = %facts.as_ref().map(|f| short_id(&f.0)).unwrap_or_default(),
+                                    disposition = "foreign_peer_refused",
+                                    "inbound route teardown"
+                                );
+                                return;
+                            }
+                            let eligible = facts.as_ref().is_some_and(|(_, state, media)| {
+                                *state == RouteState::Active
+                                    && matches!(media, MediaKind::Display | MediaKind::Video)
+                            });
+                            let gate = if eligible {
+                                self.video_switch_guards.lock().gate_inbound_teardown(
+                                    route_id,
+                                    &from,
+                                    Instant::now(),
+                                )
+                            } else {
+                                InboundVideoTeardownGate::Commit
+                            };
+                            let effects = if matches!(gate, InboundVideoTeardownGate::Commit) {
+                                session.handle(
+                                    NodeId::from(from.as_str()),
+                                    ControlMessage::Route(RouteControl::Teardown {
+                                        route_id: route_id.clone(),
+                                    }),
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            (facts, gate, effects)
+                        };
+                        let generation = self.video_route_generations.lock().current(route_id);
+                        let state_before = facts.as_ref().map(|(_, state, _)| state);
+                        let media = facts.as_ref().map(|(_, _, media)| media);
+                        match gate {
+                            InboundVideoTeardownGate::Quarantine {
+                                predecessor,
+                                age,
+                                token,
+                                incarnation,
+                            } => {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    predecessor = %predecessor,
+                                    age_us = age.as_micros(),
+                                    token,
+                                    incarnation,
+                                    quarantine_ms = VIDEO_INBOUND_TEARDOWN_QUARANTINE.as_millis(),
+                                    disposition = "quarantined",
+                                    "inbound route teardown"
+                                );
+                                let mesh = self.clone();
+                                let route_id = route_id.clone();
+                                crate::spawn(async move {
+                                    mesh.commit_quarantined_video_teardown(
+                                        route_id,
+                                        from,
+                                        network,
+                                        token,
+                                        incarnation,
+                                    )
+                                    .await;
+                                });
+                                return;
+                            }
+                            InboundVideoTeardownGate::CoalesceDuplicate { token } => {
+                                tracing::warn!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    token,
+                                    disposition = "duplicate_coalesced",
+                                    "inbound route teardown"
+                                );
+                                return;
+                            }
+                            InboundVideoTeardownGate::Commit => {
+                                tracing::info!(
+                                    route = %route_id,
+                                    from = %short_id(&from),
+                                    network = %network,
+                                    state_before = ?state_before,
+                                    media = ?media,
+                                    generation = ?generation,
+                                    disposition = "commit",
+                                    "inbound route teardown"
+                                );
+                                self.process_effects(effects).await;
+                                self.emit_snapshot();
+                                return;
+                            }
+                        }
+                    } else if let ControlMessage::Route(RouteControl::Reject { route_id, reason }) =
+                        &msg
+                    {
+                        tracing::info!(
+                            "inbound route reject for {route_id} from {}: {reason}",
+                            short_id(&from)
+                        );
+                    }
                     // Site management (list a co-owned machine's sites,
                     // re-expose them) and the terminal-sessions picker plane
                     // (list this host's open shells, the host's answer) ride
@@ -2201,14 +3176,25 @@ impl Mesh {
                         // first complete frame of a stream is logged so
                         // "connected but no pixels" is attributable from
                         // this side too.
-                        if !self.inbound_video_ok(&frame.route, &from) {
-                            tracing::debug!(
-                                "dropped video frame for {} from {} (route not live here)",
-                                frame.route,
-                                short_id(&from)
-                            );
-                            self.nack_dead_route(&from, &frame.route);
-                            return;
+                        match self.inbound_video_disposition(&frame.route, &from) {
+                            InboundVideoDisposition::Accept => {}
+                            InboundVideoDisposition::Pending => {
+                                tracing::debug!(
+                                    "early video frame for {} from {} dropped while route activation is pending",
+                                    frame.route,
+                                    short_id(&from)
+                                );
+                                return;
+                            }
+                            InboundVideoDisposition::Reject => {
+                                tracing::debug!(
+                                    "dropped video frame for {} from {} (route not live here)",
+                                    frame.route,
+                                    short_id(&from)
+                                );
+                                self.nack_dead_route(&from, &frame.route);
+                                return;
+                            }
                         }
                         let full = { self.video_in.lock().push(frame) };
                         if let Some(full) = full {
@@ -2348,27 +3334,219 @@ impl Mesh {
     /// the host-side pinned track lane (freeing it for the next stream), and
     /// the viewer-side lane→route binding.
     fn release_video_lanes(self: &Arc<Self>, route_id: &str) {
+        self.note_video_route_stopped(route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
-        // Host side: free the pinned lane so a later stream can reuse it —
-        // and tell the daemon (≥ 0.2.34) to close it, so the RTP track and
-        // its m-line stop existing the moment the route ends instead of
-        // idling on the connection forever. Best-effort + idempotent: an
-        // older daemon just errors the unknown op and the local free is
-        // still correct.
-        let pinned = self.video_lane_pins.lock().remove(route_id);
-        if let Some(lane) = pinned {
-            if let Some(peer) = self.route_peer(route_id) {
-                self.close_daemon_media_lane(&peer, "video", lane);
-            }
-        }
+        // Invalidate queued capture callbacks before freeing the pin. Route
+        // ids are stable across a re-offer; without this fence, old AUs can be
+        // dequeued onto the successor's newly claimed lane.
+        self.video_route_generations.lock().retire(route_id);
+        // Host side: free the local pin so a later stream can reuse it. Keep
+        // the daemon's fixed video track alive until its peer connection ends.
+        // Closing it asynchronously here has an ABA race: a same-id re-offer
+        // can reclaim lane N before the old MediaLaneClose arrives, and that
+        // late close then destroys the replacement stream. Reusing the idle
+        // fixed lane is both cheaper and generation-safe.
+        self.video_lane_pins.lock().remove(route_id);
         // Viewer side: drop any lane binding that pointed at this route.
         let mut binds = self.video_lane_binds.lock();
         for per_peer in binds.values_mut() {
             per_peer.retain(|_, r| r != route_id);
         }
         binds.retain(|_, per_peer| !per_peer.is_empty());
+    }
+
+    /// Record both ends of a video route's local lifecycle. These timestamps
+    /// never leave this process; they only recognize the tiny old-screen →
+    /// new-screen handoff in which a duplicate close can otherwise kill the
+    /// successor before its first capture frame.
+    fn note_video_route_started(&self, route: &Route) {
+        if !matches!(route.media, MediaKind::Display | MediaKind::Video) {
+            return;
+        }
+        let Some(peer) = self.route_peer(&route.id) else {
+            return;
+        };
+        self.video_switch_guards.lock().note_start(
+            &route.id,
+            &peer,
+            route.to.as_str(),
+            Instant::now(),
+        );
+    }
+
+    fn note_video_route_stopped(&self, route_id: &str) {
+        let facts = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .and_then(|s| s.route(route_id))
+                .filter(|r| matches!(r.route.media, MediaKind::Display | MediaKind::Video))
+                .map(|r| (r.peer.as_str().to_string(), r.route.to.as_str().to_string()))
+        };
+        let Some((peer, sink)) = facts else { return };
+        self.video_switch_guards
+            .lock()
+            .note_stop(route_id, &peer, &sink, Instant::now());
+    }
+
+    /// Read the narrow switch guard for an authenticated, currently-live
+    /// display route. Call this before mutating the session to TornDown: after
+    /// that mutation the replacement is indistinguishable from its predecessor
+    /// by route id alone.
+    fn take_early_video_teardown_guard(&self, route_id: &str) -> Option<VideoSwitchGuardHit> {
+        let peer = {
+            let st = self.state.lock();
+            let route = st.session.as_ref()?.route(route_id)?;
+            if !matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                || route.state != RouteState::Active
+            {
+                return None;
+            }
+            route.peer.as_str().to_string()
+        };
+        self.video_switch_guards
+            .lock()
+            .take_early_teardown(route_id, &peer, Instant::now())
+    }
+
+    /// Cancel a quarantined close only when the same authenticated peer emits a
+    /// periodic report for the active route after the in-flight-control floor.
+    /// Feedback is an existing app control carried on the ICE data path; no new
+    /// wire or signaling message is introduced.
+    fn cancel_pending_video_teardown(&self, route_id: &str, from: &str) -> Option<u64> {
+        let st = self.state.lock();
+        let live = st
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .is_some_and(|route| {
+                route.state == RouteState::Active
+                    && matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                    && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+            });
+        live.then(|| {
+            self.video_switch_guards
+                .lock()
+                .cancel_pending_on_mature_liveness(route_id, Instant::now())
+        })
+        .flatten()
+    }
+
+    /// A new local offer is an explicit replacement action, not a duplicate
+    /// control delivery. Cancel its predecessor's delayed close before the
+    /// local Session overwrites the deterministic route id.
+    fn cancel_pending_video_teardown_replaced(&self, route_id: &str, from: &str) -> Option<u64> {
+        let st = self.state.lock();
+        let same_peer = st
+            .session
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .is_some_and(|route| pubkey_part(route.peer.as_str()) == pubkey_part(from));
+        same_peer
+            .then(|| self.video_switch_guards.lock().cancel_pending(route_id))
+            .flatten()
+    }
+
+    /// Apply a quarantined peer close after its grace period. This folds the
+    /// original message through the session exactly once but deliberately does
+    /// not call `disconnect`: echoing a new Teardown would turn a receive-side
+    /// lifecycle decision into another wire message.
+    async fn commit_quarantined_video_teardown(
+        self: &Arc<Self>,
+        route_id: String,
+        from: String,
+        network: String,
+        token: u64,
+        incarnation: u64,
+    ) {
+        tokio::time::sleep(VIDEO_INBOUND_TEARDOWN_QUARANTINE).await;
+        let (effects, state_before, media) = {
+            let mut st = self.state.lock();
+            let Some(session) = st.session.as_mut() else {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            };
+            let Some(route) = session.route(&route_id) else {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            };
+            if route.state != RouteState::Active
+                || !matches!(route.route.media, MediaKind::Display | MediaKind::Video)
+                || pubkey_part(route.peer.as_str()) != pubkey_part(&from)
+            {
+                self.video_switch_guards.lock().take_pending_if_current(
+                    &route_id,
+                    token,
+                    incarnation,
+                );
+                return;
+            }
+            if !self.video_switch_guards.lock().take_pending_if_current(
+                &route_id,
+                token,
+                incarnation,
+            ) {
+                return;
+            }
+            let state_before = route.state.clone();
+            let media = route.route.media;
+            let effects = session.handle(
+                NodeId::from(from.as_str()),
+                ControlMessage::Route(RouteControl::Teardown {
+                    route_id: route_id.clone(),
+                }),
+            );
+            (effects, state_before, media)
+        };
+        let generation = self.video_route_generations.lock().current(&route_id);
+        tracing::warn!(
+            route = %route_id,
+            from = %short_id(&from),
+            network = %network,
+            state_before = ?state_before,
+            media = ?media,
+            generation = ?generation,
+            token,
+            incarnation,
+            disposition = "quarantine_expired_commit",
+            "inbound route teardown"
+        );
+        self.process_effects(effects).await;
+        self.emit_snapshot();
+    }
+
+    /// Allocate this actual `StartMedia` effect's process-local incarnation.
+    /// The session state machine suppresses duplicate starts under its lock;
+    /// therefore every effect reaching this boundary is a real start and must
+    /// supersede any same-id predecessor even when a stale stop was correctly
+    /// ignored before it could retire the old generation.
+    fn begin_video_generation(&self, route_id: &str) -> u64 {
+        let mut generations = self.video_route_generations.lock();
+        let (generation, replaced) = generations.begin(route_id);
+        if let Some(old) = replaced {
+            tracing::warn!(
+                "video route generation {old} replaced by {generation} for same-id successor {route_id}"
+            );
+        } else {
+            tracing::info!("video route generation {generation} started for {route_id}");
+        }
+        generation
+    }
+
+    fn video_generation_is_current(&self, route_id: &str, generation: u64) -> bool {
+        self.video_route_generations
+            .lock()
+            .is_current(route_id, generation)
     }
 
     /// Ask the daemon to close a media lane toward `peer` — the
@@ -2565,22 +3743,49 @@ impl Mesh {
             return;
         };
         self.clear_dead_lane(from, "video", stream);
-        if !self.inbound_video_ok(&route_id, from) {
-            if self.diag_ok(&format!("gate:{route_id}")) {
-                tracing::warn!(
-                    "H.264 samples for {route_id} refused — {}",
-                    self.route_diag(&route_id, from)
-                );
+        match self.inbound_video_disposition(&route_id, from) {
+            InboundVideoDisposition::Accept => {}
+            InboundVideoDisposition::Pending => {
+                if self.diag_ok(&format!("pending:{route_id}")) {
+                    tracing::info!(
+                        "early H.264 sample for {route_id} dropped during Offer→Accept; replacement route left intact"
+                    );
+                }
+                return;
             }
-            self.nack_dead_route(from, &route_id);
-            return;
+            InboundVideoDisposition::Reject => {
+                if self.diag_ok(&format!("gate:{route_id}")) {
+                    tracing::warn!(
+                        "H.264 samples for {route_id} refused — {}",
+                        self.route_diag(&route_id, from)
+                    );
+                }
+                self.nack_dead_route(from, &route_id);
+                return;
+            }
         }
         // The arrival side of the sender's "route active — streaming"
         // line: one INFO per stream, so a healthy hop is attributable
         // from this end too (the MJPEG path has logged its first frame
         // this way all along).
         let first = !self.video_in_stats.lock().contains_key(&route_id);
+        if should_hold_first_video_sample(first, key, &data) {
+            if self.diag_ok(&format!("entry:{route_id}")) {
+                tracing::warn!(
+                    "holding video deltas for {route_id} until a clean decode entry starts the current route generation"
+                );
+            }
+            let mesh = self.clone();
+            let refresh_route = route_id.clone();
+            crate::spawn(async move {
+                let _ = mesh.request_refresh(refresh_route).await;
+            });
+            return;
+        }
         self.note_video_in(&route_id, "H.264", data.len());
+        // Time the pacer's chunk trains as they land — the bandwidth
+        // estimate + delay trend the feedback loop reports back (M3/T1.1).
+        self.note_video_arrival(&route_id, rtp_timestamp, data.len());
         let wants_decode = self
             .video_watchers
             .lock()
@@ -2608,13 +3813,21 @@ impl Mesh {
                         mesh.enqueue_decoded(&rid, packet);
                     }
                 },
-                move || {
+                move |lost_ts_us| {
                     // The native decoder hit a corrupt unit or dumped its
-                    // queue: ask the sender to re-key rather than waiting
-                    // out the periodic IDR (rate-limited inside).
+                    // queue: name the broken AU in feedback (a capable
+                    // sender heals with a GDR wave, no keyframe wall) AND
+                    // keep the rate-limited re-key ask — old senders need
+                    // it, and for new ones the wave lands first so the
+                    // wall it forces is the same one today's path forced.
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
                         crate::spawn(async move {
+                            if lost_ts_us.is_some() {
+                                let _ = mesh
+                                    .send_video_feedback(rid.clone(), 0, 1, 0, lost_ts_us)
+                                    .await;
+                            }
                             let _ = mesh.request_refresh(rid).await;
                         });
                     }
@@ -2822,6 +4035,19 @@ impl Mesh {
             return Ok(route.id);
         }
 
+        if matches!(route.media, MediaKind::Display | MediaKind::Video) {
+            if let Some(token) =
+                self.cancel_pending_video_teardown_replaced(&route.id, peer.as_str())
+            {
+                tracing::warn!(
+                    route = %route.id,
+                    peer = %short_id(peer.as_str()),
+                    token,
+                    disposition = "quarantine_canceled_by_local_reoffer",
+                    "local video route control"
+                );
+            }
+        }
         let msg = {
             let mut st = self.state.lock();
             let s = st.session.as_mut().ok_or("mesh not ready")?;
@@ -2909,6 +4135,7 @@ impl Mesh {
                 token,
                 decode,
                 queue: std::collections::VecDeque::new(),
+                last_poll: Instant::now(),
             },
         );
         token
@@ -2934,6 +4161,7 @@ impl Mesh {
         let Some(w) = map.get_mut(route_id) else {
             return Vec::new();
         };
+        w.last_poll = Instant::now();
         let total: usize = w.queue.iter().map(|p| 4 + p.len()).sum();
         let mut out = Vec::with_capacity(total);
         for packet in w.queue.drain(..) {
@@ -2944,10 +4172,53 @@ impl Mesh {
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
+            // Do not infer intent from watcher *presence*: unwatch is a
+            // separate fire-and-forget command and can lag. A window that polls
+            // after this disconnect began is positive proof the successor is
+            // still live; an intentional close stops its 16 ms poll loop even
+            // if cleanup delivery itself is delayed.
+            let guarded_at = Instant::now();
+            tokio::time::sleep(
+                VIDEO_SWITCH_TEARDOWN_GUARD
+                    .saturating_sub(hit.age)
+                    .max(VIDEO_LOCAL_POLL_OBSERVE),
+            )
+            .await;
+            let polled_after_request = self
+                .video_watchers
+                .lock()
+                .get(&route_id)
+                .is_some_and(|watcher| watcher_poll_proves_liveness(watcher.last_poll, guarded_at));
+            let still_nonterminal = self
+                .state
+                .lock()
+                .session
+                .as_ref()
+                .and_then(|s| s.route(&route_id))
+                .is_some_and(|r| {
+                    matches!(
+                        r.state,
+                        RouteState::Offered | RouteState::Incoming | RouteState::Active
+                    )
+                });
+            if polled_after_request && still_nonterminal {
+                tracing::warn!(
+                    "ignored stale local video teardown for {route_id} after switch from {} — the successor window kept polling",
+                    hit.predecessor,
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                "early local video teardown for {route_id} confirmed after switch from {} (no successor poll) — committing",
+                hit.predecessor,
+            );
+        }
         let msg = {
             let mut st = self.state.lock();
             st.session.as_mut().and_then(|s| s.teardown(&route_id))
         };
+        tracing::info!("local route teardown committing for {route_id}");
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
         self.video_watchers.lock().remove(&route_id);
@@ -4372,6 +5643,23 @@ impl Mesh {
                     // routes that carry a picture.
                     if matches!(route.media, MediaKind::Display | MediaKind::Video) {
                         self.await_video_bringup().await;
+                        let still_active = self
+                            .state
+                            .lock()
+                            .session
+                            .as_ref()
+                            .and_then(|s| s.route(&route.id))
+                            .is_some_and(|live| {
+                                live.state == RouteState::Active && live.route == route
+                            });
+                        if !still_active {
+                            tracing::warn!(
+                                "stale StartMedia for {} abandoned after video bring-up wait — route is no longer the active incarnation",
+                                route.id
+                            );
+                            continue;
+                        }
+                        self.note_video_route_started(&route);
                     }
                     self.start_media(&route)
                 }
@@ -4381,16 +5669,89 @@ impl Mesh {
                     max_edge,
                     bitrate,
                     fps,
-                } => self.video.retune_dials(&route_id, max_edge, bitrate, fps),
+                    game,
+                    mode,
+                    ext: _, // pipeline-owned; no viewer-requested knob reads it yet
+                } => self.video.retune_dials(
+                    &route_id,
+                    max_edge,
+                    bitrate,
+                    fps,
+                    game,
+                    mode.as_deref(),
+                ),
                 Effect::VideoFeedback {
                     route_id,
                     recv_fps,
                     decode_fails,
                     queue_depth,
-                } => self
-                    .video
-                    .note_feedback(&route_id, recv_fps, decode_fails, queue_depth),
+                    lost_ts_us,
+                    ext,
+                } => {
+                    // The pipeline's own feedback shape lives in the opaque
+                    // ext — parse it here, at the backend edge, so the
+                    // wire crates never learned what a bandwidth estimate
+                    // is (the seam that keeps tuning backend-only).
+                    let pf = crate::video::PipelineFeedback::from_ext(&ext);
+                    if let Some(ts) = lost_ts_us {
+                        // Frame health: the viewer named the AU that died.
+                        // A GDR (game) route heals with an immediate
+                        // refresh-wave restart — spread intra, no keyframe
+                        // wall; everything else keeps the IDR refresh the
+                        // feedback path already drives. (Targeted
+                        // reference invalidation rides the ts-mapping
+                        // follow-up.)
+                        tracing::info!(
+                            "frame health {route_id}: viewer lost AU at {ts} µs — targeted refresh"
+                        );
+                        self.video.route_wave_or_refresh(&route_id);
+                    }
+                    self.video.note_feedback(
+                        &route_id,
+                        recv_fps,
+                        decode_fails,
+                        queue_depth,
+                        pf.est_kbps,
+                        pf.delay_trend_us_per_s,
+                    )
+                }
                 Effect::StopMedia(id) => {
+                    // Effects are produced after the session mutates the route
+                    // to TornDown/Rejected. If another task has already
+                    // installed a same-id nonterminal successor, this stop
+                    // belongs to the displaced incarnation and must not tear
+                    // down the replacement by id. Offered/Incoming count too:
+                    // early media can legitimately outrun Accept, and that is
+                    // exactly the ABA window seen in the field logs.
+                    let successor_is_live = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&id))
+                        .is_some_and(|r| {
+                            matches!(
+                                r.state,
+                                RouteState::Offered | RouteState::Incoming | RouteState::Active
+                            ) && matches!(r.route.media, MediaKind::Display | MediaKind::Video)
+                        });
+                    if successor_is_live {
+                        tracing::warn!(
+                            "stale StopMedia for {id} ignored because a same-id video successor is nonterminal"
+                        );
+                        continue;
+                    }
+                    let stop_state = self
+                        .state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.route(&id))
+                        .map(|r| format!("{:?}", r.state))
+                        .unwrap_or_else(|| "absent".into());
+                    tracing::info!(
+                        "session StopMedia committing for {id} (route state {stop_state})"
+                    );
                     self.audio.stop(&id);
                     self.video.stop(&id);
                     self.video_watchers.lock().remove(&id);
@@ -7559,6 +8920,8 @@ impl Mesh {
         let status_peer = peer.clone();
         let status_route = route.id.clone();
         let route_id = route.id.clone();
+        let generation = self.begin_video_generation(&route_id);
+        let recovery = Arc::new(VideoRecovery::new(&route_id));
         // The LAN gate: the automatic fps/bitrate dials open up only on a
         // link the daemon has classified host↔host. Unknown (ICE not yet
         // introspected) starts conservative; the nudge below upgrades the
@@ -7584,15 +8947,12 @@ impl Mesh {
                 }
             });
         }
-        // When the outbound queue fills, packets get dropped — and on H.264
-        // every drop leaves the viewer's decoder referencing frames it never
-        // received (smear, or a freeze that outlives the burst). One forced
-        // IDR per gap heals it: set on the first send that SUCCEEDS after a
-        // drop, so the clean unit is asked for exactly when the queue has
-        // room again instead of being eaten by the same full queue.
-        let idr_mesh = Arc::downgrade(self);
-        let idr_route = route.id.clone();
-        let was_dropping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Queue admission is not delivery. Recovery begins on either a full
+        // producer queue or a downstream lane/write failure, holds dependent
+        // deltas at both sides of the queue, and ends only after the current
+        // epoch's IDR reaches the existing media pipe successfully.
+        let recovery_mesh = Arc::downgrade(self);
+        let capture_recovery = recovery;
         self.video.start_capture(
             route.id.clone(),
             mode,
@@ -7602,21 +8962,39 @@ impl Mesh {
                 ..Default::default()
             },
             move |packet| {
-                // try_send: a full queue drops this packet; the next
-                // capture carries a fresher picture.
-                let ok = tx
-                    .try_send((peer.clone(), route_id.clone(), packet))
-                    .is_ok();
-                if ok {
-                    if was_dropping.swap(false, Ordering::SeqCst) {
-                        if let Some(mesh) = idr_mesh.upgrade() {
-                            mesh.video.force_idr(&idr_route);
+                let key = match &packet {
+                    VideoPacket::H264 { key, .. } => Some(*key),
+                    VideoPacket::Jpeg(_) => None,
+                };
+                if capture_recovery.suppresses(key) {
+                    if let Some(mesh) = recovery_mesh.upgrade() {
+                        capture_recovery.note_suppressed(&mesh);
+                    }
+                    return false;
+                }
+                let epoch = capture_recovery.epoch();
+                let failure = match tx.try_send((
+                    peer.clone(),
+                    route_id.clone(),
+                    generation,
+                    packet,
+                    epoch,
+                    capture_recovery.clone(),
+                )) {
+                    Ok(()) => None,
+                    Err(mpsc::error::TrySendError::Full(_)) => Some("shared queue full"),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Some("shared queue closed"),
+                };
+                if let Some(reason) = failure {
+                    if key.is_some() {
+                        if let Some(mesh) = recovery_mesh.upgrade() {
+                            capture_recovery.note_drop(&mesh, key, reason);
                         }
                     }
+                    false
                 } else {
-                    was_dropping.store(true, Ordering::SeqCst);
+                    true
                 }
-                ok
             },
             move |state, detail| {
                 // Capture-state transitions travel to the viewer in-band
@@ -7625,9 +9003,19 @@ impl Mesh {
                 let Some(mesh) = status_mesh.upgrade() else {
                     return;
                 };
-                let frame = VideoStatusFrame::new(status_route.clone(), state, detail);
+                let route = status_route.clone();
+                if !mesh.video_generation_is_current(&route, generation) {
+                    tracing::debug!(
+                        "discarding stale video status for {route} generation {generation}"
+                    );
+                    return;
+                }
+                let frame = VideoStatusFrame::new(route.clone(), state, detail);
                 let peer = status_peer.clone();
                 crate::spawn(async move {
+                    if !mesh.video_generation_is_current(&route, generation) {
+                        return;
+                    }
                     let Ok(payload) = serde_json::to_value(&frame) else {
                         return;
                     };
@@ -9398,12 +10786,29 @@ impl Mesh {
             && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
     }
 
+    /// Classify inbound screen/camera media without conflating the normal
+    /// Offer→Accept gap with an orphan route. A destructive NACK is correct for
+    /// a dead/foreign route, but not for an authenticated same-id re-offer whose
+    /// media beat arrived a few milliseconds before its Accept.
+    fn inbound_video_disposition(&self, route_id: &str, sender: &str) -> InboundVideoDisposition {
+        let Some(me) = self.local_node_id() else {
+            return InboundVideoDisposition::Reject;
+        };
+        let st = self.state.lock();
+        let route = st.session.as_ref().and_then(|s| s.route(route_id));
+        inbound_video_disposition_from_facts(
+            route.map(|r| &r.state),
+            route.is_some_and(|r| matches!(r.route.media, MediaKind::Display | MediaKind::Video)),
+            route.is_some_and(|r| node_of(r.route.to.as_str()) == me),
+            route.is_some_and(|r| pubkey_part(r.peer.as_str()) == pubkey_part(sender)),
+        )
+    }
+
     /// [`Self::inbound_media_ok`] for the frame kinds two media share:
     /// video frames (and their `vstat` reports) belong to a display route
     /// *or* a camera one — same pipeline, different lens.
     fn inbound_video_ok(&self, route_id: &str, sender: &str) -> bool {
-        self.inbound_media_ok(route_id, sender, MediaKind::Display)
-            || self.inbound_media_ok(route_id, sender, MediaKind::Video)
+        self.inbound_video_disposition(route_id, sender) == InboundVideoDisposition::Accept
     }
 
     /// Why an inbound video frame was refused, in one diagnosable line —
@@ -9480,12 +10885,7 @@ impl Mesh {
         // window where the daemon's converged roster is still healing (or
         // briefly lost the member to a stale tombstone) — the gap that
         // surfaced as "video streams but keyboard/mouse are refused".
-        if self
-            .ownership
-            .fleet_member_ids()
-            .iter()
-            .any(|d| pubkey_part(d) == canon)
-        {
+        if self.ownership.any_fleet_member(|d| pubkey_part(d) == canon) {
             return true;
         }
         self.fleet_authorized.lock().contains(canon)
@@ -9843,18 +11243,31 @@ impl Mesh {
     /// Ask the far end of an inbound display/camera route to stream with
     /// these quality picks (`None` = that dial back on automatic). Old
     /// peers drop the message and stay on automatic.
+    /// GUI-internal: the effective encode dials for a route THIS node is
+    /// streaming — the "what we're actually doing" half of the console's
+    /// quality panel (resolved posture, encoder rung, wire codec, the AIMD
+    /// bitrate target + its ceiling, the fps + edge targets, and the actual
+    /// output geometry). `None` when this node isn't the streamer for
+    /// `route_id` (the ordinary remote-view case, where the viewer surfaces
+    /// its own measured actuals). Read-only; touches no wire and no peer.
+    pub fn route_dials(&self, route_id: &str) -> Option<crate::video::RouteDials> {
+        self.video.route_dials(route_id)
+    }
+
     pub async fn request_tune(
         self: &Arc<Self>,
         route_id: String,
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
+        game: bool,
+        mode: Option<String>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
         // The streaming side logs the retune it actually applies — one
         // line per pill change across the pair is plenty.
         tracing::debug!(
-            "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?}",
+            "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?} · game {game} · mode {mode:?}",
             short_id(&peer)
         );
         self.send_control(
@@ -9864,6 +11277,11 @@ impl Mesh {
                 max_edge,
                 bitrate,
                 fps,
+                game,
+                mode,
+                // No viewer-requested pipeline knob today; the seam is here
+                // for when one lands (backend-only, no wire change).
+                ext: serde_json::Value::Null,
             }),
         )
         .await
@@ -9879,8 +11297,19 @@ impl Mesh {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        lost_ts_us: Option<u64>,
     ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        // Enrich with what this end measured about the link itself: the
+        // chunk-train bandwidth estimate + delay trend (T1.1). Rides the
+        // same control channel on the ICE datapath as the report always
+        // did — zeros for routes with no timed trains yet.
+        let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
+        let ext = crate::video::PipelineFeedback {
+            est_kbps,
+            delay_trend_us_per_s,
+        }
+        .to_ext();
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::VideoFeedback {
@@ -9888,6 +11317,8 @@ impl Mesh {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                lost_ts_us,
+                ext,
             }),
         )
         .await
@@ -10869,6 +12300,21 @@ fn pubkey_part(id: &str) -> &str {
     id
 }
 
+/// Video feedback is generated repeatedly by a window that still owns the
+/// route, even for a static screen whose paint rate is zero. One-shot
+/// setup/tune controls are intentionally excluded: they can already be in
+/// flight beside the stale close we are fencing.
+fn inbound_video_feedback_liveness_route_id(msg: &ControlMessage) -> Option<&str> {
+    match msg {
+        ControlMessage::Route(RouteControl::VideoFeedback { route_id, .. }) => Some(route_id),
+        _ => None,
+    }
+}
+
+fn watcher_poll_proves_liveness(last_poll: Instant, disconnect_started: Instant) -> bool {
+    last_poll >= disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE
+}
+
 /// Fold one network's daemon peer list into the `pubkey → network` map that
 /// [`Mesh::network_for_peer`] addresses control/media with. Each peer the daemon
 /// reports **reachable** (`active`/`shelved` — the same cut the graph reads
@@ -11147,6 +12593,398 @@ fn parse_media(s: &str) -> MediaKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_route_generation_fences_same_id_successors() {
+        let mut generations = VideoRouteGenerations::default();
+        let (first, replaced) = generations.begin("route:display");
+        assert_eq!(replaced, None);
+        assert!(generations.is_current("route:display", first));
+
+        // A real successor can start before the predecessor's stale StopMedia
+        // arrives, so no retire occurs between these calls. It still must mint
+        // a new generation and fence every queued predecessor callback.
+        let (successor, replaced) = generations.begin("route:display");
+        assert_eq!(replaced, Some(first));
+        assert_ne!(successor, first);
+        assert!(!generations.is_current("route:display", first));
+        assert!(generations.is_current("route:display", successor));
+
+        generations.retire("route:display");
+        assert!(!generations.is_current("route:display", successor));
+        let (third, replaced) = generations.begin("route:display");
+        assert_eq!(replaced, None);
+        assert_ne!(third, successor);
+        assert!(generations.is_current("route:display", third));
+    }
+
+    #[test]
+    fn monitor_switch_fences_duplicate_early_teardowns() {
+        let mut guards = VideoSwitchGuards::default();
+        let now = Instant::now();
+        guards.note_stop("route:primary", "viewer-ABCDE", "viewer:display:0", now);
+        guards.note_start(
+            "route:secondary",
+            "viewer-ABCDE",
+            "viewer:display:0",
+            now + Duration::from_millis(8),
+        );
+
+        let hit = guards
+            .take_early_teardown(
+                "route:secondary",
+                "viewer-FGHIJ",
+                now + Duration::from_millis(15),
+            )
+            .expect("the first close inside the measured switch race is fenced");
+        assert_eq!(hit.predecessor, "route:primary");
+        assert_eq!(hit.age, Duration::from_millis(7));
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:secondary",
+                    "viewer-ABCDE",
+                    now + Duration::from_millis(16),
+                )
+                .is_some(),
+            "a concurrent duplicate cannot consume and defeat the guard"
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:secondary",
+                    "viewer-ABCDE",
+                    now + Duration::from_millis(8)
+                        + VIDEO_SWITCH_TEARDOWN_GUARD
+                        + Duration::from_millis(1),
+                )
+                .is_none(),
+            "the guard remains strictly time bounded"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_guard_is_sink_scoped_and_time_bounded() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:other-sink",
+            "viewer",
+            "viewer:display:1",
+            now + Duration::from_millis(5),
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:other-sink",
+                    "viewer",
+                    now + Duration::from_millis(10),
+                )
+                .is_none(),
+            "an unrelated video sink is not a monitor-switch successor"
+        );
+
+        guards.note_start(
+            "route:late",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        assert!(
+            guards
+                .take_early_teardown(
+                    "route:late",
+                    "viewer",
+                    now + Duration::from_millis(5)
+                        + VIDEO_SWITCH_TEARDOWN_GUARD
+                        + Duration::from_millis(1),
+                )
+                .is_none(),
+            "a deliberate close outside the narrow race window always wins"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_quarantine_is_canceled_or_committed_exactly_once() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old-a", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-a",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: canceled,
+            incarnation: canceled_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-a", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the early close should arm a quarantine");
+        };
+        assert_eq!(guards.cancel_pending("route:new-a"), Some(canceled));
+        assert!(!guards.take_pending_if_current("route:new-a", canceled, canceled_incarnation));
+
+        guards.note_stop("route:old-b", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-b",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: expires,
+            incarnation: expires_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-b", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the second route should independently arm a quarantine");
+        };
+        assert!(guards.take_pending_if_current("route:new-b", expires, expires_incarnation));
+        assert!(
+            !guards.take_pending_if_current("route:new-b", expires, expires_incarnation),
+            "an expired timer cannot commit the route twice"
+        );
+
+        guards.note_stop("route:old-c", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new-c",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: first,
+            incarnation: first_incarnation,
+            ..
+        } = guards.gate_inbound_teardown("route:new-c", "viewer", now + Duration::from_millis(7))
+        else {
+            panic!("the first close should arm a quarantine");
+        };
+        assert!(matches!(
+            guards.gate_inbound_teardown(
+                "route:new-c",
+                "viewer",
+                now + Duration::from_millis(8),
+            ),
+            InboundVideoTeardownGate::CoalesceDuplicate { token } if token == first
+        ));
+        assert!(
+            guards.take_pending_if_current("route:new-c", first, first_incarnation),
+            "duplicate closes share the original bounded timer"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_reoffer_invalidates_an_old_quarantine_token() {
+        let now = Instant::now();
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:stable-id",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine {
+            token: old_token,
+            incarnation: old_incarnation,
+            ..
+        } = guards.gate_inbound_teardown(
+            "route:stable-id",
+            "viewer",
+            now + Duration::from_millis(7),
+        )
+        else {
+            panic!("the stale close should be initially eligible");
+        };
+
+        guards.note_start(
+            "route:stable-id",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(8),
+        );
+        assert!(
+            !guards.take_pending_if_current("route:stable-id", old_token, old_incarnation),
+            "a delayed timer from an older same-id incarnation is fenced"
+        );
+    }
+
+    #[test]
+    fn monitor_switch_ignores_inflight_feedback_then_accepts_a_mature_heartbeat() {
+        let now = Instant::now();
+        let armed_at = now + Duration::from_millis(7);
+        let mut guards = VideoSwitchGuards::default();
+        guards.note_stop("route:old", "viewer", "viewer:display:0", now);
+        guards.note_start(
+            "route:new",
+            "viewer",
+            "viewer:display:0",
+            now + Duration::from_millis(5),
+        );
+        let InboundVideoTeardownGate::Quarantine { token, .. } =
+            guards.gate_inbound_teardown("route:new", "viewer", armed_at)
+        else {
+            panic!("the early close should arm a quarantine");
+        };
+        assert_eq!(
+            guards.cancel_pending_on_mature_liveness(
+                "route:new",
+                armed_at + VIDEO_TEARDOWN_LIVENESS_MIN_AGE - Duration::from_millis(1),
+            ),
+            None,
+            "control already in flight beside the close is not proof"
+        );
+        assert_eq!(
+            guards.cancel_pending_on_mature_liveness(
+                "route:new",
+                armed_at + VIDEO_TEARDOWN_LIVENESS_MIN_AGE,
+            ),
+            Some(token),
+            "the next periodic viewer heartbeat proves the successor is live"
+        );
+    }
+
+    #[test]
+    fn zero_fps_feedback_is_still_a_static_viewer_heartbeat() {
+        let feedback = ControlMessage::Route(RouteControl::VideoFeedback {
+            route_id: "route:static".into(),
+            recv_fps: 0,
+            decode_fails: 0,
+            queue_depth: 0,
+            lost_ts_us: None,
+            ext: Value::Null,
+        });
+        assert_eq!(
+            inbound_video_feedback_liveness_route_id(&feedback),
+            Some("route:static")
+        );
+        assert_eq!(
+            inbound_video_feedback_liveness_route_id(&ControlMessage::Route(
+                RouteControl::Refresh {
+                    route_id: "route:static".into(),
+                },
+            )),
+            None,
+            "one-shot setup/recovery controls are not liveness proof"
+        );
+    }
+
+    #[test]
+    fn local_switch_guard_requires_a_mature_post_disconnect_poll() {
+        let disconnect_started = Instant::now();
+        assert!(!watcher_poll_proves_liveness(
+            disconnect_started + Duration::from_millis(1),
+            disconnect_started,
+        ));
+        assert!(!watcher_poll_proves_liveness(
+            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE - Duration::from_millis(1),
+            disconnect_started,
+        ));
+        assert!(watcher_poll_proves_liveness(
+            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE,
+            disconnect_started,
+        ));
+        assert!(VIDEO_LOCAL_POLL_OBSERVE > VIDEO_LOCAL_POLL_PROOF_MIN_AGE);
+    }
+
+    #[test]
+    fn offered_video_media_is_dropped_without_killing_the_successor() {
+        assert_eq!(
+            inbound_video_disposition_from_facts(Some(&RouteState::Offered), true, true, true),
+            InboundVideoDisposition::Pending
+        );
+        assert_eq!(
+            inbound_video_disposition_from_facts(Some(&RouteState::Active), true, true, true),
+            InboundVideoDisposition::Accept
+        );
+        assert_eq!(
+            inbound_video_disposition_from_facts(Some(&RouteState::TornDown), true, true, true),
+            InboundVideoDisposition::Reject
+        );
+        assert_eq!(
+            inbound_video_disposition_from_facts(Some(&RouteState::Offered), true, true, false),
+            InboundVideoDisposition::Reject,
+            "the grace applies only to the authenticated route peer"
+        );
+    }
+
+    #[test]
+    fn first_video_gate_accepts_parameter_set_led_hevc_entry() {
+        let hevc_vps = [0, 0, 1, 0x40, 0x01];
+        assert!(crate::video_decode::is_decode_entry(&hevc_vps));
+        assert!(
+            !should_hold_first_video_sample(true, false, &hevc_vps),
+            "HEVC entry is carried by VPS bytes because the daemon key bit is H.264-shaped"
+        );
+
+        let h264_delta = [0, 0, 1, 0x41, 0x9a];
+        assert!(should_hold_first_video_sample(true, false, &h264_delta));
+        assert!(!should_hold_first_video_sample(true, true, &h264_delta));
+        assert!(!should_hold_first_video_sample(false, false, &h264_delta));
+    }
+
+    #[test]
+    fn high_refresh_pacing_stays_inside_the_frame_slot() {
+        assert_eq!(pace_budget(16, 30), std::time::Duration::from_millis(16));
+        assert_eq!(pace_budget(16, 60), std::time::Duration::from_millis(15));
+        assert!(pace_budget(16, 120) < std::time::Duration::from_millis(8));
+        assert!(pace_budget(16, 144) < std::time::Duration::from_millis(7));
+    }
+
+    #[test]
+    fn pipe_waits_consume_the_absolute_pacing_budget() {
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_millis(10);
+        let ask = std::time::Duration::from_millis(5);
+        assert_eq!(pace_gap_until(deadline, start, ask), ask);
+        assert_eq!(
+            pace_gap_until(deadline, start + std::time::Duration::from_millis(8), ask),
+            std::time::Duration::from_millis(2)
+        );
+        assert!(
+            pace_gap_until(deadline, start + std::time::Duration::from_millis(11), ask).is_zero()
+        );
+    }
+
+    #[test]
+    fn dropped_h264_holds_deltas_until_an_accepted_keyframe() {
+        assert!(suppress_dependent_after_drop(true, Some(false)));
+        assert!(!suppress_dependent_after_drop(true, Some(true)));
+        assert!(!suppress_dependent_after_drop(false, Some(false)));
+        assert!(!suppress_dependent_after_drop(true, None));
+    }
+
+    #[test]
+    fn recovery_requires_a_delivered_key_from_the_current_epoch() {
+        let recovery = VideoRecovery::new("test:epoch");
+        let (arm, drops, first_epoch) = recovery.mark_drop(Some(false));
+        assert!(arm, "the first loss arms one IDR");
+        assert_eq!(drops, 1);
+        assert!(recovery.suppresses(Some(false)));
+
+        // A dependent send that raced with recovery is covered by the same
+        // repair: it neither advances the epoch nor creates an IDR storm.
+        let (arm, drops, current_epoch) = recovery.mark_drop(Some(false));
+        assert!(!arm, "dependent losses do not create an IDR storm");
+        assert_eq!(drops, 2);
+        assert_eq!(first_epoch, current_epoch);
+
+        // A failed key advances the epoch and always re-arms. The older key's
+        // eventual success cannot release deltas; only the newest one can.
+        let (arm, _, newest_epoch) = recovery.mark_drop(Some(true));
+        assert!(arm);
+        assert_ne!(current_epoch, newest_epoch);
+        assert!(!recovery.note_key_delivered(current_epoch));
+        assert!(recovery.suppresses(Some(false)));
+        assert!(recovery.note_key_delivered(newest_epoch));
+        assert!(!recovery.suppresses(Some(false)));
+        assert_eq!(recovery.drops.load(Ordering::Relaxed), 3);
+        assert_eq!(recovery.suppressed.load(Ordering::Relaxed), 0);
+    }
 
     fn term_route(from: &str, to: &str, media: MediaKind) -> Route {
         Route {

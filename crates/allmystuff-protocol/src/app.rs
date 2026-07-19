@@ -877,6 +877,27 @@ pub enum RouteControl {
         /// Capture rate ceiling; `None` = the streamer's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fps: Option<u32>,
+        /// Game mode: the latency-first posture (GDR intra-refresh on
+        /// capable streamers, 60 fps floor off-LAN, tight burst bounds).
+        /// Defaults off (balanced) and deserializes absent as off, so
+        /// peers that predate it interoperate untouched.
+        #[serde(default)]
+        game: bool,
+        /// The stream posture by name — `"balanced"`, `"game"`, or
+        /// `"studio"` (the LAN fidelity mode: high-bitrate quality-first
+        /// encoding). Wins over `game` when present; `game` stays for
+        /// hosts that predate the tri-state. Absent = derive from `game`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// **Opaque, encoder/decoder-backend-owned extension.** The
+        /// protocol layer carries it verbatim and never inspects it — the
+        /// node's video pipeline defines its shape and reads it end to
+        /// end. This is the seam that keeps pipeline tuning
+        /// backend-only: any future viewer-requested encoder knob rides
+        /// here instead of adding a typed field to this crate. Absent for
+        /// every peer that doesn't set it.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        ext: serde_json::Value,
     },
     /// "Here's how your stream is actually arriving" — the viewer reports its
     /// decode health back to the streamer, periodically, so the streamer can
@@ -899,6 +920,22 @@ pub enum RouteControl {
         /// large = the viewer can't drain as fast as frames arrive).
         #[serde(default)]
         queue_depth: u32,
+        /// Frame health: the presentation timestamp (µs) of the most
+        /// recent access unit that failed to decode, when one did — lets
+        /// a capable host heal with a targeted refresh (GDR wave restart
+        /// today, reference invalidation next) instead of a keyframe
+        /// wall. Old peers ignore it.
+        #[serde(default)]
+        lost_ts_us: Option<u64>,
+        /// **Opaque, decoder/encoder-backend-owned extension.** The
+        /// protocol layer relays it verbatim and never inspects it — the
+        /// node's video pipeline defines its shape (bandwidth estimate,
+        /// delay trend, and any future receiver-side signal) and reads it
+        /// end to end. The seam that keeps pipeline tuning backend-only:
+        /// a new feedback metric adds a field to the node's own struct,
+        /// not a typed field here. Absent for peers that don't set it.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        ext: serde_json::Value,
     },
     /// "Your inbound video for this route rides track lane N." The streaming
     /// (host) side tells the viewer which RTP track lane it pinned a

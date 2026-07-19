@@ -52,6 +52,15 @@ path = "src/bin/serve.rs"
 default = ["host"]
 hwenc = ["host", "dep:ffmpeg-next"]
 
+# Field-test instrumentation the fork added: the periodic telemetry line
+# (telemetry.rs — CPU/GPU-engine/VRAM every second). Diagnostic/prototype
+# builds opt into that sampler with `--features field-telemetry`; ordinary dev
+# and release builds stay silent by default. Verbose file logging remains a
+# separate, runtime-only opt-in through the app setting or
+# `ALLMYSTUFF_CWD_LOG=1`. The environment dials always win, and `=0` silences
+# either diagnostic path.
+field-telemetry = []
+
 # The capture/inject planes — everything that touches THIS machine's screen,
 # camera, microphone, speakers, keyboard, PTYs, and OS clipboard. ON by
 # default: every desktop/server build wants them. The one build that turns
@@ -108,6 +117,10 @@ serde_json = "1"
 anyhow = "1"
 dirs = "5"
 parking_lot = "0.12"
+
+# SIMD-accelerated byte scanning for the pacer's Annex-B start-code walk
+# (already in the tree transitively — this only makes it a direct dep).
+memchr = "2"
 
 # System RNG for minting a fleet's shared key (the owned-roster grouping
 # secret).
@@ -193,6 +206,11 @@ core-foundation = { version = "0.10", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # PDH — the vendor-neutral WDDM counters behind the telemetry line
+    # (per-engine GPU utilization + VRAM: same counters on NVIDIA/AMD/
+    # Intel, which is what makes the field logs comparable across boxes).
+    "Win32_System_Performance",
+    "Win32_System_Threading",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
@@ -209,18 +227,33 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Variant",
     "Win32_System_Ole",
+    # NVENC SDK backend (nvenc.rs): runtime-loads nvEncodeAPI64.dll.
+    "Win32_System_LibraryLoader",
 ] }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    # timeBeginPeriod/timeEndPeriod — the stream's 1 ms timer-resolution
+    # guard (os_perf.rs); without it the pacing sleeps quantize at ~15.6 ms.
+    "Win32_Media",
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Power",
+    # GetSystemCpuSetInformation + SYSTEM_CPU_SET_INFORMATION — the hybrid
+    # P/E-core detection behind the media threads' CPU-set preference
+    # (os_perf.rs).
+    "Win32_System_SystemInformation",
+    # QueryPerformanceCounter/Frequency — mapping DXGI's QPC LastPresentTime
+    # onto the monotonic clock for the M1 capture-age span (win_capture.rs).
+    "Win32_System_Performance",
     # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (daemon_spawn's kill-on-close job)
     # embeds IO_COUNTERS, which windows-sys gates behind Threading. The GUI
     # workspace got this feature via unification from another dep; the node
     # workspace has to ask for it explicitly.
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
+    # Monitor topology for the telemetry line (EnumDisplayDevices/
+    # EnumDisplaySettings — the multi-monitor field-test picture).
+    "Win32_Graphics_Gdi",
 ] }
 # The Service Control Manager glue so `allmystuff-serve --service` runs as a
 # real Windows service: the control dispatcher + status/stop handler the SCM

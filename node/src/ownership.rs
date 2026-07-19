@@ -384,6 +384,19 @@ impl Ownership {
             .collect()
     }
 
+    /// Allocation-free membership probe for per-event gates — the input
+    /// path runs its owner/fleet check on every mouse move, and
+    /// [`Self::fleet_member_ids`] clones the whole roster per call (fine
+    /// for a roster op, not for 60 Hz input). Same lock, same iteration,
+    /// no `Vec`.
+    pub fn any_fleet_member(&self, pred: impl Fn(&str) -> bool) -> bool {
+        self.inner
+            .lock()
+            .fleet_members
+            .iter()
+            .any(|m| pred(m.device.as_str()))
+    }
+
     /// The owner's local member records (device + label). The owner's durable,
     /// persisted view of who's in its fleet — kept consistent with the signed
     /// roster (a left/evicted device is dropped from both), so it's safe to

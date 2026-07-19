@@ -50,17 +50,80 @@ pub fn scale_rgba_to_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<
 /// Both output edges must be even (4:2:0 needs it; callers already force it
 /// via `fit_within_even`). Conversion is the standard integer BT.601
 /// limited-range transform; chroma is the average of each 2×2 luma block.
+/// The common no-scale case takes a contiguous fast path — the column map's
+/// gather defeats vectorization, and native-resolution streaming is the
+/// default.
 pub fn scale_rgba_to_i420(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
-    debug_assert!(dw % 2 == 0 && dh % 2 == 0, "I420 needs even output edges");
-    // Source byte-offset of each output column, computed once (nearest
-    // neighbour, same mapping the RGBA/RGB scalers use).
+    let mut out = Vec::new();
+    scale_rgba_to_i420_into(src, sw, sh, dw, dh, &mut out);
+    out
+}
+
+/// [`scale_rgba_to_i420`] into a reused buffer — the streaming shape. A
+/// multi-megabyte output allocated fresh per frame costs far more than the
+/// arithmetic (large allocations bypass the heap to the OS, and every page
+/// is demand-zeroed on first touch — per frame, per thread); `out` is
+/// resized (a no-op at steady state) and every byte is overwritten.
+pub fn scale_rgba_to_i420_into(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, out: &mut Vec<u8>) {
+    if (dw, dh) == (sw, sh) {
+        convert_native::<false>(src, sw as usize, sh as usize, out)
+    } else {
+        convert_scaled::<false>(src, sw as usize, sh as usize, dw as usize, dh as usize, out)
+    }
+}
+
+/// [`scale_rgba_to_i420`]'s **NV12** sibling — Y plane, then interleaved
+/// U/V — the layout every hardware H.264 MFT ingests. Producing it directly
+/// deletes the encoder-side I420→NV12 interleave pass (a full extra chroma
+/// walk per frame). Same sampling, same BT.601 math, same fast path.
+pub fn scale_rgba_to_nv12(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    scale_rgba_to_nv12_into(src, sw, sh, dw, dh, &mut out);
+    out
+}
+
+/// [`scale_rgba_to_nv12`] into a reused buffer — see
+/// [`scale_rgba_to_i420_into`] for why the reuse matters.
+pub fn scale_rgba_to_nv12_into(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, out: &mut Vec<u8>) {
+    if (dw, dh) == (sw, sh) {
+        convert_native::<true>(src, sw as usize, sh as usize, out)
+    } else {
+        convert_scaled::<true>(src, sw as usize, sh as usize, dw as usize, dh as usize, out)
+    }
+}
+
+/// Write one 2×2 block's chroma into `chroma` for either layout: NV12
+/// interleaves U,V; I420 lays the U plane before the V plane (`csize`
+/// apart).
+#[inline(always)]
+fn put_chroma<const NV12: bool>(chroma: &mut [u8], csize: usize, ci: usize, u: u8, v: u8) {
+    if NV12 {
+        chroma[ci * 2] = u;
+        chroma[ci * 2 + 1] = v;
+    } else {
+        chroma[ci] = u;
+        chroma[csize + ci] = v;
+    }
+}
+
+/// The scaled path: nearest-neighbour via a precomputed column map.
+fn convert_scaled<const NV12: bool>(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    out: &mut Vec<u8>,
+) {
+    debug_assert!(
+        dw.is_multiple_of(2) && dh.is_multiple_of(2),
+        "4:2:0 needs even output edges"
+    );
     let xmap: Vec<usize> = (0..dw).map(|x| (x * sw / dw) * 4).collect();
     let ysize = dw * dh;
     let csize = (dw / 2) * (dh / 2);
-    let mut out = vec![0u8; ysize + 2 * csize];
+    out.resize(ysize + 2 * csize, 0);
     let (y_plane, chroma) = out.split_at_mut(ysize);
-    let (u_plane, v_plane) = chroma.split_at_mut(csize);
     let cw = dw / 2;
     // Two output rows at a time: 4:2:0 chroma is one sample per 2×2 luma block.
     for by in 0..dh / 2 {
@@ -83,12 +146,58 @@ pub fn scale_rgba_to_i420(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec
             let avg =
                 |i: usize| (p00[i] as u32 + p10[i] as u32 + p01[i] as u32 + p11[i] as u32 + 2) / 4;
             let (r, g, b) = (avg(0), avg(1), avg(2));
-            let ci = by * cw + bx;
-            u_plane[ci] = rgb_to_u(r, g, b);
-            v_plane[ci] = rgb_to_v(r, g, b);
+            put_chroma::<NV12>(
+                chroma,
+                csize,
+                by * cw + bx,
+                rgb_to_u(r, g, b),
+                rgb_to_v(r, g, b),
+            );
         }
     }
-    out
+}
+
+/// The no-scale path: contiguous reads, no column map — identical sampling
+/// and math to [`convert_scaled`] at 1:1 (the equality is tested), in the
+/// shape the vectorizer can actually chew on.
+fn convert_native<const NV12: bool>(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+    debug_assert!(
+        w.is_multiple_of(2) && h.is_multiple_of(2),
+        "4:2:0 needs even edges"
+    );
+    let ysize = w * h;
+    let csize = (w / 2) * (h / 2);
+    out.resize(ysize + 2 * csize, 0);
+    let (y_plane, chroma) = out.split_at_mut(ysize);
+    let cw = w / 2;
+    for by in 0..h / 2 {
+        let y0 = 2 * by;
+        let srow0 = &src[y0 * w * 4..][..w * 4];
+        let srow1 = &src[(y0 + 1) * w * 4..][..w * 4];
+        let (yrow0, rest) = y_plane[y0 * w..].split_at_mut(w);
+        let yrow1 = &mut rest[..w];
+        for bx in 0..cw {
+            let sx = bx * 8;
+            let p00 = &srow0[sx..sx + 3];
+            let p10 = &srow0[sx + 4..sx + 7];
+            let p01 = &srow1[sx..sx + 3];
+            let p11 = &srow1[sx + 4..sx + 7];
+            yrow0[2 * bx] = rgb_to_y(p00);
+            yrow0[2 * bx + 1] = rgb_to_y(p10);
+            yrow1[2 * bx] = rgb_to_y(p01);
+            yrow1[2 * bx + 1] = rgb_to_y(p11);
+            let avg =
+                |i: usize| (p00[i] as u32 + p10[i] as u32 + p01[i] as u32 + p11[i] as u32 + 2) / 4;
+            let (r, g, b) = (avg(0), avg(1), avg(2));
+            put_chroma::<NV12>(
+                chroma,
+                csize,
+                by * cw + bx,
+                rgb_to_u(r, g, b),
+                rgb_to_v(r, g, b),
+            );
+        }
+    }
 }
 
 #[inline]
@@ -107,6 +216,29 @@ fn rgb_to_u(r: u32, g: u32, b: u32) -> u8 {
 fn rgb_to_v(r: u32, g: u32, b: u32) -> u8 {
     let (r, g, b) = (r as i32, g as i32, b as i32);
     (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
+/// BGRA rows laid `src_pitch` bytes apart (a D3D mapping's RowPitch) →
+/// tightly packed RGBA with alpha forced opaque, into a reused buffer.
+/// `dst` is resized to exactly `w*h*4` — a no-op after the first call at a
+/// given size, so a persistent buffer never re-zeroes.
+///
+/// This is the DXGI readback's per-frame swizzle. It lives in this crate so
+/// release builds run it at opt-level 3: in the node crate's size-optimized
+/// profile the identical loop measured markedly slower per 4K frame (see
+/// the win_capture bench, which keeps the old-home shape for comparison).
+pub fn bgra_to_rgba_into(src: &[u8], src_pitch: usize, w: usize, h: usize, dst: &mut Vec<u8>) {
+    dst.resize(w * h * 4, 0);
+    for row in 0..h {
+        let s = &src[row * src_pitch..][..w * 4];
+        let d = &mut dst[row * w * 4..][..w * 4];
+        for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+            dp[0] = sp[2];
+            dp[1] = sp[1];
+            dp[2] = sp[0];
+            dp[3] = 255;
+        }
+    }
 }
 
 /// Rotate a packed RGBA buffer clockwise by `quarter_turns` × 90°
@@ -280,5 +412,96 @@ mod tests {
             scale_rgba_to_rgb(&src, 2, 1, 2, 1),
             vec![255, 0, 0, 0, 0, 255]
         );
+    }
+
+    /// A deterministic multi-tone frame — every 2×2 block differs, so any
+    /// sampling or plane-layout mistake shows up as a byte mismatch.
+    fn patterned_rgba(w: usize, h: usize) -> Vec<u8> {
+        (0..w * h * 4).map(|i| (i * 37 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn native_fast_path_matches_the_scaled_path_exactly() {
+        // The 1:1 fast path must be indistinguishable from the generic path
+        // for both layouts — same sampling, same math, different loop shape.
+        let (w, h) = (8usize, 6usize);
+        let src = patterned_rgba(w, h);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        convert_native::<false>(&src, w, h, &mut a);
+        convert_scaled::<false>(&src, w, h, w, h, &mut b);
+        assert_eq!(a, b, "i420");
+        convert_native::<true>(&src, w, h, &mut a);
+        convert_scaled::<true>(&src, w, h, w, h, &mut b);
+        assert_eq!(a, b, "nv12");
+    }
+
+    #[test]
+    fn into_variants_reuse_the_buffer_and_match_the_allocating_path() {
+        let (w, h) = (8u32, 6u32);
+        let src = patterned_rgba(w as usize, h as usize);
+        let mut reused = Vec::new();
+        scale_rgba_to_nv12_into(&src, w, h, w, h, &mut reused);
+        assert_eq!(reused, scale_rgba_to_nv12(&src, w, h, w, h));
+        // A second convert at the same size must reuse the exact buffer and
+        // fully overwrite it (poison first to prove every byte is written).
+        let ptr = reused.as_ptr();
+        reused.iter_mut().for_each(|b| *b = 0xAB);
+        scale_rgba_to_nv12_into(&src, w, h, w, h, &mut reused);
+        assert_eq!(reused.as_ptr(), ptr, "buffer reused in place");
+        assert_eq!(
+            reused,
+            scale_rgba_to_nv12(&src, w, h, w, h),
+            "no stale bytes"
+        );
+        // And a size change adjusts cleanly.
+        scale_rgba_to_i420_into(&src, w, h, 4, 4, &mut reused);
+        assert_eq!(reused, scale_rgba_to_i420(&src, w, h, 4, 4));
+    }
+
+    #[test]
+    fn nv12_interleaves_the_same_chroma_i420_plans() {
+        // NV12 must carry byte-identical Y and the same U/V values as I420,
+        // just interleaved.
+        let (w, h) = (8u32, 6u32);
+        let src = patterned_rgba(w as usize, h as usize);
+        let i420 = scale_rgba_to_i420(&src, w, h, w, h);
+        let nv12 = scale_rgba_to_nv12(&src, w, h, w, h);
+        let ysize = (w * h) as usize;
+        let csize = ysize / 4;
+        assert_eq!(i420[..ysize], nv12[..ysize], "identical luma");
+        for ci in 0..csize {
+            assert_eq!(nv12[ysize + ci * 2], i420[ysize + ci], "U {ci}");
+            assert_eq!(nv12[ysize + ci * 2 + 1], i420[ysize + csize + ci], "V {ci}");
+        }
+        // The scaled path produces the same relationship.
+        let i420s = scale_rgba_to_i420(&src, w, h, 4, 4);
+        let nv12s = scale_rgba_to_nv12(&src, w, h, 4, 4);
+        assert_eq!(i420s[..16], nv12s[..16]);
+        assert_eq!(nv12s[16], i420s[16]);
+        assert_eq!(nv12s[17], i420s[20]);
+    }
+
+    #[test]
+    fn bgra_swizzle_honours_pitch_and_forces_opaque_alpha() {
+        // Two BGRA pixels per row with 4 bytes of pitch padding; alpha bytes
+        // deliberately garbage (DXGI leaves them undefined).
+        #[rustfmt::skip]
+        let src = [
+            1u8, 2, 3, 9,   4, 5, 6, 9,   0xAA, 0xBB, 0xCC, 0xDD, // row 0 + pad
+            7, 8, 9, 9,   10, 11, 12, 9,  0xAA, 0xBB, 0xCC, 0xDD, // row 1 + pad
+        ];
+        let mut dst = Vec::new();
+        bgra_to_rgba_into(&src, 12, 2, 2, &mut dst);
+        assert_eq!(
+            dst,
+            [
+                3, 2, 1, 255, 6, 5, 4, 255, // row 0: B,G,R,A → R,G,B,255
+                9, 8, 7, 255, 12, 11, 10, 255, // row 1
+            ]
+        );
+        // Reuse at the same size must not re-zero or grow the buffer.
+        let ptr = dst.as_ptr();
+        bgra_to_rgba_into(&src, 12, 2, 2, &mut dst);
+        assert_eq!(dst.as_ptr(), ptr, "buffer reused in place");
     }
 }

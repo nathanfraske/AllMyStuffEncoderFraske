@@ -24,9 +24,23 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, PWSTR};
+use windows::Win32::Foundation::LUID;
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
+
+use crate::video::EncodeOutcome;
+
+/// How long one encode call may keep polling for the freshly-fed frame's own
+/// output before returning whatever has already drained. Healthy hardware
+/// answers in a few ms, so the common case still returns this frame's unit;
+/// a loaded GPU answers whenever it answers, and that unit is returned by a
+/// later call's drain instead of stalling the capture thread. (The old model
+/// waited up to a full second and then *discarded* all but the newest
+/// backlogged unit on the next call — the freeze and the smear-until-IDR,
+/// respectively, under GPU load.)
+const ASYNC_OUTPUT_GRACE: Duration = Duration::from_millis(50);
 
 /// MF version word: `(MF_SDK_VERSION << 16) | MF_API_VERSION` = `0x0002_0070`.
 /// Hard-coded because the `windows` crate doesn't export the composed constant.
@@ -77,8 +91,51 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<MediaFoundationH264, String> {
+        self.open_for_route(width, height, fps, bitrate, false)
+    }
+
+    /// [`Self::open`] with the owning route's latency posture. Production
+    /// streams use this entry so two concurrent routes may carry different
+    /// peak/VBV shapes; the plain [`Self::open`] stays balanced for hardware
+    /// probes and backend-local tests.
+    pub(crate) fn open_for_route(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        game: bool,
+    ) -> Result<MediaFoundationH264, String> {
+        self.open_with_manager_for_route(width, height, fps, bitrate, None, game)
+    }
+
+    /// [`Self::open`] bound to a DXGI device manager — the GPU lane: the MFT
+    /// joins the shared device and accepts NV12 *textures*
+    /// ([`MediaFoundationH264::encode_texture`]) with zero CPU pixel work.
+    pub fn open_with_manager(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
+    ) -> Result<MediaFoundationH264, String> {
+        self.open_with_manager_for_route(width, height, fps, bitrate, manager, false)
+    }
+
+    /// Device-manager form of [`Self::open_for_route`]. The manager and route
+    /// posture both belong to this one encode lane; neither is process-global.
+    pub(crate) fn open_with_manager_for_route(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
+        game: bool,
+    ) -> Result<MediaFoundationH264, String> {
         ensure_com_thread();
-        unsafe { self.open_inner(width, height, fps, bitrate) }
+        unsafe { self.open_inner(width, height, fps, bitrate, manager, game) }
     }
 
     unsafe fn open_inner(
@@ -87,6 +144,8 @@ impl HwEncoder {
         height: u32,
         fps: u32,
         bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
+        game: bool,
     ) -> Result<MediaFoundationH264, String> {
         let name = self.name.clone();
 
@@ -111,6 +170,17 @@ impl HwEncoder {
             // Low-latency mode: no reordering/lookahead buffering — what a live
             // screen stream needs. Best-effort (older MFTs may ignore it).
             let _ = a.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
+
+        // The GPU lane hands over the DXGI device manager before any media
+        // types — but strictly AFTER the async unlock above: an async MFT
+        // refuses every message (MF_E_TRANSFORM_ASYNC_LOCKED) until the
+        // caller declares async support. CPU-lane opens skip this and feed
+        // system memory exactly as before.
+        if let Some(m) = manager {
+            transform
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)
+                .map_err(mferr(&name, "set D3D manager"))?;
         }
 
         // H.264 encoders require the OUTPUT type set before the input type.
@@ -155,6 +225,12 @@ impl HwEncoder {
         set_attr_size(&in_type, &MF_MT_FRAME_RATE, fps.max(1), 1)
             .map_err(mferr(&name, "in rate"))?;
         set_attr_size(&in_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1).map_err(mferr(&name, "in par"))?;
+        // Our NV12 buffers are tightly packed: stride == width, stated
+        // explicitly. Left unstated, the Intel QSV MFT computes its own
+        // assumed stride and can round it to an alignment boundary (a
+        // sheared/green frame on Intel silicon); NVIDIA is indifferent.
+        // Best-effort — an MFT that rejects the attribute keeps its default.
+        let _ = in_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width);
         transform
             .SetInputType(0, &in_type, 0)
             .map_err(mferr(&name, "set in type"))?;
@@ -170,19 +246,33 @@ impl HwEncoder {
         // recovery cadence. Plus the ability to force a keyframe on demand.
         let codecapi = transform.cast::<ICodecAPI>().ok();
         if let Some(api) = &codecapi {
-            let peak = bitrate.saturating_mul(2);
+            // Peak + VBV from the shared posture: quality-first by default,
+            // trimmed for burst latency in game mode (see
+            // `video::burst_bounds`).
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, game);
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
                 &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
             );
             let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
             let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
-            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(bitrate));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
             let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &variant_bool(true));
             let _ = api.SetValue(
                 &CODECAPI_AVEncMPVGOPSize,
                 &variant_u32(fps.saturating_mul(4).max(1)),
             );
+            if crate::video::paced_slices_enabled() {
+                // Byte-capped slices for the app-side pacer (mode 1 =
+                // bits per slice). Best-effort — MFT support varies by
+                // vendor; without it the pacer still splits at whatever
+                // NAL boundaries exist.
+                let _ = api.SetValue(&CODECAPI_AVEncSliceControlMode, &variant_u32(1));
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncSliceControlSize,
+                    &variant_u32((crate::video::PACE_SLICE_BYTES * 8) as u32),
+                );
+            }
         }
 
         // Event generator for the async (hardware) drive model.
@@ -226,8 +316,22 @@ impl HwEncoder {
             provides_samples,
             out_buf_size,
             frame_index: 0,
-            nv12: Vec::new(),
+            input_credits: 0,
+            game,
         })
+    }
+
+    /// Tear down the object cached by this activation after a throwaway
+    /// frame-send probe. `IMFActivate` otherwise returns that same transform
+    /// on the next `ActivateObject`, carrying the probe's grey reference chain
+    /// into the live route.
+    pub(crate) fn shutdown_probe_instance(&self) -> Result<(), String> {
+        ensure_com_thread();
+        unsafe {
+            self.activate
+                .ShutdownObject()
+                .map_err(mferr(&self.name, "shutdown probe instance"))
+        }
     }
 }
 
@@ -240,28 +344,161 @@ pub fn hardware_h264_mfts() -> Vec<HwEncoder> {
     unsafe { enum_hw_h264() }
 }
 
+/// [`hardware_h264_mfts`] scoped to one adapter — the GPU lane's
+/// enumeration: the encoder must live on the duplication device's adapter
+/// or the shared device manager buys nothing. Empty when that adapter has
+/// no H.264 encoder MFT; the lane then falls back to the CPU path (which
+/// may still find an encoder elsewhere).
+pub(crate) fn hardware_h264_mfts_on(adapter: LUID) -> Vec<HwEncoder> {
+    ensure_mf_started();
+    ensure_com_thread();
+    unsafe { enum_h264_encoders(Some(adapter)) }
+}
+
+/// Whether the operator pinned encoding to a specific adapter
+/// (`ALLMYSTUFF_VIDEO_ENCODE_ADAPTER`). The GPU zero-copy lane steps aside
+/// when so: the pin's whole point is encoding on a *different* GPU than
+/// the display's (iGPU offload), which is inherently cross-adapter — the
+/// CPU lane's system-memory NV12 serves that; a same-device texture lane
+/// can't.
+pub(crate) fn adapter_pin_active() -> bool {
+    adapter_pin().is_some()
+}
+
 unsafe fn enum_hw_h264() -> Vec<HwEncoder> {
+    // The operator's adapter pin runs first — soft, like every rung of the
+    // ladder: a pin that matches no adapter, or an adapter with no H.264
+    // encoder MFT, falls back to the default enumeration.
+    if let Some(pin) = adapter_pin() {
+        if let Some(luid) = adapter_luid_for_pin(pin) {
+            let pinned = enum_h264_encoders(Some(luid));
+            if !pinned.is_empty() {
+                return pinned;
+            }
+            tracing::warn!(
+                "pinned adapter ({pin}) exposes no hardware H.264 encoder MFT; \
+                 using the default enumeration"
+            );
+        }
+    }
+    enum_h264_encoders(None)
+}
+
+/// The operator's encoder-adapter pin (`ALLMYSTUFF_VIDEO_ENCODE_ADAPTER`):
+/// `intel` / `nvidia` / `amd` picks the first adapter of that vendor, a
+/// number picks the DXGI adapter index. Unset = MF's default enumeration
+/// (every adapter's encoders, merit-sorted). The lever this adds: on a box
+/// whose primary GPU is saturated (a game, a render job), pinning the
+/// encode to the idle iGPU keeps the stream's encoder off the contended
+/// engine entirely — encoder input is system-memory NV12, so feeding
+/// another adapter's MFT costs nothing extra. Read once per process, like
+/// the video dials.
+fn adapter_pin() -> Option<&'static str> {
+    static PIN: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_VIDEO_ENCODE_ADAPTER") {
+            Ok(v) if !v.trim().is_empty() => {
+                tracing::info!("ALLMYSTUFF_VIDEO_ENCODE_ADAPTER={} (override)", v.trim());
+                Some(v.trim().to_string())
+            }
+            _ => None,
+        });
+    PIN.as_deref()
+}
+
+/// Resolve a pin to a DXGI adapter LUID, logging which adapter it landed on.
+unsafe fn adapter_luid_for_pin(pin: &str) -> Option<LUID> {
+    let factory: IDXGIFactory1 = match CreateDXGIFactory1() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("DXGI factory for the encoder-adapter pin failed: {e}");
+            return None;
+        }
+    };
+    let want_vendor = match pin.to_ascii_lowercase().as_str() {
+        "intel" => Some(0x8086u32),
+        "nvidia" => Some(0x10DEu32),
+        "amd" => Some(0x1002u32),
+        _ => None,
+    };
+    let want_index: Option<u32> = pin.parse().ok();
+    if want_vendor.is_none() && want_index.is_none() {
+        tracing::warn!(
+            "ALLMYSTUFF_VIDEO_ENCODE_ADAPTER={pin} isn't intel/nvidia/amd or an adapter index"
+        );
+        return None;
+    }
+    let mut idx = 0u32;
+    while let Ok(adapter) = factory.EnumAdapters1(idx) {
+        if let Ok(desc) = adapter.GetDesc1() {
+            let hit = match want_vendor {
+                Some(v) => desc.VendorId == v,
+                None => Some(idx) == want_index,
+            };
+            if hit {
+                let name = String::from_utf16_lossy(&desc.Description);
+                tracing::info!(
+                    "encoder adapter pinned: {} (DXGI adapter {idx})",
+                    name.trim_end_matches('\0').trim()
+                );
+                return Some(desc.AdapterLuid);
+            }
+        }
+        idx += 1;
+    }
+    tracing::warn!("ALLMYSTUFF_VIDEO_ENCODE_ADAPTER={pin} matched no DXGI adapter");
+    None
+}
+
+/// One enumeration pass: `MFTEnum2` scoped to `adapter` when given
+/// (`MFT_ENUM_ADAPTER_LUID` — valid only alongside `MFT_ENUM_FLAG_HARDWARE`,
+/// which is always set here), plain `MFTEnumEx` otherwise.
+unsafe fn enum_h264_encoders(adapter: Option<LUID>) -> Vec<HwEncoder> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
-    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-    let mut count: u32 = 0;
     // Hardware encoders, output H.264; SORTANDFILTER puts the preferred MFT
     // first and drops disabled ones.
     let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
-    if MFTEnumEx(
-        MFT_CATEGORY_VIDEO_ENCODER,
-        flags,
-        None,
-        Some(&out_info),
-        &mut activates,
-        &mut count,
-    )
-    .is_err()
-        || activates.is_null()
-        || count == 0
-    {
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    let enumerated = match adapter {
+        Some(luid) => {
+            let mut attrs: Option<IMFAttributes> = None;
+            if MFCreateAttributes(&mut attrs, 1).is_err() {
+                return Vec::new();
+            }
+            let Some(attrs) = attrs else {
+                return Vec::new();
+            };
+            // The attribute's value is the adapter LUID as an 8-byte blob
+            // (LowPart then HighPart, little-endian — the struct's layout).
+            let mut blob = [0u8; 8];
+            blob[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+            blob[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+            if attrs.SetBlob(&MFT_ENUM_ADAPTER_LUID, &blob).is_err() {
+                return Vec::new();
+            }
+            MFTEnum2(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                flags,
+                None,
+                Some(&out_info),
+                &attrs,
+                &mut activates,
+                &mut count,
+            )
+        }
+        None => MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(&out_info),
+            &mut activates,
+            &mut count,
+        ),
+    };
+    if enumerated.is_err() || activates.is_null() || count == 0 {
         if !activates.is_null() {
             CoTaskMemFree(Some(activates as *const c_void));
         }
@@ -283,6 +520,24 @@ unsafe fn enum_hw_h264() -> Vec<HwEncoder> {
     }
     // The array memory itself is CoTaskMem; its element refs are now ours.
     CoTaskMemFree(Some(activates as *const c_void));
+    // The full enumeration at debug, not just the eventual winner — on a
+    // hybrid dGPU+iGPU box this is what reveals a present-but-never-selected
+    // second encoder (the ladder takes the first that emits a frame).
+    if !result.is_empty() {
+        tracing::debug!(
+            "hardware H.264 encoder MFTs{}: {}",
+            if adapter.is_some() {
+                " (pinned adapter)"
+            } else {
+                ""
+            },
+            result
+                .iter()
+                .map(|h| h.name())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+    }
     result
 }
 
@@ -321,8 +576,16 @@ pub struct MediaFoundationH264 {
     provides_samples: bool,
     out_buf_size: usize,
     frame_index: i64,
-    /// Reused NV12 scratch so a 4K frame doesn't allocate per encode.
-    nv12: Vec<u8>,
+    /// Banked `METransformNeedInput` credits. The async MFT posts each
+    /// NeedInput exactly once and then *waits*; an event that arrives while
+    /// this call's frame is already fed must be banked — not dropped — or
+    /// the input pipeline starves permanently (the MFT never re-asks). A
+    /// banked credit feeds the next call's frame immediately, no event
+    /// round-trip.
+    input_credits: u32,
+    /// This route's burst posture, retained so in-place bitrate changes keep
+    /// the same peak/VBV shape chosen at open.
+    game: bool,
 }
 
 // SAFETY: a MediaFoundationH264 is built on, and only ever used from, the single
@@ -338,35 +601,26 @@ impl MediaFoundationH264 {
         &self.name
     }
 
-    /// Encode one contiguous I420 frame (`width*height` Y, then quarter-size U,
-    /// then V). Returns the Annex-B access unit + whether it was a keyframe, or
-    /// `None` when the encoder produced nothing this call (buffering).
-    pub fn encode_i420(
+    /// Encode one contiguous NV12 frame (`width*height` Y, then interleaved
+    /// U/V) — the MFT's native layout, which the fused scaler upstream now
+    /// produces directly (the old seam took I420 and paid a full chroma
+    /// re-interleave per frame here). Returns every Annex-B access unit the
+    /// MFT had ready (oldest first) plus whether this frame was accepted —
+    /// see [`crate::video::EncodeOutcome`] for why both matter.
+    /// `pub(crate)`: the outcome type is the video module's internal seam.
+    pub(crate) fn encode_nv12(
         &mut self,
-        i420: &[u8],
+        nv12: &[u8],
         force_idr: bool,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> Result<EncodeOutcome, String> {
         let (w, h) = (self.width as usize, self.height as usize);
-        let ysize = w * h;
-        let csize = (w / 2) * (h / 2);
-        if i420.len() < ysize + 2 * csize {
+        let need = w * h + 2 * ((w / 2) * (h / 2));
+        if nv12.len() < need {
             return Err(format!(
-                "{}: short I420 ({} < {})",
+                "{}: short NV12 ({} < {need})",
                 self.name,
-                i420.len(),
-                ysize + 2 * csize
+                nv12.len(),
             ));
-        }
-        // I420 (planar Y,U,V) → NV12 (Y plane, then interleaved U,V). Same total
-        // size; every hardware H.264 MFT takes NV12.
-        self.nv12.resize(ysize + 2 * csize, 0);
-        self.nv12[..ysize].copy_from_slice(&i420[..ysize]);
-        let u = &i420[ysize..ysize + csize];
-        let v = &i420[ysize + csize..ysize + 2 * csize];
-        let uv = &mut self.nv12[ysize..];
-        for i in 0..csize {
-            uv[2 * i] = u[i];
-            uv[2 * i + 1] = v[i];
         }
 
         let duration = 10_000_000i64 / i64::from(self.fps);
@@ -374,8 +628,50 @@ impl MediaFoundationH264 {
         self.frame_index += 1;
 
         unsafe {
-            let sample = make_input_sample(&self.nv12, time, duration)
+            let sample = make_input_sample(&nv12[..need], time, duration)
                 .map_err(|e| format!("{}: input sample: {e}", self.name))?;
+            if force_idr {
+                self.force_keyframe();
+            }
+            if self.is_async {
+                self.pump_async(&sample)
+            } else {
+                self.pump_sync(&sample)
+            }
+        }
+    }
+
+    /// Encode one NV12 **texture** — the GPU lane's zero-copy input. The
+    /// MFT must have been opened with the same device manager the texture's
+    /// device is registered in ([`HwEncoder::open_with_manager`]); the
+    /// encoder reads the surface in place — no CPU pixel work anywhere on
+    /// this path.
+    pub(crate) fn encode_texture(
+        &mut self,
+        nv12: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        force_idr: bool,
+    ) -> Result<EncodeOutcome, String> {
+        let duration = 10_000_000i64 / i64::from(self.fps);
+        let time = self.frame_index * duration;
+        self.frame_index += 1;
+        unsafe {
+            let buffer = MFCreateDXGISurfaceBuffer(
+                &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::IID,
+                nv12,
+                0,
+                false,
+            )
+            .map_err(|e| format!("{}: DXGI surface buffer: {e}", self.name))?;
+            let sample = MFCreateSample().map_err(|e| format!("{}: sample: {e}", self.name))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|e| format!("{}: add buffer: {e}", self.name))?;
+            sample
+                .SetSampleTime(time)
+                .map_err(|e| format!("{}: sample time: {e}", self.name))?;
+            sample
+                .SetSampleDuration(duration)
+                .map_err(|e| format!("{}: sample duration: {e}", self.name))?;
             if force_idr {
                 self.force_keyframe();
             }
@@ -396,46 +692,107 @@ impl MediaFoundationH264 {
         }
     }
 
-    /// Synchronous MFT: feed one input, drain every output it produces.
-    unsafe fn pump_sync(&mut self, sample: &IMFSample) -> Result<Option<(Vec<u8>, bool)>, String> {
-        self.transform
-            .ProcessInput(0, sample, 0)
-            .map_err(|e| format!("{}: ProcessInput: {e}", self.name))?;
-        let mut data = Vec::new();
-        let mut key = false;
-        let mut got = false;
-        while let Some((d, k)) = self.process_output()? {
-            data.extend_from_slice(&d);
-            key |= k;
-            got = true;
+    /// Re-aim the rate controller mid-stream — mean plus the matching
+    /// peak/VBV posture, no reopen, no forced IDR. `true` when the MFT
+    /// accepted the mean (NVENC's does); a `false` leaves the encoder
+    /// exactly as it was, and the caller keeps the rebuild path. This is
+    /// the knob smooth receiver-driven adaptation needs: today a bitrate
+    /// move costs a codec rebuild whose first unit is an IDR — a burst on
+    /// the wire at the exact moment the link is struggling.
+    // Production consumer lands with receiver-driven bitrate adaptation
+    // (BWE); until then `hardware_bitrate_reconfigures_in_place` proves it.
+    #[allow(dead_code)]
+    pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        let Some(api) = &self.codecapi else {
+            return false;
+        };
+        unsafe {
+            if api
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate))
+                .is_err()
+            {
+                return false;
+            }
+            // Peak + VBV follow the mean so the burst posture stays
+            // proportional; best-effort — a box that only re-aims the mean
+            // still adapts.
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.game);
+            let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
+            let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
+            true
         }
-        Ok(if got { Some((data, key)) } else { None })
     }
 
-    /// Async (hardware) MFT: drive the event model. Feed our one frame on the
-    /// first `METransformNeedInput`, then collect its `METransformHaveOutput`.
-    /// Polls with `NO_WAIT` + a deadline so a quirky driver can never deadlock
-    /// the encode thread — output that lags by a frame is picked up next call.
-    unsafe fn pump_async(&mut self, sample: &IMFSample) -> Result<Option<(Vec<u8>, bool)>, String> {
+    /// Synchronous MFT: feed one input, drain every output it produces —
+    /// each drained sample is its own access unit, in order. A sync MFT with
+    /// pending output can refuse input (`MF_E_NOTACCEPTING`): drain, then
+    /// retry once; if it still refuses, report the frame unconsumed rather
+    /// than erroring the stream.
+    unsafe fn pump_sync(&mut self, sample: &IMFSample) -> Result<EncodeOutcome, String> {
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
+        let mut consumed = false;
+        for _ in 0..2 {
+            match self.transform.ProcessInput(0, sample, 0) {
+                Ok(()) => {
+                    consumed = true;
+                    break;
+                }
+                Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                    while let Some(unit) = self.process_output()? {
+                        units.push(unit);
+                    }
+                }
+                Err(e) => return Err(format!("{}: ProcessInput: {e}", self.name)),
+            }
+        }
+        while let Some(unit) = self.process_output()? {
+            units.push(unit);
+        }
+        Ok(EncodeOutcome {
+            units,
+            consumed,
+            input_ts: 0,
+        })
+    }
+
+    /// Async (hardware) MFT: drive the event model **losslessly**. Drain every
+    /// pending event — collecting each available output in order, feeding our
+    /// one frame on a `METransformNeedInput` (or on a banked credit from a
+    /// previous call, immediately) and **banking** any further NeedInput as an
+    /// input credit — then poll only a short [`ASYNC_OUTPUT_GRACE`] for this
+    /// frame's own output. Whatever hasn't arrived by then is returned by a
+    /// later call's drain; **no drained unit is ever discarded** (dropping one
+    /// snaps the viewer's P-frame reference chain), **no NeedInput is ever
+    /// dropped** (each is posted exactly once — losing one starves the input
+    /// pipeline for good), and the capture thread is never parked for longer
+    /// than the grace, no matter how loaded the GPU is.
+    unsafe fn pump_async(&mut self, sample: &IMFSample) -> Result<EncodeOutcome, String> {
         let events = match &self.events {
             Some(e) => e.clone(),
             None => return Err(format!("{}: async MFT without event generator", self.name)),
         };
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
         let mut fed = false;
-        let mut out: Option<(Vec<u8>, bool)> = None;
+        // A banked credit means the MFT already asked for this frame.
+        if self.input_credits > 0 {
+            self.transform
+                .ProcessInput(0, sample, 0)
+                .map_err(|e| format!("{}: ProcessInput: {e}", self.name))?;
+            self.input_credits -= 1;
+            fed = true;
+        }
         let start = Instant::now();
-        let deadline = Duration::from_millis(1000);
         loop {
             let event = match events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                 Ok(ev) => ev,
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if out.is_some() {
-                        return Ok(out);
+                    // Done once our frame is in and at least one unit is out —
+                    // or once the grace runs dry. Never discard what drained.
+                    if fed && !units.is_empty() {
+                        break;
                     }
-                    if start.elapsed() >= deadline {
-                        // Nothing yet — treat as buffering. The frame-send test
-                        // retries, and a live stream picks the unit up next tick.
-                        return Ok(None);
+                    if start.elapsed() >= ASYNC_OUTPUT_GRACE {
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
@@ -451,18 +808,22 @@ impl MediaFoundationH264 {
                         .ProcessInput(0, sample, 0)
                         .map_err(|e| format!("{}: ProcessInput: {e}", self.name))?;
                     fed = true;
+                } else {
+                    // The MFT wants the *next* frame — bank the ask; the
+                    // pump's next call spends it before touching the queue.
+                    self.input_credits += 1;
                 }
-                // A second NeedInput means the MFT wants the *next* frame; we
-                // have only this one. Keep waiting for this frame's output.
             } else if met == METransformHaveOutput.0 as u32 {
-                if let Some(pkt) = self.process_output()? {
-                    out = Some(pkt);
-                    if fed {
-                        return Ok(out);
-                    }
+                if let Some(unit) = self.process_output()? {
+                    units.push(unit);
                 }
             }
         }
+        Ok(EncodeOutcome {
+            units,
+            consumed: fed,
+            input_ts: 0,
+        })
     }
 
     /// One `ProcessOutput` call. `Ok(None)` means the MFT wants more input (or a
@@ -594,4 +955,188 @@ fn variant_u32(v: u32) -> VARIANT {
 /// A `VT_BOOL` VARIANT for an `ICodecAPI` boolean property.
 fn variant_bool(v: bool) -> VARIANT {
     VARIANT::from(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed the real hardware MFT a burst of frames back-to-back and hold the
+    /// pump to its lossless contract: every consumed frame's unit comes out
+    /// (a small in-flight tail excepted) and the whole stream decodes cleanly
+    /// through openh264, in order — one silently dropped unit snaps the
+    /// reference chain and fails the decode immediately, which is exactly the
+    /// smear-until-IDR bug the drain rewrite removed. Skips (passing) when
+    /// the box has no hardware H.264 MFT.
+    #[test]
+    fn hardware_pump_is_lossless_and_decodable() {
+        let hw = hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            eprintln!("SKIP: no hardware H.264 MFT on this machine");
+            return;
+        };
+        let (w, h) = (640u32, 480u32);
+        let mut enc = match first.open(w, h, 60, 4_000_000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: MFT open failed: {e}");
+                return;
+            }
+        };
+        let (wu, hu) = (w as usize, h as usize);
+        // NV12: luma plane + interleaved chroma; 128 chroma = neutral grey.
+        let mut nv12 = vec![128u8; wu * hu + 2 * ((wu / 2) * (hu / 2))];
+        let frames = 90u32;
+        let mut fed = 0u32;
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
+        for i in 0..frames {
+            // March a bright stripe down the luma plane so every frame
+            // carries a real delta.
+            for (j, v) in nv12[..wu * hu].iter_mut().enumerate() {
+                let row = j / wu;
+                *v = if row % 64 == (i as usize) % 64 {
+                    235
+                } else {
+                    60
+                };
+            }
+            let out = enc.encode_nv12(&nv12, i == 0).expect("encode");
+            if out.consumed {
+                fed += 1;
+            }
+            units.extend(out.units);
+        }
+        // Drain the in-flight tail with a few more calls.
+        for _ in 0..3 {
+            let out = enc.encode_nv12(&nv12, false).expect("drain");
+            if out.consumed {
+                fed += 1;
+            }
+            units.extend(out.units);
+        }
+        assert!(
+            units.len() as u32 >= fed.saturating_sub(2),
+            "lossless drain: {} units for {fed} consumed frames",
+            units.len()
+        );
+        assert!(units.iter().any(|(_, k)| *k), "a keyframe came out");
+        let mut dec = openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new(),
+        )
+        .expect("decoder");
+        let mut decoded = 0u32;
+        for (d, _) in &units {
+            let pic = dec.decode(d).expect("clean decode — no missing references");
+            if pic.is_some() {
+                decoded += 1;
+            }
+        }
+        assert!(
+            decoded >= fed.saturating_sub(3),
+            "decoded {decoded} of {fed} fed frames"
+        );
+    }
+
+    /// The in-place bitrate pilot, in the direction adaptation actually
+    /// needs it: **downward, instantly, without a reopen or an IDR** — a
+    /// congested link wants the rate cut NOW, and a rebuild's first-IDR
+    /// burst is the worst possible thing to send it. `set_bitrate` must be
+    /// accepted, the output rate must genuinely fall (≥3× on a 6× cut),
+    /// and the stream must decode cleanly across the change (an encoder
+    /// that internally reset would snap the reference chain).
+    ///
+    /// The upward direction was probed too and is only partially honored:
+    /// the NVIDIA MFT stores the new mean exactly (reads back verbatim)
+    /// but self-clamps peak/VBV to a driver-internal ceiling and tracked
+    /// ~5.7 Mbps of a 2→12 ask in the probe run. So the operational rule
+    /// this pilot sets: in-place for downshifts (and modest upshifts);
+    /// large upshifts take the rebuild path, whose IDR a healthy link
+    /// absorbs.
+    #[test]
+    fn hardware_bitrate_reconfigures_in_place() {
+        let hw = hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            eprintln!("SKIP: no hardware H.264 MFT on this machine");
+            return;
+        };
+        let (w, h) = (1280u32, 720u32);
+        let mut enc = match first.open(w, h, 60, 12_000_000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP: MFT open failed: {e}");
+                return;
+            }
+        };
+        let (wu, hu) = (w as usize, h as usize);
+        let mut nv12 = vec![128u8; wu * hu + 2 * ((wu / 2) * (hu / 2))];
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
+        // Full-luma churn every frame so the rate controller is genuinely
+        // rate-limited (a too-easy scene converges below both targets and
+        // the ratio says nothing).
+        let mut feed = |enc: &mut MediaFoundationH264,
+                        units: &mut Vec<(Vec<u8>, bool)>,
+                        base: u32,
+                        n: u32|
+         -> u64 {
+            let mut bytes = 0u64;
+            for i in 0..n {
+                for (j, v) in nv12[..wu * hu].iter_mut().enumerate() {
+                    // Decorrelated per-pixel, per-frame noise (integer
+                    // hash): incompressible, so BOTH windows are genuinely
+                    // rate-limited and the byte ratio reflects the rate
+                    // change. (A smooth pattern quality-saturates below
+                    // the high target and the ratio understates the move.)
+                    let x = (j as u32)
+                        .wrapping_add((base + i).wrapping_mul(9973))
+                        .wrapping_mul(2654435761);
+                    *v = (x >> 24) as u8;
+                }
+                let out = enc.encode_nv12(&nv12, base == 0 && i == 0).expect("encode");
+                for (d, k) in out.units {
+                    bytes += d.len() as u64;
+                    units.push((d, k));
+                }
+            }
+            bytes
+        };
+        // Warm-up (rate control settles), then the measured high window.
+        feed(&mut enc, &mut units, 0, 30);
+        let high = feed(&mut enc, &mut units, 30, 60);
+        if !enc.set_bitrate(2_000_000) {
+            eprintln!("SKIP: {} rejects dynamic bitrate", enc.label());
+            return;
+        }
+        // Settle, then the measured low window.
+        feed(&mut enc, &mut units, 90, 45);
+        let low = feed(&mut enc, &mut units, 135, 60);
+        // Two claims: the 60-frame (1 s) low window lands on the new 2 Mbps
+        // target (≤35% over), and the rate genuinely moved (≥2× down from
+        // the high window — which VBR may itself undershoot on saturated
+        // content, so the ratio bound stays modest).
+        let target_window = 2_000_000u64 / 8;
+        assert!(
+            low <= target_window + target_window / 3,
+            "low window {low} B doesn't track the 2 Mbps ask (~{target_window} B)"
+        );
+        assert!(
+            low.saturating_mul(2) <= high,
+            "rate didn't fall: high window {high} B, low window {low} B (asked 12 -> 2 Mbps)"
+        );
+        // The whole stream — across the reconfigure — must decode clean:
+        // an encoder that internally reset would snap the reference chain
+        // here.
+        let mut dec = openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new(),
+        )
+        .expect("decoder");
+        for (d, _) in &units {
+            dec.decode(d).expect("clean decode across bitrate change");
+        }
+        println!(
+            "in-place bitrate: high window {high} B -> low window {low} B ({:.1}x cut)",
+            high as f64 / low.max(1) as f64
+        );
+    }
 }

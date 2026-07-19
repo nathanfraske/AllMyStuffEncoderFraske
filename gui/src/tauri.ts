@@ -225,6 +225,18 @@ export interface StreamTune {
   maxEdge?: number;
   bitrate?: number;
   fps?: number;
+  /** Game mode: the latency-first posture (gradual intra-refresh instead
+   *  of keyframe walls on capable streamers, 60 fps floor off-LAN, tight
+   *  burst bounds). Absent/false = balanced. Kept for hosts that predate
+   *  the named tri-state below. */
+  game?: boolean;
+  /** The stream posture by name. Balanced favors stability and quality;
+   *  Game favors latency and instant recovery; Studio is the LAN
+   *  fidelity mode — a high-bitrate quality-first encode for links with
+   *  bandwidth to spend; Studio-Lossless is its top shelf — bit-exact
+   *  HEVC on NVIDIA hardware, falling soft to Studio anywhere the rung
+   *  can't run (old hosts read it as no named ask). */
+  mode?: "balanced" | "game" | "studio" | "studio-lossless";
 }
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
@@ -235,7 +247,43 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
     maxEdge: tune.maxEdge ?? null,
     bitrate: tune.bitrate ?? null,
     fps: tune.fps ?? null,
+    game: tune.game ?? null,
+    mode: tune.mode ?? null,
   });
+}
+
+/** The *effective* encode dials for a route — what the streamer is actually
+ *  doing right now, beside the requested {@link StreamTune}. The AIMD loop
+ *  (Game posture) moves `targetBitrateBps` at runtime; `outW`/`outH` are the
+ *  real output geometry; `codec`/`encoderLabel` name the wire codec and the
+ *  encoder rung. Bitrates are bits/s, `""` means "not reported yet". */
+export interface RouteDials {
+  posture: "balanced" | "game" | "studio" | "studio-lossless";
+  encoderLabel: string;
+  codec: string;
+  targetBitrateBps: number;
+  ceilingBps: number;
+  fpsTarget: number;
+  edgeCap: number;
+  outW: number;
+  outH: number;
+}
+
+/** Poll the effective encode dials for `routeId`. Returns null when this
+ *  machine isn't the route's streamer (the ordinary remote-view case — the
+ *  viewer surfaces its own measured actuals instead) or in web mode. Cheap
+ *  and read-only; call ~1 Hz only while a quality panel is open. */
+export function routeDials(routeId: string): Promise<RouteDials | null> {
+  return tryInvoke<RouteDials>("route_dials", { routeId });
+}
+
+/** Flip the Experimental (Labs) tier on this node — the Mode dropdown's
+ *  toggle. Omit `feature` for the whole tier; pass one (e.g. "damage") to
+ *  flip a single experiment. GUI-internal, never wire-visible; a no-op in
+ *  web mode. Every future Labs feature reads this gate backend-side, so
+ *  no new control is ever needed. */
+export function labsSet(on: boolean, feature?: string): Promise<null> {
+  return tryInvoke("labs_set", { on, feature: feature ?? null });
 }
 
 /** Ask the sender of `routeId` for a clean decode entry (IDR) now — call
@@ -1611,6 +1659,16 @@ export async function toggleWindowFullscreen(): Promise<boolean> {
   return next;
 }
 
+/** The window's REAL fullscreen state — the OS can flip it without our
+ *  ⛶ (Win+Up, taskbar, a shell gesture), and pointer-lock/fit logic
+ *  keys off the flag, so callers re-query on resize instead of trusting
+ *  their last click. Web mode reports the Fullscreen API instead. */
+export async function isWindowFullscreen(): Promise<boolean> {
+  if (!isTauri()) return document.fullscreenElement != null;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().isFullscreen();
+}
+
 // ---- video popouts (one stream in its own OS window) -------------------
 
 /** Open (or focus) the dedicated popout window for one video stream.
@@ -1895,6 +1953,19 @@ export function serviceRestart(): Promise<ServiceActionResult> {
 }
 export function serviceUninstall(): Promise<ServiceActionResult> {
   return serviceAction("service_uninstall");
+}
+
+/** Opt-in verbose diagnostics. The backend reads this local preference when it
+ * starts; changing it never changes mesh traffic and takes effect after the
+ * GUI/node backend is restarted. */
+export function debugLoggingGet(): Promise<boolean | null> {
+  return tryInvoke<boolean>("debug_logging_get");
+}
+
+export async function debugLoggingSet(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) return false;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke("debug_logging_set", { enabled })) as boolean;
 }
 
 /** Window/startup behaviour: whether closing / minimizing keeps AllMyStuff in

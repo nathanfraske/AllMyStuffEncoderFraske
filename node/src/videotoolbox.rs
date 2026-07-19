@@ -24,10 +24,11 @@
 //! prepended on keyframes — and handed back on the encode thread. Same seam
 //! as openh264/MF/FFmpeg: I420 in, Annex-B H.264 out.
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::mpsc;
 use std::time::Duration;
+
+use crate::video::EncodeOutcome;
 
 use core_foundation::base::{Boolean, CFRelease, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -203,10 +204,6 @@ pub struct VideoToolboxH264 {
     /// `VTCompressionSessionInvalidate` guarantees no further callbacks.
     sink: *mut CallbackSink,
     rx: mpsc::Receiver<Result<EncodedUnit, String>>,
-    /// Access units the callback produced beyond the one returned per
-    /// `encode_i420` call — drained first on the next call, so a bursty
-    /// callback never drops a unit (dropping breaks the P-frame chain).
-    pending: VecDeque<EncodedUnit>,
     frame_index: i64,
     fps: i32,
     width: usize,
@@ -230,31 +227,60 @@ impl VideoToolboxH264 {
         let sink = Box::into_raw(Box::new(CallbackSink { tx }));
         let mut session: VTCompressionSessionRef = std::ptr::null_mut();
 
-        // Encoder specification: hardware or nothing (see above).
-        let require_hw = unsafe {
-            CFDictionary::from_CFType_pairs(&[(
+        // Encoder specification: hardware or nothing (see above), plus the
+        // low-latency rate controller where the system has it (macOS
+        // 11.3+): strict one-in-one-out, no reordering, and faster rate
+        // adaptation to link changes — the productized form of the realtime
+        // posture the properties below ask for piecemeal. The key is built
+        // by *name* rather than the linked symbol so binaries still load on
+        // older systems (an unknown spec key there fails the create, which
+        // is why the create retries without it — hardware-required stays
+        // non-negotiable on both attempts).
+        let spec_for = |low_latency: bool| unsafe {
+            let mut pairs = vec![(
                 core_foundation::string::CFString::wrap_under_get_rule(
                     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 )
                 .as_CFType(),
                 CFBoolean::true_value().as_CFType(),
-            )])
+            )];
+            if low_latency {
+                pairs.push((
+                    core_foundation::string::CFString::new("EnableLowLatencyRateControl")
+                        .as_CFType(),
+                    CFBoolean::true_value().as_CFType(),
+                ));
+            }
+            CFDictionary::from_CFType_pairs(&pairs)
         };
 
-        let status = unsafe {
-            VTCompressionSessionCreate(
-                std::ptr::null(),
-                w as i32,
-                h as i32,
-                CM_VIDEO_CODEC_TYPE_H264,
-                require_hw.as_concrete_TypeRef(),
-                std::ptr::null(),
-                std::ptr::null(),
-                output_callback,
-                sink.cast(),
-                &mut session,
-            )
-        };
+        let mut status = 0;
+        for low_latency in [true, false] {
+            let spec = spec_for(low_latency);
+            status = unsafe {
+                VTCompressionSessionCreate(
+                    std::ptr::null(),
+                    w as i32,
+                    h as i32,
+                    CM_VIDEO_CODEC_TYPE_H264,
+                    spec.as_concrete_TypeRef(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    output_callback,
+                    sink.cast(),
+                    &mut session,
+                )
+            };
+            if status == 0 && !session.is_null() {
+                if !low_latency {
+                    tracing::info!(
+                        "VideoToolbox opened without low-latency rate control (pre-11.3 macOS?)"
+                    );
+                }
+                break;
+            }
+            session = std::ptr::null_mut();
+        }
         if status != 0 || session.is_null() {
             // Re-own the sink so the failed open leaks nothing.
             unsafe { drop(Box::from_raw(sink)) };
@@ -265,7 +291,6 @@ impl VideoToolboxH264 {
             session,
             sink,
             rx,
-            pending: VecDeque::new(),
             frame_index: 0,
             fps: fps.max(1) as i32,
             width: w as usize,
@@ -325,17 +350,28 @@ impl VideoToolboxH264 {
     }
 
     /// Encode one contiguous I420 frame (the trait seam: `w*h` Y then
-    /// quarter-size U then V), returning the Annex-B access unit + whether
-    /// it's a keyframe — or `None` while the session is still warming up.
-    pub fn encode_i420(
+    /// quarter-size U then V), returning every Annex-B access unit the
+    /// session had ready, oldest first — see [`EncodeOutcome`]. (The old
+    /// shape returned one queued unit *instead of* encoding the input frame,
+    /// silently skipping that frame's content whenever the callback ran a
+    /// unit ahead.) `pub(crate)`: the outcome type is the video module's
+    /// internal seam.
+    pub(crate) fn encode_i420(
         &mut self,
         i420: &[u8],
         force_idr: bool,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
-        // A unit the callback delivered beyond the last call's take: return
-        // it first, in order — dropping one would snap the P-frame chain.
-        if let Some(unit) = self.pending.pop_front() {
-            return Ok(Some((unit.annexb, unit.key)));
+    ) -> Result<EncodeOutcome, String> {
+        // Everything already delivered goes out first, in order.
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(Ok(unit)) => units.push((unit.annexb, unit.key)),
+                Ok(Err(e)) => return Err(format!("VideoToolbox encode callback: {e}")),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("VideoToolbox session went away".into())
+                }
+            }
         }
 
         let pixel_buffer = self.fill_pixel_buffer(i420)?;
@@ -371,24 +407,42 @@ impl VideoToolboxH264 {
             ));
         }
 
-        // Realtime + no reordering emits ~1:1 within a frame time; wait a
-        // bounded beat for it. Nothing yet = still warming up — the caller
-        // treats `None` as buffering (and the ladder's send test feeds a few
-        // frames before judging).
-        match self.rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(unit)) => {
-                // Anything else already queued rides `pending`, in order.
-                while let Ok(Ok(extra)) = self.rx.try_recv() {
-                    self.pending.push_back(extra);
+        // Realtime + no reordering emits ~1:1 within a frame time; when the
+        // drain above found nothing, wait a bounded beat for this frame's own
+        // unit — keeps the ladder's frame-send test and the common case 1:1.
+        // A media engine running behind delivers into a later call's drain
+        // instead of parking the capture thread; an empty return reads as
+        // buffering (`consumed` is true either way — EncodeFrame accepted it).
+        if units.is_empty() {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(unit)) => units.push((unit.annexb, unit.key)),
+                Ok(Err(e)) => return Err(format!("VideoToolbox encode callback: {e}")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("VideoToolbox session went away".into())
                 }
-                Ok(Some((unit.annexb, unit.key)))
             }
-            Ok(Err(e)) => Err(format!("VideoToolbox encode callback: {e}")),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("VideoToolbox session went away".into())
+            // Surface errors that raced the bounded wait. `while let
+            // Ok(Ok(..))` silently stopped on an `Err` callback and left the
+            // live session looking healthy until some unrelated later call.
+            loop {
+                match self.rx.try_recv() {
+                    Ok(Ok(extra)) => units.push((extra.annexb, extra.key)),
+                    Ok(Err(e)) => return Err(format!("VideoToolbox encode callback: {e}")),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("VideoToolbox session went away".into())
+                    }
+                }
             }
         }
+        Ok(EncodeOutcome {
+            units,
+            consumed: true,
+            // No ref-invalidation on this rung (like MF): 0 = "no timestamp
+            // to invalidate against", per `EncodeOutcome::input_ts`.
+            input_ts: 0,
+        })
     }
 
     /// Copy the contiguous I420 planes into a fresh planar `y420`

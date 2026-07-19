@@ -37,6 +37,8 @@ pub enum VideoPacket {
     H264 {
         /// Annex-B access unit.
         data: Vec<u8>,
+        /// Process-local recovery metadata; never serialized.
+        key: bool,
         /// Capture-tick pacing for the RTP clock (1/fps).
         duration_us: u64,
     },
@@ -73,6 +75,111 @@ pub struct Tune {
     pub bitrate: Option<u32>,
     pub fps: Option<u32>,
     pub link: LinkClass,
+    pub game: bool,
+    pub mode: Option<Posture>,
+}
+
+/// Mirror of the real module's posture dial (capture-less builds carry
+/// the type so `mesh.rs` compiles identically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Posture {
+    #[default]
+    Balanced,
+    Game,
+    Studio,
+    StudioLossless,
+}
+
+/// Mirror of the real module's wire-name parse.
+pub fn parse_posture(s: &str) -> Option<Posture> {
+    match s {
+        "game" => Some(Posture::Game),
+        "studio" => Some(Posture::Studio),
+        "studio-lossless" => Some(Posture::StudioLossless),
+        "balanced" => Some(Posture::Balanced),
+        _ => None,
+    }
+}
+
+/// Mirror of the real module's pacer grain (the send path in `mesh.rs`
+/// is compiled on capture-less builds too — a viewer node still forwards
+/// what it's asked to).
+pub(crate) const PACE_SLICE_BYTES: usize = 24 * 1024;
+
+/// Mirror of the real module's pacer dial — same env, same default-on.
+pub(crate) fn paced_slices_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("ALLMYSTUFF_PACED_SLICES")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false"
+                )
+            })
+            .unwrap_or(false)
+    });
+    *ON
+}
+
+/// Mirror of the real module's paced splitter — pure byte logic, kept
+/// identical (both codecs, glue rules, byte-exact concatenation).
+pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
+    let mut nals: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let hdr = if data[i + 2] == 1 {
+                i + 3
+            } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if hdr < data.len() {
+                nals.push((i, data[hdr]));
+            }
+            i = hdr + 1;
+        } else {
+            i += 1;
+        }
+    }
+    // Exact parameter-set bytes — see the real module's comment: a masked
+    // type test collides with H.264's 0x41 referenced P slice.
+    let hevc = nals.iter().any(|&(_, b)| matches!(b, 0x40 | 0x42 | 0x44));
+    let is_slice = |b: u8| {
+        if hevc {
+            b & 0x80 == 0 && ((b >> 1) & 0x3F) <= 21
+        } else {
+            matches!(b & 0x1F, 1 | 5)
+        }
+    };
+    let mut unit_starts: Vec<usize> = Vec::new();
+    let mut pending: Option<usize> = None;
+    for &(off, b) in &nals {
+        if is_slice(b) {
+            unit_starts.push(pending.take().unwrap_or(off));
+        } else if pending.is_none() {
+            pending = Some(off);
+        }
+    }
+    if unit_starts.len() < 2 {
+        return std::iter::once(0..data.len()).collect();
+    }
+    unit_starts[0] = 0;
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_end = 0usize;
+    for (k, &s) in unit_starts.iter().enumerate() {
+        let e = unit_starts.get(k + 1).copied().unwrap_or(data.len());
+        if chunk_end > chunk_start && e - chunk_start > max_chunk {
+            out.push(chunk_start..chunk_end);
+            chunk_start = s;
+        }
+        chunk_end = e;
+    }
+    out.push(chunk_start..chunk_end);
+    out
 }
 
 /// The host side of a capture-status report: state + optional OS error text.
@@ -87,7 +194,52 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    /// Wire-parity with the real bridge: the viewer's link estimate and
+    /// delay trend still arrive; recorded, never acted on (no encoder).
+    pub est_kbps: u32,
+    pub delay_trend_us_per_s: i32,
     pub at: Instant,
+}
+
+/// Mirror of [`crate::video::PipelineFeedback`] — the opaque-ext seam is
+/// used by `mesh.rs`, compiled on capture-less builds too. Same shape,
+/// same (de)serialization; a viewer node parses/relays feedback exactly
+/// like the real backend even though it never streams.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct PipelineFeedback {
+    #[serde(default)]
+    pub est_kbps: u32,
+    #[serde(default)]
+    pub delay_trend_us_per_s: i32,
+}
+
+impl PipelineFeedback {
+    pub fn to_ext(&self) -> serde_json::Value {
+        if self.est_kbps == 0 && self.delay_trend_us_per_s == 0 {
+            return serde_json::Value::Null;
+        }
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+    pub fn from_ext(ext: &serde_json::Value) -> Self {
+        serde_json::from_value(ext.clone()).unwrap_or_default()
+    }
+}
+
+/// Mirror of [`crate::video::RouteDials`] for surface parity — the GUI's
+/// effective-dials op compiles against this build too, though a capture-less
+/// node never streams and so always answers `None` (see
+/// [`VideoBridge::route_dials`]).
+#[derive(Debug, Clone)]
+pub struct RouteDials {
+    pub posture: &'static str,
+    pub encoder_label: String,
+    pub codec: &'static str,
+    pub target_bitrate_bps: u32,
+    pub ceiling_bps: u32,
+    pub fps_target: u32,
+    pub edge_cap: u32,
+    pub out_w: u32,
+    pub out_h: u32,
 }
 
 /// Handle the mesh holds either way; capture starts fail loudly, everything
@@ -126,6 +278,10 @@ impl VideoBridge {
 
     pub fn force_idr(&self, _route_id: &str) {}
 
+    /// Mirror of the real bridge's frame-health heal — no capture routes
+    /// exist on this build, so there is never a lane to wave.
+    pub fn route_wave_or_refresh(&self, _route_id: &str) {}
+
     /// No capture routes exist on this build, so there are never any ids to
     /// re-class. Present for surface parity with the real bridge (the LAN
     /// gate sweeps this in `refresh_peer_networks`).
@@ -148,7 +304,28 @@ impl VideoBridge {
         _max_edge: Option<u32>,
         _bitrate: Option<u32>,
         _fps: Option<u32>,
+        _game: bool,
+        _mode: Option<&str>,
     ) {
+    }
+
+    /// Mirror of the real bridge's per-route posture read (the mesh
+    /// forwarder's pacing hint) — nothing streams here, so balanced.
+    pub fn route_game(&self, _route_id: &str) -> bool {
+        false
+    }
+
+    /// The GUI effective-dials read — a capture-less node never streams a
+    /// route, so there are never any dials to report. `None`, the same
+    /// contract the real bridge returns for a route it isn't the streamer of.
+    pub fn route_dials(&self, _route_id: &str) -> Option<RouteDials> {
+        None
+    }
+
+    /// Mirror of the real bridge's pacing read — nothing streams here,
+    /// so the pacer keeps its constants.
+    pub fn route_pace(&self, _route_id: &str) -> (bool, bool, u32, u32) {
+        (false, false, 0, 60)
     }
 
     pub fn note_feedback(
@@ -157,6 +334,8 @@ impl VideoBridge {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        est_kbps: u32,
+        delay_trend_us_per_s: i32,
     ) {
         self.feedback.lock().insert(
             route_id.to_string(),
@@ -164,6 +343,8 @@ impl VideoBridge {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                est_kbps,
+                delay_trend_us_per_s,
                 at: Instant::now(),
             },
         );

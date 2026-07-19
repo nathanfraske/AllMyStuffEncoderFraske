@@ -19,10 +19,14 @@
   // arriving over the local lane — runs the same teardown, announces
   // `closed`, and the tab that popped it re-wires itself.
   import { onMount } from "svelte";
+  import { Fsr1 } from "../fsr1";
+  import ModePill from "./ModePill.svelte";
+  import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
     focusThisWindow,
+    isWindowFullscreen,
     onThisWindowClose,
     sendInput,
     toggleWindowFullscreen,
@@ -67,6 +71,80 @@
   const ended = $derived(routeState === "torn_down" || routeState === "rejected");
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+
+  // ---- FSR1-style upscale (edge-adaptive, text-biased sharpening) ----
+  // When the decoded stream is smaller than the display box, the plain
+  // path is the browser's bilinear stretch — soft edges, smeared text.
+  // The overlay canvas runs the WebGL2 EASU+RCAS pipeline instead,
+  // engaged automatically at >1.1× upscale and killable from the Scale
+  // pill. Pointer events stay on the base canvas (the normalizer and
+  // pointer lock never see the overlay). This is also Reach mode's
+  // presentation layer: a deliberately low-res stream over a starved
+  // link gets rebuilt here.
+  let glCanvasEl = $state<HTMLCanvasElement | null>(null);
+  let fsrOn = $state(localStorage.getItem("ams.fsrOff") !== "1");
+  let fsrShow = $state(false);
+  let fsrEngine: Fsr1 | null = null;
+  let fsrDead = false;
+  function presentFsr(w: number, h: number) {
+    const base = canvasEl;
+    const gl = glCanvasEl;
+    if (!base || !gl) return;
+    // The base element now fills the window with the picture letterboxed
+    // inside it (object-fit: contain) — compute that content box, because
+    // the FSR pass stretches its whole source onto its whole target: the
+    // overlay must be exactly the picture's box or the bars get "scaled
+    // into" the image. Same fit math as `norm`.
+    const dpr = window.devicePixelRatio || 1;
+    const bw = base.clientWidth;
+    const bh = base.clientHeight;
+    if (!bw || !bh || !w || !h) {
+      fsrShow = false;
+      return;
+    }
+    const scale = Math.min(bw / w, bh / h);
+    const cw = w * scale;
+    const ch = h * scale;
+    const dw = Math.round(cw * dpr);
+    const dh = Math.round(ch * dpr);
+    if (!(fsrOn && !fsrDead && dw > w * 1.1)) {
+      fsrShow = false;
+      return;
+    }
+    try {
+      fsrEngine ??= new Fsr1(gl);
+      // Explicit CSS size = the content box; `inset: 0; margin: auto`
+      // centers it over the letterboxed picture. The buffer is dpr-exact
+      // underneath, so hi-DPI monitors get a crisp 1:1 present.
+      gl.style.width = `${cw}px`;
+      gl.style.height = `${ch}px`;
+      fsrEngine.render(base, w, h, dw, dh);
+      fsrShow = true;
+    } catch (e) {
+      console.warn("FSR upscale unavailable; plain scaling:", e);
+      fsrDead = true;
+      fsrShow = false;
+    }
+  }
+  function toggleFsr() {
+    fsrOn = !fsrOn;
+    localStorage.setItem("ams.fsrOff", fsrOn ? "0" : "1");
+    if (!fsrOn) fsrShow = false;
+  }
+  // Fullscreen/resize refit: the base canvas rescales via CSS the instant
+  // the window changes shape, but the FSR overlay renders at fixed pixel
+  // sizes — re-present on any stage resize so entering fullscreen snaps
+  // to the new fit immediately, even on a static stream where no new
+  // frame would otherwise trigger a paint.
+  $effect(() => {
+    const stage = stageEl;
+    if (!stage) return undefined;
+    const ro = new ResizeObserver(() => {
+      if (hasFrame && frameW && frameH) presentFsr(frameW, frameH);
+    });
+    ro.observe(stage);
+    return () => ro.disconnect();
+  });
   // The role=application surface. Key forwarding lives on this element (not
   // `<svelte:window>`) so it fires whenever the element holds focus — and
   // hovering pins that focus (below), the reliable way to make a secondary
@@ -79,6 +157,10 @@
   let fps = $state(0);
   let transport = $state("");
   let frameCount = 0;
+  // Received bitrate (viewer truth): bytes seen this second → Mbps. The
+  // effective panel shows it beside the sender's target when co-located.
+  let recvMbps = $state(0);
+  let inBytes = 0;
   let hostStatus = $state<VideoHostStatus | null>(null);
   let fullscreen = $state(false);
 
@@ -89,6 +171,24 @@
     // into the picture.
     if (controlActive) stageEl?.focus({ preventScroll: true });
   }
+
+  // The OS can flip fullscreen without our ⛶ (Win+Up, a shell gesture) —
+  // and pointer lock engages off this flag, which is exactly the field's
+  // "fullscreen game doesn't capture the cursor": the flag said windowed,
+  // so the click never locked. Re-query the REAL state on every resize.
+  $effect(() => {
+    let alive = true;
+    const sync = () =>
+      void isWindowFullscreen().then((v) => {
+        if (alive) fullscreen = v;
+      });
+    sync();
+    window.addEventListener("resize", sync);
+    return () => {
+      alive = false;
+      window.removeEventListener("resize", sync);
+    };
+  });
 
   // ---- quality pills (streams this window owns) ----------------------
   type PillChoice = { label: string; value: number | null };
@@ -101,6 +201,9 @@
   ];
   const FPS_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "144", value: 144 },
+    { label: "120", value: 120 },
+    { label: "90", value: 90 },
     { label: "60", value: 60 },
     { label: "30", value: 30 },
     { label: "24", value: 24 },
@@ -108,6 +211,9 @@
   ];
   const RATE_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "100 Mbps", value: 100_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
     { label: "40 Mbps", value: 40_000_000 },
     { label: "25 Mbps", value: 25_000_000 },
     { label: "15 Mbps", value: 15_000_000 },
@@ -115,11 +221,32 @@
     { label: "4 Mbps", value: 4_000_000 },
   ];
   let tune = $state<StreamTune>({});
-  let openPill = $state<"res" | "fps" | "rate" | null>(null);
+  let openPill = $state<"res" | "fps" | "rate" | "live" | null>(null);
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
     choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
   function pick(field: keyof StreamTune, v: number | null) {
     tune = { ...tune, [field]: v ?? undefined };
+    openPill = null;
+    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
+  }
+
+  // Mode is the headline control now: Balanced is the stability-first
+  // default; Game asks the streamer for the latency-first posture
+  // (gradual intra-refresh instead of keyframe walls, 60 fps floor
+  // off-LAN); Studio is the LAN fidelity mode (high-bitrate
+  // quality-first — the streamer degrades it to Balanced off-LAN). The
+  // Res/FPS/Rate pills stay as expert overrides on top. The legacy
+  // `game` bool rides along so hosts that predate the tri-state still
+  // honor the Game step.
+  // The Mode control (Balanced/Game/Studio/Studio · LL) + its bandwidth
+  // warning live in the shared ModePill component so the console strip
+  // and this bar are the same element. It hands back the resolved wire
+  // values; we fold them into the route's tune.
+  function applyModeWire(
+    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    gameFlag: boolean | undefined,
+  ) {
+    tune = { ...tune, mode: wireMode, game: gameFlag };
     openPill = null;
     if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
   }
@@ -129,6 +256,8 @@
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       frameCount = 0;
+      recvMbps = (inBytes * 8) / 1e6;
+      inBytes = 0;
     }, 1000);
     // The OS chrome's ✕ runs the same teardown as a "Return video here"
     // ask — the close is held until the route teardown is on the wire.
@@ -168,6 +297,8 @@
     fps = 0;
     transport = "";
     frameCount = 0;
+    recvMbps = 0;
+    inBytes = 0;
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
@@ -193,6 +324,7 @@
       frameH = h;
       hasFrame = true;
       frameCount += 1;
+      presentFsr(w, h);
     };
 
     // MJPEG paint slot, latest-wins — the same supersede the console uses.
@@ -226,6 +358,7 @@
       route,
       (f) => {
         if (cancelled) return;
+        inBytes += f.data.byteLength;
         if (f.kind === "raw") {
           transport = "H.264";
           if (f.data.byteLength !== f.width * f.height * 4) return;
@@ -294,9 +427,43 @@
     stageEl?.focus({ preventScroll: true });
   }
 
+  // ---- pointer lock (fullscreen mouse capture) -----------------------
+  // Game-mode aiming: in fullscreen control, a click captures the mouse
+  // and RELATIVE deltas stream to the host (`mouse_move_rel`) — FPS
+  // camera control instead of a cursor pinned to the window edge. Esc
+  // (the browser's own gesture) releases it; leaving fullscreen or
+  // control drops it too.
+  let pointerLocked = $state(false);
+  function lockChanged() {
+    pointerLocked = document.pointerLockElement === stageEl;
+  }
+  function maybePointerLock() {
+    if (fullscreen && controlActive && !pointerLocked) {
+      void stageEl?.requestPointerLock();
+    }
+  }
+  $effect(() => {
+    document.addEventListener("pointerlockchange", lockChanged);
+    return () => document.removeEventListener("pointerlockchange", lockChanged);
+  });
+  $effect(() => {
+    // Falling out of fullscreen or control releases the capture.
+    if (pointerLocked && (!fullscreen || !controlActive)) {
+      document.exitPointerLock();
+    }
+  });
+
   let lastMoveAt = 0;
   function onPointerMove(e: PointerEvent) {
     if (!controlActive) return;
+    if (pointerLocked) {
+      // Raw deltas, uncoalesced beyond the browser's own batching — this
+      // is the aim path; the 16 ms absolute-move throttle doesn't apply.
+      if (e.movementX !== 0 || e.movementY !== 0) {
+        send({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+      }
+      return;
+    }
     claimFocus();
     const now = performance.now();
     if (now - lastMoveAt < 16) return;
@@ -310,6 +477,12 @@
     // A click is the most reliable focus pin — land it on the stage so keys
     // forward even if the cursor was last over a hover-bar button.
     if (down) stageEl?.focus({ preventScroll: true });
+    if (down) maybePointerLock();
+    if (pointerLocked) {
+      e.preventDefault();
+      send({ kind: "mouse_button", button: e.button, down });
+      return;
+    }
     const p = norm(e);
     if (!p) return;
     e.preventDefault();
@@ -369,6 +542,7 @@
   oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
+  <canvas bind:this={glCanvasEl} class="fsr" class:active={fsrShow && hasFrame}></canvas>
   {#if !hasFrame}
     <div class="placeholder" style="--mc: {sourceCap ? mediaColor(sourceCap.media) : '#888'}">
       <div class="glyph">{sourceCap ? originIcon(sourceCap.origin, sourceCap.media) : "🪟"}</div>
@@ -398,7 +572,37 @@
        forwarding never sees them. -->
   <footer class="hover-bar">
     {#if hasFrame}
-      <span class="chip"><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport ? ` · ${transport}` : ""}</span>
+      <span class="chip"
+        ><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport
+          ? ` · ${transport}`
+          : ""}{recvMbps ? ` · ${recvMbps >= 10 ? recvMbps.toFixed(0) : recvMbps.toFixed(1)} Mbps` : ""}</span
+      >
+      <span class="pill-wrap">
+        <button
+          class="pill"
+          class:tuned={openPill === "live"}
+          title="What this stream is actually doing — requested picks vs the live effective reality"
+          onclick={(e) => {
+            e.stopPropagation();
+            openPill = openPill === "live" ? null : "live";
+          }}
+        >
+          Live ▾
+        </button>
+        {#if openPill === "live"}
+          <div class="pill-menu wide" role="group" aria-label="Effective stream dials">
+            <EffectiveReadout
+              routeId={app.videoPopoutLive}
+              requested={tune}
+              w={frameW}
+              h={frameH}
+              {fps}
+              {transport}
+              mbps={recvMbps}
+            />
+          </div>
+        {/if}
+      </span>
     {/if}
     {#if controlActive}
       <span class="chip ctl" title="A live control route lets you click and type here — hovering this window is what aims your keyboard at it">🕹 control</span>
@@ -445,6 +649,26 @@
           {/if}
         </span>
       {/snippet}
+      <ModePill
+        mode={tune.mode}
+        game={tune.game}
+        onapply={applyModeWire}
+        experimental={app.labsTier}
+        onexperimental={(on) => app.setLabsTier(on)}
+      />
+      <button
+        class="pill"
+        class:tuned={fsrShow}
+        title="Edge-adaptive upscaling with text-biased sharpening when the stream is smaller than the window — replaces the browser's soft bilinear stretch"
+        onpointerdown={(e) => e.stopPropagation()}
+        onpointerup={(e) => e.stopPropagation()}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleFsr();
+        }}
+      >
+        Scale · {fsrOn ? (fsrShow ? "FSR" : "Auto") : "Off"}
+      </button>
       {@render pillMenu("res", "Res", RES_CHOICES, tune.maxEdge, "maxEdge")}
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}
       {@render pillMenu("rate", "Rate", RATE_CHOICES, tune.bitrate, "bitrate")}
@@ -484,14 +708,16 @@
     outline: none;
   }
   canvas {
-    /* Element sized to the video's own box (see Console.svelte .live): keeps
-       the pointer normalizer (norm) free of an object-fit inset it could get
-       wrong by a letterbox-width. */
+    /* Fill the window and letterbox INSIDE the element: fullscreen on a
+       monitor larger than the stream scales the picture UP to fit (bars
+       where the aspect differs) instead of leaving it at native size in
+       a black field. The old auto-size-with-max-caps pattern only ever
+       shrank. `norm` computes the object-fit inset itself (same math as
+       Console's normPoint), so pointer mapping is inset-safe; the FSR
+       overlay is pinned to the computed content box in presentFsr. */
     display: block;
-    width: auto;
-    height: auto;
-    max-width: 100%;
-    max-height: 100%;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     user-select: none;
     -webkit-user-drag: none;
@@ -499,6 +725,19 @@
   canvas.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* The FSR overlay sits exactly on the fitted video box; input never
+     touches it (the pointer normalizer and pointer lock live on the base
+     canvas underneath). */
+  canvas.fsr {
+    display: none;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    pointer-events: none;
+  }
+  canvas.fsr.active {
+    display: block;
   }
   .placeholder {
     display: flex;
@@ -612,6 +851,12 @@
     min-width: 7rem;
     box-shadow: var(--shadow-lg);
     z-index: 5;
+  }
+  /* The Live effective-readout popover is wider than a value list and holds
+     a small table rather than a button column. */
+  .pill-menu.wide {
+    min-width: 16rem;
+    padding: 0.5rem 0.6rem;
   }
   .pill-item {
     border: none;

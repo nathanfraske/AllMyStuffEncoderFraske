@@ -124,6 +124,11 @@ pub enum Effect {
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
+        game: bool,
+        mode: Option<String>,
+        /// Opaque video-backend extension, relayed verbatim — see
+        /// [`allmystuff_protocol::RouteControl::Tune`]'s `ext`.
+        ext: serde_json::Value,
     },
     /// The viewer of a route this machine streams reported its decode health
     /// (receiver → sender). The backend records it per route to adapt the
@@ -133,6 +138,12 @@ pub enum Effect {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
+        lost_ts_us: Option<u64>,
+        /// Opaque video-backend extension (bandwidth estimate, delay
+        /// trend, future receiver-side signals), relayed verbatim — the
+        /// pipeline owns its shape. See
+        /// [`allmystuff_protocol::RouteControl::VideoFeedback`]'s `ext`.
+        ext: serde_json::Value,
     },
     /// A share negotiation message arrived; apply it against the catalog.
     Share { from: NodeId, message: ShareControl },
@@ -497,6 +508,9 @@ impl Session {
                 max_edge,
                 bitrate,
                 fps,
+                game,
+                mode,
+                ext,
             } => {
                 if self
                     .routes
@@ -508,6 +522,9 @@ impl Session {
                         max_edge,
                         bitrate,
                         fps,
+                        game,
+                        mode,
+                        ext,
                     }];
                 }
                 Vec::new()
@@ -517,6 +534,8 @@ impl Session {
                 recv_fps,
                 decode_fails,
                 queue_depth,
+                lost_ts_us,
+                ext,
             } => {
                 // Only the route's own viewer reports on it, and only while
                 // it's live — same gate as a refresh/tune ask.
@@ -530,6 +549,8 @@ impl Session {
                         recv_fps,
                         decode_fails,
                         queue_depth,
+                        lost_ts_us,
+                        ext,
                     }];
                 }
                 Vec::new()
@@ -1051,14 +1072,18 @@ mod tests {
                 max_edge: Some(1920),
                 bitrate: None,
                 fps: Some(60),
+                game: false,
+                mode: None,
+                ext: serde_json::Value::Null,
             }),
         );
         assert!(matches!(
             fx.as_slice(),
-            [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60) }]
+            [Effect::TuneMedia { route_id, max_edge: Some(1920), bitrate: None, fps: Some(60), game: false, mode: None, .. }]
                 if route_id == "r1"
         ));
-        // …and report its decode health back (receiver → sender).
+        // …and report its decode health back, carrying an opaque pipeline
+        // ext the session must relay verbatim without inspecting it.
         let fx = s.handle(
             "this".into(),
             ControlMessage::Route(RouteControl::VideoFeedback {
@@ -1066,13 +1091,23 @@ mod tests {
                 recv_fps: 28,
                 decode_fails: 3,
                 queue_depth: 1,
+                lost_ts_us: Some(123_456),
+                ext: serde_json::json!({ "est_kbps": 12_000, "delay_trend_us_per_s": -40 }),
             }),
         );
-        assert!(matches!(
+        let relayed = matches!(
             fx.as_slice(),
-            [Effect::VideoFeedback { route_id, recv_fps: 28, decode_fails: 3, queue_depth: 1 }]
-                if route_id == "r1"
-        ));
+            [Effect::VideoFeedback {
+                route_id,
+                recv_fps: 28,
+                decode_fails: 3,
+                queue_depth: 1,
+                lost_ts_us: Some(123_456),
+                ext,
+            }]
+                if route_id == "r1" && ext["est_kbps"] == 12_000 && ext["delay_trend_us_per_s"] == -40
+        );
+        assert!(relayed, "the opaque pipeline ext is relayed verbatim");
         // A bystander may not.
         let fx = s.handle(
             "stranger".into(),

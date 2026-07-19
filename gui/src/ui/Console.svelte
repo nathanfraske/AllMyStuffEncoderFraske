@@ -52,6 +52,8 @@
     type MediaKind,
   } from "../types";
   import ConsoleKeys from "./ConsoleKeys.svelte";
+  import ModePill from "./ModePill.svelte";
+  import EffectiveReadout from "./EffectiveReadout.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
 
@@ -140,6 +142,20 @@
   // updateCrosshair) since `virt` isn't reactive state.
   let crosshairEl = $state<HTMLElement | null>(null);
   let hasFrame = $state(false);
+  // A monitor/input switch in progress: the old picture stays on the
+  // (still-mounted) canvas, dimmed under a "Switching…" chip, instead of
+  // flashing to the placeholder and back — the switch reads as a
+  // crossfade, not a teardown. Cleared by the first fresh frame; a 5 s
+  // timeout falls back to the honest placeholder (host status text) if
+  // the new stream never comes. Input stays gated on hasFrame the whole
+  // time, so pointer mapping can never land on the stale picture.
+  let switching = $state(false);
+  let switchingTimer: ReturnType<typeof setTimeout> | undefined;
+  function armSwitching() {
+    switching = true;
+    clearTimeout(switchingTimer);
+    switchingTimer = setTimeout(() => (switching = false), 5000);
+  }
   // The host's word on why pixels aren't flowing (`vstat`): shown on the
   // placeholder before the first frame, and as a banner if the stream
   // stalls after one. Null = no condition reported (or it cleared).
@@ -174,6 +190,10 @@
   let frameCount = 0;
   let inCount = 0;
   let decCount = 0;
+  // Received bitrate (viewer truth): bytes seen this second → Mbps, shown in
+  // the effective panel beside the sender's encode target when co-located.
+  let recvMbps = $state(0);
+  let inBytes = 0;
   let queuePeek = () => 0;
   let stallKick = () => {};
   let decodeModeNote = "";
@@ -203,13 +223,23 @@
   ];
   const FPS_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "144", value: 144 },
+    { label: "120", value: 120 },
+    { label: "90", value: 90 },
     { label: "60", value: 60 },
     { label: "30", value: 30 },
     { label: "24", value: 24 },
     { label: "15", value: 15 },
   ];
+  // Rate ceiling matches the posture pipeline (Studio spends 150 Mbps+ on a
+  // fast LAN; the backend clamps into each posture's lane), not the old
+  // 40 Mbps cap that silently gated Studio from the console. Mirrors the
+  // popout bar's scale so the two hosts offer the same picks.
   const RATE_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "100 Mbps", value: 100_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
     { label: "40 Mbps", value: 40_000_000 },
     { label: "25 Mbps", value: 25_000_000 },
     { label: "15 Mbps", value: 15_000_000 },
@@ -217,11 +247,18 @@
     { label: "4 Mbps", value: 4_000_000 },
   ];
   type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
-  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice }> = [
-    { label: "Auto", value: "auto" },
-    { label: "H.264", value: "h264" },
-    { label: "H.264 · native decode", value: "native" },
-    { label: "MJPEG", value: "mjpeg" },
+  // These pick the *transport + decode path* for a watched stream, not a
+  // specific encoder — the host picks its best encoder itself (NVENC on
+  // NVIDIA, the GPU's Media Foundation encoder otherwise, software as the
+  // floor), all of which produce H.264. So the labels describe what the
+  // viewer chooses between: hardware-accelerated H.264 decode here,
+  // software H.264 decode for webviews that can't, and the MJPEG
+  // compatibility fallback.
+  const CODEC_CHOICES: Array<{ label: string; value: CodecChoice; hint: string }> = [
+    { label: "Auto", value: "auto", hint: "Best available — H.264, hardware decode where the viewer supports it" },
+    { label: "H.264 · hardware decode", value: "h264", hint: "GPU-accelerated decode in the viewer (lowest CPU)" },
+    { label: "H.264 · software decode", value: "native", hint: "Decoded on the CPU — for viewers without hardware H.264" },
+    { label: "MJPEG · compatibility", value: "mjpeg", hint: "Per-frame JPEG — the universal fallback, higher bandwidth" },
   ];
 
   // ---- source aspect (mouse letterbox correction) --------------------
@@ -264,37 +301,16 @@
           : "h264",
   );
 
-  // The Speed↔Quality slider: one knob that snaps to a preset curve of
-  // res/fps/rate. Codec stays Auto here — forcing a codec is an
-  // advanced-rows-only choice. Each stop reuses the same values the rows
-  // offer.
-  const QUALITY_STOPS = [
-    { label: "Speed", maxEdge: 1280, fps: 24, bitrate: 4_000_000 },
-    { label: "Smooth", maxEdge: 1920, fps: 30, bitrate: 8_000_000 },
-    { label: "Balanced", maxEdge: 1920, fps: 60, bitrate: 15_000_000 },
-    { label: "Crisp", maxEdge: 2560, fps: 60, bitrate: 25_000_000 },
-    { label: "Quality", maxEdge: 3840, fps: 60, bitrate: 40_000_000 },
-  ];
-  // Where the slider sits for the live tune: the nearest stop by resolution,
-  // defaulting to Balanced when everything is Auto — so it reflects reality
-  // on open and on a source switch.
-  const sliderPos = $derived.by(() => {
-    const t = app.consoleTune;
-    if (t.maxEdge == null && t.fps == null && t.bitrate == null) return 2;
-    let best = 2;
-    let bestD = Infinity;
-    QUALITY_STOPS.forEach((s, i) => {
-      const d = Math.abs((t.maxEdge ?? s.maxEdge) - s.maxEdge);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    });
-    return best;
-  });
-  function pickQuality(i: number) {
-    const s = QUALITY_STOPS[i];
-    app.setConsoleTune({ maxEdge: s.maxEdge, fps: s.fps, bitrate: s.bitrate });
+  // The Mode control (shared with the popout via ModePill) is the video
+  // headline now — the Speed↔Quality slider it replaced could not reach
+  // Game/Studio/Lossless at all. Res/FPS/Rate stay as the Advanced rows.
+  // The shared control resolves the wire posture; fold it into the
+  // console's per-source tune (the same shape the popout applies).
+  function applyModeWire(
+    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    gameFlag: boolean | undefined,
+  ) {
+    app.setConsoleTune({ mode: wireMode, game: gameFlag });
   }
 
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
@@ -604,6 +620,8 @@
       frameCount = 0;
       inCount = 0;
       decCount = 0;
+      recvMbps = (inBytes * 8) / 1e6;
+      inBytes = 0;
       // Healthy: most of what arrives gets painted. Anything else is an
       // anomaly worth wearing on the chip.
       pipeDiag =
@@ -683,6 +701,19 @@
     // Reading this here makes the ladder's last rung re-run the effect:
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
+    // A route CHANGE (screen tab, camera tab, or the teardown between
+    // them) with a picture on the glass = a switch: hold the old frame
+    // dimmed instead of flashing the placeholder. A decode-mode re-wire
+    // on the SAME route keeps today's behavior.
+    // `hasFrame` is paint output, not watch identity. Tracking it here made
+    // every first decoded frame invalidate this effect, tear down the watcher,
+    // clear its queue, and subscribe again. The viewer therefore oscillated
+    // between "window watching" and "no window is watching" while a healthy
+    // 60 fps stream flowed underneath it. Only route/decode-mode changes own
+    // this lifecycle; sample the paint state without subscribing to it.
+    if (untrack(() => hasFrame) && route !== lastRoute) {
+      untrack(armSwitching);
+    }
     hasFrame = false;
     // Clear the previous stream's frame dimensions too: normPoint letterboxes
     // against frameW/frameH, so leaving them live would map pointer events onto
@@ -707,6 +738,8 @@
     frameCount = 0;
     inCount = 0;
     decCount = 0;
+    recvMbps = 0;
+    inBytes = 0;
     // A new stream starts at its natural fit, with the trackpad cursor
     // re-centered, and any touch gesture from the old one is over — but
     // ONLY on an actual route change. The decode ladder re-runs this
@@ -853,6 +886,11 @@
       frameW = w;
       frameH = h;
       hasFrame = true;
+      // The fresh picture ends any switch crossfade.
+      if (switching) {
+        switching = false;
+        clearTimeout(switchingTimer);
+      }
       frameCount += 1;
     };
 
@@ -894,6 +932,7 @@
       route,
       (f) => {
       if (cancelled) return;
+      inBytes += f.data.byteLength;
       transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
         decodePath = "mjpeg";
@@ -1338,9 +1377,11 @@
     const box = s.getBoundingClientRect();
     const ar = activeRegion;
     // Where the cursor sits on screen right now (through the active region
-    // and the current zoom), and where the stage centre is.
-    const px = r.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const py = r.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    // and the current zoom), and where the stage centre is. Mapped over
+    // the CONTENT box — in theater the element carries letterbox bars.
+    const cb = contentBox(r);
+    const px = cb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * cb.width;
+    const py = cb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * cb.height;
     // Centre of the VISIBLE area: when the soft keyboard has eaten the bottom
     // `kbInset` px, the middle of what the user can still see sits that much
     // higher — so a cursor centred here stays above the keyboard where they're
@@ -1349,6 +1390,27 @@
     const cy = box.top + (box.height - kbInset) / 2;
     setView({ scale: view.scale, x: view.x + (cx - px), y: view.y + (cy - py) });
   }
+  // The picture's content box within the canvas ELEMENT — object-fit:
+  // contain's inset, the same min-scale math normPoint runs. Outside
+  // theater the element IS the content box (auto-sized), so the inset is
+  // zero and this degrades to the rect itself; in theater the element
+  // fills the stage and the picture letterboxes inside it, and every
+  // virt→client mapping must go through here or it drifts by a bar width.
+  function contentBox(r: DOMRect): { left: number; top: number; width: number; height: number } {
+    if (!frameW || !frameH || r.width === 0 || r.height === 0) {
+      return { left: r.left, top: r.top, width: r.width, height: r.height };
+    }
+    const scale = Math.min(r.width / frameW, r.height / frameH);
+    const w = frameW * scale;
+    const h = frameH * scale;
+    return {
+      left: r.left + (r.width - w) / 2,
+      top: r.top + (r.height - h) / 2,
+      width: w,
+      height: h,
+    };
+  }
+
   // Pin the aiming crosshair to the commanded position. Same client-space math
   // as followCursor (getBoundingClientRect reflects the zoom transform), made
   // relative to the stage so a windowed console's own transform can't offset
@@ -1359,11 +1421,11 @@
     const c = canvasEl;
     const s = stageEl;
     if (!el || !c || !s || !hasFrame) return;
-    const r = c.getBoundingClientRect();
+    const cb = contentBox(c.getBoundingClientRect());
     const sb = s.getBoundingClientRect();
     const ar = activeRegion;
-    const x = r.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * r.width;
-    const y = r.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * r.height;
+    const x = cb.left - sb.left + (ar.x0 + virt.x * (ar.x1 - ar.x0)) * cb.width;
+    const y = cb.top - sb.top + (ar.y0 + virt.y * (ar.y1 - ar.y0)) * cb.height;
     el.style.transform = `translate(${x}px, ${y}px)`;
   }
   $effect(() => {
@@ -1435,6 +1497,33 @@
     if (!app.consoleControl) untrack(() => touchMouse.reset());
   });
 
+  // ---- pointer lock (theater mouse capture) --------------------------
+  // The popout's game-aiming path, brought to the console: in THEATER
+  // with control live, a click captures the mouse and RELATIVE deltas
+  // stream to the host (`mouse_move_rel`) — FPS camera control instead
+  // of a cursor pinned to the stage edge, which is exactly the
+  // "fullscreen game doesn't capture the cursor" field report. Esc (the
+  // browser's own gesture) releases; leaving theater or control drops it.
+  let pointerLocked = $state(false);
+  function lockChanged() {
+    pointerLocked = document.pointerLockElement === stageEl;
+  }
+  function maybePointerLock() {
+    if (theater && stagePointerActive && !pointerLocked) {
+      void stageEl?.requestPointerLock();
+    }
+  }
+  $effect(() => {
+    document.addEventListener("pointerlockchange", lockChanged);
+    return () => document.removeEventListener("pointerlockchange", lockChanged);
+  });
+  $effect(() => {
+    // Falling out of theater or control releases the capture.
+    if (pointerLocked && (!theater || !stagePointerActive)) {
+      document.exitPointerLock();
+    }
+  });
+
   // Pointer moves stream constantly; cap at ~60/s — the events are tiny
   // and the finer cadence keeps remote cursor motion feeling direct.
   let lastMoveAt = 0;
@@ -1444,6 +1533,13 @@
   function onPointerMove(e: PointerEvent) {
     if (e.pointerType === "touch") {
       touchMouse.move(e);
+      return;
+    }
+    if (pointerLocked && stagePointerActive) {
+      // Raw deltas, no throttle — the aiming path.
+      if (e.movementX !== 0 || e.movementY !== 0) {
+        app.sendConsoleInput({ kind: "mouse_move_rel", dx: e.movementX, dy: e.movementY });
+      }
       return;
     }
     // Keep keyboard focus on the stage whenever control is on (even over a
@@ -1527,6 +1623,17 @@
       } catch {
         // a stale/synthetic pointer id — capture is best-effort
       }
+    }
+    // Theater aiming: the click that lands in the picture captures the
+    // mouse; while captured, buttons forward raw (no position re-seat —
+    // the relative stream owns the cursor).
+    if (down) maybePointerLock();
+    if (pointerLocked) {
+      e.preventDefault();
+      app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
+      if (down) heldButtons.add(e.button);
+      else heldButtons.delete(e.button);
+      return;
     }
     const p = normPoint(e);
     if (!p) {
@@ -1780,11 +1887,15 @@
             </button>
           </div>
         {:else}
-          {#if app.consoleVideoLive}
+          {#if app.consoleVideoLive || switching}
+            <!-- Kept mounted through a switch: the canvas retains the old
+                 picture (dimmed, under the chip) so changing monitors
+                 reads as a crossfade instead of a placeholder flash. -->
             <canvas
               bind:this={canvasEl}
               class="live"
-              class:waiting={!hasFrame}
+              class:waiting={!hasFrame && !switching}
+              class:switching={!hasFrame && switching}
               style:transform={view.scale !== 1 || view.x !== 0 || view.y !== 0
                 ? `translate(${view.x}px, ${view.y}px) scale(${view.scale})`
                 : undefined}
@@ -1792,6 +1903,11 @@
                 node,
               )}"
             ></canvas>
+          {/if}
+          {#if switching && !hasFrame}
+            <div class="switching-chip" aria-live="polite">
+              Switching view…{hostStatus ? ` (${hostStatusText(hostStatus)})` : ""}
+            </div>
           {/if}
           {#if hasFrame && stagePointerActive && mobileShell}
             <!-- Thin aiming crosshair at the commanded position (crosshairEl):
@@ -2154,23 +2270,33 @@
                 <div class="mempty">No video inputs advertised</div>
               {/if}
             {:else}
-              <!-- Video: the one knob, the advanced rows, the zoom. -->
+              <!-- Video: the Mode control (shared with the popout bar),
+                   the advanced rows, the zoom. -->
               {#if app.consoleVideoLive}
-                <div class="slider-row" role="group" aria-label="Stream quality">
-                  <span class="slider-end">Speed</span>
-                  <input
-                    class="quality-slider"
-                    type="range"
-                    min="0"
-                    max={QUALITY_STOPS.length - 1}
-                    step="1"
-                    value={sliderPos}
-                    oninput={(e) => pickQuality(+e.currentTarget.value)}
-                    aria-label="Quality"
-                    title="Drag toward Speed (lighter, faster) or Quality (sharper, heavier)"
+                <div class="mode-row" role="group" aria-label="Stream mode">
+                  <span class="mode-label">Mode</span>
+                  <ModePill
+                    mode={app.consoleTune.mode}
+                    game={app.consoleTune.game}
+                    onapply={applyModeWire}
+                    experimental={app.labsTier}
+                    onexperimental={(on) => app.setLabsTier(on)}
+                    placement="down"
                   />
-                  <span class="slider-end">Quality</span>
-                  <span class="slider-now">{QUALITY_STOPS[sliderPos].label}</span>
+                </div>
+                <!-- Requested picks vs the live effective reality (polls the
+                     streamer's dials ~1 Hz while this menu is open; falls back
+                     to what's arriving here for a remote stream). -->
+                <div class="eff-wrap">
+                  <EffectiveReadout
+                    routeId={app.consoleVideoLive}
+                    requested={app.consoleTune}
+                    w={frameW}
+                    h={frameH}
+                    {fps}
+                    {transport}
+                    mbps={recvMbps}
+                  />
                 </div>
                 <button class="mrow" onclick={toggleAdv}>
                   <span class="micon">⚙</span>Advanced
@@ -2225,6 +2351,7 @@
                         <button
                           class="vopt"
                           class:sel={codecChoice === c.value}
+                          title={c.hint}
                           onclick={() => pickCodec(c.value)}>{c.label}</button
                         >
                       {/each}
@@ -2370,17 +2497,26 @@
   .console.theater .live {
     border-radius: 0;
     box-shadow: none;
+    /* Theater FILLS the monitor: the element takes the whole stage and
+       the picture letterboxes inside it (bars where the aspect differs)
+       instead of sitting at native size in a black field. Every
+       virt→client mapping goes through contentBox() so the inset never
+       skews the pointer, crosshair, or follow-cursor math; normPoint
+       always computed it. Windowed keeps the element==content-box
+       pattern below. */
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
   }
   .live {
-    /* Size the element to the video's OWN box (its intrinsic backing store
-       scaled down to fit the stage), centered by the stage's place-items — the
-       standard responsive-replaced-element pattern (display:block + auto dims +
-       max caps). NOT width/height:100% + object-fit, which makes the element the
-       full cell with the video letterboxed INSIDE it: normPoint then has to
-       recompute that inset and it drifts by ~a bar width (the "offset = letterbox
-       size" skew). With the element == the content box, normPoint's inset is 0
-       and it normalizes over the element directly — like the KVM's accurate web
-       UI. The pinch-zoom transform scales this same box; getBoundingClientRect
+    /* Windowed: size the element to the video's OWN box (its intrinsic
+       backing store scaled down to fit the stage), centered by the stage's
+       place-items — the responsive-replaced-element pattern. Theater
+       overrides to width/height:100% + object-fit (fills the monitor,
+       bars inside the element); every virt→client mapping goes through
+       contentBox() so the inset is handled in BOTH shapes — normPoint
+       always computed it, and the crosshair/follow paths do now too. The
+       pinch-zoom transform scales the same box; getBoundingClientRect
        keeps reporting the truth. */
     display: block;
     width: auto;
@@ -2399,6 +2535,26 @@
   .live.waiting {
     visibility: hidden;
     position: absolute;
+  }
+  /* A switch in progress: the retained previous picture, dimmed under
+     the switching chip. Input never maps onto it (hasFrame gates). */
+  .live.switching {
+    opacity: 0.45;
+    filter: saturate(0.55);
+    transition: opacity 160ms ease;
+  }
+  .switching-chip {
+    position: absolute;
+    top: 0.8rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    color: #f0ecff;
+    border-radius: var(--r-pill);
+    padding: 0.35rem 0.9rem;
+    font-size: 0.8rem;
+    z-index: 3;
   }
   /* The aiming crosshair. Absolutely placed within the stage (never
      position:fixed — a windowed console's own transform would reparent that),
@@ -2949,29 +3105,24 @@
   }
 
   /* ---- the video menu's guts ---- */
-  .slider-row {
+  .mode-row {
     display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    padding: 0.5rem 0.55rem 0.3rem;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.5rem 0.55rem 0.4rem;
   }
-  .slider-end {
+  /* Keep the "Mode" label vertically aligned with the pill when collapsed,
+     even though the row now top-aligns for the inline dropdown. */
+  .mode-row .mode-label {
+    padding-top: 0.32rem;
+  }
+  .mode-label {
     font-size: 0.72rem;
     color: #8a83a6;
     flex-shrink: 0;
   }
-  .quality-slider {
-    flex: 1;
-    min-width: 6rem;
-    accent-color: #7c6cff;
-    cursor: pointer;
-  }
-  .slider-now {
-    min-width: 4.2rem;
-    font-size: 0.74rem;
-    color: #c8c2e0;
-    text-align: right;
-    flex-shrink: 0;
+  .eff-wrap {
+    padding: 0.2rem 0.55rem 0.4rem;
   }
   .vrow {
     display: flex;

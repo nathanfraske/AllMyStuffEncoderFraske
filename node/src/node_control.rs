@@ -977,8 +977,11 @@ pub async fn dispatch(
             let recv_fps: u32 = try_arg!(arg(a, "recv_fps"));
             let decode_fails: u32 = try_arg!(arg(a, "decode_fails"));
             let queue_depth: u32 = try_arg!(arg(a, "queue_depth"));
+            // The webview decode ladder can't name the failed AU (its
+            // decoder is opaque); the native lane's glitch path reports
+            // the timestamp itself.
             json_result(
-                mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth)
+                mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth, None)
                     .await,
             )
         }
@@ -987,7 +990,53 @@ pub async fn dispatch(
             let max_edge: Option<u32> = try_arg!(opt(a, "max_edge"));
             let bitrate: Option<u32> = try_arg!(opt(a, "bitrate"));
             let fps: Option<u32> = try_arg!(opt(a, "fps"));
-            json_result(mesh.request_tune(route_id, max_edge, bitrate, fps).await)
+            let game: Option<bool> = try_arg!(opt(a, "game"));
+            let mode: Option<String> = try_arg!(opt(a, "mode"));
+            json_result(
+                mesh.request_tune(
+                    route_id,
+                    max_edge,
+                    bitrate,
+                    fps,
+                    game.unwrap_or(false),
+                    mode,
+                )
+                .await,
+            )
+        }
+        // GUI-internal, read-only: the effective encode dials for a route
+        // this node streams — the console's "requested → effective" panel
+        // polls it ~1 Hz while open. Null (not an error) when this node isn't
+        // the streamer, so the viewer quietly falls back to its own measured
+        // actuals. Not wire-visible.
+        "route_dials" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            match mesh.route_dials(&route_id) {
+                Some(d) => DispatchOut::Json(json!({
+                    "posture": d.posture,
+                    "encoderLabel": d.encoder_label,
+                    "codec": d.codec,
+                    "targetBitrateBps": d.target_bitrate_bps,
+                    "ceilingBps": d.ceiling_bps,
+                    "fpsTarget": d.fps_target,
+                    "edgeCap": d.edge_cap,
+                    "outW": d.out_w,
+                    "outH": d.out_h,
+                })),
+                None => DispatchOut::Json(Value::Null),
+            }
+        }
+        // The Mode dropdown's Experimental (Labs) toggle: flip the tier
+        // gate this process reads. GUI-internal (never wire-visible); a
+        // feature name flips one feature, its absence the whole tier.
+        "labs_set" => {
+            let on: bool = try_arg!(arg(a, "on"));
+            let feature: Option<String> = try_arg!(opt(a, "feature"));
+            match feature {
+                Some(f) => crate::labs::set_feature(&f, on),
+                None => crate::labs::set_tier(on),
+            }
+            json_result(Ok::<(), String>(()))
         }
 
         // ---- terminal plane ----------------------------------------------

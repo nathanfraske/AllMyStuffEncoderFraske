@@ -13,6 +13,8 @@ use std::sync::Once;
 
 use ffmpeg_next as ff;
 
+use crate::video::EncodeOutcome;
+
 static FF_INIT: Once = Once::new();
 
 /// The hardware H.264 encoders to try, best first, for the current platform.
@@ -55,7 +57,7 @@ pub struct FfmpegH264 {
 /// frame can spend ~2× the average byte budget instead of having its QP cranked
 /// into macroblocking. Without this headroom, VBR collapses toward the average
 /// and motion frames block — the "blocky on fast motion" symptom.
-fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
+fn low_latency_opts(name: &str, bitrate: u32, game: bool) -> ff::Dictionary<'static> {
     let mut d = ff::Dictionary::new();
     match name {
         "h264_nvenc" => {
@@ -75,6 +77,12 @@ fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
             d.set("preset", "veryfast");
             d.set("low_power", "1");
             d.set("forced_idr", "1");
+            // Low-latency screen-content posture: the remote-desktop
+            // scenario hint, no frame queueing (default async_depth is 4 —
+            // four frames of latency), no B-frame planning.
+            d.set("scenario", "displayremoting");
+            d.set("async_depth", "1");
+            d.set("b_strategy", "0");
         }
         "h264_videotoolbox" => {
             d.set("realtime", "1");
@@ -87,12 +95,15 @@ fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
     }
     // Peak/VBV headroom for every rate-controlled vendor (generic AVOptions →
     // rc_max_rate / rc_buffer_size; the hardware controllers honour them).
-    // VideoToolbox manages its own rate control and ignores these. maxrate =
-    // 2× average, bufsize ≈ 1 s so motion bursts can spike without starving.
+    // VideoToolbox manages its own rate control and ignores these. The
+    // shared *route* posture (`video::burst_bounds`): 2×/1 s
+    // quality-first, trimmed to 1.5×/½ s in game mode for burst
+    // latency. This must follow the route's Tune, not the process-wide env
+    // default: balanced and game routes can encode concurrently.
     if name != "h264_videotoolbox" {
-        let maxrate = u64::from(bitrate).saturating_mul(2);
+        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, game);
         d.set("maxrate", &maxrate.to_string());
-        d.set("bufsize", &bitrate.to_string());
+        d.set("bufsize", &bufsize.to_string());
     }
     d
 }
@@ -107,6 +118,7 @@ impl FfmpegH264 {
         height: u32,
         fps: u32,
         bitrate: u32,
+        game: bool,
     ) -> Result<Self, String> {
         FF_INIT.call_once(|| {
             let _ = ff::init();
@@ -132,7 +144,7 @@ impl FfmpegH264 {
                                    // the full relaxed interval, long enough not to spam keyframes.
         video.set_gop(fps.saturating_mul(4).max(1));
         let encoder = video
-            .open_as_with(codec, low_latency_opts(name, bitrate))
+            .open_as_with(codec, low_latency_opts(name, bitrate, game))
             .map_err(|e| format!("{name}: open: {e}"))?;
         Ok(Self {
             encoder,
@@ -148,14 +160,17 @@ impl FfmpegH264 {
     }
 
     /// Encode one contiguous I420 frame (`width*height` Y, then quarter-size U,
-    /// then V). Returns the concatenated Annex-B access unit and whether it was
-    /// a keyframe; `None` when the encoder produced nothing this call (it should
-    /// not, with B-frames off and zero latency, but a backend may still buffer).
-    pub fn encode_i420(
+    /// then V). Returns every Annex-B access unit the encoder had ready, oldest
+    /// first (with B-frames off and zero latency that's normally exactly one;
+    /// a backend that buffers hands its backlog to a later call) — see
+    /// [`EncodeOutcome`]. `send_frame` accepting the frame is what `consumed`
+    /// reports. `pub(crate)`: the outcome type is the video module's internal
+    /// seam.
+    pub(crate) fn encode_i420(
         &mut self,
         i420: &[u8],
         force_idr: bool,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> Result<EncodeOutcome, String> {
         let (w, h) = (self.width as usize, self.height as usize);
         let ysize = w * h;
         let csize = (w / 2) * (h / 2);
@@ -185,7 +200,8 @@ impl FfmpegH264 {
             w / 2,
             h / 2,
         );
-        frame.set_pts(Some(self.pts));
+        let input_ts = self.pts;
+        frame.set_pts(Some(input_ts));
         self.pts += 1;
         if force_idr {
             // Request an I-frame; `forced-idr`/`forced_idr` in the open opts make
@@ -195,22 +211,28 @@ impl FfmpegH264 {
         self.encoder
             .send_frame(&frame)
             .map_err(|e| format!("{}: send_frame: {e}", self.name))?;
-        self.drain()
+        Ok(EncodeOutcome {
+            units: self.drain()?,
+            consumed: true,
+            input_ts: u64::try_from(input_ts).unwrap_or(0),
+        })
     }
 
-    /// Pull every packet the encoder has ready, concatenating their Annex-B
-    /// bytes (valid — start codes delimit NALs) and OR-ing their key flags.
-    fn drain(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut keyframe = false;
+    /// Pull every packet the encoder has ready — each one is its own access
+    /// unit with its own keyframe flag, in encode order (concatenating them
+    /// would smear a whole drained backlog into one oversized "unit" with one
+    /// timestamp).
+    fn drain(&mut self) -> Result<Vec<(Vec<u8>, bool)>, String> {
+        let mut units: Vec<(Vec<u8>, bool)> = Vec::new();
         let mut packet = ff::Packet::empty();
         loop {
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
                     if let Some(data) = packet.data() {
-                        out.extend_from_slice(data);
+                        if !data.is_empty() {
+                            units.push((data.to_vec(), packet.is_key()));
+                        }
                     }
-                    keyframe |= packet.is_key();
                 }
                 // EAGAIN (needs more input) / EOF — nothing more right now.
                 Err(ff::Error::Other {
@@ -220,11 +242,7 @@ impl FfmpegH264 {
                 Err(e) => return Err(format!("{}: receive_packet: {e}", self.name)),
             }
         }
-        if out.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some((out, keyframe)))
-        }
+        Ok(units)
     }
 }
 

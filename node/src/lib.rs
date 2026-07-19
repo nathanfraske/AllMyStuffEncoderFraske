@@ -41,6 +41,11 @@
 // Audio is gated separately (`audio-io`, included in `host`): it's the one
 // capture plane iOS can genuinely run — cpal speaks CoreAudio there — so
 // the phone builds it real while the rest stay stubs.
+/// AMD AMF encode — the Radeon twin of `nvenc`, in progress (loader +
+/// availability probe today; component vtables next). Runtime-loaded from
+/// the Radeon driver's DLL; absent driver = absent rung, softly.
+#[cfg(all(windows, feature = "host"))]
+pub mod amf;
 #[cfg(feature = "audio-io")]
 pub mod audio;
 #[cfg(not(feature = "audio-io"))]
@@ -56,8 +61,24 @@ pub mod clipboard;
 #[path = "stubs/clipboard.rs"]
 pub mod clipboard;
 pub mod control_client;
+/// D3D11VA (DXVA) HEVC decode — the vendor-neutral receive rung: drives
+/// `ID3D11VideoDecoder` on whatever GPU is present (NVIDIA/AMD/Intel,
+/// dGPU or iGPU), no codec packs, no vendor SDK. The rung that turns
+/// Studio·Lossless from an NVIDIA-pair feature into any-Windows-viewer.
+#[cfg(all(windows, feature = "host"))]
+pub mod d3d11va;
 pub mod daemon_spawn;
+/// Local-only development diagnostics shared by the GUI setting and node
+/// startup. This never travels over the mesh or signaling layer.
+pub mod diagnostics;
 pub mod files;
+/// The GPU frame lane — D3D11 VideoProcessor colour conversion + a DXGI
+/// device-manager encoder feed, keeping frames on the GPU end to end.
+/// Proven by its own end-to-end test; the capture/pump integration slice
+/// switches the live path onto it. Windows + host, like the MF backend it
+/// pairs with.
+#[cfg(all(windows, feature = "host"))]
+pub mod gpu_pipeline;
 /// Hardware H.264 encode via FFmpeg vendor encoders. Only built with the
 /// `hwenc` feature (which pulls FFmpeg); the encoder ladder in [`video`] skips
 /// it otherwise and runs software openh264.
@@ -68,15 +89,36 @@ pub mod input_inject;
 #[cfg(not(feature = "host"))]
 #[path = "stubs/input_inject.rs"]
 pub mod input_inject;
+/// The Experimental ("Labs") tier gate — one runtime choke point the Mode
+/// dropdown's Experimental toggle flips, so every future field-trial
+/// feature reads `labs::on(Feature::X)` and needs no new GUI control.
+pub mod labs;
 /// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
 /// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
 /// the encoder ladder in [`video`] enumerates and frame-send-tests it, falling
-/// to software openh264 when no hardware MFT produces frames.
-#[cfg(windows)]
+/// to software openh264 when no hardware MFT produces frames. Host-gated like
+/// [`video`] itself: the backend speaks the real video module's
+/// [`video::EncodeOutcome`] seam, which the capture-less stub doesn't carry.
+#[cfg(all(windows, feature = "host"))]
 pub mod mediafoundation;
 pub mod mesh;
 pub mod networks_store;
 pub mod node_control;
+/// NVDEC (nvcuvid) HEVC decode — the receive twin of `nvenc`, feeding the
+/// native-decode lane the pictures the webview can't. Runtime-loaded from
+/// the NVIDIA driver's DLLs; absent driver = absent rung, softly.
+#[cfg(all(windows, feature = "host"))]
+pub mod nvdec;
+/// Direct NVENC (NVIDIA Video Codec SDK, runtime-loaded — no build
+/// toolchain): the game-mode encoder rung with intra-refresh/GDR and
+/// guaranteed in-place reconfigure, fed the GPU lane's NV12 textures.
+/// Windows + host, like the GPU lane it extends; opt-in via
+/// `ALLMYSTUFF_NVENC=1` until soaked.
+#[cfg(all(windows, feature = "host"))]
+pub mod nvenc;
+/// OS performance levers for the media-plane threads (timer resolution +
+/// thread priority) — Windows-real, no-op elsewhere.
+pub(crate) mod os_perf;
 pub mod ownership;
 pub(crate) mod persist;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
@@ -84,6 +126,11 @@ pub(crate) mod persist;
 pub mod reboot;
 pub mod shares;
 pub mod sites;
+/// The field-test telemetry line: process/system CPU + per-engine GPU
+/// utilization + VRAM every 5 s, via WDDM's vendor-neutral counters —
+/// the same line on NVIDIA, AMD, and Intel boxes.
+#[cfg(windows)]
+pub mod telemetry;
 #[cfg(feature = "host")]
 pub mod terminal;
 #[cfg(not(feature = "host"))]
@@ -97,8 +144,10 @@ pub mod video;
 pub mod video_decode;
 /// Hardware H.264 encode via VideoToolbox — the Mac's media engine, no
 /// FFmpeg toolchain; the encoder ladder in [`video`] frame-send-tests it and
-/// falls back to software openh264.
-#[cfg(target_os = "macos")]
+/// falls back to software openh264. Host-gated like [`video`] itself: the
+/// backend speaks the real video module's [`video::EncodeOutcome`] seam,
+/// which the capture-less stub doesn't carry.
+#[cfg(all(target_os = "macos", feature = "host"))]
 pub mod videotoolbox;
 #[cfg(feature = "host")]
 pub mod wake;

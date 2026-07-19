@@ -165,6 +165,10 @@ pub fn tune(
         max_edge,
         bitrate,
         fps,
+        game: false,
+        mode: None,
+        // The pipeline ext is the node video backend's; the phone sets none.
+        ext: serde_json::Value::Null,
     })
 }
 
@@ -183,6 +187,10 @@ pub fn video_feedback(
         recv_fps,
         decode_fails,
         queue_depth,
+        // The phone's decoder is opaque (no per-AU loss naming) and it
+        // runs no chunk-train estimator yet — no frame-health, no ext.
+        lost_ts_us: None,
+        ext: serde_json::Value::Null,
     })
 }
 
