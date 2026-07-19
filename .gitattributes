@@ -1,0 +1,4 @@
+# Fork-internal docs are excluded from `git archive` tarballs.
+# (The upstream PR is kept clean via a curated branch — see docs/fork/README.md.)
+docs/fork/ export-ignore
+HANDOFF.md  export-ignore

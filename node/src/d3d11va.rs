@@ -1557,7 +1557,7 @@ unsafe impl Send for D3d11vaAv1 {}
 
 impl D3d11vaAv1 {
     pub fn open() -> Result<Self, String> {
-        Err("D3D11VA AV1 decode not yet implemented (stub — see docs/AV1-SEAMS.md)".into())
+        Err("D3D11VA AV1 decode not yet implemented (stub — see docs/fork/AV1-SEAMS.md)".into())
     }
 
     pub fn label(&self) -> &'static str {

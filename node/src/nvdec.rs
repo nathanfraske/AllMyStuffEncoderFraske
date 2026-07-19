@@ -673,7 +673,7 @@ unsafe impl Send for NvdecAv1 {}
 
 impl NvdecAv1 {
     pub fn open() -> Result<Self, String> {
-        Err("NVDEC AV1 decode not yet implemented (stub — see docs/AV1-SEAMS.md)".into())
+        Err("NVDEC AV1 decode not yet implemented (stub — see docs/fork/AV1-SEAMS.md)".into())
     }
 
     pub fn label(&self) -> &'static str {

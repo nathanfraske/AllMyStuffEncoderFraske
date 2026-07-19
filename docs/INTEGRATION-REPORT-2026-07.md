@@ -188,7 +188,7 @@ mediafoundation,gpu_pipeline,win_capture,labs,os_perf}.rs` + the
   *depended on*, verified against, and unmodified.
 - **RTP/packetization/FEC/retransmission:** untouched (daemon's).
   Explicitly rejected as out of bounds in
-  `docs/SMOOTHNESS-IDEAS-2026-07.md` §"Explicitly rejected", so future
+  `docs/fork/SMOOTHNESS-IDEAS-2026-07.md` (fork-internal) §"Explicitly rejected", so future
   sessions don't drift there either.
 - **Your CPU capture/encode pipeline:** intact and load-bearing — it
   is the fallback every new lane fails soft into, and the only path on
@@ -308,7 +308,7 @@ Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
   and decodes clean; `precise_sleep` worst overshoot 435 µs.
 - **Benches:** NVDEC 4.24 ms vs D3D11VA 5.76 ms avg decode+copy at
   1440p (ladder order is measured); preset grid (game P2 5.7 ms);
-  encode-path A/B/C columns in `docs/ENCODER-PASS-2026-07.md`; the
+  encode-path A/B/C columns in `docs/fork/ENCODER-PASS-2026-07.md` (fork-internal); the
   NV12→RGBA viewer kernel 3.5 → 1.8 ms avg @1440p after the AVX2 +
   non-temporal-store pass (`b992776`, byte-exact against the scalar
   reference by test).
@@ -329,5 +329,5 @@ Per-file diffstat vs `78b1c76`: see `git diff --stat 78b1c76..HEAD`
 4. `node/src/nvenc.rs` / `nvdec.rs` / `d3d11va.rs` — self-contained
    FFI rungs, each with its proving tests at the bottom.
 5. `node/src/os_perf.rs` — the OS levers, all best-effort.
-6. `docs/SMOOTHNESS-IDEAS-2026-07.md` — where this is headed next and
+6. `docs/fork/SMOOTHNESS-IDEAS-2026-07.md` (fork-internal) — where this is headed next and
    what was explicitly rejected (the frozen-daemon rule, encoded).

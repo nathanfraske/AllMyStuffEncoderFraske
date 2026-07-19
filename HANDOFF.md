@@ -13,15 +13,22 @@ fork owns the computer-engineering layer — silicon interfaces, kernels,
 scheduling, transport-shaping — for encoder/decoder speed and
 smoothness. Zero MyOwnMesh changes, zero signaling-path changes, ever.
 
-**The review set:** this file (narrative) ·
+**The review set — what goes UP with the PR:**
 [`docs/INTEGRATION-REPORT-2026-07.md`](docs/INTEGRATION-REPORT-2026-07.md)
 (blast radius, wire compat, per-file rings, review order) ·
 [`docs/TESTER-KIT-2026-07.md`](docs/TESTER-KIT-2026-07.md) (how to
-verify every claim + the PR draft + security-push shortlist) ·
-[`docs/SMOOTHNESS-IDEAS-2026-07.md`](docs/SMOOTHNESS-IDEAS-2026-07.md) +
-[`docs/EXPERIMENTAL-ARC-PLAN-2026-07.md`](docs/EXPERIMENTAL-ARC-PLAN-2026-07.md)
+verify every claim + the PR draft + security-push shortlist). Those two
+travel with the upstream PR.
+
+**Fork-internal — stays on the fork, NOT in the PR** (see
+[`docs/fork/README.md`](docs/fork/README.md)): this file (narrative) ·
+[`docs/fork/PIPELINE.md`](docs/fork/PIPELINE.md) (**the** how-to-interact
+reference for the encoders/decoders/pipeline) ·
+[`docs/fork/SMOOTHNESS-IDEAS-2026-07.md`](docs/fork/SMOOTHNESS-IDEAS-2026-07.md) +
+[`docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md`](docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md)
 (what's next, gated) ·
-[`docs/ENCODER-PASS-2026-07.md`](docs/ENCODER-PASS-2026-07.md) (the
+[`docs/fork/AV1-SEAMS.md`](docs/fork/AV1-SEAMS.md) (the AV1 stub map) ·
+[`docs/fork/ENCODER-PASS-2026-07.md`](docs/fork/ENCODER-PASS-2026-07.md) (the
 first pass's before/after profiles). Fork total: **53+ commits,
 41 files, ≈+15.7k/−0.9k** — each commit message carries its full
 reasoning; the trail at the bottom is the index.
@@ -32,11 +39,12 @@ reasoning; the trail at the bottom is the index.
    lossless pump fixes, healing-ladder hardening, refinement passes,
    capture/convert ∥ encode threading, buffer-reuse lanes (A/B
    adjudicated), DXGI re-promotion, pipe-write timeout. Report:
-   `docs/ENCODER-PASS-2026-07.md`.
+   `docs/fork/ENCODER-PASS-2026-07.md`.
 2. **GPU zero-copy lane** (`bb53784`, `b7aa331`): DXGI duplication →
    D3D11 VideoProcessor BGRA→NV12 on one device → texture-fed encoder
    via `IMFDXGIDeviceManager`. Zero CPU pixel touches; fails soft into
-   the untouched CPU pipeline. `ClockKeeper` boost-clock heartbeat
+   the untouched CPU pipeline (report: `docs/fork/ENCODER-PASS-2026-07.md`).
+   `ClockKeeper` boost-clock heartbeat
    (measured 23.7→14.7 ms studio frames). NV12 ring with depth-2
    retirement (field tearing fix, `47be07f`).
 3. **Direct NVENC SDK rung** (`176c47b`, default-on `3aa2c2d`):
@@ -193,7 +201,7 @@ The next agent is **pure pipeline** — no GUI pass should be needed:
 2. **Viewer decode-capability handshake** — the remaining hard-fail
    (HEVC at a GPU-less viewer); small, fail-soft, pre-Radeon.
 3. **Experimental arc** — per
-   `docs/EXPERIMENTAL-ARC-PLAN-2026-07.md`: T2.9 damage grouping,
+   `docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md`: T2.9 damage grouping,
    T2.2 sub-frame slices, T2.8 zero-copy present, T2.5 damage-QP,
    T2.6 paint pacing, T2.4 rescue layer, T1.4 LTR (+T2.3) — all
    behind `ALLMYSTUFF_EXPERIMENTAL`, nothing on by default.

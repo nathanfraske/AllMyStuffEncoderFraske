@@ -1,12 +1,13 @@
 # Tester kit — verifying the encoder line before the upstream PR
 
 _For Chris's review + security push. Everything here runs against fork
-`main`; the companion documents are
+`main`. The companion document that travels with the PR is
 [`INTEGRATION-REPORT-2026-07.md`](INTEGRATION-REPORT-2026-07.md) (what
-changed, blast radius, wire compat) and
-[`SMOOTHNESS-IDEAS-2026-07.md`](SMOOTHNESS-IDEAS-2026-07.md) +
-[`EXPERIMENTAL-ARC-PLAN-2026-07.md`](EXPERIMENTAL-ARC-PLAN-2026-07.md)
-(where it goes next; nothing experimental is on by default)._
+changed, blast radius, wire compat). Where it goes next lives in the
+**fork-internal** docs (on the fork, not in the PR — see §5):
+`docs/fork/SMOOTHNESS-IDEAS-2026-07.md`,
+`docs/fork/EXPERIMENTAL-ARC-PLAN-2026-07.md`, and the how-to-interact
+reference `docs/fork/PIPELINE.md`; nothing experimental is on by default._
 
 ## 0 · The artifact
 
@@ -133,7 +134,25 @@ without the silicon:
 
 ## 5 · The PR
 
-Suggested shape: one PR, fork `main` → upstream `main`, title
+**Keep fork-internal docs out of the PR.** The fork's own pipeline docs
+(`docs/fork/**`) and the engineering handoff (`HANDOFF.md`) live on the
+fork and should not travel upstream — the PR is code + the review
+dossier (`INTEGRATION-REPORT` + this kit) only. A GitHub PR is a
+whole-branch diff, so the way to exclude them is to open the PR from a
+**curated branch** that strips those paths, not from `main` directly:
+
+```powershell
+# from an up-to-date fork main, cut the upstream branch and strip fork-only docs
+git switch -c for-upstream main
+git rm -r docs/fork
+git rm HANDOFF.md
+git commit -m "chore: strip fork-internal docs for the upstream PR"
+git push -u origin for-upstream
+# docs/fork/ and HANDOFF.md stay on fork main; the PR never carries them.
+# Re-cut this branch (delete + redo) whenever main advances before the PR merges.
+```
+
+Suggested shape: one PR, `for-upstream` → upstream `main`, title
 `encoder/decoder line: GPU zero-copy pipeline, four postures, cross-vendor
 lossless, closed WAN loop` — the 53-commit history is the review unit
 (each commit message carries its reasoning; the integration report is
@@ -158,16 +177,18 @@ the map). Draft body:
 > CHANNEL_CONTROL with additive serde-default fields (old↔new peers
 > degrade to today's behavior in all pairings).
 >
-> Review map: `docs/INTEGRATION-REPORT-2026-07.md` (blast radius,
-> suggested review order), `docs/TESTER-KIT-2026-07.md` (this
-> verification), `HANDOFF.md` (the full narrative). For the security
-> push, the remote-input surfaces are the protocol fields and the
-> `d3d11va.rs` parser — see the kit's §1 shortlist.
+> Review map (in this PR): `docs/INTEGRATION-REPORT-2026-07.md` (blast
+> radius, suggested review order) and `docs/TESTER-KIT-2026-07.md` (this
+> verification). The full engineering narrative (`HANDOFF.md`) and the
+> pipeline how-to docs live on the fork under `docs/fork/` if you want
+> deeper context — they're intentionally kept out of this PR. For the
+> security push, the remote-input surfaces are the protocol fields and
+> the `d3d11va.rs` parser — see the kit's §1 shortlist.
 
 Open it with:
 
 ```powershell
-gh pr create --repo mrjeeves/AllMyStuff --base main --head nathanfraske:main `
+gh pr create --repo mrjeeves/AllMyStuff --base main --head nathanfraske:for-upstream `
   --title "encoder/decoder line: GPU zero-copy pipeline, four postures, cross-vendor lossless, closed WAN loop" `
   --body-file docs/pr-body.md   # paste the draft above
 ```

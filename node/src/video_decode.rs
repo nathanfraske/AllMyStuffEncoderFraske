@@ -448,7 +448,7 @@ fn run_decode<F, G>(
                     AuCodec::Hevc => Err("no HEVC decoder on this platform".to_string()),
                     // AV1 — STUB: opens the ladder, which reports not-yet-
                     // implemented; the bridge falls soft. Dormant until an
-                    // encoder emits AV1 (see docs/AV1-SEAMS.md).
+                    // encoder emits AV1 (see docs/fork/AV1-SEAMS.md).
                     #[cfg(all(windows, feature = "host"))]
                     AuCodec::Av1 => Av1Rung::open().map(|dec| {
                         tracing::info!("AV1 decoder for {route_id}: {}", dec.label());

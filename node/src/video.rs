@@ -4378,7 +4378,7 @@ pub(crate) fn paced_slices_enabled() -> bool {
 /// aware seam is here: an `obu_split` branch that cuts at tile-group /
 /// frame OBU boundaries (the AV1 analog of slice NALs) — walk OBU
 /// headers via leb128 like `sniff_av1_obu` in `video_decode.rs`, group
-/// to `max_chunk`. See docs/AV1-SEAMS.md.
+/// to `max_chunk`. See docs/fork/AV1-SEAMS.md.
 pub(crate) fn split_annexb_paced(data: &[u8], max_chunk: usize) -> Vec<std::ops::Range<usize>> {
     // Walk the start codes (00 00 01 and 00 00 00 01), recording each
     // NAL's offset and header byte.

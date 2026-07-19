@@ -145,7 +145,7 @@ const NV_ENC_CODEC_HEVC_GUID: GUID = GUID::from_values(
 /// hardware whether it produces lossless-class bytes — run it on the
 /// 50-series first. Implementation reuses `open_on_device`'s flow with
 /// this GUID + `NV_ENC_CONFIG_AV1` (a distinct config union member) and
-/// an OBU-aware pacer/sniff branch (see docs/AV1-SEAMS.md).
+/// an OBU-aware pacer/sniff branch (see docs/fork/AV1-SEAMS.md).
 #[allow(dead_code)]
 const NV_ENC_CODEC_AV1_GUID: GUID = GUID::from_values(
     0x0a35_2289,
