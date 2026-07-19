@@ -151,6 +151,21 @@ reasoning; the trail at the bottom is the index.
   first (`versioning-is-chriss`, `transport-signaling-rule`,
   `build-env-this-box`, `project-direction`, `hardware-arcs-status`).
 
+## The backend-only boundary (`8e1308c`) — pipeline work touches ONLY node video modules
+
+The user's charter rule: encoder/decoder/pacing tuning must never
+require touching the wire crates or GUI (Chris's domain). The seam that
+enforces it: `RouteControl::VideoFeedback`/`Tune` carry an opaque
+`ext: serde_json::Value` the protocol + session crates relay verbatim;
+the node backend owns its shape via `video::PipelineFeedback`
+(`to_ext`/`from_ext`). So a new feedback signal = a field on
+`PipelineFeedback`; a viewer-requested knob = read `Tune`'s `ext`; a
+Labs feature = `labs::on(Feature::X)` (dropdown toggle already flips
+the tier). **None of these touch protocol/session/mobile-core/GUI.**
+Our modules: `video.rs · nvenc/nvdec/d3d11va/amf/mediafoundation ·
+gpu_pipeline · win_capture · mesh.rs pacer · labs.rs · os_perf.rs`.
+(Memory: `backend-only-pipeline-boundary.md`.)
+
 ## GUI is CLOSED OUT (as of `f29a5ed`)
 
 The next agent is **pure pipeline** — no GUI pass should be needed:

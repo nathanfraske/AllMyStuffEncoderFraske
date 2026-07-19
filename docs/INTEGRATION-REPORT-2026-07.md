@@ -149,12 +149,27 @@ VRAM, monitor topology.
 
 | File | Exact change | Wire compatibility |
 |---|---|---|
-| `crates/allmystuff-protocol/src/app.rs` (+30) | `RouteControl::Tune` += `game: bool`, `mode: Option<String>`; `RouteControl::VideoFeedback` += `lost_ts_us: Option<u64>`, `est_kbps: u32`, `delay_trend_us_per_s: i32` — **all `#[serde(default)]`, all additive, no field renamed/removed/retyped** | Old peer receiving new fields: ignores them (serde). New peer receiving old messages: defaults (off/zero). Proven both directions by the session-crate round-trip tests. |
+| `crates/allmystuff-protocol/src/app.rs` | `RouteControl::Tune` += `game: bool`, `mode: Option<String>`, **`ext: serde_json::Value`**; `RouteControl::VideoFeedback` += `lost_ts_us: Option<u64>`, **`ext: serde_json::Value`** — all `#[serde(default)]`, additive, nothing renamed/removed. **`ext` is the pipeline's opaque bag** (see the boundary note below): the protocol crate relays it verbatim and never inspects it, so future pipeline signals never add fields here. | Old peer receiving new fields: ignores them (serde). New peer receiving old messages: defaults (off/zero/null). Proven both directions by the session round-trip tests, including an explicit "ext relayed verbatim" assertion. |
 | `crates/allmystuff-session/src/media.rs` (+7) | `InputAction::MouseMoveRel` (pointer-lock deltas) — additive enum variant behind the existing catch-all | Old receivers drop unknown actions by the pre-existing catch-all arm |
 | `crates/allmystuff-session/src/lib.rs` (+34) | `Effect::VideoFeedback`/`TuneMedia` carry the new fields through; same gate logic (`is_active() && peer == from`) untouched | Internal to the app; wire shape is the protocol crate's |
 | `crates/allmystuff-mobile-core/src/control.rs` (+7) | The phone's `video_feedback` constructor fills the new fields with absent/zero | Pure constructor parity |
 | `gui/src-tauri/src/main.rs`, `gui/mobile/src/commands.rs` (+4 each) | Tune command plumbs `game`/`mode` through | GUI-internal |
 | `node/src/node_control.rs` (+19) | `video_feedback` op passes through; no new ops | GUI-internal |
+
+## 3.5 · The backend boundary (why future pipeline work won't touch your crates)
+
+By design, all encoder/decoder/pacing tuning is confined to the node's
+video modules; the protocol/session/GUI never need touching for it. The
+enforcing seam: `VideoFeedback`/`Tune` carry an **opaque
+`ext: serde_json::Value`** the protocol and session crates relay
+verbatim and never inspect. The node backend owns its shape
+(`video::PipelineFeedback::to_ext`/`from_ext` at the mesh edge). So a
+new receiver-side signal is a field on that struct; a viewer-requested
+encoder knob reads `Tune`'s `ext`; a Labs feature is `labs::on(...)`.
+None cross into your crates. This keeps every future pipeline change's
+blast radius inside `node/src/{video,nvenc,nvdec,d3d11va,amf,
+mediafoundation,gpu_pipeline,win_capture,labs,os_perf}.rs` + the
+`mesh.rs` pacer — review those, and pipeline evolution stays there.
 
 ## 4 · Untouched surfaces — the guarantees
 
