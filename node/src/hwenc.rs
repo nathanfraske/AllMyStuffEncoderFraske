@@ -57,7 +57,7 @@ pub struct FfmpegH264 {
 /// frame can spend ~2× the average byte budget instead of having its QP cranked
 /// into macroblocking. Without this headroom, VBR collapses toward the average
 /// and motion frames block — the "blocky on fast motion" symptom.
-fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
+fn low_latency_opts(name: &str, bitrate: u32, game: bool) -> ff::Dictionary<'static> {
     let mut d = ff::Dictionary::new();
     match name {
         "h264_nvenc" => {
@@ -96,10 +96,12 @@ fn low_latency_opts(name: &str, bitrate: u32) -> ff::Dictionary<'static> {
     // Peak/VBV headroom for every rate-controlled vendor (generic AVOptions →
     // rc_max_rate / rc_buffer_size; the hardware controllers honour them).
     // VideoToolbox manages its own rate control and ignores these. The
-    // shared posture (`video::burst_bounds`): 2×/1 s quality-first, trimmed
-    // to 1.5×/½ s in game mode for burst latency.
+    // shared *route* posture (`video::burst_bounds`): 2×/1 s
+    // quality-first, trimmed to 1.5×/½ s in game mode for burst
+    // latency. This must follow the route's Tune, not the process-wide env
+    // default: balanced and game routes can encode concurrently.
     if name != "h264_videotoolbox" {
-        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+        let (maxrate, bufsize) = crate::video::burst_bounds(bitrate, game);
         d.set("maxrate", &maxrate.to_string());
         d.set("bufsize", &bufsize.to_string());
     }
@@ -116,6 +118,7 @@ impl FfmpegH264 {
         height: u32,
         fps: u32,
         bitrate: u32,
+        game: bool,
     ) -> Result<Self, String> {
         FF_INIT.call_once(|| {
             let _ = ff::init();
@@ -141,7 +144,7 @@ impl FfmpegH264 {
                                    // the full relaxed interval, long enough not to spam keyframes.
         video.set_gop(fps.saturating_mul(4).max(1));
         let encoder = video
-            .open_as_with(codec, low_latency_opts(name, bitrate))
+            .open_as_with(codec, low_latency_opts(name, bitrate, game))
             .map_err(|e| format!("{name}: open: {e}"))?;
         Ok(Self {
             encoder,
@@ -197,7 +200,8 @@ impl FfmpegH264 {
             w / 2,
             h / 2,
         );
-        frame.set_pts(Some(self.pts));
+        let input_ts = self.pts;
+        frame.set_pts(Some(input_ts));
         self.pts += 1;
         if force_idr {
             // Request an I-frame; `forced-idr`/`forced_idr` in the open opts make
@@ -210,6 +214,7 @@ impl FfmpegH264 {
         Ok(EncodeOutcome {
             units: self.drain()?,
             consumed: true,
+            input_ts: u64::try_from(input_ts).unwrap_or(0),
         })
     }
 

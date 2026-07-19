@@ -1,4 +1,5 @@
-//! NVDEC (nvcuvid) HEVC decode — the receive twin of [`crate::nvenc`].
+//! NVDEC (nvcuvid) H.264/HEVC decode — the receive twin of
+//! [`crate::nvenc`].
 //!
 //! Why this exists: Studio's Lossless tier encodes HEVC (transquant
 //! bypass in Main profile — the flavor hardware decoders open), but the
@@ -43,6 +44,10 @@ type CuContext = *mut c_void;
 type CuVideoParser = *mut c_void;
 type CuVideoDecoder = *mut c_void;
 
+// `cudaVideoCodec` values from NVIDIA's Video Codec SDK headers. Keep these
+// explicit: this crate dynamically loads the driver API and deliberately has
+// no SDK/header build dependency.
+const CUDA_VIDEO_CODEC_H264: i32 = 4;
 const CUDA_VIDEO_CODEC_HEVC: i32 = 8;
 /// `cudaVideoCodec_AV1` — the codec id the AV1 rung will pass to
 /// `CreateVideoParser`/`CreateDecoder` (the whole HEVC path parameterizes
@@ -59,6 +64,34 @@ const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
 
 const CU_MEMORYTYPE_HOST: i32 = 1;
 const CU_MEMORYTYPE_DEVICE: i32 = 2;
+
+/// One bridge feed is one AU (or one paced chunk), so ordinary IPP decode
+/// produces at most a handful of callbacks in one synchronous parse. Keep a
+/// hard ceiling so a malformed aggregate cannot grow callback state without
+/// bound before `decode` regains control.
+const MAX_READY_PICTURES: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NvCodec {
+    H264,
+    Hevc,
+}
+
+impl NvCodec {
+    const fn id(self) -> i32 {
+        match self {
+            Self::H264 => CUDA_VIDEO_CODEC_H264,
+            Self::Hevc => CUDA_VIDEO_CODEC_HEVC,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+}
 
 /// `CUVIDSOURCEDATAPACKET`.
 #[repr(C)]
@@ -319,7 +352,9 @@ pub struct NvFrame {
 /// `user_data`.
 struct State {
     tables: &'static Tables,
+    codec: NvCodec,
     decoder: CuVideoDecoder,
+    decode_surfaces: u32,
     coded_width: u32,
     coded_height: u32,
     display_width: u32,
@@ -353,18 +388,73 @@ pub struct NvdecHevc {
 unsafe impl Send for NvdecHevc {}
 
 unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoFormat) -> i32 {
+    if user.is_null() {
+        return 0;
+    }
     let state = &mut *(user as *mut State);
+    if format.is_null() {
+        state.error = Some("NVDEC sequence callback returned no format".into());
+        return 0;
+    }
     let f = &*format;
-    if f.chroma_format != CUDA_VIDEO_CHROMA_420 || f.bit_depth_luma_minus8 != 0 {
+    if f.codec != state.codec.id() {
         state.error = Some(format!(
-            "unsupported stream shape (chroma {} · depth 8+{})",
-            f.chroma_format, f.bit_depth_luma_minus8
+            "NVDEC parser expected {} (codec {}) but announced codec {}",
+            state.codec.name(),
+            state.codec.id(),
+            f.codec,
+        ));
+        return 0;
+    }
+    if f.chroma_format != CUDA_VIDEO_CHROMA_420
+        || f.bit_depth_luma_minus8 != 0
+        || f.bit_depth_chroma_minus8 != 0
+        || f.progressive_sequence == 0
+    {
+        state.error = Some(format!(
+            "unsupported stream shape (chroma {} · depth 8+{}/8+{} · progressive {})",
+            f.chroma_format,
+            f.bit_depth_luma_minus8,
+            f.bit_depth_chroma_minus8,
+            f.progressive_sequence,
+        ));
+        return 0;
+    }
+    let Some(display_w) = f.display_right.checked_sub(f.display_left) else {
+        state.error = Some("NVDEC display rectangle overflow".into());
+        return 0;
+    };
+    let Some(display_h) = f.display_bottom.checked_sub(f.display_top) else {
+        state.error = Some("NVDEC display rectangle overflow".into());
+        return 0;
+    };
+    let rect_fits = f.display_left >= 0
+        && f.display_top >= 0
+        && display_w >= 2
+        && display_h >= 2
+        && display_w % 2 == 0
+        && display_h % 2 == 0
+        && u32::try_from(f.display_right).is_ok_and(|v| v <= f.coded_width)
+        && u32::try_from(f.display_bottom).is_ok_and(|v| v <= f.coded_height)
+        && i16::try_from(f.display_left).is_ok()
+        && i16::try_from(f.display_top).is_ok()
+        && i16::try_from(f.display_right).is_ok()
+        && i16::try_from(f.display_bottom).is_ok();
+    if f.coded_width < 2 || f.coded_height < 2 || !rect_fits {
+        state.error = Some(format!(
+            "invalid NVDEC geometry {}x{} display [{},{},{},{}]",
+            f.coded_width,
+            f.coded_height,
+            f.display_left,
+            f.display_top,
+            f.display_right,
+            f.display_bottom,
         ));
         return 0;
     }
     let surfaces = u32::from(f.min_num_decode_surfaces).max(4);
-    let display_w = (f.display_right - f.display_left).max(2) as u32;
-    let display_h = (f.display_bottom - f.display_top).max(2) as u32;
+    let display_w = display_w as u32;
+    let display_h = display_h as u32;
     if !state.decoder.is_null() {
         // Mid-stream format change: only *fully* identical geometry can
         // reuse the decoder — coded AND display. Coded dims alone are a
@@ -378,10 +468,11 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
             && f.coded_height == state.coded_height
             && display_w == state.display_width
             && display_h == state.display_height
+            && surfaces <= state.decode_surfaces
         {
-            return surfaces as i32;
+            return state.decode_surfaces as i32;
         }
-        state.error = Some("mid-stream geometry change".into());
+        state.error = Some("mid-stream geometry or decode-surface change".into());
         return 0;
     }
     state.coded_width = f.coded_width;
@@ -392,7 +483,7 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
         width: f.coded_width,
         height: f.coded_height,
         num_decode_surfaces: surfaces,
-        codec_type: CUDA_VIDEO_CODEC_HEVC,
+        codec_type: state.codec.id(),
         chroma_format: CUDA_VIDEO_CHROMA_420,
         creation_flags: 0, // cudaVideoCreate_Default (CUVID path)
         bit_depth_minus8: 0,
@@ -423,12 +514,24 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
         reserved2: [0; 4],
     };
     let status = (state.tables.cuvid.create_decoder)(&mut state.decoder, &mut info);
-    if status != CUDA_SUCCESS {
+    if status != CUDA_SUCCESS || state.decoder.is_null() {
         state.decoder = std::ptr::null_mut();
-        state.error = Some(format!("cuvidCreateDecoder: {status}"));
+        state.error = Some(if status == CUDA_SUCCESS {
+            "cuvidCreateDecoder returned a null decoder".into()
+        } else {
+            format!("cuvidCreateDecoder: {status}")
+        });
         return 0;
     }
-    let need = (state.display_width as usize) * (state.display_height as usize) * 3 / 2;
+    state.decode_surfaces = surfaces;
+    let Some(need) = (state.display_width as usize)
+        .checked_mul(state.display_height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .map(|bytes| bytes / 2)
+    else {
+        state.error = Some("NVDEC sequence output size overflow".into());
+        return 0;
+    };
     let mut p: *mut c_void = std::ptr::null_mut();
     if (state.tables.cuda.mem_host_alloc)(&mut p, need, 0) == CUDA_SUCCESS {
         state.pinned = p as *mut u8;
@@ -439,12 +542,41 @@ unsafe extern "system" fn on_sequence(user: *mut c_void, format: *mut VideoForma
         state.pinned = std::ptr::null_mut();
         state.pinned_len = 0;
     }
+    let signal = f.video_signal_description;
+    tracing::info!(
+        "NVDEC {} sequence: coded {}x{} · display {}x{} at {},{} · surfaces {} · fps {}/{} · color full={} primaries={} transfer={} matrix={} · pinned-staging={}",
+        state.codec.name(),
+        f.coded_width,
+        f.coded_height,
+        state.display_width,
+        state.display_height,
+        f.display_left,
+        f.display_top,
+        surfaces,
+        f.frame_rate_num,
+        f.frame_rate_den,
+        signal[0] & 0x08 != 0,
+        signal[1],
+        signal[2],
+        signal[3],
+        !state.pinned.is_null(),
+    );
     surfaces as i32
 }
 
 unsafe extern "system" fn on_decode(user: *mut c_void, pic: *mut c_void) -> i32 {
+    if user.is_null() {
+        return 0;
+    }
     let state = &mut *(user as *mut State);
+    if pic.is_null() {
+        state.error = Some("NVDEC decode callback returned no picture".into());
+        return 0;
+    }
     if state.decoder.is_null() {
+        state
+            .error
+            .get_or_insert_with(|| "NVDEC decode callback has no decoder".into());
         return 0;
     }
     let status = (state.tables.cuvid.decode_picture)(state.decoder, pic);
@@ -459,11 +591,27 @@ unsafe extern "system" fn on_decode(user: *mut c_void, pic: *mut c_void) -> i32 
 }
 
 unsafe extern "system" fn on_display(user: *mut c_void, disp: *mut ParserDispInfo) -> i32 {
+    if user.is_null() {
+        return 0;
+    }
     let state = &mut *(user as *mut State);
     if disp.is_null() {
         return 1; // EOS marker (only sent when asked for; be tolerant)
     }
     let d = &*disp;
+    if d.picture_index < 0 {
+        state.error = Some(format!(
+            "NVDEC display callback returned invalid picture {}",
+            d.picture_index
+        ));
+        return 0;
+    }
+    if state.ready.len() >= MAX_READY_PICTURES {
+        state.error = Some(format!(
+            "NVDEC produced more than {MAX_READY_PICTURES} pictures from one input"
+        ));
+        return 0;
+    }
     state.ready.push((d.picture_index, d.timestamp));
     1
 }
@@ -474,6 +622,10 @@ impl NvdecHevc {
     /// LUID-matched device pick is a follow-up; every field box today is
     /// single-GPU NVIDIA.
     pub fn open() -> Result<Self, String> {
+        Self::open_codec(NvCodec::Hevc)
+    }
+
+    fn open_codec(codec: NvCodec) -> Result<Self, String> {
         let tables = tables()?;
         unsafe {
             let mut device = 0i32;
@@ -486,10 +638,20 @@ impl NvdecHevc {
             if status != CUDA_SUCCESS {
                 return Err(format!("cuDevicePrimaryCtxRetain: {status}"));
             }
-            (tables.cuda.ctx_set_current)(ctx);
+            if ctx.is_null() {
+                let _ = (tables.cuda.primary_ctx_release)(device);
+                return Err("cuDevicePrimaryCtxRetain returned a null context".into());
+            }
+            let status = (tables.cuda.ctx_set_current)(ctx);
+            if status != CUDA_SUCCESS {
+                let _ = (tables.cuda.primary_ctx_release)(device);
+                return Err(format!("cuCtxSetCurrent: {status}"));
+            }
             let mut state = Box::new(State {
                 tables,
+                codec,
                 decoder: std::ptr::null_mut(),
+                decode_surfaces: 0,
                 coded_width: 0,
                 coded_height: 0,
                 display_width: 0,
@@ -500,7 +662,7 @@ impl NvdecHevc {
                 error: None,
             });
             let mut params: ParserParams = std::mem::zeroed();
-            params.codec_type = CUDA_VIDEO_CODEC_HEVC;
+            params.codec_type = codec.id();
             params.max_num_decode_surfaces = 20; // sequence callback overrides
             params.clock_rate = 1_000_000; // timestamps in µs
             params.error_threshold = 100;
@@ -511,9 +673,17 @@ impl NvdecHevc {
             params.pfn_display_picture = Some(on_display);
             let mut parser: CuVideoParser = std::ptr::null_mut();
             let status = (tables.cuvid.create_parser)(&mut parser, &mut params);
-            if status != CUDA_SUCCESS {
-                (tables.cuda.primary_ctx_release)(device);
-                return Err(format!("cuvidCreateVideoParser: {status}"));
+            if status != CUDA_SUCCESS || parser.is_null() {
+                if !parser.is_null() {
+                    let _ = (tables.cuvid.destroy_parser)(parser);
+                }
+                let _ = (tables.cuda.ctx_set_current)(std::ptr::null_mut());
+                let _ = (tables.cuda.primary_ctx_release)(device);
+                return Err(if status == CUDA_SUCCESS {
+                    "cuvidCreateVideoParser returned a null parser".into()
+                } else {
+                    format!("cuvidCreateVideoParser: {status}")
+                });
             }
             Ok(Self {
                 tables,
@@ -534,12 +704,23 @@ impl NvdecHevc {
     /// call). An `Err` means the session is wedged — drop it and re-enter
     /// at the sender's next IDR, exactly the openh264 recovery shape.
     pub fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<NvFrame>, String> {
+        if au.is_empty() {
+            return Ok(Vec::new());
+        }
+        let payload_size = u32::try_from(au.len())
+            .map_err(|_| format!("NVDEC input too large ({} bytes)", au.len()))?;
         unsafe {
-            (self.tables.cuda.ctx_set_current)(self.ctx);
+            if self.parser.is_null() {
+                return Err("NVDEC parser is not available".into());
+            }
+            let status = (self.tables.cuda.ctx_set_current)(self.ctx);
+            if status != CUDA_SUCCESS {
+                return Err(format!("cuCtxSetCurrent: {status}"));
+            }
             self.state.ready.clear();
             let mut packet = SourceDataPacket {
                 flags: CUVID_PKT_TIMESTAMP | CUVID_PKT_ENDOFPICTURE,
-                payload_size: au.len() as u32,
+                payload_size,
                 payload: au.as_ptr(),
                 timestamp: ts_us as i64,
             };
@@ -563,6 +744,14 @@ impl NvdecHevc {
     /// (tight `w`-byte rows).
     unsafe fn map_out(&mut self, pic_idx: i32, ts: i64) -> Result<NvFrame, String> {
         let (w, h) = (self.state.display_width, self.state.display_height);
+        if self.state.decoder.is_null() || w < 2 || h < 2 || w % 2 != 0 || h % 2 != 0 {
+            return Err(format!("NVDEC output state is invalid ({w}x{h})"));
+        }
+        let need = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .map(|bytes| bytes / 2)
+            .ok_or("NVDEC output size overflow")?;
         // The mapped surface is target-sized (display-sized — see the
         // create info): its chroma plane starts after `target_height`
         // luma rows.
@@ -580,7 +769,12 @@ impl NvdecHevc {
         if status != CUDA_SUCCESS {
             return Err(format!("cuvidMapVideoFrame64: {status}"));
         }
-        let need = (w as usize) * (h as usize) * 3 / 2;
+        if dptr == 0 || pitch < w {
+            let _ = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+            return Err(format!(
+                "cuvidMapVideoFrame64 returned invalid surface (ptr {dptr:#x}, pitch {pitch}, width {w})"
+            ));
+        }
         let mut nv12 = vec![0u8; need];
         // DMA into the page-locked staging when we have it (full-rate
         // transfer), one memcpy out; else straight into the Vec.
@@ -653,8 +847,29 @@ impl Drop for NvdecHevc {
             if !self.state.pinned.is_null() {
                 let _ = (self.tables.cuda.mem_free_host)(self.state.pinned as *mut c_void);
             }
+            let _ = (self.tables.cuda.ctx_set_current)(std::ptr::null_mut());
             let _ = (self.tables.cuda.primary_ctx_release)(self.device);
         }
+    }
+}
+
+/// An NVDEC H.264 session. It deliberately wraps the same parser/decoder
+/// implementation as HEVC: nvcuvid parameterizes both objects by codec ID,
+/// while AU framing, display callbacks, NV12 mapping, and recovery are
+/// identical for the progressive 8-bit 4:2:0 streams this pipeline emits.
+pub struct NvdecH264(NvdecHevc);
+
+impl NvdecH264 {
+    pub fn open() -> Result<Self, String> {
+        NvdecHevc::open_codec(NvCodec::H264).map(Self)
+    }
+
+    pub fn label(&self) -> &'static str {
+        "NVDEC (H.264, hardware)"
+    }
+
+    pub fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<NvFrame>, String> {
+        self.0.decode(au, ts_us)
     }
 }
 
@@ -1008,6 +1223,142 @@ mod tests {
         }
         ctx.Unmap(&staging, 0);
         out
+    }
+
+    /// Ordinary H.264 through the exact receive contract: the sender may split
+    /// at slice NALs, but the bridge reassembles same-timestamp chunks before
+    /// setting NVDEC's END_OF_PICTURE. The reconstructed AU must remain byte-
+    /// exact and decode to the same pictures as the original.
+    #[test]
+    fn nvdec_h264_whole_and_reassembled_paced_au_match() {
+        use openh264::encoder::{
+            BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
+        };
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        let (w, h) = (640usize, 480usize);
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(10_000_000))
+            .max_frame_rate(FrameRate::from_hz(60.0))
+            .max_slice_len(4 * 1024);
+        let mut enc = match Encoder::with_api_config(openh264::OpenH264API::from_source(), config) {
+            Ok(enc) => enc,
+            Err(e) => {
+                eprintln!("SKIP: OpenH264 encoder unavailable: {e}");
+                return;
+            }
+        };
+        let mut whole = match NvdecH264::open() {
+            Ok(dec) => dec,
+            Err(e) => {
+                eprintln!("SKIP: H.264 NVDEC unavailable: {e}");
+                return;
+            }
+        };
+        let mut paced = NvdecH264::open().expect("second H.264 NVDEC session");
+        let mut rgb = vec![0u8; w * h * 3];
+        let mut whole_out = Vec::new();
+        let mut paced_out = Vec::new();
+        let mut saw_split = false;
+
+        for frame in 0..12u64 {
+            for (p, px) in rgb.chunks_exact_mut(3).enumerate() {
+                let x = p % w;
+                let y = p / w;
+                let tile = (((x / 8) + (y / 8) + frame as usize) & 1) as u8;
+                px[0] = if tile == 0 { 24 } else { 228 };
+                px[1] = ((x + frame as usize * 7) & 255) as u8;
+                px[2] = ((y * 3 + frame as usize * 11) & 255) as u8;
+            }
+            let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (w, h)));
+            let au = enc.encode(&yuv).expect("H.264 encode").to_vec();
+            if au.is_empty() {
+                continue;
+            }
+            let ts = frame * 16_667;
+            whole_out.extend(whole.decode(&au, ts).expect("whole-AU NVDEC"));
+            let chunks = crate::video::split_annexb_paced(&au, 4 * 1024);
+            saw_split |= chunks.len() > 1;
+            let mut rebuilt = Vec::with_capacity(au.len());
+            for chunk in chunks {
+                rebuilt.extend_from_slice(&au[chunk]);
+            }
+            assert_eq!(rebuilt, au, "paced chunk coalescing is byte-exact");
+            paced_out.extend(paced.decode(&rebuilt, ts).expect("coalesced H.264 NVDEC"));
+        }
+
+        assert!(saw_split, "encoder produced a real multi-slice access unit");
+        assert_eq!(
+            paced_out.len(),
+            whole_out.len(),
+            "one picture per access unit"
+        );
+        assert!(!whole_out.is_empty(), "at least one H.264 picture decoded");
+        for (paced, whole) in paced_out.iter().zip(&whole_out) {
+            assert_eq!((paced.width, paced.height), (w as u32, h as u32));
+            assert_eq!(paced.ts_us, whole.ts_us, "timestamp survives chunk feeds");
+            assert_eq!(paced.nv12, whole.nv12, "paced decode is byte-identical");
+        }
+    }
+
+    /// The production NVIDIA path at both field resolutions: D3D11 capture
+    /// texture -> NV12 VideoProcessor -> NVENC H.264 -> NVDEC. This proves the
+    /// driver encoder's actual profile/VUI/slice output, not only OpenH264's
+    /// convenient test stream.
+    #[test]
+    fn nvenc_h264_nvdec_round_trip_1080p_and_1440p() {
+        for (w, h) in [(1920u32, 1080u32), (2560u32, 1440u32)] {
+            let (wu, hu) = (w as usize, h as usize);
+            let mut gpu = match crate::gpu_pipeline::GpuConvert::new(w, h, w, h) {
+                Ok(gpu) => gpu,
+                Err(e) => {
+                    eprintln!("SKIP: GPU convert unavailable at {w}x{h}: {e}");
+                    return;
+                }
+            };
+            let mut enc = match crate::nvenc::NvencH264::open_on_device(
+                &gpu.device(),
+                w,
+                h,
+                60,
+                30_000_000,
+                false,
+                false,
+            ) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    eprintln!("SKIP: NVENC H.264 unavailable at {w}x{h}: {e}");
+                    return;
+                }
+            };
+            let mut dec = NvdecH264::open().expect("H.264 NVDEC after NVENC opened");
+            let mut doc = vec![0u8; wu * (hu + 96) * 4];
+            crate::nvenc::tests_support::paint_document(&mut doc, wu, hu + 96);
+            let mut bgra = vec![0u8; wu * hu * 4];
+            let tex = gpu.bgra_texture_from(&bgra, w, h).expect("BGRA texture");
+            let mut decoded = 0u32;
+
+            for frame in 0..10u64 {
+                let offset = frame as usize * 4;
+                bgra.copy_from_slice(&doc[offset * wu * 4..][..wu * hu * 4]);
+                gpu.update_bgra(&tex, &bgra, w, h);
+                let (slot, nv12) = gpu.convert(&tex).expect("convert").expect("NV12 slot");
+                let out = enc
+                    .encode_texture(&nv12, frame == 0)
+                    .expect("NVENC H.264 encode");
+                gpu.release(slot);
+                for (au, _) in out.units {
+                    for picture in dec.decode(&au, frame * 16_667).expect("NVDEC H.264 decode") {
+                        assert_eq!((picture.width, picture.height), (w, h));
+                        assert_eq!(picture.nv12.len(), wu * hu * 3 / 2);
+                        decoded += 1;
+                    }
+                }
+            }
+            assert!(decoded >= 9, "{w}x{h}: decoded {decoded}/10 NVENC frames");
+        }
     }
 
     /// The whole Studio·Lossless media plane in one test, both hardware

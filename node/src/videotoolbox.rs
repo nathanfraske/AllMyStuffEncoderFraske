@@ -422,8 +422,18 @@ impl VideoToolboxH264 {
                     return Err("VideoToolbox session went away".into())
                 }
             }
-            while let Ok(Ok(extra)) = self.rx.try_recv() {
-                units.push((extra.annexb, extra.key));
+            // Surface errors that raced the bounded wait. `while let
+            // Ok(Ok(..))` silently stopped on an `Err` callback and left the
+            // live session looking healthy until some unrelated later call.
+            loop {
+                match self.rx.try_recv() {
+                    Ok(Ok(extra)) => units.push((extra.annexb, extra.key)),
+                    Ok(Err(e)) => return Err(format!("VideoToolbox encode callback: {e}")),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("VideoToolbox session went away".into())
+                    }
+                }
             }
         }
         Ok(EncodeOutcome {

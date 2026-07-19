@@ -33,11 +33,11 @@
 //! and closes a picture when (a) a slice arrives carrying
 //! `first_slice_segment_in_pic_flag`, (b) the RTP timestamp changes, or
 //! (c) the stream's learned slices-per-picture count is reached. The
-//! count is learned from boundary-closed pictures and only ratchets up
-//! (`max`), so a picture missing chunks to loss can never teach a short
-//! count and cascade partial submits. Steady state closes each picture
-//! on its own final chunk — no added latency; only the stream's first
-//! picture waits for its successor.
+//! count is learned only after two matching, successfully submitted
+//! boundary-closed pictures and only ratchets up (`max`), so one picture
+//! missing chunks cannot teach a short count and cascade partial submits.
+//! Steady state closes each picture on its own final chunk — no added
+//! latency; only the first two pictures may wait for their successors.
 //!
 //! Threading contract: one owner thread (the route's decode thread),
 //! same as the encoder twin. The D3D11 device is multithread-protected
@@ -860,6 +860,109 @@ struct PendingPicture {
     nal_type: u8,
 }
 
+/// Conservative evidence for the fixed slice count our NVENC sessions
+/// request. A single boundary-closed picture is not enough: if the first
+/// picture lost a chunk, some drivers can still accept the partial submit,
+/// and learning that short count would then close every healthy successor
+/// early. Two equal, successfully submitted boundary closes establish the
+/// steady count; later observations may raise it but never lower it.
+#[derive(Default)]
+struct SliceCountLearner {
+    learned: usize,
+    candidate: usize,
+    confirmations: u8,
+}
+
+/// Once a stable slices-per-picture count is known, a timestamp/first-slice
+/// boundary with fewer slices is evidence of loss, not completion. Submitting
+/// that partial picture can paint green/black bands and poison its reference
+/// chain; drop it so the bridge requests a clean entry instead.
+fn boundary_picture_is_complete(expected: Option<usize>, observed: usize) -> bool {
+    expected.is_none_or(|expected| observed >= expected)
+}
+
+impl SliceCountLearner {
+    fn expected(&self) -> Option<usize> {
+        (self.learned > 0).then_some(self.learned)
+    }
+
+    fn observe_boundary(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.candidate == count {
+            self.confirmations = self.confirmations.saturating_add(1);
+        } else {
+            self.candidate = count;
+            self.confirmations = 1;
+        }
+        if self.confirmations >= 2 {
+            self.learned = self.learned.max(count);
+        }
+    }
+}
+
+/// A successful `DecoderBeginFrame` owns a transaction until exactly one
+/// `DecoderEndFrame`. The decode body has many fallible buffer/submit steps;
+/// this guard closes the frame on every early return and exposes `finish` for
+/// the success path so an `EndFrame` error is still reported to the caller.
+struct DecoderFrameGuard<'a> {
+    ctx: &'a ID3D11VideoContext,
+    decoder: &'a ID3D11VideoDecoder,
+    active: bool,
+}
+
+impl<'a> DecoderFrameGuard<'a> {
+    unsafe fn begin(
+        ctx: &'a ID3D11VideoContext,
+        decoder: &'a ID3D11VideoDecoder,
+        view: &ID3D11VideoDecoderOutputView,
+    ) -> Result<Self, String> {
+        // The engine can still be draining a previous frame; the
+        // documented response is "try again shortly".
+        let mut tries = 0;
+        loop {
+            match ctx.DecoderBeginFrame(decoder, view, 0, None) {
+                Ok(()) => {
+                    return Ok(Self {
+                        ctx,
+                        decoder,
+                        active: true,
+                    });
+                }
+                Err(e) if tries < 50 && matches!(e.code().0 as u32, 0x8000_000a | 0x887a_000a) => {
+                    // E_PENDING / DXGI_ERROR_WAS_STILL_DRAWING
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(format!("DecoderBeginFrame: {e}")),
+            }
+        }
+    }
+
+    unsafe fn finish(mut self) -> Result<(), String> {
+        let result = self
+            .ctx
+            .DecoderEndFrame(self.decoder)
+            .map_err(|e| format!("DecoderEndFrame: {e}"));
+        // EndFrame was attempted even when it reported failure; never issue a
+        // second EndFrame from Drop against the same transaction.
+        self.active = false;
+        result
+    }
+}
+
+impl Drop for DecoderFrameGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = self.ctx.DecoderEndFrame(self.decoder);
+            }
+            self.active = false;
+        }
+    }
+}
+
 /// Write one DXVA buffer: get, bounds-check, copy, release.
 unsafe fn fill_buffer(
     ctx: &ID3D11VideoContext,
@@ -871,6 +974,10 @@ unsafe fn fill_buffer(
     let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
     ctx.GetDecoderBuffer(decoder, kind, &mut size, &mut ptr)
         .map_err(|e| format!("GetDecoderBuffer({kind:?}): {e}"))?;
+    if ptr.is_null() {
+        let _ = ctx.ReleaseDecoderBuffer(decoder, kind);
+        return Err(format!("GetDecoderBuffer({kind:?}) returned a null buffer"));
+    }
     if (size as usize) < bytes.len() {
         let _ = ctx.ReleaseDecoderBuffer(decoder, kind);
         return Err(format!(
@@ -895,10 +1002,10 @@ pub struct D3d11vaHevc {
     ppss: HashMap<u32, Pps>,
     session: Option<Session>,
     pending: Option<PendingPicture>,
-    /// Slices per picture, learned from boundary-closed pictures — only
-    /// ratchets up, so a lossy picture can't teach a short count (see
-    /// module docs). 0 = not yet learned.
-    learned_slices: usize,
+    /// Slices per picture, learned from two matching boundary-closed
+    /// pictures. The count only ratchets up, so one lossy picture cannot
+    /// teach a short completion count (see module docs).
+    slice_counts: SliceCountLearner,
     report: u32,
 }
 
@@ -946,7 +1053,7 @@ impl D3d11vaHevc {
                 ppss: HashMap::new(),
                 session: None,
                 pending: None,
-                learned_slices: 0,
+                slice_counts: SliceCountLearner::default(),
                 report: 0,
             })
         }
@@ -1006,7 +1113,7 @@ impl D3d11vaHevc {
             // VPS/SPS/PPS/AUD/prefix-SEI only open AUs — a buffered
             // picture is complete when one arrives.
             32..=35 | 39 => {
-                self.close_pending(out)?;
+                self.close_pending(out, true)?;
                 match nal_type {
                     33 => {
                         let sps = parse_sps(&rbsp(&nal[2..], 4096))?;
@@ -1027,7 +1134,7 @@ impl D3d11vaHevc {
                     .as_ref()
                     .is_some_and(|p| first_in_pic || p.ts_us != ts_us);
                 if boundary {
-                    self.close_pending(out)?;
+                    self.close_pending(out, true)?;
                 }
                 let pend = self.pending.get_or_insert_with(|| PendingPicture {
                     slices: Vec::new(),
@@ -1036,7 +1143,7 @@ impl D3d11vaHevc {
                 });
                 // Red team: a stream whose first picture never closes (every
                 // slice carries first_in_pic=0 with an unchanging ts) never
-                // teaches `learned_slices`, so without a cap `slices` grows
+                // teaches `slice_counts`, so without a cap `slices` grows
                 // per access unit until the heap is exhausted (abort). Real
                 // pictures have far fewer than this even at 8K; a stream that
                 // exceeds it is malformed — drop the picture and let the
@@ -1049,8 +1156,12 @@ impl D3d11vaHevc {
                 pend.slices.push(nal.to_vec());
                 // The learned count closes a picture on its final slice —
                 // the zero-latency steady state.
-                if self.learned_slices > 0 && pend.slices.len() >= self.learned_slices {
-                    self.close_pending(out)?;
+                if self
+                    .slice_counts
+                    .expected()
+                    .is_some_and(|expected| pend.slices.len() >= expected)
+                {
+                    self.close_pending(out, false)?;
                 }
             }
             _ => {} // suffix SEI, EOS/EOB, reserved: nothing to do
@@ -1060,7 +1171,11 @@ impl D3d11vaHevc {
 
     /// Submit the buffered picture (if any) and hand back its pixels. The
     /// slices-per-picture ratchet learns only from successful closes.
-    fn close_pending(&mut self, out: &mut Vec<NvFrame>) -> Result<(), String> {
+    fn close_pending(
+        &mut self,
+        out: &mut Vec<NvFrame>,
+        boundary_evidence: bool,
+    ) -> Result<(), String> {
         let Some(pend) = self.pending.take() else {
             return Ok(());
         };
@@ -1068,10 +1183,20 @@ impl D3d11vaHevc {
             return Ok(());
         }
         let count = pend.slices.len();
+        if boundary_evidence && !boundary_picture_is_complete(self.slice_counts.expected(), count) {
+            return Err(format!(
+                "incomplete HEVC picture at boundary: received {count}/{} slices",
+                self.slice_counts.expected().unwrap_or_default()
+            ));
+        }
         let frame = self.submit_picture(&pend)?;
-        // After: a session rebuild inside submit resets the ratchet, and
-        // this close is the first thing the fresh session learns from.
-        self.learned_slices = self.learned_slices.max(count);
+        // After: a session rebuild inside submit resets the learner, and this
+        // boundary close becomes the first observation for the fresh session.
+        // Learned-count closes merely confirm the count already in force;
+        // feeding them back would not be independent evidence.
+        if boundary_evidence {
+            self.slice_counts.observe_boundary(count);
+        }
         out.push(frame);
         Ok(())
     }
@@ -1272,25 +1397,7 @@ impl D3d11vaHevc {
         // --- The decode transaction ------------------------------------------
         unsafe {
             let view = &session.views[curr as usize];
-            // The engine can still be draining a previous frame; the
-            // documented response is "try again shortly".
-            let mut tries = 0;
-            loop {
-                match self
-                    .video_context
-                    .DecoderBeginFrame(&session.decoder, view, 0, None)
-                {
-                    Ok(()) => break,
-                    Err(e)
-                        if tries < 50 && matches!(e.code().0 as u32, 0x8000_000a | 0x887a_000a) =>
-                    {
-                        // E_PENDING / DXGI_ERROR_WAS_STILL_DRAWING
-                        tries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(e) => return Err(format!("DecoderBeginFrame: {e}")),
-                }
-            }
+            let frame = DecoderFrameGuard::begin(&self.video_context, &session.decoder, view)?;
 
             fill_buffer(
                 &self.video_context,
@@ -1313,6 +1420,10 @@ impl D3d11vaHevc {
 
             // Bitstream: every slice NAL re-prefixed with 00 00 01, then
             // zero-padded toward the spec's 128-byte multiple.
+            let need = pend.slices.iter().try_fold(0usize, |total, slice| {
+                total.checked_add(3)?.checked_add(slice.len())
+            });
+            let need = need.ok_or("bitstream size overflow")?;
             let mut size = 0u32;
             let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
             self.video_context
@@ -1323,12 +1434,16 @@ impl D3d11vaHevc {
                     &mut ptr,
                 )
                 .map_err(|e| format!("GetDecoderBuffer(bitstream): {e}"))?;
-            let need: usize = pend.slices.iter().map(|s| 3 + s.len()).sum();
+            if ptr.is_null() {
+                let _ = self
+                    .video_context
+                    .ReleaseDecoderBuffer(&session.decoder, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
+                return Err("GetDecoderBuffer(bitstream) returned a null buffer".into());
+            }
             if (size as usize) < need {
                 let _ = self
                     .video_context
                     .ReleaseDecoderBuffer(&session.decoder, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM);
-                let _ = self.video_context.DecoderEndFrame(&session.decoder);
                 return Err(format!("bitstream buffer too small ({size} < {need})"));
             }
             let base = ptr as *mut u8;
@@ -1384,9 +1499,7 @@ impl D3d11vaHevc {
             self.video_context
                 .SubmitDecoderBuffers(&session.decoder, &descs)
                 .map_err(|e| format!("SubmitDecoderBuffers: {e}"))?;
-            self.video_context
-                .DecoderEndFrame(&session.decoder)
-                .map_err(|e| format!("DecoderEndFrame: {e}"))?;
+            frame.finish()?;
         }
 
         // --- Readback (display-cropped) --------------------------------------
@@ -1463,7 +1576,7 @@ impl D3d11vaHevc {
             return Ok(());
         }
         self.session = None;
-        self.learned_slices = 0;
+        self.slice_counts = SliceCountLearner::default();
         // Texture dims: the MinCb-padded picture rounded to 16 — the
         // alignment the field's D3D11VA stacks allocate (drivers keep any
         // further CTB spill internal).
@@ -1613,6 +1726,34 @@ impl D3d11vaAv1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lossy first boundary must not become the steady-state completion
+    /// count. Two matching successful boundaries activate the fast close;
+    /// later short observations never ratchet it down.
+    #[test]
+    fn slice_count_learning_requires_stable_boundary_evidence() {
+        let mut counts = SliceCountLearner::default();
+        counts.observe_boundary(7); // potentially short after loss
+        assert_eq!(counts.expected(), None);
+        counts.observe_boundary(8); // first complete observation
+        assert_eq!(counts.expected(), None);
+        counts.observe_boundary(8); // independent confirmation
+        assert_eq!(counts.expected(), Some(8));
+        counts.observe_boundary(5); // later loss cannot shorten completion
+        assert_eq!(counts.expected(), Some(8));
+        counts.observe_boundary(10);
+        assert_eq!(counts.expected(), Some(8));
+        counts.observe_boundary(10);
+        assert_eq!(counts.expected(), Some(10));
+    }
+
+    #[test]
+    fn learned_slice_count_rejects_short_boundary_picture() {
+        assert!(boundary_picture_is_complete(None, 3));
+        assert!(boundary_picture_is_complete(Some(8), 8));
+        assert!(boundary_picture_is_complete(Some(8), 9));
+        assert!(!boundary_picture_is_complete(Some(8), 7));
+    }
 
     /// The bit alphabet against hand-packed vectors: ue/se values, fixed
     /// reads across byte edges, truncation as error, and

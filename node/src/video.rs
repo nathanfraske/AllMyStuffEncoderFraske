@@ -969,19 +969,17 @@ impl VideoBridge {
         F: Fn(VideoPacket) -> bool + Send + Sync + 'static,
         S: Fn(VideoStatusState, Option<String>) + Send + Sync + 'static,
     {
-        // Exactly one capture pump per route. A duplicate `StartMedia` (the
-        // daemon redelivers an Offer once per shared network) must not start a
-        // second capture for a route that already has one — two backends bound
-        // to one monitor, and with the release profile's `panic = "abort"` a
-        // panic on either aborts the host. A genuine restart (a viewer's
-        // retune) goes through `spawn_route` directly, which is allowed to
-        // replace; only this entry point dedupes.
-        if self.routes.lock().contains_key(&route_id) {
-            tracing::debug!(
-                "video capture already running for {route_id}; ignoring duplicate start"
-            );
-            return;
+        // `Effect::StartMedia` is deduplicated by the session state machine,
+        // so reaching this boundary means a real incarnation. A same-id
+        // predecessor can remain in the registry after its worker exited (or
+        // while a stale StopMedia is being ignored); stop and join it before
+        // the successor captures so callbacks and monitor sessions never
+        // overlap.
+        let displaced = self.take_existing_capture(&route_id);
+        if displaced.is_some() {
+            tracing::warn!("replacing prior video capture worker for same-id route {route_id}");
         }
+        drop(displaced);
         self.spawn_route(
             route_id,
             mode,
@@ -990,6 +988,10 @@ impl VideoBridge {
             Arc::new(on_packet),
             Arc::new(on_status),
         );
+    }
+
+    fn take_existing_capture(&self, route_id: &str) -> Option<RouteVideo> {
+        self.routes.lock().remove(route_id)
     }
 
     /// The route ids with a live capture pump — for the mesh to sweep
@@ -1128,11 +1130,11 @@ impl VideoBridge {
                 },
             )
         };
-        // Join any displaced capture thread (RouteVideo::drop) only after the
+        // Join any concurrently displaced capture thread (RouteVideo::drop) only after the
         // routes lock is released — joining a thread under the lock would
         // block every other route op, and on the async start path stall a
-        // tokio worker. `start_capture` dedupes so this is normally `None`;
-        // the explicit drop keeps the off-lock guarantee for any caller.
+        // tokio worker. `start_capture` normally removed its predecessor
+        // before spawning; the explicit drop also makes two racing starts safe.
         drop(displaced);
     }
 
@@ -2487,10 +2489,11 @@ fn open_gpu_encoder(
     h: u32,
     fps: u32,
     bitrate: u32,
+    game: bool,
     manager: &windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager,
 ) -> Option<crate::mediafoundation::MediaFoundationH264> {
     for hw in crate::mediafoundation::hardware_h264_mfts_on(adapter) {
-        match hw.open_with_manager(w, h, fps, bitrate, Some(manager)) {
+        match hw.open_with_manager_for_route(w, h, fps, bitrate, Some(manager), game) {
             Ok(enc) => return Some(enc),
             Err(e) => tracing::debug!("GPU-lane MFT {} declined: {e}", hw.name()),
         }
@@ -2633,7 +2636,7 @@ fn run_gpu_lane(
                 Err(e) => tracing::debug!("AMF rung not taken for {route_id}: {e}"),
             }
         }
-        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager) {
+        match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, game, &lane.manager) {
             Some(m) => GpuCodec::Mf(m),
             None => return GpuEnd::Fallback("no hardware MFT accepted the shared device".into()),
         }
@@ -2652,12 +2655,12 @@ fn run_gpu_lane(
     // through before reacting (red team, pacing item 6).
     let mut noise_recent: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let noise_burst_bytes = noise_frame_bytes * 72; // 18 frames × 4×
-    // Armed only when the lossless rung actually opened — a fallback that
-    // already runs rate-controlled studio has nothing to guard (red team,
-    // encoder finding 7). Runtime behavior follows what actually opened, not
-    // merely the requested posture. A failed lossless open has already landed
-    // on rate-controlled Studio and must immediately participate in rate
-    // adaptation and pacing.
+                                                    // Armed only when the lossless rung actually opened — a fallback that
+                                                    // already runs rate-controlled studio has nothing to guard (red team,
+                                                    // encoder finding 7). Runtime behavior follows what actually opened, not
+                                                    // merely the requested posture. A failed lossless open has already landed
+                                                    // on rate-controlled Studio and must immediately participate in rate
+                                                    // adaptation and pacing.
     let mut lossless_active = enc.label().contains("studio-lossless");
     let mut noise_guard_armed = lossless_active;
     // Hold boost clocks while this route streams — the encode engine's
@@ -2942,7 +2945,15 @@ fn run_gpu_lane(
                         retain_gpu_frame(&mut retained, frame, &enc, &lane.release);
                         refresh.store(true, Ordering::SeqCst);
                         match gpu_heal(&mut policy, route_id, &e, || {
-                            open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager)
+                            open_gpu_encoder(
+                                lane.adapter_luid,
+                                dw,
+                                dh,
+                                fps,
+                                bitrate,
+                                game,
+                                &lane.manager,
+                            )
                         }) {
                             Ok(Some(next)) => {
                                 // A heal always lands on the MF rung — a
@@ -3027,6 +3038,7 @@ fn run_gpu_lane(
                                     dh,
                                     fps,
                                     bitrate,
+                                    game,
                                     &lane.manager,
                                 )
                             }) {
@@ -3075,6 +3087,7 @@ fn run_gpu_lane(
                                     dh,
                                     fps,
                                     bitrate,
+                                    game,
                                     &lane.manager,
                                 )
                             }) {
@@ -4444,31 +4457,42 @@ fn rate_adapt_step(
 }
 
 pub(crate) fn paced_slices_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        // Default ON: verified against the daemon's assembler and pinned
-        // by the chunk-decode test; `=0` pins the old single-write path
-        // for comparison runs.
-        let off = std::env::var("ALLMYSTUFF_PACED_SLICES")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false"
-                )
-            })
-            .unwrap_or(false);
-        if off {
-            tracing::info!("ALLMYSTUFF_PACED_SLICES=0 — app-side slice pacing disabled");
-        }
-        !off
-    });
-    *ON
+    // Production is deliberately locked safe-off for the upstream cut. The
+    // env-controlled form remains in test builds so the fork can exercise its
+    // sender/receiver prototype without making one-sided field configuration
+    // or version skew capable of fragmenting pictures for WebCodecs/NVDEC.
+    #[cfg(not(test))]
+    {
+        false
+    }
+    #[cfg(test)]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            // Experimental opt-in only. A paced picture becomes several media
+            // samples with one RTP timestamp; WebCodecs and NVDEC require a whole
+            // access-unit/finality contract that shipped ingress does not carry.
+            // Defaulting this on caused partial-frame decode regressions.
+            let on = std::env::var("ALLMYSTUFF_PACED_SLICES")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+                .unwrap_or(false);
+            if on {
+                tracing::warn!(
+                    "ALLMYSTUFF_PACED_SLICES=1 — experimental multi-sample AU pacing enabled"
+                );
+            }
+            on
+        });
+        *ON
+    }
 }
 
 /// Split one Annex-B access unit into paced chunks of at most `max_chunk`
-/// bytes, cutting **only** at slice-NAL boundaries so every chunk is
-/// independently feedable to a decoder, and gluing any parameter-set/SEI
-/// run to the slice that follows it — a chunk never strands a slice from
-/// its headers. Speaks both codecs: an AU carrying HEVC parameter sets
+/// bytes, cutting **only** at slice-NAL boundaries and gluing any
+/// parameter-set/SEI run to the slice that follows it — a chunk never
+/// strands a slice from its headers. The ranges concatenate back to one
+/// complete access unit; they are not generally independent pictures
+/// (WebCodecs/NVDEC require receiver-side AU completion). Speaks both codecs:
+/// an AU carrying HEVC parameter sets
 /// (VPS/SPS/PPS — byte values no H.264 key unit leads with) cuts at HEVC
 /// VCL NALs; anything else cuts at H.264 slice types 1/5, which for a
 /// paramless HEVC delta AU means "no cut" — correct, just unpaced, and
@@ -4831,22 +4855,43 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     #[cfg(windows)]
     {
         let bitrate = tuned_bitrate(tune, bw, bh, fps);
+        let game = tune.game();
         for hw in crate::mediafoundation::hardware_h264_mfts() {
-            match hw.open(bw, bh, fps, bitrate) {
+            match hw.open_for_route(bw, bh, fps, bitrate, game) {
                 Ok(enc) => {
-                    let mut codec = MfCodec(enc);
-                    if codec_emits_frame(&mut codec, bw, bh) {
+                    let mut probe = MfCodec(enc);
+                    let label = probe.label().to_string();
+                    if codec_emits_frame(&mut probe, bw, bh) {
+                        // The probe encoded up to ten forced-grey IDRs. Drop
+                        // it, clear IMFActivate's cached transform, and open a
+                        // genuinely fresh live encoder so none of those bytes
+                        // or references can enter the route.
+                        drop(probe);
+                        if let Err(e) = hw.shutdown_probe_instance() {
+                            tracing::debug!(
+                                "Media Foundation H.264 probe reset failed for {label}: {e}"
+                            );
+                            continue;
+                        }
+                        match hw.open_for_route(bw, bh, fps, bitrate, game) {
+                            Ok(enc) => {
+                                let codec = MfCodec(enc);
+                                tracing::info!(
+                                    "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps (Media Foundation)",
+                                    codec.label(),
+                                    bitrate as f64 / 1e6
+                                );
+                                return Ok(Box::new(codec));
+                            }
+                            Err(e) => tracing::debug!(
+                                "Media Foundation H.264 live reopen failed after probe for {label}: {e}"
+                            ),
+                        }
+                    } else {
                         tracing::info!(
-                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps (Media Foundation)",
-                            codec.label(),
-                            bitrate as f64 / 1e6
+                            "H.264 encoder {label} opened but produced no frame in the send test — stepping down"
                         );
-                        return Ok(Box::new(codec));
                     }
-                    tracing::info!(
-                        "H.264 encoder {} opened but produced no frame in the send test — stepping down",
-                        codec.label()
-                    );
                 }
                 Err(e) => tracing::debug!("Media Foundation H.264 MFT unavailable: {e}"),
             }
@@ -4861,18 +4906,31 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
         let bitrate = tuned_bitrate(tune, bw, bh, fps);
         match crate::videotoolbox::VideoToolboxH264::open(bw, bh, fps, bitrate) {
             Ok(enc) => {
-                let mut codec = VtCodec(enc);
-                if codec_emits_frame(&mut codec, bw, bh) {
+                let mut probe = VtCodec(enc);
+                if codec_emits_frame(&mut probe, bw, bh) {
+                    // A VT session owns its callback queue/reference state;
+                    // invalidating the probe before reopening keeps its grey
+                    // units out of the live stream.
+                    drop(probe);
+                    match crate::videotoolbox::VideoToolboxH264::open(bw, bh, fps, bitrate) {
+                        Ok(enc) => {
+                            let codec = VtCodec(enc);
+                            tracing::info!(
+                                "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                                codec.label(),
+                                bitrate as f64 / 1e6
+                            );
+                            return Ok(Box::new(codec));
+                        }
+                        Err(e) => tracing::debug!(
+                            "VideoToolbox live reopen failed after successful probe: {e}"
+                        ),
+                    }
+                } else {
                     tracing::info!(
-                        "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
-                        codec.label(),
-                        bitrate as f64 / 1e6
+                        "VideoToolbox opened but produced no frame in the send test — stepping down"
                     );
-                    return Ok(Box::new(codec));
                 }
-                tracing::info!(
-                    "VideoToolbox opened but produced no frame in the send test — stepping down"
-                );
             }
             Err(e) => tracing::debug!("VideoToolbox H.264 unavailable: {e}"),
         }
@@ -4880,21 +4938,37 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
     #[cfg(feature = "hwenc")]
     {
         let bitrate = tuned_bitrate(tune, bw, bh, fps);
+        let game = tune.game();
         for &name in crate::hwenc::candidates() {
-            match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate) {
+            match crate::hwenc::FfmpegH264::open(name, bw, bh, fps, bitrate, game) {
                 Ok(enc) => {
-                    let mut codec = FfmpegCodec(enc);
-                    if codec_emits_frame(&mut codec, bw, bh) {
+                    let mut probe = FfmpegCodec(enc);
+                    if codec_emits_frame(&mut probe, bw, bh) {
+                        // Discard the probed AVCodecContext entirely. A fresh
+                        // context starts the route at PTS zero with no queued
+                        // grey packets or reference history.
+                        drop(probe);
+                        match crate::hwenc::FfmpegH264::open(
+                            name, bw, bh, fps, bitrate, game,
+                        ) {
+                            Ok(enc) => {
+                                let codec = FfmpegCodec(enc);
+                                tracing::info!(
+                                    "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
+                                    codec.label(),
+                                    bitrate as f64 / 1e6
+                                );
+                                return Ok(Box::new(codec));
+                            }
+                            Err(e) => tracing::debug!(
+                                "H.264 encoder {name} live reopen failed after successful probe: {e}"
+                            ),
+                        }
+                    } else {
                         tracing::info!(
-                            "H.264 hardware encoder: {} · {bw}×{bh} · {:.1} Mbps @ {fps} fps",
-                            codec.label(),
-                            bitrate as f64 / 1e6
+                            "H.264 encoder {name} opened but produced no frame in the send test — stepping down"
                         );
-                        return Ok(Box::new(codec));
                     }
-                    tracing::info!(
-                        "H.264 encoder {name} opened but produced no frame in the send test — stepping down"
-                    );
                 }
                 Err(e) => tracing::debug!("H.264 encoder {name} unavailable: {e}"),
             }
@@ -5092,14 +5166,14 @@ mod tests {
         assert_eq!(split_annexb_paced(&[0, 0], 1000)[0], 0..2);
     }
 
-    /// The pacer's core claim on a REAL bitstream: an openh264 encoder
+    /// The OpenH264-specific incremental-feed property on a REAL bitstream: an encoder
     /// with a slice cap emits multi-slice units, the splitter cuts them,
-    /// and a decoder fed **chunk by chunk** — exactly how the far side
-    /// sees paced sends arrive as separate samples — still decodes every
-    /// picture cleanly. No hardware needed, so this holds on every CI
-    /// platform.
+    /// and an OpenH264 decoder fed **chunk by chunk** still decode every
+    /// picture cleanly. This does not generalize to WebCodecs or NVDEC, which
+    /// require complete access units; pacing remains experimental until the
+    /// receiver has an explicit completion contract.
     #[test]
-    fn paced_slice_chunks_decode_independently() {
+    fn openh264_accepts_paced_slice_chunks_incrementally() {
         use openh264::encoder::{
             BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
         };
@@ -5680,6 +5754,58 @@ mod tests {
         // Tearing the route down drops its feedback (no unbounded growth).
         vb.stop("r1");
         assert!(vb.latest_feedback("r1").is_none());
+    }
+
+    #[test]
+    fn existing_capture_worker_is_joined_before_successor_reuses_route_id() {
+        fn fake_route(exited: Arc<AtomicBool>) -> RouteVideo {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                exited.store(true, Ordering::SeqCst);
+            });
+            RouteVideo {
+                stop,
+                thread: Some(thread),
+                mode: VideoMode::Mjpeg,
+                source: VideoSource::Screen(None),
+                on_packet: Arc::new(|_| true),
+                on_status: Arc::new(|_, _| {}),
+                refresh: Arc::new(AtomicBool::new(false)),
+                idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+                tune: Tune::default(),
+                auto: AutoAdapt::new(),
+            }
+        }
+
+        let bridge = VideoBridge::new();
+        let old_exited = Arc::new(AtomicBool::new(false));
+        bridge
+            .routes
+            .lock()
+            .insert("same-id".into(), fake_route(old_exited.clone()));
+
+        let displaced = bridge
+            .take_existing_capture("same-id")
+            .expect("predecessor registry entry");
+        assert!(!bridge.routes.lock().contains_key("same-id"));
+        drop(displaced);
+        assert!(
+            old_exited.load(Ordering::SeqCst),
+            "predecessor is stopped and joined before successor insertion"
+        );
+
+        let successor_exited = Arc::new(AtomicBool::new(false));
+        bridge
+            .routes
+            .lock()
+            .insert("same-id".into(), fake_route(successor_exited.clone()));
+        assert!(bridge.routes.lock().contains_key("same-id"));
+        bridge.stop("same-id");
+        assert!(successor_exited.load(Ordering::SeqCst));
     }
 
     #[test]

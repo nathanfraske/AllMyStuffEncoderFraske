@@ -91,7 +91,22 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<MediaFoundationH264, String> {
-        self.open_with_manager(width, height, fps, bitrate, None)
+        self.open_for_route(width, height, fps, bitrate, false)
+    }
+
+    /// [`Self::open`] with the owning route's latency posture. Production
+    /// streams use this entry so two concurrent routes may carry different
+    /// peak/VBV shapes; the plain [`Self::open`] stays balanced for hardware
+    /// probes and backend-local tests.
+    pub(crate) fn open_for_route(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        game: bool,
+    ) -> Result<MediaFoundationH264, String> {
+        self.open_with_manager_for_route(width, height, fps, bitrate, None, game)
     }
 
     /// [`Self::open`] bound to a DXGI device manager — the GPU lane: the MFT
@@ -105,8 +120,22 @@ impl HwEncoder {
         bitrate: u32,
         manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<MediaFoundationH264, String> {
+        self.open_with_manager_for_route(width, height, fps, bitrate, manager, false)
+    }
+
+    /// Device-manager form of [`Self::open_for_route`]. The manager and route
+    /// posture both belong to this one encode lane; neither is process-global.
+    pub(crate) fn open_with_manager_for_route(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
+        game: bool,
+    ) -> Result<MediaFoundationH264, String> {
         ensure_com_thread();
-        unsafe { self.open_inner(width, height, fps, bitrate, manager) }
+        unsafe { self.open_inner(width, height, fps, bitrate, manager, game) }
     }
 
     unsafe fn open_inner(
@@ -116,6 +145,7 @@ impl HwEncoder {
         fps: u32,
         bitrate: u32,
         manager: Option<&IMFDXGIDeviceManager>,
+        game: bool,
     ) -> Result<MediaFoundationH264, String> {
         let name = self.name.clone();
 
@@ -219,7 +249,7 @@ impl HwEncoder {
             // Peak + VBV from the shared posture: quality-first by default,
             // trimmed for burst latency in game mode (see
             // `video::burst_bounds`).
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, game);
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
                 &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
@@ -287,7 +317,21 @@ impl HwEncoder {
             out_buf_size,
             frame_index: 0,
             input_credits: 0,
+            game,
         })
+    }
+
+    /// Tear down the object cached by this activation after a throwaway
+    /// frame-send probe. `IMFActivate` otherwise returns that same transform
+    /// on the next `ActivateObject`, carrying the probe's grey reference chain
+    /// into the live route.
+    pub(crate) fn shutdown_probe_instance(&self) -> Result<(), String> {
+        ensure_com_thread();
+        unsafe {
+            self.activate
+                .ShutdownObject()
+                .map_err(mferr(&self.name, "shutdown probe instance"))
+        }
     }
 }
 
@@ -539,6 +583,9 @@ pub struct MediaFoundationH264 {
     /// banked credit feeds the next call's frame immediately, no event
     /// round-trip.
     input_credits: u32,
+    /// This route's burst posture, retained so in-place bitrate changes keep
+    /// the same peak/VBV shape chosen at open.
+    game: bool,
 }
 
 // SAFETY: a MediaFoundationH264 is built on, and only ever used from, the single
@@ -669,7 +716,7 @@ impl MediaFoundationH264 {
             // Peak + VBV follow the mean so the burst posture stays
             // proportional; best-effort — a box that only re-aims the mean
             // still adapts.
-            let (peak, vbv) = crate::video::burst_bounds(bitrate, crate::video::game_mode());
+            let (peak, vbv) = crate::video::burst_bounds(bitrate, self.game);
             let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak));
             let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &variant_u32(vbv));
             true

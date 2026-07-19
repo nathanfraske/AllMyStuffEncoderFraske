@@ -709,7 +709,7 @@ impl NvencH264 {
         studio: bool,
     ) -> Result<Self, String> {
         Self::open_inner(
-            device, width, height, fps, bitrate, game, studio, false, false,
+            device, width, height, fps, bitrate, game, studio, false, false, false,
         )
     }
 
@@ -728,7 +728,9 @@ impl NvencH264 {
         height: u32,
         fps: u32,
     ) -> Result<Self, String> {
-        Self::open_inner(device, width, height, fps, 0, false, true, true, false)
+        Self::open_inner(
+            device, width, height, fps, 0, false, true, true, false, false,
+        )
     }
 
     /// The hardware-decodable lossless: HEVC under the same constQP-0
@@ -744,7 +746,9 @@ impl NvencH264 {
         height: u32,
         fps: u32,
     ) -> Result<Self, String> {
-        Self::open_inner(device, width, height, fps, 0, false, true, true, true)
+        Self::open_inner(
+            device, width, height, fps, 0, false, true, true, true, false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -758,6 +762,7 @@ impl NvencH264 {
         studio: bool,
         lossless: bool,
         hevc: bool,
+        allow_slow_preset_override: bool,
     ) -> Result<Self, String> {
         let intra_refresh = game && !studio;
         let api = api()?;
@@ -809,12 +814,16 @@ impl NvencH264 {
             };
             // An init failure drops `me`, which destroys the session —
             // no leaked hardware slot.
-            me.initialize(bitrate)?;
+            me.initialize(bitrate, allow_slow_preset_override)?;
             Ok(me)
         }
     }
 
-    unsafe fn initialize(&mut self, bitrate: u32) -> Result<(), String> {
+    unsafe fn initialize(
+        &mut self,
+        bitrate: u32,
+        allow_slow_preset_override: bool,
+    ) -> Result<(), String> {
         // Start from the driver's own preset config (P4, ultra-low-latency
         // tuning — no lookahead, no B-frames, single-frame delay), then
         // re-aim the pieces our stream model owns.
@@ -848,20 +857,30 @@ impl NvencH264 {
         } else {
             (NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
         };
-        // `ALLMYSTUFF_NVENC_PRESET=1..7` overrides the posture's preset —
-        // the field dial for the latency/quality ladder the preset-grid
-        // bench maps (tuning stays the posture's own).
-        let preset_guid = match std::env::var("ALLMYSTUFF_NVENC_PRESET")
+        // `ALLMYSTUFF_NVENC_PRESET=1..5` overrides the posture's preset —
+        // the field dial for the latency/quality ladder the preset-grid bench
+        // maps (tuning stays the posture's own). P6/P7 are deliberately
+        // refused on production opens: their driver configs enable deep
+        // lookahead. The ignored preset-grid benchmark opts in explicitly so
+        // those diagnostic cells remain measurable.
+        let requested_preset = std::env::var("ALLMYSTUFF_NVENC_PRESET")
             .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-        {
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let preset_guid = match requested_preset {
             Some(1) => NV_ENC_PRESET_P1_GUID,
             Some(2) => NV_ENC_PRESET_P2_GUID,
             Some(3) => NV_ENC_PRESET_P3_GUID,
             Some(4) => NV_ENC_PRESET_P4_GUID,
             Some(5) => NV_ENC_PRESET_P5_GUID,
-            Some(6) => NV_ENC_PRESET_P6_GUID,
-            Some(7) => NV_ENC_PRESET_P7_GUID,
+            Some(6) if allow_slow_preset_override => NV_ENC_PRESET_P6_GUID,
+            Some(7) if allow_slow_preset_override => NV_ENC_PRESET_P7_GUID,
+            Some(6 | 7) => {
+                tracing::warn!(
+                    "ALLMYSTUFF_NVENC_PRESET={} refused for streaming (P6/P7 enable deep lookahead); using the posture default",
+                    requested_preset.unwrap_or_default()
+                );
+                preset_guid
+            }
             _ => preset_guid,
         };
         let codec_guid = if self.hevc {
@@ -1196,7 +1215,13 @@ impl NvencH264 {
                 if lock.bitstream_buffer_ptr.is_null() {
                     // A success status with a null payload (TDR race,
                     // device removal) must take the clean heal path —
-                    // `from_raw_parts` on null is UB even for length 0.
+                    // `from_raw_parts` on null is UB even for length 0. The
+                    // successful lock must still be paired with an unlock or
+                    // the poisoned session can retain the bitstream forever.
+                    let _ = self
+                        .api
+                        .unlock_bitstream
+                        .map(|f| f(self.encoder, self.bitstream));
                     let _ = self
                         .api
                         .unmap_input_resource
@@ -1222,7 +1247,9 @@ impl NvencH264 {
             } else if status == NV_ENC_ERR_NEED_MORE_INPUT {
                 // Can't happen with PTD + no B-frames + sync mode, but the
                 // seam has a lossless answer for it, so use it.
-                EncodeOutcome::consumed(None)
+                let mut o = EncodeOutcome::consumed(None);
+                o.input_ts = input_ts;
+                o
             } else {
                 let _ = self
                     .api
@@ -2135,11 +2162,10 @@ mod tests_bench {
         );
         for (label, preset, game, studio, ll, bitrate) in GRID {
             std::env::set_var("ALLMYSTUFF_NVENC_PRESET", preset.to_string());
-            let opened = if ll {
-                NvencH264::open_lossless_hevc_on_device(&gpu.device(), w, h, 60)
-            } else {
-                NvencH264::open_on_device(&gpu.device(), w, h, 60, bitrate, game, studio)
-            };
+            // Diagnostic-only opt-in: production opens refuse P6/P7 because
+            // their deep lookahead violates the live-stream latency contract.
+            let opened =
+                NvencH264::open_inner(&gpu.device(), w, h, 60, bitrate, game, studio, ll, ll, true);
             let mut enc = match opened {
                 Ok(e) => e,
                 Err(e) => {
