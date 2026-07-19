@@ -199,6 +199,23 @@ pub struct RecvFeedback {
     pub at: Instant,
 }
 
+/// Mirror of [`crate::video::RouteDials`] for surface parity — the GUI's
+/// effective-dials op compiles against this build too, though a capture-less
+/// node never streams and so always answers `None` (see
+/// [`VideoBridge::route_dials`]).
+#[derive(Debug, Clone)]
+pub struct RouteDials {
+    pub posture: &'static str,
+    pub encoder_label: String,
+    pub codec: &'static str,
+    pub target_bitrate_bps: u32,
+    pub ceiling_bps: u32,
+    pub fps_target: u32,
+    pub edge_cap: u32,
+    pub out_w: u32,
+    pub out_h: u32,
+}
+
 /// Handle the mesh holds either way; capture starts fail loudly, everything
 /// else is a shrug.
 #[derive(Default)]
@@ -270,6 +287,13 @@ impl VideoBridge {
     /// forwarder's pacing hint) — nothing streams here, so balanced.
     pub fn route_game(&self, _route_id: &str) -> bool {
         false
+    }
+
+    /// The GUI effective-dials read — a capture-less node never streams a
+    /// route, so there are never any dials to report. `None`, the same
+    /// contract the real bridge returns for a route it isn't the streamer of.
+    pub fn route_dials(&self, _route_id: &str) -> Option<RouteDials> {
+        None
     }
 
     /// Mirror of the real bridge's pacing read — nothing streams here,

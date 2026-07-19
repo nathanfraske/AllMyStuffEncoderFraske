@@ -10201,6 +10201,17 @@ impl Mesh {
     /// Ask the far end of an inbound display/camera route to stream with
     /// these quality picks (`None` = that dial back on automatic). Old
     /// peers drop the message and stay on automatic.
+    /// GUI-internal: the effective encode dials for a route THIS node is
+    /// streaming — the "what we're actually doing" half of the console's
+    /// quality panel (resolved posture, encoder rung, wire codec, the AIMD
+    /// bitrate target + its ceiling, the fps + edge targets, and the actual
+    /// output geometry). `None` when this node isn't the streamer for
+    /// `route_id` (the ordinary remote-view case, where the viewer surfaces
+    /// its own measured actuals). Read-only; touches no wire and no peer.
+    pub fn route_dials(&self, route_id: &str) -> Option<crate::video::RouteDials> {
+        self.video.route_dials(route_id)
+    }
+
     pub async fn request_tune(
         self: &Arc<Self>,
         route_id: String,

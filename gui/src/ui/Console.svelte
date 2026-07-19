@@ -53,6 +53,7 @@
   } from "../types";
   import ConsoleKeys from "./ConsoleKeys.svelte";
   import ModePill from "./ModePill.svelte";
+  import EffectiveReadout from "./EffectiveReadout.svelte";
 
   let { windowed = false }: { windowed?: boolean } = $props();
 
@@ -189,6 +190,10 @@
   let frameCount = 0;
   let inCount = 0;
   let decCount = 0;
+  // Received bitrate (viewer truth): bytes seen this second → Mbps, shown in
+  // the effective panel beside the sender's encode target when co-located.
+  let recvMbps = $state(0);
+  let inBytes = 0;
   let queuePeek = () => 0;
   let stallKick = () => {};
   let decodeModeNote = "";
@@ -226,8 +231,15 @@
     { label: "24", value: 24 },
     { label: "15", value: 15 },
   ];
+  // Rate ceiling matches the posture pipeline (Studio spends 150 Mbps+ on a
+  // fast LAN; the backend clamps into each posture's lane), not the old
+  // 40 Mbps cap that silently gated Studio from the console. Mirrors the
+  // popout bar's scale so the two hosts offer the same picks.
   const RATE_CHOICES: PillChoice[] = [
     { label: "Auto", value: null },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "100 Mbps", value: 100_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
     { label: "40 Mbps", value: 40_000_000 },
     { label: "25 Mbps", value: 25_000_000 },
     { label: "15 Mbps", value: 15_000_000 },
@@ -608,6 +620,8 @@
       frameCount = 0;
       inCount = 0;
       decCount = 0;
+      recvMbps = (inBytes * 8) / 1e6;
+      inBytes = 0;
       // Healthy: most of what arrives gets painted. Anything else is an
       // anomaly worth wearing on the chip.
       pipeDiag =
@@ -718,6 +732,8 @@
     frameCount = 0;
     inCount = 0;
     decCount = 0;
+    recvMbps = 0;
+    inBytes = 0;
     // A new stream starts at its natural fit, with the trackpad cursor
     // re-centered, and any touch gesture from the old one is over — but
     // ONLY on an actual route change. The decode ladder re-runs this
@@ -910,6 +926,7 @@
       route,
       (f) => {
       if (cancelled) return;
+      inBytes += f.data.byteLength;
       transport = f.kind === "jpeg" ? "MJPEG" : "H.264";
       if (f.kind === "jpeg") {
         decodePath = "mjpeg";
@@ -2256,6 +2273,23 @@
                     mode={app.consoleTune.mode}
                     game={app.consoleTune.game}
                     onapply={applyModeWire}
+                    experimental={app.labsTier}
+                    onexperimental={(on) => app.setLabsTier(on)}
+                    placement="down"
+                  />
+                </div>
+                <!-- Requested picks vs the live effective reality (polls the
+                     streamer's dials ~1 Hz while this menu is open; falls back
+                     to what's arriving here for a remote stream). -->
+                <div class="eff-wrap">
+                  <EffectiveReadout
+                    routeId={app.consoleVideoLive}
+                    requested={app.consoleTune}
+                    w={frameW}
+                    h={frameH}
+                    {fps}
+                    {transport}
+                    mbps={recvMbps}
                   />
                 </div>
                 <button class="mrow" onclick={toggleAdv}>
@@ -3067,14 +3101,22 @@
   /* ---- the video menu's guts ---- */
   .mode-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.6rem;
     padding: 0.5rem 0.55rem 0.4rem;
+  }
+  /* Keep the "Mode" label vertically aligned with the pill when collapsed,
+     even though the row now top-aligns for the inline dropdown. */
+  .mode-row .mode-label {
+    padding-top: 0.32rem;
   }
   .mode-label {
     font-size: 0.72rem;
     color: #8a83a6;
     flex-shrink: 0;
+  }
+  .eff-wrap {
+    padding: 0.2rem 0.55rem 0.4rem;
   }
   .vrow {
     display: flex;

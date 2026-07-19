@@ -252,6 +252,40 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
   });
 }
 
+/** The *effective* encode dials for a route — what the streamer is actually
+ *  doing right now, beside the requested {@link StreamTune}. The AIMD loop
+ *  (Game posture) moves `targetBitrateBps` at runtime; `outW`/`outH` are the
+ *  real output geometry; `codec`/`encoderLabel` name the wire codec and the
+ *  encoder rung. Bitrates are bits/s, `""` means "not reported yet". */
+export interface RouteDials {
+  posture: "balanced" | "game" | "studio" | "studio-lossless";
+  encoderLabel: string;
+  codec: string;
+  targetBitrateBps: number;
+  ceilingBps: number;
+  fpsTarget: number;
+  edgeCap: number;
+  outW: number;
+  outH: number;
+}
+
+/** Poll the effective encode dials for `routeId`. Returns null when this
+ *  machine isn't the route's streamer (the ordinary remote-view case — the
+ *  viewer surfaces its own measured actuals instead) or in web mode. Cheap
+ *  and read-only; call ~1 Hz only while a quality panel is open. */
+export function routeDials(routeId: string): Promise<RouteDials | null> {
+  return tryInvoke<RouteDials>("route_dials", { routeId });
+}
+
+/** Flip the Experimental (Labs) tier on this node — the Mode dropdown's
+ *  toggle. Omit `feature` for the whole tier; pass one (e.g. "damage") to
+ *  flip a single experiment. GUI-internal, never wire-visible; a no-op in
+ *  web mode. Every future Labs feature reads this gate backend-side, so
+ *  no new control is ever needed. */
+export function labsSet(on: boolean, feature?: string): Promise<null> {
+  return tryInvoke("labs_set", { on, feature: feature ?? null });
+}
+
 /** Ask the sender of `routeId` for a clean decode entry (IDR) now — call
  *  from a decode-error handler. Rate-limited backend-side. */
 export function refreshRoute(routeId: string): Promise<null> {

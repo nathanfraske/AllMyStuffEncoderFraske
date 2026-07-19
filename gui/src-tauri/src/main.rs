@@ -517,6 +517,38 @@ async fn tune_route(
     Ok(())
 }
 
+/// The effective encode dials for a route THIS machine is streaming — the
+/// "requested → effective" panel reads it ~1 Hz while open. Returns JSON
+/// null when this machine isn't the streamer (the ordinary remote-view
+/// case), so the viewer falls back to its own measured actuals. GUI-internal
+/// and read-only — no wire traffic.
+#[tauri::command]
+async fn route_dials(
+    state: State<'_, AppState>,
+    route_id: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("route_dials", json!({ "route_id": route_id }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Flip the Experimental (Labs) tier — or one feature — on this node.
+/// GUI-internal, never wire-visible; the Mode dropdown's toggle.
+#[tauri::command]
+async fn labs_set(
+    state: State<'_, AppState>,
+    on: bool,
+    feature: Option<String>,
+) -> Result<serde_json::Value, String> {
+    state
+        .node
+        .request("labs_set", json!({ "on": on, "feature": feature }))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---- terminal (the mesh-native shell) ----------------------------------
 
 /// Forward keystrokes or a resize from a terminal window down its active
@@ -2412,6 +2444,8 @@ fn main() {
             video_refresh,
             video_feedback,
             tune_route,
+            route_dials,
+            labs_set,
             open_console_window,
             open_video_window,
             term_send,

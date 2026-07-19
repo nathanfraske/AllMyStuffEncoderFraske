@@ -50,6 +50,7 @@ import {
   clientLog,
   closeThisWindow,
   connectRoute,
+  labsSet,
   tuneRoute,
   type StreamTune,
   type VideoLocalEvent,
@@ -718,6 +719,11 @@ class AppStore {
    *  remembered across windows, so a freshly opened console opens the way
    *  you last left it. */
   consoleControlMode = $state<"slider" | "pills">(loadConsoleControlMode());
+  /** The Experimental (Labs) tier — the Mode dropdown's toggle. Persisted
+   *  so it survives restarts and is pushed to the node on boot; the node's
+   *  labs gate is what every future field-trial feature reads. Off by
+   *  default: a stock session behaves exactly like today. */
+  labsTier = $state<boolean>(localStorage.getItem("ams.labs") === "1");
   /** The live outbound control route console input events ride on. */
   consoleControlLive = $state<string | null>(null);
   /** The live outbound clipboard route a paste pushes our clipboard down. */
@@ -1562,6 +1568,11 @@ class AppStore {
     // customer — its readiness gate then waits forever for a fleet
     // relationship the customer will never have.
     void this.loadCec();
+    // Re-assert the Experimental tier the user last chose: the node's gate
+    // is process-local (a fresh serve boots it off), so every window pushes
+    // its persisted setting — harmless when off (the default), and the one
+    // that streams carries the real intent.
+    void this.pushLabsTier();
     // (The rooms plane — invites, join/leave presence, chat, knocks — and
     // its same-device sibling bus are subscribed at the top of init, before
     // the identity pull, so a room window can't join before onRoom listens.)
@@ -3129,7 +3140,22 @@ class AppStore {
     this.consoleVideoLive = null;
     if (epoch !== this.consoleVideoEpoch) return; // a newer switch took over
     const inp = this.consoleInput ? this.capability(this.consoleInput) : null;
-    if (!inp) return;
+    if (!inp) {
+      // No input to wire — the CEC support-console failure the field saw:
+      // the window pops the instant a customer approves, before their
+      // display capability lands in this fresh window's catalog, so there
+      // is nothing to stream. `ensureConsoleInput` (the reactive re-drive
+      // in ConsoleHost) re-runs this the moment the cap arrives by any
+      // path; name it here so a stuck console explains itself in the log.
+      if (this.consoleNodeId) {
+        const n = this.consoleVideoInputs(this.consoleNodeId).length;
+        clientLog(
+          `[console] no video input to wire for ${shortId(this.consoleNodeId)} yet ` +
+            `(${n} candidate${n === 1 ? "" : "s"} in catalog) — waiting for the capability`,
+        );
+      }
+      return;
+    }
     // An input that lives in its own popout window stays there — the
     // stage shows "Return video here" instead of competing for the
     // stream's one watch slot.
@@ -3144,7 +3170,13 @@ class AppStore {
     // camera (video) on its synthetic video-in sink — either way a real
     // route the backend streams frames down.
     const sink = matchEndpoint(this.catalog, this.localId, inp.media, "consume");
-    if (!sink) return;
+    if (!sink) {
+      clientLog(
+        `[console] no local ${inp.media} sink to receive ${shortId(inp.node)}'s stream — ` +
+          `this machine can't consume it`,
+      );
+      return;
+    }
     const leg = this.ownedConnect(inp.id, sink.id, this.consoleCodec);
     // Render whatever's live; only own the route for teardown if this call
     // created it.
@@ -3153,6 +3185,24 @@ class AppStore {
     // Carry the quality pills onto the fresh route (the sender restarts
     // its capture with them; harmless no-op when everything is Auto).
     if (leg && this.hasTune()) void tuneRoute(leg.id, this.consoleTune);
+  }
+
+  /** Re-drive the console's video wire once a video input for the open
+   *  target becomes available — the path-agnostic fix for the CEC
+   *  support console, whose customer capabilities can land after the
+   *  window already opened and gave up (the snapshot re-pick only fires
+   *  for caps that arrive *in a session snapshot*; a cap arriving via
+   *  presence/catalog otherwise stranded the window at a blank stage).
+   *  Idempotent: does nothing once an input is picked, so a healthy
+   *  console (caps present at open) never enters here. Driven reactively
+   *  by [`ConsoleHost`]'s effect over `consoleVideoInputs`. */
+  ensureConsoleInput() {
+    if (!this.consoleNodeId || this.consoleInput) return;
+    const first = this.consoleVideoInputs(this.consoleNodeId)[0]?.id ?? null;
+    if (first) {
+      this.consoleInput = first;
+      void this.applyConsoleVideo();
+    }
   }
 
   private hasTune(): boolean {
@@ -3190,6 +3240,27 @@ class AppStore {
     } catch {
       // No storage (private mode / web preview) — in-memory for this session.
     }
+  }
+
+  /** Flip the Experimental (Labs) tier — the Mode dropdown's toggle.
+   *  Persists the choice, pushes it to the node's labs gate (which every
+   *  future field-trial feature reads), and it re-pushes on boot via
+   *  [`pushLabsTier`] so a restart honors the last setting. `on` is
+   *  optional — omit to flip. */
+  setLabsTier(on?: boolean) {
+    this.labsTier = on ?? !this.labsTier;
+    try {
+      localStorage.setItem("ams.labs", this.labsTier ? "1" : "0");
+    } catch {
+      // No storage — in-memory for this session.
+    }
+    void this.pushLabsTier();
+  }
+
+  /** Push the persisted Labs tier to this node's gate — on boot and on
+   *  every toggle. A no-op in web mode (labsSet tryInvokes). */
+  private pushLabsTier() {
+    return labsSet(this.labsTier);
   }
 
   /** Audio passthrough: play what the remote machine is playing — its

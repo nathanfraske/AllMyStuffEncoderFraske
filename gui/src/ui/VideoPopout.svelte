@@ -21,6 +21,7 @@
   import { onMount } from "svelte";
   import { Fsr1 } from "../fsr1";
   import ModePill from "./ModePill.svelte";
+  import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
   import { app } from "../store.svelte";
   import {
@@ -156,6 +157,10 @@
   let fps = $state(0);
   let transport = $state("");
   let frameCount = 0;
+  // Received bitrate (viewer truth): bytes seen this second → Mbps. The
+  // effective panel shows it beside the sender's target when co-located.
+  let recvMbps = $state(0);
+  let inBytes = 0;
   let hostStatus = $state<VideoHostStatus | null>(null);
   let fullscreen = $state(false);
 
@@ -216,7 +221,7 @@
     { label: "4 Mbps", value: 4_000_000 },
   ];
   let tune = $state<StreamTune>({});
-  let openPill = $state<"res" | "fps" | "rate" | null>(null);
+  let openPill = $state<"res" | "fps" | "rate" | "live" | null>(null);
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
     choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
   function pick(field: keyof StreamTune, v: number | null) {
@@ -251,6 +256,8 @@
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       frameCount = 0;
+      recvMbps = (inBytes * 8) / 1e6;
+      inBytes = 0;
     }, 1000);
     // The OS chrome's ✕ runs the same teardown as a "Return video here"
     // ask — the close is held until the route teardown is on the wire.
@@ -290,6 +297,8 @@
     fps = 0;
     transport = "";
     frameCount = 0;
+    recvMbps = 0;
+    inBytes = 0;
     if (!route) return;
     let cancelled = false;
     let unwatch: (() => void) | undefined;
@@ -349,6 +358,7 @@
       route,
       (f) => {
         if (cancelled) return;
+        inBytes += f.data.byteLength;
         if (f.kind === "raw") {
           transport = "H.264";
           if (f.data.byteLength !== f.width * f.height * 4) return;
@@ -562,7 +572,37 @@
        forwarding never sees them. -->
   <footer class="hover-bar">
     {#if hasFrame}
-      <span class="chip"><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport ? ` · ${transport}` : ""}</span>
+      <span class="chip"
+        ><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport
+          ? ` · ${transport}`
+          : ""}{recvMbps ? ` · ${recvMbps >= 10 ? recvMbps.toFixed(0) : recvMbps.toFixed(1)} Mbps` : ""}</span
+      >
+      <span class="pill-wrap">
+        <button
+          class="pill"
+          class:tuned={openPill === "live"}
+          title="What this stream is actually doing — requested picks vs the live effective reality"
+          onclick={(e) => {
+            e.stopPropagation();
+            openPill = openPill === "live" ? null : "live";
+          }}
+        >
+          Live ▾
+        </button>
+        {#if openPill === "live"}
+          <div class="pill-menu wide" role="group" aria-label="Effective stream dials">
+            <EffectiveReadout
+              routeId={app.videoPopoutLive}
+              requested={tune}
+              w={frameW}
+              h={frameH}
+              {fps}
+              {transport}
+              mbps={recvMbps}
+            />
+          </div>
+        {/if}
+      </span>
     {/if}
     {#if controlActive}
       <span class="chip ctl" title="A live control route lets you click and type here — hovering this window is what aims your keyboard at it">🕹 control</span>
@@ -609,7 +649,13 @@
           {/if}
         </span>
       {/snippet}
-      <ModePill mode={tune.mode} game={tune.game} onapply={applyModeWire} />
+      <ModePill
+        mode={tune.mode}
+        game={tune.game}
+        onapply={applyModeWire}
+        experimental={app.labsTier}
+        onexperimental={(on) => app.setLabsTier(on)}
+      />
       <button
         class="pill"
         class:tuned={fsrShow}
@@ -805,6 +851,12 @@
     min-width: 7rem;
     box-shadow: var(--shadow-lg);
     z-index: 5;
+  }
+  /* The Live effective-readout popover is wider than a value list and holds
+     a small table rather than a button column. */
+  .pill-menu.wide {
+    min-width: 16rem;
+    padding: 0.5rem 0.6rem;
   }
   .pill-item {
     border: none;

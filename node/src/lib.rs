@@ -86,6 +86,10 @@ pub mod input_inject;
 #[cfg(not(feature = "host"))]
 #[path = "stubs/input_inject.rs"]
 pub mod input_inject;
+/// The Experimental ("Labs") tier gate — one runtime choke point the Mode
+/// dropdown's Experimental toggle flips, so every future field-trial
+/// feature reads `labs::on(Feature::X)` and needs no new GUI control.
+pub mod labs;
 /// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
 /// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
 /// the encoder ladder in [`video`] enumerates and frame-send-tests it, falling

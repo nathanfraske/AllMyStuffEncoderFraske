@@ -140,6 +140,11 @@ pub struct StreamStats {
     age_ms: Vec<f32>,
     out_w: u32,
     out_h: u32,
+    /// The pollable per-route cell this stats object publishes its output
+    /// geometry + codec into every frame (cheap atomics), so the GUI's
+    /// effective-dials panel has fresh numbers independent of the 5 s log
+    /// cadence. Shared with [`VideoBridge::route_dials`]; see [`route_live`].
+    live: Arc<RouteLive>,
 }
 
 impl StreamStats {
@@ -163,6 +168,7 @@ impl StreamStats {
             age_ms: Vec::new(),
             out_w: 0,
             out_h: 0,
+            live: route_live_cell(route_id),
         }
     }
 
@@ -194,6 +200,16 @@ impl StreamStats {
         };
     }
 
+    /// Publish the encoder-rung label for the effective-dials panel. The CPU
+    /// pipeline names itself in [`HealingEncoder::new`]; [`run_capture`] sets
+    /// the coarse "GPU (hardware)" before the GPU lane runs. The exact
+    /// NVENC/MF/AMF rung lives inside `run_gpu_lane`, which this pass leaves
+    /// untouched — so this stays a best-effort label, never a claim about a
+    /// specific silicon path.
+    fn set_encoder(&self, label: impl Into<String>) {
+        *self.live.encoder.lock() = label.into();
+    }
+
     fn p95(samples: &mut [f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -203,6 +219,20 @@ impl StreamStats {
     }
 
     fn maybe_log(&mut self) {
+        // Publish the live output geometry + codec every frame (cheap
+        // atomics) so the GUI's 1 Hz effective-dials poll always reads fresh
+        // numbers, independent of the 5 s log cadence below. Both encode
+        // lanes call maybe_log() once per frame.
+        self.live.out_w.store(self.out_w, Ordering::Relaxed);
+        self.live.out_h.store(self.out_h, Ordering::Relaxed);
+        self.live.codec.store(
+            match self.label {
+                "H.264" => 1,
+                "MJPEG" => 2,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
         let elapsed = self.since.elapsed();
         if elapsed < STATS_EVERY {
             return;
@@ -1075,6 +1105,69 @@ impl VideoBridge {
             .unwrap_or(false)
     }
 
+    /// The effective encode dials for `route_id` when THIS node is its
+    /// streamer — the "what we're actually doing" half of the console's
+    /// quality panel: the resolved posture, the encoder rung, the codec on
+    /// the wire, the AIMD bitrate target + its posture ceiling, the fps and
+    /// edge targets, and the actual output geometry. `None` when the route
+    /// isn't encoded here (the ordinary remote-view case — the viewer shows
+    /// its own measured actuals instead). Read-only and lock-cheap: a brief
+    /// lock on each of the three per-route maps, no wire traffic. Poll ~1 Hz
+    /// while a panel is open.
+    pub fn route_dials(&self, route_id: &str) -> Option<RouteDials> {
+        let (tune, edge_cap) = {
+            let routes = self.routes.lock();
+            let r = routes.get(route_id)?;
+            (r.tune, effective_h264_edge(r.tune, &r.auto))
+        };
+        let posture = match tune.posture() {
+            Posture::Balanced => "balanced",
+            Posture::Game => "game",
+            Posture::Studio => "studio",
+            Posture::StudioLossless => "studio-lossless",
+        };
+        // The closed-loop bitrate the encoder is actually aiming at right now
+        // (AIMD moves it under Game), and the posture budget it climbs back
+        // toward. Absent until the encode lane registers its rate cell.
+        let (target_bitrate_bps, ceiling_bps) = route_rates()
+            .lock()
+            .get(route_id)
+            .map(|rr| {
+                (
+                    rr.target.load(Ordering::Relaxed),
+                    rr.ceiling.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
+        let (out_w, out_h, codec, encoder_label) = route_live()
+            .lock()
+            .get(route_id)
+            .map(|l| {
+                (
+                    l.out_w.load(Ordering::Relaxed),
+                    l.out_h.load(Ordering::Relaxed),
+                    match l.codec.load(Ordering::Relaxed) {
+                        1 => "H.264",
+                        2 => "MJPEG",
+                        _ => "",
+                    },
+                    l.encoder.lock().clone(),
+                )
+            })
+            .unwrap_or((0, 0, "", String::new()));
+        Some(RouteDials {
+            posture,
+            encoder_label,
+            codec,
+            target_bitrate_bps,
+            ceiling_bps,
+            fps_target: tune.fps(),
+            edge_cap,
+            out_w,
+            out_h,
+        })
+    }
+
     pub fn force_idr(&self, route_id: &str) {
         if let Some(r) = self.routes.lock().get(route_id) {
             r.refresh.store(true, Ordering::SeqCst);
@@ -1333,6 +1426,9 @@ impl VideoBridge {
         // thread join.
         let removed = self.routes.lock().remove(route_id);
         self.feedback.lock().remove(route_id);
+        // Reap the pollable live cell too, so a stopped route stops
+        // reporting stale dials to the effective-reality panel.
+        route_live().lock().remove(route_id);
         drop(removed);
     }
 }
@@ -1484,6 +1580,11 @@ fn run_capture(
         && !crate::mediafoundation::adapter_pin_active()
     {
         if let Ok(mid) = monitor.id() {
+            // Coarse rung label for the effective-dials panel while the GPU
+            // lane owns the stream; the CPU fallback relabels itself in
+            // HealingEncoder::new. The exact NVENC/MF/AMF rung is chosen
+            // inside run_gpu_lane, which this pass deliberately leaves alone.
+            stats.set_encoder("GPU (hardware)");
             let mut window = Instant::now();
             let mut attempts = 0u32;
             loop {
@@ -2253,6 +2354,7 @@ fn nvenc_opt_in() -> bool {
 #[cfg(windows)]
 enum GpuCodec {
     Nvenc(crate::nvenc::NvencH264),
+    Amf(crate::amf::AmfAvc),
     Mf(crate::mediafoundation::MediaFoundationH264),
 }
 
@@ -2265,6 +2367,7 @@ impl GpuCodec {
     ) -> Result<EncodeOutcome, String> {
         match self {
             GpuCodec::Nvenc(e) => e.encode_texture(tex, force_idr),
+            GpuCodec::Amf(e) => e.encode_texture(tex, force_idr),
             GpuCodec::Mf(e) => e.encode_texture(tex, force_idr),
         }
     }
@@ -2272,6 +2375,7 @@ impl GpuCodec {
     fn label(&self) -> &str {
         match self {
             GpuCodec::Nvenc(e) => e.label(),
+            GpuCodec::Amf(e) => e.label(),
             GpuCodec::Mf(e) => e.label(),
         }
     }
@@ -2282,6 +2386,7 @@ impl GpuCodec {
     fn set_bitrate(&mut self, bitrate: u32) -> bool {
         match self {
             GpuCodec::Nvenc(e) => e.set_bitrate(bitrate),
+            GpuCodec::Amf(e) => e.set_bitrate(bitrate),
             GpuCodec::Mf(e) => e.set_bitrate(bitrate),
         }
     }
@@ -2416,8 +2521,31 @@ fn run_gpu_lane(
             ) {
                 Ok(n) => break 'open GpuCodec::Nvenc(n),
                 Err(e) => tracing::info!(
-                    "direct NVENC unavailable for {route_id} ({e}); using the MF rung"
+                    "direct NVENC unavailable for {route_id} ({e}); trying the AMF rung"
                 ),
+            }
+        }
+        // AMD's native SDK rung — the 9060 XT field host's first-class
+        // path: GDR game mode, guaranteed in-place bitrate, posture
+        // presets, pacer slices. Refuses instantly on non-AMD adapters
+        // (a vendor check before any AMF call), so every other box falls
+        // straight through to MF. `ALLMYSTUFF_AMF=0` pins MF for A/B on
+        // the Radeon.
+        if std::env::var("ALLMYSTUFF_AMF")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            match crate::amf::AmfAvc::open_on_device(
+                &lane.device,
+                dw,
+                dh,
+                fps,
+                bitrate,
+                game,
+                studio,
+            ) {
+                Ok(a) => break 'open GpuCodec::Amf(a),
+                Err(e) => tracing::debug!("AMF rung not taken for {route_id}: {e}"),
             }
         }
         match open_gpu_encoder(lane.adapter_luid, dw, dh, fps, bitrate, &lane.manager) {
@@ -2452,7 +2580,10 @@ fn run_gpu_lane(
     // quiesce rescue) force an IDR through. Mutable: a mid-stream heal
     // onto the MF rung loses GDR, and the cadence must come back with it
     // (red team, encoder finding 4).
-    let mut gdr = game && matches!(&enc, GpuCodec::Nvenc(_));
+    // Both SDK rungs speak GDR: NVENC arms per-picture waves; AMF runs a
+    // continuous rolling refresh (a wave permanently in flight), so its
+    // loss heal needs no arming at all.
+    let mut gdr = game && matches!(&enc, GpuCodec::Nvenc(_) | GpuCodec::Amf(_));
     // Frame health's wave flag: registered while this GDR lane lives so
     // a viewer's loss report heals with a wave instead of an IDR wall;
     // the guard unregisters on every lane exit path. The value carries
@@ -2581,8 +2712,14 @@ fn run_gpu_lane(
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
                 let wave_frames = wave.swap(0, Ordering::SeqCst);
                 if gdr && wave_frames > 0 {
-                    if let GpuCodec::Nvenc(n) = &mut enc {
-                        n.arm_wave(wave_frames);
+                    match &mut enc {
+                        GpuCodec::Nvenc(n) => n.arm_wave(wave_frames),
+                        // AMF's rolling refresh is continuous — the
+                        // requested wave is already in flight by
+                        // construction; consuming the flag (no IDR
+                        // fallback) is the correct heal.
+                        GpuCodec::Amf(_) => {}
+                        GpuCodec::Mf(_) => {}
                     }
                 }
                 // Closed-loop bitrate: apply the controller's target in
@@ -2626,7 +2763,7 @@ fn run_gpu_lane(
                                         .and_then(|v| v.parse().ok())
                                 });
                             let depth = RETIRE
-                                .unwrap_or(if matches!(&enc, GpuCodec::Mf(_)) {
+                                .unwrap_or(if matches!(&enc, GpuCodec::Mf(_) | GpuCodec::Amf(_)) {
                                     4
                                 } else {
                                     2
@@ -3235,6 +3372,14 @@ impl HealingEncoder {
         auto: &Arc<AutoAdapt>,
     ) -> Result<Self, String> {
         let enc = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
+        // Name the CPU pipeline for the effective-dials panel (the actual
+        // encoder after any MJPEG-floor fallback). The GPU lane, when it
+        // wins, set "GPU (hardware)" before this constructor was ever reached
+        // on the fallback path.
+        *route_live_cell(route_id).encoder.lock() = match enc.mode() {
+            VideoMode::H264 => "H.264 (CPU)".to_string(),
+            VideoMode::Mjpeg => "MJPEG (CPU)".to_string(),
+        };
         Ok(HealingEncoder {
             enc,
             route_id: route_id.to_string(),
@@ -3968,6 +4113,60 @@ pub(crate) fn route_rates(
         parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<RouteRate>>>,
     > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     &RATES
+}
+
+/// Live, pollable per-route encode facts for the GUI's "effective reality"
+/// panel — the counterpart to [`route_rates`] for the dials the rate
+/// controller doesn't own. Published cheaply by the encode lanes through
+/// [`StreamStats::maybe_log`] (output dims + codec, every frame) and by
+/// [`run_capture`] / [`HealingEncoder::new`] (the encoder rung label, once
+/// per lane), and read by [`VideoBridge::route_dials`]. Lane-lifetime like
+/// [`route_rates`]; [`VideoBridge::stop`] reaps the entry.
+#[derive(Default)]
+pub(crate) struct RouteLive {
+    /// Actual encoded output width/height (0 until the first frame lands).
+    out_w: AtomicU32,
+    out_h: AtomicU32,
+    /// Wire codec: 0 unknown, 1 H.264, 2 MJPEG.
+    codec: AtomicU8,
+    /// Human encoder-rung label ("GPU (hardware)", "H.264 (CPU)", …).
+    encoder: Mutex<String>,
+}
+
+pub(crate) fn route_live(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<RouteLive>>> {
+    static LIVE: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<RouteLive>>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    &LIVE
+}
+
+/// Get-or-create the live cell for `route_id` — one per route, shared by
+/// whichever lane (GPU or CPU) is currently encoding it.
+fn route_live_cell(route_id: &str) -> std::sync::Arc<RouteLive> {
+    route_live()
+        .lock()
+        .entry(route_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The effective encode dials for one locally-encoded route — the values the
+/// viewer's panel shows beside the requested [`Tune`]. Assembled from
+/// [`Tune`] (posture / fps target / edge cap), [`route_rates`] (the AIMD
+/// bitrate target + its ceiling), and [`route_live`] (actual dims, codec,
+/// rung). Built by [`VideoBridge::route_dials`].
+#[derive(Debug, Clone)]
+pub struct RouteDials {
+    pub posture: &'static str,
+    pub encoder_label: String,
+    pub codec: &'static str,
+    pub target_bitrate_bps: u32,
+    pub ceiling_bps: u32,
+    pub fps_target: u32,
+    pub edge_cap: u32,
+    pub out_w: u32,
+    pub out_h: u32,
 }
 
 /// Where the closed-loop bitrate may act. The rule: an automatic rate

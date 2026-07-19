@@ -1004,6 +1004,40 @@ pub async fn dispatch(
                 .await,
             )
         }
+        // GUI-internal, read-only: the effective encode dials for a route
+        // this node streams — the console's "requested → effective" panel
+        // polls it ~1 Hz while open. Null (not an error) when this node isn't
+        // the streamer, so the viewer quietly falls back to its own measured
+        // actuals. Not wire-visible.
+        "route_dials" => {
+            let route_id: String = try_arg!(arg(a, "route_id"));
+            match mesh.route_dials(&route_id) {
+                Some(d) => DispatchOut::Json(json!({
+                    "posture": d.posture,
+                    "encoderLabel": d.encoder_label,
+                    "codec": d.codec,
+                    "targetBitrateBps": d.target_bitrate_bps,
+                    "ceilingBps": d.ceiling_bps,
+                    "fpsTarget": d.fps_target,
+                    "edgeCap": d.edge_cap,
+                    "outW": d.out_w,
+                    "outH": d.out_h,
+                })),
+                None => DispatchOut::Json(Value::Null),
+            }
+        }
+        // The Mode dropdown's Experimental (Labs) toggle: flip the tier
+        // gate this process reads. GUI-internal (never wire-visible); a
+        // feature name flips one feature, its absence the whole tier.
+        "labs_set" => {
+            let on: bool = try_arg!(arg(a, "on"));
+            let feature: Option<String> = try_arg!(opt(a, "feature"));
+            match feature {
+                Some(f) => crate::labs::set_feature(&f, on),
+                None => crate::labs::set_tier(on),
+            }
+            json_result(Ok::<(), String>(()))
+        }
 
         // ---- terminal plane ----------------------------------------------
         "term_send" => {
