@@ -151,6 +151,27 @@ reasoning; the trail at the bottom is the index.
   first (`versioning-is-chriss`, `transport-signaling-rule`,
   `build-env-this-box`, `project-direction`, `hardware-arcs-status`).
 
+## GUI is CLOSED OUT (as of `f29a5ed`)
+
+The next agent is **pure pipeline** — no GUI pass should be needed:
+- **Mode control** is a keyboard-accessible dropdown (`ModePill.svelte`,
+  one shared component) with the four postures + an **Experimental
+  (Labs) toggle** folded in (orthogonal to posture). The Studio warning
+  portals to `document.body`. svelte-check is 0/0.
+- **Experimental gate** is `node/src/labs.rs`: `labs::on(Feature::X)` is
+  the single read every future field-trial feature uses; the dropdown
+  toggle flips it via the GUI-internal `labs_set` op (`ALLMYSTUFF_
+  EXPERIMENTAL`/`X_*` envs also work). Adding a Labs feature = one
+  `Feature` variant + reading the gate. **No GUI change ever again.**
+- **Effective panel** (`EffectiveReadout.svelte` + `route_dials` op)
+  shows requested→effective (res/fps/bitrate/rung/codec) live.
+- **CEC support console** fixed: `ConsoleHost` reactively re-drives the
+  video wire when the customer's capability lands (path-agnostic);
+  `applyConsoleVideo` names silent failures in the log.
+- **AMF native rung** (`amf.rs`) is the AMD host's first-class encoder —
+  ladder NVENC→AMF→MF→software, vendor-gated, e2e test runs on the
+  Radeon (`amf_avc_e2e_encodes_decodable_stream`).
+
 ## Open arcs (value order)
 
 1. **Upstream PR** — the kit's §5 has the draft; the user opens it.
