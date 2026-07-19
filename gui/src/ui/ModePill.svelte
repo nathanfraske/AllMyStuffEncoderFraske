@@ -75,7 +75,6 @@
   let studioPrompt = $state<ModeKey | null>(null);
   let rootEl = $state<HTMLElement | null>(null);
   let menuEl = $state<HTMLElement | null>(null);
-  let dialogEl = $state<HTMLElement | null>(null);
 
   // Move a node to <body> so its position:fixed resolves against the
   // viewport. Both hosts mount this component inside an element that carries
@@ -139,21 +138,18 @@
     active?.focus({ preventScroll: true });
   });
 
-  // Dismiss the open menu (or the warning) on an outside press or Escape,
-  // handled at the window level so no static element needs a click/key
-  // handler of its own. Capture phase so it fires before a host bar's own
-  // pointer logic.
+  // Dismiss the open menu on an outside press, and either surface on Escape.
+  // The Studio warning is portaled to <body>; its backdrop owns pointer
+  // dismissal below and also stops the host's outside-bar listener. Keeping
+  // modal presses out of this capture listener ensures no window-level
+  // closer can clear `studioPrompt` before a confirmation click applies it.
   $effect(() => {
     if (!open && !studioPrompt) return;
     const onDown = (e: PointerEvent) => {
+      if (studioPrompt) return;
       const t = e.target as Node | null;
-      // A press inside the pill/menu, or inside the (portaled) warning
-      // dialog, isn't a dismiss — the latter check keeps this capture-phase
-      // pointerdown from tearing the dialog down before a button's own click
-      // lands. A press on the bare scrim backdrop still dismisses.
-      if (t && (rootEl?.contains(t) || dialogEl?.contains(t))) return;
+      if (t && rootEl?.contains(t)) return;
       open = false;
-      studioPrompt = null;
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -268,14 +264,26 @@
 </span>
 
 {#if studioPrompt}
-  <div class="studio-scrim" use:portal>
+  <div
+    class="studio-scrim"
+    role="presentation"
+    use:portal
+    onpointerdown={(e) => {
+      // The portaled prompt no longer sits inside Console's bar DOM. Stop
+      // its press here so the host's outside-bar listener cannot unmount
+      // this component before a confirmation button receives its click.
+      e.stopPropagation();
+      // Only the bare backdrop cancels. Presses in the dialog survive all
+      // the way to `click`, including inside a portaled WebView2 subtree.
+      if (e.target === e.currentTarget) studioPrompt = null;
+    }}
+  >
     <div
       class="studio-dialog"
       role="dialog"
       aria-modal="true"
       aria-labelledby="studio-title"
       tabindex="-1"
-      bind:this={dialogEl}
     >
       <h3 id="studio-title">
         {studioPrompt === "studio-ll" ? "Turn on Studio · Lossless?" : "Turn on Studio mode?"}

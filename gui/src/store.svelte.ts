@@ -3217,7 +3217,17 @@ class AppStore {
 
   private hasTune(): boolean {
     const t = this.consoleTune;
-    return t.maxEdge != null || t.bitrate != null || t.fps != null;
+    // Mode is a first-class tune too. Omitting it here meant a mode-only
+    // Studio/Game selection was remembered in the GUI but not re-applied to
+    // the fresh route after a monitor switch or codec re-offer, so the sender
+    // silently came back Balanced.
+    return (
+      t.maxEdge != null ||
+      t.bitrate != null ||
+      t.fps != null ||
+      t.mode != null ||
+      t.game != null
+    );
   }
 
   /** A quality pick changed (a pill or the slider): remember it against the

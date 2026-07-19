@@ -1448,8 +1448,14 @@ impl VideoBridge {
             old.on_status.clone(),
         );
         drop(old); // joins the old capture thread; its session releases
+        let posture = match tune.posture() {
+            Posture::Balanced => "balanced",
+            Posture::Game => "game",
+            Posture::Studio => "studio",
+            Posture::StudioLossless => "studio-lossless",
+        };
         tracing::info!(
-            "route {route_id} retuned: edge {} · bitrate {} · fps {}",
+            "route {route_id} retuned: posture {posture} · edge {} · bitrate {} · fps {}",
             tune.max_edge.map_or("auto".into(), |v| v.to_string()),
             tune.bitrate
                 .map_or("auto".into(), |v| format!("{:.1} Mbps", v as f64 / 1e6)),
