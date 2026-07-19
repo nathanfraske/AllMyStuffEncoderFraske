@@ -125,11 +125,15 @@ without the silicon:
      down within ~5 s and climb back after ~30 s clean.
 4. Kill switches if anything misbehaves (all env, viewer/host as noted):
    `ALLMYSTUFF_RATE_ADAPT=0` (host) · `ALLMYSTUFF_PACED_SLICES=0`
-   (host) · `ALLMYSTUFF_NVENC=0` (host, pins MF) ·
-   `ALLMYSTUFF_GPU_LANE=0` (host) · `ALLMYSTUFF_HEVC_DECODER=nvdec`
-   (viewer). Opt-ins that default OFF: `ALLMYSTUFF_MMCSS=1`,
-   `ALLMYSTUFF_GPU_SCHED=1`, `ALLMYSTUFF_AUTO_ADAPT=1`,
-   `ALLMYSTUFF_RATE_ADAPT=1` (all-postures form). Full dial table:
+   (host) · `ALLMYSTUFF_NVENC=0` (host, pins the vendor MFT and disables
+   the direct lossless rung) · `ALLMYSTUFF_HEVC_DECODER=nvdec` (viewer).
+   Opt-ins that default OFF for normal lossy postures:
+   `ALLMYSTUFF_GPU_LANE=1` (experimental shared-texture capture),
+   `ALLMYSTUFF_NVENC=1` (direct SDK; Studio·Lossless explicitly enables its
+   required texture/direct-HEVC path unless either dial is pinned to `0`),
+   postures), `ALLMYSTUFF_MMCSS=1`, `ALLMYSTUFF_GPU_SCHED=1`,
+   `ALLMYSTUFF_AUTO_ADAPT=1`, `ALLMYSTUFF_RATE_ADAPT=1` (all-postures
+   form). Full dial table:
    integration report §5.
 
 ## 5 · The PR

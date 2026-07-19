@@ -1592,6 +1592,21 @@ fn run_capture(
             }
         }
     };
+    #[cfg(windows)]
+    let stable_monitor_name = match monitor.name() {
+        Ok(name) if !name.trim().is_empty() => Some(name),
+        Ok(_) if monitor_id.is_some() => {
+            let e = "requested monitor has no stable Windows display name".to_string();
+            reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
+            return Err(e);
+        }
+        Err(e) if monitor_id.is_some() => {
+            let e = format!("requested monitor's stable Windows display name is unreadable: {e}");
+            reporter.report(VideoStatusState::NoMonitor, Some(e.clone()));
+            return Err(e);
+        }
+        _ => None,
+    };
     let source_hint = (monitor.width().unwrap_or(0), monitor.height().unwrap_or(0));
     // A physically-rotated monitor: Windows DXGI hands over the raw scan-out and
     // reports its own rotation per frame (the orient pass rotates it upright);
@@ -1629,7 +1644,7 @@ fn run_capture(
     // cross-adapter — the CPU lane's system-memory NV12 serves that.
     #[cfg(windows)]
     if mode == VideoMode::H264
-        && gpu_lane_enabled()
+        && gpu_lane_allowed(tune.posture())
         && !crate::mediafoundation::adapter_pin_active()
     {
         if let Ok(mid) = monitor.id() {
@@ -1660,6 +1675,7 @@ fn run_capture(
                     fps,
                     route_id,
                     mid,
+                    stable_monitor_name.as_deref(),
                     tune,
                     refresh,
                     idr_ms,
@@ -1698,7 +1714,7 @@ fn run_capture(
     {
         match monitor.id() {
             Ok(mid) => loop {
-                match crate::win_capture::start(mid) {
+                match crate::win_capture::start_named(mid, stable_monitor_name.as_deref()) {
                     Ok((session, frames, reclaim)) => {
                         tracing::info!(
                             "DXGI duplication started for {route_id} (monitor {mid:#x})"
@@ -1750,7 +1766,8 @@ fn run_capture(
                     stop,
                     fps,
                     route_id,
-                    &monitor,
+                    monitor_id,
+                    monitor,
                     on_packet,
                     &mut encoder,
                     &mut stats,
@@ -1892,7 +1909,8 @@ fn run_capture(
         stop,
         fps,
         route_id,
-        &monitor,
+        monitor_id,
+        monitor,
         on_packet,
         &mut encoder,
         &mut stats,
@@ -2338,26 +2356,61 @@ fn log_orient(rotation_deg: u32, bw: u32, bh: u32, turns: u8, ow: u32, oh: u32) 
     }
 }
 
-/// Kill-switch for the GPU zero-copy lane (`ALLMYSTUFF_GPU_LANE=0`).
-/// Default ON: the lane self-proves at start and falls back to the CPU
-/// path on any failure, so the dial exists for diagnosis, not safety.
+/// Explicit opt-in for the GPU zero-copy capture→encode lane
+/// (`ALLMYSTUFF_GPU_LANE=1`).
+///
+/// The lane proves that its D3D objects can be created, but that does not
+/// prove that the capture texture is ready without a long driver wait when
+/// the encoder consumes it. Field A/B runs found both direct NVENC and the
+/// NVIDIA MFT blocking for hundreds of milliseconds on these live textures,
+/// while the same encoders stayed in the low milliseconds on CPU-DXGI input.
+/// Keep normal production postures on that bounded-latency path; the shared-
+/// texture lane remains available for explicit experimental runs. The one
+/// posture exception is Studio·Lossless: selecting it is an explicit request
+/// for the const-QP-0 encoder whose input contract is this texture lane.
 #[cfg(windows)]
-fn gpu_lane_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let off = std::env::var("ALLMYSTUFF_GPU_LANE")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false"
-                )
-            })
-            .unwrap_or(false);
-        if off {
-            tracing::info!("ALLMYSTUFF_GPU_LANE off — GPU zero-copy lane disabled");
+fn gpu_lane_preference() -> Option<bool> {
+    static CHOICE: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        let raw = std::env::var("ALLMYSTUFF_GPU_LANE").ok();
+        let choice = explicit_bool_choice(raw.as_deref());
+        match choice {
+            Some(true) => {
+                tracing::info!("ALLMYSTUFF_GPU_LANE=1 — experimental GPU zero-copy lane enabled")
+            }
+            Some(false) => tracing::info!(
+                "ALLMYSTUFF_GPU_LANE=0 — using CPU-DXGI capture + hardware encode"
+            ),
+            None => {}
         }
-        !off
+        choice
     });
-    *ON
+    *CHOICE
+}
+
+#[cfg(windows)]
+fn gpu_lane_policy(
+    posture: Posture,
+    gpu_lane_choice: Option<bool>,
+    nvenc_choice: Option<bool>,
+) -> bool {
+    match gpu_lane_choice {
+        Some(explicit) => explicit,
+        None => posture == Posture::StudioLossless && nvenc_choice.unwrap_or(true),
+    }
+}
+
+#[cfg(windows)]
+fn gpu_lane_allowed(posture: Posture) -> bool {
+    let allowed = gpu_lane_policy(posture, gpu_lane_preference(), nvenc_preference());
+    if allowed
+        && posture == Posture::StudioLossless
+        && gpu_lane_preference().is_none()
+    {
+        tracing::info!(
+            "Studio·Lossless explicitly selected — enabling its direct HEVC texture lane"
+        );
+    }
+    allowed
 }
 
 /// How a GPU-lane run ended. Hard errors fold into `Fallback`'s reason —
@@ -2379,26 +2432,49 @@ enum GpuEnd {
 /// proven default; flipping this on puts the SDK session first with the
 /// MF rung as its in-lane fallback.
 #[cfg(windows)]
-fn nvenc_opt_in() -> bool {
-    // Default ON: trying to open the SDK session IS the NVIDIA detection
-    // (no driver fails the load softly and the lane keeps the MF rung),
-    // so the default costs nothing where it can't win. =0 pins MF for
-    // comparison runs.
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = !std::env::var("ALLMYSTUFF_NVENC")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "off" | "false"
-                )
-            })
-            .unwrap_or(false);
-        if on {
-            tracing::info!("ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled");
+fn explicit_bool_choice(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Some(true),
+        "0" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn nvenc_preference() -> Option<bool> {
+    static CHOICE: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        let raw = std::env::var("ALLMYSTUFF_NVENC").ok();
+        let choice = explicit_bool_choice(raw.as_deref());
+        match choice {
+            Some(true) => tracing::info!("ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled"),
+            Some(false) => {
+                tracing::info!("ALLMYSTUFF_NVENC=0 — direct NVENC rung disabled")
+            }
+            None => {}
         }
-        on
+        choice
     });
-    *ON
+    *CHOICE
+}
+
+#[cfg(windows)]
+fn nvenc_opt_in() -> bool {
+    // Balanced, Game, and lossy Studio use the vendor MFT by default. The
+    // direct SDK rung is real hardware, but field production found a driver
+    // combination where its synchronous LockBitstream call blocked for
+    // 0.4–1.0 s per 1440p frame while the NVIDIA MFT on the same machine
+    // stayed in the low milliseconds. Keep the experimental rung explicit
+    // until it has its own bounded-latency watchdog.
+    nvenc_preference().unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn nvenc_lossless_allowed() -> bool {
+    // Studio·Lossless has no equivalent MFT rung: its HEVC const-QP-0
+    // encoder is direct NVENC. Selecting that posture is itself an explicit
+    // request, while ALLMYSTUFF_NVENC=0 must still be able to pin the proven
+    // MFT ladder for diagnostics.
+    nvenc_preference().unwrap_or(true)
 }
 
 /// The GPU lane's texture-eating encoder: the direct-NVENC SDK session
@@ -2560,6 +2636,7 @@ fn run_gpu_lane(
     fps: u32,
     route_id: &str,
     mid: u32,
+    stable_monitor_name: Option<&str>,
     tune: Tune,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
@@ -2569,7 +2646,7 @@ fn run_gpu_lane(
     reporter: &mut StatusReporter,
 ) -> GpuEnd {
     let edge = effective_h264_edge(tune, auto);
-    let lane = match crate::win_capture::start_gpu(mid, edge) {
+    let lane = match crate::win_capture::start_gpu_named(mid, stable_monitor_name, edge) {
         Ok(l) => l,
         Err(e) => return GpuEnd::Fallback(e),
     };
@@ -2589,7 +2666,7 @@ fn run_gpu_lane(
     // plain Studio — the posture's spirit with rate control back on.
     let studio = posture == Posture::Studio || requested_lossless;
     let mut enc = 'open: {
-        if requested_lossless && nvenc_opt_in() {
+        if requested_lossless && nvenc_lossless_allowed() {
             // Studio·Lossless: the HEVC constQP-0 rung. Anything short of
             // a clean open degrades to lossy Studio below — the viewer
             // asked for fidelity, and 150 Mbps VBR is the honest next
@@ -3169,12 +3246,13 @@ fn run_session_capture(
 /// is set, the loop returns `Ok(true)` once that long has passed — the
 /// caller's cue to re-attempt a real capture session; `Ok(false)` means the
 /// route stopped.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_mut)]
 fn run_oneshot_capture(
     stop: &AtomicBool,
     fps: u32,
     route_id: &str,
-    monitor: &xcap::Monitor,
+    requested_monitor_id: Option<u32>,
+    mut monitor: xcap::Monitor,
     on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
     encoder: &mut HealingEncoder,
     stats: &mut StreamStats,
@@ -3184,6 +3262,10 @@ fn run_oneshot_capture(
     let budget = Duration::from_secs(1) / fps.max(1);
     let began = Instant::now();
     let mut failures = 0u64;
+    #[cfg(windows)]
+    let stable_name = requested_monitor_id
+        .and_then(|_| monitor.name().ok())
+        .filter(|name| !name.trim().is_empty());
     while !stop.load(Ordering::SeqCst) {
         if let Some(after) = retry_capture_after {
             if began.elapsed() >= after {
@@ -3215,6 +3297,56 @@ fn run_oneshot_capture(
             }
             Err(e) => {
                 let e = e.to_string();
+                #[cfg(windows)]
+                if invalid_monitor_handle(&e) {
+                    let old_id = monitor.id().ok();
+                    let started_reacquire = Instant::now();
+                    tracing::warn!(
+                        "screen grab for {route_id} lost monitor handle {:?} ({e}); re-enumerating{}",
+                        old_id,
+                        stable_name
+                            .as_deref()
+                            .map(|name| format!(" {name}"))
+                            .unwrap_or_default()
+                    );
+                    loop {
+                        if stop.load(Ordering::SeqCst) {
+                            return Ok(false);
+                        }
+                        if retry_capture_after.is_some_and(|after| began.elapsed() >= after) {
+                            return Ok(true);
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                        match reacquire_monitor(requested_monitor_id, stable_name.as_deref()) {
+                            Ok(fresh) => {
+                                let new_id = fresh.id().ok();
+                                tracing::info!(
+                                    "screen grab for {route_id} rebound monitor {:?} -> {:?} in {:.0} ms{}",
+                                    old_id,
+                                    new_id,
+                                    started_reacquire.elapsed().as_secs_f64() * 1000.0,
+                                    stable_name
+                                        .as_deref()
+                                        .map(|name| format!(" ({name})"))
+                                        .unwrap_or_default()
+                                );
+                                monitor = fresh;
+                                failures = 0;
+                                break;
+                            }
+                            Err(reacquire) => {
+                                if failures == 0 || failures.is_multiple_of(16) {
+                                    tracing::warn!(
+                                        "screen grab for {route_id} waiting for monitor reacquisition: {reacquire}"
+                                    );
+                                }
+                                failures = failures.saturating_add(1);
+                                reporter.report(VideoStatusState::NoMonitor, Some(reacquire));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // A transient grab failure (screen lock, monitor sleep)
                 // shouldn't end the stream — but a *persistent* one (a
                 // denied screen-recording permission, a Wayland portal
@@ -3240,10 +3372,69 @@ fn run_oneshot_capture(
     Ok(false)
 }
 
+#[cfg(windows)]
+fn invalid_monitor_handle(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("0x800705b5") || error.contains("invalid monitor handle")
+}
+
+/// Re-enumerate a Windows monitor after its raw `HMONITOR` was invalidated.
+/// The synthetic primary source follows the current primary. An explicit
+/// secondary source stays bound to its `\\.\DISPLAYn` device name; showing a
+/// different monitor is a privacy/correctness failure, so absence is loud.
+#[cfg(windows)]
+fn reacquire_monitor(
+    requested_monitor_id: Option<u32>,
+    stable_name: Option<&str>,
+) -> Result<xcap::Monitor, String> {
+    match monitor_reacquire_key(requested_monitor_id, stable_name)? {
+        MonitorReacquireKey::Primary => select_monitor(None),
+        MonitorReacquireKey::DeviceName(name) => {
+            let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
+            monitors
+                .into_iter()
+                .find(|monitor| {
+                    monitor
+                        .name()
+                        .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(&name))
+                })
+                .ok_or_else(|| format!("requested monitor {name} is not currently attached"))
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorReacquireKey {
+    Primary,
+    DeviceName(String),
+}
+
+/// Select the only privacy-safe identity for monitor reacquisition. A raw
+/// `HMONITOR` is deliberately absent from this enum: Windows may recycle it
+/// for another output after topology churn, so falling back to the stale
+/// number could expose the wrong display.
+#[cfg(windows)]
+fn monitor_reacquire_key(
+    requested_monitor_id: Option<u32>,
+    stable_name: Option<&str>,
+) -> Result<MonitorReacquireKey, String> {
+    if requested_monitor_id.is_none() {
+        return Ok(MonitorReacquireKey::Primary);
+    }
+    stable_name
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| MonitorReacquireKey::DeviceName(name.to_string()))
+        .ok_or_else(|| {
+            "requested monitor lost its stable display name; refusing stale-handle fallback"
+                .to_string()
+        })
+}
+
 /// The monitor a capture should run on: by enumeration id when the route
 /// names one, else the primary. A named monitor that's gone (unplugged
-/// since the scan) degrades to the primary with a note — a stream beats
-/// an error.
+/// since the scan) is an error: silently substituting the primary would show
+/// the wrong display and can expose pixels the viewer never selected.
 fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
     if let Some(id) = monitor_id {
@@ -3252,7 +3443,9 @@ fn select_monitor(monitor_id: Option<u32>) -> Result<xcap::Monitor, String> {
                 return Ok(m.clone());
             }
         }
-        tracing::warn!("monitor {id} not found (unplugged?); capturing the primary instead");
+        return Err(format!(
+            "monitor {id:#x} not found (unplugged or topology changed)"
+        ));
     }
     let mut first = None;
     for m in monitors {
@@ -5089,6 +5282,70 @@ use allmystuff_pixels::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn experimental_gpu_paths_require_an_explicit_boolean_value() {
+        assert_eq!(explicit_bool_choice(None), None);
+        assert_eq!(explicit_bool_choice(Some("")), None);
+        assert_eq!(explicit_bool_choice(Some("unexpected")), None);
+        for value in ["1", "on", "TRUE", " true "] {
+            assert_eq!(explicit_bool_choice(Some(value)), Some(true), "{value}");
+        }
+        for value in ["0", "off", "FALSE", " false "] {
+            assert_eq!(explicit_bool_choice(Some(value)), Some(false), "{value}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gpu_lane_policy_keeps_normal_modes_safe_and_lossless_honest() {
+        for posture in [Posture::Balanced, Posture::Game, Posture::Studio] {
+            assert!(!gpu_lane_policy(posture, None, None));
+            assert!(gpu_lane_policy(posture, Some(true), None));
+            assert!(!gpu_lane_policy(posture, Some(false), Some(true)));
+        }
+        assert!(gpu_lane_policy(Posture::StudioLossless, None, None));
+        assert!(!gpu_lane_policy(
+            Posture::StudioLossless,
+            None,
+            Some(false)
+        ));
+        assert!(!gpu_lane_policy(
+            Posture::StudioLossless,
+            Some(false),
+            Some(true)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_invalid_hmonitor_errors_trigger_screenshot_reacquisition() {
+        assert!(invalid_monitor_handle(
+            "Invalid monitor handle. (0x800705B5)"
+        ));
+        assert!(invalid_monitor_handle("invalid monitor handle"));
+        assert!(!invalid_monitor_handle("Access is denied. (0x80070005)"));
+        assert!(!invalid_monitor_handle(
+            "screen recording permission denied"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_monitor_reacquisition_never_uses_a_stale_numeric_handle() {
+        assert_eq!(
+            monitor_reacquire_key(None, None),
+            Ok(MonitorReacquireKey::Primary)
+        );
+        assert_eq!(
+            monitor_reacquire_key(Some(0x1234), Some(r"\\.\DISPLAY2")),
+            Ok(MonitorReacquireKey::DeviceName(r"\\.\DISPLAY2".into()))
+        );
+        assert!(monitor_reacquire_key(Some(0x1234), None)
+            .unwrap_err()
+            .contains("refusing stale-handle fallback"));
+    }
 
     #[cfg(windows)]
     #[test]

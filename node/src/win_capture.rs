@@ -82,7 +82,21 @@ impl Drop for Session {
 pub type StartedDuplication = (Session, mpsc::Receiver<RawFrame>, mpsc::SyncSender<Vec<u8>>);
 
 pub fn start(monitor_id: u32) -> Result<StartedDuplication, String> {
-    let mut dup = Duplication::new(monitor_id)?;
+    start_named(monitor_id, None)
+}
+
+/// Start on a route-lifetime display identity when one is available. The
+/// numeric handle is used only for the initial legacy/default-primary bind;
+/// exact monitor routes pass `\\.\DISPLAYn` so every rebuild is immune to
+/// `HMONITOR` recycling.
+pub fn start_named(
+    monitor_id: u32,
+    stable_name: Option<&str>,
+) -> Result<StartedDuplication, String> {
+    let mut dup = match stable_name {
+        Some(name) => Duplication::new_named(name)?,
+        None => Duplication::new(monitor_id)?,
+    };
     // A shallow channel: the consumer drains to the freshest frame each
     // tick; anything it hasn't taken by the time two more arrive is stale.
     let (tx, rx) = mpsc::sync_channel::<RawFrame>(2);
@@ -95,7 +109,7 @@ pub fn start(monitor_id: u32) -> Result<StartedDuplication, String> {
     dup.reclaim = Some(reclaim_rx);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let thread = std::thread::spawn(move || pump(dup, monitor_id, &stop_thread, &tx));
+    let thread = std::thread::spawn(move || pump(dup, &stop_thread, &tx));
     Ok((
         Session {
             stop,
@@ -106,7 +120,7 @@ pub fn start(monitor_id: u32) -> Result<StartedDuplication, String> {
     ))
 }
 
-fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>) {
+fn pump(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>) {
     // The duplication readback competes with whatever loaded the GPU/CPU —
     // the exact condition the stream exists for.
     crate::os_perf::boost_media_thread();
@@ -120,19 +134,31 @@ fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::Syn
             Ok(None) => {} // timeout (idle screen) or a mouse-only update
             Err(NextError::AccessLost) => {
                 // Mode change / fullscreen toggle / secure desktop: the
-                // duplication is dead but the monitor isn't. Re-acquire
-                // for up to ~10 s before giving up on the session.
-                tracing::debug!("duplication of monitor {monitor_id:#x} lost — re-acquiring");
+                // duplication is dead but the output identity remains. A
+                // wake/topology change can replace HMONITOR, so rebind by
+                // `\\.\DISPLAYn`, never by the dead numeric handle.
+                let old_id = dup.monitor_id;
+                let device_name = dup.device_name.clone();
+                tracing::debug!(
+                    "duplication of {device_name} ({old_id:#x}) lost — re-acquiring by name"
+                );
+                // DXGI requires the lost duplication interface to be
+                // released before DuplicateOutput is attempted again.
+                drop(dup.dup.take());
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
-                    match Duplication::new(monitor_id) {
+                    match Duplication::new_named(&device_name) {
                         Ok(mut d) => {
                             // The reclaim lane outlives the duplication —
                             // carry it onto the rebuilt session.
                             d.reclaim = dup.reclaim.take();
+                            tracing::info!(
+                                "duplication rebound {device_name}: {old_id:#x} -> {:#x}",
+                                d.monitor_id
+                            );
                             dup = d;
                             break;
                         }
@@ -142,7 +168,7 @@ fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::Syn
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "duplication of monitor {monitor_id:#x} not recoverable: {e}"
+                                "duplication of {device_name} ({old_id:#x}) not recoverable: {e}"
                             );
                             return;
                         }
@@ -150,7 +176,11 @@ fn pump(mut dup: Duplication, monitor_id: u32, stop: &AtomicBool, tx: &mpsc::Syn
                 }
             }
             Err(NextError::Fatal(e)) => {
-                tracing::warn!("duplication of monitor {monitor_id:#x} ended: {e}");
+                tracing::warn!(
+                    "duplication of {} ({:#x}) ended: {e}",
+                    dup.device_name,
+                    dup.monitor_id
+                );
                 return;
             }
         }
@@ -164,31 +194,38 @@ enum NextError {
     Fatal(String),
 }
 
-/// Find the output whose `HMONITOR` is `monitor_id` on `device`'s adapter
-/// and duplicate *only* that one — an already-duplicated sibling output
-/// must not abort us. Returns the duplication plus its clockwise scan-out
-/// rotation: the duplicated output's own rotation is the ground truth for
-/// how its raw scan-out is oriented — far more reliable than a separate
-/// monitor-rotation query, which can report the native (unrotated)
-/// geometry. Read once: it's fixed for the duplication's life, and an
-/// orientation change tears the duplication down with ACCESS_LOST (the
-/// pump re-acquires, re-reading it on the fresh one).
-unsafe fn duplicate_output(
-    device: &ID3D11Device,
+/// One DXGI output binding. `monitor_id` is the volatile `HMONITOR`; the
+/// `device_name` (`\\.\DISPLAYn`) is the route-lifetime identity used to
+/// find the same output again after Windows invalidates and replaces the
+/// handle during wake/topology changes.
+struct BoundOutput {
+    dup: IDXGIOutputDuplication,
+    rotation_deg: u32,
     monitor_id: u32,
-) -> Result<(IDXGIOutputDuplication, u32), String> {
+    device_name: String,
+}
+
+/// Find and duplicate one output on `device`'s adapter. An
+/// already-duplicated sibling output must not abort the search. The
+/// duplicated output's own rotation is authoritative for raw scan-out.
+unsafe fn duplicate_matching_output(
+    device: &ID3D11Device,
+    wanted: &str,
+    mut matches: impl FnMut(u32, &str) -> bool,
+) -> Result<BoundOutput, String> {
     let dxgi: IDXGIDevice = device.cast().map_err(|e| e.to_string())?;
     let adapter: IDXGIAdapter = dxgi.GetAdapter().map_err(|e| e.to_string())?;
     let mut index = 0u32;
     loop {
         let Ok(output) = adapter.EnumOutputs(index) else {
-            return Err(format!(
-                "monitor {monitor_id:#x} not found on the primary adapter"
-            ));
+            return Err(format!("monitor {wanted} not found on the capture adapter"));
         };
         index += 1;
         let desc = output.GetDesc().map_err(|e| e.to_string())?;
-        if desc.Monitor.0 as usize as u32 != monitor_id {
+        let monitor_id = desc.Monitor.0 as usize as u32;
+        let name_end = desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+        let device_name = String::from_utf16_lossy(&desc.DeviceName[..name_end]);
+        if !matches(monitor_id, &device_name) {
             continue;
         }
         let output1: IDXGIOutput1 = output.cast().map_err(|e| e.to_string())?;
@@ -202,17 +239,36 @@ unsafe fn duplicate_output(
             DXGI_MODE_ROTATION_ROTATE270 => 270,
             _ => 0, // IDENTITY / UNSPECIFIED / anything else: upright.
         };
-        // The datastream↔monitor link: this device name is the same
-        // `\\.\DISPLAYn` key the telemetry `monitors:` line prints, so
-        // one grep correlates a route's stream with the physical panel's
-        // mode/refresh/position — the multi-monitor field-test question.
-        let name_end = desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+        // The datastream↔monitor link uses the same `\\.\DISPLAYn` key as
+        // telemetry, so one grep correlates the route with its panel.
         tracing::info!(
             "capture bound to {} (monitor id {monitor_id} · rotation {rotation_deg}°)",
-            String::from_utf16_lossy(&desc.DeviceName[..name_end])
+            device_name
         );
-        return Ok((dup, rotation_deg));
+        return Ok(BoundOutput {
+            dup,
+            rotation_deg,
+            monitor_id,
+            device_name,
+        });
     }
+}
+
+/// Initial bind by the advertised raw monitor handle.
+unsafe fn duplicate_output(device: &ID3D11Device, monitor_id: u32) -> Result<BoundOutput, String> {
+    duplicate_matching_output(device, &format!("{monitor_id:#x}"), |candidate, _| {
+        candidate == monitor_id
+    })
+}
+
+/// Rebind by the stable route-lifetime display name after `HMONITOR` churn.
+unsafe fn duplicate_output_named(
+    device: &ID3D11Device,
+    device_name: &str,
+) -> Result<BoundOutput, String> {
+    duplicate_matching_output(device, device_name, |_, candidate| {
+        candidate.eq_ignore_ascii_case(device_name)
+    })
 }
 
 /// Fetch the current pointer bitmap from a held frame (held-frame only).
@@ -254,9 +310,11 @@ struct CursorShape {
 }
 
 struct Duplication {
-    _device: ID3D11Device,
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
-    dup: IDXGIOutputDuplication,
+    dup: Option<IDXGIOutputDuplication>,
+    monitor_id: u32,
+    device_name: String,
     /// CPU-readable copy target, reused across frames of the same size.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     /// Clockwise degrees from `DXGI_OUTDUPL_DESC.Rotation`, read at
@@ -292,6 +350,16 @@ struct Duplication {
 
 impl Duplication {
     fn new(monitor_id: u32) -> Result<Self, String> {
+        Self::open(|device| unsafe { duplicate_output(device, monitor_id) })
+    }
+
+    fn new_named(device_name: &str) -> Result<Self, String> {
+        Self::open(|device| unsafe { duplicate_output_named(device, device_name) })
+    }
+
+    fn open(
+        bind: impl FnOnce(&ID3D11Device) -> Result<BoundOutput, String>,
+    ) -> Result<Self, String> {
         unsafe {
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
@@ -309,13 +377,15 @@ impl Duplication {
             .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
             let device = device.ok_or("D3D11CreateDevice returned no device")?;
             let context = context.ok_or("D3D11CreateDevice returned no context")?;
-            let (dup, rotation_deg) = duplicate_output(&device, monitor_id)?;
+            let bound = bind(&device)?;
             Ok(Duplication {
-                _device: device,
+                device,
                 context,
-                dup,
+                dup: Some(bound.dup),
+                monitor_id: bound.monitor_id,
+                device_name: bound.device_name,
                 staging: None,
-                rotation_deg,
+                rotation_deg: bound.rotation_deg,
                 cursor: None,
                 ptr_x: 0,
                 ptr_y: 0,
@@ -332,12 +402,14 @@ impl Duplication {
     /// timeout or a cursor-only update (no new pixels).
     fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<RawFrame>, NextError> {
         unsafe {
+            let dup = self
+                .dup
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| NextError::Fatal("duplication is not bound".into()))?;
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
-            if let Err(e) = self
-                .dup
-                .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
-            {
+            if let Err(e) = dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
                 return match e.code() {
                     c if c == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
                     c if c == DXGI_ERROR_ACCESS_LOST => Err(NextError::AccessLost),
@@ -350,7 +422,7 @@ impl Duplication {
             if info.PointerShapeBufferSize > 0 {
                 // A new pointer bitmap is available — cache it. Best-effort:
                 // a failed fetch keeps the previous shape, never breaks capture.
-                self.update_cursor_shape(info.PointerShapeBufferSize);
+                self.update_cursor_shape(&dup, info.PointerShapeBufferSize);
             }
             if info.LastMouseUpdateTime != 0 {
                 let p = info.PointerPosition;
@@ -362,7 +434,7 @@ impl Duplication {
                 // No new desktop pixels: release at once. If only the pointer
                 // moved, re-emit the retained clean frame with the cursor at
                 // its new spot so it doesn't freeze on a static screen.
-                let _ = self.dup.ReleaseFrame();
+                let _ = dup.ReleaseFrame();
                 return Ok(self.cursor_only_frame());
             }
             // New desktop pixels: queue the GPU copy into our reusable
@@ -373,7 +445,7 @@ impl Duplication {
             // documented fast path, and `Map` still waits for the queued
             // copy to complete.
             let queued = self.queue_copy(resource);
-            let _ = self.dup.ReleaseFrame();
+            let _ = dup.ReleaseFrame();
             match queued.map_err(NextError::Fatal)? {
                 Some((staging, w, h)) => self.read_back(&staging, w, h).map_err(NextError::Fatal),
                 None => Ok(None),
@@ -383,8 +455,8 @@ impl Duplication {
 
     /// Fetch and cache the current pointer bitmap (held-frame only). Silent on
     /// failure — the cursor just keeps its last shape.
-    unsafe fn update_cursor_shape(&mut self, size: u32) {
-        if let Some(shape) = fetch_cursor_shape(&self.dup, size) {
+    unsafe fn update_cursor_shape(&mut self, dup: &IDXGIOutputDuplication, size: u32) {
+        if let Some(shape) = fetch_cursor_shape(dup, size) {
             self.cursor = Some(shape);
         }
     }
@@ -504,7 +576,7 @@ impl Duplication {
             MiscFlags: 0,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
-        self._device
+        self.device
             .CreateTexture2D(&desc, None, Some(&mut tex))
             .map_err(|e| format!("CreateTexture2D (staging): {e}"))?;
         let tex = tex.ok_or("CreateTexture2D returned no texture")?;
@@ -651,7 +723,7 @@ fn composite_cursor_impl<const BGRA_DST: bool>(
 }
 
 #[cfg(feature = "host")]
-pub use gpu_lane::{start_gpu, GpuFrame, GpuLane};
+pub use gpu_lane::{start_gpu, start_gpu_named, GpuFrame, GpuLane};
 
 /// The GPU zero-copy capture lane: duplication, cursor composite, and
 /// BGRA→NV12 conversion all on **one** D3D11 device, frames leaving as
@@ -756,14 +828,31 @@ mod gpu_lane {
     /// Rotated outputs are declined here: the VideoProcessor could rotate,
     /// but they're rare and the CPU lane's rotation path is proven.
     pub fn start_gpu(monitor_id: u32, out_edge: u32) -> Result<GpuLane, String> {
+        start_gpu_named(monitor_id, None, out_edge)
+    }
+
+    /// Start the experimental shared-texture lane on a stable display name
+    /// when the route has one. Repeated lane rebuilds therefore cannot follow
+    /// a recycled numeric monitor handle onto a different screen.
+    pub fn start_gpu_named(
+        monitor_id: u32,
+        stable_name: Option<&str>,
+        out_edge: u32,
+    ) -> Result<GpuLane, String> {
         let (device, context) = create_video_device()?;
-        let (dup, rotation_deg) = unsafe { duplicate_output(&device, monitor_id)? };
-        if rotation_deg != 0 {
+        let bound = unsafe {
+            match stable_name {
+                Some(name) => duplicate_output_named(&device, name)?,
+                None => duplicate_output(&device, monitor_id)?,
+            }
+        };
+        if bound.rotation_deg != 0 {
             return Err(format!(
-                "output is rotated ({rotation_deg}°) — the CPU lane handles rotation"
+                "output is rotated ({}°) — the CPU lane handles rotation",
+                bound.rotation_deg
             ));
         }
-        let desc = unsafe { dup.GetDesc() };
+        let desc = unsafe { bound.dup.GetDesc() };
         let (sw, sh) = (desc.ModeDesc.Width, desc.ModeDesc.Height);
         if sw == 0 || sh == 0 {
             return Err("duplication reports a degenerate mode".into());
@@ -795,7 +884,9 @@ mod gpu_lane {
         let mut d = GpuDup {
             device,
             context,
-            dup,
+            dup: Some(bound.dup),
+            monitor_id: bound.monitor_id,
+            device_name: bound.device_name,
             gpu,
             clean,
             cursor_staging: None,
@@ -811,7 +902,7 @@ mod gpu_lane {
             release: release_rx,
         };
         let device = d.device.clone();
-        let thread = std::thread::spawn(move || pump_gpu(&mut d, monitor_id, &stop_thread, &tx));
+        let thread = std::thread::spawn(move || pump_gpu(&mut d, &stop_thread, &tx));
         Ok(GpuLane {
             session: Session {
                 stop,
@@ -862,7 +953,9 @@ mod gpu_lane {
     struct GpuDup {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
-        dup: IDXGIOutputDuplication,
+        dup: Option<IDXGIOutputDuplication>,
+        monitor_id: u32,
+        device_name: String,
         gpu: GpuConvert,
         /// The persistent cursor-free desktop image — GPU-resident,
         /// refreshed by each damage frame's `CopyResource`. The cursor
@@ -897,12 +990,7 @@ mod gpu_lane {
     // driven only by the capture thread this value moves onto at spawn.
     unsafe impl Send for GpuDup {}
 
-    fn pump_gpu(
-        d: &mut GpuDup,
-        monitor_id: u32,
-        stop: &AtomicBool,
-        tx: &mpsc::SyncSender<GpuFrame>,
-    ) {
+    fn pump_gpu(d: &mut GpuDup, stop: &AtomicBool, tx: &mpsc::SyncSender<GpuFrame>) {
         crate::os_perf::boost_media_thread();
         while !stop.load(Ordering::SeqCst) {
             // Slots the consumer has finished with go back into rotation
@@ -914,22 +1002,29 @@ mod gpu_lane {
                 Ok(()) => {}
                 Err(NextError::AccessLost) => {
                     // Mode change / fullscreen toggle / secure desktop.
-                    // Re-acquire on the same device — but if the mode came
+                    // Re-acquire the same named output on the same device;
+                    // Windows may have replaced its raw HMONITOR. If the mode came
                     // back *different* (size or rotation), every fitted
                     // size in the lane is stale: end the thread and let
                     // the consumer restart the lane fresh.
+                    let old_id = d.monitor_id;
+                    let device_name = d.device_name.clone();
                     tracing::debug!(
-                        "GPU-lane duplication of monitor {monitor_id:#x} lost — re-acquiring"
+                        "GPU-lane duplication of {device_name} ({old_id:#x}) lost — re-acquiring by name"
                     );
+                    // A lost duplication must be released before DXGI will
+                    // permit DuplicateOutput on the replacement interface.
+                    drop(d.dup.take());
                     let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
                         if stop.load(Ordering::SeqCst) {
                             return;
                         }
-                        match unsafe { duplicate_output(&d.device, monitor_id) } {
-                            Ok((dup, rot)) => {
-                                let desc = unsafe { dup.GetDesc() };
-                                if rot != 0 || (desc.ModeDesc.Width, desc.ModeDesc.Height) != d.src
+                        match unsafe { duplicate_output_named(&d.device, &device_name) } {
+                            Ok(bound) => {
+                                let desc = unsafe { bound.dup.GetDesc() };
+                                if bound.rotation_deg != 0
+                                    || (desc.ModeDesc.Width, desc.ModeDesc.Height) != d.src
                                 {
                                     tracing::debug!(
                                         "GPU-lane duplication came back with a different mode — \
@@ -937,7 +1032,13 @@ mod gpu_lane {
                                     );
                                     return;
                                 }
-                                d.dup = dup;
+                                tracing::info!(
+                                    "GPU-lane duplication rebound {device_name}: {old_id:#x} -> {:#x}",
+                                    bound.monitor_id
+                                );
+                                d.dup = Some(bound.dup);
+                                d.monitor_id = bound.monitor_id;
+                                d.device_name = bound.device_name;
                                 break;
                             }
                             Err(e) if Instant::now() < deadline => {
@@ -946,7 +1047,7 @@ mod gpu_lane {
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "GPU-lane duplication of monitor {monitor_id:#x} \
+                                    "GPU-lane duplication of {device_name} ({old_id:#x}) \
                                      not recoverable: {e}"
                                 );
                                 return;
@@ -955,7 +1056,11 @@ mod gpu_lane {
                     }
                 }
                 Err(NextError::Fatal(e)) => {
-                    tracing::warn!("GPU-lane capture for monitor {monitor_id:#x} ended: {e}");
+                    tracing::warn!(
+                        "GPU-lane capture for {} ({:#x}) ended: {e}",
+                        d.device_name,
+                        d.monitor_id
+                    );
                     return;
                 }
             }
@@ -972,12 +1077,14 @@ mod gpu_lane {
             tx: &mpsc::SyncSender<GpuFrame>,
         ) -> Result<(), NextError> {
             unsafe {
+                let dup = self
+                    .dup
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| NextError::Fatal("GPU duplication is not bound".into()))?;
                 let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
                 let mut resource: Option<IDXGIResource> = None;
-                if let Err(e) = self
-                    .dup
-                    .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
-                {
+                if let Err(e) = dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
                     return match e.code() {
                         c if c == DXGI_ERROR_WAIT_TIMEOUT => Ok(()),
                         c if c == DXGI_ERROR_ACCESS_LOST => Err(NextError::AccessLost),
@@ -985,8 +1092,7 @@ mod gpu_lane {
                     };
                 }
                 if info.PointerShapeBufferSize > 0 {
-                    if let Some(shape) = fetch_cursor_shape(&self.dup, info.PointerShapeBufferSize)
-                    {
+                    if let Some(shape) = fetch_cursor_shape(&dup, info.PointerShapeBufferSize) {
                         self.cursor = Some(shape);
                     }
                 }
@@ -1002,7 +1108,7 @@ mod gpu_lane {
                     // same discipline as the CPU lane (holding the frame
                     // throttles the compositor).
                     let refreshed = self.refresh_clean(resource);
-                    let _ = self.dup.ReleaseFrame();
+                    let _ = dup.ReleaseFrame();
                     if !refreshed {
                         return Ok(());
                     }
@@ -1013,7 +1119,7 @@ mod gpu_lane {
                     // the time it saw them.
                     self.presented = Some(qpc_to_instant(info.LastPresentTime));
                 } else {
-                    let _ = self.dup.ReleaseFrame();
+                    let _ = dup.ReleaseFrame();
                     // Pointer-only update: re-emit the retained clean
                     // desktop with the cursor at its new spot, rate-limited
                     // so a fast mouse can't spin the pump.

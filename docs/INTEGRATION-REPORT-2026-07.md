@@ -213,8 +213,8 @@ Ranked by how much they act without being asked:
 | Adaptive IDR cadence | ON (pre-existing, benign recovery lever: 2 s↔8 s) | — |
 | GDR wave + loss-aware length | Game posture only (GDR streams) | posture-gated |
 | Link-fitted pacer drain | ON (LAN keeps original constants; WAN stops inheriting them) | `ALLMYSTUFF_PACED_SLICES=0` off · `ALLMYSTUFF_PACE_DRAIN_MBPS` pin |
-| NVENC rung | ON with soft fallback to MF | `ALLMYSTUFF_NVENC=0` pins MF |
-| GPU zero-copy lane | ON with soft fallback to CPU lane | `ALLMYSTUFF_GPU_LANE=0` |
+| Direct NVENC SDK rung | OFF for normal lossy postures; the vendor hardware MFT is the production default. Selecting Studio·Lossless explicitly permits its only const-QP-0 rung. | `ALLMYSTUFF_NVENC=1` enables direct SDK for normal postures · `0` pins the vendor MFT and disables direct lossless |
+| GPU zero-copy lane | OFF for normal lossy postures after production A/B isolated unbounded driver waits in live shared-texture submission; CPU-DXGI capture still feeds NVIDIA/Intel/AMD hardware encoders. Studio·Lossless explicitly enables the texture lane required by its const-QP-0 encoder. | `ALLMYSTUFF_GPU_LANE=1` enables the experimental lane · `0` is an unconditional kill switch |
 | MMCSS scheduling class | OFF | `ALLMYSTUFF_MMCSS=1` |
 | HEVC decode rung choice | auto (NVDEC→D3D11VA) | `ALLMYSTUFF_HEVC_DECODER=nvdec\|d3d11va` |
 

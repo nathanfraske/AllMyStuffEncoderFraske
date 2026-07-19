@@ -46,9 +46,11 @@ opaque `ext` field on `RouteControl::VideoFeedback`/`Tune` (commit
 ```
 
 Capture and the BGRA→NV12 conversion feed a GPU texture straight into the
-encoder when the zero-copy lane is up (`ALLMYSTUFF_GPU_LANE`); otherwise
-a CPU NV12 buffer. Everything from ENCODE rightward is what this guide
-covers.
+encoder only when the experimental zero-copy lane is explicitly enabled
+(`ALLMYSTUFF_GPU_LANE=1`) or Studio·Lossless explicitly requests its required
+const-QP-0 texture path; normal production defaults to CPU-DXGI capture
+feeding the vendor hardware encoder through a CPU NV12 buffer. Everything
+from ENCODE rightward is what this guide covers.
 
 ## Encode — the ladder and how a rung is picked
 
@@ -136,11 +138,11 @@ elsewhere). Unset = the shipped default; every dial is fail-soft.
 **Selection / codec**
 | Dial | Effect |
 |---|---|
-| `ALLMYSTUFF_NVENC` / `ALLMYSTUFF_AMF` | force/skip that encode rung |
+| `ALLMYSTUFF_NVENC` / `ALLMYSTUFF_AMF` | enable/skip the direct SDK rung (`NVENC=1` is required for normal lossy postures; Studio·Lossless is an explicit exception, while `NVENC=0` disables it too) |
 | `ALLMYSTUFF_NVENC_PRESET` | preset override (P1–P5; P6/P7 refused) |
 | `ALLMYSTUFF_HEVC_DECODER` / `ALLMYSTUFF_AV1_DECODER` | pin a decode rung (`nvdec`/`d3d11va`) |
 | `ALLMYSTUFF_VIDEO_ENCODE_ADAPTER` | choose the encode GPU |
-| `ALLMYSTUFF_GPU_LANE` | enable/disable the zero-copy capture→encode lane |
+| `ALLMYSTUFF_GPU_LANE` | `1` enables the experimental zero-copy capture→encode lane; unset uses CPU-DXGI + hardware encode except for explicit Studio·Lossless; `0` disables the lane unconditionally |
 
 **Posture / rate**
 | Dial | Effect |
