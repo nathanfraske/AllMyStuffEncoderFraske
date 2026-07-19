@@ -106,6 +106,9 @@ pub enum VideoPacket {
     H264 {
         /// Annex-B access unit.
         data: Vec<u8>,
+        /// Independently decodable access unit. This stays process-local for
+        /// queue recovery; the existing RTP payload remains unchanged.
+        key: bool,
         /// Capture-tick pacing for the RTP clock (1/fps).
         duration_us: u64,
     },
@@ -1267,19 +1270,19 @@ impl VideoBridge {
     /// WAN-class (Unknown counts — conservative until ICE says LAN), and
     /// the current send rate in bps (0 = no live encode lane; the pacer
     /// keeps its LAN constants).
-    pub fn route_pace(&self, route_id: &str) -> (bool, bool, u32) {
-        let (game, wan) = self
+    pub fn route_pace(&self, route_id: &str) -> (bool, bool, u32, u32) {
+        let (game, wan, fps) = self
             .routes
             .lock()
             .get(route_id)
-            .map(|r| (r.tune.game(), r.tune.link != LinkClass::Lan))
-            .unwrap_or((false, false));
+            .map(|r| (r.tune.game(), r.tune.link != LinkClass::Lan, r.tune.fps()))
+            .unwrap_or((false, false, 60));
         let rate = route_rates()
             .lock()
             .get(route_id)
             .map(|r| r.target.load(Ordering::Relaxed))
             .unwrap_or(0);
-        (game, wan, rate)
+        (game, wan, rate, fps)
     }
 
     /// Record the decode health a viewer reported for one of our streams
@@ -2532,12 +2535,12 @@ fn run_gpu_lane(
         );
     }
     let game = posture == Posture::Game;
-    let lossless = posture == Posture::StudioLossless;
+    let requested_lossless = posture == Posture::StudioLossless;
     // The lossy-fallback opens (rung unavailable, noise guard) run as
     // plain Studio — the posture's spirit with rate control back on.
-    let studio = posture == Posture::Studio || lossless;
+    let studio = posture == Posture::Studio || requested_lossless;
     let mut enc = 'open: {
-        if lossless && nvenc_opt_in() {
+        if requested_lossless && nvenc_opt_in() {
             // Studio·Lossless: the HEVC constQP-0 rung. Anything short of
             // a clean open degrades to lossy Studio below — the viewer
             // asked for fidelity, and 150 Mbps VBR is the honest next
@@ -2612,7 +2615,11 @@ fn run_gpu_lane(
                                                     // Armed only when the lossless rung actually opened — a fallback
                                                     // that already runs rate-controlled studio has nothing to guard
                                                     // (red team, encoder finding 7).
-    let mut noise_guard_armed = lossless && enc.label().contains("studio-lossless");
+    // Runtime behavior follows what actually opened, not merely the requested
+    // posture. A failed lossless open has already landed on rate-controlled
+    // Studio and must immediately participate in rate adaptation and pacing.
+    let mut lossless_active = enc.label().contains("studio-lossless");
+    let mut noise_guard_armed = lossless_active;
     // Hold boost clocks while this route streams — the encode engine's
     // own load doesn't (the soak evidence lives on the struct). RAII:
     // every lane exit path drops it and the GPU goes back to sleep.
@@ -2664,12 +2671,19 @@ fn run_gpu_lane(
             }
         }
     }
-    let _rate_reg = RateReg((!lossless).then(|| {
-        route_rates()
-            .lock()
-            .insert(route_id.to_string(), rate.clone());
-        route_id.to_string()
-    }));
+    let mut rate_registered = false;
+    let register_rate = |registered: &mut bool| {
+        if !*registered {
+            route_rates()
+                .lock()
+                .insert(route_id.to_string(), rate.clone());
+            *registered = true;
+        }
+    };
+    if !lossless_active {
+        register_rate(&mut rate_registered);
+    }
+    let _rate_reg = RateReg(Some(route_id.to_string()));
     let mut applied_rate = bitrate;
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
@@ -2769,7 +2783,7 @@ fn run_gpu_lane(
                 // mid-heal) pins the target back so the controller never
                 // chases a knob wired to nothing.
                 let want_rate = rate.target.load(Ordering::Relaxed);
-                if want_rate != applied_rate && want_rate > 0 && !lossless {
+                if want_rate != applied_rate && want_rate > 0 && !lossless_active {
                     if enc.set_bitrate(want_rate) {
                         tracing::info!(
                             "{}: rate re-aimed {:.1} → {:.1} Mbps in place for {route_id}",
@@ -2877,6 +2891,8 @@ fn run_gpu_lane(
                                         // decoder — the same seam a posture
                                         // retune crosses.
                                         enc = GpuCodec::Nvenc(n);
+                                        lossless_active = false;
+                                        register_rate(&mut rate_registered);
                                         refresh.store(true, Ordering::SeqCst);
                                     }
                                     Err(e) => {
@@ -2913,7 +2929,9 @@ fn run_gpu_lane(
                                 // no GDR: the periodic-IDR cadence takes
                                 // recovery duty back.
                                 enc = GpuCodec::Mf(next);
-                                gdr = false;
+                                disable_gdr_route(route_id, &mut gdr, &wave);
+                                lossless_active = false;
+                                register_rate(&mut rate_registered);
                                 refresh.store(true, Ordering::SeqCst);
                             }
                             Ok(None) => {}
@@ -2981,6 +2999,9 @@ fn run_gpu_lane(
                             }) {
                                 Ok(Some(next)) => {
                                     enc = GpuCodec::Mf(next);
+                                    disable_gdr_route(route_id, &mut gdr, &wave);
+                                    lossless_active = false;
+                                    register_rate(&mut rate_registered);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
@@ -3018,6 +3039,9 @@ fn run_gpu_lane(
                             }) {
                                 Ok(Some(next)) => {
                                     enc = GpuCodec::Mf(next);
+                                    disable_gdr_route(route_id, &mut gdr, &wave);
+                                    lossless_active = false;
+                                    register_rate(&mut rate_registered);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
@@ -4085,6 +4109,7 @@ fn packetize_units(
             stats.bytes += data.len() as u64;
             VideoPacket::H264 {
                 data,
+                key,
                 duration_us: per_unit,
             }
         })
@@ -4118,6 +4143,26 @@ pub(crate) fn wave_flags(
         parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<AtomicU32>>>,
     > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     &FLAGS
+}
+
+/// A direct-SDK heal onto Media Foundation loses rolling intra refresh. Clear
+/// both the lane-local bit and the feedback registry atomically enough for the
+/// control path: subsequent loss reports must request an IDR, never write a
+/// stale wave flag that no encoder will consume.
+#[cfg(windows)]
+fn disable_gdr_route(route_id: &str, gdr: &mut bool, wave: &Arc<AtomicU32>) {
+    *gdr = false;
+    wave.store(0, Ordering::SeqCst);
+    let mut flags = wave_flags().lock();
+    if flags
+        .get(route_id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, wave))
+    {
+        flags.remove(route_id);
+    }
+    tracing::info!(
+        "video encoder fallback for {route_id}: GDR wave unregistered; IDR recovery restored"
+    );
 }
 
 /// The steady-state wave length for `fps` — the same shape init
@@ -4916,6 +4961,19 @@ use allmystuff_pixels::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn mf_fallback_unregisters_the_stale_gdr_wave() {
+        let route = "test:gdr-to-mf";
+        let wave = Arc::new(AtomicU32::new(7));
+        wave_flags().lock().insert(route.into(), wave.clone());
+        let mut gdr = true;
+        disable_gdr_route(route, &mut gdr, &wave);
+        assert!(!gdr);
+        assert_eq!(wave.load(Ordering::SeqCst), 0);
+        assert!(!wave_flags().lock().contains_key(route));
+    }
 
     /// One synthetic Annex-B NAL: start code + header byte (type in the
     /// low 5 bits) + a body that can't fake a start code.

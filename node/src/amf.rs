@@ -47,6 +47,29 @@ const AMF_OK: AmfResult = 0;
 const AMF_EOF: AmfResult = 23;
 const AMF_REPEAT: AmfResult = 24;
 const AMF_INPUT_FULL: AmfResult = 25;
+
+type EncodedUnit = (Vec<u8>, bool);
+
+/// Retry a saturated submit without discarding the output that made room.
+fn submit_preserving_output(
+    mut submit: impl FnMut() -> AmfResult,
+    mut drain: impl FnMut() -> Result<Option<EncodedUnit>, String>,
+    mut backoff: impl FnMut(),
+) -> Result<(AmfResult, Vec<EncodedUnit>, u8), String> {
+    let mut units = Vec::new();
+    let mut fulls = 0u8;
+    loop {
+        let status = submit();
+        if status != AMF_INPUT_FULL || fulls >= 8 {
+            return Ok((status, units, fulls));
+        }
+        fulls += 1;
+        if let Some(unit) = drain()? {
+            units.push(unit);
+        }
+        backoff();
+    }
+}
 const AMF_NEED_MORE_INPUT: AmfResult = 44;
 
 /// The full-version word AMF speaks (`AMF_MAKE_FULL_VERSION`): the
@@ -366,6 +389,8 @@ pub(crate) struct AmfAvc {
     game: bool,
     studio: bool,
     frame_index: u64,
+    backpressure_drains: u64,
+    backpressure_units: u64,
     label: String,
 }
 
@@ -543,6 +568,8 @@ impl AmfAvc {
                 game,
                 studio,
                 frame_index: 0,
+                backpressure_drains: 0,
+                backpressure_units: 0,
                 label,
             })
         }
@@ -584,40 +611,61 @@ impl AmfAvc {
             }
             let duration = 10_000_000 / u64::from(self.fps.max(1));
             let input_ts = self.frame_index * duration;
-            self.frame_index += 1;
 
             // Submit; a full input queue drains one output and retries.
-            let mut submit_status;
-            let mut tries = 0;
-            loop {
-                submit_status =
-                    ((*(*self.encoder).vtbl).submit_input)(self.encoder, surface as *mut AmfData);
-                if submit_status == AMF_INPUT_FULL && tries < 8 {
-                    tries += 1;
-                    let _ = self.drain_one();
-                    std::thread::sleep(std::time::Duration::from_micros(500));
-                    continue;
-                }
-                break;
-            }
+            let encoder = self.encoder;
+            let submitted = submit_preserving_output(
+                || ((*(*encoder).vtbl).submit_input)(encoder, surface as *mut AmfData),
+                || self.drain_one(),
+                || std::thread::sleep(std::time::Duration::from_micros(500)),
+            );
             ((*(*surface).vtbl).release)(surface);
+            let (submit_status, mut units, fulls) = submitted?;
+            if fulls > 0 {
+                let before = self.backpressure_drains;
+                self.backpressure_drains += u64::from(fulls);
+                self.backpressure_units += units.len() as u64;
+                let log_every = u64::from(self.fps.max(1)) * 5;
+                if before == 0 || before / log_every != self.backpressure_drains / log_every {
+                    tracing::warn!(
+                        "AMF backpressure: {} relief drains, {} access units conserved",
+                        self.backpressure_drains,
+                        self.backpressure_units
+                    );
+                }
+            }
+            if submit_status == AMF_INPUT_FULL {
+                return Ok(crate::video::EncodeOutcome {
+                    units,
+                    consumed: false,
+                    input_ts: 0,
+                });
+            }
             if submit_status != AMF_OK && submit_status != AMF_NEED_MORE_INPUT {
                 return Err(format!("AMF SubmitInput: {submit_status}"));
             }
+            self.frame_index += 1;
 
             // Poll for the AU (cap ~10 ms — ULL produces in-frame).
-            for _ in 0..40 {
-                match self.drain_one()? {
-                    Some((data, key)) => {
-                        let mut o = crate::video::EncodeOutcome::consumed(Some((data, key)));
-                        o.input_ts = input_ts;
-                        return Ok(o);
+            if units.is_empty() {
+                for _ in 0..40 {
+                    match self.drain_one()? {
+                        Some(unit) => {
+                            units.push(unit);
+                            break;
+                        }
+                        None => std::thread::sleep(std::time::Duration::from_micros(250)),
                     }
-                    None => std::thread::sleep(std::time::Duration::from_micros(250)),
                 }
             }
-            // Pipeline still warming (first frames on some drivers).
-            Ok(crate::video::EncodeOutcome::consumed(None))
+            while let Some(unit) = self.drain_one()? {
+                units.push(unit);
+            }
+            Ok(crate::video::EncodeOutcome {
+                units,
+                consumed: true,
+                input_ts,
+            })
         }
     }
 
@@ -647,6 +695,11 @@ impl AmfAvc {
         let buffer = raw as *mut AmfBuffer;
         let size = ((*(*buffer).vtbl).get_size)(buffer);
         let native = ((*(*buffer).vtbl).get_native)(buffer);
+        if size > 0 && native.is_null() {
+            ((*(*buffer).vtbl).release)(buffer);
+            ((*(*data).vtbl).release)(data);
+            return Err("AMF output buffer has bytes but no native pointer".into());
+        }
         let mut bytes = vec![0u8; size];
         if size > 0 && !native.is_null() {
             std::ptr::copy_nonoverlapping(native as *const u8, bytes.as_mut_ptr(), size);
@@ -718,6 +771,52 @@ impl Drop for AmfAvc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_full_drain_preserves_every_access_unit_in_order() {
+        let mut submits = std::collections::VecDeque::from([
+            AMF_INPUT_FULL,
+            AMF_INPUT_FULL,
+            AMF_OK,
+        ]);
+        let mut drained = std::collections::VecDeque::from([
+            Some((vec![1], false)),
+            Some((vec![2], true)),
+        ]);
+        let mut backoffs = 0;
+        let (status, units, fulls) = submit_preserving_output(
+            || submits.pop_front().expect("scripted submit"),
+            || Ok(drained.pop_front().expect("scripted drain")),
+            || backoffs += 1,
+        )
+        .expect("backpressure handling");
+        assert_eq!(status, AMF_OK);
+        assert_eq!(units, vec![(vec![1], false), (vec![2], true)]);
+        assert_eq!(fulls, 2);
+        assert_eq!(backoffs, 2);
+    }
+
+    #[test]
+    fn persistent_input_full_returns_drained_units_without_consuming_input() {
+        let mut submits = 0;
+        let mut byte = 0u8;
+        let (status, units, fulls) = submit_preserving_output(
+            || {
+                submits += 1;
+                AMF_INPUT_FULL
+            },
+            || {
+                byte += 1;
+                Ok(Some((vec![byte], false)))
+            },
+            || {},
+        )
+        .expect("bounded backpressure handling");
+        assert_eq!(status, AMF_INPUT_FULL);
+        assert_eq!(submits, 9);
+        assert_eq!(units.len(), 8);
+        assert_eq!(fulls, 8);
+    }
 
     /// The rung's absence contract, provable on any box: the loader
     /// either loads cleanly (a Radeon box) or reports a named, specific

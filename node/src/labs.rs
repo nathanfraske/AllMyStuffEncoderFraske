@@ -61,6 +61,9 @@ pub enum Feature {
     Rescue,
     /// Fence/async encode submit chain.
     EncAsync,
+    /// Route-isolated video sender queues/workers. Intentionally default-off
+    /// until multi-route soak proves the scheduling prototype.
+    VideoSched,
 }
 
 /// One override slot per feature: `0` = follow env, `1` = on, `2` = off.
@@ -76,6 +79,7 @@ fn slot(f: Feature) -> &'static AtomicU8 {
     static GAP_NACK: AtomicU8 = AtomicU8::new(0);
     static RESCUE: AtomicU8 = AtomicU8::new(0);
     static ENC_ASYNC: AtomicU8 = AtomicU8::new(0);
+    static VIDEO_SCHED: AtomicU8 = AtomicU8::new(0);
     match f {
         Feature::Damage => &DAMAGE,
         Feature::PaintPace => &PAINT_PACE,
@@ -88,6 +92,7 @@ fn slot(f: Feature) -> &'static AtomicU8 {
         Feature::GapNack => &GAP_NACK,
         Feature::Rescue => &RESCUE,
         Feature::EncAsync => &ENC_ASYNC,
+        Feature::VideoSched => &VIDEO_SCHED,
     }
 }
 
@@ -108,6 +113,7 @@ fn env_spec(f: Feature) -> (&'static str, bool) {
         Feature::GapNack => ("ALLMYSTUFF_X_GAP_NACK", false),
         Feature::Rescue => ("ALLMYSTUFF_X_RESCUE", false),
         Feature::EncAsync => ("ALLMYSTUFF_X_ENC_ASYNC", false),
+        Feature::VideoSched => ("ALLMYSTUFF_X_VIDEO_SCHED", false),
     }
 }
 
@@ -173,6 +179,7 @@ pub fn set_feature(name: &str, on: bool) {
         "gap_nack" => Feature::GapNack,
         "rescue" => Feature::Rescue,
         "enc_async" => Feature::EncAsync,
+        "video_sched" => Feature::VideoSched,
         _ => {
             tracing::debug!("labs_set: unknown feature {name}");
             return;

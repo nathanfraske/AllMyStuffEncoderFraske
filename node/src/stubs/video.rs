@@ -37,6 +37,8 @@ pub enum VideoPacket {
     H264 {
         /// Annex-B access unit.
         data: Vec<u8>,
+        /// Process-local recovery metadata; never serialized.
+        key: bool,
         /// Capture-tick pacing for the RTP clock (1/fps).
         duration_us: u64,
     },
@@ -322,8 +324,8 @@ impl VideoBridge {
 
     /// Mirror of the real bridge's pacing read — nothing streams here,
     /// so the pacer keeps its constants.
-    pub fn route_pace(&self, _route_id: &str) -> (bool, bool, u32) {
-        (false, false, 0)
+    pub fn route_pace(&self, _route_id: &str) -> (bool, bool, u32, u32) {
+        (false, false, 0, 60)
     }
 
     pub fn note_feedback(
