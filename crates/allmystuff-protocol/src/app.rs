@@ -889,6 +889,15 @@ pub enum RouteControl {
         /// hosts that predate the tri-state. Absent = derive from `game`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        /// **Opaque, encoder/decoder-backend-owned extension.** The
+        /// protocol layer carries it verbatim and never inspects it — the
+        /// node's video pipeline defines its shape and reads it end to
+        /// end. This is the seam that keeps pipeline tuning
+        /// backend-only: any future viewer-requested encoder knob rides
+        /// here instead of adding a typed field to this crate. Absent for
+        /// every peer that doesn't set it.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        ext: serde_json::Value,
     },
     /// "Here's how your stream is actually arriving" — the viewer reports its
     /// decode health back to the streamer, periodically, so the streamer can
@@ -918,17 +927,15 @@ pub enum RouteControl {
         /// wall. Old peers ignore it.
         #[serde(default)]
         lost_ts_us: Option<u64>,
-        /// The viewer's bandwidth estimate for this route's path (kbps;
-        /// 0 = none yet): arrival dispersion of the sender's own paced
-        /// chunk trains — what the closed-loop bitrate converges on.
-        /// Old peers ignore it; absent deserializes as 0.
-        #[serde(default)]
-        est_kbps: u32,
-        /// One-way-delay trend (µs of added delay per second, signed):
-        /// a sustained positive slope is a standing queue growing before
-        /// loss confirms it. Absent deserializes as 0 (flat/unknown).
-        #[serde(default)]
-        delay_trend_us_per_s: i32,
+        /// **Opaque, decoder/encoder-backend-owned extension.** The
+        /// protocol layer relays it verbatim and never inspects it — the
+        /// node's video pipeline defines its shape (bandwidth estimate,
+        /// delay trend, and any future receiver-side signal) and reads it
+        /// end to end. The seam that keeps pipeline tuning backend-only:
+        /// a new feedback metric adds a field to the node's own struct,
+        /// not a typed field here. Absent for peers that don't set it.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        ext: serde_json::Value,
     },
     /// "Your inbound video for this route rides track lane N." The streaming
     /// (host) side tells the viewer which RTP track lane it pinned a

@@ -199,6 +199,30 @@ pub struct RecvFeedback {
     pub at: Instant,
 }
 
+/// Mirror of [`crate::video::PipelineFeedback`] — the opaque-ext seam is
+/// used by `mesh.rs`, compiled on capture-less builds too. Same shape,
+/// same (de)serialization; a viewer node parses/relays feedback exactly
+/// like the real backend even though it never streams.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct PipelineFeedback {
+    #[serde(default)]
+    pub est_kbps: u32,
+    #[serde(default)]
+    pub delay_trend_us_per_s: i32,
+}
+
+impl PipelineFeedback {
+    pub fn to_ext(&self) -> serde_json::Value {
+        if self.est_kbps == 0 && self.delay_trend_us_per_s == 0 {
+            return serde_json::Value::Null;
+        }
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+    pub fn from_ext(ext: &serde_json::Value) -> Self {
+        serde_json::from_value(ext.clone()).unwrap_or_default()
+    }
+}
+
 /// Mirror of [`crate::video::RouteDials`] for surface parity — the GUI's
 /// effective-dials op compiles against this build too, though a capture-less
 /// node never streams and so always answers `None` (see

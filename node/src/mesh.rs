@@ -4714,6 +4714,7 @@ impl Mesh {
                     fps,
                     game,
                     mode,
+                    ext: _, // pipeline-owned; no viewer-requested knob reads it yet
                 } => self.video.retune_dials(
                     &route_id,
                     max_edge,
@@ -4728,9 +4729,13 @@ impl Mesh {
                     decode_fails,
                     queue_depth,
                     lost_ts_us,
-                    est_kbps,
-                    delay_trend_us_per_s,
+                    ext,
                 } => {
+                    // The pipeline's own feedback shape lives in the opaque
+                    // ext — parse it here, at the backend edge, so the
+                    // wire crates never learned what a bandwidth estimate
+                    // is (the seam that keeps tuning backend-only).
+                    let pf = crate::video::PipelineFeedback::from_ext(&ext);
                     if let Some(ts) = lost_ts_us {
                         // Frame health: the viewer named the AU that died.
                         // A GDR (game) route heals with an immediate
@@ -4749,8 +4754,8 @@ impl Mesh {
                         recv_fps,
                         decode_fails,
                         queue_depth,
-                        est_kbps,
-                        delay_trend_us_per_s,
+                        pf.est_kbps,
+                        pf.delay_trend_us_per_s,
                     )
                 }
                 Effect::StopMedia(id) => {
@@ -10237,6 +10242,9 @@ impl Mesh {
                 fps,
                 game,
                 mode,
+                // No viewer-requested pipeline knob today; the seam is here
+                // for when one lands (backend-only, no wire change).
+                ext: serde_json::Value::Null,
             }),
         )
         .await
@@ -10260,6 +10268,11 @@ impl Mesh {
         // same control channel on the ICE datapath as the report always
         // did — zeros for routes with no timed trains yet.
         let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
+        let ext = crate::video::PipelineFeedback {
+            est_kbps,
+            delay_trend_us_per_s,
+        }
+        .to_ext();
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::VideoFeedback {
@@ -10268,8 +10281,7 @@ impl Mesh {
                 decode_fails,
                 queue_depth,
                 lost_ts_us,
-                est_kbps,
-                delay_trend_us_per_s,
+                ext,
             }),
         )
         .await

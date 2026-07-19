@@ -751,6 +751,43 @@ pub struct RecvFeedback {
     pub at: Instant,
 }
 
+/// The video pipeline's OWN feedback payload — the typed shape of the
+/// opaque `ext` bag on `RouteControl::VideoFeedback`. This is the seam
+/// that keeps pipeline tuning backend-only: the protocol/session crates
+/// carry `ext` as an unexamined `serde_json::Value`, and every
+/// receiver-side signal the closed loop needs is a field HERE, added
+/// without ever touching a wire crate or the GUI. `#[serde(default)]`
+/// throughout so an older/leaner peer's absent keys read as zero.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct PipelineFeedback {
+    /// The viewer's chunk-train bandwidth estimate (kbps; 0 = none yet).
+    #[serde(default)]
+    pub est_kbps: u32,
+    /// One-way-delay trend (µs of added delay per second, signed).
+    #[serde(default)]
+    pub delay_trend_us_per_s: i32,
+    // Future receiver-side signals (last-good ts for LTR, per-plane loss,
+    // paint-interval jitter, …) land here — backend-only, no wire change.
+}
+
+impl PipelineFeedback {
+    /// Pack into the opaque wire `ext`; `Null` when nothing is set, so an
+    /// all-default report adds zero bytes and reads identically to a peer
+    /// that sends no ext at all.
+    pub fn to_ext(&self) -> serde_json::Value {
+        if self.est_kbps == 0 && self.delay_trend_us_per_s == 0 {
+            return serde_json::Value::Null;
+        }
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Parse from the opaque wire `ext`; unknown/absent shapes yield the
+    /// all-zero default (a peer that never learned this shape).
+    pub fn from_ext(ext: &serde_json::Value) -> Self {
+        serde_json::from_value(ext.clone()).unwrap_or_default()
+    }
+}
+
 // ---- receiver-driven auto-adaptation ---------------------------------
 //
 // The viewer reports its decode health every couple of seconds

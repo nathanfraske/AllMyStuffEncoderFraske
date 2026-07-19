@@ -2915,6 +2915,19 @@ class AppStore {
       this.openCecSupportFlowFor(node.id);
       return;
     }
+    this.openConsoleResolved(nodeId, node);
+  }
+
+  /** The one console-open implementation — a dedicated OS window on
+   *  desktop, an in-place session on the phone/web. BOTH the normal
+   *  console (above) and the CEC support console (below) funnel through
+   *  here, so the "support console" is a literal clone of the main one:
+   *  it renders the same `ConsoleHost` → `Console.svelte`, wires video
+   *  the same way (`openConsoleHere` → `applyConsoleVideo`), and cannot
+   *  drift. The ONLY thing that differs between them is authorization —
+   *  a CEC customer reaches this after their approval instead of a fleet
+   *  relationship — which is upstream of this method, not inside it. */
+  private openConsoleResolved(nodeId: string, node: MeshNode | undefined) {
     if (!this.consoleAllowed(node, nodeId)) return;
     if (isTauri() && !isMobile()) {
       void openConsoleWindow(nodeId);
@@ -2926,16 +2939,13 @@ class AppStore {
   /** The post-approval console open — the ONLY direct path onto a CEC
    *  customer's console, reached exclusively through a session the customer
    *  just approved (see [`openCecConsoleWhenFound`]). Ordinary machines never
-   *  come through here. */
+   *  come through here. It is the identical open as a normal console
+   *  (`openConsoleResolved`); the CEC-ness was the authorization to get
+   *  here, nothing about the console itself. */
   private openCecConsoleDirect(nodeId: string) {
     const node = this.machineByAnyId(nodeId);
     if (node) nodeId = node.id;
-    if (!this.consoleAllowed(node, nodeId)) return;
-    if (isTauri() && !isMobile()) {
-      void openConsoleWindow(nodeId);
-      return;
-    }
-    this.openConsoleHere(nodeId);
+    this.openConsoleResolved(nodeId, node);
   }
 
   /** Route a CEC customer's console ask through the Support tab: open the
