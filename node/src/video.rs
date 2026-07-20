@@ -5099,11 +5099,13 @@ const NO_POLICY_RATE_CAP: u64 = u64::MAX;
 /// RAII ownership of one entry in [`route_rates`]. The pointer check matters
 /// during encoder healing: a successor can register before the predecessor is
 /// dropped, and the old guard must never remove the new cell.
+#[cfg(windows)]
 struct RouteRateRegistration {
     route_id: String,
     rate: Arc<RouteRate>,
 }
 
+#[cfg(windows)]
 impl RouteRateRegistration {
     fn new(route_id: &str, rate: Arc<RouteRate>) -> Self {
         route_rates()
@@ -5116,6 +5118,7 @@ impl RouteRateRegistration {
     }
 }
 
+#[cfg(windows)]
 impl Drop for RouteRateRegistration {
     fn drop(&mut self) {
         let mut rates = route_rates().lock();
