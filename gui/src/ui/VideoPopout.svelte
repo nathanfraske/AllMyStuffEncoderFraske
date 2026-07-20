@@ -220,14 +220,30 @@
     { label: "8 Mbps", value: 8_000_000 },
     { label: "4 Mbps", value: 4_000_000 },
   ];
+  const ALL_MEDIA_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "500 Mbps", value: 500_000_000 },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "150 Mbps", value: 150_000_000 },
+    { label: "80 Mbps", value: 80_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
+    { label: "25 Mbps", value: 25_000_000 },
+    { label: "10 Mbps", value: 10_000_000 },
+    { label: "4 Mbps", value: 4_000_000 },
+    { label: "1 Mbps", value: 1_000_000 },
+  ];
   let tune = $state<StreamTune>({});
-  let openPill = $state<"res" | "fps" | "rate" | "live" | null>(null);
+  let openPill = $state<"res" | "fps" | "rate" | "all-media" | "live" | null>(null);
   const pillLabel = (choices: PillChoice[], v: number | null | undefined) =>
     choices.find((c) => c.value === (v ?? null))?.label ?? "Auto";
   function pick(field: keyof StreamTune, v: number | null) {
     tune = { ...tune, [field]: v ?? undefined };
     openPill = null;
-    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
+    if (app.videoPopoutLive) {
+      const wireTune = { ...tune, priority: true };
+      if (field === "peerCapBps" && v == null) wireTune.peerCapBps = 0;
+      void tuneRoute(app.videoPopoutLive, wireTune);
+    }
   }
 
   // Mode is the headline control now: Balanced is the stability-first
@@ -238,18 +254,35 @@
   // Res/FPS/Rate pills stay as expert overrides on top. The legacy
   // `game` bool rides along so hosts that predate the tri-state still
   // honor the Game step.
-  // The Mode control (Balanced/Game/Studio/Studio · LL) + its bandwidth
+  // The Mode control (Reach/Balanced/Game/Studio/Studio · Lossless) and warning
   // warning live in the shared ModePill component so the console strip
   // and this bar are the same element. It hands back the resolved wire
   // values; we fold them into the route's tune.
   function applyModeWire(
-    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    wireMode: "reach" | "game" | "studio" | "studio-lossless" | undefined,
     gameFlag: boolean | undefined,
   ) {
     tune = { ...tune, mode: wireMode, game: gameFlag };
     openPill = null;
-    if (app.videoPopoutLive) void tuneRoute(app.videoPopoutLive, tune);
+    if (app.videoPopoutLive) {
+      void tuneRoute(app.videoPopoutLive, { ...tune, priority: true });
+    }
   }
+
+  /** Opening/focusing this window elects its route through a live Tune only;
+   *  no offer, reconnect, or decoder lifecycle is involved. */
+  function prioritizeLive() {
+    if (app.videoPopoutLive) {
+      void tuneRoute(app.videoPopoutLive, { priority: true });
+    }
+  }
+
+  $effect(() => {
+    const route = app.videoPopoutLive;
+    if (route) {
+      void tuneRoute(route, { priority: true });
+    }
+  });
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
@@ -518,7 +551,11 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} onclick={() => (openPill = null)} />
+<svelte:window
+  onkeydown={onWindowKey}
+  onclick={() => (openPill = null)}
+  onfocus={prioritizeLive}
+/>
 
 <!-- role=application: with control granted this is a remote-desktop
      surface — every pointer/key goes to the far machine. It's focusable
@@ -610,7 +647,7 @@
     <span class="spacer"></span>
     {#if ownsRoute}
       {#snippet pillMenu(
-        key: "res" | "fps" | "rate",
+        key: "res" | "fps" | "rate" | "all-media",
         name: string,
         choices: PillChoice[],
         current: number | null | undefined,
@@ -671,7 +708,14 @@
       </button>
       {@render pillMenu("res", "Res", RES_CHOICES, tune.maxEdge, "maxEdge")}
       {@render pillMenu("fps", "FPS", FPS_CHOICES, tune.fps, "fps")}
-      {@render pillMenu("rate", "Rate", RATE_CHOICES, tune.bitrate, "bitrate")}
+      {@render pillMenu(
+        "all-media",
+        "All media",
+        ALL_MEDIA_CHOICES,
+        tune.peerCapBps,
+        "peerCapBps",
+      )}
+      {@render pillMenu("rate", "Route", RATE_CHOICES, tune.bitrate, "bitrate")}
     {/if}
     <button
       class="corner-btn"

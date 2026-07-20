@@ -32,6 +32,77 @@ use allmystuff_protocol::control::{
 };
 pub use allmystuff_protocol::{Request, Response};
 
+/// A decoded local media-pipe frame plus process-local profiler correlation.
+/// `profile_id` is never part of [`InboundFrame`] and is never serialized.
+pub(crate) struct ProfiledInboundFrame {
+    pub frame: InboundFrame,
+    pub profile_id: u64,
+    profile_ts_us: Option<u64>,
+    enqueued_at: Option<std::time::Instant>,
+}
+
+impl ProfiledInboundFrame {
+    /// Record residence in the node's bounded media-dispatch queue at the
+    /// dequeue boundary. Admission backpressure is measured separately by the
+    /// producer, so the two waits do not overlap.
+    pub(crate) fn record_dispatch_wait(&mut self) {
+        crate::pipeline_profile::record_since(
+            &self.frame.from,
+            self.profile_id,
+            self.profile_ts_us,
+            crate::pipeline_profile::Stage::InboundDispatchWait,
+            self.enqueued_at.take(),
+        );
+    }
+}
+
+struct InboundProfileAu {
+    rtp_timestamp: u32,
+    frame_id: u64,
+    last_fragment: std::time::Instant,
+}
+
+/// Reuse one process-local id for paced fragments of the same access unit.
+/// The cache exists only in the opt-in profiler path and is bounded by peer and
+/// stream counts; it never changes the decoded frame or any protocol bytes.
+fn inbound_profile_id(
+    cache: &mut std::collections::HashMap<String, std::collections::HashMap<u8, InboundProfileAu>>,
+    frame: &InboundFrame,
+) -> u64 {
+    const MAX_PEERS: usize = 256;
+    const FRAGMENT_TTL: Duration = Duration::from_secs(1);
+
+    let now = std::time::Instant::now();
+    if !cache.contains_key(frame.from.as_str()) {
+        cache.retain(|_, streams| {
+            streams.retain(|_, au| now.saturating_duration_since(au.last_fragment) < FRAGMENT_TTL);
+            !streams.is_empty()
+        });
+        if cache.len() >= MAX_PEERS {
+            cache.clear();
+        }
+    }
+    let streams = cache.entry(frame.from.clone()).or_default();
+    if let Some(au) = streams.get_mut(&frame.stream) {
+        if au.rtp_timestamp == frame.rtp_timestamp
+            && now.saturating_duration_since(au.last_fragment) < FRAGMENT_TTL
+        {
+            au.last_fragment = now;
+            return au.frame_id;
+        }
+    }
+    let frame_id = crate::pipeline_profile::next_frame_id();
+    streams.insert(
+        frame.stream,
+        InboundProfileAu {
+            rtp_timestamp: frame.rtp_timestamp,
+            frame_id,
+            last_fragment: now,
+        },
+    );
+    frame_id
+}
+
 /// Where the daemon's control socket lives. Recomputed locally (via the
 /// protocol crate) so the GUI never has to link `myownmesh-core`.
 enum SocketAddr {
@@ -202,6 +273,42 @@ impl ControlClient {
         client_id: allmystuff_protocol::ClientId,
         tx: mpsc::Sender<InboundFrame>,
     ) -> Result<()> {
+        self.subscribe_media_source_inner(client_id, tx, |frame, _, _, _| frame)
+            .await
+    }
+
+    /// Internal variant that keeps process-local timing correlation beside the
+    /// decoded frame. Keeping this separate preserves the public
+    /// `subscribe_media_source` API and does not add anything to the media or
+    /// control wire formats.
+    pub(crate) async fn subscribe_profiled_media_source(
+        &self,
+        client_id: allmystuff_protocol::ClientId,
+        tx: mpsc::Sender<ProfiledInboundFrame>,
+    ) -> Result<()> {
+        self.subscribe_media_source_inner(
+            client_id,
+            tx,
+            |frame, profile_id, profile_ts_us, enqueued_at| ProfiledInboundFrame {
+                frame,
+                profile_id,
+                profile_ts_us,
+                enqueued_at,
+            },
+        )
+        .await
+    }
+
+    async fn subscribe_media_source_inner<T, F>(
+        &self,
+        client_id: allmystuff_protocol::ClientId,
+        tx: mpsc::Sender<T>,
+        wrap: F,
+    ) -> Result<()>
+    where
+        T: Send + 'static,
+        F: Fn(InboundFrame, u64, Option<u64>, Option<std::time::Instant>) -> T + Send + 'static,
+    {
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -237,7 +344,12 @@ impl ControlClient {
             // Hold the writer half open for the lifetime of the read loop
             // (dropping it would half-close the pipe).
             let _writer_keepalive = writer;
+            let mut profile_aus = std::collections::HashMap::new();
             loop {
+                // Includes the expected inter-frame wait plus both local-pipe
+                // reads. It is intentionally named wait/read: this is not a
+                // claim that the socket spent the whole span executing I/O.
+                let pipe_started = crate::pipeline_profile::stamp();
                 let mut len_buf = [0u8; 4];
                 if reader.read_exact(&mut len_buf).await.is_err() {
                     break;
@@ -251,13 +363,64 @@ impl ControlClient {
                 if reader.read_exact(&mut body).await.is_err() {
                     break;
                 }
+                let parse_started = crate::pipeline_profile::stamp();
                 let Some(frame) = decode_inbound_frame(&body) else {
                     tracing::warn!("malformed media-source frame ({len} bytes) — skipped");
                     continue;
                 };
-                if tx.send(frame).await.is_err() {
-                    break;
+                // Snapshot both observed spans before recording either; a
+                // five-second summary or full trace queue must not inflate the
+                // parse measurement it is describing.
+                let parsed_at = crate::pipeline_profile::stamp();
+                let profile_video =
+                    frame.kind == MEDIA_KIND_VIDEO && crate::pipeline_profile::enabled();
+                let profile_id = if profile_video {
+                    inbound_profile_id(&mut profile_aus, &frame)
+                } else {
+                    0
+                };
+                let profile_ts_us = profile_video
+                    .then(|| u64::from(frame.rtp_timestamp).saturating_mul(1_000) / 90);
+                if profile_video {
+                    if let (Some(read_started), Some(parse_started)) = (pipe_started, parse_started)
+                    {
+                        crate::pipeline_profile::record_at(
+                            &frame.from,
+                            profile_id,
+                            profile_ts_us,
+                            crate::pipeline_profile::Stage::InboundPipeWaitRead,
+                            parse_started.saturating_duration_since(read_started),
+                            parse_started,
+                        );
+                    }
+                    if let (Some(started), Some(ended)) = (parse_started, parsed_at) {
+                        crate::pipeline_profile::record_at(
+                            &frame.from,
+                            profile_id,
+                            profile_ts_us,
+                            crate::pipeline_profile::Stage::InboundParseBusy,
+                            ended.saturating_duration_since(started),
+                            ended,
+                        );
+                    }
                 }
+                let admission_started =
+                    profile_video.then(crate::pipeline_profile::stamp).flatten();
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                if profile_video {
+                    crate::pipeline_profile::record_since(
+                        &frame.from,
+                        profile_id,
+                        profile_ts_us,
+                        crate::pipeline_profile::Stage::InboundDispatchBackpressure,
+                        admission_started,
+                    );
+                }
+                let enqueued_at = profile_video.then(crate::pipeline_profile::stamp).flatten();
+                permit.send(wrap(frame, profile_id, profile_ts_us, enqueued_at));
             }
         });
 
@@ -315,13 +478,63 @@ impl MediaPipe {
     /// `Ok` means the bytes reached the socket; the daemon's verdict
     /// arrives later via the reader task's (rate-limited) log line.
     pub async fn send(&self, req: &Request) -> Result<()> {
+        self.send_inner(req, None).await
+    }
+
+    /// The same local JSON pipe with process-local profiler correlation.
+    /// Neither the id nor any timing is serialized into the request.
+    pub async fn send_profiled(&self, req: &Request, route: &str, frame_id: u64) -> Result<()> {
+        self.send_inner(req, Some((route, frame_id))).await
+    }
+
+    async fn send_inner(&self, req: &Request, profile: Option<(&str, u64)>) -> Result<()> {
+        let profile = profile.filter(|_| crate::pipeline_profile::enabled());
+        let frame_id = profile
+            .map(|(_, id)| {
+                if id == 0 {
+                    crate::pipeline_profile::next_frame_id()
+                } else {
+                    id
+                }
+            })
+            .unwrap_or(0);
+        let serialize_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let line = serde_json::to_string(req)? + "\n";
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                frame_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundSerializeBusy,
+                serialize_started,
+            );
+        }
+        let pipe_wait_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let mut writer = self.writer.lock().await;
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                frame_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundPipeWait,
+                pipe_wait_started,
+            );
+        }
         if writer.is_none() {
+            let connect_started = profile.and_then(|_| crate::pipeline_profile::stamp());
             let stream = self.client.connect().await?;
             let (reader, send_half) = stream.split();
             spawn_response_drain(reader);
             *writer = Some(send_half);
+            if let Some((route, _)) = profile {
+                crate::pipeline_profile::record_since(
+                    route,
+                    frame_id,
+                    None,
+                    crate::pipeline_profile::Stage::OutboundPipeConnectWait,
+                    connect_started,
+                );
+            }
         }
         let w = writer.as_mut().expect("connected above");
         // Bounded: a daemon that stops *reading* (wedged, not dead) never
@@ -330,11 +543,21 @@ impl MediaPipe {
         // that into the same drop-and-reconnect a write error gets. A
         // healthy local-socket write completes in microseconds; seconds of
         // blockage is a wedged peer, not backpressure.
+        let pipe_write_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
             w.write_all(line.as_bytes()).await?;
             w.flush().await
         })
         .await;
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                frame_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundPipeWrite,
+                pipe_write_started,
+            );
+        }
         match outcome {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
@@ -388,8 +611,41 @@ impl MediaTrackPipe {
         duration_us: u64,
         data: &[u8],
     ) -> Result<()> {
-        self.send_frame(MEDIA_KIND_VIDEO, network, peer, stream, duration_us, data)
-            .await
+        self.send_frame(
+            MEDIA_KIND_VIDEO,
+            network,
+            peer,
+            stream,
+            duration_us,
+            data,
+            None,
+        )
+        .await
+    }
+
+    /// Internal profiler-correlated form of [`Self::send_video`]. Correlation
+    /// remains process-local and does not alter the daemon or peer wire bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_profiled_video(
+        &self,
+        network: &str,
+        peer: &str,
+        stream: u8,
+        duration_us: u64,
+        data: &[u8],
+        profile_route: &str,
+        profile_id: u64,
+    ) -> Result<()> {
+        self.send_frame(
+            MEDIA_KIND_VIDEO,
+            network,
+            peer,
+            stream,
+            duration_us,
+            data,
+            Some((profile_route, profile_id)),
+        )
+        .await
     }
 
     /// Stream one Opus frame to `peer`'s audio lane `stream`.
@@ -401,10 +657,19 @@ impl MediaTrackPipe {
         duration_us: u64,
         data: &[u8],
     ) -> Result<()> {
-        self.send_frame(MEDIA_KIND_AUDIO, network, peer, stream, duration_us, data)
-            .await
+        self.send_frame(
+            MEDIA_KIND_AUDIO,
+            network,
+            peer,
+            stream,
+            duration_us,
+            data,
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_frame(
         &self,
         kind: u8,
@@ -413,10 +678,42 @@ impl MediaTrackPipe {
         stream: u8,
         duration_us: u64,
         data: &[u8],
+        profile: Option<(&str, u64)>,
     ) -> Result<()> {
+        let profile = profile.filter(|_| crate::pipeline_profile::enabled());
+        let profile_id = profile
+            .map(|(_, id)| {
+                if id == 0 {
+                    crate::pipeline_profile::next_frame_id()
+                } else {
+                    id
+                }
+            })
+            .unwrap_or(0);
+        let serialize_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let body = encode_media_frame(kind, stream, duration_us, network, peer, data);
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                profile_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundSerializeBusy,
+                serialize_started,
+            );
+        }
+        let pipe_wait_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let mut writer = self.writer.lock().await;
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                profile_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundPipeWait,
+                pipe_wait_started,
+            );
+        }
         if writer.is_none() {
+            let connect_started = profile.and_then(|_| crate::pipeline_profile::stamp());
             let conn = self.client.connect().await?;
             let (reader, mut send_half) = conn.split();
             spawn_response_drain(reader);
@@ -437,6 +734,15 @@ impl MediaTrackPipe {
                 }
             }
             *writer = Some(send_half);
+            if let Some((route, _)) = profile {
+                crate::pipeline_profile::record_since(
+                    route,
+                    profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::OutboundPipeConnectWait,
+                    connect_started,
+                );
+            }
         }
         // Header and body go out under one lock so frames never interleave.
         // Bounded like the JSON pipe: a hung-but-open daemon socket must
@@ -445,12 +751,22 @@ impl MediaTrackPipe {
         // encoder pass left open).
         let w = writer.as_mut().expect("connected above");
         let len = (body.len() as u32).to_le_bytes();
+        let pipe_write_started = profile.and_then(|_| crate::pipeline_profile::stamp());
         let outcome = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
             w.write_all(&len).await?;
             w.write_all(&body).await?;
             w.flush().await
         })
         .await;
+        if let Some((route, _)) = profile {
+            crate::pipeline_profile::record_since(
+                route,
+                profile_id,
+                None,
+                crate::pipeline_profile::Stage::OutboundPipeWrite,
+                pipe_write_started,
+            );
+        }
         match outcome {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {

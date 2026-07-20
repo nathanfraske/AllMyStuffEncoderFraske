@@ -16,7 +16,7 @@
 //! means at a pull-based sink.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +32,110 @@ pub struct Au {
     pub key: bool,
     /// Annex-B bytes.
     pub data: Vec<u8>,
+}
+
+/// Queue-only metadata for the local development profiler. It is never part
+/// of [`Au`]'s public/media shape, so the daemon and every wire format remain
+/// byte-for-byte untouched.
+struct QueuedAu {
+    au: Au,
+    profile: Option<QueuedProfile>,
+}
+
+struct QueuedProfile {
+    frame_id: u64,
+    enqueued_at: Option<Instant>,
+}
+
+impl QueuedAu {
+    fn new(au: Au, inherited_frame_id: u64) -> Self {
+        let profile = crate::pipeline_profile::enabled().then(|| QueuedProfile {
+            frame_id: if inherited_frame_id == 0 {
+                crate::pipeline_profile::next_frame_id()
+            } else {
+                inherited_frame_id
+            },
+            enqueued_at: crate::pipeline_profile::stamp(),
+        });
+        Self { au, profile }
+    }
+
+    fn into_au(self) -> Au {
+        self.au
+    }
+
+    fn frame_id(&self) -> u64 {
+        self.profile.as_ref().map_or(0, |p| p.frame_id)
+    }
+}
+
+impl std::ops::Deref for QueuedAu {
+    type Target = Au;
+
+    fn deref(&self) -> &Self::Target {
+        &self.au
+    }
+}
+
+impl std::ops::DerefMut for QueuedAu {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.au
+    }
+}
+
+/// Record one decoder-queue residence and return the profiler bookkeeping wall
+/// time, so a surrounding coalesce-wait span can subtract observer work.
+fn record_decoder_queue_wait(route_id: &str, au: &mut QueuedAu) -> Duration {
+    let ts_us = au.au.ts_us;
+    let Some(profile) = au.profile.as_mut() else {
+        return Duration::ZERO;
+    };
+    let Some(enqueued_at) = profile.enqueued_at.take() else {
+        return Duration::ZERO;
+    };
+    let ended = Instant::now();
+    let observer_started = Instant::now();
+    crate::pipeline_profile::record_at(
+        route_id,
+        profile.frame_id,
+        Some(ts_us),
+        crate::pipeline_profile::Stage::DecoderQueueWait,
+        ended.saturating_duration_since(enqueued_at),
+        ended,
+    );
+    observer_started.elapsed()
+}
+
+struct DeliveryObservation {
+    frame_ts_us: u64,
+    duration: Duration,
+    ended: Instant,
+}
+
+fn deliver_profiled<F>(
+    on_frame: &F,
+    packet: Vec<u8>,
+    _route_id: &str,
+    frame_id: u64,
+    frame_ts_us: u64,
+    delivery_spent: &mut Duration,
+    observations: &mut Vec<DeliveryObservation>,
+) where
+    F: Fn(Vec<u8>, u64, u64),
+{
+    let started = crate::pipeline_profile::stamp();
+    on_frame(packet, frame_id, frame_ts_us);
+    if let Some(started) = started {
+        let ended = Instant::now();
+        observations.push(DeliveryObservation {
+            frame_ts_us,
+            duration: ended.saturating_duration_since(started),
+            ended,
+        });
+        // Subtract callback plus local observation bookkeeping from decode;
+        // the observations themselves are recorded only after decode ends.
+        *delivery_spent = delivery_spent.saturating_add(started.elapsed());
+    }
 }
 
 /// Which codec an access unit opens with. H.264/HEVC are judged from the
@@ -163,16 +267,33 @@ fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
     None
 }
 
-/// Pending AUs per route before the overflow dump. Kept short (~200 ms at
-/// 60 fps) so a decoder that stalls dumps to the next keyframe fast instead of
-/// playing seconds of stale, latency-inducing backlog — a healthy decoder (a
-/// few ms per frame) never queues anywhere near this.
-// Sized in *samples*, and the pacer sends each sliced AU as several
-// samples (a lossless frame is 8+, more at its IDRs) — 48 keeps the
-// documented ~200 ms of headroom for chunked streams where 12 was 1.5
-// frames. Whole-AU reassembly upstream of the queue is the follow-up
-// that makes this exact again.
-const MAX_PENDING: usize = 48;
+/// Production feeds one complete access unit per sample. Keep enough startup
+/// headroom for a cold hardware decoder: field profiling on Windows measured
+/// about 174 ms from the first H.264 AU through NVDEC session creation and its
+/// first picture, which is already eleven 60 Hz arrivals. A three-AU queue
+/// therefore guaranteed an overflow before the decoder could reach steady
+/// state. Sixteen AUs cover that cold start plus ordinary scheduling jitter
+/// while bounding the compressed backlog to about 267 ms at 60 fps.
+///
+/// H.264 remains ordered. On overflow the dependent chain is discarded and
+/// decoding resumes from a complete parameter-set-led key AU; a healthy
+/// same-codec decoder is retained so overload recovery does not pay another
+/// cold-open penalty.
+const MAX_PENDING_AUS: usize = 16;
+
+/// The opt-in paced-slice experiment feeds multiple samples per AU. Retain its
+/// sample-sized bound only in that explicit test mode; non-test production has
+/// pacing disabled and always uses [`MAX_PENDING_AUS`].
+#[cfg(all(windows, feature = "host"))]
+const MAX_PENDING_PACED_SAMPLES: usize = 48;
+
+fn pending_capacity() -> usize {
+    #[cfg(all(windows, feature = "host"))]
+    if crate::video::paced_slices_enabled() {
+        return MAX_PENDING_PACED_SAMPLES;
+    }
+    MAX_PENDING_AUS
+}
 
 /// Idle boundary for paced NVDEC chunks. NVDEC treats END_OF_PICTURE
 /// literally for both H.264 and HEVC, so same-timestamp samples must be
@@ -193,11 +314,71 @@ const STATS_EVERY: Duration = Duration::from_secs(5);
 const ZERO_OUTPUT_AU_LIMIT: u32 = 30;
 
 struct RouteDecode {
-    tx: mpsc::SyncSender<Au>,
+    tx: mpsc::SyncSender<QueuedAu>,
     /// Set on queue overflow; the thread dumps to the next key unit.
     need_key: Arc<AtomicBool>,
+    queue_stats: Arc<QueueStats>,
+    /// A complete key AU returned by a full whole-AU queue. Keeping only this
+    /// self-contained recovery point is safe; dependent deltas are never
+    /// reordered or latest-wins thinned.
+    recovery_entry: Arc<Mutex<Option<QueuedAu>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Route-local queue instrumentation. The counters are appended to the
+/// existing debug/opt-in decoder stats line; ordinary logs gain no chatter.
+struct QueueStats {
+    capacity: usize,
+    pending: AtomicUsize,
+    high_water: AtomicUsize,
+    overflows: AtomicU64,
+}
+
+impl QueueStats {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            pending: AtomicUsize::new(0),
+            high_water: AtomicUsize::new(0),
+            overflows: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve accounting before `try_send`, preventing a fast receiver from
+    /// underflowing the depth counter before the sender records success.
+    fn reserve_send(&self) -> usize {
+        self.pending.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn sent(&self, reserved_depth: usize) {
+        // The consumer can dequeue between reservation and send completion;
+        // clamp the diagnostic high-water to the physical channel capacity.
+        self.high_water
+            .fetch_max(reserved_depth.min(self.capacity), Ordering::Relaxed);
+    }
+
+    fn send_failed(&self) {
+        let before = self.pending.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "decoder queue accounting underflow");
+    }
+
+    fn received(&self) {
+        let before = self.pending.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "decoder queue accounting underflow");
+    }
+
+    fn overflowed(&self) {
+        self.overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (usize, usize, u64) {
+        (
+            self.pending.load(Ordering::Relaxed),
+            self.high_water.load(Ordering::Relaxed),
+            self.overflows.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Drop for RouteDecode {
@@ -230,24 +411,64 @@ impl DecodeBridge {
         F: Fn(Vec<u8>) + Send + 'static,
         G: Fn(Option<u64>) + Send + 'static,
     {
+        self.feed_profiled(
+            route_id,
+            au,
+            0,
+            move |packet, _frame_id, _frame_ts_us| on_frame(packet),
+            on_glitch,
+        )
+    }
+
+    /// Feed with a process-local profiler id inherited from the binary media
+    /// pipe. The id never appears in [`Au`] or any serialized media shape.
+    pub fn feed_profiled<F, G>(
+        &self,
+        route_id: &str,
+        au: Au,
+        profile_id: u64,
+        on_frame: F,
+        on_glitch: G,
+    ) where
+        F: Fn(Vec<u8>, u64, u64) + Send + 'static,
+        G: Fn(Option<u64>) + Send + 'static,
+    {
         let mut routes = self.routes.lock();
         let mut au = au;
+        let mut profile_id = profile_id;
         let mut restarting = false;
         if let Some(entry) = routes.get_mut(route_id) {
-            match entry.tx.try_send(au) {
-                Ok(()) => return,
-                Err(mpsc::TrySendError::Full(_)) => {
+            let reserved_depth = entry.queue_stats.reserve_send();
+            match entry.tx.try_send(QueuedAu::new(au, profile_id)) {
+                Ok(()) => {
+                    entry.queue_stats.sent(reserved_depth);
+                    return;
+                }
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    entry.queue_stats.send_failed();
+                    entry.queue_stats.overflowed();
                     // Deltas past a full queue are useless without their
                     // predecessors. The decoder thread drops its whole stale
-                    // backlog and requests a fresh key unit.
+                    // backlog and requests a fresh key unit. In production's
+                    // whole-AU framing, preserve a returned SPS/PPS-led entry
+                    // so recovery need not wait on another round trip.
+                    if entry.queue_stats.capacity == MAX_PENDING_AUS
+                        && (returned.key || is_decode_entry(&returned.data))
+                    {
+                        *entry.recovery_entry.lock() = Some(returned);
+                    }
                     entry.need_key.store(true, Ordering::SeqCst);
                     return;
                 }
                 Err(mpsc::TrySendError::Disconnected(returned)) => {
+                    entry.queue_stats.send_failed();
                     // A panicked/returned decoder used to leave a permanent
                     // tombstone in `routes`: every later feed failed against
                     // the dead receiver and the display could never restart.
-                    au = returned;
+                    // The restarted queue represents this same AU. Preserve
+                    // its inherited correlation id when profiling is active.
+                    profile_id = returned.frame_id();
+                    au = returned.into_au();
                     restarting = true;
                 }
             }
@@ -263,21 +484,34 @@ impl DecodeBridge {
         // dead-worker restart path leaves Game/GDR's infinite GOP black until
         // an unrelated refresh happens.
         let request_key = !(au.key || is_decode_entry(&au.data));
-        let (tx, rx) = mpsc::sync_channel::<Au>(MAX_PENDING);
+        let request_ts_us = request_key.then_some(au.ts_us);
+        let capacity = pending_capacity();
+        let (tx, rx) = mpsc::sync_channel::<QueuedAu>(capacity);
+        let queue_stats = Arc::new(QueueStats::new(capacity));
         // The receiver is live in this stack frame and the new queue is empty,
         // so the initial unit cannot fail or block.
-        if tx.try_send(au).is_err() {
-            return;
+        let reserved_depth = queue_stats.reserve_send();
+        match tx.try_send(QueuedAu::new(au, profile_id)) {
+            Ok(()) => queue_stats.sent(reserved_depth),
+            Err(_) => {
+                queue_stats.send_failed();
+                return;
+            }
         }
         let need_key = Arc::new(AtomicBool::new(false));
+        let recovery_entry = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let id = route_id.to_string();
         let (nk, st) = (need_key.clone(), stop.clone());
+        let (qs, recovery) = (queue_stats.clone(), recovery_entry.clone());
         let thread = std::thread::spawn(move || {
             if request_key {
-                on_glitch(None);
+                // Policy-v1 recovery is driven by timestamped frame-health
+                // feedback. `None` is reserved for legacy callers and would
+                // suppress both that report and the legacy Refresh fallback.
+                on_glitch(request_ts_us);
             }
-            run_decode(&st, &nk, &id, rx, on_frame, on_glitch);
+            run_decode(&st, &nk, &qs, &recovery, &id, rx, on_frame, on_glitch);
         });
         tracing::info!("native video decoder started for {route_id}");
         routes.insert(
@@ -285,6 +519,8 @@ impl DecodeBridge {
             RouteDecode {
                 tx,
                 need_key,
+                queue_stats,
+                recovery_entry,
                 stop,
                 thread: Some(thread),
             },
@@ -319,6 +555,37 @@ enum H264Rung {
     #[cfg(all(windows, feature = "host"))]
     Nvdec(crate::nvdec::NvdecH264),
     Software(openh264::decoder::Decoder),
+}
+
+/// Route-local open counts for the deterministic software bridge tests. This
+/// makes decoder-session retention observable without adding any production
+/// hook or depending on global environment variables.
+#[cfg(test)]
+static TEST_H264_SOFTWARE_OPENS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(windows, feature = "host"))]
+#[derive(Debug)]
+enum FreshNvdecError {
+    Open(String),
+    Decode(crate::nvdec::NvdecError),
+}
+
+#[cfg(all(windows, feature = "host"))]
+impl FreshNvdecError {
+    fn is_bitstream_corrupt(&self) -> bool {
+        matches!(self, Self::Decode(e) if e.is_bitstream_corrupt())
+    }
+}
+
+#[cfg(all(windows, feature = "host"))]
+impl std::fmt::Display for FreshNvdecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(e) => f.write_str(e),
+            Self::Decode(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
 }
 
 /// Route-local runtime ladder state. One NVDEC delta error may just be a lost
@@ -373,6 +640,19 @@ impl H264Rung {
     }
 
     fn open(route_id: &str) -> Result<Self, String> {
+        // Deterministic decoder-bridge tests must not depend on whether the
+        // machine running them happens to have an NVIDIA adapter/driver. Keep
+        // the seam route-local so parallel tests and production selection are
+        // untouched.
+        #[cfg(test)]
+        if route_id.starts_with("test-software-") {
+            *TEST_H264_SOFTWARE_OPENS
+                .lock()
+                .entry(route_id.to_owned())
+                .or_default() += 1;
+            return Self::software();
+        }
+
         let force = std::env::var("ALLMYSTUFF_H264_DECODER")
             .map(|v| v.trim().to_ascii_lowercase())
             .unwrap_or_default();
@@ -441,9 +721,13 @@ fn decode_openh264_packet(
 fn emit_nv_frames<F>(
     pics: Vec<crate::nvdec::NvFrame>,
     on_frame: &F,
+    route_id: &str,
+    frame_id: u64,
+    delivery_spent: &mut Duration,
+    observations: &mut Vec<DeliveryObservation>,
 ) -> (u32, Option<(usize, usize)>)
 where
-    F: Fn(Vec<u8>),
+    F: Fn(Vec<u8>, u64, u64),
 {
     let mut emitted = 0u32;
     let mut dims = None;
@@ -461,7 +745,15 @@ where
         );
         emitted += 1;
         dims = Some((w, h));
-        on_frame(packet);
+        deliver_profiled(
+            on_frame,
+            packet,
+            route_id,
+            frame_id,
+            f.ts_us,
+            delivery_spent,
+            observations,
+        );
     }
     (emitted, dims)
 }
@@ -478,6 +770,19 @@ enum HevcRung {
     // Boxed: the DXVA session carries its parser stores inline and would
     // otherwise dwarf the enum every H.264 route also instantiates.
     Dxva(Box<crate::d3d11va::D3d11vaHevc>),
+}
+
+#[cfg(all(windows, feature = "host"))]
+struct HevcDecodeError {
+    message: String,
+    known_corrupt: bool,
+}
+
+#[cfg(all(windows, feature = "host"))]
+impl std::fmt::Display for HevcDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 #[cfg(all(windows, feature = "host"))]
@@ -538,10 +843,20 @@ impl HevcRung {
         matches!(self, Self::Nvdec(_))
     }
 
-    fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<crate::nvdec::NvFrame>, String> {
+    fn decode(
+        &mut self,
+        au: &[u8],
+        ts_us: u64,
+    ) -> Result<Vec<crate::nvdec::NvFrame>, HevcDecodeError> {
         match self {
-            Self::Nvdec(d) => d.decode(au, ts_us),
-            Self::Dxva(d) => d.decode(au, ts_us),
+            Self::Nvdec(d) => d.decode_typed(au, ts_us).map_err(|e| HevcDecodeError {
+                known_corrupt: e.is_bitstream_corrupt(),
+                message: e.to_string(),
+            }),
+            Self::Dxva(d) => d.decode(au, ts_us).map_err(|e| HevcDecodeError {
+                known_corrupt: false,
+                message: e,
+            }),
         }
     }
 }
@@ -598,15 +913,18 @@ impl Av1Rung {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_decode<F, G>(
     stop: &AtomicBool,
     need_key: &AtomicBool,
+    queue_stats: &QueueStats,
+    recovery_entry: &Mutex<Option<QueuedAu>>,
     route_id: &str,
-    rx: mpsc::Receiver<Au>,
+    rx: mpsc::Receiver<QueuedAu>,
     on_frame: F,
     on_glitch: G,
 ) where
-    F: Fn(Vec<u8>),
+    F: Fn(Vec<u8>, u64, u64),
     G: Fn(Option<u64>),
 {
     // The decode thread is the viewer's media plane — same priority/EcoQoS
@@ -638,7 +956,7 @@ fn run_decode<F, G>(
     // Compressed bytes fed this window — the wire layer's bandwidth at
     // the decoder's door (the nv12/rgba layers derive from frames×dims).
     let mut in_bytes = 0u64;
-    let mut deferred_au: Option<Au> = None;
+    let mut deferred_au: Option<QueuedAu> = None;
     #[cfg(all(windows, feature = "host"))]
     let mut logged_nvdec_coalesce = false;
     let mut h264_runtime = H264RuntimePolicy::default();
@@ -654,11 +972,14 @@ fn run_decode<F, G>(
 
     while !stop.load(Ordering::SeqCst) {
         // A bounded wait keeps the stop flag responsive on a quiet stream.
-        let au = if let Some(au) = deferred_au.take() {
+        let mut au = if let Some(au) = deferred_au.take() {
             au
         } else {
             match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(au) => au,
+                Ok(au) => {
+                    queue_stats.received();
+                    au
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if zero_output_aus > 0
                         && zero_output_since.is_some_and(|t| t.elapsed() >= STATS_EVERY)
@@ -675,28 +996,65 @@ fn run_decode<F, G>(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
-        #[cfg(all(windows, feature = "host"))]
-        let mut au = au;
+        let _ = record_decoder_queue_wait(route_id, &mut au);
+        let decoder_prepare_started = crate::pipeline_profile::stamp();
         in_bytes += au.data.len() as u64;
         if need_key.swap(false, Ordering::SeqCst) {
             // The feeder overflowed: drain the stale backlog and wait for
-            // the sender's next IDR — same recovery as a decode error.
-            while rx.try_recv().is_ok() {}
+            // the sender's next IDR — same recovery as a decode error. A
+            // complete key AU already in hand/queue is retained as the only
+            // safe newest-wins unit; dependent deltas stay ordered or drop as
+            // a chain, never individually.
+            let lost_ts_us = au.ts_us;
+            let mut saved_entry = if queue_stats.capacity == MAX_PENDING_AUS
+                && (au.key || is_decode_entry(&au.data))
+            {
+                Some(au)
+            } else {
+                None
+            };
+            while let Ok(candidate) = rx.try_recv() {
+                queue_stats.received();
+                if queue_stats.capacity == MAX_PENDING_AUS
+                    && (candidate.key || is_decode_entry(&candidate.data))
+                {
+                    saved_entry = Some(candidate);
+                }
+            }
+            if let Some(returned_entry) = recovery_entry.lock().take() {
+                saved_entry = Some(returned_entry);
+            }
             if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                let recovery = if saved_entry.is_some() {
+                    "retaining the newest complete key entry"
+                } else {
+                    "requesting a key"
+                };
                 tracing::warn!(
-                    "video decoder queue overflow for {route_id}; dropped stale access units and requesting a key"
+                    "video decoder queue overflow for {route_id}; dropped stale access units and {recovery}"
                 );
                 last_queue_reset = Some(Instant::now());
             }
-            decoder = None;
+            // The compressed dependency chain is stale, not the decoder
+            // session. Keeping a healthy same-codec decoder avoids a cold
+            // NVDEC/OpenH264 rebuild on every overload. A key AU below can
+            // still morph codecs or resize through the ordinary sniff/sequence
+            // path, which performs the required targeted rebuild itself.
             waiting_key = true;
             zero_output_since = None;
             zero_output_aus = 0;
             zero_output_bytes = 0;
-            on_glitch(None);
-            // `au` was the oldest queued unit, removed before the overflow
-            // flag could be observed. Drop it too: processing it would violate
-            // the wholesale freshness reset (and can resurrect a stale key).
+            if let Some(entry) = saved_entry {
+                // Re-enter immediately from the newest complete SPS/PPS/key
+                // unit. It is processed before any later queued delta.
+                deferred_au = Some(entry);
+            } else {
+                // Name the AU whose chain was abandoned. Policy-v1 peers use
+                // the existing VideoFeedback data-channel message to produce
+                // an immediate GDR wave/IDR; `None` accidentally suppressed
+                // that request and made recovery wait for the periodic key.
+                on_glitch(Some(lost_ts_us));
+            }
             continue;
         }
         // A parameter-set-led unit is a decode entry in both codecs and
@@ -782,6 +1140,14 @@ fn run_decode<F, G>(
             }
         }
 
+        crate::pipeline_profile::record_since(
+            route_id,
+            au.frame_id(),
+            Some(au.ts_us),
+            crate::pipeline_profile::Stage::DecoderPrepareBusy,
+            decoder_prepare_started,
+        );
+
         // NVDEC interprets END_OF_PICTURE literally in both codecs and would
         // display every paced slice as a partial picture. Collect
         // same-timestamp samples until the next timestamp or the sender's
@@ -797,6 +1163,8 @@ fn run_decode<F, G>(
                     | Some(Active::Av1(Av1Rung::Nvdec(_)))
             )
         {
+            let coalesce_started = crate::pipeline_profile::stamp();
+            let mut observer_spent = Duration::ZERO;
             let mut deadline = Instant::now() + NVDEC_CHUNK_IDLE;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -804,19 +1172,36 @@ fn run_decode<F, G>(
                     break;
                 }
                 match rx.recv_timeout(remaining) {
-                    Ok(next) if next.ts_us == au.ts_us => {
+                    Ok(mut next) if next.ts_us == au.ts_us => {
+                        queue_stats.received();
+                        observer_spent = observer_spent
+                            .saturating_add(record_decoder_queue_wait(route_id, &mut next));
                         in_bytes += next.data.len() as u64;
                         au.key |= next.key;
                         au.data.extend_from_slice(&next.data);
                         deadline = Instant::now() + NVDEC_CHUNK_IDLE;
                     }
                     Ok(next) => {
+                        queue_stats.received();
                         deferred_au = Some(next);
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+            }
+            if let Some(started) = coalesce_started {
+                let ended = Instant::now();
+                crate::pipeline_profile::record_at(
+                    route_id,
+                    au.frame_id(),
+                    Some(au.ts_us),
+                    crate::pipeline_profile::Stage::DecoderCoalesceWait,
+                    ended
+                        .saturating_duration_since(started)
+                        .saturating_sub(observer_spent),
+                    ended,
+                );
             }
             if !logged_nvdec_coalesce {
                 logged_nvdec_coalesce = true;
@@ -828,7 +1213,11 @@ fn run_decode<F, G>(
             // Overflow may have been signaled while we were collecting the
             // train. Apply the same wholesale freshness reset before decode.
             if need_key.swap(false, Ordering::SeqCst) {
-                while rx.try_recv().is_ok() {}
+                let lost_ts_us = au.ts_us;
+                while let Ok(_dropped) = rx.try_recv() {
+                    queue_stats.received();
+                }
+                recovery_entry.lock().take();
                 if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
                     tracing::warn!(
                         "video decoder queue overflow for {route_id} while coalescing; dropped stale access units and requesting a key"
@@ -836,18 +1225,20 @@ fn run_decode<F, G>(
                     last_queue_reset = Some(Instant::now());
                 }
                 deferred_au = None;
-                decoder = None;
                 waiting_key = true;
                 zero_output_since = None;
                 zero_output_aus = 0;
                 zero_output_bytes = 0;
-                on_glitch(None);
+                on_glitch(Some(lost_ts_us));
                 continue;
             }
         }
 
         let dec = decoder.as_mut().expect("decoder was initialized above");
         let t0 = Instant::now();
+        let profile_id = au.frame_id();
+        let mut delivery_spent = Duration::ZERO;
+        let mut delivery_observations = Vec::new();
         let frames_before = frames;
         let mut broke: Option<String> = None;
         match dec {
@@ -862,37 +1253,72 @@ fn run_decode<F, G>(
                                 spent += t0.elapsed();
                                 frames += 1;
                                 out_dims = (w, h);
-                                on_frame(packet);
+                                deliver_profiled(
+                                    &on_frame,
+                                    packet,
+                                    route_id,
+                                    profile_id,
+                                    au.ts_us,
+                                    &mut delivery_spent,
+                                    &mut delivery_observations,
+                                );
                             }
                         }
                         Err(e) => broke = Some(format!("H.264/OpenH264: {e}")),
                     }
                 }
                 #[cfg(all(windows, feature = "host"))]
-                H264Rung::Nvdec(hw) => match hw.decode(&au.data, au.ts_us) {
+                H264Rung::Nvdec(hw) => match hw.decode_typed(&au.data, au.ts_us) {
                     Ok(pics) => {
                         waiting_key = false;
                         if !is_key {
                             h264_runtime.note_delta_success();
                         }
-                        let (n, dims) = emit_nv_frames(pics, &on_frame);
+                        let (n, dims) = emit_nv_frames(
+                            pics,
+                            &on_frame,
+                            route_id,
+                            profile_id,
+                            &mut delivery_spent,
+                            &mut delivery_observations,
+                        );
                         if let Some(dims) = dims {
                             frames += n;
                             out_dims = dims;
                             spent += t0.elapsed();
                         }
                     }
+                    Err(first) if first.is_bitstream_corrupt() => {
+                        // The driver positively identified this picture/AU as
+                        // damaged. Do not retry the same known-bad bytes through
+                        // fresh hardware or OpenH264: either could conceal and
+                        // paint them. The common `broke` path resets and asks
+                        // for a clean entry without blaming the hardware rung.
+                        broke = Some(format!("H.264/NVDEC bitstream corruption: {first}"));
+                    }
                     Err(first) if is_key => {
                         // A resize/retune intentionally invalidates the old
                         // NVDEC session. Rebuild and retry this SAME key once;
                         // only a second failure earns software demotion.
-                        let retry = crate::nvdec::NvdecH264::open().and_then(|mut fresh| {
-                            fresh.decode(&au.data, au.ts_us).map(|pics| (fresh, pics))
-                        });
+                        let retry = crate::nvdec::NvdecH264::open()
+                            .map_err(FreshNvdecError::Open)
+                            .and_then(|mut fresh| {
+                                fresh
+                                    .decode_typed(&au.data, au.ts_us)
+                                    .map(|pics| (fresh, pics))
+                                    .map_err(FreshNvdecError::Decode)
+                            });
                         match retry {
                             Ok((fresh, pics)) => {
                                 waiting_key = false;
-                                let (n, dims) = emit_nv_frames(pics, &on_frame);
+                                let (n, dims) = emit_nv_frames(
+                                    pics,
+                                    &on_frame,
+                                    route_id,
+                                    profile_id,
+                                    &mut delivery_spent,
+                                    &mut delivery_observations,
+                                );
                                 if let Some(dims) = dims {
                                     frames += n;
                                     out_dims = dims;
@@ -902,6 +1328,11 @@ fn run_decode<F, G>(
                                 tracing::info!(
                                     "H.264 NVDEC session for {route_id} rebuilt at a key unit after: {first}"
                                 );
+                            }
+                            Err(retry) if retry.is_bitstream_corrupt() => {
+                                broke = Some(format!(
+                                    "H.264/NVDEC fresh-session bitstream corruption: {retry}"
+                                ));
                             }
                             Err(retry) => match H264Rung::software_decoder() {
                                 Ok(mut software) => {
@@ -913,7 +1344,15 @@ fn run_decode<F, G>(
                                                 frames += 1;
                                                 out_dims = (w, h);
                                                 spent += t0.elapsed();
-                                                on_frame(packet);
+                                                deliver_profiled(
+                                                    &on_frame,
+                                                    packet,
+                                                    route_id,
+                                                    profile_id,
+                                                    au.ts_us,
+                                                    &mut delivery_spent,
+                                                    &mut delivery_observations,
+                                                );
                                             }
                                             *rung = H264Rung::Software(software);
                                             h264_runtime.demote();
@@ -955,12 +1394,26 @@ fn run_decode<F, G>(
             Active::Hevc(rung) => match rung.decode(&au.data, au.ts_us) {
                 Ok(pics) => {
                     waiting_key = false;
-                    let (n, dims) = emit_nv_frames(pics, &on_frame);
+                    let (n, dims) = emit_nv_frames(
+                        pics,
+                        &on_frame,
+                        route_id,
+                        profile_id,
+                        &mut delivery_spent,
+                        &mut delivery_observations,
+                    );
                     if let Some(dims) = dims {
                         frames += n;
                         out_dims = dims;
                         spent += t0.elapsed();
                     }
+                }
+                Err(first) if first.known_corrupt => {
+                    // Keep the NVIDIA ladder selected, but discard this known
+                    // damaged entry/dependent picture and use common re-key
+                    // recovery. Retrying the same bytes on D3D11VA could paint
+                    // another decoder's unobservable concealment.
+                    broke = Some(format!("HEVC/NVDEC bitstream corruption: {first}"));
                 }
                 Err(first) => {
                     let was_nvdec = rung.is_nvdec();
@@ -970,12 +1423,22 @@ fn run_decode<F, G>(
                         // vendor-neutral hardware rung and retry it instead of
                         // dropping the only clean recovery point.
                         let retry = HevcRung::dxva().and_then(|mut fresh| {
-                            fresh.decode(&au.data, au.ts_us).map(|pics| (fresh, pics))
+                            fresh
+                                .decode(&au.data, au.ts_us)
+                                .map(|pics| (fresh, pics))
+                                .map_err(|e| e.to_string())
                         });
                         match retry {
                             Ok((fresh, pics)) => {
                                 waiting_key = false;
-                                let (n, dims) = emit_nv_frames(pics, &on_frame);
+                                let (n, dims) = emit_nv_frames(
+                                    pics,
+                                    &on_frame,
+                                    route_id,
+                                    profile_id,
+                                    &mut delivery_spent,
+                                    &mut delivery_observations,
+                                );
                                 if let Some(dims) = dims {
                                     frames += n;
                                     out_dims = dims;
@@ -1030,7 +1493,15 @@ fn run_decode<F, G>(
                         frames += 1;
                         emitted = true;
                         out_dims = (w, h);
-                        on_frame(packet);
+                        deliver_profiled(
+                            &on_frame,
+                            packet,
+                            route_id,
+                            profile_id,
+                            f.ts_us,
+                            &mut delivery_spent,
+                            &mut delivery_observations,
+                        );
                     }
                     if emitted {
                         spent += t0.elapsed();
@@ -1038,6 +1509,27 @@ fn run_decode<F, G>(
                 }
                 Err(e) => broke = Some(format!("AV1: {e}")),
             },
+        }
+        let decode_ended = Instant::now();
+        crate::pipeline_profile::record_at(
+            route_id,
+            profile_id,
+            Some(au.ts_us),
+            crate::pipeline_profile::Stage::DecodeBusy,
+            decode_ended
+                .saturating_duration_since(t0)
+                .saturating_sub(delivery_spent),
+            decode_ended,
+        );
+        for observation in delivery_observations {
+            crate::pipeline_profile::record_at(
+                route_id,
+                profile_id,
+                Some(observation.frame_ts_us),
+                crate::pipeline_profile::Stage::FrameDelivery,
+                observation.duration,
+                observation.ended,
+            );
         }
         if broke.is_none() {
             if frames > frames_before {
@@ -1080,8 +1572,19 @@ fn run_decode<F, G>(
             // the field log's answer to "where does the bandwidth go".
             let secs = elapsed.as_secs_f64();
             let px = frames as f64 * out_dims.0 as f64 * out_dims.1 as f64;
+            let (queue_pending, queue_hwm, queue_overflows) = queue_stats.snapshot();
+            #[cfg(all(windows, feature = "host"))]
+            let nvdec_diag = {
+                let s = crate::nvdec::status_counters();
+                format!(
+                    " · NVDEC status q={} clean={} concealed={} corrupt={} unsettled={} api_err={}",
+                    s.queries, s.clean, s.concealed, s.corrupt, s.unsettled, s.api_errors
+                )
+            };
+            #[cfg(not(all(windows, feature = "host")))]
+            let nvdec_diag = String::new();
             let line = format!(
-                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native) · wire {:.1} → nv12 {:.0} → rgba {:.0} Mbps",
+                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native) · wire {:.1} → nv12 {:.0} → rgba {:.0} Mbps · queue {queue_pending}/{} hwm={queue_hwm} overflow={queue_overflows}{nvdec_diag}",
                 frames as f64 / secs,
                 spent.as_secs_f64() * 1000.0 / frames as f64,
                 out_dims.0,
@@ -1089,6 +1592,7 @@ fn run_decode<F, G>(
                 in_bytes as f64 * 8.0 / secs / 1e6,
                 px * 1.5 * 8.0 / secs / 1e6,
                 px * 4.0 * 8.0 / secs / 1e6,
+                queue_stats.capacity,
             );
             if crate::video::stats_to_info() {
                 tracing::info!("{line}");
@@ -1114,6 +1618,353 @@ fn raw_ipc_packet(ts_us: u64, w: u32, h: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encoded_h264_recovery_chain() -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        use openh264::encoder::{Encoder, EncoderConfig, IntraFramePeriod};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        fn encode(encoder: &mut Encoder, shade: u8) -> Vec<u8> {
+            let rgb = vec![shade; 64 * 64 * 3];
+            let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (64, 64)));
+            let bytes = encoder.encode(&yuv).expect("encode test AU").to_vec();
+            assert!(!bytes.is_empty(), "frame skipping is disabled");
+            bytes
+        }
+
+        let config = EncoderConfig::new()
+            .skip_frames(false)
+            .scene_change_detect(false)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(1_000));
+        let mut encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+            .expect("H.264 test encoder");
+
+        let initial_key = encode(&mut encoder, 20);
+        assert!(is_decode_entry(&initial_key), "first AU is a decode entry");
+        let deltas = (0..=MAX_PENDING_AUS)
+            .map(|i| encode(&mut encoder, 30u8.saturating_add(i as u8)))
+            .collect::<Vec<_>>();
+        assert!(
+            deltas.iter().all(|au| !is_decode_entry(au)),
+            "the overflow backlog is one dependent delta chain"
+        );
+        encoder.force_intra_frame();
+        let recovery_key = encode(&mut encoder, 90);
+        assert!(
+            is_decode_entry(&recovery_key),
+            "forced IDR is a self-describing recovery entry"
+        );
+        (initial_key, deltas, recovery_key)
+    }
+
+    fn packet_ts_us(packet: &[u8]) -> u64 {
+        u64::from_le_bytes(packet[20..28].try_into().expect("timestamp field"))
+    }
+
+    fn reset_test_software_open_count(route_id: &str) {
+        TEST_H264_SOFTWARE_OPENS.lock().remove(route_id);
+    }
+
+    fn test_software_open_count(route_id: &str) -> usize {
+        TEST_H264_SOFTWARE_OPENS
+            .lock()
+            .get(route_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn native_whole_au_queue_covers_cold_start_and_accounting_is_bounded() {
+        // 16 arrivals are ~267 ms at 60 Hz: enough for the measured cold
+        // NVDEC first-picture path without restoring the old 48-AU/800 ms
+        // latency allowance.
+        assert_eq!(MAX_PENDING_AUS, 16);
+        let stats = QueueStats::new(MAX_PENDING_AUS);
+        for expected in 1..=MAX_PENDING_AUS {
+            let reserved = stats.reserve_send();
+            stats.sent(reserved);
+            assert_eq!(stats.snapshot().0, expected);
+        }
+        // A failed seventeenth reservation is rolled back and counted without
+        // ever reporting a high-water beyond the physical channel.
+        stats.reserve_send();
+        stats.send_failed();
+        stats.overflowed();
+        assert_eq!(stats.snapshot(), (MAX_PENDING_AUS, MAX_PENDING_AUS, 1));
+        for _ in 0..MAX_PENDING_AUS {
+            stats.received();
+        }
+        assert_eq!(stats.snapshot(), (0, MAX_PENDING_AUS, 1));
+    }
+
+    /// Force the real bridge through its full-channel path while the software
+    /// decoder's first delivery is deliberately blocked. A complete key that
+    /// loses the `try_send` race must be retained, stale deltas must never
+    /// paint, and recovery must not ask the sender for yet another key.
+    #[test]
+    fn full_queue_retains_returned_key_and_resumes_without_glitch() {
+        const ROUTE: &str = "test-software-overflow-retained";
+        assert_eq!(pending_capacity(), MAX_PENDING_AUS);
+        reset_test_software_open_count(ROUTE);
+        let (initial_key, deltas, recovery_key) = encoded_h264_recovery_chain();
+        let bridge = DecodeBridge::new();
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(0);
+        let (glitch_tx, glitch_rx) = mpsc::channel::<Option<u64>>();
+        let blocked_once = Arc::new(AtomicBool::new(false));
+        let sink_blocked = blocked_once.clone();
+
+        bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: 1,
+                key: true,
+                data: initial_key,
+            },
+            move |packet| {
+                let _ = frame_tx.send(packet);
+                if !sink_blocked.swap(true, Ordering::SeqCst) {
+                    let _ = blocked_tx.send(());
+                    let _ = release_rx.recv();
+                }
+            },
+            move |lost| {
+                let _ = glitch_tx.send(lost);
+            },
+        );
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first decoded frame reached the blocked sink");
+        let first = frame_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial decoded frame");
+        assert_eq!(packet_ts_us(&first), 1);
+
+        for (index, data) in deltas.iter().take(MAX_PENDING_AUS).enumerate() {
+            bridge.feed(
+                ROUTE,
+                Au {
+                    ts_us: 10_000 + index as u64,
+                    key: false,
+                    data: data.clone(),
+                },
+                |_| {},
+                |_| {},
+            );
+        }
+        let recovery_ts = 90_000;
+        bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: recovery_ts,
+                key: true,
+                data: recovery_key,
+            },
+            |_| {},
+            |_| {},
+        );
+        {
+            let routes = bridge.routes.lock();
+            let route = routes.get(ROUTE).expect("route remains live");
+            assert!(route.need_key.load(Ordering::SeqCst));
+            assert_eq!(route.queue_stats.snapshot().2, 1);
+            let saved = route.recovery_entry.lock();
+            assert_eq!(saved.as_ref().map(|entry| entry.ts_us), Some(recovery_ts));
+        }
+
+        release_tx.send(()).expect("release decoder sink");
+        let recovered = frame_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retained key decoded immediately after overflow");
+        assert_eq!(packet_ts_us(&recovered), recovery_ts);
+        assert_eq!(
+            test_software_open_count(ROUTE),
+            1,
+            "overflow recovery retains the healthy decoder session"
+        );
+        assert!(matches!(
+            glitch_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let routes = bridge.routes.lock();
+        assert_eq!(
+            routes
+                .get(ROUTE)
+                .expect("route remains live")
+                .queue_stats
+                .snapshot()
+                .0,
+            0,
+            "overflow reset drains the stale dependency chain"
+        );
+        drop(routes);
+        bridge.stop(ROUTE);
+    }
+
+    /// If a full queue contains no complete entry, recovery must name the
+    /// abandoned frame, hold subsequent deltas, and resume on the next key.
+    /// This is the timestamped media-plane feedback path that prevents a
+    /// Game/GDR stream from remaining black indefinitely.
+    #[test]
+    fn full_delta_queue_requests_key_then_resumes() {
+        const ROUTE: &str = "test-software-overflow-rekey";
+        assert_eq!(pending_capacity(), MAX_PENDING_AUS);
+        reset_test_software_open_count(ROUTE);
+        let (initial_key, deltas, recovery_key) = encoded_h264_recovery_chain();
+        let bridge = DecodeBridge::new();
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(0);
+        let (glitch_tx, glitch_rx) = mpsc::channel::<Option<u64>>();
+        let blocked_once = Arc::new(AtomicBool::new(false));
+        let sink_blocked = blocked_once.clone();
+
+        bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: 1,
+                key: true,
+                data: initial_key,
+            },
+            move |packet| {
+                let _ = frame_tx.send(packet);
+                if !sink_blocked.swap(true, Ordering::SeqCst) {
+                    let _ = blocked_tx.send(());
+                    let _ = release_rx.recv();
+                }
+            },
+            move |lost| {
+                let _ = glitch_tx.send(lost);
+            },
+        );
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first decoded frame reached the blocked sink");
+        let first = frame_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial decoded frame");
+        assert_eq!(packet_ts_us(&first), 1);
+
+        let first_stale_ts = 20_000;
+        for (index, data) in deltas.iter().take(MAX_PENDING_AUS).enumerate() {
+            bridge.feed(
+                ROUTE,
+                Au {
+                    ts_us: first_stale_ts + index as u64,
+                    key: false,
+                    data: data.clone(),
+                },
+                |_| {},
+                |_| {},
+            );
+        }
+        bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: 30_000,
+                key: false,
+                data: deltas[MAX_PENDING_AUS].clone(),
+            },
+            |_| {},
+            |_| {},
+        );
+        release_tx.send(()).expect("release decoder sink");
+        assert_eq!(
+            glitch_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("overflow asks for a key"),
+            Some(first_stale_ts)
+        );
+        assert!(matches!(
+            frame_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let recovery_ts = 100_000;
+        bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: recovery_ts,
+                key: true,
+                data: recovery_key,
+            },
+            |_| {},
+            |_| {},
+        );
+        let recovered = frame_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("next key resumes the same route");
+        assert_eq!(packet_ts_us(&recovered), recovery_ts);
+        assert_eq!(
+            test_software_open_count(ROUTE),
+            1,
+            "re-key recovery retains the healthy decoder session"
+        );
+        bridge.stop(ROUTE);
+    }
+
+    /// HEVC has no portable software decoder in this crate, but its queue
+    /// recovery contract is codec-agnostic and can still be proven without a
+    /// GPU: a self-describing HEVC entry returned by a full whole-AU queue is
+    /// retained locally for the decoder thread rather than discarded.
+    #[test]
+    fn full_queue_preserves_hevc_recovery_entry_without_hardware() {
+        let bridge = DecodeBridge::new();
+        let (tx, rx) = mpsc::sync_channel::<QueuedAu>(MAX_PENDING_AUS);
+        let stats = Arc::new(QueueStats::new(MAX_PENDING_AUS));
+        for index in 0..MAX_PENDING_AUS {
+            let reserved = stats.reserve_send();
+            assert!(
+                tx.try_send(QueuedAu::new(
+                    Au {
+                        ts_us: index as u64,
+                        key: false,
+                        data: vec![0, 0, 1, 0x41, 0x9a],
+                    },
+                    0,
+                ))
+                .is_ok(),
+                "fill synthetic queue"
+            );
+            stats.sent(reserved);
+        }
+        let need_key = Arc::new(AtomicBool::new(false));
+        let recovery_entry = Arc::new(Mutex::new(None));
+        bridge.routes.lock().insert(
+            "hevc-overflow".into(),
+            RouteDecode {
+                tx,
+                need_key: need_key.clone(),
+                queue_stats: stats.clone(),
+                recovery_entry: recovery_entry.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: None,
+            },
+        );
+
+        let hevc_entry = vec![0, 0, 1, 0x40, 0x01, 0xaa];
+        bridge.feed(
+            "hevc-overflow",
+            Au {
+                ts_us: 77,
+                key: false,
+                data: hevc_entry.clone(),
+            },
+            |_| {},
+            |_| {},
+        );
+        assert!(need_key.load(Ordering::SeqCst));
+        assert_eq!(stats.snapshot(), (MAX_PENDING_AUS, MAX_PENDING_AUS, 1));
+        {
+            let saved = recovery_entry.lock();
+            let saved = saved.as_ref().expect("HEVC entry retained");
+            assert_eq!(saved.ts_us, 77);
+            assert_eq!(saved.data, hevc_entry);
+            assert_eq!(sniff_codec(&saved.data), Some(AuCodec::Hevc));
+        }
+        bridge.stop("hevc-overflow");
+        drop(rx);
+    }
 
     /// The codec sniff's three-way branch, including the AV1 OBU seam:
     /// H.264/HEVC key units are detected from their start-code-led NAL
@@ -1160,6 +2011,8 @@ mod tests {
             RouteDecode {
                 tx: dead_tx,
                 need_key: Arc::new(AtomicBool::new(false)),
+                queue_stats: Arc::new(QueueStats::new(1)),
+                recovery_entry: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
                 thread: None,
             },
@@ -1181,7 +2034,7 @@ mod tests {
 
         assert_eq!(
             glitch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            None,
+            Some(1),
             "a restarted delta stream asks for a fresh key"
         );
         assert!(bridge.is_running("dead-route"));
@@ -1213,7 +2066,7 @@ mod tests {
 
         assert_eq!(
             glitch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            None,
+            Some(1),
             "a newly-created decoder starting on a delta asks for a fresh key"
         );
         assert!(bridge.is_running("fresh-delta-route"));
@@ -1319,12 +2172,7 @@ mod tests {
         assert!(!bridge.is_running("r1"));
     }
 
-    /// A retune can change display geometry without changing the route ID.
-    /// NVDEC deliberately rejects that on an existing session; the bridge must
-    /// rebuild hardware and retry the same key instead of permanently
-    /// demoting or waiting for another IDR.
-    #[test]
-    fn h264_route_rebuilds_across_resolution_change() {
+    fn assert_h264_route_decodes_resolution_change(route_id: &str) {
         use openh264::encoder::Encoder;
         use openh264::formats::{RgbSliceU8, YUVBuffer};
 
@@ -1341,7 +2189,7 @@ mod tests {
             let data = enc.encode(&yuv).expect("encode key").to_vec();
             let sink = tx.clone();
             bridge.feed(
-                "resize-route",
+                route_id,
                 Au {
                     ts_us: seq * 20_000,
                     key: true,
@@ -1365,7 +2213,31 @@ mod tests {
             ));
         }
         assert_eq!(dims, [(64, 64), (96, 80)]);
-        bridge.stop("resize-route");
+        bridge.stop(route_id);
+    }
+
+    /// A retune can change display geometry without changing the route ID.
+    /// NVDEC deliberately rejects that on an existing session; the bridge must
+    /// rebuild hardware and retry the same key instead of permanently
+    /// demoting or waiting for another IDR.
+    #[test]
+    fn h264_route_rebuilds_across_resolution_change() {
+        assert_h264_route_decodes_resolution_change("resize-route");
+    }
+
+    /// The same reconfiguration contract has a deterministic portable gate:
+    /// OpenH264 accepts the new SPS on the existing route/session and paints
+    /// the new dimensions without teardown or another key request.
+    #[test]
+    fn h264_software_route_reconfigures_in_place_across_resolution_change() {
+        const ROUTE: &str = "test-software-resize-route";
+        reset_test_software_open_count(ROUTE);
+        assert_h264_route_decodes_resolution_change(ROUTE);
+        assert_eq!(
+            test_software_open_count(ROUTE),
+            1,
+            "software decoder reconfigures without rebuilding the route"
+        );
     }
 
     /// Experimental pacing's receiver contract on the real NVIDIA rung. Feed

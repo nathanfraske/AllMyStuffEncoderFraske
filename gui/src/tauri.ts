@@ -223,20 +223,27 @@ export function connectRoute(
  *  field means "automatic". The far end restarts its capture with these. */
 export interface StreamTune {
   maxEdge?: number;
+  /** Per-route video ceiling. This is distinct from `peerCapBps`, which
+   *  covers every media route to the peer (including reserved audio). */
   bitrate?: number;
   fps?: number;
+  /** Aggregate media ceiling for the peer, in bits/s. Older backends ignore
+   *  this optional field and continue with their automatic envelope. */
+  peerCapBps?: number;
+  /** Elect this route as the peer's single priority video route. This is a
+   *  live scheduling hint: it must never reconnect or renegotiate the route. */
+  priority?: boolean;
   /** Game mode: the latency-first posture (gradual intra-refresh instead
    *  of keyframe walls on capable streamers, 60 fps floor off-LAN, tight
    *  burst bounds). Absent/false = balanced. Kept for hosts that predate
-   *  the named tri-state below. */
+   *  the named posture below. */
   game?: boolean;
-  /** The stream posture by name. Balanced favors stability and quality;
-   *  Game favors latency and instant recovery; Studio is the LAN
-   *  fidelity mode — a high-bitrate quality-first encode for links with
-   *  bandwidth to spend; Studio-Lossless is its top shelf — bit-exact
-   *  HEVC on NVIDIA hardware, falling soft to Studio anywhere the rung
-   *  can't run (old hosts read it as no named ask). */
-  mode?: "balanced" | "game" | "studio" | "studio-lossless";
+  /** The stream posture by name. Reach protects a constrained link;
+   *  Balanced favors stability and quality; Game favors latency and instant
+   *  recovery; Studio spends bandwidth on fidelity. Studio-Lossless may use
+   *  the legacy lossless HEVC rung when supported, but does not imply
+   *  source-exact 4:4:4 video or lossless audio. */
+  mode?: "reach" | "balanced" | "game" | "studio" | "studio-lossless";
 }
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
@@ -247,6 +254,8 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
     maxEdge: tune.maxEdge ?? null,
     bitrate: tune.bitrate ?? null,
     fps: tune.fps ?? null,
+    peerCapBps: tune.peerCapBps ?? null,
+    priority: tune.priority ?? null,
     game: tune.game ?? null,
     mode: tune.mode ?? null,
   });
@@ -258,7 +267,7 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
  *  real output geometry; `codec`/`encoderLabel` name the wire codec and the
  *  encoder rung. Bitrates are bits/s, `""` means "not reported yet". */
 export interface RouteDials {
-  posture: "balanced" | "game" | "studio" | "studio-lossless";
+  posture: "reach" | "balanced" | "game" | "studio" | "studio-lossless";
   encoderLabel: string;
   codec: string;
   targetBitrateBps: number;
@@ -267,6 +276,24 @@ export interface RouteDials {
   edgeCap: number;
   outW: number;
   outH: number;
+  /** Requested aggregate ceiling and the currently effective peer-wide
+   *  envelope. Optional while talking to a pre-policy backend. */
+  peerCapBps?: number;
+  peerBudgetBps?: number;
+  /** This route's allocation and hard ceiling within the peer envelope. */
+  routeBudgetBps?: number;
+  routeCeilingBps?: number;
+  /** True for the peer's single priority display, false for background. */
+  priority?: boolean;
+  /** Effective realtime-audio plan. */
+  audioPacketMs?: number;
+  audioJitterMs?: number;
+  audioFec?: boolean;
+  /** Current bounded handoff depths (frames / packets). */
+  videoQueueDepth?: number;
+  audioQueueDepth?: number;
+  /** Honest, user-facing reasons the effective plan differs from the ask. */
+  degradationReasons?: string[];
 }
 
 /** Poll the effective encode dials for `routeId`. Returns null when this

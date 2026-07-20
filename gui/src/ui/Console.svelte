@@ -246,6 +246,21 @@
     { label: "8 Mbps", value: 8_000_000 },
     { label: "4 Mbps", value: 4_000_000 },
   ];
+  // Peer-wide media envelope, deliberately separate from the selected
+  // route's Rate. These anchors include every mode contract and a 1 Mbps
+  // constrained-link test point; audio is reserved inside this cap first.
+  const ALL_MEDIA_CHOICES: PillChoice[] = [
+    { label: "Auto", value: null },
+    { label: "500 Mbps", value: 500_000_000 },
+    { label: "200 Mbps", value: 200_000_000 },
+    { label: "150 Mbps", value: 150_000_000 },
+    { label: "80 Mbps", value: 80_000_000 },
+    { label: "60 Mbps", value: 60_000_000 },
+    { label: "25 Mbps", value: 25_000_000 },
+    { label: "10 Mbps", value: 10_000_000 },
+    { label: "4 Mbps", value: 4_000_000 },
+    { label: "1 Mbps", value: 1_000_000 },
+  ];
   type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
   // These pick the *transport + decode path* for a watched stream, not a
   // specific encoder — the host picks its best encoder itself (NVENC on
@@ -307,7 +322,7 @@
   // The shared control resolves the wire posture; fold it into the
   // console's per-source tune (the same shape the popout applies).
   function applyModeWire(
-    wireMode: "game" | "studio" | "studio-lossless" | undefined,
+    wireMode: "reach" | "game" | "studio" | "studio-lossless" | undefined,
     gameFlag: boolean | undefined,
   ) {
     app.setConsoleTune({ mode: wireMode, game: gameFlag });
@@ -326,6 +341,10 @@
   }
   function pickRate(v: number | null) {
     app.setConsoleTune({ bitrate: v ?? undefined });
+    openSub = null;
+  }
+  function pickPeerCap(v: number | null) {
+    app.setConsoleTune({ peerCapBps: v ?? undefined });
     openSub = null;
   }
   function pickCodec(v: CodecChoice) {
@@ -358,7 +377,7 @@
   let menuEl = $state<HTMLElement | null>(null);
   type MenuKind = "session" | "screens" | "video";
   let openMenu = $state<MenuKind | null>(null);
-  let openSub = $state<"res" | "fps" | "rate" | "codec" | "aspect" | null>(null);
+  let openSub = $state<"res" | "fps" | "rate" | "all-media" | "codec" | "aspect" | null>(null);
   // The advanced rows' disclosure remembers the old slider/pills toggle:
   // whoever preferred the pills gets the rows open by default.
   let advOpen = $state(app.consoleControlMode === "pills");
@@ -1838,7 +1857,12 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} onpointerdown={onWindowPointerDown} onresize={clampBarPos} />
+<svelte:window
+  onkeydown={onWindowKey}
+  onpointerdown={onWindowPointerDown}
+  onresize={clampBarPos}
+  onfocus={() => app.prioritizeConsoleVideo()}
+/>
 
 {#if node}
   <div class="scrim" class:windowed>
@@ -2304,7 +2328,7 @@
                 </button>
                 {#if advOpen}
                   {#snippet valueRow(
-                    key: "res" | "fps" | "rate",
+                    key: "res" | "fps" | "rate" | "all-media",
                     name: string,
                     choices: PillChoice[],
                     current: number | null | undefined,
@@ -2333,7 +2357,14 @@
                   {/snippet}
                   {@render valueRow("res", "Resolution", RES_CHOICES, app.consoleTune.maxEdge, pickRes)}
                   {@render valueRow("fps", "Frame rate", FPS_CHOICES, app.consoleTune.fps, pickFps)}
-                  {@render valueRow("rate", "Bitrate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
+                  {@render valueRow(
+                    "all-media",
+                    "All media",
+                    ALL_MEDIA_CHOICES,
+                    app.consoleTune.peerCapBps,
+                    pickPeerCap,
+                  )}
+                  {@render valueRow("rate", "Route bitrate", RATE_CHOICES, app.consoleTune.bitrate, pickRate)}
                   <button
                     class="vrow"
                     class:tuned={codecChoice !== "auto"}

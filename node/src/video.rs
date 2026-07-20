@@ -111,7 +111,29 @@ pub enum VideoPacket {
         key: bool,
         /// Capture-tick pacing for the RTP clock (1/fps).
         duration_us: u64,
+        /// Development-profiler correlation only. This id is process-local,
+        /// is never serialized into the media payload, and remains zero when
+        /// profiling is disabled.
+        profile_id: u64,
     },
+}
+
+impl VideoPacket {
+    /// Process-local profiler correlation. MJPEG deliberately returns zero:
+    /// its public packet shape stays wire-compatible and the media forwarder
+    /// starts a fresh local correlation span at queue admission.
+    pub(crate) fn profile_id(&self) -> u64 {
+        match self {
+            Self::Jpeg(_) => 0,
+            Self::H264 { profile_id, .. } => *profile_id,
+        }
+    }
+
+    fn set_profile_id(&mut self, id: u64) {
+        if let Self::H264 { profile_id, .. } = self {
+            *profile_id = id;
+        }
+    }
 }
 
 /// Pipeline counters for one outbound stream, logged every
@@ -541,7 +563,12 @@ fn env_u32(key: &str, default: u32) -> u32 {
 /// the `ALLMYSTUFF_GUI_LOG` filter can also reach them).
 pub(crate) fn stats_to_info() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("ALLMYSTUFF_VIDEO_STATS").is_ok_and(|v| !v.is_empty() && v != "0")
+        std::env::var("ALLMYSTUFF_VIDEO_STATS").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            )
+        })
     });
     *ON
 }
@@ -565,6 +592,14 @@ pub struct Tune {
     /// [`Tune::posture`]. `Option<Posture>` (Copy) so `Tune` stays the
     /// by-value dial bundle every retune path copies around.
     pub mode: Option<Posture>,
+    /// The peer-wide allocator's ceiling for this route. Unlike the viewer's
+    /// `bitrate` pick this can move when another monitor is focused or added.
+    /// It is always a cap: an explicit per-route Rate can lower it, never
+    /// escape the aggregate peer envelope.
+    pub policy_cap_bps: Option<u32>,
+    /// Reach/Balanced policy may protect an automatic resolution without the
+    /// node-wide experimental environment switch. Explicit Res still wins.
+    pub policy_auto_resolution: bool,
     /// How the path to this stream's viewer flows (host side fills it
     /// from the daemon's nominated-pair class). Not a viewer dial: it
     /// gates only what the AUTOMATIC fps/bitrate fall back to.
@@ -580,6 +615,9 @@ pub struct Tune {
 /// viewer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
+    /// Constrained-link posture: one peer-wide 1 Mbps envelope, automatic
+    /// cadence/resolution protection, and a hard 850 kbps route ceiling.
+    Reach,
     Balanced,
     Game,
     Studio,
@@ -597,6 +635,7 @@ pub enum Posture {
 /// legacy `game` bool still steers.
 pub fn parse_posture(s: &str) -> Option<Posture> {
     match s {
+        "reach" => Some(Posture::Reach),
         "game" => Some(Posture::Game),
         "studio" => Some(Posture::Studio),
         "studio-lossless" => Some(Posture::StudioLossless),
@@ -639,11 +678,28 @@ impl Tune {
 
     fn fps(&self) -> u32 {
         self.fps
-            .unwrap_or_else(|| target_fps_for(self.link, self.game()))
+            .unwrap_or_else(|| match self.posture() {
+                Posture::Reach => {
+                    if self.link == LinkClass::Lan {
+                        30
+                    } else {
+                        15
+                    }
+                }
+                _ => target_fps_for(self.link, self.game()),
+            })
             .clamp(1, 240)
     }
     fn h264_edge(&self) -> u32 {
-        self.max_edge.unwrap_or_else(h264_max_edge).clamp(320, 3840)
+        self.max_edge
+            .unwrap_or_else(|| {
+                if self.posture() == Posture::Reach {
+                    1280
+                } else {
+                    h264_max_edge()
+                }
+            })
+            .clamp(320, 3840)
     }
     /// MJPEG honours the Res control the same way H.264 does — up to a 4K
     /// hard cap (chunked under the 64 KiB data channel) — so the pill moves
@@ -651,7 +707,13 @@ impl Tune {
     /// rather than 4K, since a JPEG frame is far heavier than an H.264 one.
     fn mjpeg_edge(&self) -> u32 {
         self.max_edge
-            .unwrap_or_else(mjpeg_max_edge)
+            .unwrap_or_else(|| {
+                if self.posture() == Posture::Reach {
+                    1280
+                } else {
+                    mjpeg_max_edge()
+                }
+            })
             .clamp(320, 3840)
     }
     /// MJPEG has no bitrate, so the Rate control maps to JPEG quality — the
@@ -772,6 +834,19 @@ pub struct PipelineFeedback {
     /// One-way-delay trend (µs of added delay per second, signed).
     #[serde(default)]
     pub delay_trend_us_per_s: i32,
+    /// Receive-side audio arrival variation and live jitter-buffer state.
+    /// These share the peer-wide feedback report because audio is reserved
+    /// before video by the allocator.
+    #[serde(default)]
+    pub audio_arrival_jitter_us: u64,
+    #[serde(default)]
+    pub audio_target_ms: u32,
+    #[serde(default)]
+    pub audio_buffered_ms: u32,
+    #[serde(default)]
+    pub audio_underruns: u64,
+    #[serde(default)]
+    pub audio_underrun_frames: u64,
     // Future receiver-side signals (last-good ts for LTR, per-plane loss,
     // paint-interval jitter, …) land here — backend-only, no wire change.
 }
@@ -781,7 +856,14 @@ impl PipelineFeedback {
     /// all-default report adds zero bytes and reads identically to a peer
     /// that sends no ext at all.
     pub fn to_ext(&self) -> serde_json::Value {
-        if self.est_kbps == 0 && self.delay_trend_us_per_s == 0 {
+        if self.est_kbps == 0
+            && self.delay_trend_us_per_s == 0
+            && self.audio_arrival_jitter_us == 0
+            && self.audio_target_ms == 0
+            && self.audio_buffered_ms == 0
+            && self.audio_underruns == 0
+            && self.audio_underrun_frames == 0
+        {
             return serde_json::Value::Null;
         }
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
@@ -1006,6 +1088,7 @@ impl VideoBridge {
     /// A viewer's Tune (the console pills/slider): the dials change, the
     /// link class the gate learned stays — a viewer retune must not
     /// quietly reset a LAN stream to the conservative Unknown dials.
+    #[allow(clippy::too_many_arguments)]
     pub fn retune_dials(
         &self,
         route_id: &str,
@@ -1014,13 +1097,22 @@ impl VideoBridge {
         fps: Option<u32>,
         game: bool,
         mode: Option<&str>,
+        policy_cap_bps: Option<u32>,
+        policy_auto_resolution: bool,
     ) {
-        let link = self
-            .routes
-            .lock()
-            .get(route_id)
-            .map(|r| r.tune.link)
-            .unwrap_or_default();
+        let current = self.routes.lock().get(route_id).map(|r| r.tune);
+        let link = current.map(|t| t.link).unwrap_or_default();
+        let parsed_mode = mode.and_then(parse_posture);
+        if current.is_some_and(|t| {
+            t.max_edge == max_edge
+                && t.bitrate == bitrate
+                && t.fps == fps
+                && t.game == game
+                && t.mode == parsed_mode
+        }) {
+            self.apply_policy_cap(route_id, policy_cap_bps, policy_auto_resolution);
+            return;
+        }
         self.retune(
             route_id,
             Tune {
@@ -1029,9 +1121,92 @@ impl VideoBridge {
                 fps,
                 link,
                 game,
-                mode: mode.and_then(parse_posture),
+                mode: parsed_mode,
+                policy_cap_bps,
+                policy_auto_resolution,
             },
         );
+    }
+
+    /// Apply an allocator-only change without disturbing a proven-good route
+    /// or its pinned media lane. H.264 lanes expose a live rate cell; move
+    /// that cell here. The encode stage either reconfigures its codec in place
+    /// or rebuilds only that codec while persistent monitor capture stays up.
+    pub fn apply_policy_cap(
+        &self,
+        route_id: &str,
+        policy_cap_bps: Option<u32>,
+        policy_auto_resolution: bool,
+    ) {
+        let current = {
+            let routes = self.routes.lock();
+            routes.get(route_id).map(|r| (r.tune, r.mode))
+        };
+        let Some((mut tune, transport)) = current else {
+            return;
+        };
+        if tune.policy_cap_bps == policy_cap_bps
+            && tune.policy_auto_resolution == policy_auto_resolution
+        {
+            return;
+        }
+        tune.policy_cap_bps = policy_cap_bps;
+        tune.policy_auto_resolution = policy_auto_resolution;
+
+        let live_rate = route_rates().lock().get(route_id).cloned();
+        if let Some(rate) = live_rate {
+            let update = rate.update_policy(tune);
+            if let Some(route) = self.routes.lock().get_mut(route_id) {
+                route.tune = tune;
+            }
+            tracing::info!(
+                "video policy {route_id}: ceiling {:.2} → {:.2} Mbps · target {:.2} → {:.2} Mbps (encoder/capture kept)",
+                update.old_ceiling as f64 / 1e6,
+                update.new_ceiling as f64 / 1e6,
+                update.old_target as f64 / 1e6,
+                update.new_target as f64 / 1e6,
+            );
+            return;
+        }
+
+        // MJPEG and an actually-lossless const-QP lane have no encoder rate
+        // controller. Restarting capture would not make the cap real, so keep
+        // the monitor session intact and state the boundary plainly; the
+        // downstream per-route budget gate is the enforcement point.
+        let encoder_is_mjpeg = route_live()
+            .lock()
+            .get(route_id)
+            .is_some_and(|live| live.codec.load(Ordering::Relaxed) == 2);
+        if transport == VideoMode::Mjpeg
+            || encoder_is_mjpeg
+            || tune.posture() == Posture::StudioLossless
+        {
+            if let Some(route) = self.routes.lock().get_mut(route_id) {
+                route.tune = tune;
+            }
+            tracing::warn!(
+                "video policy {route_id}: {:?} has no encoder bitrate control; capture kept, downstream route budget gate must enforce cap {}",
+                if encoder_is_mjpeg {
+                    VideoMode::Mjpeg
+                } else {
+                    transport
+                },
+                policy_cap_bps
+                    .map(|bps| format!("{:.2} Mbps", bps as f64 / 1e6))
+                    .unwrap_or_else(|| "auto".to_string()),
+            );
+            return;
+        }
+
+        // A lossy H.264 route normally registers its rate seam as soon as the
+        // encoder opens. If a cap lands during bring-up (or on a backend that
+        // could not expose the seam), rebuild once to make the cap effective.
+        // This is intentionally the exceptional path and is named in logs so
+        // diagnostics never call it an in-place retune.
+        tracing::warn!(
+            "video policy {route_id}: H.264 live-rate seam unavailable during cap change; rebuilding the route once (capture/encoder restart)"
+        );
+        self.retune(route_id, tune);
     }
 
     /// Re-class a live route's link (the LAN gate learning the truth after
@@ -1171,13 +1346,14 @@ impl VideoBridge {
             (r.tune, effective_h264_edge(r.tune, &r.auto))
         };
         let posture = match tune.posture() {
+            Posture::Reach => "reach",
             Posture::Balanced => "balanced",
             Posture::Game => "game",
             Posture::Studio => "studio",
             Posture::StudioLossless => "studio-lossless",
         };
         // The closed-loop bitrate the encoder is actually aiming at right now
-        // (AIMD moves it under Game), and the posture budget it climbs back
+        // (AIMD moves it under policy Reach/Balanced/Game), and the posture budget it climbs back
         // toward. Absent until the encode lane registers its rate cell.
         let (target_bitrate_bps, ceiling_bps) = route_rates()
             .lock()
@@ -1215,6 +1391,16 @@ impl VideoBridge {
             edge_cap,
             out_w,
             out_h,
+            peer_budget_bps: 0,
+            route_budget_bps: u64::from(tune.policy_cap_bps.unwrap_or(0)),
+            route_ceiling_bps: u64::from(tune.policy_cap_bps.unwrap_or(0)),
+            priority: false,
+            audio_packet_ms: 0,
+            audio_jitter_ms: 0,
+            audio_fec: false,
+            video_queue_depth: 0,
+            audio_queue_depth: 0,
+            degradation_reasons: Vec::new(),
         })
     }
 
@@ -1330,32 +1516,45 @@ impl VideoBridge {
         // Closed-loop bitrate: AIMD against the posture lane's budget,
         // applied by the encode thread through the in-place reconfigure
         // (no reset, no IDR, no visible seam). Reserved to the postures
-        // whose use case it serves in every case — Game by default (see
-        // [`rate_adapt_mode`]). Skips besides the gate: user-pinned
+        // whose effective policy advertises it — Reach, Balanced, and Game
+        // by default (see [`rate_adapt_mode`]). Skips besides the gate: user-pinned
         // bitrates (their wire to own), lossless (no rate to move), and
-        // routes with no live rate registration (CPU lane, MJPEG floor).
+        // routes with no live rate registration (MJPEG or true const-QP lossless).
         {
-            let (pinned, target_fps, game) = {
+            let (pinned, target_fps, policy_auto_rate) = {
                 let routes = self.routes.lock();
                 routes
                     .get(route_id)
-                    .map(|r| (r.tune.bitrate.is_some(), r.tune.fps(), r.tune.game()))
+                    .map(|r| {
+                        (
+                            r.tune.bitrate.is_some(),
+                            r.tune.fps(),
+                            r.tune.game() || r.tune.policy_auto_resolution,
+                        )
+                    })
                     .unwrap_or((true, 0, false))
             };
-            if !pinned && rate_adapt_allowed(game, rate_adapt_mode()) {
+            if !pinned && rate_adapt_allowed(policy_auto_rate, rate_adapt_mode()) {
                 if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+                    let mut adapt = rate.adapt.lock();
                     let current = rate.target.load(Ordering::Relaxed);
                     let ceiling = rate.ceiling.load(Ordering::Relaxed);
+                    let floor = rate.adapt_floor.load(Ordering::Relaxed);
                     if current > 0 && ceiling > 0 {
                         let step = rate_adapt_step(
-                            &mut rate.adapt.lock(),
+                            &mut adapt,
                             &fb,
                             target_fps,
                             current,
                             ceiling,
+                            floor,
                             Instant::now(),
                         );
                         if let Some(next) = step {
+                            // A focus/cap update can race this report. Re-read
+                            // the ceiling while holding the shared adaptation
+                            // state and never publish a target above it.
+                            let next = next.min(rate.ceiling.load(Ordering::Relaxed));
                             rate.target.store(next, Ordering::Relaxed);
                             tracing::info!(
                                 "video rate {route_id}: {:.1} → {:.1} Mbps (ceiling {:.1}) — {}",
@@ -1400,7 +1599,7 @@ impl VideoBridge {
         // was once disabled outright (and the console's standing decode
         // backlog is what disabling it cost). `auto_adapt_enabled` is the
         // operator kill switch on top.
-        if !auto_adapt_enabled() || tune.max_edge.is_some() {
+        if (!auto_adapt_enabled() && !tune.policy_auto_resolution) || tune.max_edge.is_some() {
             return;
         }
         if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
@@ -1452,6 +1651,7 @@ impl VideoBridge {
         );
         drop(old); // joins the old capture thread; its session releases
         let posture = match tune.posture() {
+            Posture::Reach => "reach",
             Posture::Balanced => "balanced",
             Posture::Game => "game",
             Posture::Studio => "studio",
@@ -1668,6 +1868,10 @@ fn run_capture(
             stats.set_encoder("GPU (hardware)");
             let mut window = Instant::now();
             let mut attempts = 0u32;
+            // Survives internal GPU-lane restarts (capture resize/reacquire)
+            // so the latest allocator cap and AIMD backoff are never replaced
+            // by the route thread's original by-value Tune.
+            let mut rate_registration: Option<RouteRateRegistration> = None;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -1690,6 +1894,7 @@ fn run_capture(
                     mid,
                     stable_monitor_name.as_deref(),
                     tune,
+                    &mut rate_registration,
                     refresh,
                     idr_ms,
                     auto,
@@ -1707,6 +1912,10 @@ fn run_capture(
                     }
                 }
             }
+            // A fall through to the system-memory capture ladder gets its own
+            // H264Stream registration. Remove the GPU cell first; the guard's
+            // pointer check makes this safe on every exit path.
+            drop(rate_registration);
         }
     }
 
@@ -2005,17 +2214,41 @@ where
 /// drop. A backlogged hardware encoder can drain several units in one call;
 /// every one must reach the wire **in order** or the viewer's P-frame chain
 /// snaps (the smear-until-IDR failure this replaced).
-fn emit_packets(
+/// Profile the synchronous hand-off separately from codec work. This ends at
+/// the local callback return; it does not claim socket, network, decode, or
+/// viewer-paint completion.
+fn emit_packets_profiled(
     packets: Vec<VideoPacket>,
     on_packet: &(dyn Fn(VideoPacket) -> bool + Send + Sync),
     stats: &mut StreamStats,
+    route_id: &str,
+    frame_id: u64,
 ) {
-    for p in packets {
-        if on_packet(p) {
+    for mut packet in packets {
+        // Hardware backends may drain an oldest-first backlog unrelated to
+        // the input submitted by this call. Preserve the per-output id the
+        // encoder FIFO assigned; synchronous MJPEG/software packets inherit
+        // the call's id here.
+        let packet_id = match packet.profile_id() {
+            0 => {
+                packet.set_profile_id(frame_id);
+                frame_id
+            }
+            id => id,
+        };
+        let started = crate::pipeline_profile::stamp();
+        if on_packet(packet) {
             stats.sent += 1;
         } else {
             stats.dropped += 1;
         }
+        crate::pipeline_profile::record_since(
+            route_id,
+            packet_id,
+            None,
+            crate::pipeline_profile::Stage::EncoderOutputDelivery,
+            started,
+        );
     }
 }
 
@@ -2075,6 +2308,14 @@ where
     // Set by the encode side on ANY exit so the capture side never keeps
     // converting into a dead stage; its error surfaces through the join.
     let encode_done = AtomicBool::new(false);
+    // The stats object moves to the encode thread. Keep one stable route label
+    // on each side solely when the development profiler is active.
+    let profile_route = if crate::pipeline_profile::enabled() {
+        stats.route_id.clone()
+    } else {
+        String::new()
+    };
+    let encode_profile_route = profile_route.clone();
 
     std::thread::scope(|s| {
         let need_format = &need_format;
@@ -2119,8 +2360,31 @@ where
                         refines_left = 0;
                         refine_at = None;
                         stats.add_scale(staged.scale_spent);
-                        match encoder.encode_staged(staged, stats, &mut recycle) {
-                            Ok(packets) => emit_packets(packets, on_packet, stats),
+                        let profile_id = staged.profile_id;
+                        crate::pipeline_profile::record_since(
+                            &encode_profile_route,
+                            profile_id,
+                            None,
+                            crate::pipeline_profile::Stage::EncoderQueueWait,
+                            staged.profile_ready,
+                        );
+                        let encode_started = crate::pipeline_profile::stamp();
+                        let encoded = encoder.encode_staged(staged, stats, &mut recycle);
+                        crate::pipeline_profile::record_since(
+                            &encode_profile_route,
+                            profile_id,
+                            None,
+                            crate::pipeline_profile::Stage::EncodeBusy,
+                            encode_started,
+                        );
+                        match encoded {
+                            Ok(packets) => emit_packets_profiled(
+                                packets,
+                                on_packet,
+                                stats,
+                                &encode_profile_route,
+                                profile_id,
+                            ),
                             Err(e) => break Err(e),
                         }
                         stats.maybe_log();
@@ -2145,10 +2409,25 @@ where
                         // coarse.
                         if !quiesced || encoder.wants_refresh() {
                             quiesced = true;
-                            match encoder.re_emit(stats, true) {
+                            let profile_id = crate::pipeline_profile::next_frame_id();
+                            let encode_started = crate::pipeline_profile::stamp();
+                            match encoder.re_emit(stats, true, profile_id) {
                                 Ok(packets) => {
+                                    crate::pipeline_profile::record_since(
+                                        &encode_profile_route,
+                                        profile_id,
+                                        None,
+                                        crate::pipeline_profile::Stage::EncodeBusy,
+                                        encode_started,
+                                    );
                                     let emitted = !packets.is_empty();
-                                    emit_packets(packets, on_packet, stats);
+                                    emit_packets_profiled(
+                                        packets,
+                                        on_packet,
+                                        stats,
+                                        &encode_profile_route,
+                                        profile_id,
+                                    );
                                     if emitted && encoder.mode() == VideoMode::H264 {
                                         refines_left = REFINE_PASSES;
                                         refine_at = Some(Instant::now() + REFINE_AFTER);
@@ -2159,9 +2438,24 @@ where
                             stats.maybe_log();
                         } else if refines_left > 0 && refine_at.is_some_and(|t| Instant::now() >= t)
                         {
-                            match encoder.re_emit(stats, false) {
+                            let profile_id = crate::pipeline_profile::next_frame_id();
+                            let encode_started = crate::pipeline_profile::stamp();
+                            match encoder.re_emit(stats, false, profile_id) {
                                 Ok(packets) => {
-                                    emit_packets(packets, on_packet, stats);
+                                    crate::pipeline_profile::record_since(
+                                        &encode_profile_route,
+                                        profile_id,
+                                        None,
+                                        crate::pipeline_profile::Stage::EncodeBusy,
+                                        encode_started,
+                                    );
+                                    emit_packets_profiled(
+                                        packets,
+                                        on_packet,
+                                        stats,
+                                        &encode_profile_route,
+                                        profile_id,
+                                    );
                                     refines_left -= 1;
                                     refine_at =
                                         (refines_left > 0).then(|| Instant::now() + REFINE_SPACING);
@@ -2187,6 +2481,7 @@ where
                 break Ok(());
             }
             // A bounded wait keeps the stop flag responsive on idle screens.
+            let capture_wait_started = crate::pipeline_profile::stamp();
             let mut frame = match frames.recv_timeout(Duration::from_millis(250)) {
                 Ok(f) => f,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2225,6 +2520,14 @@ where
             while let Ok(newer) = frames.try_recv() {
                 frame = newer;
             }
+            let profile_id = crate::pipeline_profile::next_frame_id();
+            crate::pipeline_profile::record_since(
+                &profile_route,
+                profile_id,
+                None,
+                crate::pipeline_profile::Stage::CaptureWait,
+                capture_wait_started,
+            );
             let (rgba, sw, sh) = raw(frame);
             let staged = match stage_need_from_u8(need_format.load(Ordering::Relaxed)) {
                 None => Staged {
@@ -2234,6 +2537,8 @@ where
                     sw,
                     sh,
                     scale_spent: Duration::ZERO,
+                    profile_id,
+                    profile_ready: crate::pipeline_profile::stamp(),
                 },
                 Some(format) => {
                     // The convert indexes by dims — a short backend buffer
@@ -2259,6 +2564,13 @@ where
                         YuvFormat::Nv12 => scale_rgba_to_nv12_into(&rgba, sw, sh, dw, dh, &mut buf),
                     }
                     let scale_spent = t0.elapsed();
+                    crate::pipeline_profile::record(
+                        &profile_route,
+                        profile_id,
+                        None,
+                        crate::pipeline_profile::Stage::ConvertBusy,
+                        scale_spent,
+                    );
                     // The source frame is spent — hand its pages back to the
                     // capture backend if it runs a reclaim lane.
                     if let Some(reclaim) = reclaim {
@@ -2271,6 +2583,8 @@ where
                         sw,
                         sh,
                         scale_spent,
+                        profile_id,
+                        profile_ready: crate::pipeline_profile::stamp(),
                     }
                 }
             };
@@ -2638,6 +2952,7 @@ fn run_gpu_lane(
     mid: u32,
     stable_monitor_name: Option<&str>,
     tune: Tune,
+    rate_registration: &mut Option<RouteRateRegistration>,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
     auto: &Arc<AutoAdapt>,
@@ -2651,7 +2966,14 @@ fn run_gpu_lane(
         Err(e) => return GpuEnd::Fallback(e),
     };
     let (dw, dh) = lane.out_size;
-    let bitrate = tuned_bitrate(tune, dw, dh, fps);
+    let prior_rate = rate_registration
+        .as_ref()
+        .map(|registration| registration.rate.clone());
+    let bitrate = if let Some(rate) = &prior_rate {
+        rate.update_geometry(tune, dw, dh, fps).new_target
+    } else {
+        tuned_bitrate(tune, dw, dh, fps)
+    };
     let posture = tune.posture();
     if matches!(posture, Posture::Studio | Posture::StudioLossless) && tune.link != LinkClass::Lan {
         tracing::info!(
@@ -2784,32 +3106,17 @@ fn run_gpu_lane(
     // is actually asked to carry. Not registered for lossless — constQP
     // has no rate to move, and the pacer's lossless shaping is the
     // LAN-tuned path on purpose.
-    let rate = std::sync::Arc::new(RouteRate {
-        target: AtomicU32::new(bitrate),
-        ceiling: AtomicU32::new(bitrate),
-        adapt: Mutex::new(RateAdaptState::default()),
-    });
-    struct RateReg(Option<String>);
-    impl Drop for RateReg {
-        fn drop(&mut self) {
-            if let Some(id) = self.0.take() {
-                route_rates().lock().remove(&id);
-            }
-        }
-    }
-    let mut rate_registered = false;
-    let register_rate = |registered: &mut bool| {
+    let rate = prior_rate.unwrap_or_else(|| Arc::new(RouteRate::new(tune, dw, dh, fps)));
+    let mut rate_registered = rate_registration.is_some();
+    let mut register_rate = |registered: &mut bool| {
         if !*registered {
-            route_rates()
-                .lock()
-                .insert(route_id.to_string(), rate.clone());
+            *rate_registration = Some(RouteRateRegistration::new(route_id, rate.clone()));
             *registered = true;
         }
     };
     if !lossless_active {
         register_rate(&mut rate_registered);
     }
-    let _rate_reg = RateReg(Some(route_id.to_string()));
     let mut applied_rate = bitrate;
     tracing::info!(
         "GPU zero-copy lane for {route_id}: {} · {}×{} fitted to {dw}×{dh} · {:.1} Mbps @ {fps} fps",
@@ -2831,6 +3138,7 @@ fn run_gpu_lane(
     // encoder can still be reading an older texture after a later submit.
     let mut retained: std::collections::VecDeque<crate::win_capture::GpuFrame> =
         std::collections::VecDeque::with_capacity(gpu_retirement_depth(&enc));
+    let mut profile_inputs = std::collections::VecDeque::new();
     let mut last_idr: Option<Instant> = None;
     let mut last_emit: Option<Instant> = None;
     // Watchdog: an MFT that consumes frames but never produces a unit is a
@@ -2847,11 +3155,61 @@ fn run_gpu_lane(
         if stop.load(Ordering::SeqCst) {
             return GpuEnd::Stopped;
         }
+        // Apply allocator/AIMD moves before waiting for damage so a cap change
+        // on a static desktop is not postponed until the next mouse movement.
+        // A backend that rejects its dynamic API is reopened on the SAME D3D
+        // lane at the requested rate: encoder/reference state pays one IDR,
+        // while duplication, monitor identity, and capture textures stay put.
+        let want_rate = rate.target.load(Ordering::Relaxed);
+        if want_rate != applied_rate && want_rate > 0 && !lossless_active {
+            let old_label = enc.label().to_string();
+            if enc.set_bitrate(want_rate) {
+                tracing::info!(
+                    "{}: rate re-aimed {:.1} → {:.1} Mbps in place for {route_id} (capture/encoder/reference state kept)",
+                    old_label,
+                    applied_rate as f64 / 1e6,
+                    want_rate as f64 / 1e6,
+                );
+                applied_rate = want_rate;
+            } else if let Some(next) = open_gpu_encoder(
+                lane.adapter_luid,
+                dw,
+                dh,
+                fps,
+                want_rate,
+                game,
+                &lane.manager,
+            ) {
+                let next_label = next.label().to_string();
+                enc = GpuCodec::Mf(next);
+                profile_inputs.clear();
+                disable_gdr_route(route_id, &mut gdr, &wave);
+                lossless_active = false;
+                noise_guard_armed = false;
+                applied_rate = want_rate;
+                refresh.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    "video rate {route_id}: {old_label} rejected live reconfigure; rebuilt encoder only as {next_label} at {:.2} Mbps (capture/monitor kept, next frame IDR)",
+                    want_rate as f64 / 1e6,
+                );
+            } else {
+                // Keep target/readout equal to what is genuinely configured.
+                // The ceiling remains the requested allocator budget, making
+                // the limitation visible instead of pretending it applied.
+                rate.target.store(applied_rate, Ordering::Relaxed);
+                tracing::warn!(
+                    "video rate {route_id}: {old_label} rejected live reconfigure and no same-lane MFT reopened; encoder remains at {:.2} Mbps (requested ceiling {:.2} Mbps)",
+                    applied_rate as f64 / 1e6,
+                    rate.ceiling.load(Ordering::Relaxed) as f64 / 1e6,
+                );
+            }
+        }
         // Game mode wakes the quiet path 5× faster: the quiesce IDR (and
         // with it the refinement ladder) lands within ~50 ms of motion
         // stopping instead of ~250 — the "screen snaps crisp the moment
         // you stop" feel. Balanced keeps the relaxed tick.
         let quiet_tick = Duration::from_millis(if gdr || game { 50 } else { 250 });
+        let capture_wait_started = crate::pipeline_profile::stamp();
         match lane.frames.recv_timeout(quiet_tick) {
             Ok(mut frame) => {
                 let frame_start = Instant::now();
@@ -2863,6 +3221,14 @@ fn run_gpu_lane(
                     let _ = lane.release.try_send(frame.slot);
                     frame = newer;
                 }
+                let profile_id = crate::pipeline_profile::next_frame_id();
+                crate::pipeline_profile::record_since(
+                    route_id,
+                    profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::CaptureWait,
+                    capture_wait_started,
+                );
                 // The receiver's edge cap may have moved (auto-adapt); the
                 // blt output size is baked into the lane, so a changed fit
                 // rebuilds the lane rather than mis-scaling.
@@ -2885,9 +3251,24 @@ fn run_gpu_lane(
                 refines_left = 0;
                 refine_at = None;
                 stats.add_scale(frame.spent);
+                crate::pipeline_profile::record(
+                    route_id,
+                    profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::ConvertBusy,
+                    frame.spent,
+                );
                 // M1: how stale the pixels are as encoding begins.
                 if let Some(presented) = frame.presented {
-                    stats.add_age(presented.elapsed());
+                    let age = presented.elapsed();
+                    stats.add_age(age);
+                    crate::pipeline_profile::record(
+                        route_id,
+                        profile_id,
+                        None,
+                        crate::pipeline_profile::Stage::CaptureAge,
+                        age,
+                    );
                 }
                 (stats.out_w, stats.out_h) = (frame.out_w, frame.out_h);
                 let refresh_asked = refresh.swap(false, Ordering::SeqCst);
@@ -2903,32 +3284,26 @@ fn run_gpu_lane(
                         GpuCodec::Mf(_) => {}
                     }
                 }
-                // Closed-loop bitrate: apply the controller's target in
-                // place. A rung that can't move (MF partial coverage
-                // mid-heal) pins the target back so the controller never
-                // chases a knob wired to nothing.
-                let want_rate = rate.target.load(Ordering::Relaxed);
-                if want_rate != applied_rate && want_rate > 0 && !lossless_active {
-                    if enc.set_bitrate(want_rate) {
-                        tracing::info!(
-                            "{}: rate re-aimed {:.1} → {:.1} Mbps in place for {route_id}",
-                            enc.label(),
-                            applied_rate as f64 / 1e6,
-                            want_rate as f64 / 1e6,
-                        );
-                        applied_rate = want_rate;
-                    } else {
-                        rate.target.store(applied_rate, Ordering::Relaxed);
-                    }
-                }
                 let idr_every = Duration::from_millis(idr_ms.load(Ordering::Relaxed));
                 let force_idr = refresh_asked
                     || (!gdr && last_idr.is_none_or(|idr| idr.elapsed() >= idr_every));
                 let t1 = Instant::now();
-                match enc.encode_texture(&frame.tex, force_idr) {
+                let encoded = enc.encode_texture(&frame.tex, force_idr);
+                let encode_spent = t1.elapsed();
+                crate::pipeline_profile::record(
+                    route_id,
+                    profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::EncodeBusy,
+                    encode_spent,
+                );
+                match encoded {
                     Ok(outcome) => {
-                        stats.add_encode(t1.elapsed());
+                        stats.add_encode(encode_spent);
                         let consumed = outcome.consumed;
+                        if consumed {
+                            note_profile_input(&mut profile_inputs, route_id, profile_id);
+                        }
                         // Keep the submitted source in the same bounded
                         // retirement deque even when the encoder reports it
                         // unconsumed. A quiet tick can then re-offer those
@@ -2955,9 +3330,17 @@ fn run_gpu_lane(
                         } else {
                             units_ever = true;
                         }
+                        let frame_bytes: usize =
+                            outcome.units.iter().map(|(data, _)| data.len()).sum();
+                        let mut packets = packetize_units(
+                            outcome.units,
+                            fps,
+                            &mut last_emit,
+                            &mut last_idr,
+                            stats,
+                        );
+                        assign_profile_output_ids(&mut packets, &mut profile_inputs);
                         if noise_guard_armed {
-                            let frame_bytes: usize =
-                                outcome.units.iter().map(|(d, _)| d.len()).sum();
                             noise_window.push_back(frame_bytes > noise_frame_bytes);
                             if noise_window.len() > 120 {
                                 noise_window.pop_front();
@@ -2983,7 +3366,7 @@ fn run_gpu_lane(
                                     dw,
                                     dh,
                                     fps,
-                                    bitrate,
+                                    rate.target.load(Ordering::Relaxed),
                                     false,
                                     true,
                                 ) {
@@ -2994,8 +3377,13 @@ fn run_gpu_lane(
                                         // decoder — the same seam a posture
                                         // retune crosses.
                                         enc = GpuCodec::Nvenc(n);
+                                        // Outputs from this call were assigned
+                                        // above; any older un-emitted inputs
+                                        // belonged to the replaced codec.
+                                        profile_inputs.clear();
                                         lossless_active = false;
                                         register_rate(&mut rate_registered);
+                                        applied_rate = rate.target.load(Ordering::Relaxed);
                                         refresh.store(true, Ordering::SeqCst);
                                     }
                                     Err(e) => {
@@ -3011,14 +3399,7 @@ fn run_gpu_lane(
                                 }
                             }
                         }
-                        let packets = packetize_units(
-                            outcome.units,
-                            fps,
-                            &mut last_emit,
-                            &mut last_idr,
-                            stats,
-                        );
-                        emit_packets(packets, on_packet, stats);
+                        emit_packets_profiled(packets, on_packet, stats, route_id, profile_id);
                     }
                     Err(e) => {
                         // Preserve the final damaged picture before any heal
@@ -3033,7 +3414,7 @@ fn run_gpu_lane(
                                 dw,
                                 dh,
                                 fps,
-                                bitrate,
+                                rate.target.load(Ordering::Relaxed),
                                 game,
                                 &lane.manager,
                             )
@@ -3045,9 +3426,11 @@ fn run_gpu_lane(
                                 // no GDR: the periodic-IDR cadence takes
                                 // recovery duty back.
                                 enc = GpuCodec::Mf(next);
+                                profile_inputs.clear();
                                 disable_gdr_route(route_id, &mut gdr, &wave);
                                 lossless_active = false;
                                 register_rate(&mut rate_registered);
+                                applied_rate = rate.target.load(Ordering::Relaxed);
                                 refresh.store(true, Ordering::SeqCst);
                             }
                             Ok(None) => {}
@@ -3081,11 +3464,22 @@ fn run_gpu_lane(
                 if !quiesced || refresh.load(Ordering::SeqCst) {
                     quiesced = true;
                     let refresh_asked = refresh.load(Ordering::SeqCst);
+                    let profile_id = crate::pipeline_profile::next_frame_id();
                     let t1 = Instant::now();
-                    match enc.encode_texture(&kept.tex, true) {
+                    let encoded = enc.encode_texture(&kept.tex, true);
+                    let encode_spent = t1.elapsed();
+                    crate::pipeline_profile::record(
+                        route_id,
+                        profile_id,
+                        None,
+                        crate::pipeline_profile::Stage::EncodeBusy,
+                        encode_spent,
+                    );
+                    match encoded {
                         Ok(outcome) => {
-                            stats.add_encode(t1.elapsed());
+                            stats.add_encode(encode_spent);
                             if outcome.consumed {
+                                note_profile_input(&mut profile_inputs, route_id, profile_id);
                                 if refresh_asked {
                                     refresh.store(false, Ordering::SeqCst);
                                 }
@@ -3097,14 +3491,15 @@ fn run_gpu_lane(
                             }
                             let consumed = outcome.consumed;
                             let emitted = !outcome.units.is_empty();
-                            let packets = packetize_units(
+                            let mut packets = packetize_units(
                                 outcome.units,
                                 fps,
                                 &mut last_emit,
                                 &mut last_idr,
                                 stats,
                             );
-                            emit_packets(packets, on_packet, stats);
+                            assign_profile_output_ids(&mut packets, &mut profile_inputs);
+                            emit_packets_profiled(packets, on_packet, stats, route_id, profile_id);
                             if consumed && emitted {
                                 refines_left = REFINE_PASSES;
                                 refine_at = Some(Instant::now() + REFINE_AFTER);
@@ -3120,16 +3515,18 @@ fn run_gpu_lane(
                                     dw,
                                     dh,
                                     fps,
-                                    bitrate,
+                                    rate.target.load(Ordering::Relaxed),
                                     game,
                                     &lane.manager,
                                 )
                             }) {
                                 Ok(Some(next)) => {
                                     enc = GpuCodec::Mf(next);
+                                    profile_inputs.clear();
                                     disable_gdr_route(route_id, &mut gdr, &wave);
                                     lossless_active = false;
                                     register_rate(&mut rate_registered);
+                                    applied_rate = rate.target.load(Ordering::Relaxed);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
@@ -3139,22 +3536,36 @@ fn run_gpu_lane(
                     }
                     stats.maybe_log();
                 } else if refines_left > 0 && refine_at.is_some_and(|t| Instant::now() >= t) {
+                    let profile_id = crate::pipeline_profile::next_frame_id();
                     let t1 = Instant::now();
-                    match enc.encode_texture(&kept.tex, false) {
+                    let encoded = enc.encode_texture(&kept.tex, false);
+                    let encode_spent = t1.elapsed();
+                    crate::pipeline_profile::record(
+                        route_id,
+                        profile_id,
+                        None,
+                        crate::pipeline_profile::Stage::EncodeBusy,
+                        encode_spent,
+                    );
+                    match encoded {
                         Ok(outcome) => {
-                            stats.add_encode(t1.elapsed());
+                            stats.add_encode(encode_spent);
                             let consumed = outcome.consumed;
+                            if consumed {
+                                note_profile_input(&mut profile_inputs, route_id, profile_id);
+                            }
                             if !consumed {
                                 refresh.store(true, Ordering::SeqCst);
                             }
-                            let packets = packetize_units(
+                            let mut packets = packetize_units(
                                 outcome.units,
                                 fps,
                                 &mut last_emit,
                                 &mut last_idr,
                                 stats,
                             );
-                            emit_packets(packets, on_packet, stats);
+                            assign_profile_output_ids(&mut packets, &mut profile_inputs);
+                            emit_packets_profiled(packets, on_packet, stats, route_id, profile_id);
                             if consumed {
                                 refines_left -= 1;
                                 refine_at =
@@ -3169,16 +3580,18 @@ fn run_gpu_lane(
                                     dw,
                                     dh,
                                     fps,
-                                    bitrate,
+                                    rate.target.load(Ordering::Relaxed),
                                     game,
                                     &lane.manager,
                                 )
                             }) {
                                 Ok(Some(next)) => {
                                     enc = GpuCodec::Mf(next);
+                                    profile_inputs.clear();
                                     disable_gdr_route(route_id, &mut gdr, &wave);
                                     lossless_active = false;
                                     register_rate(&mut rate_registered);
+                                    applied_rate = rate.target.load(Ordering::Relaxed);
                                     refresh.store(true, Ordering::SeqCst);
                                 }
                                 Ok(None) => {}
@@ -3282,14 +3695,24 @@ fn run_oneshot_capture(
         // zombie-stream failure this used to produce.
         match monitor.capture_image() {
             Ok(image) => {
+                let profile_id = crate::pipeline_profile::next_frame_id();
                 let (sw, sh) = (image.width(), image.height());
                 // capture_image (X11 grab, Windows GDI/WGC fallback) is upright.
                 let (rgba, sw, sh) = orient_to_monitor(image.into_raw(), sw, sh, 0);
-                match encoder.encode(rgba, sw, sh, stats) {
+                let encode_started = crate::pipeline_profile::stamp();
+                let encoded = encoder.encode_profiled(rgba, sw, sh, stats, profile_id);
+                crate::pipeline_profile::record_since(
+                    route_id,
+                    profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::EncodeBusy,
+                    encode_started,
+                );
+                match encoded {
                     Ok(packets) => {
                         failures = 0;
                         reporter.report(VideoStatusState::Ok, None);
-                        emit_packets(packets, on_packet, stats);
+                        emit_packets_profiled(packets, on_packet, stats, route_id, profile_id);
                     }
                     Err(e) => {
                         reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
@@ -3725,6 +4148,7 @@ impl HealingEncoder {
         self.enc.wants_refresh()
     }
 
+    #[cfg(test)]
     fn encode(
         &mut self,
         rgba: Vec<u8>,
@@ -3732,7 +4156,18 @@ impl HealingEncoder {
         sh: u32,
         stats: &mut StreamStats,
     ) -> Result<Vec<VideoPacket>, String> {
-        match self.enc.encode(rgba, sw, sh, stats) {
+        self.encode_profiled(rgba, sw, sh, stats, 0)
+    }
+
+    fn encode_profiled(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+        profile_id: u64,
+    ) -> Result<Vec<VideoPacket>, String> {
+        match self.enc.encode_profiled(rgba, sw, sh, stats, profile_id) {
             Ok(packets) => Ok(packets),
             Err(e) => {
                 self.heal(&e, (sw, sh))?;
@@ -3745,8 +4180,9 @@ impl HealingEncoder {
         &mut self,
         stats: &mut StreamStats,
         force_idr: bool,
+        profile_id: u64,
     ) -> Result<Vec<VideoPacket>, String> {
-        match self.enc.re_emit(stats, force_idr) {
+        match self.enc.re_emit(stats, force_idr, profile_id) {
             Ok(packets) => Ok(packets),
             Err(e) => {
                 self.heal(&e, (0, 0))?;
@@ -3888,6 +4324,10 @@ struct Staged {
     /// Time the capture side spent converting — accounted into the encode
     /// side's stats, which own the dial-in log line.
     scale_spent: Duration,
+    /// Process-local development-trace correlation. Zero/`None` in the
+    /// ordinary disabled path; never serialized or sent across a pipe.
+    profile_id: u64,
+    profile_ready: Option<Instant>,
 }
 
 /// The wire encoding of [`HealingEncoder::current_needs`]'s layout half for
@@ -3949,6 +4389,7 @@ impl StreamEncoder {
                 auto.clone(),
             ))),
             VideoMode::H264 => Ok(StreamEncoder::H264(Box::new(H264Stream::new(
+                route_id,
                 source_hint,
                 tune,
                 refresh.clone(),
@@ -3958,12 +4399,24 @@ impl StreamEncoder {
         }
     }
 
+    #[cfg(test)]
     fn encode(
         &mut self,
         rgba: Vec<u8>,
         sw: u32,
         sh: u32,
         stats: &mut StreamStats,
+    ) -> Result<Vec<VideoPacket>, String> {
+        self.encode_profiled(rgba, sw, sh, stats, 0)
+    }
+
+    fn encode_profiled(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+        profile_id: u64,
     ) -> Result<Vec<VideoPacket>, String> {
         // A backend that hands over fewer bytes than its stated dimensions
         // imply must cost an error, not an out-of-bounds panic downstream —
@@ -3983,7 +4436,7 @@ impl StreamEncoder {
                 .map(VideoPacket::Jpeg)
                 .into_iter()
                 .collect()),
-            StreamEncoder::H264(enc) => enc.encode(rgba, sw, sh, stats),
+            StreamEncoder::H264(enc) => enc.encode_profiled(rgba, sw, sh, stats, profile_id),
         }
     }
 
@@ -4006,6 +4459,7 @@ impl StreamEncoder {
         &mut self,
         stats: &mut StreamStats,
         force_idr: bool,
+        profile_id: u64,
     ) -> Result<Vec<VideoPacket>, String> {
         match self {
             StreamEncoder::Mjpeg(enc) => {
@@ -4018,7 +4472,7 @@ impl StreamEncoder {
                     .into_iter()
                     .collect())
             }
-            StreamEncoder::H264(enc) => enc.re_emit(stats, force_idr),
+            StreamEncoder::H264(enc) => enc.re_emit(stats, force_idr, profile_id),
         }
     }
 
@@ -4049,9 +4503,15 @@ impl StreamEncoder {
                     .into_iter()
                     .collect())
             }
-            (StreamEncoder::H264(enc), Prepared::Yuv(format, yuv)) => {
-                enc.encode_prepared(yuv, format, staged.dw, staged.dh, stats, recycle)
-            }
+            (StreamEncoder::H264(enc), Prepared::Yuv(format, yuv)) => enc.encode_prepared(
+                yuv,
+                format,
+                staged.dw,
+                staged.dh,
+                staged.profile_id,
+                stats,
+                recycle,
+            ),
             (_, Prepared::Yuv(_, yuv)) => {
                 stats.dropped += 1;
                 recycle(yuv);
@@ -4083,6 +4543,7 @@ impl StreamEncoder {
 /// a decode entry point within seconds. A resolution change (monitor swap)
 /// re-initializes the encoder inside openh264; the next unit out is an IDR.
 struct H264Stream {
+    route_id: String,
     /// The active H.264 backend — a hardware encoder (Media Foundation's GPU
     /// H.264 MFT on Windows; NVENC/AMF/QSV/VideoToolbox/VA-API via FFmpeg on
     /// Linux/macOS) when one passed the frame-send test, else software openh264.
@@ -4094,6 +4555,11 @@ struct H264Stream {
     /// *reports* are logical pixels on HiDPI while captures are physical,
     /// and a 4× pixel gap on the same budget is a mush stream.
     budget_size: (u32, u32),
+    /// Shared allocator/AIMD seam. Cap-only changes move this cell; the
+    /// encode stage applies them without touching monitor capture.
+    rate: Arc<RouteRate>,
+    /// Rate currently configured into `codec`.
+    applied_rate: u32,
     tune: Tune,
     fps: u32,
     prev: Vec<u8>,
@@ -4106,6 +4572,11 @@ struct H264Stream {
     /// motion gets a ~2 s duration, not 1/fps), instead of lagging and churning
     /// the viewer's jitter buffer on motion onset.
     last_emit: Option<Instant>,
+    /// Process-local profiler metadata for inputs accepted by an asynchronous
+    /// hardware encoder but not necessarily emitted by the same call. Units
+    /// drain oldest-first, so one FIFO entry maps to one output AU. Empty in
+    /// the ordinary disabled path and cleared whenever the codec is rebuilt.
+    profile_inputs: std::collections::VecDeque<u64>,
     /// The route's one-shot "clean entry now" flag (a viewer asked).
     refresh: Arc<AtomicBool>,
     /// The current forced-IDR interval (ms), adapted from receiver feedback
@@ -4118,8 +4589,21 @@ struct H264Stream {
     auto: Arc<AutoAdapt>,
 }
 
+impl Drop for H264Stream {
+    fn drop(&mut self) {
+        let mut rates = route_rates().lock();
+        if rates
+            .get(&self.route_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.rate))
+        {
+            rates.remove(&self.route_id);
+        }
+    }
+}
+
 impl H264Stream {
     fn new(
+        route_id: &str,
         source_hint: (u32, u32),
         tune: Tune,
         refresh: Arc<AtomicBool>,
@@ -4141,9 +4625,17 @@ impl H264Stream {
             fit_within_even(source_hint.0, source_hint.1, auto_capped_edge)
         };
         let codec = make_h264_codec(bw, bh, fps, tune)?;
+        let rate = Arc::new(RouteRate::new(tune, bw, bh, fps));
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), rate.clone());
+        let applied_rate = rate.target.load(Ordering::Relaxed);
         Ok(H264Stream {
+            route_id: route_id.to_string(),
             codec,
             budget_size: (bw, bh),
+            rate,
+            applied_rate,
             tune,
             fps,
             prev: Vec::new(),
@@ -4151,6 +4643,7 @@ impl H264Stream {
             last_sent: None,
             last_idr: None,
             last_emit: None,
+            profile_inputs: std::collections::VecDeque::new(),
             refresh,
             idr_ms,
             auto,
@@ -4163,12 +4656,73 @@ impl H264Stream {
         effective_h264_edge(self.tune, &self.auto)
     }
 
+    /// Apply the allocator/AIMD target at the codec boundary. Media
+    /// Foundation can normally move in place; openh264/VT/FFmpeg wrappers do
+    /// not claim that capability here, so they rebuild only the encoder. In
+    /// both cases the persistent monitor/camera capture and pipeline threads
+    /// stay alive.
+    fn apply_pending_rate(&mut self) -> Result<bool, String> {
+        let target = self.rate.target.load(Ordering::Relaxed);
+        if target == 0 || target == self.applied_rate {
+            return Ok(false);
+        }
+        let old_rate = self.applied_rate;
+        let old_label = self.codec.label().to_string();
+        if self.codec.set_bitrate(target) {
+            self.applied_rate = target;
+            tracing::info!(
+                "video rate {}: {} applied {:.2} → {:.2} Mbps in place (capture/encoder/reference state kept)",
+                self.route_id,
+                old_label,
+                old_rate as f64 / 1e6,
+                target as f64 / 1e6,
+            );
+            return Ok(false);
+        }
+
+        let next = make_h264_codec(
+            self.budget_size.0,
+            self.budget_size.1,
+            self.fps,
+            tune_at_encoder_rate(self.tune, target),
+        )?;
+        let next_label = next.label().to_string();
+        self.codec = next;
+        self.applied_rate = target;
+        self.last_idr = None;
+        self.last_sent = None;
+        self.profile_inputs.clear();
+        self.prev.clear();
+        self.prev_size = (0, 0);
+        self.refresh.store(true, Ordering::SeqCst);
+        tracing::warn!(
+            "video rate {}: {} has no verified live-rate seam; rebuilt encoder only as {} at {:.2} Mbps (capture/monitor kept, next frame IDR)",
+            self.route_id,
+            old_label,
+            next_label,
+            target as f64 / 1e6,
+        );
+        Ok(true)
+    }
+
+    #[cfg(test)]
     fn encode(
         &mut self,
         rgba: Vec<u8>,
         sw: u32,
         sh: u32,
         stats: &mut StreamStats,
+    ) -> Result<Vec<VideoPacket>, String> {
+        self.encode_profiled(rgba, sw, sh, stats, 0)
+    }
+
+    fn encode_profiled(
+        &mut self,
+        rgba: Vec<u8>,
+        sw: u32,
+        sh: u32,
+        stats: &mut StreamStats,
+        profile_id: u64,
     ) -> Result<Vec<VideoPacket>, String> {
         if sw == 0 || sh == 0 {
             return Ok(Vec::new());
@@ -4186,7 +4740,7 @@ impl H264Stream {
             YuvFormat::Nv12 => scale_rgba_to_nv12(&rgba, sw, sh, dw, dh),
         };
         stats.add_scale(t0.elapsed());
-        self.encode_prepared(yuv, format, dw, dh, stats, &mut |_spent| {})
+        self.encode_prepared(yuv, format, dw, dh, profile_id, stats, &mut |_spent| {})
     }
 
     /// The post-conversion half of [`Self::encode`]: budget rebuild,
@@ -4202,12 +4756,14 @@ impl H264Stream {
     /// `recycle`, which the pipelined pump routes back to the capture side
     /// so steady state converts into reused pages instead of allocating
     /// megabytes per frame.
+    #[allow(clippy::too_many_arguments)]
     fn encode_prepared(
         &mut self,
         yuv: Vec<u8>,
         format: YuvFormat,
         dw: u32,
         dh: u32,
+        profile_id: u64,
         stats: &mut StreamStats,
         recycle: &mut dyn FnMut(Vec<u8>),
     ) -> Result<Vec<VideoPacket>, String> {
@@ -4222,12 +4778,31 @@ impl H264Stream {
         // dies with the old codec: the fresh one may ingest a different
         // layout, and stale bytes must never masquerade as "already sent".
         if (dw, dh) != self.budget_size {
-            self.codec = make_h264_codec(dw, dh, self.fps, self.tune)?;
+            let update = self.rate.update_geometry(self.tune, dw, dh, self.fps);
+            self.codec = make_h264_codec(
+                dw,
+                dh,
+                self.fps,
+                tune_at_encoder_rate(self.tune, update.new_target),
+            )?;
+            self.applied_rate = update.new_target;
             self.budget_size = (dw, dh);
             self.last_idr = None;
+            self.profile_inputs.clear();
             self.prev = Vec::new();
             self.prev_size = (0, 0);
+            tracing::info!(
+                "video rate {}: geometry {}×{} re-budgeted ceiling {:.2} → {:.2} Mbps · target {:.2} → {:.2} Mbps (encoder only)",
+                self.route_id,
+                dw,
+                dh,
+                update.old_ceiling as f64 / 1e6,
+                update.new_ceiling as f64 / 1e6,
+                update.old_target as f64 / 1e6,
+                update.new_target as f64 / 1e6,
+            );
         }
+        self.apply_pending_rate()?;
         if format != self.codec.input_format() {
             // Converted for a backend the rebuild just replaced (or the
             // pipelined producer raced a needs change): one dropped frame;
@@ -4262,6 +4837,9 @@ impl H264Stream {
             .encode_yuv(&yuv, dw as usize, dh as usize, force_idr)?;
         stats.add_encode(t1.elapsed());
         if outcome.consumed {
+            self.note_profile_input(profile_id);
+        }
+        if outcome.consumed {
             recycle(std::mem::replace(&mut self.prev, yuv));
             self.prev_size = (dw, dh);
             self.last_sent = Some(Instant::now());
@@ -4275,7 +4853,7 @@ impl H264Stream {
                 self.refresh.store(true, Ordering::SeqCst);
             }
         }
-        Ok(self.packetize(outcome.units, stats))
+        Ok(self.packetize_profiled(outcome.units, stats))
     }
 
     /// Re-encode the retained last picture — a forced, clean IDR when
@@ -4292,7 +4870,9 @@ impl H264Stream {
         &mut self,
         stats: &mut StreamStats,
         force_idr: bool,
+        profile_id: u64,
     ) -> Result<Vec<VideoPacket>, String> {
+        self.apply_pending_rate()?;
         if self.prev.is_empty() || self.prev_size == (0, 0) {
             return Ok(Vec::new());
         }
@@ -4303,12 +4883,15 @@ impl H264Stream {
             .encode_yuv(&self.prev, dw as usize, dh as usize, force_idr)?;
         stats.add_encode(t1.elapsed());
         if outcome.consumed {
+            self.note_profile_input(profile_id);
+        }
+        if outcome.consumed {
             self.last_sent = Some(Instant::now());
             if force_idr {
                 self.refresh.store(false, Ordering::SeqCst);
             }
         }
-        Ok(self.packetize(outcome.units, stats))
+        Ok(self.packetize_profiled(outcome.units, stats))
     }
 
     /// See [`packetize_units`] — bound to this stream's clock state.
@@ -4324,6 +4907,20 @@ impl H264Stream {
             &mut self.last_idr,
             stats,
         )
+    }
+
+    fn note_profile_input(&mut self, frame_id: u64) {
+        note_profile_input(&mut self.profile_inputs, &self.route_id, frame_id);
+    }
+
+    fn packetize_profiled(
+        &mut self,
+        units: Vec<(Vec<u8>, bool)>,
+        stats: &mut StreamStats,
+    ) -> Vec<VideoPacket> {
+        let mut packets = self.packetize(units, stats);
+        assign_profile_output_ids(&mut packets, &mut self.profile_inputs);
+        packets
     }
 }
 
@@ -4366,9 +4963,42 @@ fn packetize_units(
                 data,
                 key,
                 duration_us: per_unit,
+                profile_id: 0,
             }
         })
         .collect()
+}
+
+fn note_profile_input(
+    pending: &mut std::collections::VecDeque<u64>,
+    route_id: &str,
+    frame_id: u64,
+) {
+    const MAX_PROFILE_BACKLOG: usize = 128;
+    if !crate::pipeline_profile::enabled() {
+        return;
+    }
+    if pending.len() >= MAX_PROFILE_BACKLOG {
+        tracing::warn!(
+            "video profiler input FIFO for {route_id} exceeded {MAX_PROFILE_BACKLOG}; resetting correlation"
+        );
+        pending.clear();
+    }
+    pending.push_back(frame_id);
+}
+
+fn assign_profile_output_ids(
+    packets: &mut [VideoPacket],
+    pending: &mut std::collections::VecDeque<u64>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    for packet in packets {
+        if let Some(frame_id) = pending.pop_front() {
+            packet.set_profile_id(frame_id);
+        }
+    }
 }
 
 /// Byte cap for one paced burst — the slice pacer's grain. Encoders are
@@ -4446,7 +5076,179 @@ pub(crate) struct RouteRate {
     pub target: AtomicU32,
     /// The posture lane's full budget — where AIMD climbs back to.
     pub ceiling: AtomicU32,
+    /// The route's uncapped encoder target for its current geometry and
+    /// posture. Allocator caps are applied *over* this value; retaining it is
+    /// what lets a focus/cap increase recover upward instead of inheriting the
+    /// previously lowered ceiling forever.
+    configured_ceiling: AtomicU32,
+    /// Raw allocator cap (`u64::MAX` = no policy cap). Kept separately from
+    /// `ceiling` so an encoder-only geometry rebuild can recompute the right
+    /// effective ceiling without consulting the capture thread's stale
+    /// by-value `Tune` copy.
+    policy_cap: AtomicU64,
+    /// Smallest rate the encoder can be configured for in this posture.
+    encoder_floor: AtomicU32,
+    /// Closed-loop floor. Game retains its proven 8 Mbps floor; policy Reach
+    /// and Balanced may move through their lower viable ranges as advertised.
+    adapt_floor: AtomicU32,
     adapt: Mutex<RateAdaptState>,
+}
+
+const NO_POLICY_RATE_CAP: u64 = u64::MAX;
+
+/// RAII ownership of one entry in [`route_rates`]. The pointer check matters
+/// during encoder healing: a successor can register before the predecessor is
+/// dropped, and the old guard must never remove the new cell.
+struct RouteRateRegistration {
+    route_id: String,
+    rate: Arc<RouteRate>,
+}
+
+impl RouteRateRegistration {
+    fn new(route_id: &str, rate: Arc<RouteRate>) -> Self {
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), rate.clone());
+        RouteRateRegistration {
+            route_id: route_id.to_string(),
+            rate,
+        }
+    }
+}
+
+impl Drop for RouteRateRegistration {
+    fn drop(&mut self) {
+        let mut rates = route_rates().lock();
+        if rates
+            .get(&self.route_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.rate))
+        {
+            rates.remove(&self.route_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateUpdate {
+    old_target: u32,
+    new_target: u32,
+    old_ceiling: u32,
+    new_ceiling: u32,
+}
+
+impl RouteRate {
+    fn new(tune: Tune, w: u32, h: u32, fps: u32) -> Self {
+        let encoder_floor = encoder_rate_floor(tune);
+        let configured = configured_rate_ceiling(tune, w, h, fps);
+        let ceiling = policy_rate_ceiling(configured, tune.policy_cap_bps, encoder_floor);
+        RouteRate {
+            target: AtomicU32::new(ceiling),
+            ceiling: AtomicU32::new(ceiling),
+            configured_ceiling: AtomicU32::new(configured),
+            policy_cap: AtomicU64::new(encode_policy_rate_cap(tune.policy_cap_bps)),
+            encoder_floor: AtomicU32::new(encoder_floor),
+            adapt_floor: AtomicU32::new(rate_adapt_floor(tune)),
+            adapt: Mutex::new(RateAdaptState::default()),
+        }
+    }
+
+    fn policy_cap(&self) -> Option<u32> {
+        decode_policy_rate_cap(self.policy_cap.load(Ordering::Relaxed))
+    }
+
+    /// Apply a new allocator cap without losing the unconstrained target.
+    /// If the controller was sitting at its old ceiling, move it directly to
+    /// the new ceiling in either direction. If Game/auto-rate had backed off
+    /// below that ceiling, preserve the congestion target on an increase and
+    /// only clamp it on a decrease.
+    fn update_policy(&self, tune: Tune) -> RateUpdate {
+        self.policy_cap.store(
+            encode_policy_rate_cap(tune.policy_cap_bps),
+            Ordering::Relaxed,
+        );
+        let encoder_floor = encoder_rate_floor(tune);
+        self.encoder_floor.store(encoder_floor, Ordering::Relaxed);
+        self.adapt_floor
+            .store(rate_adapt_floor(tune), Ordering::Relaxed);
+        let configured = self.configured_ceiling.load(Ordering::Relaxed);
+        let new_ceiling = policy_rate_ceiling(configured, tune.policy_cap_bps, encoder_floor);
+        self.install_ceiling(new_ceiling)
+    }
+
+    /// Re-budget after an encoder geometry change while retaining the latest
+    /// allocator cap and any genuine congestion backoff.
+    fn update_geometry(&self, tune: Tune, w: u32, h: u32, fps: u32) -> RateUpdate {
+        let configured = configured_rate_ceiling(tune, w, h, fps);
+        self.configured_ceiling.store(configured, Ordering::Relaxed);
+        let encoder_floor = encoder_rate_floor(tune);
+        self.encoder_floor.store(encoder_floor, Ordering::Relaxed);
+        self.adapt_floor
+            .store(rate_adapt_floor(tune), Ordering::Relaxed);
+        let new_ceiling = policy_rate_ceiling(configured, self.policy_cap(), encoder_floor);
+        self.install_ceiling(new_ceiling)
+    }
+
+    fn install_ceiling(&self, new_ceiling: u32) -> RateUpdate {
+        // Serialize against the AIMD streak state so a policy/focus move gets
+        // a clean observation window at its new budget.
+        let mut adapt = self.adapt.lock();
+        let old_ceiling = self.ceiling.load(Ordering::Relaxed);
+        let old_target = self.target.load(Ordering::Relaxed);
+        let new_target = rebase_rate_target(old_target, old_ceiling, new_ceiling);
+        self.ceiling.store(new_ceiling, Ordering::Relaxed);
+        self.target.store(new_target, Ordering::Relaxed);
+        adapt.bad = 0;
+        adapt.good = 0;
+        adapt.last_step = Some(Instant::now());
+        RateUpdate {
+            old_target,
+            new_target,
+            old_ceiling,
+            new_ceiling,
+        }
+    }
+}
+
+fn encode_policy_rate_cap(cap: Option<u32>) -> u64 {
+    cap.map(u64::from).unwrap_or(NO_POLICY_RATE_CAP)
+}
+
+fn decode_policy_rate_cap(cap: u64) -> Option<u32> {
+    (cap != NO_POLICY_RATE_CAP).then_some(cap as u32)
+}
+
+fn encoder_rate_floor(tune: Tune) -> u32 {
+    if tune.posture() == Posture::Reach {
+        64_000
+    } else {
+        250_000
+    }
+}
+
+fn configured_rate_ceiling(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
+    tuned_bitrate(
+        Tune {
+            policy_cap_bps: None,
+            ..tune
+        },
+        w,
+        h,
+        fps,
+    )
+}
+
+fn policy_rate_ceiling(configured: u32, policy_cap: Option<u32>, floor: u32) -> u32 {
+    policy_cap
+        .map_or(configured, |cap| configured.min(cap.max(floor)))
+        .max(floor)
+}
+
+fn rebase_rate_target(old_target: u32, old_ceiling: u32, new_ceiling: u32) -> u32 {
+    if old_target >= old_ceiling {
+        new_ceiling
+    } else {
+        old_target.min(new_ceiling)
+    }
 }
 
 #[derive(Default)]
@@ -4516,23 +5318,28 @@ pub struct RouteDials {
     pub edge_cap: u32,
     pub out_w: u32,
     pub out_h: u32,
+    pub peer_budget_bps: u64,
+    pub route_budget_bps: u64,
+    pub route_ceiling_bps: u64,
+    pub priority: bool,
+    pub audio_packet_ms: u16,
+    pub audio_jitter_ms: u16,
+    pub audio_fec: bool,
+    pub video_queue_depth: u8,
+    pub audio_queue_depth: u8,
+    pub degradation_reasons: Vec<String>,
 }
 
-/// Where the closed-loop bitrate may act. The rule: an automatic rate
-/// changer runs by default ONLY where it is beneficial in every case
-/// for that mode's use case. **Game qualifies** — its identity is
-/// smoothness/latency over quality, so a congestion cut is always the
-/// right trade there and even a false positive costs little (the climb
-/// restores). **Balanced and Studio don't**: their deal is the picked
-/// quality, and a false-positive cut (viewer-side CPU hiccup reading as
-/// congestion) would silently soften a healthy stream — the same
-/// native-quality contract that keeps [`auto_adapt_enabled`] opt-in.
-/// `ALLMYSTUFF_RATE_ADAPT=1` opts every lossy posture in (field A/B);
-/// `=0` kills it everywhere; unset = game-only.
+/// Where the closed-loop bitrate may act. Policy v1 advertises automatic
+/// rate for Reach, Balanced, and Game, so those plans enable it by default;
+/// legacy Balanced routes (no policy plan) retain their fixed-quality
+/// behavior. Studio remains fixed-rate. `ALLMYSTUFF_RATE_ADAPT=1` opts every
+/// lossy posture in for field A/B, `=0` is the diagnostic kill switch, and
+/// unset follows the policy contract (plus legacy Game).
 #[derive(Clone, Copy, PartialEq)]
 enum RateAdaptMode {
     Off,
-    GameOnly,
+    Policy,
     All,
 }
 
@@ -4554,17 +5361,20 @@ fn rate_adapt_mode() -> RateAdaptMode {
                 );
                 RateAdaptMode::All
             }
-            _ => RateAdaptMode::GameOnly,
+            _ => RateAdaptMode::Policy,
         }
     });
     *MODE
 }
 
-/// The gate itself, pure for the tests.
-fn rate_adapt_allowed(game: bool, mode: RateAdaptMode) -> bool {
+/// The gate itself, pure for the tests. `policy_auto_rate` comes from the
+/// effective policy's current auto-rate/auto-resolution pair; v1 defines the
+/// same set of modes for both (Reach/Balanced/Game). Keeping the decision at
+/// the encoder means no signaling or protocol field is added.
+fn rate_adapt_allowed(policy_auto_rate: bool, mode: RateAdaptMode) -> bool {
     match mode {
         RateAdaptMode::Off => false,
-        RateAdaptMode::GameOnly => game,
+        RateAdaptMode::Policy => policy_auto_rate,
         RateAdaptMode::All => true,
     }
 }
@@ -4582,6 +5392,16 @@ const RATE_HOLD: Duration = Duration::from_secs(6);
 /// The floor AIMD never cuts through — the existing stream budget floor.
 const RATE_FLOOR: u32 = 8_000_000;
 
+fn rate_adapt_floor(tune: Tune) -> u32 {
+    match tune.posture() {
+        Posture::Reach => 120_000,
+        // A policy-v1 Balanced plan advertises auto-rate and defines a 1 Mbps
+        // viable-video floor. Legacy Balanced never enters the default loop.
+        Posture::Balanced if tune.policy_auto_resolution => 1_000_000,
+        _ => RATE_FLOOR,
+    }
+}
+
 /// One AIMD step from one feedback report: multiplicative down on
 /// congestion evidence, additive up on sustained health, `None` to hold.
 /// Pure — the unit tests drive it with synthetic reports.
@@ -4591,6 +5411,7 @@ fn rate_adapt_step(
     target_fps: u32,
     current: u32,
     ceiling: u32,
+    floor: u32,
     now: Instant,
 ) -> Option<u32> {
     // Congestion evidence, most-direct first: the viewer's decode queue
@@ -4629,7 +5450,7 @@ fn rate_adapt_step(
             // floor (`ALLMYSTUFF_VIDEO_BITRATE` bypasses the floor) makes
             // reachable via two peer congestion reports. When the ceiling
             // is under the floor we simply don't cut below it.
-            let next = next.clamp(RATE_FLOOR.min(ceiling), ceiling);
+            let next = next.clamp(floor.min(ceiling), ceiling);
             if next < current {
                 state.bad = 0;
                 state.last_step = Some(now);
@@ -4800,6 +5621,7 @@ fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
     //    (150 Mbps auto floor); the viewer's warning gates it, then the
     //    user owns the wire.
     let (floor, ceiling) = match tune.posture() {
+        Posture::Reach => (auto.min(850_000), 850_000),
         // Lossless has no rate control — this number only steers the
         // lossy-Studio fallback when the HEVC rung can't open (and the
         // noise guard's landing spot), so it mirrors Studio.
@@ -4807,7 +5629,29 @@ fn tuned_bitrate(tune: Tune, w: u32, h: u32, fps: u32) -> u32 {
         Posture::Game => (auto, 200_000_000),
         Posture::Balanced => (auto, 80_000_000),
     };
-    tune.bitrate.unwrap_or(floor).clamp(250_000, ceiling)
+    let minimum = if tune.posture() == Posture::Reach {
+        64_000
+    } else {
+        250_000
+    };
+    let ceiling = tune
+        .policy_cap_bps
+        .map_or(ceiling, |policy| ceiling.min(policy.max(minimum)));
+    tune.bitrate
+        .unwrap_or(floor)
+        .min(ceiling)
+        .clamp(minimum, ceiling.max(minimum))
+}
+
+/// Pin a codec (re)open to the controller's already-clamped target. This is
+/// local encoder configuration only; neither the request nor any media/control
+/// payload is changed.
+fn tune_at_encoder_rate(tune: Tune, target: u32) -> Tune {
+    Tune {
+        bitrate: Some(target),
+        policy_cap_bps: Some(target),
+        ..tune
+    }
 }
 
 /// The H.264 edge a frame fits to right now: the tuned ceiling, capped by
@@ -4925,6 +5769,13 @@ trait H264Codec: Send {
         h: usize,
         force_idr: bool,
     ) -> Result<EncodeOutcome, String>;
+    /// Re-aim bitrate without resetting codec/reference state. Backends that
+    /// cannot prove this capability return `false`; the stream then rebuilds
+    /// only the encoder (never the monitor/capture session) and logs that IDR
+    /// boundary honestly.
+    fn set_bitrate(&mut self, _bitrate: u32) -> bool {
+        false
+    }
     /// Human label for logs ("openh264 (software)", "h264_nvenc", …).
     fn label(&self) -> &str;
 }
@@ -4983,6 +5834,9 @@ impl H264Codec for MfCodec {
         // The MFT is fixed to the size it was opened at — the same (dw, dh) the
         // ladder built it for; `H264Stream` rebuilds on resize.
         self.0.encode_nv12(yuv, force_idr)
+    }
+    fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        self.0.set_bitrate(bitrate)
     }
     fn label(&self) -> &str {
         self.0.label()
@@ -5304,6 +6158,7 @@ mod tests {
     #[test]
     fn gpu_lane_policy_quarantines_every_posture_unless_explicitly_enabled() {
         for posture in [
+            Posture::Reach,
             Posture::Balanced,
             Posture::Game,
             Posture::Studio,
@@ -5539,21 +6394,21 @@ mod tests {
         let t0 = Instant::now();
         // One bad report is a hiccup, not a verdict.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, RATE_FLOOR, t0,),
             None
         );
         // The second cuts ×0.7.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, 60, ceiling, ceiling, RATE_FLOOR, t0,),
             Some(28_000_000)
         );
         // Inside the hold window nothing moves, evidence or not.
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, RATE_FLOOR, t0,),
             None
         );
         assert_eq!(
-            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, t0),
+            rate_adapt_step(&mut st, &congested, 60, 28_000_000, ceiling, RATE_FLOOR, t0,),
             None
         );
         // Past the hold, with a measured estimate as the witness, the cut
@@ -5565,7 +6420,7 @@ mod tests {
         // The bad streak carried through the hold, so the first post-hold
         // report with congestion evidence steps immediately.
         let t1 = t0 + RATE_HOLD + Duration::from_secs(1);
-        let cut = rate_adapt_step(&mut st, &est, 60, 28_000_000, ceiling, t1)
+        let cut = rate_adapt_step(&mut st, &est, 60, 28_000_000, ceiling, RATE_FLOOR, t1)
             .expect("estimate-guided cut");
         assert_eq!(cut, 8_500_000, "85% of the measured 10 Mbps");
         // Clean reports climb additively — and only after the streak.
@@ -5573,7 +6428,7 @@ mod tests {
         let t2 = t1 + RATE_HOLD + Duration::from_secs(1);
         let mut up = None;
         for _ in 0..RATE_GOOD_STREAK {
-            up = rate_adapt_step(&mut st, &clean, 60, cut, ceiling, t2);
+            up = rate_adapt_step(&mut st, &clean, 60, cut, ceiling, RATE_FLOOR, t2);
         }
         let up = up.expect("climb after the streak");
         assert_eq!(up, cut + (ceiling / 12).max(500_000));
@@ -5587,27 +6442,111 @@ mod tests {
         let mut st2 = RateAdaptState::default();
         let t3 = t2 + RATE_HOLD + Duration::from_secs(1);
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, RATE_FLOOR, t3,),
             None
         );
         assert_eq!(
-            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, t3),
+            rate_adapt_step(&mut st2, &ramping, 60, ceiling, ceiling, RATE_FLOOR, t3,),
             Some(28_000_000)
         );
     }
 
-    /// The reservation rule: automatic bitrate changes act only where
-    /// they are beneficial in every case for the mode's use case — Game
-    /// by default; everything else opt-in, off means off.
+    /// Policy Reach/Balanced and Game all enter the default loop; legacy
+    /// fixed-quality Balanced does not. The env kill/all switches retain
+    /// their diagnostic meanings.
     #[test]
-    fn rate_adapt_is_reserved_to_game_by_default() {
-        assert!(rate_adapt_allowed(true, RateAdaptMode::GameOnly));
+    fn rate_adapt_matches_the_policy_contract_by_default() {
+        assert!(rate_adapt_allowed(true, RateAdaptMode::Policy));
         assert!(
-            !rate_adapt_allowed(false, RateAdaptMode::GameOnly),
-            "balanced/studio keep the picked quality unless opted in"
+            !rate_adapt_allowed(false, RateAdaptMode::Policy),
+            "legacy Balanced and Studio remain fixed-rate"
         );
         assert!(rate_adapt_allowed(false, RateAdaptMode::All));
         assert!(!rate_adapt_allowed(true, RateAdaptMode::Off));
+    }
+
+    #[test]
+    fn policy_caps_recover_upward_without_erasing_congestion_backoff() {
+        assert_eq!(
+            rebase_rate_target(40_000_000, 40_000_000, 10_000_000),
+            10_000_000
+        );
+        assert_eq!(
+            rebase_rate_target(10_000_000, 10_000_000, 40_000_000),
+            40_000_000,
+            "a target pinned by the old allocator ceiling follows it upward"
+        );
+        assert_eq!(
+            rebase_rate_target(8_000_000, 10_000_000, 40_000_000),
+            8_000_000,
+            "a genuine AIMD backoff survives a cap increase"
+        );
+        assert_eq!(
+            rebase_rate_target(8_000_000, 10_000_000, 6_000_000),
+            6_000_000,
+            "a cap decrease remains hard"
+        );
+
+        let initial = Tune {
+            bitrate: Some(40_000_000),
+            policy_cap_bps: Some(10_000_000),
+            policy_auto_resolution: true,
+            ..Tune::default()
+        };
+        let rate = RouteRate::new(initial, 1920, 1080, 30);
+        assert_eq!(rate.target.load(Ordering::Relaxed), 10_000_000);
+        let raised = rate.update_policy(Tune {
+            policy_cap_bps: Some(20_000_000),
+            ..initial
+        });
+        assert_eq!(raised.new_target, 20_000_000);
+        let uncapped = rate.update_policy(Tune {
+            policy_cap_bps: None,
+            ..initial
+        });
+        assert_eq!(uncapped.new_ceiling, 40_000_000);
+        assert_eq!(uncapped.new_target, 40_000_000);
+
+        rate.target.store(7_000_000, Ordering::Relaxed);
+        let backed_off = rate.update_policy(Tune {
+            policy_cap_bps: Some(30_000_000),
+            ..initial
+        });
+        assert_eq!(backed_off.new_target, 7_000_000);
+    }
+
+    #[test]
+    fn reach_and_policy_balanced_have_real_adaptation_room() {
+        let reach = Tune {
+            mode: Some(Posture::Reach),
+            policy_auto_resolution: true,
+            ..Tune::default()
+        };
+        let balanced = Tune {
+            mode: Some(Posture::Balanced),
+            policy_auto_resolution: true,
+            ..Tune::default()
+        };
+        let legacy_balanced = Tune::default();
+        assert_eq!(rate_adapt_floor(reach), 120_000);
+        assert_eq!(rate_adapt_floor(balanced), 1_000_000);
+        assert_eq!(rate_adapt_floor(legacy_balanced), RATE_FLOOR);
+
+        let congested = RecvFeedback {
+            queue_depth: 12,
+            ..fb(15, 0, 12)
+        };
+        let mut state = RateAdaptState::default();
+        let now = Instant::now();
+        assert_eq!(
+            rate_adapt_step(&mut state, &congested, 15, 850_000, 850_000, 120_000, now),
+            None
+        );
+        assert_eq!(
+            rate_adapt_step(&mut state, &congested, 15, 850_000, 850_000, 120_000, now),
+            Some(595_000),
+            "Reach no longer sticks at its sub-8-Mbps ceiling"
+        );
     }
 
     /// The wave chooser: a first loss heals with the smooth default; a
@@ -5888,6 +6827,8 @@ mod tests {
             link: LinkClass::default(),
             game: false,
             mode: None,
+            policy_cap_bps: None,
+            policy_auto_resolution: false,
         };
         assert_eq!(t.fps(), 60);
         assert_eq!(t.h264_edge(), 800);
@@ -6105,6 +7046,7 @@ mod tests {
     fn h264_stream_emits_annexb_with_a_leading_idr() {
         let mut stats = StreamStats::new("r", VideoMode::H264);
         let mut enc = H264Stream::new(
+            "r",
             (64, 64),
             Tune::default(),
             Arc::new(AtomicBool::new(false)),
@@ -6175,20 +7117,71 @@ mod tests {
     /// An [`H264Stream`] around an injected codec, budget-sized so a 64×64
     /// test frame never triggers the real-ladder rebuild.
     fn h264_stream_with(codec: Box<dyn H264Codec>) -> H264Stream {
+        let tune = Tune::default();
+        let rate = Arc::new(RouteRate::new(tune, 64, 64, 30));
         H264Stream {
+            route_id: "scripted-test".to_string(),
             codec,
             budget_size: (64, 64),
-            tune: Tune::default(),
+            applied_rate: rate.target.load(Ordering::Relaxed),
+            rate,
+            tune,
             fps: 30,
             prev: Vec::new(),
             prev_size: (0, 0),
             last_sent: None,
             last_idr: None,
             last_emit: None,
+            profile_inputs: std::collections::VecDeque::new(),
             refresh: Arc::new(AtomicBool::new(false)),
             idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
             auto: AutoAdapt::new(),
         }
+    }
+
+    struct LiveRateCodec {
+        rates: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl H264Codec for LiveRateCodec {
+        fn encode_yuv(
+            &mut self,
+            _yuv: &[u8],
+            _w: usize,
+            _h: usize,
+            _force_idr: bool,
+        ) -> Result<EncodeOutcome, String> {
+            Ok(EncodeOutcome::consumed(None))
+        }
+
+        fn set_bitrate(&mut self, bitrate: u32) -> bool {
+            self.rates.lock().push(bitrate);
+            true
+        }
+
+        fn label(&self) -> &str {
+            "live-rate (test)"
+        }
+    }
+
+    #[test]
+    fn h264_cap_change_uses_live_codec_seam_without_rebuilding_the_stream() {
+        let rates = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = h264_stream_with(Box::new(LiveRateCodec {
+            rates: rates.clone(),
+        }));
+        let target = (stream.applied_rate / 2).max(250_000);
+        assert_ne!(target, stream.applied_rate);
+        stream.rate.target.store(target, Ordering::Relaxed);
+
+        let mut stats = StreamStats::new("live-rate-test", VideoMode::H264);
+        let yuv = vec![128; 64 * 64 + 2 * (32 * 32)];
+        stream
+            .encode_prepared(yuv, YuvFormat::I420, 64, 64, 0, &mut stats, &mut |_| {})
+            .expect("rate retune");
+        assert_eq!(&*rates.lock(), &[target]);
+        assert_eq!(stream.applied_rate, target);
+        assert_eq!(stream.codec.label(), "live-rate (test)");
     }
 
     #[test]
@@ -6215,6 +7208,28 @@ mod tests {
         assert_eq!(datas, vec![vec![1, 1], vec![2, 2], vec![3, 3]]);
         assert_eq!(stats.keyframes, 1, "the drained key is counted");
         assert_eq!(stats.bytes, 6);
+    }
+
+    #[test]
+    fn profiler_fifo_assigns_oldest_accepted_inputs_to_drained_units() {
+        let mut stats = StreamStats::new("profile-fifo", VideoMode::H264);
+        let mut packets = packetize_units(
+            vec![(vec![1], false), (vec![2], false), (vec![3], true)],
+            60,
+            &mut None,
+            &mut None,
+            &mut stats,
+        );
+        let mut pending = std::collections::VecDeque::from([41, 42, 43]);
+        assign_profile_output_ids(&mut packets, &mut pending);
+        assert_eq!(
+            packets
+                .iter()
+                .map(VideoPacket::profile_id)
+                .collect::<Vec<_>>(),
+            vec![41, 42, 43]
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

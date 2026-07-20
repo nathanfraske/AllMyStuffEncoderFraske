@@ -715,6 +715,9 @@ class AppStore {
    *  route-id; this is the GUI remembering which pick belongs to which. */
   private consoleCodecBySource = $state<Record<string, "auto" | "h264" | "mjpeg">>({});
   private consoleTuneBySource = $state<Record<string, StreamTune>>({});
+  /** One aggregate cap covers the whole peer, so unlike resolution/rate it
+   *  follows the console across source changes instead of being per-monitor. */
+  private consolePeerCapBps = $state<number | undefined>(undefined);
   /** The selected source's codec (which transport to *offer*). "auto" and
    *  "h264" both offer H.264; "mjpeg" forces the fallback. */
   get consoleCodec(): "auto" | "h264" | "mjpeg" {
@@ -724,7 +727,10 @@ class AppStore {
   /** The selected source's quality picks — absent fields are Automatic. */
   get consoleTune(): StreamTune {
     const s = this.consoleInput;
-    return (s ? this.consoleTuneBySource[s] : undefined) ?? {};
+    return {
+      ...((s ? this.consoleTuneBySource[s] : undefined) ?? {}),
+      peerCapBps: this.consolePeerCapBps,
+    };
   }
   /** Which quality surface the console shows — the single Speed↔Quality
    *  slider or the four granular pills. The "…" button flips it, and it's
@@ -3008,6 +3014,7 @@ class AppStore {
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodecBySource = {};
     this.consoleTuneBySource = {};
+    this.consolePeerCapBps = undefined;
     if (isTauri() && !isMobile()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
@@ -3221,9 +3228,10 @@ class AppStore {
     // created it.
     this.consoleVideoLive = leg?.id ?? null;
     this.consoleVideoRouteId = leg?.created ? leg.id : null;
-    // Carry the quality pills onto the fresh route (the sender restarts
-    // its capture with them; harmless no-op when everything is Auto).
-    if (leg && this.hasTune()) void tuneRoute(leg.id, this.consoleTune);
+    // Carry the quality picks onto the fresh route and elect the selected
+    // source. Priority is a live scheduler hint inside the established media
+    // path; it does not reconnect the route or disturb the fast switch path.
+    if (leg) void tuneRoute(leg.id, { ...this.consoleTune, priority: true });
   }
 
   /** Re-drive the console's video wire once a video input for the open
@@ -3244,31 +3252,42 @@ class AppStore {
     }
   }
 
-  private hasTune(): boolean {
-    const t = this.consoleTune;
-    // Mode is a first-class tune too. Omitting it here meant a mode-only
-    // Studio/Game selection was remembered in the GUI but not re-applied to
-    // the fresh route after a monitor switch or codec re-offer, so the sender
-    // silently came back Balanced.
-    return (
-      t.maxEdge != null ||
-      t.bitrate != null ||
-      t.fps != null ||
-      t.mode != null ||
-      t.game != null
-    );
-  }
-
   /** A quality pick changed (a pill or the slider): remember it against the
    *  current source and re-tune the live stream. */
   setConsoleTune(patch: StreamTune) {
     const s = this.consoleInput;
     if (!s) return;
+    if (Object.prototype.hasOwnProperty.call(patch, "peerCapBps")) {
+      this.consolePeerCapBps = patch.peerCapBps;
+    }
+    // Aggregate policy and the transient priority election are not source
+    // settings; keep only route-local dials in the per-source map.
+    const routePatch = { ...patch };
+    delete routePatch.peerCapBps;
+    delete routePatch.priority;
     this.consoleTuneBySource = {
       ...this.consoleTuneBySource,
-      [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...patch },
+      [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...routePatch },
     };
-    if (this.consoleVideoLive) void tuneRoute(this.consoleVideoLive, this.consoleTune);
+    if (this.consoleVideoLive) {
+      const wireTune = { ...this.consoleTune, priority: true };
+      // Preserve absence for focus-only Tunes; zero is the explicit backend
+      // representation for the user's "All media: Auto" reset.
+      if (
+        Object.prototype.hasOwnProperty.call(patch, "peerCapBps") &&
+        patch.peerCapBps == null
+      ) {
+        wireTune.peerCapBps = 0;
+      }
+      void tuneRoute(this.consoleVideoLive, wireTune);
+    }
+  }
+
+  /** Window focus elects the active display without touching route topology. */
+  prioritizeConsoleVideo() {
+    if (this.consoleVideoLive) {
+      void tuneRoute(this.consoleVideoLive, { priority: true });
+    }
   }
 
   /** The codec pick changed: remember it against the current source and

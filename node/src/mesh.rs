@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use crate::UiSink;
 
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
-use allmystuff_protocol::control::{InboundFrame, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
+use allmystuff_protocol::control::{MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage, KvmControl,
     NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request, RoomMessage, RouteControl,
@@ -40,11 +40,17 @@ use allmystuff_session::{
     CLIPBOARD_CHUNK_BYTES, SITE_CHUNK_BYTES,
 };
 
-use crate::audio::{AudioBridge, CaptureSource};
+use crate::audio::{
+    AudioBridge, AudioProfile, CaptureSource, OpusDecodeKind, OpusReceiver, OpusStream,
+};
 use crate::clipboard::{ClipboardService, LocalClip};
-use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe};
+use crate::control_client::{ControlClient, MediaPipe, MediaTrackPipe, ProfiledInboundFrame};
 use crate::files::FilesPlane;
 use crate::input_inject::Injector;
+use crate::media_policy::{
+    EffectivePlan, MediaCapabilities, MediaMode, MediaPolicyController, PolicyEnvelope,
+    PolicyPayload, PolicyRequest, AUDIO_HANDOFF_PACKETS, VIDEO_HANDOFF_FRAMES,
+};
 use crate::ownership::Ownership;
 use crate::shares::Shares;
 use crate::sites::{ClientMapping, SitesProxy};
@@ -57,10 +63,14 @@ pub struct Mesh {
     client: Arc<ControlClient>,
     /// The media plane's dedicated daemon connection: frame chunks ride it
     /// back-to-back instead of paying a connect + round trip each.
+    /// The legacy/general local-daemon writer. Non-A/V application traffic
+    /// stays on this single pipe; only audio and video receive isolated IPC
+    /// writers below.
     media_pipe: MediaPipe,
-    /// The binary lane for H.264/Opus track sends (no base64); MJPEG, PCM and
-    /// route signalling stay on `media_pipe`.
-    media_track_pipe: MediaTrackPipe,
+    realtime_video_pipe: MediaPipe,
+    audio_pipe: MediaPipe,
+    background_video_pipe: MediaPipe,
+    audio_track_pipe: MediaTrackPipe,
     /// Where node events surface. The GUI wires this to Tauri's event bus
     /// (`app.emit`); the headless `allmystuff serve` binary uses a logging
     /// sink — the events are all front-end concerns, so a node with no UI
@@ -198,19 +208,27 @@ pub struct Mesh {
     /// link sheds buffers (a brief skip) instead of queueing a backlog the
     /// listener then hears seconds late.
     audio_out: mpsc::Sender<AudioOut>,
-    /// Outbound video, deliberately *bounded*: when the link can't keep up
-    /// the capture side drops frames instead of queueing stale ones (an
-    /// MJPEG drop costs freshness only; an H.264 drop is healed by the
-    /// next forced IDR).
-    video_out: mpsc::Sender<VideoOut>,
-    /// The matching receivers, parked by [`Mesh::new`] and drained by the
-    /// forwarder tasks [`Mesh::start`] spawns. They live here rather than
-    /// being spawned in `new` because the GUI builds the `Mesh` in a
-    /// *synchronous* Tauri `setup` (no ambient Tokio runtime to spawn on);
-    /// `start` is the first point guaranteed an async context, and on the
-    /// same runtime everything else runs on.
+    /// The matching receiver, parked by [`Mesh::new`] and drained by the
+    /// forwarder task [`Mesh::start`] spawns. It lives here rather than being
+    /// spawned in `new` because the GUI builds the `Mesh` in a *synchronous*
+    /// Tauri `setup` (no ambient Tokio runtime to spawn on); `start` is the
+    /// first point guaranteed an async context, and on the same runtime
+    /// everything else runs on.
+    ///
+    /// Video deliberately does not have a process-global class queue. Each
+    /// capture route gets its own one-AU queue and persistent local-daemon
+    /// writer in [`Self::start_video_stream`]. Besides eliminating cross-route
+    /// head-of-line blocking, keeping a route on one ordered writer prevents
+    /// a focus change from sending adjacent dependent AUs down two sockets
+    /// that the daemon could service in the opposite order.
     audio_rx: Mutex<Option<mpsc::Receiver<AudioOut>>>,
-    video_rx: Mutex<Option<mpsc::Receiver<VideoOut>>>,
+    /// Peer-wide budgets, focus election, requested/effective policy, and the
+    /// viewer's cached remote plans. It contains no transport state.
+    media_policy: Mutex<MediaPolicyController>,
+    /// Last full legacy Tune fields sent for each watched route. A v1
+    /// priority-only message repeats them so an older peer that ignores the
+    /// extension keeps its current quality instead of resetting to Auto.
+    requested_video_tunes: Mutex<HashMap<String, LegacyVideoTune>>,
     /// Sequence for outbound input events (one stream per app run).
     input_seq: AtomicU64,
     /// Sequence for outbound clipboard frames (one stream per app run, like
@@ -282,7 +300,15 @@ pub struct Mesh {
     profile_req: Mutex<HashMap<String, ProfileReqState>>,
     /// Per-route Opus decoders for inbound lane audio (stateful across
     /// frames; dropped with the route).
-    audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
+    audio_decoders: Mutex<HashMap<String, OpusReceiver>>,
+    /// Policy-aware Opus encoders captured by the audio callbacks. Replacing
+    /// one in place changes packetization/bitrate/FEC without reopening the
+    /// OS capture device.
+    audio_encoders: Mutex<HashMap<String, Arc<Mutex<OpusStream>>>>,
+    /// Legacy outbound PCM captures still allowed only while their peer has no
+    /// governed video plan. The first policy-managed video route stops them so
+    /// raw PCM cannot silently exceed the peer-wide media cap.
+    pcm_audio_routes: Mutex<HashMap<String, String>>,
     /// Whether the local daemon speaks the audio track lane (`audio_*`
     /// ops, myownmesh ≥ 0.2.4) — the audio twin of `daemon_video`.
     /// While false, audio rides PCM frames over the media channel.
@@ -351,8 +377,18 @@ enum AudioOut {
     Lane {
         peer: String,
         route: String,
+        duration_us: u64,
         data: Vec<u8>,
     },
+}
+
+#[derive(Clone, Default)]
+struct LegacyVideoTune {
+    max_edge: Option<u32>,
+    bitrate: Option<u32>,
+    fps: Option<u32>,
+    game: bool,
+    mode: Option<String>,
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -365,11 +401,93 @@ struct VideoWatcher {
     /// Whether this window asked the backend to decode H.264 for it
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
-    queue: std::collections::VecDeque<Vec<u8>>,
+    queue: std::collections::VecDeque<ViewerPacket>,
+    /// Raw H.264 only: once a reference chain is dropped, dependent AUs are
+    /// refused until a key unit arrives.
+    awaiting_key: bool,
     /// Updated by the window's 16 ms safety poll even when no frame arrived.
     /// A post-disconnect-request poll is stronger liveness evidence than mere
     /// watcher presence because `video_unwatch` is fire-and-forget.
     last_poll: Instant,
+}
+
+/// One packet waiting at the local backend-to-viewer boundary. Profiling
+/// metadata is process-local only: it is stripped while `video_poll` builds
+/// the existing byte-identical length-prefixed batch.
+struct ViewerPacket {
+    bytes: Vec<u8>,
+    profile_id: u64,
+    frame_ts_us: Option<u64>,
+    enqueued_at: Option<Instant>,
+}
+
+impl ViewerPacket {
+    fn new(bytes: Vec<u8>, profile_id: u64, frame_ts_us: Option<u64>) -> Self {
+        Self {
+            bytes,
+            profile_id,
+            frame_ts_us,
+            enqueued_at: crate::pipeline_profile::stamp(),
+        }
+    }
+}
+
+/// A drained local viewer batch whose packet payloads remain separately
+/// owned. [`crate::node_control`] writes these segments directly to the local
+/// node socket, preserving the existing `[u32 len][packet]...` bytes without
+/// first copying a full decoded frame into a second contiguous buffer.
+/// Neither this type nor its profiling metadata crosses the mesh.
+pub(crate) struct VideoPollBatch {
+    packets: std::collections::VecDeque<ViewerPacket>,
+    encoded_len: usize,
+}
+
+impl VideoPollBatch {
+    fn new(packets: std::collections::VecDeque<ViewerPacket>) -> Self {
+        let encoded_len = packets.iter().fold(0usize, |total, packet| {
+            total.saturating_add(4usize.saturating_add(packet.bytes.len()))
+        });
+        Self {
+            packets,
+            encoded_len,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    pub(crate) fn packets(&self) -> impl Iterator<Item = &[u8]> {
+        self.packets.iter().map(|packet| packet.bytes.as_slice())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len);
+        for packet in self.packets {
+            out.extend_from_slice(&(packet.bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&packet.bytes);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_packets(packets: Vec<Vec<u8>>) -> Self {
+        Self::new(
+            packets
+                .into_iter()
+                .map(|bytes| ViewerPacket {
+                    bytes,
+                    profile_id: 0,
+                    frame_ts_us: None,
+                    enqueued_at: None,
+                })
+                .collect(),
+        )
+    }
 }
 
 /// One registered "save this download to disk" sink: the open file the
@@ -435,10 +553,27 @@ const TERM_INIT_ROWS: u16 = 24;
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// One item on the shipped shared video queue. Generation and recovery
-/// metadata are strictly process-local: the packet still reaches the same
-/// established media sender with the same bytes and duration as before.
-type VideoOut = (String, String, u64, VideoPacket, u64, Arc<VideoRecovery>);
+/// One item on a route-local video queue. Generation, recovery, and profiler
+/// metadata are strictly process-local: the packet reaches the established
+/// media sender with the same bytes and duration as before.
+struct VideoOut {
+    peer: String,
+    route_id: String,
+    generation: u64,
+    packet: VideoPacket,
+    recovery_epoch: u64,
+    recovery: Arc<VideoRecovery>,
+    profile_id: u64,
+    enqueued_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalMediaClass {
+    General,
+    PriorityVideo,
+    Audio,
+    BackgroundVideo,
+}
 
 #[derive(Default)]
 struct VideoRouteGenerations {
@@ -735,6 +870,51 @@ struct VideoRecovery {
     state: AtomicU64,
     drops: AtomicU64,
     suppressed: AtomicU64,
+    /// A zero allocator budget intentionally sheds the entire encoded chain.
+    /// Track that separately from accidental loss so a paused route does not
+    /// force an IDR on every capture tick; resume arms exactly one repair.
+    policy_paused: AtomicBool,
+    /// Legacy MJPEG has no encoder bitrate control. Shape complete,
+    /// independently decodable JPEG frames at admission so that fallback
+    /// transport cannot silently ignore the peer allocator's video grant.
+    jpeg_gate: Mutex<JpegRateGate>,
+    jpeg_shaped: AtomicU64,
+}
+
+#[derive(Default)]
+struct JpegRateGate {
+    rate_bps: u64,
+    next_at: Option<Instant>,
+}
+
+impl JpegRateGate {
+    fn admit(&mut self, rate_bps: u64, wire_bytes: usize, now: Instant) -> bool {
+        if rate_bps == 0 {
+            return false;
+        }
+        if rate_bps == u64::MAX {
+            self.rate_bps = rate_bps;
+            self.next_at = None;
+            return true;
+        }
+        // A new allocator grant takes effect immediately in either direction;
+        // stale debt from an old, lower cap must not pin the route after focus
+        // moves back to it.
+        if self.rate_bps != rate_bps {
+            self.rate_bps = rate_bps;
+            self.next_at = None;
+        }
+        if self.next_at.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        let wire_bits = (wire_bytes as u128).saturating_mul(8);
+        let interval_ns = wire_bits
+            .saturating_mul(1_000_000_000)
+            .div_ceil(u128::from(rate_bps))
+            .min(u128::from(u64::MAX)) as u64;
+        self.next_at = Some(now + Duration::from_nanos(interval_ns));
+        true
+    }
 }
 
 impl VideoRecovery {
@@ -745,7 +925,60 @@ impl VideoRecovery {
             state: AtomicU64::new(0),
             drops: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
+            policy_paused: AtomicBool::new(false),
+            jpeg_gate: Mutex::new(JpegRateGate::default()),
+            jpeg_shaped: AtomicU64::new(0),
         }
+    }
+
+    fn admits_jpeg(&self, mesh: &Mesh, route_budget_bps: u64, frame: &VideoFrame) -> bool {
+        // JSON/base64 is the actual legacy data-plane representation. Count
+        // its expansion and a conservative envelope per chunk instead of
+        // pretending the raw JPEG length is the wire cost.
+        let chunks = frame.jpeg.len().div_ceil(MAX_JPEG_CHUNK_BYTES).max(1);
+        let base64_bytes = frame.jpeg.len().div_ceil(3).saturating_mul(4);
+        let wire_bytes = base64_bytes.saturating_add(chunks.saturating_mul(512));
+        if self
+            .jpeg_gate
+            .lock()
+            .admit(route_budget_bps, wire_bytes, Instant::now())
+        {
+            return true;
+        }
+        let shaped = self.jpeg_shaped.fetch_add(1, Ordering::Relaxed) + 1;
+        if mesh.diag_ok(&format!("video-jpeg-shape:{}", self.route_id)) {
+            tracing::info!(
+                "video policy {}: shaped {shaped} MJPEG frames to the {} kbps route grant",
+                self.route_id,
+                route_budget_bps / 1_000
+            );
+        }
+        false
+    }
+
+    /// Return true while policy intentionally pauses this route. The first
+    /// packet after a pause enters the normal recovery epoch so only a clean
+    /// key can reopen the dependency chain.
+    fn policy_pauses(&self, mesh: &Mesh, route_budget_bps: u64, key: Option<bool>) -> bool {
+        if route_budget_bps == 0 {
+            if !self.policy_paused.swap(true, Ordering::AcqRel) {
+                tracing::info!(
+                    "video policy {}: route paused at a zero video allocation",
+                    self.route_id
+                );
+            }
+            return true;
+        }
+        if self.policy_paused.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                "video policy {}: route allocation restored; reopening from a clean unit",
+                self.route_id
+            );
+            if key.is_some() {
+                self.note_drop(mesh, key, "policy allocation resumed");
+            }
+        }
+        false
     }
 
     fn epoch(&self) -> u64 {
@@ -983,15 +1216,18 @@ async fn paced_gap(gap: std::time::Duration) {
 
 impl Mesh {
     pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
-        // Shallow queues both: at most a few frames in flight, so a slow
-        // link sheds load by dropping captures rather than growing latency.
-        // Audio's 8 buffers are ~160 ms of slack.
-        let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(8);
-        let (video_out, video_rx) = mpsc::channel::<VideoOut>(4);
+        // Audio keeps three packets of jitter tolerance. Video queues are
+        // created per route when capture starts: a route-local one-AU handoff
+        // plus one persistent writer is the ordering boundary for dependent
+        // frames, even while focus changes its priority classification.
+        let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(usize::from(AUDIO_HANDOFF_PACKETS));
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
-            media_track_pipe: MediaTrackPipe::new(client.clone()),
+            realtime_video_pipe: MediaPipe::new(client.clone()),
+            audio_pipe: MediaPipe::new(client.clone()),
+            background_video_pipe: MediaPipe::new(client.clone()),
+            audio_track_pipe: MediaTrackPipe::new(client.clone()),
             sink,
             audio: Arc::new(AudioBridge::new()),
             video: Arc::new(VideoBridge::new()),
@@ -1032,9 +1268,9 @@ impl Mesh {
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
-            video_out,
             audio_rx: Mutex::new(Some(audio_rx)),
-            video_rx: Mutex::new(Some(video_rx)),
+            media_policy: Mutex::new(MediaPolicyController::default()),
+            requested_video_tunes: Mutex::new(HashMap::new()),
             input_seq: AtomicU64::new(0),
             clipboard_seq: AtomicU64::new(0),
             clipboard_transfer: AtomicU64::new(0),
@@ -1051,6 +1287,8 @@ impl Mesh {
             refresh_asks: Mutex::new(HashMap::new()),
             profile_req: Mutex::new(HashMap::new()),
             audio_decoders: Mutex::new(HashMap::new()),
+            audio_encoders: Mutex::new(HashMap::new()),
+            pcm_audio_routes: Mutex::new(HashMap::new()),
             daemon_audio: std::sync::atomic::AtomicBool::new(false),
             daemon_lanes: std::sync::atomic::AtomicU8::new(1),
             daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
@@ -1101,7 +1339,12 @@ impl Mesh {
                             let r = mesh.send_media_value(&peer, payload).await;
                             (peer, r)
                         }
-                        AudioOut::Lane { peer, route, data } => {
+                        AudioOut::Lane {
+                            peer,
+                            route,
+                            duration_us,
+                            data,
+                        } => {
                             // Same lane discipline as video: drop rather than
                             // ship on lane 0 when the route has no current lane
                             // (torn down, or past the audio lane pool), which
@@ -1109,7 +1352,8 @@ impl Mesh {
                             // another's route.
                             match mesh.audio_lane(&route, &peer, true) {
                                 Some(lane) => {
-                                    let r = mesh.send_audio_track(&peer, lane, data).await;
+                                    let r =
+                                        mesh.send_audio_track(&peer, lane, duration_us, data).await;
                                     (peer, r)
                                 }
                                 None => {
@@ -1132,27 +1376,47 @@ impl Mesh {
                 }
             });
         }
-        if let Some(mut video_rx) = self.video_rx.lock().take() {
-            let mesh = self.clone();
-            crate::spawn(async move {
-                let mut last_warn = std::time::Instant::now() - WARN_EVERY;
-                while let Some((peer, route_id, generation, packet, epoch, recovery)) =
-                    video_rx.recv().await
-                {
-                    let outcome = mesh
-                        .forward_video_packet(
-                            &peer, &route_id, generation, packet, epoch, &recovery,
-                        )
-                        .await;
-                    if let Err(e) = outcome {
-                        if last_warn.elapsed() >= WARN_EVERY {
-                            last_warn = std::time::Instant::now();
-                            tracing::warn!("video to {} failed: {e}", short_id(&peer));
-                        }
+    }
+
+    fn spawn_video_forwarder(self: &Arc<Self>, mut video_rx: mpsc::Receiver<VideoOut>) {
+        let mesh = self.clone();
+        crate::spawn(async move {
+            // These writers belong to exactly one route incarnation. Every AU
+            // from that route therefore crosses the same local socket in
+            // producer order; a priority election changes budgets, never the
+            // ordering domain underneath an H.264 reference chain.
+            let json_pipe = MediaPipe::new(mesh.client.clone());
+            let track_pipe = MediaTrackPipe::new(mesh.client.clone());
+            let mut last_warn = std::time::Instant::now() - WARN_EVERY;
+            while let Some(out) = video_rx.recv().await {
+                crate::pipeline_profile::record_since(
+                    &out.route_id,
+                    out.profile_id,
+                    None,
+                    crate::pipeline_profile::Stage::OutboundRouteQueueWait,
+                    out.enqueued_at,
+                );
+                let outcome = mesh
+                    .forward_video_packet(
+                        &out.peer,
+                        &out.route_id,
+                        out.generation,
+                        out.packet,
+                        out.recovery_epoch,
+                        &out.recovery,
+                        out.profile_id,
+                        &json_pipe,
+                        &track_pipe,
+                    )
+                    .await;
+                if let Err(e) = outcome {
+                    if last_warn.elapsed() >= WARN_EVERY {
+                        last_warn = std::time::Instant::now();
+                        tracing::warn!("route video to {} failed: {e}", short_id(&out.peer));
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     /// Send one media-channel payload to `peer` (canonicalised to the bare
@@ -1165,6 +1429,7 @@ impl Mesh {
     /// the shipped shared worker. Labs scheduling changes only which bounded
     /// queue owns the packet; it does not introduce a channel, request, or
     /// signaling operation.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_video_packet(
         &self,
         peer: &str,
@@ -1173,6 +1438,9 @@ impl Mesh {
         packet: VideoPacket,
         packet_epoch: u64,
         recovery: &VideoRecovery,
+        profile_id: u64,
+        json_pipe: &MediaPipe,
+        track_pipe: &MediaTrackPipe,
     ) -> Result<(), String> {
         if !self.video_generation_is_current(route_id, generation) {
             tracing::debug!(
@@ -1196,7 +1464,8 @@ impl Mesh {
                     let Ok(payload) = serde_json::to_value(&chunk) else {
                         continue;
                     };
-                    self.send_media_value(peer, payload).await?;
+                    self.send_route_video_value(json_pipe, peer, route_id, profile_id, payload)
+                        .await?;
                 }
                 Ok(())
             }
@@ -1204,6 +1473,7 @@ impl Mesh {
                 data,
                 key,
                 duration_us,
+                ..
             } => {
                 // Capture cannot retract deltas already in the queue when a
                 // newer packet is dropped. Re-check at dequeue so none cross
@@ -1218,7 +1488,18 @@ impl Mesh {
                 };
                 let pace = self.video.route_pace(route_id);
                 match self
-                    .send_video_paced(peer, route_id, generation, lane, &data, duration_us, pace)
+                    .send_video_paced(
+                        json_pipe,
+                        track_pipe,
+                        peer,
+                        route_id,
+                        generation,
+                        lane,
+                        &data,
+                        duration_us,
+                        pace,
+                        profile_id,
+                    )
                     .await
                 {
                     Ok(true) => {}
@@ -1240,15 +1521,70 @@ impl Mesh {
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
-        self.media_pipe
-            .send(&Request::ChannelSendTo {
+        let class = self.classify_local_media(&payload);
+        let pipe = match class {
+            LocalMediaClass::General => &self.media_pipe,
+            LocalMediaClass::PriorityVideo => &self.realtime_video_pipe,
+            LocalMediaClass::Audio => &self.audio_pipe,
+            LocalMediaClass::BackgroundVideo => &self.background_video_pipe,
+        };
+        pipe.send(&Request::ChannelSendTo {
+            network,
+            channel: CHANNEL_MEDIA.to_string(),
+            peer: pubkey_part(peer).to_string(),
+            payload,
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Route-local JSON video send. MJPEG chunks stay on the same persistent
+    /// writer for the lifetime of one capture incarnation; using the generic
+    /// class pipes here would let a focus change split adjacent chunks/frames
+    /// across independently serviced daemon sockets.
+    async fn send_route_video_value(
+        &self,
+        pipe: &MediaPipe,
+        peer: &str,
+        route_id: &str,
+        profile_id: u64,
+        payload: Value,
+    ) -> Result<(), String> {
+        let Some(network) = self.network_for_peer(peer) else {
+            return Err("no shared network".into());
+        };
+        pipe.send_profiled(
+            &Request::ChannelSendTo {
                 network,
                 channel: CHANNEL_MEDIA.to_string(),
                 peer: pubkey_part(peer).to_string(),
                 payload,
-            })
-            .await
-            .map_err(|e| e.to_string())
+            },
+            route_id,
+            profile_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    fn classify_local_media(&self, payload: &Value) -> LocalMediaClass {
+        let tag = payload.get("t").and_then(Value::as_str);
+        match tag {
+            Some("video" | "vstat") => {
+                let priority = payload
+                    .get("route")
+                    .and_then(Value::as_str)
+                    .is_none_or(|route| self.media_policy.lock().is_priority(route));
+                if priority {
+                    LocalMediaClass::PriorityVideo
+                } else {
+                    LocalMediaClass::BackgroundVideo
+                }
+            }
+            // AudioFrame intentionally has no `t` for v0.1 compatibility.
+            None => LocalMediaClass::Audio,
+            Some(_) => LocalMediaClass::General,
+        }
     }
 
     /// Send one H.264 access unit, paced when the dial is on: the unit is
@@ -1281,6 +1617,8 @@ impl Mesh {
     #[allow(clippy::too_many_arguments)]
     async fn send_video_paced(
         &self,
+        json_pipe: &MediaPipe,
+        track_pipe: &MediaTrackPipe,
         peer: &str,
         route_id: &str,
         generation: u64,
@@ -1288,13 +1626,24 @@ impl Mesh {
         data: &[u8],
         duration_us: u64,
         pace: (bool, bool, u32, u32),
+        profile_id: u64,
     ) -> Result<bool, String> {
         let current = || self.video_generation_is_current(route_id, generation);
         if !crate::video::paced_slices_enabled() {
             if !current() {
                 return Ok(false);
             }
-            self.send_video_track(peer, lane, data, duration_us).await?;
+            self.send_video_track(
+                json_pipe,
+                track_pipe,
+                peer,
+                route_id,
+                lane,
+                data,
+                duration_us,
+                profile_id,
+            )
+            .await?;
             return Ok(true);
         }
         let chunks = crate::video::split_annexb_paced(data, crate::video::PACE_SLICE_BYTES);
@@ -1302,7 +1651,17 @@ impl Mesh {
             if !current() {
                 return Ok(false);
             }
-            self.send_video_track(peer, lane, data, duration_us).await?;
+            self.send_video_track(
+                json_pipe,
+                track_pipe,
+                peer,
+                route_id,
+                lane,
+                data,
+                duration_us,
+                profile_id,
+            )
+            .await?;
             return Ok(true);
         }
         // (game posture, WAN-class path, current send rate bps) — the
@@ -1346,7 +1705,17 @@ impl Mesh {
             let dur = if i == last { duration_us } else { 0 };
             let sent_bytes = range.len();
             let tw = Instant::now();
-            self.send_video_track(peer, lane, &data[range], dur).await?;
+            self.send_video_track(
+                json_pipe,
+                track_pipe,
+                peer,
+                route_id,
+                lane,
+                &data[range],
+                dur,
+                profile_id,
+            )
+            .await?;
             write_us += tw.elapsed().as_micros() as u64;
             writes += 1;
             if i != last {
@@ -1360,7 +1729,15 @@ impl Mesh {
                 if !gap.is_zero() {
                     let t0 = std::time::Instant::now();
                     paced_gap(gap).await;
-                    ledger.push((gap.as_micros() as u64, t0.elapsed().as_micros() as u64));
+                    let actual = t0.elapsed();
+                    crate::pipeline_profile::record(
+                        route_id,
+                        profile_id,
+                        None,
+                        crate::pipeline_profile::Stage::OutboundPaceWait,
+                        actual,
+                    );
+                    ledger.push((gap.as_micros() as u64, actual.as_micros() as u64));
                 }
             }
         }
@@ -1466,6 +1843,11 @@ impl Mesh {
         let Some(st) = map.get(route_id) else {
             return (0, 0);
         };
+        // Feedback is periodic. Never let a dead/stalled route's last burst
+        // masquerade as a current path ceiling after media has gone quiet.
+        if st.last.elapsed() > Duration::from_secs(5) {
+            return (0, 0);
+        }
         (st.est_kbps as u32, Self::owd_trend_us_per_s(&st.owd))
     }
 
@@ -1512,12 +1894,17 @@ impl Mesh {
 
     /// Send one H.264 access unit to `peer` over the daemon's video track
     /// lane — raw binary on the control socket (no base64), RTP on the wire.
+    #[allow(clippy::too_many_arguments)]
     async fn send_video_track(
         &self,
+        json_pipe: &MediaPipe,
+        track_pipe: &MediaTrackPipe,
         peer: &str,
+        route_id: &str,
         lane: u8,
         data: &[u8],
         duration_us: u64,
+        profile_id: u64,
     ) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
@@ -1525,20 +1912,32 @@ impl Mesh {
         // Binary media pipe when the daemon speaks it; otherwise the legacy
         // base64 video_send op (so an older daemon still streams).
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
-            self.media_track_pipe
-                .send_video(&network, pubkey_part(peer), lane, duration_us, data)
+            track_pipe
+                .send_profiled_video(
+                    &network,
+                    pubkey_part(peer),
+                    lane,
+                    duration_us,
+                    data,
+                    route_id,
+                    profile_id,
+                )
                 .await
                 .map_err(|e| e.to_string())
         } else {
             use base64::Engine as _;
-            self.media_pipe
-                .send(&Request::VideoSend {
-                    network,
-                    peer: pubkey_part(peer).to_string(),
-                    stream: lane,
-                    duration_us,
-                    data: base64::engine::general_purpose::STANDARD.encode(data),
-                })
+            json_pipe
+                .send_profiled(
+                    &Request::VideoSend {
+                        network,
+                        peer: pubkey_part(peer).to_string(),
+                        stream: lane,
+                        duration_us,
+                        data: base64::engine::general_purpose::STANDARD.encode(data),
+                    },
+                    route_id,
+                    profile_id,
+                )
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1546,29 +1945,29 @@ impl Mesh {
 
     /// Send one encoded Opus frame to `peer` over the daemon's audio track
     /// lane — binary media pipe when supported, else legacy base64.
-    async fn send_audio_track(&self, peer: &str, lane: u8, data: Vec<u8>) -> Result<(), String> {
+    async fn send_audio_track(
+        &self,
+        peer: &str,
+        lane: u8,
+        duration_us: u64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
         let Some(network) = self.network_for_peer(peer) else {
             return Err("no shared network".into());
         };
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
-            self.media_track_pipe
-                .send_audio(
-                    &network,
-                    pubkey_part(peer),
-                    lane,
-                    crate::audio::OPUS_FRAME_US,
-                    &data,
-                )
+            self.audio_track_pipe
+                .send_audio(&network, pubkey_part(peer), lane, duration_us, &data)
                 .await
                 .map_err(|e| e.to_string())
         } else {
             use base64::Engine as _;
-            self.media_pipe
+            self.audio_pipe
                 .send(&Request::AudioSend {
                     network,
                     peer: pubkey_part(peer).to_string(),
                     stream: lane,
-                    duration_us: crate::audio::OPUS_FRAME_US,
+                    duration_us,
                     data: base64::engine::general_purpose::STANDARD.encode(&data),
                 })
                 .await
@@ -1640,18 +2039,44 @@ impl Mesh {
             // class genuinely changes what the stream would do, so a
             // steady-state refresh costs nothing.
             for (peer, class) in changed {
-                for route_id in self.video.route_ids() {
-                    let owns = self
-                        .route_peer(&route_id)
-                        .is_some_and(|p| pubkey_part(&p) == peer);
-                    if owns && self.video.retune_link(&route_id, class) {
+                let route_ids = self
+                    .video
+                    .route_ids()
+                    .into_iter()
+                    .filter(|route_id| {
+                        self.route_peer(route_id)
+                            .is_some_and(|p| pubkey_part(&p) == peer)
+                    })
+                    .collect::<Vec<_>>();
+                if route_ids.is_empty() {
+                    continue;
+                }
+                // PCM suspension mutates audio accounting. Do it before the
+                // link-class recompute, then publish only the final generation.
+                self.stop_policy_pcm_for_peer(&peer);
+                for route_id in route_ids {
+                    if self.video.retune_link(&route_id, class) {
                         tracing::info!(
                             "link to {} classified {:?} — re-gating {route_id}'s automatic video dials",
                             short_id(&peer),
                             class,
                         );
                     }
+                    let _ = self.media_policy.lock().register_route(
+                        &peer,
+                        &route_id,
+                        class == crate::video::LinkClass::Lan,
+                    );
                 }
+                let policy_plans = self.media_policy.lock().plans_for_peer(&peer);
+                for plan in &policy_plans {
+                    self.video.apply_policy_cap(
+                        &plan.route_id,
+                        Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                        plan.auto_resolution,
+                    );
+                }
+                self.send_effective_plans(policy_plans).await;
             }
         }
     }
@@ -1698,6 +2123,7 @@ impl Mesh {
         // Spawn the media forwarders now that we're on a runtime (see
         // `spawn_media_forwarders` — `new` runs in the GUI's sync setup).
         self.spawn_media_forwarders();
+        self.spawn_media_policy_sweep();
 
         // Devices change under a running app; the watcher re-scans on a slow
         // cadence and re-advertises when the picture changed. Once for the
@@ -1753,6 +2179,75 @@ impl Mesh {
         });
     }
 
+    /// Tear down process-local media state before installing a daemon's fresh
+    /// session. The restarted daemon owns none of the old lanes/routes; keeping
+    /// allocator ids, captures, decoders, or lane bindings would let a later
+    /// route inherit stale priority and audio reservations. Deliberately do not
+    /// send lane-close requests here: they would target the new daemon and could
+    /// race a successor route onto the same positional lane.
+    fn reset_media_for_fresh_session(&self) {
+        // Invalidate every old route gate atomically before doing any teardown
+        // work. The rest of bring-up awaits identity/network queries; leaving
+        // the old Session visible during those awaits would let a late media
+        // task repopulate the maps after this reset.
+        let old_session = {
+            let mut state = self.state.lock();
+            state.client_id = None;
+            state.session.take()
+        };
+        let mut routes = std::collections::BTreeSet::new();
+        if let Some(session) = old_session.as_ref() {
+            routes.extend(
+                session
+                    .routes()
+                    .filter(|live| {
+                        matches!(
+                            live.route.media,
+                            MediaKind::Audio | MediaKind::Display | MediaKind::Video
+                        )
+                    })
+                    .map(|live| live.route.id.clone()),
+            );
+        }
+        routes.extend(self.video.route_ids());
+        routes.extend(self.audio_encoders.lock().keys().cloned());
+        routes.extend(self.audio_decoders.lock().keys().cloned());
+        routes.extend(self.pcm_audio_routes.lock().keys().cloned());
+
+        if !routes.is_empty() {
+            tracing::info!(
+                "fresh daemon session — retiring {} stale local media route(s)",
+                routes.len()
+            );
+        }
+        for route_id in &routes {
+            self.video_route_generations.lock().retire(route_id);
+            self.audio.stop(route_id);
+            self.video.stop(route_id);
+            self.video_decode.stop(route_id);
+        }
+
+        self.media_policy.lock().reset();
+        self.requested_video_tunes.lock().clear();
+        self.pcm_audio_routes.lock().clear();
+        self.audio_decoders.lock().clear();
+        self.audio_encoders.lock().clear();
+        *self.video_in.lock() = VideoAssembler::new();
+        self.video_watchers.lock().clear();
+        self.video_arrivals.lock().clear();
+        self.video_in_stats.lock().clear();
+        self.video_diag_last.lock().clear();
+        self.dead_lane_since.lock().clear();
+        self.refresh_asks.lock().clear();
+        self.video_lane_pins.lock().clear();
+        self.video_lane_binds.lock().clear();
+        *self.video_switch_guards.lock() = VideoSwitchGuards::default();
+        self.daemon_video.store(false, Ordering::SeqCst);
+        self.daemon_audio.store(false, Ordering::SeqCst);
+        self.daemon_media_pipes.store(false, Ordering::SeqCst);
+        self.daemon_lanes.store(1, Ordering::SeqCst);
+    }
+
     /// One full session bring-up against a freshly-subscribed daemon link:
     /// identity → profile → networks → media-pipe probe → channel
     /// subscribes → ownership/presence. Runs on every (re)connect — after a
@@ -1760,6 +2255,7 @@ impl Mesh {
     /// everything is re-established, and peers re-learn us from the fresh
     /// presence broadcast.
     async fn bring_up(self: &Arc<Self>, client_id: ClientId) {
+        self.reset_media_for_fresh_session();
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
@@ -1811,10 +2307,10 @@ impl Mesh {
         // `video_inbound`/`audio_inbound` events, which the value dispatcher
         // below still decodes and handles.
         if media_pipes {
-            let (media_tx, mut media_rx) = mpsc::channel::<InboundFrame>(256);
+            let (media_tx, mut media_rx) = mpsc::channel::<ProfiledInboundFrame>(256);
             match self
                 .client
-                .subscribe_media_source(client_id, media_tx)
+                .subscribe_profiled_media_source(client_id, media_tx)
                 .await
             {
                 Ok(()) => {
@@ -1823,18 +2319,25 @@ impl Mesh {
                     );
                     let mesh = self.clone();
                     crate::spawn(async move {
-                        while let Some(f) = media_rx.recv().await {
+                        while let Some(mut profiled) = media_rx.recv().await {
+                            profiled.record_dispatch_wait();
+                            let profile_id = profiled.profile_id;
+                            let f = profiled.frame;
                             match f.kind {
-                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound(
+                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound_profiled(
                                     &f.from,
                                     f.stream,
                                     f.rtp_timestamp,
                                     f.key,
                                     f.data,
+                                    profile_id,
                                 ),
-                                MEDIA_KIND_AUDIO => {
-                                    mesh.handle_audio_inbound(&f.from, f.stream, f.data)
-                                }
+                                MEDIA_KIND_AUDIO => mesh.handle_audio_inbound(
+                                    &f.from,
+                                    f.stream,
+                                    f.rtp_timestamp,
+                                    f.data,
+                                ),
                                 _ => {}
                             }
                         }
@@ -1951,6 +2454,30 @@ impl Mesh {
                     }
                     mesh.emit_snapshot();
                 }
+            }
+        });
+    }
+
+    /// Expire stale media-path estimates independently of route-offer
+    /// housekeeping. This task only retunes active media routes and echoes the
+    /// resulting effective media plans over their already-established data
+    /// channel; it cannot delay or mutate the offer/signaling reaper.
+    fn spawn_media_policy_sweep(self: &Arc<Self>) {
+        const SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP).await;
+                let Some(mesh) = mesh.upgrade() else { break };
+                let plans = mesh.media_policy.lock().expire_stale_path_estimates();
+                for plan in &plans {
+                    mesh.video.apply_policy_cap(
+                        &plan.route_id,
+                        Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                        plan.auto_resolution,
+                    );
+                }
+                mesh.send_effective_plans(plans).await;
             }
         });
     }
@@ -2503,12 +3030,16 @@ impl Mesh {
                 let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
                     return;
                 };
+                let rtp_timestamp = value
+                    .get("rtp_timestamp")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 use base64::Engine as _;
                 let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
                     return;
                 };
-                self.handle_audio_inbound(from, stream, data);
+                self.handle_audio_inbound(from, stream, rtp_timestamp, data);
             }
             "event" => {
                 if let Some(event) = value.get("event") {
@@ -3212,7 +3743,14 @@ impl Mesh {
                             // Without this the viewer replays history frame by
                             // frame ("always catching up") whenever decode or
                             // the wire runs behind the capture rate.
-                            self.enqueue_for_watcher(&full.route, video_ipc_bytes(&full), true);
+                            let profile_id = crate::pipeline_profile::next_frame_id();
+                            let _ = self.enqueue_for_watcher(
+                                &full.route,
+                                video_ipc_bytes(&full),
+                                true,
+                                profile_id,
+                                None,
+                            );
                         }
                     }
                     MediaPayload::VideoStatus(status) => {
@@ -3335,6 +3873,7 @@ impl Mesh {
     /// the viewer-side lane→route binding.
     fn release_video_lanes(self: &Arc<Self>, route_id: &str) {
         self.note_video_route_stopped(route_id);
+        self.video_arrivals.lock().remove(route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
         self.video_decode.stop(route_id);
@@ -3583,6 +4122,38 @@ impl Mesh {
         });
     }
 
+    /// Stop legacy PCM captures as soon as the same peer gains a governed
+    /// video plan. Raw PCM is retained only for uncapped legacy/audio-only
+    /// sessions; it is far larger than every encoded-audio reservation and
+    /// would make the effective aggregate cap dishonest.
+    fn stop_policy_pcm_for_peer(self: &Arc<Self>, peer: &str) {
+        let peer = pubkey_part(peer);
+        let routes = {
+            let mut active = self.pcm_audio_routes.lock();
+            let routes = active
+                .iter()
+                .filter(|(_, route_peer)| pubkey_part(route_peer) == peer)
+                .map(|(route_id, _)| route_id.clone())
+                .collect::<Vec<_>>();
+            for route_id in &routes {
+                active.remove(route_id);
+            }
+            routes
+        };
+        for route_id in routes {
+            tracing::warn!(
+                "audio unavailable for {route_id}: peer now has an enforced media aggregate; \
+                 legacy PCM stopped because it cannot fit the encoded-audio reservation"
+            );
+            self.audio.stop(&route_id);
+            // The route itself is still Active. Remove only its aggregate
+            // reservation: release_audio_lanes also closes a positional daemon
+            // lane and is correct exclusively after route teardown.
+            self.audio_encoders.lock().remove(&route_id);
+            self.media_policy.lock().remove_audio_route(&route_id);
+        }
+    }
+
     /// The audio twin of [`Self::release_video_lanes`]: drop the route's
     /// Opus decoder when it ends — and close the daemon audio lane the
     /// end freed. Audio lanes are positional, not pinned like video
@@ -3594,7 +4165,21 @@ impl Mesh {
     /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
     /// window and a write inside it revives the track with no SDP work.
     fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
+        self.pcm_audio_routes.lock().remove(route_id);
         self.audio_decoders.lock().remove(route_id);
+        self.audio_encoders.lock().remove(route_id);
+        let policy_plans = self.media_policy.lock().remove_audio_route(route_id);
+        for plan in &policy_plans {
+            self.video.apply_policy_cap(
+                &plan.route_id,
+                Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                plan.auto_resolution,
+            );
+        }
+        if !policy_plans.is_empty() {
+            let mesh = self.clone();
+            crate::spawn(async move { mesh.send_effective_plans(policy_plans).await });
+        }
         let Some(peer) = self.route_peer(route_id) else {
             return;
         };
@@ -3627,7 +4212,13 @@ impl Mesh {
     /// gated exactly like every other media frame (route live, sinks here,
     /// sender is the route's peer) — then decodes straight into the
     /// route's playback ring.
-    fn handle_audio_inbound(self: &Arc<Self>, from: &str, stream: u8, data: Vec<u8>) {
+    fn handle_audio_inbound(
+        self: &Arc<Self>,
+        from: &str,
+        stream: u8,
+        rtp_timestamp: u32,
+        data: Vec<u8>,
+    ) {
         let Some(route_id) = self.audio_route_for_lane(from, stream) else {
             // The audio twin of the video lane's "no route for it" warn
             // (rate-limited the same way): Opus arriving with nowhere to
@@ -3648,34 +4239,47 @@ impl Mesh {
             self.nack_dead_route(from, &route_id);
             return;
         }
-        // Up to 120 ms per packet is legal Opus; ours are 20 ms.
-        let mut pcm = vec![0i16; crate::audio::OPUS_FRAME_SAMPLES * 6];
+        let profile = audio_profile_for_mode(self.media_mode_for_peer(from));
         let decoded = {
             let mut decoders = self.audio_decoders.lock();
             let dec = match decoders.entry(route_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    match opus::Decoder::new(crate::audio::OPUS_RATE, opus::Channels::Mono) {
-                        Ok(d) => v.insert(d),
-                        Err(e) => {
-                            tracing::warn!("opus decoder for {route_id} failed: {e}");
-                            return;
-                        }
+                std::collections::hash_map::Entry::Vacant(v) => match OpusReceiver::new(profile) {
+                    Ok(d) => v.insert(d),
+                    Err(e) => {
+                        tracing::warn!("opus decoder for {route_id} failed: {e}");
+                        return;
                     }
-                }
+                },
             };
-            match dec.decode(&data, &mut pcm, false) {
-                Ok(n) => n,
+            dec.set_profile(profile);
+            match dec.decode(rtp_timestamp, &data) {
+                Ok(frames) => frames,
                 Err(e) => {
-                    // One bad frame costs 20 ms; the next stands alone.
                     tracing::debug!("opus decode for {route_id} failed: {e}");
                     return;
                 }
             }
         };
-        pcm.truncate(decoded);
-        let frame = AudioFrame::new(route_id.clone(), 0, crate::audio::OPUS_RATE, 1, pcm);
-        self.audio.feed(&route_id, &frame);
+        for decoded in decoded {
+            if decoded.kind != OpusDecodeKind::Normal
+                && self.diag_ok(&format!("opus-recovery:{route_id}"))
+            {
+                tracing::debug!(
+                    "opus {kind:?} recovery for {route_id} at RTP {rtp_timestamp}",
+                    kind = decoded.kind
+                );
+            }
+            let frame = AudioFrame::new_timestamped(
+                route_id.clone(),
+                decoded.seq,
+                crate::audio::OPUS_RATE,
+                2,
+                decoded.media_timestamp_us,
+                decoded.pcm,
+            );
+            self.audio.feed(&route_id, &frame);
+        }
     }
 
     /// Count one inbound video payload for `route_id` and emit the
@@ -3726,6 +4330,21 @@ impl Mesh {
         rtp_timestamp: u32,
         key: bool,
         data: Vec<u8>,
+    ) {
+        self.handle_video_inbound_profiled(from, stream, rtp_timestamp, key, data, 0);
+    }
+
+    /// Binary media-pipe twin carrying a process-local profiler id from the
+    /// local IPC reader into the decoder queue. The id is not present on the
+    /// network or any daemon protocol frame.
+    fn handle_video_inbound_profiled(
+        self: &Arc<Self>,
+        from: &str,
+        stream: u8,
+        rtp_timestamp: u32,
+        key: bool,
+        data: Vec<u8>,
+        profile_id: u64,
     ) {
         let canon = pubkey_part(from).to_string();
         let Some(route_id) = self.video_route_for_lane(from, stream) else {
@@ -3805,12 +4424,13 @@ impl Mesh {
             let rid = route_id.clone();
             let glitch_mesh = Arc::downgrade(self);
             let glitch_rid = route_id.clone();
-            self.video_decode.feed(
+            self.video_decode.feed_profiled(
                 &route_id,
                 Au { ts_us, key, data },
-                move |packet| {
+                profile_id,
+                move |packet, frame_id, frame_ts_us| {
                     if let Some(mesh) = mesh.upgrade() {
-                        mesh.enqueue_decoded(&rid, packet);
+                        mesh.enqueue_decoded(&rid, packet, frame_id, frame_ts_us);
                     }
                 },
                 move |lost_ts_us| {
@@ -3823,12 +4443,20 @@ impl Mesh {
                     if let Some(mesh) = glitch_mesh.upgrade() {
                         let rid = glitch_rid.clone();
                         crate::spawn(async move {
+                            let policy_v1 = mesh.media_policy.lock().plan(&rid).is_some();
                             if lost_ts_us.is_some() {
                                 let _ = mesh
                                     .send_video_feedback(rid.clone(), 0, 1, 0, lost_ts_us)
                                     .await;
                             }
-                            let _ = mesh.request_refresh(rid).await;
+                            // A v1 sender consumes the loss report with one
+                            // capability-aware wave-or-IDR strategy. Only an
+                            // older peer also needs the legacy Refresh ask;
+                            // sending both made GDR immediately self-defeat
+                            // into a keyframe wall.
+                            if !policy_v1 {
+                                let _ = mesh.request_refresh(rid).await;
+                            }
                         });
                     }
                 },
@@ -3837,7 +4465,23 @@ impl Mesh {
             // NOT latest_wins: H.264 deltas must all reach the decoder in
             // order — freshest-wins happens after decode (enqueue_decoded) or
             // at the GUI's paint slot instead.
-            self.enqueue_for_watcher(&route_id, h264_ipc_bytes(ts_us, key, &data), false);
+            let profile_id = if profile_id == 0 {
+                crate::pipeline_profile::next_frame_id()
+            } else {
+                profile_id
+            };
+            if self.enqueue_for_watcher(
+                &route_id,
+                h264_ipc_bytes(ts_us, key, &data),
+                false,
+                profile_id,
+                Some(ts_us),
+            ) {
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    let _ = mesh.request_refresh(route_id).await;
+                });
+            }
         }
     }
 
@@ -3847,13 +4491,18 @@ impl Mesh {
     /// of stream and is then cleared wholesale — the decoder re-keys on
     /// the sender's next IDR, and `video_unwatch`/route teardown remove
     /// the entry entirely.
-    fn enqueue_for_watcher(&self, route_id: &str, packet: Vec<u8>, latest_wins: bool) {
-        // One second of 60 fps H.264. An unread backlog is pure latency by
-        // the time the window drains it (the old 120 held 2–4 s of "catch
-        // up"), and the overflow below re-enters at a queued keyframe
-        // instead of dumping the lot, so a slow-but-alive window loses
-        // moments, not the stream.
-        const MAX_QUEUED: usize = 60;
+    fn enqueue_for_watcher(
+        &self,
+        route_id: &str,
+        packet: Vec<u8>,
+        latest_wins: bool,
+        profile_id: u64,
+        frame_ts_us: Option<u64>,
+    ) -> bool {
+        // About 100 ms at 60 fps. Encoded H.264 must remain ordered, but a
+        // one-second (formerly two-to-four-second) WebCodecs backlog is
+        // already stale. Overflow below re-enters only on a key unit.
+        const MAX_QUEUED: usize = 6;
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -3866,14 +4515,22 @@ impl Mesh {
                     "frames flowing for {route_id} but no window is watching it — dropping until one does"
                 );
             }
-            return;
+            return false;
         };
+        let was_empty = w.queue.is_empty();
+        let packet_is_key = !latest_wins && packet.first() == Some(&2) && packet.get(1) == Some(&1);
         if latest_wins {
             // Self-contained frames (MJPEG): anything the window hasn't
             // pulled yet is stale the moment a newer picture exists —
             // painting history buys nothing but lag. Mirrors
             // enqueue_decoded's freshest-wins.
             w.queue.clear();
+        } else if w.awaiting_key {
+            if !packet_is_key {
+                return false;
+            }
+            w.queue.clear();
+            w.awaiting_key = false;
         } else if w.queue.len() >= MAX_QUEUED {
             // H.264 backlog: skip forward to the NEWEST queued key unit —
             // decode re-enters there cleanly, and the viewer jumps to
@@ -3885,7 +4542,7 @@ impl Mesh {
             match w
                 .queue
                 .iter()
-                .rposition(|p| p.first() == Some(&2) && p.get(1) == Some(&1))
+                .rposition(|p| p.bytes.first() == Some(&2) && p.bytes.get(1) == Some(&1))
             {
                 Some(i) if i > 0 => {
                     tracing::debug!(
@@ -3898,23 +4555,34 @@ impl Mesh {
                     // still at cap — the chain itself outgrew the bound.
                     tracing::debug!("video queue for {route_id} unread for a second — cleared");
                     w.queue.clear();
+                    if !packet_is_key {
+                        w.awaiting_key = true;
+                        return true;
+                    }
                 }
                 None => {
                     tracing::debug!("video queue for {route_id} unread and keyless — cleared");
                     w.queue.clear();
+                    if !packet_is_key {
+                        w.awaiting_key = true;
+                        return true;
+                    }
                 }
             }
         }
-        w.queue.push_back(packet);
+        w.queue
+            .push_back(ViewerPacket::new(packet, profile_id, frame_ts_us));
         // Poke the watcher when the queue goes non-empty: the console
         // pulls on a timer, but Chromium throttles timers in occluded
         // windows (a non-maximized console behind the main window paints
         // ~1 fps) — the event rides eval, which isn't throttled, and it
         // also shaves the poll interval off delivery latency. Coalesced
         // by construction: no further pokes until the queue drains.
-        if w.queue.len() == 1 {
+        drop(map);
+        if was_empty {
             self.sink.emit("allmystuff://video-ready", json!(route_id));
         }
+        false
     }
 
     /// Queue one natively decoded frame, freshest-wins: a decoded picture
@@ -3922,15 +4590,20 @@ impl Mesh {
     /// screen — painting two per tick buys nothing but latency). Encoded
     /// packets append instead, because H.264 deltas must all reach their
     /// decoder; that distinction is the whole reason for two enqueues.
-    fn enqueue_decoded(&self, route_id: &str, packet: Vec<u8>) {
+    fn enqueue_decoded(&self, route_id: &str, packet: Vec<u8>, profile_id: u64, frame_ts_us: u64) {
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             tracing::debug!("no console window watching {route_id} — decoded frame dropped");
             return;
         };
+        let was_empty = w.queue.is_empty();
         w.queue.clear();
-        w.queue.push_back(packet);
-        self.sink.emit("allmystuff://video-ready", json!(route_id));
+        w.queue
+            .push_back(ViewerPacket::new(packet, profile_id, Some(frame_ts_us)));
+        drop(map);
+        if was_empty {
+            self.sink.emit("allmystuff://video-ready", json!(route_id));
+        }
     }
 
     /// Front-end command: offer a route from `from` to `to`.
@@ -4135,6 +4808,7 @@ impl Mesh {
                 token,
                 decode,
                 queue: std::collections::VecDeque::new(),
+                awaiting_key: false,
                 last_poll: Instant::now(),
             },
         );
@@ -4153,21 +4827,94 @@ impl Mesh {
         }
     }
 
-    /// Drain everything queued for `route_id` into one length-prefixed
-    /// batch: `[u32 len][packet]…` — empty (and cheap) when nothing
-    /// arrived since the last poll.
-    pub fn video_poll(&self, route_id: &str) -> Vec<u8> {
+    /// Drain everything queued for `route_id` while measuring the viewer-side
+    /// lock, poll cadence, and queue residence. Framing happens after this
+    /// returns, outside the watcher lock.
+    fn drain_video_poll(&self, route_id: &str) -> std::collections::VecDeque<ViewerPacket> {
+        let lock_started = crate::pipeline_profile::stamp();
         let mut map = self.video_watchers.lock();
+        let lock_acquired = crate::pipeline_profile::stamp();
         let Some(w) = map.get_mut(route_id) else {
-            return Vec::new();
+            return std::collections::VecDeque::new();
         };
-        w.last_poll = Instant::now();
-        let total: usize = w.queue.iter().map(|p| 4 + p.len()).sum();
-        let mut out = Vec::with_capacity(total);
-        for packet in w.queue.drain(..) {
-            out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
-            out.extend_from_slice(&packet);
+        let polled_at = Instant::now();
+        let poll_cadence = polled_at.saturating_duration_since(w.last_poll);
+        w.last_poll = polled_at;
+        let packets = std::mem::take(&mut w.queue);
+        drop(map);
+
+        crate::pipeline_profile::record_at(
+            route_id,
+            0,
+            None,
+            crate::pipeline_profile::Stage::ViewerPollCadence,
+            poll_cadence,
+            polled_at,
+        );
+        if let (Some(started), Some(ended)) = (lock_started, lock_acquired) {
+            crate::pipeline_profile::record_at(
+                route_id,
+                0,
+                None,
+                crate::pipeline_profile::Stage::ViewerPollLockWait,
+                ended.saturating_duration_since(started),
+                ended,
+            );
         }
+        for packet in &packets {
+            if let Some(enqueued_at) = packet.enqueued_at {
+                crate::pipeline_profile::record_at(
+                    route_id,
+                    packet.profile_id,
+                    packet.frame_ts_us,
+                    crate::pipeline_profile::Stage::ViewerQueueWait,
+                    polled_at.saturating_duration_since(enqueued_at),
+                    polled_at,
+                );
+            }
+        }
+        packets
+    }
+
+    /// Drain queued video packets for the local node-control server's
+    /// segmented writer. The resulting on-socket payload remains byte-for-byte
+    /// identical to [`Self::video_poll`], but native RGBA frames are not copied
+    /// into an intermediate batch allocation.
+    pub(crate) fn video_poll_batch(&self, route_id: &str) -> VideoPollBatch {
+        let packets = self.drain_video_poll(route_id);
+        if packets.is_empty() {
+            return VideoPollBatch::new(packets);
+        }
+
+        let batch_started = crate::pipeline_profile::stamp();
+        let batch = VideoPollBatch::new(packets);
+        crate::pipeline_profile::record_since(
+            route_id,
+            0,
+            None,
+            crate::pipeline_profile::Stage::ViewerBatchBusy,
+            batch_started,
+        );
+        batch
+    }
+
+    /// Compatibility form of [`Self::video_poll_batch`] for in-process
+    /// callers: one contiguous `[u32 len][packet]...` payload.
+    pub fn video_poll(&self, route_id: &str) -> Vec<u8> {
+        let packets = self.drain_video_poll(route_id);
+        if packets.is_empty() {
+            return Vec::new();
+        }
+
+        let batch_started = crate::pipeline_profile::stamp();
+        let out = VideoPollBatch::new(packets).into_bytes();
+        crate::pipeline_profile::record_since(
+            route_id,
+            0,
+            None,
+            crate::pipeline_profile::Stage::ViewerBatchBusy,
+            batch_started,
+        );
         out
     }
 
@@ -4221,6 +4968,15 @@ impl Mesh {
         tracing::info!("local route teardown committing for {route_id}");
         self.audio.stop(&route_id);
         self.video.stop(&route_id);
+        let policy_plans = self.media_policy.lock().remove_route(&route_id);
+        for plan in &policy_plans {
+            self.video.apply_policy_cap(
+                &plan.route_id,
+                Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                plan.auto_resolution,
+            );
+        }
+        self.send_effective_plans(policy_plans).await;
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
         self.release_audio_lanes(&route_id);
@@ -5671,15 +6427,127 @@ impl Mesh {
                     fps,
                     game,
                     mode,
-                    ext: _, // pipeline-owned; no viewer-requested knob reads it yet
-                } => self.video.retune_dials(
-                    &route_id,
-                    max_edge,
-                    bitrate,
-                    fps,
-                    game,
-                    mode.as_deref(),
-                ),
+                    ext,
+                } => {
+                    let legacy_dials_absent = max_edge.is_none()
+                        && bitrate.is_none()
+                        && fps.is_none()
+                        && !game
+                        && mode.is_none();
+                    let mut policy_cap = None;
+                    let mut policy_auto_resolution = false;
+                    let mut plans_to_echo = Vec::new();
+                    let mut audio_profile_update = None;
+                    let mut election_only = false;
+                    if let Some(envelope) = PolicyEnvelope::from_ext(&ext) {
+                        match envelope.payload {
+                            PolicyPayload::Effective { plan } => {
+                                // Streamer → viewer answer. Cache it for the
+                                // effective panel; never reflect it back or
+                                // interpret it as a local encoder command.
+                                if plan.route_id != route_id {
+                                    tracing::warn!(
+                                        "ignoring media-policy effective route mismatch: Tune {route_id}, plan {}",
+                                        plan.route_id
+                                    );
+                                    continue;
+                                }
+                                let peer = self.route_peer(&route_id);
+                                let mode = plan.effective_mode;
+                                self.media_policy.lock().record_effective(plan);
+                                if let Some(peer) = peer {
+                                    self.apply_audio_profile_for_peer(&peer, mode);
+                                }
+                                continue;
+                            }
+                            PolicyPayload::Request {
+                                route_id: ext_route,
+                                request,
+                                capabilities,
+                            } if ext_route == route_id => {
+                                if let Some(peer) = self.route_peer(&route_id) {
+                                    let lan = self
+                                        .state
+                                        .lock()
+                                        .peer_links
+                                        .get(pubkey_part(&peer))
+                                        .is_some_and(|c| *c == crate::video::LinkClass::Lan);
+                                    election_only = request.priority_only
+                                        || (request.priority
+                                            && request.peer_cap_bps.is_none()
+                                            && request.route_cap_bps.is_none()
+                                            && legacy_dials_absent);
+                                    plans_to_echo = if election_only {
+                                        // OS/window focus is a scheduler hint,
+                                        // not a quality request. Preserve the
+                                        // aggregate cap and every route dial.
+                                        self.media_policy.lock().elect_priority(&route_id)
+                                    } else {
+                                        self.media_policy.lock().apply_request(
+                                            pubkey_part(&peer),
+                                            &route_id,
+                                            request,
+                                            capabilities,
+                                            lan,
+                                        )
+                                    };
+                                    if let Some(plan) = plans_to_echo
+                                        .iter()
+                                        .find(|plan| plan.priority)
+                                        .or_else(|| plans_to_echo.first())
+                                    {
+                                        audio_profile_update =
+                                            Some((peer.clone(), plan.effective_mode));
+                                    }
+                                    if let Some(plan) =
+                                        plans_to_echo.iter().find(|plan| plan.route_id == route_id)
+                                    {
+                                        policy_cap =
+                                            Some(plan.route_budget_bps.min(u64::from(u32::MAX))
+                                                as u32);
+                                        policy_auto_resolution = plan.auto_resolution;
+                                    }
+                                }
+                            }
+                            PolicyPayload::Request {
+                                route_id: ext_route,
+                                ..
+                            } => {
+                                tracing::warn!(
+                                    "ignoring media-policy route mismatch: Tune {route_id}, ext {ext_route}"
+                                );
+                            }
+                        }
+                    }
+                    if election_only {
+                        self.video
+                            .apply_policy_cap(&route_id, policy_cap, policy_auto_resolution);
+                    } else {
+                        self.video.retune_dials(
+                            &route_id,
+                            max_edge,
+                            bitrate,
+                            fps,
+                            game,
+                            mode.as_deref(),
+                            policy_cap,
+                            policy_auto_resolution,
+                        );
+                    }
+                    for plan in &plans_to_echo {
+                        if plan.route_id != route_id {
+                            self.video.apply_policy_cap(
+                                &plan.route_id,
+                                Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                                plan.auto_resolution,
+                            );
+                        }
+                    }
+                    if let Some((peer, mode)) = audio_profile_update {
+                        self.apply_audio_profile_for_peer(&peer, mode);
+                    }
+                    self.send_effective_plans(plans_to_echo).await;
+                }
                 Effect::VideoFeedback {
                     route_id,
                     recv_fps,
@@ -5713,7 +6581,33 @@ impl Mesh {
                         queue_depth,
                         pf.est_kbps,
                         pf.delay_trend_us_per_s,
-                    )
+                    );
+                    if pf.audio_underruns > 0 {
+                        tracing::info!(
+                            "audio health {route_id}: {} underruns / {} frames, jitter {} us, buffer {}/{} ms",
+                            pf.audio_underruns,
+                            pf.audio_underrun_frames,
+                            pf.audio_arrival_jitter_us,
+                            pf.audio_buffered_ms,
+                            pf.audio_target_ms,
+                        );
+                    }
+                    if let Some(peer) = self.route_peer(&route_id) {
+                        let estimate = (pf.est_kbps > 0)
+                            .then_some(u64::from(pf.est_kbps).saturating_mul(1_000));
+                        let plans = self
+                            .media_policy
+                            .lock()
+                            .note_path_estimate(pubkey_part(&peer), estimate);
+                        for plan in &plans {
+                            self.video.apply_policy_cap(
+                                &plan.route_id,
+                                Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                                plan.auto_resolution,
+                            );
+                        }
+                        self.send_effective_plans(plans).await;
+                    }
                 }
                 Effect::StopMedia(id) => {
                     // Effects are produced after the session mutates the route
@@ -5754,7 +6648,17 @@ impl Mesh {
                     );
                     self.audio.stop(&id);
                     self.video.stop(&id);
+                    let policy_plans = self.media_policy.lock().remove_route(&id);
+                    for plan in &policy_plans {
+                        self.video.apply_policy_cap(
+                            &plan.route_id,
+                            Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                            plan.auto_resolution,
+                        );
+                    }
+                    self.send_effective_plans(policy_plans).await;
                     self.video_watchers.lock().remove(&id);
+                    self.requested_video_tunes.lock().remove(&id);
                     self.release_video_lanes(&id);
                     self.release_audio_lanes(&id);
                     // A control route ending mid-chord must not leave this
@@ -8304,10 +9208,17 @@ impl Mesh {
                 // the default mic for a scanned input device — and stream
                 // it to the sink. Transport: the offer said what the sink
                 // can consume — Opus on the daemon's audio track lane when
-                // both stacks carry it and this peer's lane is free, PCM
-                // frames over the media channel otherwise (the floor).
+                // both stacks carry it and this peer's lane is free. Legacy
+                // PCM over the media channel remains available only to an
+                // uncapped audio-only peer; it is never counted as though it
+                // fit an encoded-audio reservation in a governed aggregate.
                 if from_node == me {
                     let source = audio_capture_source(route);
+                    let audio_profile = audio_profile_for_mode(self.media_mode_for_peer(&to_node));
+                    let policy_enforced = self
+                        .media_policy
+                        .lock()
+                        .has_video_routes(pubkey_part(&to_node));
                     let accepts_opus = self
                         .state
                         .lock()
@@ -8317,6 +9228,89 @@ impl Mesh {
                         .map(|r| r.audio.iter().any(|a| a == "opus"))
                         .unwrap_or(false);
                     let lane = accepts_opus && self.audio_lane(&route.id, &to_node, true).is_some();
+                    if policy_enforced && !lane {
+                        tracing::warn!(
+                            "audio unavailable for {}: peer lacks a usable Opus lane; legacy PCM \
+                             is disabled while a peer-wide media aggregate is enforced",
+                            route.id
+                        );
+                        return;
+                    }
+                    let peer = to_node.clone();
+                    let tx = self.audio_out.clone();
+                    let encoder = if lane {
+                        match OpusStream::with_profile(audio_profile) {
+                            Ok(enc) => {
+                                let candidate = Arc::new(parking_lot::Mutex::new(enc));
+                                let encoder = self
+                                    .audio_encoders
+                                    .lock()
+                                    .entry(route.id.clone())
+                                    .or_insert_with(|| candidate.clone())
+                                    .clone();
+                                // A duplicate StartMedia retains the same Arc
+                                // captured by the live pump, but still applies
+                                // the newest mode contract in place.
+                                if !Arc::ptr_eq(&encoder, &candidate) {
+                                    *encoder.lock() = OpusStream::with_profile(audio_profile)
+                                        .expect("profile already constructed above");
+                                }
+                                Some(encoder)
+                            }
+                            Err(e) => {
+                                let existing = self.audio_encoders.lock().get(&route.id).cloned();
+                                if let Some(existing) = existing {
+                                    tracing::warn!(
+                                        "replacement Opus encoder for {} failed ({e}); retaining the live encoder",
+                                        route.id
+                                    );
+                                    Some(existing)
+                                } else if policy_enforced {
+                                    tracing::warn!(
+                                        "audio unavailable for {}: Opus encoder failed ({e}); \
+                                         legacy PCM is disabled while a peer-wide media aggregate \
+                                         is enforced",
+                                        route.id
+                                    );
+                                    return;
+                                } else {
+                                    tracing::warn!(
+                                        "opus encoder for {} failed ({e}); falling back to legacy PCM \
+                                         because this peer has no governed video plan",
+                                        route.id
+                                    );
+                                    // The route remains live and no daemon lane
+                                    // was opened, so positional lane teardown
+                                    // would risk closing a neighbour.
+                                    None
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if encoder.is_some() {
+                        self.pcm_audio_routes.lock().remove(&route.id);
+                    } else {
+                        self.pcm_audio_routes
+                            .lock()
+                            .insert(route.id.clone(), to_node.clone());
+                    }
+                    let policy_plans = self
+                        .media_policy
+                        .lock()
+                        .register_audio_route(pubkey_part(&to_node), &route.id);
+                    for plan in &policy_plans {
+                        self.video.apply_policy_cap(
+                            &plan.route_id,
+                            Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                            plan.auto_resolution,
+                        );
+                    }
+                    if !policy_plans.is_empty() {
+                        let mesh = self.clone();
+                        crate::spawn(async move { mesh.send_effective_plans(policy_plans).await });
+                    }
                     tracing::info!(
                         "route {} active — streaming {} to {} ({})",
                         route.id,
@@ -8325,50 +9319,52 @@ impl Mesh {
                             CaptureSource::Mic => "mic audio",
                         },
                         short_id(&to_node),
-                        if lane { "Opus lane" } else { "PCM channel" }
-                    );
-                    let peer = to_node.clone();
-                    let tx = self.audio_out.clone();
-                    let encoder = if lane {
-                        match crate::audio::OpusStream::new() {
-                            Ok(enc) => Some(parking_lot::Mutex::new(enc)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "opus encoder for {} failed ({e}) — falling back to PCM frames",
-                                    route.id
-                                );
-                                // Decoder drop only — NOT release_audio_lanes:
-                                // the route is still live (it keeps its rank in
-                                // the peer's Opus order), so the positional
-                                // close there would hit the top-ranked
-                                // neighbour's lane, not this route's.
-                                self.audio_decoders.lock().remove(&route.id);
-                                None
-                            }
+                        if encoder.is_some() {
+                            "Opus lane"
+                        } else {
+                            "legacy PCM channel"
                         }
-                    } else {
-                        None
-                    };
+                    );
                     let rid = route.id.clone();
                     let seq = Arc::new(AtomicU64::new(0));
-                    self.audio
-                        .start_capture(route.id.clone(), source, move |pcm, rate| {
+                    let media_samples = Arc::new(AtomicU64::new(0));
+                    self.audio.start_capture_interleaved(
+                        route.id.clone(),
+                        source,
+                        move |pcm, rate, channels| {
                             // try_send everywhere: a full queue drops this
                             // buffer; the next one carries fresher sound.
                             if let Some(enc) = &encoder {
-                                enc.lock().push(&pcm, rate, |data| {
+                                let mut enc = enc.lock();
+                                let duration_us = enc.profile().frame_duration_us();
+                                enc.push_interleaved(&pcm, rate, channels, |data| {
                                     let _ = tx.try_send(AudioOut::Lane {
                                         peer: peer.clone(),
                                         route: rid.clone(),
+                                        duration_us,
                                         data,
                                     });
                                 });
                             } else {
                                 let s = seq.fetch_add(1, Ordering::Relaxed);
-                                let frame = AudioFrame::new(rid.clone(), s, rate, 1, pcm);
+                                let frames = pcm.len() / channels.max(1) as usize;
+                                let start_sample =
+                                    media_samples.fetch_add(frames as u64, Ordering::Relaxed);
+                                let media_timestamp_us = start_sample
+                                    .saturating_mul(1_000_000)
+                                    .saturating_div(u64::from(rate.max(1)));
+                                let frame = AudioFrame::new_timestamped(
+                                    rid.clone(),
+                                    s,
+                                    rate,
+                                    channels,
+                                    media_timestamp_us,
+                                    pcm,
+                                );
                                 let _ = tx.try_send(AudioOut::Channel(peer.clone(), frame));
                             }
-                        });
+                        },
+                    );
                 }
                 // We sink: play inbound frames for this route. Inbound Opus
                 // lane samples find their route on demand
@@ -8383,7 +9379,9 @@ impl Mesh {
                         route.id,
                         short_id(&from_node)
                     );
-                    self.audio.start_playback(route.id.clone());
+                    let profile = audio_profile_for_mode(self.media_mode_for_peer(&from_node));
+                    self.audio
+                        .start_playback_with_profile(route.id.clone(), profile);
                 }
             }
             MediaKind::Display => {
@@ -8915,13 +9913,18 @@ impl Mesh {
         source: VideoSource,
     ) {
         let peer = to_node.to_string();
-        let tx = self.video_out.clone();
         let status_mesh = Arc::downgrade(self);
         let status_peer = peer.clone();
         let status_route = route.id.clone();
         let route_id = route.id.clone();
         let generation = self.begin_video_generation(&route_id);
         let recovery = Arc::new(VideoRecovery::new(&route_id));
+        // One route, one ordered AU queue, one persistent local writer. Focus
+        // changes can alter this route's budget immediately without moving its
+        // dependent frame chain to a differently scheduled socket.
+        let (route_video_out, route_video_rx) =
+            mpsc::channel::<VideoOut>(usize::from(VIDEO_HANDOFF_FRAMES));
+        self.spawn_video_forwarder(route_video_rx);
         // The LAN gate: the automatic fps/bitrate dials open up only on a
         // link the daemon has classified host↔host. Unknown (ICE not yet
         // introspected) starts conservative; the nudge below upgrades the
@@ -8933,6 +9936,33 @@ impl Mesh {
                 .copied()
                 .unwrap_or_default()
         };
+        // A first governed video route makes legacy PCM invalid. Suspend it
+        // before taking any policy snapshot so the encoder and readout see one
+        // final allocator generation rather than racing an intermediate plan.
+        self.stop_policy_pcm_for_peer(to_node);
+        let (initial_plan, policy_plans) = {
+            let mut policy = self.media_policy.lock();
+            let _ = policy.register_route(
+                pubkey_part(to_node),
+                &route.id,
+                link == crate::video::LinkClass::Lan,
+            );
+            let initial = policy.plan(&route.id).cloned().unwrap_or_default();
+            let plans = policy.plans_for_peer(pubkey_part(to_node));
+            (initial, plans)
+        };
+        // Adding this display can lower existing siblings' shares. Apply
+        // those live where the encoder supports it; the new capture receives
+        // its cap in the Tune below.
+        for plan in &policy_plans {
+            if plan.route_id != route.id {
+                self.video.apply_policy_cap(
+                    &plan.route_id,
+                    Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                    plan.auto_resolution,
+                );
+            }
+        }
         if link == crate::video::LinkClass::Unknown {
             // The class usually lands within a couple of seconds of ICE
             // settling — poll the daemon shortly after the stream starts so
@@ -8959,6 +9989,9 @@ impl Mesh {
             source,
             crate::video::Tune {
                 link,
+                mode: crate::video::parse_posture(initial_plan.effective_mode.wire_name()),
+                policy_cap_bps: Some(initial_plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                policy_auto_resolution: initial_plan.auto_resolution,
                 ..Default::default()
             },
             move |packet| {
@@ -8966,30 +9999,50 @@ impl Mesh {
                     VideoPacket::H264 { key, .. } => Some(*key),
                     VideoPacket::Jpeg(_) => None,
                 };
-                if capture_recovery.suppresses(key) {
-                    if let Some(mesh) = recovery_mesh.upgrade() {
-                        capture_recovery.note_suppressed(&mesh);
+                let Some(mesh) = recovery_mesh.upgrade() else {
+                    return false;
+                };
+                let route_budget_bps = {
+                    let policy = mesh.media_policy.lock();
+                    policy
+                        .plan(&route_id)
+                        .map(|plan| plan.route_budget_bps)
+                        .unwrap_or(u64::MAX)
+                };
+                if capture_recovery.policy_pauses(&mesh, route_budget_bps, key) {
+                    return false;
+                }
+                if let VideoPacket::Jpeg(frame) = &packet {
+                    if !capture_recovery.admits_jpeg(&mesh, route_budget_bps, frame) {
+                        return false;
                     }
+                }
+                if capture_recovery.suppresses(key) {
+                    capture_recovery.note_suppressed(&mesh);
                     return false;
                 }
                 let epoch = capture_recovery.epoch();
-                let failure = match tx.try_send((
-                    peer.clone(),
-                    route_id.clone(),
+                let packet_profile_id = match packet.profile_id() {
+                    0 => crate::pipeline_profile::next_frame_id(),
+                    id => id,
+                };
+                let failure = match route_video_out.try_send(VideoOut {
+                    peer: peer.clone(),
+                    route_id: route_id.clone(),
                     generation,
                     packet,
-                    epoch,
-                    capture_recovery.clone(),
-                )) {
+                    recovery_epoch: epoch,
+                    recovery: capture_recovery.clone(),
+                    profile_id: packet_profile_id,
+                    enqueued_at: crate::pipeline_profile::stamp(),
+                }) {
                     Ok(()) => None,
-                    Err(mpsc::error::TrySendError::Full(_)) => Some("shared queue full"),
-                    Err(mpsc::error::TrySendError::Closed(_)) => Some("shared queue closed"),
+                    Err(mpsc::error::TrySendError::Full(_)) => Some("route one-frame queue full"),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Some("route queue closed"),
                 };
                 if let Some(reason) = failure {
                     if key.is_some() {
-                        if let Some(mesh) = recovery_mesh.upgrade() {
-                            capture_recovery.note_drop(&mesh, key, reason);
-                        }
+                        capture_recovery.note_drop(&mesh, key, reason);
                     }
                     false
                 } else {
@@ -9025,6 +10078,13 @@ impl Mesh {
                 });
             },
         );
+        // Route creation itself changes every sibling's allocation. Publish
+        // that state even before the viewer touches a control, so the
+        // effective panel and background/priority labels never wait on a
+        // later Tune. This remains a best-effort message on the established
+        // route data channel.
+        let mesh = self.clone();
+        crate::spawn(async move { mesh.send_effective_plans(policy_plans).await });
     }
 
     /// The host side of a terminal route going active: spawn this user's
@@ -11251,7 +12311,194 @@ impl Mesh {
     /// `route_id` (the ordinary remote-view case, where the viewer surfaces
     /// its own measured actuals). Read-only; touches no wire and no peer.
     pub fn route_dials(&self, route_id: &str) -> Option<crate::video::RouteDials> {
-        self.video.route_dials(route_id)
+        let plan = self.media_policy.lock().plan(route_id).cloned();
+        let mut dials = self.video.route_dials(route_id).or_else(|| {
+            let plan = plan.as_ref()?;
+            Some(crate::video::RouteDials {
+                posture: plan.effective_mode.wire_name(),
+                encoder_label: plan.encoder.clone(),
+                codec: if plan.codec.eq_ignore_ascii_case("h.264") {
+                    "H.264"
+                } else if plan.codec.eq_ignore_ascii_case("mjpeg") {
+                    "MJPEG"
+                } else if plan.codec.eq_ignore_ascii_case("hevc") {
+                    "HEVC"
+                } else {
+                    ""
+                },
+                target_bitrate_bps: plan.route_budget_bps.min(u64::from(u32::MAX)) as u32,
+                ceiling_bps: plan.route_ceiling_bps.min(u64::from(u32::MAX)) as u32,
+                fps_target: plan.fps,
+                edge_cap: 0,
+                out_w: 0,
+                out_h: 0,
+                peer_budget_bps: 0,
+                route_budget_bps: 0,
+                route_ceiling_bps: 0,
+                priority: false,
+                audio_packet_ms: 0,
+                audio_jitter_ms: 0,
+                audio_fec: false,
+                video_queue_depth: 0,
+                audio_queue_depth: 0,
+                degradation_reasons: Vec::new(),
+            })
+        })?;
+        if let Some(plan) = plan {
+            dials.peer_budget_bps = plan.aggregate_budget_bps;
+            dials.route_budget_bps = plan.route_budget_bps;
+            dials.route_ceiling_bps = plan.route_ceiling_bps;
+            dials.priority = plan.priority;
+            dials.audio_packet_ms = plan.audio_packet_ms;
+            dials.audio_jitter_ms = plan.audio_jitter_ms;
+            dials.audio_fec = plan.audio_fec;
+            dials.video_queue_depth = plan.video_queue_frames;
+            dials.audio_queue_depth = plan.audio_queue_packets;
+            dials.degradation_reasons = plan.degradation_reasons;
+            if dials.encoder_label.is_empty() {
+                dials.encoder_label = plan.encoder;
+            }
+        }
+        Some(dials)
+    }
+
+    fn local_media_capabilities(&self) -> MediaCapabilities {
+        #[cfg(all(windows, feature = "host"))]
+        let native_h264_decode = {
+            static AVAILABLE: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| crate::nvdec::NvdecH264::open().is_ok());
+            *AVAILABLE
+        };
+        #[cfg(not(all(windows, feature = "host")))]
+        let native_h264_decode = false;
+        MediaCapabilities {
+            policy_v1: true,
+            h264: true,
+            // HEVC encode/framing remains quarantined behind the fork's
+            // experimental GPU-lane switch. A Windows build flag is not a
+            // runtime capability, so production negotiation must not claim
+            // Studio Lossless merely because this binary compiled on Windows.
+            hevc: false,
+            opus: true,
+            native_h264_decode,
+            native_hevc_decode: false,
+            binary_media_pipes: self.daemon_media_pipes.load(Ordering::SeqCst),
+            source_exact_444: false,
+            lossless_audio: false,
+        }
+    }
+
+    fn media_mode_for_peer(&self, peer: &str) -> MediaMode {
+        let peer = pubkey_part(peer);
+        let route_ids = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .active_routes()
+                        .filter(|route| {
+                            pubkey_part(route.peer.as_str()) == peer
+                                && matches!(
+                                    route.route.media,
+                                    MediaKind::Display | MediaKind::Video
+                                )
+                        })
+                        .map(|route| route.route.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let policy = self.media_policy.lock();
+        route_ids
+            .iter()
+            .filter_map(|route| policy.plan(route))
+            .find(|plan| plan.priority)
+            .or_else(|| route_ids.iter().find_map(|route| policy.plan(route)))
+            .map(|plan| plan.effective_mode)
+            .unwrap_or(MediaMode::Balanced)
+    }
+
+    fn apply_audio_profile_for_peer(&self, peer: &str, mode: MediaMode) {
+        let profile = audio_profile_for_mode(mode);
+        let Some(me) = self.local_node_id() else {
+            return;
+        };
+        let me = pubkey_part(&me).to_string();
+        let peer = pubkey_part(peer).to_string();
+        let routes = {
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .active_routes()
+                        .filter(|route| {
+                            route.route.media == MediaKind::Audio
+                                && pubkey_part(route.peer.as_str()) == peer
+                        })
+                        .map(|route| {
+                            let outbound =
+                                pubkey_part(node_of(route.route.from.as_str()).as_str()) == me;
+                            (route.route.id.clone(), outbound)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        for (route_id, outbound) in routes {
+            if outbound {
+                if let Some(encoder) = self.audio_encoders.lock().get(&route_id).cloned() {
+                    match OpusStream::with_profile(profile) {
+                        Ok(next) => {
+                            *encoder.lock() = next;
+                            tracing::debug!(
+                                "audio policy {route_id}: {:?} packetization applied live",
+                                mode
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            "audio policy {route_id}: encoder reconfigure failed ({error}); keeping prior profile"
+                        ),
+                    }
+                }
+            } else {
+                self.audio.set_playback_profile(&route_id, profile);
+                if let Some(decoder) = self.audio_decoders.lock().get_mut(&route_id) {
+                    decoder.set_profile(profile);
+                }
+            }
+        }
+    }
+
+    async fn send_effective_plans(&self, plans: Vec<EffectivePlan>) {
+        for mut plan in plans {
+            if let Some(dials) = self.video.route_dials(&plan.route_id) {
+                plan.encoder = dials.encoder_label;
+                plan.codec = dials.codec.to_string();
+            }
+            let Some(peer) = self.route_peer(&plan.route_id) else {
+                continue;
+            };
+            let ext = PolicyEnvelope::effective(plan.clone()).into_ext(Value::Null);
+            if let Err(e) = self
+                .send_control(
+                    &peer,
+                    &ControlMessage::Route(RouteControl::Tune {
+                        route_id: plan.route_id,
+                        max_edge: None,
+                        bitrate: None,
+                        fps: None,
+                        game: false,
+                        mode: None,
+                        ext,
+                    }),
+                )
+                .await
+            {
+                tracing::debug!("effective media plan to {} failed: {e}", short_id(&peer));
+            }
+        }
     }
 
     pub async fn request_tune(
@@ -11263,25 +12510,90 @@ impl Mesh {
         game: bool,
         mode: Option<String>,
     ) -> Result<(), String> {
+        self.request_policy_tune(route_id, max_edge, bitrate, fps, game, mode, None, false)
+            .await
+    }
+
+    /// Policy-aware sibling of [`Self::request_tune`]. The legacy public call
+    /// shape remains intact for embedders; the desktop node-control adapter uses
+    /// this form for aggregate-cap and focus requests.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_policy_tune(
+        self: &Arc<Self>,
+        route_id: String,
+        max_edge: Option<u32>,
+        bitrate: Option<u32>,
+        fps: Option<u32>,
+        game: bool,
+        mode: Option<String>,
+        peer_cap_bps: Option<u64>,
+        priority: bool,
+    ) -> Result<(), String> {
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        let priority_only = priority
+            && max_edge.is_none()
+            && bitrate.is_none()
+            && fps.is_none()
+            && !game
+            && mode.is_none()
+            && peer_cap_bps.is_none();
+        let wire_tune = if priority_only {
+            self.requested_video_tunes
+                .lock()
+                .get(&route_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            let tune = LegacyVideoTune {
+                max_edge,
+                bitrate,
+                fps,
+                game,
+                mode: mode.clone(),
+            };
+            self.requested_video_tunes
+                .lock()
+                .insert(route_id.clone(), tune.clone());
+            tune
+        };
         // The streaming side logs the retune it actually applies — one
         // line per pill change across the pair is plenty.
         tracing::debug!(
             "asking {} to tune {route_id}: edge {max_edge:?} · bitrate {bitrate:?} · fps {fps:?} · game {game} · mode {mode:?}",
             short_id(&peer)
         );
+        let policy_mode = mode
+            .as_deref()
+            .and_then(MediaMode::parse)
+            .unwrap_or(if game {
+                MediaMode::Game
+            } else {
+                MediaMode::Balanced
+            });
+        let policy = PolicyRequest {
+            mode: policy_mode,
+            // `Some(0)` is an explicit aggregate reset. `None` stays absent
+            // so a priority-only focus Tune cannot clear another window's cap.
+            peer_cap_bps,
+            route_cap_bps: bitrate.map(u64::from),
+            priority,
+            priority_only,
+            source_exact_video: policy_mode == MediaMode::StudioLossless,
+            lossless_audio: policy_mode == MediaMode::StudioLossless,
+        };
+        let ext =
+            PolicyEnvelope::request(route_id.clone(), policy, self.local_media_capabilities())
+                .into_ext(Value::Null);
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::Tune {
                 route_id,
-                max_edge,
-                bitrate,
-                fps,
-                game,
-                mode,
-                // No viewer-requested pipeline knob today; the seam is here
-                // for when one lands (backend-only, no wire change).
-                ext: serde_json::Value::Null,
+                max_edge: wire_tune.max_edge,
+                bitrate: wire_tune.bitrate,
+                fps: wire_tune.fps,
+                game: wire_tune.game,
+                mode: wire_tune.mode,
+                ext,
             }),
         )
         .await
@@ -11305,9 +12617,50 @@ impl Mesh {
         // same control channel on the ICE datapath as the report always
         // did — zeros for routes with no timed trains yet.
         let (est_kbps, delay_trend_us_per_s) = self.route_link_estimate(&route_id);
+        let audio_routes = {
+            let me = self.local_node_id().map(|id| pubkey_part(&id).to_string());
+            let peer_id = pubkey_part(&peer);
+            let st = self.state.lock();
+            st.session
+                .as_ref()
+                .map(|session| {
+                    session
+                        .active_routes()
+                        .filter(|active| {
+                            active.route.media == MediaKind::Audio
+                                && pubkey_part(active.peer.as_str()) == peer_id
+                                && me.as_deref().is_some_and(|local| {
+                                    pubkey_part(node_of(active.route.to.as_str()).as_str()) == local
+                                })
+                        })
+                        .map(|active| active.route.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let mut audio_arrival_jitter_us = 0;
+        let mut audio_target_ms = 0;
+        let mut audio_buffered_ms = 0;
+        let mut audio_underruns = 0u64;
+        let mut audio_underrun_frames = 0u64;
+        for audio_route in audio_routes {
+            if let Some(feedback) = self.audio.take_receive_feedback(&audio_route) {
+                audio_arrival_jitter_us = audio_arrival_jitter_us.max(feedback.arrival_jitter_us);
+                audio_target_ms = audio_target_ms.max(feedback.target_depth_ms);
+                audio_buffered_ms = audio_buffered_ms.max(feedback.buffered_depth_ms);
+                audio_underruns = audio_underruns.saturating_add(feedback.underrun_events);
+                audio_underrun_frames =
+                    audio_underrun_frames.saturating_add(feedback.underrun_frames);
+            }
+        }
         let ext = crate::video::PipelineFeedback {
             est_kbps,
             delay_trend_us_per_s,
+            audio_arrival_jitter_us,
+            audio_target_ms,
+            audio_buffered_ms,
+            audio_underruns,
+            audio_underrun_frames,
         }
         .to_ext();
         self.send_control(
@@ -12009,6 +13362,15 @@ fn mode_label(mode: VideoMode) -> &'static str {
     }
 }
 
+fn audio_profile_for_mode(mode: MediaMode) -> AudioProfile {
+    match mode {
+        MediaMode::Reach => AudioProfile::Reach,
+        MediaMode::Balanced => AudioProfile::Balanced,
+        MediaMode::Game => AudioProfile::Game,
+        MediaMode::Studio | MediaMode::StudioLossless => AudioProfile::Studio,
+    }
+}
+
 // ---- refresh round-trip backoff -------------------------------------------
 //
 // The per-node refresh asks a peer to re-announce its profile
@@ -12595,6 +13957,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jpeg_rate_gate_enforces_wire_rate_and_recovers_on_cap_change() {
+        let t0 = Instant::now();
+        let mut gate = JpegRateGate::default();
+        // 125 kB at 1 Mbps consumes exactly one second of the grant.
+        assert!(gate.admit(1_000_000, 125_000, t0));
+        assert!(!gate.admit(1_000_000, 125_000, t0 + Duration::from_millis(999)));
+        assert!(gate.admit(1_000_000, 125_000, t0 + Duration::from_secs(1)));
+
+        // A focus/cap increase must take effect now, not inherit the old
+        // route's future deadline (the bitrate analogue of sticky fetch_min).
+        assert!(gate.admit(8_000_000, 125_000, t0 + Duration::from_millis(1_001)));
+        assert!(!gate.admit(0, 1, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
     fn video_route_generation_fences_same_id_successors() {
         let mut generations = VideoRouteGenerations::default();
         let (first, replaced) = generations.begin("route:display");
@@ -13001,6 +14378,70 @@ mod tests {
         fn restart(&self) -> ! {
             unreachable!("test sink never restarts")
         }
+    }
+
+    #[derive(Default)]
+    struct VideoReadyCountingSink {
+        ready: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UiSink for VideoReadyCountingSink {
+        fn emit(&self, event: &str, _payload: Value) {
+            if event == "allmystuff://video-ready" {
+                self.ready.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn restart(&self) -> ! {
+            unreachable!("test sink never restarts")
+        }
+    }
+
+    #[test]
+    fn decoded_video_ready_events_coalesce_until_poll() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let sink = Arc::new(VideoReadyCountingSink::default());
+        let mesh = Mesh::new(client, sink.clone());
+        let route = "route:peer:screen→me:display:0";
+        mesh.video_watch(route.to_string(), true);
+
+        mesh.enqueue_decoded(route, vec![1, 2, 3], 1, 10);
+        assert_eq!(sink.ready.load(Ordering::Relaxed), 1);
+
+        // Freshest-wins replaces the queued picture but does not emit an
+        // event storm while the consumer already has one outstanding poke.
+        mesh.enqueue_decoded(route, vec![4, 5, 6], 2, 20);
+        assert_eq!(sink.ready.load(Ordering::Relaxed), 1);
+
+        assert!(!mesh.video_poll(route).is_empty());
+        mesh.enqueue_decoded(route, vec![7, 8, 9], 3, 30);
+        assert_eq!(sink.ready.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn non_av_local_media_keeps_the_single_general_ipc_class() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+
+        for tag in ["input", "term", "file", "site", "clip", "future"] {
+            assert_eq!(
+                mesh.classify_local_media(&json!({ "t": tag })),
+                LocalMediaClass::General,
+                "{tag} must not be rescheduled by the A/V isolation work"
+            );
+        }
+        assert_eq!(
+            mesh.classify_local_media(&json!({ "route": "audio" })),
+            LocalMediaClass::Audio
+        );
+        assert_eq!(
+            mesh.classify_local_media(&json!({ "t": "video" })),
+            LocalMediaClass::PriorityVideo
+        );
+        assert_eq!(
+            mesh.classify_local_media(&json!({ "t": "video", "route": "unknown" })),
+            LocalMediaClass::BackgroundVideo
+        );
     }
 
     /// Regression guard for the silent fleet-wide loss of remote control: a

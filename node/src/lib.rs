@@ -93,6 +93,10 @@ pub mod input_inject;
 /// dropdown's Experimental toggle flips, so every future field-trial
 /// feature reads `labs::on(Feature::X)` and needs no new GUI control.
 pub mod labs;
+/// Application-owned media policy exchanged only after a route is active.
+/// The protocol carries this as an opaque `Tune.ext` value; no discovery,
+/// signalling, ICE, STUN, or TURN contract knows its shape.
+pub mod media_policy;
 /// Hardware H.264 encode via Media Foundation — the GPU's own H.264 MFT
 /// (NVENC/QuickSync/AMD) on Windows, with no FFmpeg toolchain. Windows-only;
 /// the encoder ladder in [`video`] enumerates and frame-send-tests it, falling
@@ -121,6 +125,8 @@ pub mod nvenc;
 pub(crate) mod os_perf;
 pub mod ownership;
 pub(crate) mod persist;
+/// Opt-in, bounded, process-local development timing for the video pipeline.
+pub(crate) mod pipeline_profile;
 /// OS-level reboot of this machine — behind the gear menu's "Restart this
 /// device" and the fleet's `RestartDevice` command.
 pub mod reboot;

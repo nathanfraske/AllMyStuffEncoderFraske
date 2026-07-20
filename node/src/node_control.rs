@@ -49,7 +49,7 @@ use allmystuff_protocol::LOCAL_CLAIM_NETWORK_ID;
 use allmystuff_session::{FileEvent, InputAction, TermEvent};
 
 use crate::control_client::{ControlClient, Request};
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, VideoPollBatch};
 use crate::networks_store::DisabledNetworks;
 use crate::UiSink;
 
@@ -76,6 +76,18 @@ pub const TAG_RESTART: u8 = 3;
 /// frame while still bounding the damage.
 const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
 
+/// Diagnostic escape hatch for comparing the legacy contiguous video-poll
+/// response with the segmented zero-copy writer. This changes only local
+/// desktop IPC; it never affects peer media or signaling.
+static BUFFERED_VIDEO_POLL_IPC: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("ALLMYSTUFF_VIDEO_IPC_BUFFERED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+});
+
 /// Write one length-prefixed frame: `[u32 BE len][tag][payload]`, then flush.
 /// `len` counts the tag byte plus the payload, so an empty payload is `len 1`.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
@@ -87,6 +99,43 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(&[tag]).await?;
     w.write_all(payload).await?;
+    w.flush().await
+}
+
+/// Write a local video-poll response without coalescing its packet payloads
+/// into a second full-frame allocation. The bytes on the node socket are
+/// exactly the same as `write_frame(TAG_BYTES, buffered_batch)`: one outer
+/// big-endian frame length/tag followed by little-endian packet lengths and
+/// the original packet bytes.
+async fn write_video_batch_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    batch: &VideoPollBatch,
+) -> std::io::Result<()> {
+    let frame_len = batch
+        .encoded_len()
+        .checked_add(1)
+        .and_then(|len| u32::try_from(len).ok())
+        .filter(|len| (*len as usize) <= MAX_FRAME_LEN)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "video poll frame exceeds the local IPC size ceiling",
+            )
+        })?;
+    let mut header = [0u8; 5];
+    header[..4].copy_from_slice(&frame_len.to_be_bytes());
+    header[4] = TAG_BYTES;
+    w.write_all(&header).await?;
+    for packet in batch.packets() {
+        let packet_len = u32::try_from(packet.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "video packet exceeds the local IPC length field",
+            )
+        })?;
+        w.write_all(&packet_len.to_le_bytes()).await?;
+        w.write_all(packet).await?;
+    }
     w.flush().await
 }
 
@@ -238,11 +287,13 @@ impl SocketAddr {
 
 /// Client of a running node's control socket. The GUI uses this in Phase B to
 /// drive the node it no longer runs in-process; the tests use it to exercise
-/// [`serve`]. Cheap to clone the address; every call opens its own connection
-/// (a local round trip is cheap and pooling muddies node-restart semantics —
-/// same reasoning as [`ControlClient`](crate::control_client::ControlClient)).
+/// [`serve`]. Ordinary commands use short-lived connections so a node restart
+/// is observed immediately. High-frequency desktop video polls reuse one
+/// reconnectable connection: repeatedly creating and destroying Windows local
+/// pipe handles at display cadence proved unsafe under 20 MiB RGBA frames.
 pub struct NodeClient {
     addr: SocketAddr,
+    video_poll: Mutex<Option<LocalSocketStream>>,
 }
 
 impl NodeClient {
@@ -250,6 +301,7 @@ impl NodeClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
             addr: node_socket_addr()?,
+            video_poll: Mutex::new(None),
         })
     }
 
@@ -279,7 +331,11 @@ impl NodeClient {
     /// One-shot command → raw bytes (the poll commands). Same as
     /// [`NodeClient::request`] but expects a [`TAG_BYTES`] response.
     pub async fn request_bytes(&self, cmd: &str, args: Value) -> Result<Vec<u8>> {
-        let (tag, payload) = self.round_trip(cmd, args).await?;
+        let (tag, payload) = if cmd == "video_poll" {
+            self.video_poll_round_trip(args).await?
+        } else {
+            self.round_trip(cmd, args).await?
+        };
         match tag {
             TAG_BYTES => Ok(payload),
             // A failed poll still comes back as a JSON error frame.
@@ -296,16 +352,44 @@ impl NodeClient {
 
     /// Connect, send the request, read exactly one response frame, close.
     async fn round_trip(&self, cmd: &str, args: Value) -> Result<(u8, Vec<u8>)> {
-        let stream = self.connect().await?;
-        let (mut reader, mut writer) = stream.split();
+        let mut stream = self.connect().await?;
+        Self::exchange(&mut stream, cmd, args).await
+    }
+
+    /// Reuse one strictly serialized local connection for the display-cadence
+    /// video drain. Any read/write failure retires it; the next tick connects
+    /// to whichever node process is current.
+    async fn video_poll_round_trip(&self, args: Value) -> Result<(u8, Vec<u8>)> {
+        let mut slot = self.video_poll.lock().await;
+        if slot.is_none() {
+            *slot = Some(self.connect().await?);
+        }
+        let result = Self::exchange(
+            slot.as_mut().expect("video poll connection initialized"),
+            "video_poll",
+            args,
+        )
+        .await;
+        if result.is_err() {
+            // A poll drains a lossy viewer queue. Never replay it after an
+            // ambiguous partial response; the normal next tick reconnects.
+            slot.take();
+        }
+        result
+    }
+
+    async fn exchange<S>(stream: &mut S, cmd: &str, args: Value) -> Result<(u8, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let body = serde_json::to_vec(&NodeRequest {
             cmd: cmd.to_string(),
             args,
         })?;
-        write_frame(&mut writer, TAG_JSON, &body)
+        write_frame(stream, TAG_JSON, &body)
             .await
             .context("write node request")?;
-        read_frame(&mut reader)
+        read_frame(stream)
             .await
             .context("read node response")?
             .ok_or_else(|| anyhow!("node closed the connection without a response"))
@@ -315,18 +399,17 @@ impl NodeClient {
     /// sentinel, await the ack, then spawn a read loop forwarding each
     /// [`NodeEvent`] to `tx` until EOF. Returns once the ack lands.
     pub async fn subscribe_events(&self, tx: mpsc::Sender<NodeEvent>) -> Result<()> {
-        let stream = self.connect().await?;
-        let (mut reader, mut writer) = stream.split();
+        let mut stream = self.connect().await?;
         let body = serde_json::to_vec(&NodeRequest {
             cmd: SUBSCRIBE_EVENTS.to_string(),
             args: Value::Null,
         })?;
-        write_frame(&mut writer, TAG_JSON, &body)
+        write_frame(&mut stream, TAG_JSON, &body)
             .await
             .context("write node subscribe")?;
 
         // The ack — a TAG_JSON `{ok:true}` — confirms we're registered.
-        let (tag, payload) = read_frame(&mut reader)
+        let (tag, payload) = read_frame(&mut stream)
             .await
             .context("read subscribe ack")?
             .ok_or_else(|| anyhow!("node closed the connection before the subscribe ack"))?;
@@ -342,10 +425,8 @@ impl NodeClient {
         }
 
         tokio::spawn(async move {
-            // Keep the writer half alive for the read loop's lifetime.
-            let _writer_keepalive = writer;
             loop {
-                match read_frame(&mut reader).await {
+                match read_frame(&mut stream).await {
                     Ok(Some((TAG_EVENT, body))) => {
                         match serde_json::from_slice::<NodeEvent>(&body) {
                             Ok(ev) => {
@@ -603,8 +684,9 @@ pub async fn serve(
     }
 }
 
-/// Serve one connection: read its first [`NodeRequest`], then either run the
-/// event-writer loop (subscribe) or dispatch one command and reply.
+/// Serve one connection: subscriptions switch to the event-writer loop;
+/// desktop video polls may repeat on a persistent connection; other commands
+/// retain the legacy one-request/one-response lifetime.
 async fn handle_connection(
     stream: LocalSocketStream,
     mesh: Arc<Mesh>,
@@ -613,34 +695,81 @@ async fn handle_connection(
     broadcaster: Broadcaster,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.split();
-    let Some((tag, body)) = read_frame(&mut reader).await? else {
-        // Clean hangup before sending anything — nothing to do.
+    loop {
+        let Some((tag, body)) = read_frame(&mut reader).await? else {
+            // Clean hangup at a request boundary.
+            return Ok(());
+        };
+        if tag != TAG_JSON {
+            bail!("node frame wasn't a JSON request (tag {tag})");
+        }
+        let req: NodeRequest = serde_json::from_slice(&body).context("parse node request")?;
+
+        if req.cmd == SUBSCRIBE_EVENTS {
+            return run_event_writer(writer, broadcaster).await;
+        }
+
+        // Desktop `video_poll` is local GUI/backend IPC, not mesh signalling.
+        // Stream its existing packet framing directly so a 14 MiB decoded frame
+        // is not copied into a second contiguous batch. `dispatch` keeps the
+        // buffered form for in-process/mobile callers, preserving that public API.
+        if req.cmd == "video_poll" {
+            let route_id: String = match arg(&req.args, "route_id") {
+                Ok(route_id) => route_id,
+                Err(e) => {
+                    let body = serde_json::to_vec(&WireResponse::err(e))?;
+                    write_frame(&mut writer, TAG_JSON, &body).await?;
+                    continue;
+                }
+            };
+            if *BUFFERED_VIDEO_POLL_IPC {
+                let batch = mesh.video_poll(&route_id);
+                let started = (!batch.is_empty())
+                    .then(crate::pipeline_profile::stamp)
+                    .flatten();
+                let result = write_frame(&mut writer, TAG_BYTES, &batch).await;
+                crate::pipeline_profile::record_since(
+                    &route_id,
+                    0,
+                    None,
+                    crate::pipeline_profile::Stage::ViewerIpcWrite,
+                    started,
+                );
+                result?;
+                continue;
+            }
+            let batch = mesh.video_poll_batch(&route_id);
+            let started = (!batch.is_empty())
+                .then(crate::pipeline_profile::stamp)
+                .flatten();
+            let result = write_video_batch_frame(&mut writer, &batch).await;
+            crate::pipeline_profile::record_since(
+                &route_id,
+                0,
+                None,
+                crate::pipeline_profile::Stage::ViewerIpcWrite,
+                started,
+            );
+            result?;
+            continue;
+        }
+
+        let out = dispatch(&mesh, &client, &disabled, req).await;
+        match out {
+            DispatchOut::Json(v) => {
+                let body = serde_json::to_vec(&WireResponse::ok(v))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+            }
+            DispatchOut::Bytes(b) => {
+                write_frame(&mut writer, TAG_BYTES, &b).await?;
+            }
+            DispatchOut::Err(e) => {
+                let body = serde_json::to_vec(&WireResponse::err(e))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+            }
+        }
         return Ok(());
-    };
-    if tag != TAG_JSON {
-        bail!("first node frame wasn't a JSON request (tag {tag})");
     }
-    let req: NodeRequest = serde_json::from_slice(&body).context("parse node request")?;
-
-    if req.cmd == SUBSCRIBE_EVENTS {
-        return run_event_writer(writer, broadcaster).await;
-    }
-
-    let out = dispatch(&mesh, &client, &disabled, req).await;
-    match out {
-        DispatchOut::Json(v) => {
-            let body = serde_json::to_vec(&WireResponse::ok(v))?;
-            write_frame(&mut writer, TAG_JSON, &body).await?;
-        }
-        DispatchOut::Bytes(b) => {
-            write_frame(&mut writer, TAG_BYTES, &b).await?;
-        }
-        DispatchOut::Err(e) => {
-            let body = serde_json::to_vec(&WireResponse::err(e))?;
-            write_frame(&mut writer, TAG_JSON, &body).await?;
-        }
-    }
-    Ok(())
 }
 
 /// Register this connection in the broadcaster, ack, then drain its receiver
@@ -992,14 +1121,18 @@ pub async fn dispatch(
             let fps: Option<u32> = try_arg!(opt(a, "fps"));
             let game: Option<bool> = try_arg!(opt(a, "game"));
             let mode: Option<String> = try_arg!(opt(a, "mode"));
+            let peer_cap_bps: Option<u64> = try_arg!(opt(a, "peer_cap_bps"));
+            let priority: Option<bool> = try_arg!(opt(a, "priority"));
             json_result(
-                mesh.request_tune(
+                mesh.request_policy_tune(
                     route_id,
                     max_edge,
                     bitrate,
                     fps,
                     game.unwrap_or(false),
                     mode,
+                    peer_cap_bps,
+                    priority.unwrap_or(false),
                 )
                 .await,
             )
@@ -1022,6 +1155,16 @@ pub async fn dispatch(
                     "edgeCap": d.edge_cap,
                     "outW": d.out_w,
                     "outH": d.out_h,
+                    "peerBudgetBps": d.peer_budget_bps,
+                    "routeBudgetBps": d.route_budget_bps,
+                    "routeCeilingBps": d.route_ceiling_bps,
+                    "priority": d.priority,
+                    "audioPacketMs": d.audio_packet_ms,
+                    "audioJitterMs": d.audio_jitter_ms,
+                    "audioFec": d.audio_fec,
+                    "videoQueueDepth": d.video_queue_depth,
+                    "audioQueueDepth": d.audio_queue_depth,
+                    "degradationReasons": d.degradation_reasons,
                 })),
                 None => DispatchOut::Json(Value::Null),
             }
@@ -2139,6 +2282,69 @@ mod tests {
     async fn frame_round_trip_empty_and_bytes() {
         round_trip(TAG_BYTES, Vec::new()).await;
         round_trip(TAG_BYTES, vec![0, 1, 2, 3, 255, 254]).await;
+    }
+
+    #[tokio::test]
+    async fn client_exchange_reuses_one_stream_for_video_polls() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let responder = tokio::spawn(async move {
+            for expected_route in ["route-a", "route-b"] {
+                let (tag, body) = read_frame(&mut server).await.unwrap().expect("request");
+                assert_eq!(tag, TAG_JSON);
+                let request: NodeRequest = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.cmd, "video_poll");
+                assert_eq!(request.args["route_id"], expected_route);
+                write_frame(&mut server, TAG_BYTES, expected_route.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for route in ["route-a", "route-b"] {
+            let (tag, payload) =
+                NodeClient::exchange(&mut client, "video_poll", json!({ "route_id": route }))
+                    .await
+                    .unwrap();
+            assert_eq!(tag, TAG_BYTES);
+            assert_eq!(payload, route.as_bytes());
+        }
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn segmented_video_batch_is_byte_for_byte_compatible() {
+        async fn write_raw(packets: Vec<Vec<u8>>) -> Vec<u8> {
+            let batch = VideoPollBatch::from_test_packets(packets);
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            let task = tokio::spawn(async move {
+                write_video_batch_frame(&mut writer, &batch).await.unwrap();
+            });
+            let mut raw = Vec::new();
+            reader.read_to_end(&mut raw).await.unwrap();
+            task.await.unwrap();
+            raw
+        }
+
+        fn expected_raw(packets: &[Vec<u8>]) -> Vec<u8> {
+            let payload_len: usize = packets.iter().map(|packet| 4 + packet.len()).sum();
+            let mut raw = Vec::with_capacity(5 + payload_len);
+            raw.extend_from_slice(&((payload_len as u32) + 1).to_be_bytes());
+            raw.push(TAG_BYTES);
+            for packet in packets {
+                raw.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                raw.extend_from_slice(packet);
+            }
+            raw
+        }
+
+        let packets = vec![vec![0, 1, 2], Vec::new(), vec![255, 4]];
+        assert_eq!(write_raw(packets.clone()).await, expected_raw(&packets));
+        assert_eq!(write_raw(Vec::new()).await, expected_raw(&[]));
+
+        // Larger than the duplex capacity so the writer must handle partial
+        // writes and local-socket backpressure without changing one byte.
+        let large = vec![(0..200_000u32).map(|i| (i % 251) as u8).collect()];
+        assert_eq!(write_raw(large.clone()).await, expected_raw(&large));
     }
 
     #[tokio::test]

@@ -136,18 +136,16 @@ fn monitors_line() -> String {
     format!("monitors: {}", parts.join(" · "))
 }
 
-/// Whether the sampler should run. A field/prototype build carries the
-/// `field-telemetry` feature and defaults ON (unless `ALLMYSTUFF_TELEMETRY`
-/// is explicitly off); a stamped PROD build compiles without the feature
-/// and defaults OFF, so a released binary is silent unless an operator sets
-/// `ALLMYSTUFF_TELEMETRY=1` for on-demand debugging. The env dial always
-/// wins over the build stamp in both directions.
+/// Whether the sampler should run. Instrumentation may be compiled into a
+/// field build, but collection is always runtime opt-in. The feature controls
+/// availability only; it is never consent.
 fn telemetry_enabled() -> bool {
-    match std::env::var("ALLMYSTUFF_TELEMETRY") {
-        Ok(v) if matches!(v.trim(), "0" | "off" | "false") => false,
-        Ok(_) => true, // any explicit non-off value opts in, any build
-        Err(_) => cfg!(feature = "field-telemetry"), // unset → the build stamp decides
-    }
+    std::env::var("ALLMYSTUFF_TELEMETRY").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        )
+    })
 }
 
 /// Start the sampler; returns quietly if disabled or unavailable.

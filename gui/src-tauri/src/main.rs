@@ -515,12 +515,14 @@ async fn tune_route(
     fps: Option<u32>,
     game: Option<bool>,
     mode: Option<String>,
+    peer_cap_bps: Option<u64>,
+    priority: Option<bool>,
 ) -> Result<(), String> {
     state
         .node
         .request(
             "tune_route",
-            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps, "game": game, "mode": mode }),
+            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps, "game": game, "mode": mode, "peer_cap_bps": peer_cap_bps, "priority": priority }),
         )
         .await
         .map_err(|e| e.to_string())?;
