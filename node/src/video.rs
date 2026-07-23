@@ -677,7 +677,8 @@ impl Tune {
     }
 
     fn fps(&self) -> u32 {
-        self.fps
+        let requested = self
+            .fps
             .unwrap_or_else(|| match self.posture() {
                 Posture::Reach => {
                     if self.link == LinkClass::Lan {
@@ -688,7 +689,16 @@ impl Tune {
                 }
                 _ => target_fps_for(self.link, self.game()),
             })
-            .clamp(1, 240)
+            .clamp(1, 240);
+        // Until the WAN transport has closed-loop pacing/BWE, explicit 90/120/
+        // 144 fps asks can outrun the receiver in bursts and turn cadence into
+        // queue delay. Preserve every explicit LAN choice, but cap unknown/WAN
+        // paths at Game's reviewed 60 fps ceiling.
+        if self.link == LinkClass::Lan {
+            requested
+        } else {
+            requested.min(60)
+        }
     }
     fn h264_edge(&self) -> u32 {
         self.max_edge
@@ -721,6 +731,45 @@ impl Tune {
     /// neutral [`JPEG_QUALITY`] default.
     fn jpeg_quality(&self) -> u8 {
         self.bitrate.map_or(JPEG_QUALITY, mjpeg_quality_for)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkPolicyPlan {
+    NoChange,
+    UpdateInPlace(Tune),
+    Restart(Tune),
+}
+
+/// Compose the link classification and allocator result before deciding
+/// whether capture must restart. Unknown and WAN have identical automatic
+/// media settings. A fully pinned route is also capture-equivalent across a
+/// link change when its effective cadence stays unchanged. Both cases still
+/// publish the new class so the media pacer sees the current path.
+fn plan_link_policy(
+    tune: Tune,
+    link: LinkClass,
+    policy_cap_bps: Option<u32>,
+    policy_auto_resolution: bool,
+) -> LinkPolicyPlan {
+    let next = Tune {
+        link,
+        policy_cap_bps,
+        policy_auto_resolution,
+        ..tune
+    };
+    if next == tune {
+        return LinkPolicyPlan::NoChange;
+    }
+
+    let link_changed = tune.link != link;
+    let off_lan_equivalent = link_changed && tune.link != LinkClass::Lan && link != LinkClass::Lan;
+    let pinned_equivalent =
+        link_changed && tune.fps.is_some() && tune.bitrate.is_some() && tune.fps() == next.fps();
+    if !link_changed || off_lan_equivalent || pinned_equivalent {
+        LinkPolicyPlan::UpdateInPlace(next)
+    } else {
+        LinkPolicyPlan::Restart(next)
     }
 }
 
@@ -769,6 +818,71 @@ impl StatusReporter {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RoutePolicy {
+    cap_bps: Option<u32>,
+    auto_resolution: bool,
+}
+
+impl RoutePolicy {
+    fn from_tune(tune: Tune) -> Self {
+        Self {
+            cap_bps: tune.policy_cap_bps,
+            auto_resolution: tune.policy_auto_resolution,
+        }
+    }
+
+    fn apply(self, tune: Tune) -> Tune {
+        Tune {
+            policy_cap_bps: self.cap_bps,
+            policy_auto_resolution: self.auto_resolution,
+            ..tune
+        }
+    }
+}
+
+struct RouteRateState {
+    /// Present only while a lossy encoder has a live bitrate controller.
+    rate: Option<Arc<RouteRate>>,
+    /// Exists for the whole capture generation, including lossless and
+    /// encoder bring-up gaps where no rate controller is published.
+    policy: RoutePolicy,
+}
+
+impl RouteRateState {
+    fn new(tune: Tune) -> Self {
+        Self {
+            rate: None,
+            policy: RoutePolicy::from_tune(tune),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rate(tune: Tune, rate: Arc<RouteRate>) -> Self {
+        Self {
+            rate: Some(rate),
+            policy: RoutePolicy::from_tune(tune),
+        }
+    }
+}
+
+type RouteRateSlot = Arc<Mutex<RouteRateState>>;
+
+fn publish_route_rate(
+    route_id: &str,
+    rate: Arc<RouteRate>,
+    route_slot: &RouteRateSlot,
+    tune: Tune,
+) -> Tune {
+    let mut rates = route_rates().lock();
+    let mut slot = route_slot.lock();
+    let effective_tune = slot.policy.apply(tune);
+    rate.update_policy(effective_tune);
+    rates.insert(route_id.to_string(), rate.clone());
+    slot.rate = Some(rate);
+    effective_tune
+}
+
 struct RouteVideo {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -793,6 +907,9 @@ struct RouteVideo {
     /// The receiver-driven resolution cap (see [`AutoAdapt`]); fresh per
     /// capture, so a manual retune resets it.
     auto: Arc<AutoAdapt>,
+    /// Generation-local encoder rate seam. Unlike the route-id global used by
+    /// the pacer, this slot cannot resolve to a retiring predecessor.
+    rate: RouteRateSlot,
 }
 
 impl Drop for RouteVideo {
@@ -1098,9 +1215,63 @@ impl Drop for CaptureWorkerRegistration {
     }
 }
 
+fn acquire_capture_serial(
+    serial: &Mutex<()>,
+    wait: Duration,
+) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    serial.try_lock_for(wait)
+}
+
 impl VideoBridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_policy_test_route(&self, route_id: &str, tune: Tune) {
+        let rate = Arc::new(RouteRate::new(tune, 1920, 1080, tune.fps()));
+        route_rates()
+            .lock()
+            .insert(route_id.to_string(), rate.clone());
+        self.routes.lock().insert(
+            route_id.to_string(),
+            RouteVideo {
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: None,
+                generation: Arc::new(()),
+                mode: VideoMode::H264,
+                source: VideoSource::Screen(None),
+                on_packet: Arc::new(|_| true),
+                on_status: Arc::new(|_, _| {}),
+                refresh: Arc::new(AtomicBool::new(false)),
+                idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+                tune,
+                auto: AutoAdapt::new(),
+                rate: Arc::new(Mutex::new(RouteRateState::with_rate(tune, rate))),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_test_snapshot(&self, route_id: &str) -> Option<(Tune, Option<u32>, u32)> {
+        let routes = self.routes.lock();
+        let route = routes.get(route_id)?;
+        let state = route.rate.lock();
+        Some((
+            route.tune,
+            state.rate.as_ref().and_then(|rate| rate.policy_cap()),
+            state
+                .rate
+                .as_ref()
+                .map(|rate| rate.target.load(Ordering::Relaxed))
+                .unwrap_or(0),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_policy_test_route(&self, route_id: &str) {
+        self.stop(route_id);
+        route_rates().lock().remove(route_id);
     }
 
     /// Begin streaming `source` for `route_id`, encoding for `mode` — a
@@ -1163,6 +1334,13 @@ impl VideoBridge {
         self.routes.lock().keys().cloned().collect()
     }
 
+    fn current_route_rate(&self, route_id: &str) -> Option<Arc<RouteRate>> {
+        let routes = self.routes.lock();
+        let route = routes.get(route_id)?;
+        let rate = route.rate.lock().rate.clone();
+        rate
+    }
+
     /// A viewer's Tune (the console pills/slider): the dials change, the
     /// link class the gate learned stays — a viewer retune must not
     /// quietly reset a LAN stream to the conservative Unknown dials.
@@ -1178,32 +1356,55 @@ impl VideoBridge {
         policy_cap_bps: Option<u32>,
         policy_auto_resolution: bool,
     ) {
-        let current = self.routes.lock().get(route_id).map(|r| r.tune);
-        let link = current.map(|t| t.link).unwrap_or_default();
         let parsed_mode = mode.and_then(parse_posture);
-        if current.is_some_and(|t| {
-            t.max_edge == max_edge
-                && t.bitrate == bitrate
-                && t.fps == fps
-                && t.game == game
-                && t.mode == parsed_mode
-        }) {
-            self.apply_policy_cap(route_id, policy_cap_bps, policy_auto_resolution);
-            return;
-        }
-        self.retune(
-            route_id,
-            Tune {
+        loop {
+            let current = self
+                .routes
+                .lock()
+                .get(route_id)
+                .map(|route| (route.tune, route.generation.clone()));
+            let Some((current, generation)) = current else {
+                return;
+            };
+            if current.max_edge == max_edge
+                && current.bitrate == bitrate
+                && current.fps == fps
+                && current.game == game
+                && current.mode == parsed_mode
+            {
+                self.apply_policy_cap(route_id, policy_cap_bps, policy_auto_resolution);
+                return;
+            }
+            let tune = Tune {
                 max_edge,
                 bitrate,
                 fps,
-                link,
+                link: current.link,
                 game,
                 mode: parsed_mode,
                 policy_cap_bps,
                 policy_auto_resolution,
-            },
-        );
+            };
+            if self.restart_route_generation(route_id, &generation, tune) {
+                let posture = match tune.posture() {
+                    Posture::Reach => "reach",
+                    Posture::Balanced => "balanced",
+                    Posture::Game => "game",
+                    Posture::Studio => "studio",
+                    Posture::StudioLossless => "studio-lossless",
+                };
+                tracing::info!(
+                    "route {route_id} retuned: posture {posture} · edge {} · bitrate {} · fps {}",
+                    tune.max_edge.map_or("auto".into(), |v| v.to_string()),
+                    tune.bitrate
+                        .map_or("auto".into(), |v| format!("{:.1} Mbps", v as f64 / 1e6)),
+                    tune.fps.map_or("auto".into(), |v| v.to_string()),
+                );
+                return;
+            }
+            // A simultaneous link-policy restart installed a successor. Read
+            // its learned class and retry instead of restoring a stale class.
+        }
     }
 
     /// Apply an allocator-only change without disturbing a proven-good route
@@ -1216,106 +1417,250 @@ impl VideoBridge {
         policy_cap_bps: Option<u32>,
         policy_auto_resolution: bool,
     ) {
-        let current = {
-            let routes = self.routes.lock();
-            routes.get(route_id).map(|r| (r.tune, r.mode))
-        };
-        let Some((mut tune, transport)) = current else {
-            return;
-        };
-        if tune.policy_cap_bps == policy_cap_bps
-            && tune.policy_auto_resolution == policy_auto_resolution
-        {
-            return;
+        enum Apply {
+            Updated(RateUpdate),
+            Stored(VideoMode),
+            Restart(Arc<()>, Tune),
         }
-        tune.policy_cap_bps = policy_cap_bps;
-        tune.policy_auto_resolution = policy_auto_resolution;
 
-        let live_rate = route_rates().lock().get(route_id).cloned();
-        if let Some(rate) = live_rate {
-            let update = rate.update_policy(tune);
-            if let Some(route) = self.routes.lock().get_mut(route_id) {
-                route.tune = tune;
+        loop {
+            let action = {
+                let mut routes = self.routes.lock();
+                let Some(route) = routes.get_mut(route_id) else {
+                    return;
+                };
+                if route.tune.policy_cap_bps == policy_cap_bps
+                    && route.tune.policy_auto_resolution == policy_auto_resolution
+                {
+                    return;
+                }
+                let tune = Tune {
+                    policy_cap_bps,
+                    policy_auto_resolution,
+                    ..route.tune
+                };
+
+                let mut live_rate = route.rate.lock();
+                live_rate.policy = RoutePolicy::from_tune(tune);
+                if let Some(rate) = live_rate.rate.as_ref() {
+                    let update = rate.update_policy(tune);
+                    route.tune = tune;
+                    drop(live_rate);
+                    Apply::Updated(update)
+                } else {
+                    drop(live_rate);
+                    // MJPEG and an actually-lossless const-QP lane have no
+                    // encoder rate controller. Restarting capture would not
+                    // make the cap real, so keep the monitor session intact;
+                    // the downstream per-route gate remains authoritative.
+                    let encoder_is_mjpeg = route_live()
+                        .lock()
+                        .get(route_id)
+                        .is_some_and(|live| live.codec.load(Ordering::Relaxed) == 2);
+                    if route.mode == VideoMode::Mjpeg
+                        || encoder_is_mjpeg
+                        || tune.posture() == Posture::StudioLossless
+                    {
+                        route.tune = tune;
+                        Apply::Stored(if encoder_is_mjpeg {
+                            VideoMode::Mjpeg
+                        } else {
+                            route.mode
+                        })
+                    } else {
+                        Apply::Restart(route.generation.clone(), tune)
+                    }
+                }
+            };
+
+            match action {
+                Apply::Updated(update) => {
+                    tracing::info!(
+                        "video policy {route_id}: ceiling {:.2} → {:.2} Mbps · target {:.2} → {:.2} Mbps (encoder/capture kept)",
+                        update.old_ceiling as f64 / 1e6,
+                        update.new_ceiling as f64 / 1e6,
+                        update.old_target as f64 / 1e6,
+                        update.new_target as f64 / 1e6,
+                    );
+                    return;
+                }
+                Apply::Stored(transport) => {
+                    tracing::warn!(
+                        "video policy {route_id}: {transport:?} has no encoder bitrate control; capture kept, downstream route budget gate must enforce cap {}",
+                        policy_cap_bps
+                            .map(|bps| format!("{:.2} Mbps", bps as f64 / 1e6))
+                            .unwrap_or_else(|| "auto".to_string()),
+                    );
+                    return;
+                }
+                Apply::Restart(generation, tune) => {
+                    // A lossy H.264 route normally registers its rate seam as
+                    // soon as the encoder opens. If a cap lands during
+                    // bring-up, restart the exact generation. A simultaneous
+                    // GUI retune wins its own generation and makes us retry
+                    // against the successor instead of overwriting its dials.
+                    tracing::warn!(
+                        "video policy {route_id}: H.264 live-rate seam unavailable during cap change; rebuilding the route once (capture/encoder restart)"
+                    );
+                    if self.restart_route_generation(route_id, &generation, tune) {
+                        return;
+                    }
+                }
             }
-            tracing::info!(
-                "video policy {route_id}: ceiling {:.2} → {:.2} Mbps · target {:.2} → {:.2} Mbps (encoder/capture kept)",
-                update.old_ceiling as f64 / 1e6,
-                update.new_ceiling as f64 / 1e6,
-                update.old_target as f64 / 1e6,
-                update.new_target as f64 / 1e6,
-            );
-            return;
         }
+    }
 
-        // MJPEG and an actually-lossless const-QP lane have no encoder rate
-        // controller. Restarting capture would not make the cap real, so keep
-        // the monitor session intact and state the boundary plainly; the
-        // downstream per-route budget gate is the enforcement point.
-        let encoder_is_mjpeg = route_live()
+    /// Re-class a live route's link after the LAN gate learns the truth.
+    ///
+    /// Kept as a compatibility wrapper for callers that do not own allocator
+    /// policy. The mesh's link refresh must use [`Self::retune_link_policy`]
+    /// so the successor never starts with a cap from the preceding policy
+    /// generation.
+    pub fn retune_link(&self, route_id: &str, link: LinkClass) -> bool {
+        let policy = self
+            .routes
             .lock()
             .get(route_id)
-            .is_some_and(|live| live.codec.load(Ordering::Relaxed) == 2);
-        if transport == VideoMode::Mjpeg
-            || encoder_is_mjpeg
-            || tune.posture() == Posture::StudioLossless
-        {
-            if let Some(route) = self.routes.lock().get_mut(route_id) {
-                route.tune = tune;
+            .map(|route| (route.tune.policy_cap_bps, route.tune.policy_auto_resolution));
+        let Some((policy_cap_bps, policy_auto_resolution)) = policy else {
+            return false;
+        };
+        self.retune_link_policy(route_id, link, policy_cap_bps, policy_auto_resolution)
+    }
+
+    /// Apply one media-policy generation to a live route. Link class and
+    /// allocator cap are composed first, then either installed in place when
+    /// media settings are equivalent or used to create exactly one successor.
+    ///
+    /// Returns `true` only when capture was restarted.
+    pub fn retune_link_policy(
+        &self,
+        route_id: &str,
+        link: LinkClass,
+        policy_cap_bps: Option<u32>,
+        policy_auto_resolution: bool,
+    ) -> bool {
+        loop {
+            let current = {
+                let routes = self.routes.lock();
+                routes
+                    .get(route_id)
+                    .map(|route| (route.tune, route.mode, route.generation.clone()))
+            };
+            let Some((old_tune, transport, generation)) = current else {
+                return false;
+            };
+
+            let plan = plan_link_policy(old_tune, link, policy_cap_bps, policy_auto_resolution);
+            let next = match plan {
+                LinkPolicyPlan::NoChange => return false,
+                LinkPolicyPlan::UpdateInPlace(next) | LinkPolicyPlan::Restart(next) => next,
+            };
+            let policy_changed = old_tune.policy_cap_bps != policy_cap_bps
+                || old_tune.policy_auto_resolution != policy_auto_resolution;
+
+            if matches!(plan, LinkPolicyPlan::UpdateInPlace(_)) {
+                // Hold the route generation stable while selecting and
+                // updating its generation-local rate cell.
+                let mut routes = self.routes.lock();
+                let Some(route) = routes.get_mut(route_id) else {
+                    return false;
+                };
+                if !Arc::ptr_eq(&route.generation, &generation) {
+                    continue;
+                }
+                let mut live_rate = route.rate.lock();
+                live_rate.policy = RoutePolicy::from_tune(next);
+                if let Some(rate) = live_rate.rate.as_ref() {
+                    let update = rate.update_policy(next);
+                    route.tune = next;
+                    drop(live_rate);
+                    drop(routes);
+                    tracing::info!(
+                        "video relink {route_id}: {:?} to {:?} in place, fps {} to {} and ceiling {:.2} to {:.2} Mbps",
+                        old_tune.link,
+                        link,
+                        old_tune.fps(),
+                        next.fps(),
+                        update.old_ceiling as f64 / 1e6,
+                        update.new_ceiling as f64 / 1e6,
+                    );
+                    return false;
+                }
+                drop(live_rate);
+
+                let encoder_is_mjpeg = route_live()
+                    .lock()
+                    .get(route_id)
+                    .is_some_and(|live| live.codec.load(Ordering::Relaxed) == 2);
+                if !policy_changed
+                    || transport == VideoMode::Mjpeg
+                    || encoder_is_mjpeg
+                    || next.posture() == Posture::StudioLossless
+                {
+                    route.tune = next;
+                    drop(routes);
+                    tracing::info!(
+                        "video relink {route_id}: {:?} to {:?} is media-equivalent, keeping capture at {} fps",
+                        old_tune.link,
+                        link,
+                        next.fps(),
+                    );
+                    return false;
+                }
+                drop(routes);
             }
-            tracing::warn!(
-                "video policy {route_id}: {:?} has no encoder bitrate control; capture kept, downstream route budget gate must enforce cap {}",
-                if encoder_is_mjpeg {
-                    VideoMode::Mjpeg
-                } else {
-                    transport
-                },
+
+            tracing::info!(
+                "video relink {route_id}: {:?} to {:?}, fps cap {} to {}, restarting once with policy cap {}",
+                old_tune.link,
+                link,
+                old_tune.fps(),
+                next.fps(),
                 policy_cap_bps
                     .map(|bps| format!("{:.2} Mbps", bps as f64 / 1e6))
                     .unwrap_or_else(|| "auto".to_string()),
             );
-            return;
+            if self.restart_route_generation(route_id, &generation, next) {
+                return true;
+            }
+            // A concurrent GUI retune installed a successor. Recompute the
+            // effective plan against that generation so the learned class and
+            // allocator cap cannot be lost.
         }
-
-        // A lossy H.264 route normally registers its rate seam as soon as the
-        // encoder opens. If a cap lands during bring-up (or on a backend that
-        // could not expose the seam), rebuild once to make the cap effective.
-        // This is intentionally the exceptional path and is named in logs so
-        // diagnostics never call it an in-place retune.
-        tracing::warn!(
-            "video policy {route_id}: H.264 live-rate seam unavailable during cap change; rebuilding the route once (capture/encoder restart)"
-        );
-        self.retune(route_id, tune);
     }
 
-    /// Re-class a live route's link (the LAN gate learning the truth after
-    /// the stream started): respawns the capture only when the class
-    /// actually changed AND no viewer dial pins the affected knobs — a
-    /// restart costs one IDR hiccup, so a no-op reclassification must cost
-    /// nothing. Returns whether a retune happened.
-    pub fn retune_link(&self, route_id: &str, link: LinkClass) -> bool {
-        let current = { self.routes.lock().get(route_id).map(|r| r.tune) };
-        let Some(t) = current else { return false };
-        if t.link == link {
-            return false;
-        }
-        // With BOTH automatic dials pinned by the viewer, the class change
-        // can't alter the stream — skip the restart entirely.
-        if t.fps.is_some() && t.bitrate.is_some() {
-            return false;
-        }
-        // Instrumented: a capped stream's whole story is often this line — a
-        // CEC dial that never leaves Unknown/Wan stays at the 30fps cap, while
-        // a direct LAN dial flips to Lan and unlocks 60. Posted logs then show
-        // exactly which happened on each path.
-        let new_t = Tune { link, ..t };
-        tracing::info!(
-            "video relink {route_id}: {:?} → {:?} · fps cap {} → {}",
-            t.link,
-            link,
-            t.fps(),
-            new_t.fps(),
+    fn restart_route_generation(
+        &self,
+        route_id: &str,
+        expected_generation: &Arc<()>,
+        tune: Tune,
+    ) -> bool {
+        let old = {
+            let mut routes = self.routes.lock();
+            if !routes
+                .get(route_id)
+                .is_some_and(|route| Arc::ptr_eq(&route.generation, expected_generation))
+            {
+                return false;
+            }
+            routes.remove(route_id).expect("generation checked above")
+        };
+        let (mode, source, on_packet, on_status) = (
+            old.mode,
+            old.source.clone(),
+            old.on_packet.clone(),
+            old.on_status.clone(),
         );
-        self.retune(route_id, new_t);
+        drop(old);
+        self.spawn_route(
+            route_id.to_string(),
+            mode,
+            source,
+            tune,
+            on_packet,
+            on_status,
+        );
         true
     }
 
@@ -1333,6 +1678,7 @@ impl VideoBridge {
         let idr_ms = Arc::new(AtomicU64::new(IDR_MS_TIGHT));
         let auto = AutoAdapt::new();
         let generation = Arc::new(());
+        let rate: RouteRateSlot = Arc::new(Mutex::new(RouteRateState::new(tune)));
         let serial = self.capture_serial(&route_id);
         // The worker cannot finish and clean itself before its RouteVideo is
         // installed. This is a start barrier only; sending never waits for
@@ -1349,6 +1695,7 @@ impl VideoBridge {
         let id = route_id.clone();
         let src = source.clone();
         let generation_thread = generation.clone();
+        let rate_thread = rate.clone();
         let serial_thread = serial.clone();
         let routes_thread = Arc::downgrade(&self.routes);
         let feedback_thread = Arc::downgrade(&self.feedback);
@@ -1365,10 +1712,19 @@ impl VideoBridge {
                 generation: generation_thread,
             };
 
-            // A stopped predecessor may still be blocked inside its backend.
-            // Waiting belongs to this detached worker, never the Tokio route
-            // task. Every generation for this route id uses the same gate.
-            let _same_id_serial = serial_thread.lock();
+            // A stopped predecessor may still be blocked forever inside an OS
+            // or driver call. Preserve normal same-id serialization, but do
+            // not let that predecessor turn every successor into a registered
+            // route that can never emit. The callbacks of a displaced worker
+            // are already stop-gated and registry cleanup is generation-exact,
+            // so a timed-out successor can safely attempt a fresh session.
+            let _same_id_serial = acquire_capture_serial(&serial_thread, FIRST_FRAME_STALL);
+            if _same_id_serial.is_none() {
+                tracing::warn!(
+                    "video capture for {id}: predecessor still owns the route gate after {:?}; attempting a generation-fenced concurrent reopen",
+                    FIRST_FRAME_STALL
+                );
+            }
             if stop_thread.load(Ordering::SeqCst) {
                 return;
             }
@@ -1406,6 +1762,7 @@ impl VideoBridge {
                 mode,
                 &src,
                 tune,
+                &rate_thread,
                 guarded_packet,
                 guarded_status,
             );
@@ -1432,6 +1789,7 @@ impl VideoBridge {
                     idr_ms,
                     tune,
                     auto,
+                    rate,
                 },
             )
         };
@@ -1483,10 +1841,15 @@ impl VideoBridge {
     /// lock on each of the three per-route maps, no wire traffic. Poll ~1 Hz
     /// while a panel is open.
     pub fn route_dials(&self, route_id: &str) -> Option<RouteDials> {
-        let (tune, edge_cap) = {
+        let (tune, edge_cap, rate) = {
             let routes = self.routes.lock();
             let r = routes.get(route_id)?;
-            (r.tune, effective_h264_edge(r.tune, &r.auto))
+            let snapshot = (
+                r.tune,
+                effective_h264_edge(r.tune, &r.auto),
+                r.rate.lock().rate.clone(),
+            );
+            snapshot
         };
         let posture = match tune.posture() {
             Posture::Reach => "reach",
@@ -1498,9 +1861,8 @@ impl VideoBridge {
         // The closed-loop bitrate the encoder is actually aiming at right now
         // (AIMD moves it under policy Reach/Balanced/Game), and the posture budget it climbs back
         // toward. Absent until the encode lane registers its rate cell.
-        let (target_bitrate_bps, ceiling_bps) = route_rates()
-            .lock()
-            .get(route_id)
+        let (target_bitrate_bps, ceiling_bps) = rate
+            .as_ref()
             .map(|rr| {
                 (
                     rr.target.load(Ordering::Relaxed),
@@ -1605,16 +1967,22 @@ impl VideoBridge {
     /// the current send rate in bps (0 = no live encode lane; the pacer
     /// keeps its LAN constants).
     pub fn route_pace(&self, route_id: &str) -> (bool, bool, u32, u32) {
-        let (game, wan, fps) = self
+        let (game, wan, fps, rate) = self
             .routes
             .lock()
             .get(route_id)
-            .map(|r| (r.tune.game(), r.tune.link != LinkClass::Lan, r.tune.fps()))
-            .unwrap_or((false, false, 60));
-        let rate = route_rates()
-            .lock()
-            .get(route_id)
-            .map(|r| r.target.load(Ordering::Relaxed))
+            .map(|r| {
+                (
+                    r.tune.game(),
+                    r.tune.link != LinkClass::Lan,
+                    r.tune.fps(),
+                    r.rate.lock().rate.clone(),
+                )
+            })
+            .unwrap_or((false, false, 60, None));
+        let rate = rate
+            .as_ref()
+            .map(|rate| rate.target.load(Ordering::Relaxed))
             .unwrap_or(0);
         (game, wan, rate, fps)
     }
@@ -1647,7 +2015,7 @@ impl VideoBridge {
                 idr_ms.store(IDR_MS_TIGHT, Ordering::Relaxed);
                 auto.neutral();
             }
-            if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+            if let Some(rate) = self.current_route_rate(route_id) {
                 let mut adapt = rate.adapt.lock();
                 adapt.bad = 0;
                 adapt.good = 0;
@@ -1699,7 +2067,7 @@ impl VideoBridge {
                     .unwrap_or((true, 0, false))
             };
             if !pinned && rate_adapt_allowed(policy_auto_rate, rate_adapt_mode()) {
-                if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+                if let Some(rate) = self.current_route_rate(route_id) {
                     let mut adapt = rate.adapt.lock();
                     let current = rate.target.load(Ordering::Relaxed);
                     let ceiling = rate.ceiling.load(Ordering::Relaxed);
@@ -1860,6 +2228,7 @@ fn run_capture(
     mode: VideoMode,
     source: &VideoSource,
     tune: Tune,
+    rate: &RouteRateSlot,
     on_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync>,
     on_status: OnStatus,
 ) -> Result<(), String> {
@@ -1878,7 +2247,8 @@ fn run_capture(
         // on; the camera doesn't need the display lit).
         let _awake = wake::DisplayAwake::hold("hosting a camera stream");
         let fps = tune.fps();
-        let mut encoder = HealingEncoder::new(route_id, mode, (0, 0), tune, refresh, idr_ms, auto)?;
+        let mut encoder =
+            HealingEncoder::new(route_id, mode, (0, 0), tune, rate, refresh, idr_ms, auto)?;
         let mut stats = StreamStats::new(route_id, encoder.mode());
         tracing::info!(
             "video stream start {route_id}: {} · link {:?} · fps cap {fps} · camera",
@@ -2055,6 +2425,7 @@ fn run_capture(
                     mid,
                     stable_monitor_name.as_deref(),
                     tune,
+                    rate,
                     &mut rate_registration,
                     refresh,
                     idr_ms,
@@ -2080,8 +2451,16 @@ fn run_capture(
         }
     }
 
-    let mut encoder =
-        HealingEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
+    let mut encoder = HealingEncoder::new(
+        route_id,
+        mode,
+        source_hint,
+        tune,
+        rate,
+        refresh,
+        idr_ms,
+        auto,
+    )?;
     // The negotiated transport pre-labelled the stats line; correct it if
     // the encoder fell to the MJPEG floor.
     stats.set_mode(encoder.mode());
@@ -3113,6 +3492,7 @@ fn run_gpu_lane(
     mid: u32,
     stable_monitor_name: Option<&str>,
     tune: Tune,
+    rate_slot: &RouteRateSlot,
     rate_registration: &mut Option<RouteRateRegistration>,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
@@ -3247,20 +3627,26 @@ fn run_gpu_lane(
     // the guard unregisters on every lane exit path. The value carries
     // the requested wave length (frames; 0 = idle).
     let wave = std::sync::Arc::new(AtomicU32::new(0));
-    struct WaveReg(Option<String>);
+    struct WaveReg {
+        route_id: Option<String>,
+        wave: Arc<AtomicU32>,
+    }
     impl Drop for WaveReg {
         fn drop(&mut self) {
-            if let Some(id) = self.0.take() {
-                wave_flags().lock().remove(&id);
+            if let Some(id) = self.route_id.take() {
+                remove_wave_flag_if_current(&id, &self.wave);
             }
         }
     }
-    let _wave_reg = WaveReg(gdr.then(|| {
-        wave_flags()
-            .lock()
-            .insert(route_id.to_string(), wave.clone());
-        route_id.to_string()
-    }));
+    let _wave_reg = WaveReg {
+        route_id: gdr.then(|| {
+            wave_flags()
+                .lock()
+                .insert(route_id.to_string(), wave.clone());
+            route_id.to_string()
+        }),
+        wave: wave.clone(),
+    };
     // The route's rate seam: the AIMD controller (feedback path) writes
     // `target`, this thread applies it through the in-place reconfigure,
     // and the mesh pacer reads it to spread bursts at the rate the link
@@ -3271,7 +3657,12 @@ fn run_gpu_lane(
     let mut rate_registered = rate_registration.is_some();
     let mut register_rate = |registered: &mut bool| {
         if !*registered {
-            *rate_registration = Some(RouteRateRegistration::new(route_id, rate.clone()));
+            *rate_registration = Some(RouteRateRegistration::new(
+                route_id,
+                rate.clone(),
+                rate_slot.clone(),
+                tune,
+            ));
             *registered = true;
         }
     };
@@ -4255,6 +4646,7 @@ struct HealingEncoder {
     route_id: String,
     mode: VideoMode,
     tune: Tune,
+    rate: RouteRateSlot,
     refresh: Arc<AtomicBool>,
     idr_ms: Arc<AtomicU64>,
     auto: Arc<AutoAdapt>,
@@ -4262,8 +4654,11 @@ struct HealingEncoder {
     /// Test seam: replaces the ladder rebuild so recovery is testable
     /// without hardware.
     #[cfg(test)]
-    rebuild_override: Option<Box<dyn FnMut() -> Result<StreamEncoder, String> + Send>>,
+    rebuild_override: Option<RebuildOverride>,
 }
+
+#[cfg(test)]
+type RebuildOverride = Box<dyn FnMut(Tune) -> Result<StreamEncoder, String> + Send>;
 
 impl HealingEncoder {
     #[allow(clippy::too_many_arguments)]
@@ -4272,11 +4667,21 @@ impl HealingEncoder {
         mode: VideoMode,
         source_hint: (u32, u32),
         tune: Tune,
+        rate: &RouteRateSlot,
         refresh: &Arc<AtomicBool>,
         idr_ms: &Arc<AtomicU64>,
         auto: &Arc<AutoAdapt>,
     ) -> Result<Self, String> {
-        let enc = make_encoder(route_id, mode, source_hint, tune, refresh, idr_ms, auto)?;
+        let enc = make_encoder(
+            route_id,
+            mode,
+            source_hint,
+            tune,
+            rate,
+            refresh,
+            idr_ms,
+            auto,
+        )?;
         // Name the CPU pipeline for the effective-dials panel (the actual
         // encoder after any MJPEG-floor fallback). The GPU lane, when it
         // wins, set "GPU (hardware)" before this constructor was ever reached
@@ -4290,6 +4695,7 @@ impl HealingEncoder {
             route_id: route_id.to_string(),
             mode,
             tune,
+            rate: rate.clone(),
             refresh: refresh.clone(),
             idr_ms: idr_ms.clone(),
             auto: auto.clone(),
@@ -4407,9 +4813,18 @@ impl HealingEncoder {
     }
 
     fn rebuild(&mut self, source_hint: (u32, u32)) -> Result<StreamEncoder, String> {
+        // Allocator-only changes update the generation-local RouteRate in
+        // place. Refresh our by-value capture tune from that authority before
+        // a full encoder heal, or a later TDR can silently resurrect the cap
+        // and auto-resolution flag that existed when capture first started.
+        let tune = {
+            let rate = self.rate.lock();
+            rate.policy.apply(self.tune)
+        };
+        self.tune = tune;
         #[cfg(test)]
         if let Some(f) = &mut self.rebuild_override {
-            return f();
+            return f(tune);
         }
         // The negotiated transport is pinned for the route's life: a heal
         // rebuilds the SAME mode or fails the route (which then restarts
@@ -4423,7 +4838,8 @@ impl HealingEncoder {
             &self.route_id,
             self.mode,
             source_hint,
-            self.tune,
+            tune,
+            &self.rate,
             &self.refresh,
             &self.idr_ms,
             &self.auto,
@@ -4440,11 +4856,21 @@ fn make_encoder(
     mode: VideoMode,
     source_hint: (u32, u32),
     tune: Tune,
+    rate: &RouteRateSlot,
     refresh: &Arc<AtomicBool>,
     idr_ms: &Arc<AtomicU64>,
     auto: &Arc<AutoAdapt>,
 ) -> Result<StreamEncoder, String> {
-    match StreamEncoder::new(route_id, mode, source_hint, tune, refresh, idr_ms, auto) {
+    match StreamEncoder::new(
+        route_id,
+        mode,
+        source_hint,
+        tune,
+        rate,
+        refresh,
+        idr_ms,
+        auto,
+    ) {
         Ok(enc) => Ok(enc),
         Err(e) => {
             tracing::warn!("encoder for {route_id} unavailable ({e}); falling back to MJPEG");
@@ -4453,6 +4879,7 @@ fn make_encoder(
                 VideoMode::Mjpeg,
                 source_hint,
                 tune,
+                rate,
                 refresh,
                 idr_ms,
                 auto,
@@ -4536,6 +4963,7 @@ impl StreamEncoder {
         mode: VideoMode,
         source_hint: (u32, u32),
         tune: Tune,
+        rate: &RouteRateSlot,
         refresh: &Arc<AtomicBool>,
         idr_ms: &Arc<AtomicU64>,
         auto: &Arc<AutoAdapt>,
@@ -4553,6 +4981,7 @@ impl StreamEncoder {
                 route_id,
                 source_hint,
                 tune,
+                rate.clone(),
                 refresh.clone(),
                 idr_ms.clone(),
                 auto.clone(),
@@ -4719,6 +5148,8 @@ struct H264Stream {
     /// Shared allocator/AIMD seam. Cap-only changes move this cell; the
     /// encode stage applies them without touching monitor capture.
     rate: Arc<RouteRate>,
+    /// Generation-local publication of `rate`.
+    route_rate: RouteRateSlot,
     /// Rate currently configured into `codec`.
     applied_rate: u32,
     tune: Tune,
@@ -4759,6 +5190,15 @@ impl Drop for H264Stream {
         {
             rates.remove(&self.route_id);
         }
+        drop(rates);
+        let mut slot = self.route_rate.lock();
+        if slot
+            .rate
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.rate))
+        {
+            slot.rate = None;
+        }
     }
 }
 
@@ -4767,6 +5207,7 @@ impl H264Stream {
         route_id: &str,
         source_hint: (u32, u32),
         tune: Tune,
+        route_rate: RouteRateSlot,
         refresh: Arc<AtomicBool>,
         idr_ms: Arc<AtomicU64>,
         auto: Arc<AutoAdapt>,
@@ -4787,17 +5228,19 @@ impl H264Stream {
         };
         let codec = make_h264_codec(bw, bh, fps, tune)?;
         let rate = Arc::new(RouteRate::new(tune, bw, bh, fps));
-        route_rates()
-            .lock()
-            .insert(route_id.to_string(), rate.clone());
         let applied_rate = rate.target.load(Ordering::Relaxed);
+        // Publication and policy application share the route slot fence. If a
+        // cap update won before this heal, inherit it before replacing the old
+        // rate. If publication wins, the updater finds this new rate.
+        let effective_tune = publish_route_rate(route_id, rate.clone(), &route_rate, tune);
         Ok(H264Stream {
             route_id: route_id.to_string(),
             codec,
             budget_size: (bw, bh),
             rate,
+            route_rate,
             applied_rate,
-            tune,
+            tune: effective_tune,
             fps,
             prev: Vec::new(),
             prev_size: (0, 0),
@@ -5191,6 +5634,19 @@ pub(crate) fn wave_flags(
     &FLAGS
 }
 
+fn remove_wave_flag_if_current(route_id: &str, wave: &Arc<AtomicU32>) -> bool {
+    let mut flags = wave_flags().lock();
+    if flags
+        .get(route_id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, wave))
+    {
+        flags.remove(route_id);
+        true
+    } else {
+        false
+    }
+}
+
 /// A direct-SDK heal onto Media Foundation loses rolling intra refresh. Clear
 /// both the lane-local bit and the feedback registry atomically enough for the
 /// control path: subsequent loss reports must request an IDR, never write a
@@ -5199,16 +5655,7 @@ pub(crate) fn wave_flags(
 fn disable_gdr_route(route_id: &str, gdr: &mut bool, wave: &Arc<AtomicU32>) -> bool {
     let was_gdr = std::mem::replace(gdr, false);
     wave.store(0, Ordering::SeqCst);
-    let mut flags = wave_flags().lock();
-    let removed = if flags
-        .get(route_id)
-        .is_some_and(|registered| Arc::ptr_eq(registered, wave))
-    {
-        flags.remove(route_id);
-        true
-    } else {
-        false
-    };
+    let removed = remove_wave_flag_if_current(route_id, wave);
     let changed = was_gdr || removed;
     if changed {
         tracing::info!(
@@ -5242,11 +5689,10 @@ pub(crate) struct RouteRate {
     /// what lets a focus/cap increase recover upward instead of inheriting the
     /// previously lowered ceiling forever.
     configured_ceiling: AtomicU32,
-    /// Raw allocator cap (`u64::MAX` = no policy cap). Kept separately from
-    /// `ceiling` so an encoder-only geometry rebuild can recompute the right
-    /// effective ceiling without consulting the capture thread's stale
-    /// by-value `Tune` copy.
-    policy_cap: AtomicU64,
+    /// Atomically packed allocator cap and auto-resolution authority. Keeping
+    /// the pair in one word prevents an encoder heal from observing a cap from
+    /// one policy generation and the resolution flag from another.
+    policy: AtomicU64,
     /// Smallest rate the encoder can be configured for in this posture.
     encoder_floor: AtomicU32,
     /// Closed-loop floor. Game retains its proven 8 Mbps floor; policy Reach
@@ -5255,7 +5701,8 @@ pub(crate) struct RouteRate {
     adapt: Mutex<RateAdaptState>,
 }
 
-const NO_POLICY_RATE_CAP: u64 = u64::MAX;
+const POLICY_CAP_PRESENT: u64 = 1 << 32;
+const POLICY_AUTO_RESOLUTION: u64 = 1 << 33;
 
 /// RAII ownership of one entry in [`route_rates`]. The pointer check matters
 /// during encoder healing: a successor can register before the predecessor is
@@ -5264,17 +5711,17 @@ const NO_POLICY_RATE_CAP: u64 = u64::MAX;
 struct RouteRateRegistration {
     route_id: String,
     rate: Arc<RouteRate>,
+    route_slot: RouteRateSlot,
 }
 
 #[cfg(windows)]
 impl RouteRateRegistration {
-    fn new(route_id: &str, rate: Arc<RouteRate>) -> Self {
-        route_rates()
-            .lock()
-            .insert(route_id.to_string(), rate.clone());
+    fn new(route_id: &str, rate: Arc<RouteRate>, route_slot: RouteRateSlot, tune: Tune) -> Self {
+        publish_route_rate(route_id, rate.clone(), &route_slot, tune);
         RouteRateRegistration {
             route_id: route_id.to_string(),
             rate,
+            route_slot,
         }
     }
 }
@@ -5288,6 +5735,15 @@ impl Drop for RouteRateRegistration {
             .is_some_and(|registered| Arc::ptr_eq(registered, &self.rate))
         {
             rates.remove(&self.route_id);
+        }
+        drop(rates);
+        let mut slot = self.route_slot.lock();
+        if slot
+            .rate
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.rate))
+        {
+            slot.rate = None;
         }
     }
 }
@@ -5309,15 +5765,26 @@ impl RouteRate {
             target: AtomicU32::new(ceiling),
             ceiling: AtomicU32::new(ceiling),
             configured_ceiling: AtomicU32::new(configured),
-            policy_cap: AtomicU64::new(encode_policy_rate_cap(tune.policy_cap_bps)),
+            policy: AtomicU64::new(encode_rate_policy(tune)),
             encoder_floor: AtomicU32::new(encoder_floor),
             adapt_floor: AtomicU32::new(rate_adapt_floor(tune)),
             adapt: Mutex::new(RateAdaptState::default()),
         }
     }
 
+    #[cfg(test)]
     fn policy_cap(&self) -> Option<u32> {
-        decode_policy_rate_cap(self.policy_cap.load(Ordering::Relaxed))
+        decode_rate_policy(self.policy.load(Ordering::Acquire)).0
+    }
+
+    fn current_policy_tune(&self, tune: Tune) -> Tune {
+        let (policy_cap_bps, policy_auto_resolution) =
+            decode_rate_policy(self.policy.load(Ordering::Acquire));
+        Tune {
+            policy_cap_bps,
+            policy_auto_resolution,
+            ..tune
+        }
     }
 
     /// Apply a new allocator cap without losing the unconstrained target.
@@ -5326,36 +5793,34 @@ impl RouteRate {
     /// below that ceiling, preserve the congestion target on an increase and
     /// only clamp it on a decrease.
     fn update_policy(&self, tune: Tune) -> RateUpdate {
-        self.policy_cap.store(
-            encode_policy_rate_cap(tune.policy_cap_bps),
-            Ordering::Relaxed,
-        );
+        let mut adapt = self.adapt.lock();
+        self.policy
+            .store(encode_rate_policy(tune), Ordering::Release);
         let encoder_floor = encoder_rate_floor(tune);
         self.encoder_floor.store(encoder_floor, Ordering::Relaxed);
         self.adapt_floor
             .store(rate_adapt_floor(tune), Ordering::Relaxed);
         let configured = self.configured_ceiling.load(Ordering::Relaxed);
         let new_ceiling = policy_rate_ceiling(configured, tune.policy_cap_bps, encoder_floor);
-        self.install_ceiling(new_ceiling)
+        self.install_ceiling_locked(new_ceiling, &mut adapt)
     }
 
     /// Re-budget after an encoder geometry change while retaining the latest
     /// allocator cap and any genuine congestion backoff.
     fn update_geometry(&self, tune: Tune, w: u32, h: u32, fps: u32) -> RateUpdate {
+        let mut adapt = self.adapt.lock();
+        let tune = self.current_policy_tune(tune);
         let configured = configured_rate_ceiling(tune, w, h, fps);
         self.configured_ceiling.store(configured, Ordering::Relaxed);
         let encoder_floor = encoder_rate_floor(tune);
         self.encoder_floor.store(encoder_floor, Ordering::Relaxed);
         self.adapt_floor
             .store(rate_adapt_floor(tune), Ordering::Relaxed);
-        let new_ceiling = policy_rate_ceiling(configured, self.policy_cap(), encoder_floor);
-        self.install_ceiling(new_ceiling)
+        let new_ceiling = policy_rate_ceiling(configured, tune.policy_cap_bps, encoder_floor);
+        self.install_ceiling_locked(new_ceiling, &mut adapt)
     }
 
-    fn install_ceiling(&self, new_ceiling: u32) -> RateUpdate {
-        // Serialize against the AIMD streak state so a policy/focus move gets
-        // a clean observation window at its new budget.
-        let mut adapt = self.adapt.lock();
+    fn install_ceiling_locked(&self, new_ceiling: u32, adapt: &mut RateAdaptState) -> RateUpdate {
         let old_ceiling = self.ceiling.load(Ordering::Relaxed);
         let old_target = self.target.load(Ordering::Relaxed);
         let new_target = rebase_rate_target(old_target, old_ceiling, new_ceiling);
@@ -5373,12 +5838,22 @@ impl RouteRate {
     }
 }
 
-fn encode_policy_rate_cap(cap: Option<u32>) -> u64 {
-    cap.map(u64::from).unwrap_or(NO_POLICY_RATE_CAP)
+fn encode_rate_policy(tune: Tune) -> u64 {
+    let mut encoded = tune.policy_cap_bps.map(u64::from).unwrap_or(0);
+    if tune.policy_cap_bps.is_some() {
+        encoded |= POLICY_CAP_PRESENT;
+    }
+    if tune.policy_auto_resolution {
+        encoded |= POLICY_AUTO_RESOLUTION;
+    }
+    encoded
 }
 
-fn decode_policy_rate_cap(cap: u64) -> Option<u32> {
-    (cap != NO_POLICY_RATE_CAP).then_some(cap as u32)
+fn decode_rate_policy(encoded: u64) -> (Option<u32>, bool) {
+    (
+        (encoded & POLICY_CAP_PRESENT != 0).then_some(encoded as u32),
+        encoded & POLICY_AUTO_RESOLUTION != 0,
+    )
 }
 
 fn encoder_rate_floor(tune: Tune) -> u32 {
@@ -6384,6 +6859,25 @@ mod tests {
         assert!(!wave_flags().lock().contains_key(route));
     }
 
+    #[test]
+    fn retiring_wave_registration_cannot_erase_its_successor() {
+        let route = "test:wave-registration-aba";
+        let predecessor = Arc::new(AtomicU32::new(3));
+        let successor = Arc::new(AtomicU32::new(7));
+        wave_flags().lock().insert(route.into(), successor.clone());
+
+        assert!(
+            !remove_wave_flag_if_current(route, &predecessor),
+            "a retiring predecessor must not remove the successor's wave"
+        );
+        assert!(wave_flags()
+            .lock()
+            .get(route)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &successor)));
+        assert!(remove_wave_flag_if_current(route, &successor));
+        assert!(!wave_flags().lock().contains_key(route));
+    }
+
     /// One synthetic Annex-B NAL: start code + header byte (type in the
     /// low 5 bits) + a body that can't fake a start code.
     fn nal(ty: u8, len: usize, four_byte_sc: bool) -> Vec<u8> {
@@ -6691,6 +7185,132 @@ mod tests {
             ..initial
         });
         assert_eq!(backed_off.new_target, 7_000_000);
+    }
+
+    #[test]
+    fn replacement_rate_publication_inherits_the_generation_policy_atomically() {
+        let route_id = "rate-publication-policy-order";
+        let original = Tune {
+            policy_cap_bps: Some(10_000_000),
+            ..Tune::default()
+        };
+        let predecessor = Arc::new(RouteRate::new(original, 1920, 1080, 30));
+        let slot = Arc::new(Mutex::new(RouteRateState::with_rate(
+            original,
+            predecessor.clone(),
+        )));
+        route_rates()
+            .lock()
+            .insert(route_id.into(), predecessor.clone());
+
+        let latest = Tune {
+            policy_cap_bps: Some(4_000_000),
+            policy_auto_resolution: true,
+            ..original
+        };
+        let successor = Arc::new(RouteRate::new(original, 1920, 1080, 30));
+        let mut state = slot.lock();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let publish_slot = slot.clone();
+        let publish_rate = successor.clone();
+        let publish = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            publish_route_rate(route_id, publish_rate, &publish_slot, original)
+        });
+
+        attempt_rx.recv().unwrap();
+        state.policy = RoutePolicy::from_tune(latest);
+        state
+            .rate
+            .as_ref()
+            .expect("predecessor rate")
+            .update_policy(latest);
+        drop(state);
+
+        let published_tune = publish.join().unwrap();
+        let state = slot.lock();
+        assert!(state
+            .rate
+            .as_ref()
+            .is_some_and(|rate| Arc::ptr_eq(rate, &successor)));
+        assert_eq!(state.policy.cap_bps, latest.policy_cap_bps);
+        assert_eq!(state.policy.auto_resolution, latest.policy_auto_resolution);
+        assert_eq!(successor.policy_cap(), latest.policy_cap_bps);
+        assert_eq!(published_tune.policy_cap_bps, latest.policy_cap_bps);
+        assert_eq!(
+            published_tune.policy_auto_resolution,
+            latest.policy_auto_resolution
+        );
+        drop(state);
+        route_rates().lock().remove(route_id);
+    }
+
+    #[test]
+    fn first_rate_publication_after_lossless_inherits_stored_policy() {
+        let route_id = "lossless-to-rate-policy-order";
+        let original = Tune {
+            mode: Some(Posture::StudioLossless),
+            ..Tune::default()
+        };
+        let slot = Arc::new(Mutex::new(RouteRateState::new(original)));
+        let latest = Tune {
+            mode: Some(Posture::Balanced),
+            policy_cap_bps: Some(3_000_000),
+            policy_auto_resolution: true,
+            ..original
+        };
+        {
+            let mut state = slot.lock();
+            state.policy = RoutePolicy::from_tune(latest);
+            assert!(state.rate.is_none(), "lossless starts without a rate cell");
+        }
+
+        let rate = Arc::new(RouteRate::new(original, 1920, 1080, 60));
+        let published = publish_route_rate(route_id, rate.clone(), &slot, original);
+        assert_eq!(published.policy_cap_bps, latest.policy_cap_bps);
+        assert_eq!(
+            published.policy_auto_resolution,
+            latest.policy_auto_resolution
+        );
+        assert_eq!(rate.policy_cap(), latest.policy_cap_bps);
+        assert_eq!(rate.ceiling.load(Ordering::Relaxed), 3_000_000);
+        assert!(slot
+            .lock()
+            .rate
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &rate)));
+        route_rates().lock().remove(route_id);
+    }
+
+    #[test]
+    fn policy_and_geometry_updates_preserve_the_latest_policy_in_either_order() {
+        let initial = Tune {
+            bitrate: Some(40_000_000),
+            ..Tune::default()
+        };
+        let latest = Tune {
+            policy_cap_bps: Some(4_000_000),
+            policy_auto_resolution: true,
+            ..initial
+        };
+
+        let policy_first = RouteRate::new(initial, 1920, 1080, 60);
+        policy_first.update_policy(latest);
+        policy_first.update_geometry(initial, 1280, 720, 60);
+
+        let geometry_first = RouteRate::new(initial, 1920, 1080, 60);
+        geometry_first.update_geometry(initial, 1280, 720, 60);
+        geometry_first.update_policy(latest);
+
+        for rate in [&policy_first, &geometry_first] {
+            assert_eq!(rate.policy_cap(), latest.policy_cap_bps);
+            assert_eq!(
+                rate.current_policy_tune(initial).policy_auto_resolution,
+                latest.policy_auto_resolution
+            );
+            assert_eq!(rate.ceiling.load(Ordering::Relaxed), 4_000_000);
+            assert_eq!(rate.target.load(Ordering::Relaxed), 4_000_000);
+        }
     }
 
     #[test]
@@ -7055,6 +7675,73 @@ mod tests {
         };
         assert_eq!(pinned.fps(), 48);
         assert_eq!(pinned.bitrate, Some(60_000_000));
+        let overdriven_wan = Tune {
+            fps: Some(144),
+            link: LinkClass::Wan,
+            ..Tune::default()
+        };
+        assert_eq!(overdriven_wan.fps(), 60, "open-loop WAN cadence is capped");
+        let pinned_lan = Tune {
+            fps: Some(144),
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        assert_eq!(pinned_lan.fps(), 144, "explicit LAN cadence is preserved");
+    }
+
+    #[test]
+    fn link_policy_plan_skips_equivalent_restarts_and_carries_current_cap() {
+        let pinned_unknown = Tune {
+            fps: Some(48),
+            bitrate: Some(80_000_000),
+            link: LinkClass::Unknown,
+            ..Tune::default()
+        };
+        let LinkPolicyPlan::UpdateInPlace(pinned_wan) =
+            plan_link_policy(pinned_unknown, LinkClass::Wan, Some(9_000_000), true)
+        else {
+            panic!("Unknown to WAN is media-equivalent");
+        };
+        assert_eq!(pinned_wan.link, LinkClass::Wan);
+        assert_eq!(pinned_wan.policy_cap_bps, Some(9_000_000));
+        assert!(pinned_wan.policy_auto_resolution);
+
+        let pinned_lan = Tune {
+            link: LinkClass::Lan,
+            ..pinned_wan
+        };
+        assert!(matches!(
+            plan_link_policy(pinned_lan, LinkClass::Wan, Some(9_000_000), true),
+            LinkPolicyPlan::UpdateInPlace(_)
+        ));
+
+        let automatic_lan = Tune {
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        let LinkPolicyPlan::Restart(automatic_wan) =
+            plan_link_policy(automatic_lan, LinkClass::Wan, Some(7_000_000), false)
+        else {
+            panic!("LAN boundary changes automatic media settings");
+        };
+        assert_eq!(automatic_wan.link, LinkClass::Wan);
+        assert_eq!(automatic_wan.policy_cap_bps, Some(7_000_000));
+        assert_eq!(automatic_wan.fps(), 30);
+
+        let high_fps_lan = Tune {
+            fps: Some(144),
+            bitrate: Some(80_000_000),
+            link: LinkClass::Lan,
+            ..Tune::default()
+        };
+        assert!(matches!(
+            plan_link_policy(high_fps_lan, LinkClass::Wan, None, false),
+            LinkPolicyPlan::Restart(_)
+        ));
+        assert!(matches!(
+            plan_link_policy(pinned_wan, LinkClass::Wan, Some(9_000_000), true),
+            LinkPolicyPlan::NoChange
+        ));
     }
 
     #[test]
@@ -7136,6 +7823,125 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_link_policy_update_keeps_the_installed_generation() {
+        let bridge = VideoBridge::new();
+        let route_id = "equivalent-link-policy-generation";
+        let generation = Arc::new(());
+        let initial_tune = Tune {
+            link: LinkClass::Unknown,
+            ..Tune::default()
+        };
+        let rate = Arc::new(RouteRate::new(initial_tune, 1920, 1080, 30));
+        route_rates().lock().insert(route_id.into(), rate.clone());
+        bridge.routes.lock().insert(
+            route_id.into(),
+            RouteVideo {
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: None,
+                generation: generation.clone(),
+                mode: VideoMode::H264,
+                source: VideoSource::Screen(None),
+                on_packet: Arc::new(|_| true),
+                on_status: Arc::new(|_, _| {}),
+                refresh: Arc::new(AtomicBool::new(false)),
+                idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+                tune: initial_tune,
+                auto: AutoAdapt::new(),
+                rate: Arc::new(Mutex::new(RouteRateState::with_rate(
+                    initial_tune,
+                    rate.clone(),
+                ))),
+            },
+        );
+
+        assert!(
+            !bridge.retune_link_policy(route_id, LinkClass::Wan, Some(8_000_000), true),
+            "equivalent relink must not restart capture"
+        );
+        let routes = bridge.routes.lock();
+        let route = routes.get(route_id).expect("route remains installed");
+        assert!(Arc::ptr_eq(&route.generation, &generation));
+        assert_eq!(route.tune.link, LinkClass::Wan);
+        assert_eq!(route.tune.policy_cap_bps, Some(8_000_000));
+        assert!(route.tune.policy_auto_resolution);
+        assert_eq!(rate.policy_cap(), Some(8_000_000));
+        assert_eq!(rate.ceiling.load(Ordering::Relaxed), 8_000_000);
+        assert_eq!(rate.target.load(Ordering::Relaxed), 8_000_000);
+        drop(routes);
+        bridge.stop(route_id);
+        route_rates().lock().remove(route_id);
+    }
+
+    #[test]
+    fn public_rate_reads_and_feedback_ignore_a_stale_route_id_registration() {
+        let bridge = VideoBridge::new();
+        let route_id = "generation-local-rate-authority";
+        let tune = Tune {
+            mode: Some(Posture::Game),
+            link: LinkClass::Wan,
+            ..Tune::default()
+        };
+        bridge.install_policy_test_route(route_id, tune);
+        let current = bridge
+            .current_route_rate(route_id)
+            .expect("generation-local rate");
+        current.target.store(12_000_000, Ordering::Relaxed);
+        {
+            let mut adapt = current.adapt.lock();
+            adapt.bad = 4;
+            adapt.good = 5;
+        }
+
+        let stale = Arc::new(RouteRate::new(tune, 1920, 1080, tune.fps()));
+        stale.target.store(1_000_000, Ordering::Relaxed);
+        {
+            let mut adapt = stale.adapt.lock();
+            adapt.bad = 6;
+            adapt.good = 7;
+        }
+        route_rates().lock().insert(route_id.into(), stale.clone());
+
+        assert_eq!(bridge.route_pace(route_id).2, 12_000_000);
+        assert_eq!(
+            bridge
+                .route_dials(route_id)
+                .expect("route dials")
+                .target_bitrate_bps,
+            12_000_000
+        );
+        bridge.note_feedback(route_id, 0, 0, 0, 0, 0);
+        {
+            let adapt = current.adapt.lock();
+            assert_eq!((adapt.bad, adapt.good), (0, 0));
+        }
+        {
+            let adapt = stale.adapt.lock();
+            assert_eq!(
+                (adapt.bad, adapt.good),
+                (6, 7),
+                "feedback must not mutate a same-id predecessor"
+            );
+        }
+
+        bridge.remove_policy_test_route(route_id);
+    }
+
+    #[test]
+    fn capture_serial_timeout_allows_a_generation_fenced_reopen() {
+        let serial = Mutex::new(());
+        let predecessor = serial.lock();
+        assert!(
+            acquire_capture_serial(&serial, Duration::ZERO).is_none(),
+            "a stuck predecessor must not force an unbounded wait"
+        );
+        drop(predecessor);
+        assert!(
+            acquire_capture_serial(&serial, Duration::ZERO).is_some(),
+            "normal serialization remains active when the gate is available"
+        );
+    }
+
+    #[test]
     fn capture_worker_drop_signals_and_detaches_without_waiting_for_backend_exit() {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
@@ -7161,6 +7967,7 @@ mod tests {
             idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
             tune: Tune::default(),
             auto: AutoAdapt::new(),
+            rate: Arc::new(Mutex::new(RouteRateState::new(Tune::default()))),
         };
 
         // The worker is deliberately blocked independently of its stop flag.
@@ -7186,6 +7993,7 @@ mod tests {
                 idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
                 tune: Tune::default(),
                 auto: AutoAdapt::new(),
+                rate: Arc::new(Mutex::new(RouteRateState::new(Tune::default()))),
             }
         }
 
@@ -7301,6 +8109,7 @@ mod tests {
             "r",
             (64, 64),
             Tune::default(),
+            Arc::new(Mutex::new(RouteRateState::new(Tune::default()))),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
             AutoAdapt::new(),
@@ -7371,12 +8180,14 @@ mod tests {
     fn h264_stream_with(codec: Box<dyn H264Codec>) -> H264Stream {
         let tune = Tune::default();
         let rate = Arc::new(RouteRate::new(tune, 64, 64, 30));
+        let route_rate = Arc::new(Mutex::new(RouteRateState::with_rate(tune, rate.clone())));
         H264Stream {
             route_id: "scripted-test".to_string(),
             codec,
             budget_size: (64, 64),
             applied_rate: rate.target.load(Ordering::Relaxed),
             rate,
+            route_rate,
             tune,
             fps: 30,
             prev: Vec::new(),
@@ -7536,6 +8347,7 @@ mod tests {
             route_id: "r".into(),
             mode,
             tune: Tune::default(),
+            rate: Arc::new(Mutex::new(RouteRateState::new(Tune::default()))),
             refresh: Arc::new(AtomicBool::new(false)),
             idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
             auto: AutoAdapt::new(),
@@ -7600,7 +8412,7 @@ mod tests {
     fn healing_encoder_rebuilds_and_the_stream_continues() {
         let mut stats = StreamStats::new("r", VideoMode::H264);
         let mut he = healing_with(erroring_h264("driver reset"));
-        he.rebuild_override = Some(Box::new(|| {
+        he.rebuild_override = Some(Box::new(|_| {
             Ok(StreamEncoder::H264(Box::new(h264_stream_with(Box::new(
                 ScriptedCodec::new(vec![Ok(EncodeOutcome {
                     units: vec![(vec![9], true)],
@@ -7618,6 +8430,51 @@ mod tests {
         // The next frame rides the rebuilt encoder.
         let packets = he.encode(rgba, 64, 64, &mut stats).expect("encodes again");
         assert_eq!(packets.len(), 1, "the stream continues after the rebuild");
+    }
+
+    #[test]
+    fn healing_encoder_rebuild_keeps_the_latest_allocator_policy() {
+        let mut stats = StreamStats::new("r", VideoMode::H264);
+        let mut he = healing_with(erroring_h264("driver reset"));
+        let rate = Arc::new(RouteRate::new(he.tune, 1920, 1080, 30));
+        let latest = Tune {
+            policy_cap_bps: Some(4_000_000),
+            policy_auto_resolution: true,
+            ..he.tune
+        };
+        {
+            let mut state = he.rate.lock();
+            state.policy = RoutePolicy::from_tune(latest);
+            state.rate = Some(rate.clone());
+        }
+        rate.update_policy(latest);
+
+        let seen = Arc::new(Mutex::new(None));
+        let seen_rebuild = seen.clone();
+        he.rebuild_override = Some(Box::new(move |tune| {
+            *seen_rebuild.lock() = Some(tune);
+            Ok(StreamEncoder::H264(Box::new(h264_stream_with(Box::new(
+                ScriptedCodec::new(Vec::new()),
+            )))))
+        }));
+
+        let rgba = vec![128u8; 64 * 64 * 4];
+        he.encode(rgba, 64, 64, &mut stats).expect("healed");
+        let rebuilt = seen
+            .lock()
+            .as_ref()
+            .copied()
+            .expect("rebuild tune captured");
+        assert_eq!(rebuilt.policy_cap_bps, latest.policy_cap_bps);
+        assert_eq!(
+            rebuilt.policy_auto_resolution,
+            latest.policy_auto_resolution
+        );
+        assert_eq!(he.tune.policy_cap_bps, latest.policy_cap_bps);
+        assert_eq!(
+            he.tune.policy_auto_resolution,
+            latest.policy_auto_resolution
+        );
     }
 
     #[test]

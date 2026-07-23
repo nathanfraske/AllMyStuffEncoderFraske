@@ -338,6 +338,18 @@ impl VideoBridge {
         false
     }
 
+    /// Capture-less mirror of the real bridge's combined link and allocator
+    /// policy generation.
+    pub fn retune_link_policy(
+        &self,
+        _route_id: &str,
+        _link: LinkClass,
+        _policy_cap_bps: Option<u32>,
+        _policy_auto_resolution: bool,
+    ) -> bool {
+        false
+    }
+
     /// A viewer's Tune against a stream this build can't produce — accepted
     /// and ignored, matching the real bridge's signature.
     #[allow(clippy::too_many_arguments)]

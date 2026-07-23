@@ -205,6 +205,32 @@ pub(crate) fn is_decode_entry(data: &[u8]) -> bool {
     sniff_codec(data).is_some()
 }
 
+/// A paced recovery entry must begin with codec parameter sets. A later slice
+/// of the same split key picture can still carry an IDR NAL and a copied key
+/// bit, but it cannot initialize a decoder after the parameter-set-led first
+/// chunk was lost.
+fn is_paced_decode_entry_start(data: &[u8]) -> bool {
+    let mut i = 0usize;
+    loop {
+        if i + 3 >= data.len() {
+            return sniff_av1_obu(data).is_some();
+        }
+        if data[i] == 0 && data[i + 1] == 0 {
+            let first = if data[i + 2] == 1 {
+                data.get(i + 3).copied()
+            } else if data[i + 2] == 0 && data.get(i + 3) == Some(&1) {
+                data.get(i + 4).copied()
+            } else {
+                None
+            };
+            if let Some(first) = first {
+                return matches!(first, 0x40 | 0x42 | 0x44) || matches!(first & 0x1f, 7 | 8);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// AV1 codec detection from a start-code-less AU — the OBU-aware seam.
 /// An AV1 key access unit leads with a **sequence header OBU** (our
 /// encoders emit it on every key frame, the AV1 analog of repeated
@@ -267,13 +293,9 @@ fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
     None
 }
 
-/// Production feeds one complete access unit per sample. Keep enough startup
-/// headroom for a cold hardware decoder: field profiling on Windows measured
-/// about 174 ms from the first H.264 AU through NVDEC session creation and its
-/// first picture, which is already eleven 60 Hz arrivals. A three-AU queue
-/// therefore guaranteed an overflow before the decoder could reach steady
-/// state. Sixteen AUs cover that cold start plus ordinary scheduling jitter
-/// while bounding the compressed backlog to about 267 ms at 60 fps.
+/// Production feeds one complete access unit per sample. Once a decoder is
+/// producing pictures, sixteen AUs bound the compressed backlog to about
+/// 267 ms at 60 fps or 111 ms at 144 fps.
 ///
 /// H.264 remains ordered. On overflow the dependent chain is discarded and
 /// decoding resumes from a complete parameter-set-led key AU; a healthy
@@ -281,18 +303,49 @@ fn sniff_av1_obu(data: &[u8]) -> Option<AuCodec> {
 /// cold-open penalty.
 const MAX_PENDING_AUS: usize = 16;
 
+/// Cold hardware decoder creation is a different phase from steady decode. A
+/// field profile measured 271 ms from the first H.264 AU to NVDEC readiness.
+/// At the viewer's 144 fps ceiling that is 40 arrivals after rounding up; adding
+/// the existing 50 ms scheduling/jitter allowance needs 47. The 48-AU startup
+/// queue covers that measured window. After the first decoded picture, a
+/// backlog above [`MAX_PENDING_AUS`] makes one explicit cut to a fresh key.
+/// Accepting every new dependent delta while decode only matches arrival rate
+/// cannot reduce latency; the bounded cut prevents the startup queue from
+/// becoming a permanent steady-state delay.
+const MAX_STARTUP_PENDING_AUS: usize = 48;
+
 /// The opt-in paced-slice experiment feeds multiple samples per AU. Retain its
 /// sample-sized bound only in that explicit test mode; non-test production has
 /// pacing disabled and always uses [`MAX_PENDING_AUS`].
 #[cfg(all(windows, feature = "host"))]
 const MAX_PENDING_PACED_SAMPLES: usize = 48;
 
-fn pending_capacity() -> usize {
+#[derive(Clone, Copy)]
+struct QueueLimits {
+    channel: usize,
+    steady: usize,
+    whole_au: bool,
+}
+
+fn pending_limits() -> QueueLimits {
     #[cfg(all(windows, feature = "host"))]
     if crate::video::paced_slices_enabled() {
-        return MAX_PENDING_PACED_SAMPLES;
+        return QueueLimits {
+            channel: MAX_PENDING_PACED_SAMPLES,
+            steady: MAX_PENDING_PACED_SAMPLES,
+            whole_au: false,
+        };
     }
-    MAX_PENDING_AUS
+    QueueLimits {
+        channel: MAX_STARTUP_PENDING_AUS,
+        steady: MAX_PENDING_AUS,
+        whole_au: true,
+    }
+}
+
+#[cfg(test)]
+fn pending_capacity() -> usize {
+    pending_limits().channel
 }
 
 /// Idle boundary for paced NVDEC chunks. NVDEC treats END_OF_PICTURE
@@ -315,40 +368,253 @@ const ZERO_OUTPUT_AU_LIMIT: u32 = 30;
 
 struct RouteDecode {
     tx: mpsc::SyncSender<QueuedAu>,
-    /// Set on queue overflow; the thread dumps to the next key unit.
-    need_key: Arc<AtomicBool>,
     queue_stats: Arc<QueueStats>,
-    /// A complete key AU returned by a full whole-AU queue. Keeping only this
-    /// self-contained recovery point is safe; dependent deltas are never
-    /// reordered or latest-wins thinned.
-    recovery_entry: Arc<Mutex<Option<QueuedAu>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum QueuePhase {
+    Cold = 0,
+    Cutting = 1,
+    AwaitEntry = 2,
+    Steady = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum QueueCutReason {
+    None = 0,
+    StartupBacklog = 1,
+    Overflow = 2,
+}
+
+const QUEUE_PHASE_BITS: usize = 2;
+const QUEUE_REASON_BITS: usize = 2;
+const QUEUE_PHASE_MASK: usize = (1 << QUEUE_PHASE_BITS) - 1;
+const QUEUE_REASON_MASK: usize = (1 << QUEUE_REASON_BITS) - 1;
+const QUEUE_PENDING_SHIFT: usize = QUEUE_PHASE_BITS + QUEUE_REASON_BITS;
+
+fn queue_state(phase: QueuePhase, pending: usize, reason: QueueCutReason) -> usize {
+    (pending << QUEUE_PENDING_SHIFT) | ((reason as usize) << QUEUE_PHASE_BITS) | phase as usize
+}
+
+fn queue_state_parts(state: usize) -> (QueuePhase, usize, QueueCutReason) {
+    let phase = match state & QUEUE_PHASE_MASK {
+        0 => QueuePhase::Cold,
+        1 => QueuePhase::Cutting,
+        2 => QueuePhase::AwaitEntry,
+        3 => QueuePhase::Steady,
+        _ => unreachable!("queue phase is masked to two bits"),
+    };
+    let reason = match (state >> QUEUE_PHASE_BITS) & QUEUE_REASON_MASK {
+        1 => QueueCutReason::StartupBacklog,
+        2 => QueueCutReason::Overflow,
+        _ => QueueCutReason::None,
+    };
+    (phase, state >> QUEUE_PENDING_SHIFT, reason)
 }
 
 /// Route-local queue instrumentation. The counters are appended to the
 /// existing debug/opt-in decoder stats line; ordinary logs gain no chatter.
 struct QueueStats {
     capacity: usize,
-    pending: AtomicUsize,
+    steady_capacity: usize,
+    whole_au: bool,
+    /// Phase and pending depth share one CAS word. This makes the first-output
+    /// decision, queue reservation, dequeue, and recovery boundary linearizable
+    /// instead of cross-validating independent phase/depth atomics.
+    state: AtomicUsize,
     high_water: AtomicUsize,
     overflows: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueReservation {
+    Reserved {
+        depth: usize,
+        commit_entry: bool,
+    },
+    /// Cutting drops every arrival. AwaitEntry drops deltas until the first
+    /// self-describing entry can become the empty FIFO's head.
+    Recovering,
+    Full,
+}
+
 impl QueueStats {
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, capacity, capacity == MAX_PENDING_AUS)
+    }
+
+    fn with_limits(capacity: usize, steady_capacity: usize, whole_au: bool) -> Self {
+        debug_assert!(steady_capacity <= capacity);
         Self {
             capacity,
-            pending: AtomicUsize::new(0),
+            steady_capacity,
+            whole_au,
+            state: AtomicUsize::new(queue_state(
+                if steady_capacity == capacity {
+                    QueuePhase::Steady
+                } else {
+                    QueuePhase::Cold
+                },
+                0,
+                QueueCutReason::None,
+            )),
             high_water: AtomicUsize::new(0),
             overflows: AtomicU64::new(0),
+        }
+    }
+
+    fn start_cut(&self, reason: QueueCutReason) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, _) = queue_state_parts(current);
+            if phase == QueuePhase::Cutting {
+                return false;
+            }
+            let next = queue_state(QueuePhase::Cutting, pending, reason);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn cut_reason(&self) -> QueueCutReason {
+        queue_state_parts(self.state.load(Ordering::Acquire)).2
+    }
+
+    fn is_recovery_entry(&self, au: &QueuedAu) -> bool {
+        if self.whole_au {
+            au.key || is_decode_entry(&au.data)
+        } else {
+            is_paced_decode_entry_start(&au.data)
+        }
+    }
+
+    /// Reserve a queue slot against the phase-specific admission limit. The
+    /// route map serializes producers, but the decoder consumes concurrently,
+    /// so the depth update still uses compare-exchange.
+    fn try_reserve_send(&self, is_entry: bool) -> QueueReservation {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, reason) = queue_state_parts(current);
+            match phase {
+                QueuePhase::Cutting => return QueueReservation::Recovering,
+                QueuePhase::AwaitEntry if !is_entry => {
+                    return QueueReservation::Recovering;
+                }
+                QueuePhase::AwaitEntry => {
+                    if pending != 0 {
+                        return QueueReservation::Recovering;
+                    }
+                    let next = queue_state(QueuePhase::AwaitEntry, 1, reason);
+                    if self
+                        .state
+                        .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return QueueReservation::Reserved {
+                            depth: 1,
+                            commit_entry: true,
+                        };
+                    }
+                }
+                QueuePhase::Cold | QueuePhase::Steady => {
+                    let limit = if phase == QueuePhase::Cold {
+                        self.capacity
+                    } else {
+                        self.steady_capacity
+                    };
+                    if pending >= limit {
+                        let next =
+                            queue_state(QueuePhase::Cutting, pending, QueueCutReason::Overflow);
+                        if self
+                            .state
+                            .compare_exchange_weak(
+                                current,
+                                next,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return QueueReservation::Full;
+                        }
+                        continue;
+                    }
+                    let next = queue_state(phase, pending + 1, reason);
+                    if self
+                        .state
+                        .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return QueueReservation::Reserved {
+                            depth: pending + 1,
+                            commit_entry: false,
+                        };
+                    }
+                }
+            }
         }
     }
 
     /// Reserve accounting before `try_send`, preventing a fast receiver from
     /// underflowing the depth counter before the sender records success.
     fn reserve_send(&self) -> usize {
-        self.pending.fetch_add(1, Ordering::Relaxed) + 1
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, reason) = queue_state_parts(current);
+            debug_assert!(matches!(phase, QueuePhase::Cold | QueuePhase::Steady));
+            let next = queue_state(phase, pending + 1, reason);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return pending + 1;
+            }
+        }
+    }
+
+    /// A reservation made just before first output may race the Cold->Cutting
+    /// transition. Roll it back before touching the channel so the cut remains
+    /// growth-free. Cold->Steady keeps the reservation valid.
+    fn reservation_is_current(&self, commit_entry: bool) -> bool {
+        let (phase, _, _) = queue_state_parts(self.state.load(Ordering::Acquire));
+        if commit_entry {
+            phase == QueuePhase::AwaitEntry
+        } else {
+            !matches!(phase, QueuePhase::Cutting | QueuePhase::AwaitEntry)
+        }
+    }
+
+    /// Publish Steady only after the recovery entry has entered the FIFO. The
+    /// consumer may dequeue it immediately, so preserve whatever live depth
+    /// the CAS observes rather than assuming it is still one.
+    fn commit_recovery_entry(&self) {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, _) = queue_state_parts(current);
+            if phase != QueuePhase::AwaitEntry {
+                return;
+            }
+            let next = queue_state(QueuePhase::Steady, pending, QueueCutReason::None);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     fn sent(&self, reserved_depth: usize) {
@@ -359,22 +625,130 @@ impl QueueStats {
     }
 
     fn send_failed(&self) {
-        let before = self.pending.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(before > 0, "decoder queue accounting underflow");
+        self.decrement_pending();
     }
 
     fn received(&self) {
-        let before = self.pending.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(before > 0, "decoder queue accounting underflow");
+        self.decrement_pending();
+    }
+
+    fn decrement_pending(&self) {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, reason) = queue_state_parts(current);
+            debug_assert!(pending > 0, "decoder queue accounting underflow");
+            if pending == 0 {
+                return;
+            }
+            let next = queue_state(phase, pending - 1, reason);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     fn overflowed(&self) {
         self.overflows.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Enter steady admission on the first picture from this decoder
+    /// generation. If cold-start buffering is still above the steady limit,
+    /// make one explicit cut to a fresh key instead of allowing equal-rate
+    /// input and decode to refill the queue forever.
+    fn note_first_output(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, _) = queue_state_parts(current);
+            if phase != QueuePhase::Cold {
+                return false;
+            }
+            let next_phase = if pending > self.steady_capacity {
+                QueuePhase::Cutting
+            } else {
+                QueuePhase::Steady
+            };
+            let reason = if next_phase == QueuePhase::Cutting {
+                QueueCutReason::StartupBacklog
+            } else {
+                QueueCutReason::None
+            };
+            let next = queue_state(next_phase, pending, reason);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return next_phase == QueuePhase::Cutting;
+            }
+        }
+    }
+
+    /// A codec morph, hardware-rung replacement, or failed decoder is another
+    /// cold generation on the same route worker and needs startup headroom.
+    fn begin_decoder_generation(&self) {
+        let next_phase = if self.capacity == self.steady_capacity {
+            QueuePhase::Steady
+        } else {
+            QueuePhase::Cold
+        };
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, _) = queue_state_parts(current);
+            if phase == QueuePhase::Cutting || phase == next_phase {
+                return;
+            }
+            let next = queue_state(next_phase, pending, QueueCutReason::None);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Complete a dependency-chain cut only after the consumer has drained all
+    /// old and in-flight reservations. AwaitEntry then holds the physical FIFO
+    /// empty until the sender's requested key arrives.
+    fn finish_cut(&self) -> Option<QueueCutReason> {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (phase, pending, reason) = queue_state_parts(current);
+            if phase != QueuePhase::Cutting || pending != 0 {
+                return None;
+            }
+            let next = queue_state(QueuePhase::AwaitEntry, 0, QueueCutReason::None);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(reason);
+            }
+        }
+    }
+
+    fn phase_pending(&self) -> (QueuePhase, usize) {
+        let (phase, pending, _) = queue_state_parts(self.state.load(Ordering::Acquire));
+        (phase, pending)
+    }
+
+    fn active_capacity(&self) -> usize {
+        match self.phase_pending().0 {
+            QueuePhase::Cold => self.capacity,
+            QueuePhase::Cutting | QueuePhase::AwaitEntry => 0,
+            QueuePhase::Steady => self.steady_capacity,
+        }
+    }
+
     fn snapshot(&self) -> (usize, usize, u64) {
         (
-            self.pending.load(Ordering::Relaxed),
+            self.phase_pending().1,
             self.high_water.load(Ordering::Relaxed),
             self.overflows.load(Ordering::Relaxed),
         )
@@ -406,7 +780,9 @@ impl DecodeBridge {
     /// its place (corrupt unit, dumped backlog) so the caller can ask the
     /// sender to re-key. Both are only captured when this call starts the
     /// thread. A full queue dumps wholesale and re-keys — see module docs.
-    pub fn feed<F, G>(&self, route_id: &str, au: Au, on_frame: F, on_glitch: G)
+    /// Returns true when the AU was queued or retained as a complete recovery
+    /// entry, and false when it was discarded.
+    pub fn feed<F, G>(&self, route_id: &str, au: Au, on_frame: F, on_glitch: G) -> bool
     where
         F: Fn(Vec<u8>) + Send + 'static,
         G: Fn(Option<u64>) + Send + 'static,
@@ -429,7 +805,8 @@ impl DecodeBridge {
         profile_id: u64,
         on_frame: F,
         on_glitch: G,
-    ) where
+    ) -> bool
+    where
         F: Fn(Vec<u8>, u64, u64) + Send + 'static,
         G: Fn(Option<u64>) + Send + 'static,
     {
@@ -438,27 +815,38 @@ impl DecodeBridge {
         let mut profile_id = profile_id;
         let mut restarting = false;
         if let Some(entry) = routes.get_mut(route_id) {
-            let reserved_depth = entry.queue_stats.reserve_send();
-            match entry.tx.try_send(QueuedAu::new(au, profile_id)) {
-                Ok(()) => {
-                    entry.queue_stats.sent(reserved_depth);
-                    return;
-                }
-                Err(mpsc::TrySendError::Full(returned)) => {
-                    entry.queue_stats.send_failed();
+            let queued = QueuedAu::new(au, profile_id);
+            let is_entry = entry.queue_stats.is_recovery_entry(&queued);
+            let (reserved_depth, commit_entry) = match entry.queue_stats.try_reserve_send(is_entry)
+            {
+                QueueReservation::Reserved {
+                    depth,
+                    commit_entry,
+                } => (depth, commit_entry),
+                QueueReservation::Recovering => return false,
+                QueueReservation::Full => {
                     entry.queue_stats.overflowed();
-                    // Deltas past a full queue are useless without their
-                    // predecessors. The decoder thread drops its whole stale
-                    // backlog and requests a fresh key unit. In production's
-                    // whole-AU framing, preserve a returned SPS/PPS-led entry
-                    // so recovery need not wait on another round trip.
-                    if entry.queue_stats.capacity == MAX_PENDING_AUS
-                        && (returned.key || is_decode_entry(&returned.data))
-                    {
-                        *entry.recovery_entry.lock() = Some(returned);
+                    return false;
+                }
+            };
+            if !entry.queue_stats.reservation_is_current(commit_entry) {
+                entry.queue_stats.send_failed();
+                return false;
+            }
+            match entry.tx.try_send(queued) {
+                Ok(()) => {
+                    if commit_entry {
+                        entry.queue_stats.commit_recovery_entry();
                     }
-                    entry.need_key.store(true, Ordering::SeqCst);
-                    return;
+                    entry.queue_stats.sent(reserved_depth);
+                    return true;
+                }
+                Err(mpsc::TrySendError::Full(_returned)) => {
+                    entry.queue_stats.send_failed();
+                    if entry.queue_stats.start_cut(QueueCutReason::Overflow) {
+                        entry.queue_stats.overflowed();
+                    }
+                    return false;
                 }
                 Err(mpsc::TrySendError::Disconnected(returned)) => {
                     entry.queue_stats.send_failed();
@@ -485,9 +873,13 @@ impl DecodeBridge {
         // an unrelated refresh happens.
         let request_key = !(au.key || is_decode_entry(&au.data));
         let request_ts_us = request_key.then_some(au.ts_us);
-        let capacity = pending_capacity();
-        let (tx, rx) = mpsc::sync_channel::<QueuedAu>(capacity);
-        let queue_stats = Arc::new(QueueStats::new(capacity));
+        let limits = pending_limits();
+        let (tx, rx) = mpsc::sync_channel::<QueuedAu>(limits.channel);
+        let queue_stats = Arc::new(QueueStats::with_limits(
+            limits.channel,
+            limits.steady,
+            limits.whole_au,
+        ));
         // The receiver is live in this stack frame and the new queue is empty,
         // so the initial unit cannot fail or block.
         let reserved_depth = queue_stats.reserve_send();
@@ -495,15 +887,14 @@ impl DecodeBridge {
             Ok(()) => queue_stats.sent(reserved_depth),
             Err(_) => {
                 queue_stats.send_failed();
-                return;
+                return false;
             }
         }
-        let need_key = Arc::new(AtomicBool::new(false));
-        let recovery_entry = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let id = route_id.to_string();
-        let (nk, st) = (need_key.clone(), stop.clone());
-        let (qs, recovery) = (queue_stats.clone(), recovery_entry.clone());
+        let st = stop.clone();
+        let qs = queue_stats.clone();
+        let output_stats = queue_stats.clone();
         let thread = std::thread::spawn(move || {
             if request_key {
                 // Policy-v1 recovery is driven by timestamped frame-health
@@ -511,20 +902,29 @@ impl DecodeBridge {
                 // suppress both that report and the legacy Refresh fallback.
                 on_glitch(request_ts_us);
             }
-            run_decode(&st, &nk, &qs, &recovery, &id, rx, on_frame, on_glitch);
+            run_decode(
+                &st,
+                &qs,
+                &id,
+                rx,
+                move |packet, frame_id, frame_ts_us| {
+                    output_stats.note_first_output();
+                    on_frame(packet, frame_id, frame_ts_us);
+                },
+                on_glitch,
+            );
         });
         tracing::info!("native video decoder started for {route_id}");
         routes.insert(
             route_id.to_string(),
             RouteDecode {
                 tx,
-                need_key,
                 queue_stats,
-                recovery_entry,
                 stop,
                 thread: Some(thread),
             },
         );
+        true
     }
 
     /// Whether `route_id` currently has a live decoder.
@@ -919,12 +1319,40 @@ impl Av1Rung {
     }
 }
 
+/// Drain one dependency-chain cut to an actually empty FIFO. A producer can
+/// be preempted after reserving a packed pending slot but before `try_send`, so
+/// an empty channel is not sufficient. AwaitEntry is published only after that
+/// reservation either arrives or rolls back.
+fn drain_queue_cut(
+    stop: &AtomicBool,
+    queue_stats: &QueueStats,
+    rx: &mpsc::Receiver<QueuedAu>,
+) -> Option<(QueueCutReason, usize, Option<u64>)> {
+    if queue_stats.phase_pending().0 != QueuePhase::Cutting {
+        return None;
+    }
+    let mut dropped = 0usize;
+    let mut first_dropped_ts_us = None;
+    loop {
+        while let Ok(dropped_au) = rx.try_recv() {
+            first_dropped_ts_us.get_or_insert(dropped_au.ts_us);
+            queue_stats.received();
+            dropped += 1;
+        }
+        if let Some(reason) = queue_stats.finish_cut() {
+            return Some((reason, dropped, first_dropped_ts_us));
+        }
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_decode<F, G>(
     stop: &AtomicBool,
-    need_key: &AtomicBool,
     queue_stats: &QueueStats,
-    recovery_entry: &Mutex<Option<QueuedAu>>,
     route_id: &str,
     rx: mpsc::Receiver<QueuedAu>,
     on_frame: F,
@@ -976,8 +1404,46 @@ fn run_decode<F, G>(
     let mut zero_output_bytes = 0u64;
     let mut zero_output_last_ts_us: Option<u64> = None;
     let mut last_queue_reset: Option<Instant> = None;
+    let mut last_au_ts_us: Option<u64> = None;
+
+    macro_rules! recover_queue_cut {
+        ($lost_ts_us:expr, $request_recovery:expr) => {{
+            if queue_stats.phase_pending().0 == QueuePhase::Cutting {
+                deferred_au = None;
+                if let Some((reason, dropped, first_dropped_ts_us)) =
+                    drain_queue_cut(stop, queue_stats, &rx)
+                {
+                    if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
+                        match reason {
+                            QueueCutReason::StartupBacklog => tracing::info!(
+                                "video decoder cold backlog for {route_id} crossed into steady state; dropped {dropped} stale access unit(s) and requesting a key"
+                            ),
+                            QueueCutReason::Overflow | QueueCutReason::None => tracing::warn!(
+                                "video decoder queue overflow for {route_id}; dropped {dropped} stale access unit(s) and requesting a key"
+                            ),
+                        }
+                        last_queue_reset = Some(Instant::now());
+                    }
+                    waiting_key = true;
+                    zero_output_since = None;
+                    zero_output_aus = 0;
+                    zero_output_bytes = 0;
+                    zero_output_last_ts_us = None;
+                    if $request_recovery {
+                        on_glitch(first_dropped_ts_us.or($lost_ts_us));
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }};
+    }
 
     while !stop.load(Ordering::SeqCst) {
+        if recover_queue_cut!(last_au_ts_us, true) {
+            continue;
+        }
         // A bounded wait keeps the stop flag responsive on a quiet stream.
         let mut au = if let Some(au) = deferred_au.take() {
             au
@@ -1005,76 +1471,23 @@ fn run_decode<F, G>(
                         decoder = None;
                         waiting_key = true;
                         on_glitch(zero_output_last_ts_us);
-                        zero_output_since = None;
-                        zero_output_aus = 0;
-                        zero_output_bytes = 0;
-                        zero_output_last_ts_us = None;
+                        if !recover_queue_cut!(zero_output_last_ts_us, false) {
+                            zero_output_since = None;
+                            zero_output_aus = 0;
+                            zero_output_bytes = 0;
+                            zero_output_last_ts_us = None;
+                        }
                     }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
+        last_au_ts_us = Some(au.ts_us);
         let _ = record_decoder_queue_wait(route_id, &mut au);
         let decoder_prepare_started = crate::pipeline_profile::stamp();
         in_bytes += au.data.len() as u64;
-        if need_key.swap(false, Ordering::SeqCst) {
-            // The feeder overflowed: drain the stale backlog and wait for
-            // the sender's next IDR — same recovery as a decode error. A
-            // complete key AU already in hand/queue is retained as the only
-            // safe newest-wins unit; dependent deltas stay ordered or drop as
-            // a chain, never individually.
-            let lost_ts_us = au.ts_us;
-            let mut saved_entry = if queue_stats.capacity == MAX_PENDING_AUS
-                && (au.key || is_decode_entry(&au.data))
-            {
-                Some(au)
-            } else {
-                None
-            };
-            while let Ok(candidate) = rx.try_recv() {
-                queue_stats.received();
-                if queue_stats.capacity == MAX_PENDING_AUS
-                    && (candidate.key || is_decode_entry(&candidate.data))
-                {
-                    saved_entry = Some(candidate);
-                }
-            }
-            if let Some(returned_entry) = recovery_entry.lock().take() {
-                saved_entry = Some(returned_entry);
-            }
-            if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-                let recovery = if saved_entry.is_some() {
-                    "retaining the newest complete key entry"
-                } else {
-                    "requesting a key"
-                };
-                tracing::warn!(
-                    "video decoder queue overflow for {route_id}; dropped stale access units and {recovery}"
-                );
-                last_queue_reset = Some(Instant::now());
-            }
-            // The compressed dependency chain is stale, not the decoder
-            // session. Keeping a healthy same-codec decoder avoids a cold
-            // NVDEC/OpenH264 rebuild on every overload. A key AU below can
-            // still morph codecs or resize through the ordinary sniff/sequence
-            // path, which performs the required targeted rebuild itself.
-            waiting_key = true;
-            zero_output_since = None;
-            zero_output_aus = 0;
-            zero_output_bytes = 0;
-            zero_output_last_ts_us = None;
-            if let Some(entry) = saved_entry {
-                // Re-enter immediately from the newest complete SPS/PPS/key
-                // unit. It is processed before any later queued delta.
-                deferred_au = Some(entry);
-            } else {
-                // Name the AU whose chain was abandoned. Policy-v1 peers use
-                // the existing VideoFeedback data-channel message to produce
-                // an immediate GDR wave/IDR; `None` accidentally suppressed
-                // that request and made recovery wait for the periodic key.
-                on_glitch(Some(lost_ts_us));
-            }
+        if recover_queue_cut!(Some(au.ts_us), true) {
             continue;
         }
         // A parameter-set-led unit is a decode entry in both codecs and
@@ -1101,6 +1514,7 @@ fn run_decode<F, G>(
             }
         }
         if decoder.is_none() {
+            queue_stats.begin_decoder_generation();
             let built = match stream_codec {
                 AuCodec::H264 => {
                     let opened = if h264_runtime.requires_software() {
@@ -1157,6 +1571,7 @@ fn run_decode<F, G>(
                         tracing::warn!("decoder init for {route_id} failed: {e}");
                     }
                     on_glitch(Some(au.ts_us));
+                    let _ = recover_queue_cut!(Some(au.ts_us), false);
                     continue;
                 }
             }
@@ -1234,25 +1649,7 @@ fn run_decode<F, G>(
             }
             // Overflow may have been signaled while we were collecting the
             // train. Apply the same wholesale freshness reset before decode.
-            if need_key.swap(false, Ordering::SeqCst) {
-                let lost_ts_us = au.ts_us;
-                while let Ok(_dropped) = rx.try_recv() {
-                    queue_stats.received();
-                }
-                recovery_entry.lock().take();
-                if last_queue_reset.is_none_or(|t| t.elapsed() >= STATS_EVERY) {
-                    tracing::warn!(
-                        "video decoder queue overflow for {route_id} while coalescing; dropped stale access units and requesting a key"
-                    );
-                    last_queue_reset = Some(Instant::now());
-                }
-                deferred_au = None;
-                waiting_key = true;
-                zero_output_since = None;
-                zero_output_aus = 0;
-                zero_output_bytes = 0;
-                zero_output_last_ts_us = None;
-                on_glitch(Some(lost_ts_us));
+            if recover_queue_cut!(Some(au.ts_us), true) {
                 continue;
             }
         }
@@ -1324,6 +1721,7 @@ fn run_decode<F, G>(
                         // A resize/retune intentionally invalidates the old
                         // NVDEC session. Rebuild and retry this SAME key once;
                         // only a second failure earns software demotion.
+                        queue_stats.begin_decoder_generation();
                         let retry = crate::nvdec::NvdecH264::open()
                             .map_err(FreshNvdecError::Open)
                             .and_then(|mut fresh| {
@@ -1446,6 +1844,7 @@ fn run_decode<F, G>(
                         // The entry AU is still in hand: step to the
                         // vendor-neutral hardware rung and retry it instead of
                         // dropping the only clean recovery point.
+                        queue_stats.begin_decoder_generation();
                         let retry = HevcRung::dxva().and_then(|mut fresh| {
                             fresh
                                 .decode(&au.data, au.ts_us)
@@ -1574,6 +1973,7 @@ fn run_decode<F, G>(
                 }
             }
         }
+        let decode_failed = broke.is_some();
         if let Some(e) = broke {
             if zero_output_failure {
                 #[cfg(all(windows, feature = "host"))]
@@ -1602,6 +2002,9 @@ fn run_decode<F, G>(
             // heals with a wave instead of a keyframe wall.
             on_glitch(Some(au.ts_us));
         }
+        if recover_queue_cut!(Some(au.ts_us), !decode_failed) {
+            continue;
+        }
         let elapsed = since.elapsed();
         if elapsed >= STATS_EVERY && frames > 0 {
             // Bandwidth at each viewer layer: `wire` = compressed bytes
@@ -1611,6 +2014,7 @@ fn run_decode<F, G>(
             let secs = elapsed.as_secs_f64();
             let px = frames as f64 * out_dims.0 as f64 * out_dims.1 as f64;
             let (queue_pending, queue_hwm, queue_overflows) = queue_stats.snapshot();
+            let (queue_phase, _) = queue_stats.phase_pending();
             #[cfg(all(windows, feature = "host"))]
             let nvdec_diag = {
                 let s = crate::nvdec::status_counters();
@@ -1622,7 +2026,7 @@ fn run_decode<F, G>(
             #[cfg(not(all(windows, feature = "host")))]
             let nvdec_diag = String::new();
             let line = format!(
-                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native) · wire {:.1} → nv12 {:.0} → rgba {:.0} Mbps · queue {queue_pending}/{} hwm={queue_hwm} overflow={queue_overflows}{nvdec_diag}",
+                "video decode {route_id}: {:.1} fps · {:.1} ms/frame · {}×{} (native) · wire {:.1} → nv12 {:.0} → rgba {:.0} Mbps · queue {queue_pending}/{} phase={queue_phase:?} physical={} hwm={queue_hwm} overflow={queue_overflows}{nvdec_diag}",
                 frames as f64 / secs,
                 spent.as_secs_f64() * 1000.0 / frames as f64,
                 out_dims.0,
@@ -1630,6 +2034,7 @@ fn run_decode<F, G>(
                 in_bytes as f64 * 8.0 / secs / 1e6,
                 px * 1.5 * 8.0 / secs / 1e6,
                 px * 4.0 * 8.0 / secs / 1e6,
+                queue_stats.active_capacity(),
                 queue_stats.capacity,
             );
             if crate::video::stats_to_info() {
@@ -1710,38 +2115,223 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn reserve(stats: &QueueStats, is_entry: bool) -> (usize, bool) {
+        match stats.try_reserve_send(is_entry) {
+            QueueReservation::Reserved {
+                depth,
+                commit_entry,
+            } => (depth, commit_entry),
+            other => panic!("queue reservation rejected: {other:?}"),
+        }
+    }
+
     #[test]
     fn native_whole_au_queue_covers_cold_start_and_accounting_is_bounded() {
-        // 16 arrivals are ~267 ms at 60 Hz: enough for the measured cold
-        // NVDEC first-picture path without restoring the old 48-AU/800 ms
-        // latency allowance.
+        let limits = pending_limits();
         assert_eq!(MAX_PENDING_AUS, 16);
-        let stats = QueueStats::new(MAX_PENDING_AUS);
-        for expected in 1..=MAX_PENDING_AUS {
-            let reserved = stats.reserve_send();
-            stats.sent(reserved);
+        assert_eq!(limits.channel, MAX_STARTUP_PENDING_AUS);
+        assert_eq!(limits.steady, MAX_PENDING_AUS);
+        assert!(limits.whole_au);
+        let stats = QueueStats::with_limits(limits.channel, limits.steady, limits.whole_au);
+        for expected in 1..=MAX_STARTUP_PENDING_AUS {
+            let (depth, commit_entry) = reserve(&stats, false);
+            assert_eq!(depth, expected);
+            assert!(!commit_entry);
+            stats.sent(depth);
             assert_eq!(stats.snapshot().0, expected);
         }
-        // A failed seventeenth reservation is rolled back and counted without
-        // ever reporting a high-water beyond the physical channel.
-        stats.reserve_send();
-        stats.send_failed();
+        assert!(
+            stats.note_first_output(),
+            "a cold backlog above steady requires one dependency-safe cut"
+        );
+        assert_eq!(
+            stats.phase_pending(),
+            (QueuePhase::Cutting, MAX_STARTUP_PENDING_AUS)
+        );
+        assert_eq!(stats.cut_reason(), QueueCutReason::StartupBacklog);
+        assert_eq!(
+            stats.active_capacity(),
+            0,
+            "cutting must report closed admission, not a queue-full steady phase"
+        );
+        assert_eq!(
+            stats.try_reserve_send(false),
+            QueueReservation::Recovering,
+            "new arrivals must not refill a cold backlog above steady"
+        );
+        for _ in 0..MAX_STARTUP_PENDING_AUS {
+            stats.received();
+        }
+        assert_eq!(stats.finish_cut(), Some(QueueCutReason::StartupBacklog));
+        assert_eq!(stats.phase_pending(), (QueuePhase::AwaitEntry, 0));
+        assert_eq!(
+            stats.try_reserve_send(false),
+            QueueReservation::Recovering,
+            "deltas remain gated until a fresh entry"
+        );
+
+        let (depth, commit_entry) = reserve(&stats, true);
+        assert_eq!((depth, commit_entry), (1, true));
+        assert!(stats.reservation_is_current(commit_entry));
+        stats.sent(depth);
+        stats.commit_recovery_entry();
+        assert_eq!(stats.phase_pending(), (QueuePhase::Steady, 1));
+        stats.received();
+
+        for expected in 1..=MAX_PENDING_AUS {
+            let (depth, commit_entry) = reserve(&stats, false);
+            assert_eq!(depth, expected);
+            assert!(!commit_entry);
+            stats.sent(depth);
+        }
+        assert_eq!(stats.try_reserve_send(false), QueueReservation::Full);
+        assert_eq!(stats.cut_reason(), QueueCutReason::Overflow);
         stats.overflowed();
-        assert_eq!(stats.snapshot(), (MAX_PENDING_AUS, MAX_PENDING_AUS, 1));
+        assert_eq!(stats.snapshot().0, MAX_PENDING_AUS);
+        assert_eq!(stats.snapshot().2, 1);
+    }
+
+    #[test]
+    fn decoder_generation_rearms_cold_headroom() {
+        let stats = QueueStats::with_limits(MAX_STARTUP_PENDING_AUS, MAX_PENDING_AUS, true);
+        assert!(!stats.note_first_output());
+        for _ in 0..MAX_PENDING_AUS {
+            let (depth, commit_entry) = reserve(&stats, false);
+            assert!(!commit_entry);
+            stats.sent(depth);
+        }
+
+        stats.begin_decoder_generation();
+        for _ in MAX_PENDING_AUS..MAX_STARTUP_PENDING_AUS {
+            let (depth, commit_entry) = reserve(&stats, false);
+            assert!(!commit_entry);
+            stats.sent(depth);
+        }
+        assert_eq!(
+            stats.phase_pending(),
+            (QueuePhase::Cold, MAX_STARTUP_PENDING_AUS)
+        );
+    }
+
+    #[test]
+    fn in_flight_reservation_cannot_strand_a_queue_cut() {
+        let stats = QueueStats::with_limits(MAX_STARTUP_PENDING_AUS, MAX_PENDING_AUS, true);
+        for _ in 0..MAX_PENDING_AUS {
+            let (depth, _) = reserve(&stats, false);
+            stats.sent(depth);
+        }
+        let (_, commit_entry) = reserve(&stats, false);
+        assert!(!commit_entry);
+        assert!(stats.note_first_output());
+        assert_eq!(
+            stats.phase_pending(),
+            (QueuePhase::Cutting, MAX_PENDING_AUS + 1)
+        );
+        assert!(!stats.reservation_is_current(false));
+        assert_eq!(stats.finish_cut(), None);
+        stats.send_failed();
         for _ in 0..MAX_PENDING_AUS {
             stats.received();
         }
-        assert_eq!(stats.snapshot(), (0, MAX_PENDING_AUS, 1));
+        assert_eq!(stats.finish_cut(), Some(QueueCutReason::StartupBacklog));
+        assert_eq!(stats.phase_pending(), (QueuePhase::AwaitEntry, 0));
+    }
+
+    #[test]
+    fn cut_reason_is_linearized_with_both_first_output_race_orders() {
+        let first_output_wins =
+            QueueStats::with_limits(MAX_STARTUP_PENDING_AUS, MAX_PENDING_AUS, true);
+        for _ in 0..MAX_PENDING_AUS {
+            let (depth, _) = reserve(&first_output_wins, false);
+            first_output_wins.sent(depth);
+        }
+        assert!(!first_output_wins.note_first_output());
+        assert_eq!(
+            first_output_wins.try_reserve_send(false),
+            QueueReservation::Full
+        );
+        assert_eq!(
+            first_output_wins.phase_pending(),
+            (QueuePhase::Cutting, MAX_PENDING_AUS)
+        );
+        assert_eq!(first_output_wins.cut_reason(), QueueCutReason::Overflow);
+
+        let reservation_wins =
+            QueueStats::with_limits(MAX_STARTUP_PENDING_AUS, MAX_PENDING_AUS, true);
+        for _ in 0..=MAX_PENDING_AUS {
+            let (depth, _) = reserve(&reservation_wins, false);
+            reservation_wins.sent(depth);
+        }
+        assert!(reservation_wins.note_first_output());
+        assert_eq!(
+            reservation_wins.phase_pending(),
+            (QueuePhase::Cutting, MAX_PENDING_AUS + 1)
+        );
+        assert_eq!(
+            reservation_wins.cut_reason(),
+            QueueCutReason::StartupBacklog
+        );
+    }
+
+    #[test]
+    fn recovery_entry_commit_cannot_overwrite_a_decoder_rebuild() {
+        let stats = QueueStats::with_limits(MAX_STARTUP_PENDING_AUS, MAX_PENDING_AUS, true);
+        assert!(stats.start_cut(QueueCutReason::Overflow));
+        assert_eq!(stats.finish_cut(), Some(QueueCutReason::Overflow));
+        let (depth, commit_entry) = reserve(&stats, true);
+        assert!(commit_entry);
+        stats.sent(depth);
+        stats.received();
+        stats.begin_decoder_generation();
+        stats.commit_recovery_entry();
+        assert_eq!(stats.phase_pending(), (QueuePhase::Cold, 0));
+    }
+
+    #[test]
+    fn paced_recovery_rejects_a_bare_idr_slice() {
+        let stats =
+            QueueStats::with_limits(MAX_PENDING_PACED_SAMPLES, MAX_PENDING_PACED_SAMPLES, false);
+        assert!(stats.start_cut(QueueCutReason::Overflow));
+        assert_eq!(stats.finish_cut(), Some(QueueCutReason::Overflow));
+
+        let bare_idr = QueuedAu::new(
+            Au {
+                ts_us: 1,
+                key: true,
+                data: vec![0, 0, 1, 0x65, 0x88],
+            },
+            0,
+        );
+        assert!(!stats.is_recovery_entry(&bare_idr));
+        assert_eq!(
+            stats.try_reserve_send(stats.is_recovery_entry(&bare_idr)),
+            QueueReservation::Recovering
+        );
+
+        let parameter_set_led = QueuedAu::new(
+            Au {
+                ts_us: 2,
+                key: true,
+                data: vec![0, 0, 1, 0x67, 0x42],
+            },
+            0,
+        );
+        assert!(stats.is_recovery_entry(&parameter_set_led));
+        let (depth, commit_entry) = reserve(&stats, stats.is_recovery_entry(&parameter_set_led));
+        assert_eq!((depth, commit_entry), (1, true));
+        stats.sent(depth);
+        stats.commit_recovery_entry();
+        assert_eq!(stats.phase_pending(), (QueuePhase::Steady, 1));
     }
 
     /// Force the real bridge through its full-channel path while the software
-    /// decoder's first delivery is deliberately blocked. A complete key that
-    /// loses the `try_send` race must be retained, stale deltas must never
-    /// paint, and recovery must not ask the sender for yet another key.
+    /// decoder's first delivery is deliberately blocked. A key that arrives
+    /// after a dependency gap must be dropped with the stale suffix. Recovery
+    /// resumes only from a newly requested entry at the empty FIFO head.
     #[test]
-    fn full_queue_retains_returned_key_and_resumes_without_glitch() {
-        const ROUTE: &str = "test-software-overflow-retained";
-        assert_eq!(pending_capacity(), MAX_PENDING_AUS);
+    fn full_queue_drops_overflowing_key_and_resumes_from_a_fresh_entry() {
+        const ROUTE: &str = "test-software-overflow-fresh-entry";
+        assert_eq!(pending_capacity(), MAX_STARTUP_PENDING_AUS);
         reset_test_software_open_count(ROUTE);
         let (initial_key, deltas, recovery_key) = encoded_h264_recovery_chain();
         let bridge = DecodeBridge::new();
@@ -1796,7 +2386,7 @@ mod tests {
             Au {
                 ts_us: recovery_ts,
                 key: true,
-                data: recovery_key,
+                data: recovery_key.clone(),
             },
             |_| {},
             |_| {},
@@ -1804,16 +2394,37 @@ mod tests {
         {
             let routes = bridge.routes.lock();
             let route = routes.get(ROUTE).expect("route remains live");
-            assert!(route.need_key.load(Ordering::SeqCst));
             assert_eq!(route.queue_stats.snapshot().2, 1);
-            let saved = route.recovery_entry.lock();
-            assert_eq!(saved.as_ref().map(|entry| entry.ts_us), Some(recovery_ts));
+            assert_eq!(
+                route.queue_stats.phase_pending(),
+                (QueuePhase::Cutting, MAX_PENDING_AUS)
+            );
         }
 
         release_tx.send(()).expect("release decoder sink");
+        assert_eq!(
+            glitch_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("overflow requests a fresh entry"),
+            Some(10_000)
+        );
+        assert!(matches!(
+            frame_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(bridge.feed(
+            ROUTE,
+            Au {
+                ts_us: recovery_ts,
+                key: true,
+                data: recovery_key,
+            },
+            |_| {},
+            |_| {},
+        ));
         let recovered = frame_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("retained key decoded immediately after overflow");
+            .expect("fresh recovery entry decoded after the cut");
         assert_eq!(packet_ts_us(&recovered), recovery_ts);
         assert_eq!(
             test_software_open_count(ROUTE),
@@ -1846,7 +2457,7 @@ mod tests {
     #[test]
     fn full_delta_queue_requests_key_then_resumes() {
         const ROUTE: &str = "test-software-overflow-rekey";
-        assert_eq!(pending_capacity(), MAX_PENDING_AUS);
+        assert_eq!(pending_capacity(), MAX_STARTUP_PENDING_AUS);
         reset_test_software_open_count(ROUTE);
         let (initial_key, deltas, recovery_key) = encoded_h264_recovery_chain();
         let bridge = DecodeBridge::new();
@@ -1943,65 +2554,42 @@ mod tests {
 
     /// HEVC has no portable software decoder in this crate, but its queue
     /// recovery contract is codec-agnostic and can still be proven without a
-    /// GPU: a self-describing HEVC entry returned by a full whole-AU queue is
-    /// retained locally for the decoder thread rather than discarded.
+    /// GPU. The overflowing entry is discarded with the stale chain, while a
+    /// later parameter-set-led entry becomes the empty FIFO head.
     #[test]
-    fn full_queue_preserves_hevc_recovery_entry_without_hardware() {
-        let bridge = DecodeBridge::new();
-        let (tx, rx) = mpsc::sync_channel::<QueuedAu>(MAX_PENDING_AUS);
-        let stats = Arc::new(QueueStats::new(MAX_PENDING_AUS));
-        for index in 0..MAX_PENDING_AUS {
-            let reserved = stats.reserve_send();
-            assert!(
-                tx.try_send(QueuedAu::new(
-                    Au {
-                        ts_us: index as u64,
-                        key: false,
-                        data: vec![0, 0, 1, 0x41, 0x9a],
-                    },
-                    0,
-                ))
-                .is_ok(),
-                "fill synthetic queue"
-            );
-            stats.sent(reserved);
+    fn hevc_recovery_waits_for_a_fresh_parameter_set_led_entry() {
+        let stats = QueueStats::new(MAX_PENDING_AUS);
+        for _ in 0..MAX_PENDING_AUS {
+            let (depth, commit_entry) = reserve(&stats, false);
+            assert!(!commit_entry);
+            stats.sent(depth);
         }
-        let need_key = Arc::new(AtomicBool::new(false));
-        let recovery_entry = Arc::new(Mutex::new(None));
-        bridge.routes.lock().insert(
-            "hevc-overflow".into(),
-            RouteDecode {
-                tx,
-                need_key: need_key.clone(),
-                queue_stats: stats.clone(),
-                recovery_entry: recovery_entry.clone(),
-                stop: Arc::new(AtomicBool::new(false)),
-                thread: None,
-            },
+        assert_eq!(
+            stats.try_reserve_send(true),
+            QueueReservation::Full,
+            "the entry that discovers the dependency gap is not retained"
         );
+        assert_eq!(stats.cut_reason(), QueueCutReason::Overflow);
+        for _ in 0..MAX_PENDING_AUS {
+            stats.received();
+        }
+        assert_eq!(stats.finish_cut(), Some(QueueCutReason::Overflow));
 
-        let hevc_entry = vec![0, 0, 1, 0x40, 0x01, 0xaa];
-        bridge.feed(
-            "hevc-overflow",
+        let hevc_entry = QueuedAu::new(
             Au {
                 ts_us: 77,
                 key: false,
-                data: hevc_entry.clone(),
+                data: vec![0, 0, 1, 0x40, 0x01, 0xaa],
             },
-            |_| {},
-            |_| {},
+            0,
         );
-        assert!(need_key.load(Ordering::SeqCst));
-        assert_eq!(stats.snapshot(), (MAX_PENDING_AUS, MAX_PENDING_AUS, 1));
-        {
-            let saved = recovery_entry.lock();
-            let saved = saved.as_ref().expect("HEVC entry retained");
-            assert_eq!(saved.ts_us, 77);
-            assert_eq!(saved.data, hevc_entry);
-            assert_eq!(sniff_codec(&saved.data), Some(AuCodec::Hevc));
-        }
-        bridge.stop("hevc-overflow");
-        drop(rx);
+        assert!(stats.is_recovery_entry(&hevc_entry));
+        assert_eq!(sniff_codec(&hevc_entry.data), Some(AuCodec::Hevc));
+        let (depth, commit_entry) = reserve(&stats, stats.is_recovery_entry(&hevc_entry));
+        assert_eq!((depth, commit_entry), (1, true));
+        stats.sent(depth);
+        stats.commit_recovery_entry();
+        assert_eq!(stats.phase_pending(), (QueuePhase::Steady, 1));
     }
 
     /// The codec sniff's three-way branch, including the AV1 OBU seam:
@@ -2048,9 +2636,7 @@ mod tests {
             "dead-route".into(),
             RouteDecode {
                 tx: dead_tx,
-                need_key: Arc::new(AtomicBool::new(false)),
                 queue_stats: Arc::new(QueueStats::new(1)),
-                recovery_entry: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
                 thread: None,
             },
