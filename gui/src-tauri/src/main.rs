@@ -1223,6 +1223,33 @@ async fn fleet_leave(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Danger Zone: leave the fleet and forget every network the daemon holds
+/// (keeps this device's identity). The daemon exits afterward; the caller
+/// follows with `restart_app` so the whole stack reloads clean.
+#[tauri::command]
+async fn reset_networking(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .node
+        .request("reset_networking", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Danger Zone: factory reset — wipe this device's entire state (identity,
+/// config, all networks, fleet ownership) so it's brand-new to every peer. The
+/// node clears its ownership and the daemon wipes `~/.myownmesh` and exits; the
+/// caller follows with `restart_app`.
+#[tauri::command]
+async fn factory_reset(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .node
+        .request("factory_reset", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Evict a device from the fleet (owner-only; the daemon enforces it). `code`
 /// is the owner's custody second factor when fleet MFA is enrolled.
 #[tauri::command]
@@ -2505,6 +2532,8 @@ fn main() {
             open_room_window,
             owned_roster,
             fleet_leave,
+            reset_networking,
+            factory_reset,
             fleet_kick,
             fleet_set_name,
             fleet_grant_role,
