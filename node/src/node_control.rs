@@ -1166,6 +1166,8 @@ pub async fn dispatch(
         }
         "owned_roster" => DispatchOut::Json(mesh.fleet_roster_value().await),
         "fleet_leave" => json_result(mesh.fleet_leave().await),
+        "reset_networking" => json_result(mesh.reset_networking().await),
+        "factory_reset" => json_result(mesh.factory_reset().await),
         "fleet_kick" => {
             let device: String = try_arg!(arg(a, "device"));
             let code: Option<String> = try_arg!(opt(a, "code"));

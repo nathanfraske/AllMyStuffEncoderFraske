@@ -7779,6 +7779,48 @@ impl Mesh {
         Ok(())
     }
 
+    /// Danger Zone: leave the fleet **and** forget every network on the daemon —
+    /// clears this device's fleet membership and purges each mesh's roster +
+    /// signed governance state, keeping the device identity. A clean networking
+    /// slate for a wedged node. Leaves the fleet first (clears our ownership +
+    /// purges the fleet's closed network), then tells the daemon to forget the
+    /// rest; the daemon exits so a fresh one reloads clean, and the GUI restarts
+    /// the app around it. Best-effort per step — we're resetting regardless.
+    pub async fn reset_networking(self: &Arc<Self>) -> Result<(), String> {
+        let _ = self.fleet_leave().await;
+        if let Err(e) = self.client.request(&Request::ForgetAllNetworks).await {
+            // A pre-reset-op daemon can't parse it; the fleet leave above still
+            // did the important part. Surface it but don't fail the reset.
+            tracing::warn!("reset networking: daemon forget-all errored: {e}");
+        }
+        Ok(())
+    }
+
+    /// Danger Zone: factory reset — wipe this device back to brand-new. Clears
+    /// our local ownership record first (so the node can't re-persist
+    /// `allmystuff-ownership.json` after the daemon deletes it), then tells the
+    /// daemon to wipe its **entire** state directory (`~/.myownmesh`: identity,
+    /// config, every network, and our co-located ownership file) and exit. The
+    /// GUI restarts the app; a fresh node + daemon come up on empty state with a
+    /// new identity. The daemon's response may race its own exit, so a transport
+    /// error after the request is treated as "reset underway", not a failure.
+    pub async fn factory_reset(self: &Arc<Self>) -> Result<(), String> {
+        // Quiesce our ownership writer so it can't rewrite the file the daemon is
+        // about to delete. Best-effort — the daemon wipe is the authority, and
+        // we're restarting the whole stack regardless.
+        let _ = self.ownership.leave_fleet();
+        self.emit_owned().await;
+        match self.client.request(&Request::FactoryReset).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "factory reset: daemon request errored (it is likely already exiting): {e}"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Front-end command: kick `device` out of the fleet. Only the fleet
     /// **owner** can — eviction is an owner-authority governance act on the
     /// closed network. The signed `Evict` propagates the removal to every
