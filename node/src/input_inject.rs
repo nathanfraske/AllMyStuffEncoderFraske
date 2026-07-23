@@ -43,8 +43,9 @@
 //! route/ownership gates pass. The thread starts lazily on the first
 //! event and dies with the app.
 
-use std::collections::HashMap;
-use std::sync::mpsc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -55,8 +56,13 @@ use parking_lot::Mutex;
 use allmystuff_session::InputAction;
 
 enum Cmd {
-    Event { route: String, action: InputAction },
-    ReleaseRoute(String),
+    Event {
+        route: String,
+        action: InputAction,
+        session_epoch: u64,
+        route_epoch: u64,
+    },
+    FlushReleases,
 }
 
 /// AMS-06: the most input events queued for injection before excess is dropped.
@@ -68,6 +74,26 @@ const INPUT_QUEUE_CAP: usize = 4096;
 #[derive(Default)]
 pub struct Injector {
     tx: Mutex<Option<mpsc::SyncSender<Cmd>>>,
+    session_epoch: Arc<AtomicU64>,
+    next_route_epoch: AtomicU64,
+    route_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    pending_releases: Arc<Mutex<PendingReleases>>,
+}
+
+/// A snapshot of one active input route's local lifetime. The mesh captures
+/// this before its route/authority checks and queues it with the event. A
+/// teardown that races either check invalidates the lease, so a late key-down
+/// cannot be stamped with the successor route's generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputLease {
+    session_epoch: u64,
+    route_epoch: u64,
+}
+
+#[derive(Default)]
+struct PendingReleases {
+    all: bool,
+    routes: HashSet<String>,
 }
 
 impl Injector {
@@ -75,46 +101,104 @@ impl Injector {
         Self::default()
     }
 
-    /// Queue one event for injection. Starts the injector thread on first
-    /// use; if the platform refuses (no display server, missing
-    /// permissions) the failure is logged once and events are dropped.
-    pub fn apply(&self, route: &str, action: InputAction) {
-        self.send(
-            Cmd::Event {
-                route: route.into(),
-                action,
-            },
-            true,
-        );
+    /// Open a new local lifetime for an active input route. Reusing a route id
+    /// always mints a different generation and schedules cleanup of any state
+    /// retained by its predecessor.
+    pub fn activate_route(&self, route: &str) {
+        let route_epoch = self
+            .next_route_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+            .max(1);
+        let replaced = self
+            .route_epochs
+            .lock()
+            .insert(route.to_string(), route_epoch)
+            .is_some();
+        if replaced && self.tx.lock().is_some() {
+            self.pending_releases
+                .lock()
+                .routes
+                .insert(route.to_string());
+            self.wake_releases();
+        }
     }
 
-    /// A control route ended (teardown, peer drop): lift any keys its
-    /// stream still holds down, so a console that vanished mid-chord
-    /// doesn't leave this machine with a stuck Ctrl. No-op for routes
-    /// that never pressed anything.
+    /// Capture the active generation before the caller checks route ownership.
+    /// Unknown and already-ended route ids do not allocate bookkeeping.
+    pub fn lease(&self, route: &str) -> Option<InputLease> {
+        let route_epoch = self.route_epochs.lock().get(route).copied()?;
+        Some(InputLease {
+            session_epoch: self.session_epoch.load(Ordering::SeqCst),
+            route_epoch,
+        })
+    }
+
+    /// Queue one event for injection using the generation captured before the
+    /// mesh authorization gate. Starts the injector thread on first use; if
+    /// the platform refuses, the failure is logged once and events are dropped.
+    pub fn apply(&self, route: &str, action: InputAction, lease: InputLease) {
+        self.send_event(Cmd::Event {
+            route: route.into(),
+            action,
+            session_epoch: lease.session_epoch,
+            route_epoch: lease.route_epoch,
+        });
+    }
+
+    /// A control route ended (teardown, peer drop): lift any keys or mouse
+    /// buttons its stream still holds down. No-op for routes that never held
+    /// anything.
     pub fn release_route(&self, route: &str) {
+        // Removing the active generation is the fence. Unknown ids are a true
+        // no-op, so rejected forged ids cannot grow this map or its pending set.
+        if self.route_epochs.lock().remove(route).is_none() {
+            return;
+        }
         // Never spawns the thread: if it isn't running, nothing is held.
-        self.send(Cmd::ReleaseRoute(route.into()), false);
+        if self.tx.lock().is_none() {
+            return;
+        }
+        self.pending_releases
+            .lock()
+            .routes
+            .insert(route.to_string());
+        self.wake_releases();
     }
 
-    fn send(&self, cmd: Cmd, spawn: bool) {
+    /// The daemon session disappeared, so every old control route is invalid.
+    /// Release the injector's authoritative held-input set instead of relying
+    /// on the replacement session to enumerate routes that no longer exist.
+    pub fn release_all(&self) {
+        self.session_epoch.fetch_add(1, Ordering::SeqCst);
+        self.route_epochs.lock().clear();
+        if self.tx.lock().is_none() {
+            return;
+        }
+        let mut pending = self.pending_releases.lock();
+        pending.all = true;
+        pending.routes.clear();
+        drop(pending);
+        self.wake_releases();
+    }
+
+    fn send_event(&self, cmd: Cmd) {
         let mut tx = self.tx.lock();
         if tx.is_none() {
-            if !spawn {
-                return;
-            }
             // A *bounded* queue: a flood from an abusive controller drops excess
             // (below) rather than growing memory without limit (AMS-06).
             let (sender, rx) = mpsc::sync_channel::<Cmd>(INPUT_QUEUE_CAP);
-            std::thread::spawn(move || run_injector(rx));
+            let session_epoch = self.session_epoch.clone();
+            let route_epochs = self.route_epochs.clone();
+            let pending_releases = self.pending_releases.clone();
+            std::thread::spawn(move || {
+                run_injector(rx, session_epoch, route_epochs, pending_releases)
+            });
             *tx = Some(sender);
         }
         if let Some(t) = tx.as_ref() {
             match t.try_send(cmd) {
                 Ok(()) => {}
-                // Queue full — the injector can't keep up with the inbound rate.
-                // Drop the event; legitimate control never fills a queue this
-                // deep, and a teardown's `release_route` lifts any held keys.
                 Err(mpsc::TrySendError::Full(_)) => {}
                 // The thread ended (platform refused); allow a retry on the next
                 // event rather than wedging forever.
@@ -122,9 +206,23 @@ impl Injector {
             }
         }
     }
+
+    fn wake_releases(&self) {
+        let mut tx = self.tx.lock();
+        let Some(sender) = tx.as_ref() else { return };
+        match sender.try_send(Cmd::FlushReleases) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => *tx = None,
+        }
+    }
 }
 
-fn run_injector(rx: mpsc::Receiver<Cmd>) {
+fn run_injector(
+    rx: mpsc::Receiver<Cmd>,
+    session_epoch: Arc<AtomicU64>,
+    route_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    pending_releases: Arc<Mutex<PendingReleases>>,
+) {
     // Inbound control is what the user *feels* — keep the injector
     // responsive under exactly the load that made them reach for it.
     crate::os_perf::boost_media_thread();
@@ -136,24 +234,30 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
         }
     };
     let mut screens = ScreenMap::load();
-    // Each control route's keyboard state — held modifiers steer how the
-    // next key resolves, and whatever is still down gets lifted when the
-    // route goes away.
-    let mut keys: HashMap<String, KeyTracker> = HashMap::new();
+    // Each control route's held keyboard and mouse state. Modifiers steer how
+    // the next key resolves, and everything still down is lifted when the
+    // route or daemon session goes away.
+    let mut routes: HashMap<String, RouteInputState> = HashMap::new();
     while let Ok(cmd) = rx.recv() {
-        let (route, action) = match cmd {
-            Cmd::Event { route, action } => (route, action),
-            Cmd::ReleaseRoute(route) => {
-                if let Some(mut tracker) = keys.remove(&route) {
-                    for k in tracker.release_all() {
-                        if let Err(e) = enigo.key(k, Direction::Release) {
-                            tracing::debug!("releasing {k:?} after route end failed: {e}");
-                        }
-                    }
-                }
-                continue;
-            }
+        flush_pending_releases(&mut enigo, &mut routes, &pending_releases);
+        let (route, action, event_session_epoch, event_route_epoch) = match cmd {
+            Cmd::Event {
+                route,
+                action,
+                session_epoch,
+                route_epoch,
+            } => (route, action, session_epoch, route_epoch),
+            Cmd::FlushReleases => continue,
         };
+        if !event_generation_is_current(
+            &session_epoch,
+            &route_epochs,
+            &route,
+            event_session_epoch,
+            event_route_epoch,
+        ) {
+            continue;
+        }
         // A viewer clicking or typing at a *dark* console is the "remote
         // login wakes the machine" moment — relight the panel so the
         // stream they're driving blind comes back. No-op while frames
@@ -176,7 +280,11 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
             InputAction::MouseMoveRel { dx, dy } => enigo
                 .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
                 .map_err(|e| e.to_string()),
-            InputAction::MouseButton { button, down } => match dom_button(button) {
+            InputAction::MouseButton { button, down } => match if down {
+                routes.entry(route).or_default().press_button(button)
+            } else {
+                routes.entry(route).or_default().release_button(button)
+            } {
                 Some(b) => enigo.button(b, direction(down)).map_err(|e| e.to_string()),
                 None => Ok(()),
             },
@@ -199,7 +307,7 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
                 ref code,
                 down,
             } => {
-                let tracker = keys.entry(route).or_default();
+                let tracker = &mut routes.entry(route).or_default().keys;
                 let k = if down {
                     tracker.press(key, code.as_deref())
                 } else {
@@ -217,6 +325,41 @@ fn run_injector(rx: mpsc::Receiver<Cmd>) {
         };
         if let Err(e) = result {
             tracing::debug!("input injection event failed: {e}");
+        }
+    }
+}
+
+fn event_generation_is_current(
+    session_epoch: &AtomicU64,
+    route_epochs: &Mutex<HashMap<String, u64>>,
+    route: &str,
+    event_session_epoch: u64,
+    event_route_epoch: u64,
+) -> bool {
+    event_session_epoch == session_epoch.load(Ordering::SeqCst)
+        && route_epochs.lock().get(route).copied() == Some(event_route_epoch)
+}
+
+fn flush_pending_releases(
+    enigo: &mut Enigo,
+    routes: &mut HashMap<String, RouteInputState>,
+    pending: &Mutex<PendingReleases>,
+) {
+    let (release_all, release_routes) = {
+        let mut pending = pending.lock();
+        let all = std::mem::take(&mut pending.all);
+        let routes = pending.routes.drain().collect::<Vec<_>>();
+        (all, routes)
+    };
+    if release_all {
+        for (_, mut state) in routes.drain() {
+            release_input_state(enigo, &mut state, "daemon session reset");
+        }
+        return;
+    }
+    for route in release_routes {
+        if let Some(mut state) = routes.remove(&route) {
+            release_input_state(enigo, &mut state, "route end");
         }
     }
 }
@@ -401,6 +544,57 @@ fn dom_button(button: u8) -> Option<Button> {
         1 => Some(Button::Middle),
         2 => Some(Button::Right),
         _ => None,
+    }
+}
+
+/// Everything one control route currently holds on the remote desktop.
+#[derive(Default)]
+struct RouteInputState {
+    keys: KeyTracker,
+    /// DOM button ids in press order. Keeping ids avoids relying on enigo's
+    /// platform enum as the map identity and lets cleanup reuse dom_button.
+    pressed_buttons: Vec<u8>,
+}
+
+impl RouteInputState {
+    fn press_button(&mut self, button: u8) -> Option<Button> {
+        let injected = dom_button(button)?;
+        self.pressed_buttons.retain(|held| *held != button);
+        self.pressed_buttons.push(button);
+        Some(injected)
+    }
+
+    fn release_button(&mut self, button: u8) -> Option<Button> {
+        let injected = dom_button(button)?;
+        if let Some(index) = self.pressed_buttons.iter().position(|held| *held == button) {
+            self.pressed_buttons.remove(index);
+        }
+        // Release even when the down was missed. This heals a route attached
+        // mid-drag instead of preserving an unknown held state.
+        Some(injected)
+    }
+
+    fn release_buttons(&mut self) -> Vec<Button> {
+        self.pressed_buttons
+            .drain(..)
+            .rev()
+            .filter_map(dom_button)
+            .collect()
+    }
+}
+
+fn release_input_state(enigo: &mut Enigo, state: &mut RouteInputState, reason: &str) {
+    // End drags before lifting their modifier keys, matching a physical user
+    // releasing the mouse and then unwinding the chord.
+    for button in state.release_buttons() {
+        if let Err(error) = enigo.button(button, Direction::Release) {
+            tracing::debug!("releasing {button:?} after {reason} failed: {error}");
+        }
+    }
+    for key in state.keys.release_all() {
+        if let Err(error) = enigo.key(key, Direction::Release) {
+            tracing::debug!("releasing {key:?} after {reason} failed: {error}");
+        }
     }
 }
 
@@ -773,5 +967,67 @@ mod tests {
         assert_eq!(dom_button(0), Some(Button::Left));
         assert_eq!(dom_button(2), Some(Button::Right));
         assert_eq!(dom_button(4), None);
+    }
+
+    #[test]
+    fn mouse_buttons_are_tracked_and_unwound_on_route_end() {
+        let mut state = RouteInputState::default();
+        assert_eq!(state.press_button(0), Some(Button::Left));
+        assert_eq!(state.press_button(2), Some(Button::Right));
+        // A repeated down remains one held state.
+        assert_eq!(state.press_button(0), Some(Button::Left));
+        assert_eq!(state.pressed_buttons, vec![2, 0]);
+        assert_eq!(state.release_buttons(), vec![Button::Left, Button::Right]);
+        assert!(state.pressed_buttons.is_empty());
+    }
+
+    #[test]
+    fn mouse_up_heals_an_unobserved_down() {
+        let mut state = RouteInputState::default();
+        assert_eq!(state.release_button(1), Some(Button::Middle));
+        assert!(state.pressed_buttons.is_empty());
+        assert_eq!(state.press_button(4), None);
+        assert!(state.pressed_buttons.is_empty());
+    }
+
+    #[test]
+    fn rejected_unknown_route_ids_do_not_allocate_release_state() {
+        let injector = Injector::new();
+        for n in 0..100_000 {
+            injector.release_route(&format!("forged-{n}"));
+        }
+        assert!(injector.route_epochs.lock().is_empty());
+        assert!(injector.pending_releases.lock().routes.is_empty());
+    }
+
+    #[test]
+    fn teardown_fences_an_event_captured_before_authorization() {
+        let injector = Injector::new();
+        injector.activate_route("control-r1");
+        let stale = injector.lease("control-r1").unwrap();
+
+        // This is the route-state teardown that can race between the mesh's
+        // authorization check and its enqueue. A same-id successor opens a
+        // distinct generation.
+        injector.release_route("control-r1");
+        injector.activate_route("control-r1");
+        let current = injector.lease("control-r1").unwrap();
+
+        assert_ne!(stale, current);
+        assert!(!event_generation_is_current(
+            &injector.session_epoch,
+            &injector.route_epochs,
+            "control-r1",
+            stale.session_epoch,
+            stale.route_epoch,
+        ));
+        assert!(event_generation_is_current(
+            &injector.session_epoch,
+            &injector.route_epochs,
+            "control-r1",
+            current.session_epoch,
+            current.route_epoch,
+        ));
+        assert_eq!(injector.route_epochs.lock().len(), 1);
     }
 }

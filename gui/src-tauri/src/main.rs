@@ -29,7 +29,7 @@ compile_error!(
     "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
 );
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
 // client of the per-machine node's control socket (see
@@ -45,6 +45,10 @@ mod window_behavior;
 
 struct AppState {
     node: Arc<NodeClient>,
+    /// Keep route-watch registration order identical to command arrival order
+    /// across every webview. Node replies can complete out of order otherwise,
+    /// allowing a cancelled older watch to replace and then remove its successor.
+    video_watch_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
     /// the app); a reused service node has no child here and keeps running.
@@ -98,10 +102,36 @@ async fn connect_route(
 }
 
 #[tauri::command]
-async fn disconnect_route(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+async fn connect_route_handle(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+    media: String,
+    video: Option<Vec<String>>,
+    session: Option<String>,
+) -> Result<Value, String> {
     state
         .node
-        .request("disconnect_route", json!({ "route_id": route_id }))
+        .request(
+            "connect_route_handle",
+            json!({ "from": from, "to": to, "media": media, "video": video, "session": session }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn disconnect_route(
+    state: State<'_, AppState>,
+    route_id: String,
+    generation: Option<u64>,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "disconnect_route",
+            json!({ "route_id": route_id, "generation": generation }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -413,36 +443,59 @@ async fn clipboard_pull(state: State<'_, AppState>, route_id: String) -> Result<
 /// frames — for webviews without WebCodecs, and the bottom rung of the
 /// console's decode ladder.
 #[tauri::command]
-async fn video_watch(app: tauri::AppHandle, route_id: String, decode: Option<bool>) -> u64 {
+async fn video_watch(
+    app: tauri::AppHandle,
+    route_id: String,
+    decode: Option<bool>,
+) -> Result<u64, String> {
     let state = app.state::<AppState>();
-    match state
+    let route_lock = {
+        let mut locks = state.video_watch_locks.lock().await;
+        locks
+            .entry(route_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _registration_guard = route_lock.lock().await;
+    let value = state
         .node
         .request(
             "video_watch",
             json!({ "route_id": route_id, "decode": decode }),
         )
         .await
-    {
-        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
-        Err(e) => {
+        .map_err(|e| {
             tracing::warn!("video_watch failed: {e:#}");
-            0
-        }
+            e.to_string()
+        })?;
+    let token: u64 = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if token == 0 {
+        return Err("video_watch returned an invalid zero token".into());
     }
+    Ok(token)
 }
 
 /// Drain the queued packets for a route as one raw batch:
 /// `[u32 len][28-byte header + payload]…`, empty when nothing arrived.
 #[tauri::command]
-async fn video_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
+async fn video_poll(
+    app: tauri::AppHandle,
+    route_id: String,
+    token: u64,
+) -> Result<tauri::ipc::Response, String> {
     let state = app.state::<AppState>();
-    tauri::ipc::Response::new(
-        state
-            .node
-            .request_bytes("video_poll", json!({ "route_id": route_id }))
-            .await
-            .unwrap_or_default(),
-    )
+    let bytes = state
+        .node
+        .request_bytes(
+            "video_poll",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!("video_poll failed: {error:#}");
+            error.to_string()
+        })?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Stop streaming a route's frames to the front-end (console closed or
@@ -484,6 +537,7 @@ async fn video_refresh(state: State<'_, AppState>, route_id: String) -> Result<(
 async fn video_feedback(
     state: State<'_, AppState>,
     route_id: String,
+    watcher_token: u64,
     recv_fps: u32,
     decode_fails: u32,
     queue_depth: u32,
@@ -494,6 +548,7 @@ async fn video_feedback(
             "video_feedback",
             json!({
                 "route_id": route_id,
+                "watcher_token": watcher_token,
                 "recv_fps": recv_fps,
                 "decode_fails": decode_fails,
                 "queue_depth": queue_depth,
@@ -2448,6 +2503,7 @@ fn main() {
             scan_self,
             scan_full,
             connect_route,
+            connect_route_handle,
             disconnect_route,
             client_log,
             claim_node,
@@ -2586,6 +2642,7 @@ fn main() {
             };
             app.manage(AppState {
                 node: node.clone(),
+                video_watch_locks: tokio::sync::Mutex::new(HashMap::new()),
                 node_child: Mutex::new(None),
             });
             tauri::async_runtime::spawn(async move {

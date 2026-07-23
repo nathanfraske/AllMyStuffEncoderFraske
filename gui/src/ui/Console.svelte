@@ -27,8 +27,10 @@
   // tap-then-drag holds the button, and two fingers pinch-zoom the view.
   import { flushSync, onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { makeRemoteButtonTracker } from "../remote-button-tracker";
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
   import { app } from "../store.svelte";
+  import { DecodeStallEvidence, h264CodecString } from "../video-decoder";
   import {
     closeThisWindow,
     focusThisWindow,
@@ -36,6 +38,7 @@
     isTauri,
     onThisWindowClose,
     refreshRoute,
+    sendInput,
     sendVideoFeedback,
     toggleWindowFullscreen,
     watchVideo,
@@ -195,8 +198,9 @@
   let recvMbps = $state(0);
   let inBytes = 0;
   let queuePeek = () => 0;
-  let stallKick = () => {};
+  let stallKick = (_inputFps: number, _decodedFps: number, _paintFps: number) => {};
   let decodeModeNote = "";
+  let feedbackWatcherToken = 0;
   // Whether the backend decodes for us (raw RGBA in, no webview codec).
   // Starts true where WebCodecs doesn't exist at all, and flips true at
   // mount when it exists but can't actually decode H.264 (the
@@ -205,7 +209,9 @@
   // The decode ladder also lands here after WebCodecs stalls or dies
   // repeatedly. Sticky for the session — a webview whose decoder wedged
   // once isn't owed a third chance.
-  let nativeDecode = $state(typeof VideoDecoder === "undefined");
+  let nativeDecode = $state(
+    typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined",
+  );
 
   // ---- the quality choices --------------------------------------------
   //
@@ -262,17 +268,14 @@
     { label: "1 Mbps", value: 1_000_000 },
   ];
   type CodecChoice = "auto" | "h264" | "native" | "mjpeg";
-  // These pick the *transport + decode path* for a watched stream, not a
-  // specific encoder — the host picks its best encoder itself (NVENC on
-  // NVIDIA, the GPU's Media Foundation encoder otherwise, software as the
-  // floor), all of which produce H.264. So the labels describe what the
-  // viewer chooses between: hardware-accelerated H.264 decode here,
-  // software H.264 decode for webviews that can't, and the MJPEG
-  // compatibility fallback.
+  // These pick the transport and decode ladder for a watched stream, not a
+  // guaranteed device. WebCodecs accepts a hardware preference but does not
+  // report whether the browser honored it. The native ladder may select
+  // NVDEC or OpenH264, so the UI names exactly what it can prove.
   const CODEC_CHOICES: Array<{ label: string; value: CodecChoice; hint: string }> = [
-    { label: "Auto", value: "auto", hint: "Best available — H.264, hardware decode where the viewer supports it" },
-    { label: "H.264 · hardware decode", value: "h264", hint: "GPU-accelerated decode in the viewer (lowest CPU)" },
-    { label: "H.264 · software decode", value: "native", hint: "Decoded on the CPU — for viewers without hardware H.264" },
+    { label: "Auto", value: "auto", hint: "Best available H.264 decode ladder" },
+    { label: "H.264 · WebCodecs", value: "h264", hint: "Requests hardware acceleration, then falls back if the browser cannot sustain it" },
+    { label: "H.264 · native", value: "native", hint: "Backend decoder ladder: NVDEC when available, then OpenH264" },
     { label: "MJPEG · compatibility", value: "mjpeg", hint: "Per-frame JPEG — the universal fallback, higher bandwidth" },
   ];
 
@@ -351,7 +354,10 @@
     openSub = null;
     // Where to decode is this window's choice; which transport to offer
     // is the store's (it re-offers the route when that part changes).
-    nativeDecode = v === "native" || (v === "auto" && typeof VideoDecoder === "undefined");
+    nativeDecode =
+      v === "native" ||
+      (v === "auto" &&
+        (typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined"));
     app.setConsoleCodec(v === "mjpeg" ? "mjpeg" : v === "auto" ? "auto" : "h264");
   }
 
@@ -618,7 +624,11 @@
     // session on native decode instead of feeding a decoder that can
     // only die. (A probe that *lies* is still caught by the born-dead
     // ladder below — this just skips the few seconds it costs.)
-    if (!nativeDecode && typeof VideoDecoder !== "undefined") {
+    if (
+      !nativeDecode &&
+      typeof VideoDecoder !== "undefined" &&
+      typeof EncodedVideoChunk !== "undefined"
+    ) {
       try {
         void VideoDecoder.isConfigSupported({ codec: "avc1.42E01F" })
           .then((s) => {
@@ -631,11 +641,13 @@
     }
     let fbTick = 0;
     let fbFailsSent = 0;
+    let fbRouteSeen: string | null = null;
     const fpsTimer = setInterval(() => {
       fps = frameCount;
       const inRate = inCount;
+      const decodedRate = decCount;
       inFps = inRate;
-      decFps = decCount;
+      decFps = decodedRate;
       frameCount = 0;
       inCount = 0;
       decCount = 0;
@@ -650,7 +662,7 @@
       // Chunks flowing in, paints collapsed, queue deep: the decoder
       // stopped consuming (the hardware-pool stall). Rebuild it — the
       // ladder steps to software decode on the way.
-      if (inRate > 5 && fps < inRate / 4 && queuePeek() > 8) stallKick();
+      stallKick(inRate, decodedRate, fps);
       // (Letterbox auto-detect no longer runs here — it samples the decoded
       // frame from the paint path via maybeDetect(), so it never reads the
       // live canvas and can't trigger Chromium's CPU-raster demotion.)
@@ -658,8 +670,19 @@
       // it can adapt (receiver → sender). decode_fails is the delta since the
       // last report; recv_fps is what we actually painted.
       const fbRoute = app.consoleVideoLive;
-      if (fbRoute && ++fbTick % 2 === 0) {
-        void sendVideoFeedback(fbRoute, fps, decodeFails - fbFailsSent, queuePeek());
+      if (fbRoute !== fbRouteSeen) {
+        fbRouteSeen = fbRoute;
+        fbFailsSent = 0;
+        fbTick = 0;
+      }
+      if (fbRoute && feedbackWatcherToken > 0 && ++fbTick % 2 === 0) {
+        void sendVideoFeedback(
+          fbRoute,
+          feedbackWatcherToken,
+          decodedRate,
+          Math.max(0, decodeFails - fbFailsSent),
+          queuePeek(),
+        );
         fbFailsSent = decodeFails;
       }
     }, 1000);
@@ -691,24 +714,6 @@
     };
   });
 
-  // The exact codec string for the incoming stream, read off its SPS
-  // (profile/constraints/level are the three bytes after the NAL header)
-  // — a guessed string risks the decoder sizing reorder buffers for a
-  // stream we're not sending.
-  function spsCodecString(au: Uint8Array): string | null {
-    for (let i = 0; i + 4 < au.length; i++) {
-      if (au[i] !== 0 || au[i + 1] !== 0) continue;
-      const off = au[i + 2] === 1 ? i + 3 : au[i + 2] === 0 && au[i + 3] === 1 ? i + 4 : 0;
-      if (!off) continue;
-      if ((au[off] & 0x1f) === 7 && off + 3 < au.length) {
-        const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
-        return `avc1.${hex(au[off + 1])}${hex(au[off + 2])}${hex(au[off + 3])}`;
-      }
-      i = off;
-    }
-    return null;
-  }
-
   // Follow the live video route: watch its packet channel while it's up,
   // and show the placeholder rather than a stale frame whenever it
   // changes (input switch, session end). The effect ALSO re-runs on a
@@ -720,6 +725,7 @@
     // Reading this here makes the ladder's last rung re-run the effect:
     // flipping it tears the watch down and re-watches in native mode.
     const native = nativeDecode;
+    const diagnostics = untrack(() => app.debugLoggingEnabled === true);
     // A route CHANGE (screen tab, camera tab, or the teardown between
     // them) with a picture on the glass = a switch: hold the old frame
     // dimmed instead of flashing the placeholder. A decode-mode re-wire
@@ -775,6 +781,7 @@
     }
     if (!route) return;
     let cancelled = false;
+    const watchAbort = new AbortController();
     let unwatch: (() => void) | undefined;
     let unwatchStatus: (() => void) | undefined;
     // The host's capture-state reports for this route — they explain the
@@ -787,6 +794,7 @@
       else unwatchStatus = u;
     });
     let decoder: VideoDecoder | null = null;
+    let decoderGeneration = 0;
     let codecString: string | null = null;
     // The decode ladder: hardware-preference first; any stall (born dead
     // *or* mid-stream — the hardware-pool failure shape is bursts, then a
@@ -798,8 +806,7 @@
     // the lowest-latency, lowest-CPU rung. The ladder steps down to software
     // then native on a stall, so a box without HW decode still recovers.
     let decodeMode: HardwareAcceleration = "prefer-hardware";
-    let decodeCalls = 0;
-    let decodeOutputs = 0;
+    const stallEvidence = new DecodeStallEvidence();
     // Decoded frames don't paint inside the output callback: the freshest
     // one is parked here (superseded frames close immediately — freshness
     // over completeness) and a rAF paints it. The decoder's frame pool can
@@ -808,37 +815,52 @@
     let paintScheduled = false;
     queuePeek = () => decoder?.decodeQueueSize ?? 0;
     decodeModeNote = native ? "native" : "";
-    // "webview (hw)" only asserts we *asked* for hardware (prefer-hardware);
-    // whether WKWebView honours it shows in whether decFps reaches 60.
-    decodePath = native ? "native (sw)" : "webview (hw)";
+    // These labels state the requested ladder, not an unobservable hardware
+    // guarantee. Backend diagnostics record the actual NVDEC/OpenH264 rung.
+    decodePath = native ? "native (NVDEC/OpenH264)" : "WebCodecs (HW requested)";
+
+    const closeDecoder = () => {
+      decoderGeneration += 1;
+      try {
+        if (decoder && decoder.state !== "closed") decoder.close();
+      } catch {
+        // already closed
+      }
+      decoder = null;
+    };
 
     const rebuildDecoder = () => {
+      rungErrors = 0;
+      stallEvidence.reset();
       if (decodeMode !== "prefer-software") {
         decodeMode = "prefer-software";
         decodeModeNote = "sw";
-        decodePath = "webview (sw)";
+        decodePath = "WebCodecs (SW requested)";
+        askRefresh();
       } else {
         // Software decode stalled too — hand the stream to the backend's
         // openh264 decoder. Setting the flag re-runs this effect, which
         // re-watches the route in native mode (and tears this rung down).
         console.warn(`video decoder (${codecString}) stalled twice — switching to native decode`);
         nativeDecode = true;
-        decodePath = "native (sw)";
-        askRefresh();
+        decodePath = "native (NVDEC/OpenH264)";
         return;
       }
       console.warn(
         `video decoder (${codecString}) stalled — rebuilding with ${decodeMode}`,
       );
-      try {
-        if (decoder && decoder.state !== "closed") decoder.close();
-      } catch {
-        // already closed
-      }
-      decoder = null; // re-created on the next key unit (≤2s away)
+      closeDecoder();
     };
-    stallKick = () => {
-      if (!cancelled && decoder) rebuildDecoder();
+    stallKick = (inputRate, decodedRate, paintRate) => {
+      if (cancelled || !decoder) return;
+      const evidence = stallEvidence.sample(decodedRate);
+      if (
+        evidence.silentSubmissions >= 20 ||
+        (inputRate > 5 && paintRate < inputRate / 4 && queuePeek() > 8)
+      ) {
+        stallEvidence.reset();
+        rebuildDecoder();
+      }
     };
 
     const paintPending = () => {
@@ -921,29 +943,24 @@
     // 2.4x is the live case: it exposes the VideoDecoder *shape* with no
     // working H.264 behind it (GStreamer-dependent), so the old "does
     // VideoDecoder exist" test chose a decoder that can only die.
-    let bornDeadDrops = 0;
+    let rungErrors = 0;
 
-    const dropDecoder = (why: unknown) => {
+    const dropDecoder = (why: unknown, instanceGeneration = decoderGeneration) => {
+      if (instanceGeneration !== decoderGeneration) return;
       // Surfaced, not swallowed: the chip counts these and the console
       // log names them — a decoder that quietly dies reads as a freeze.
       decodeFails += 1;
-      askRefresh();
+      rungErrors += 1;
       console.warn("video decode error:", why);
-      try {
-        if (decoder && decoder.state !== "closed") decoder.close();
-      } catch {
-        // already closed
-      }
-      decoder = null;
+      closeDecoder();
       // Nothing ever decoded on this rung and the decoder keeps dying:
       // that's a rung failure, not a glitch — walk the same ladder the
       // stall detectors use, which ends at the backend's native decoder.
-      if (decodeOutputs === 0) {
-        bornDeadDrops += 1;
-        if (bornDeadDrops >= 3) {
-          bornDeadDrops = 0;
-          rebuildDecoder();
-        }
+      if (rungErrors >= 3) {
+        rungErrors = 0;
+        rebuildDecoder();
+      } else {
+        askRefresh();
       }
     };
 
@@ -997,41 +1014,39 @@
         f.key &&
         decoder.decodeQueueSize > 12
       ) {
-        try {
-          decoder.close();
-        } catch {
-          // already closed
-        }
-        decoder = null; // re-created right below, at this key unit
+        closeDecoder();
       }
       if (!decoder || decoder.state === "closed") {
         if (!f.key) return;
-        codecString = spsCodecString(f.data) ?? codecString ?? "avc1.42E01F";
-        decoder = new VideoDecoder({
-          output: (frame) => {
-            decodeOutputs += 1;
-            decCount += 1;
-            if (pendingFrame) pendingFrame.close();
-            pendingFrame = frame;
-            if (!paintScheduled) {
-              paintScheduled = true;
-              requestAnimationFrame(paintPending);
-            }
-          },
-          // Recovery is the sender's periodic IDR: drop the decoder,
-          // re-init on the next key unit.
-          error: dropDecoder,
-        });
+        codecString = h264CodecString(f.data) ?? codecString ?? "avc1.42E01F";
+        const instanceGeneration = decoderGeneration + 1;
+        decoderGeneration = instanceGeneration;
         try {
+          decoder = new VideoDecoder({
+            output: (frame) => {
+              if (cancelled || instanceGeneration !== decoderGeneration) {
+                frame.close();
+                return;
+              }
+              rungErrors = 0;
+              decCount += 1;
+              if (pendingFrame) pendingFrame.close();
+              pendingFrame = frame;
+              if (!paintScheduled) {
+                paintScheduled = true;
+                requestAnimationFrame(paintPending);
+              }
+            },
+            error: (error) => dropDecoder(error, instanceGeneration),
+          });
           decoder.configure({
             codec: codecString,
             optimizeForLatency: true,
             hardwareAcceleration: decodeMode,
           });
-          decodeCalls = 0;
-          decodeOutputs = 0;
+          stallEvidence.reset();
         } catch (e) {
-          dropDecoder(e);
+          dropDecoder(e, instanceGeneration);
           return;
         }
       }
@@ -1043,36 +1058,44 @@
             data: f.data,
           }),
         );
-        decodeCalls += 1;
+        stallEvidence.noteSubmission();
       } catch (e) {
-        dropDecoder(e);
+        dropDecoder(e, decoderGeneration);
         return;
       }
       // Born-dead decoders (key accepted, nothing ever out) get the same
       // rebuild as mid-stream stalls — without waiting for the 1s sweep.
-      if (decodeOutputs === 0 && decodeCalls >= 20) rebuildDecoder();
+      // Never flush a live decoder as a liveness probe. WebCodecs requires a
+      // key after flush, so the following delta would create a false
+      // DataError/reset loop. The one-second decoded-cadence guard observes
+      // born-dead decoders after callbacks have had an event-loop turn.
       },
-      { decode: native },
+      {
+        decode: native,
+        diagnostics,
+        signal: watchAbort.signal,
+        onRegistered: (token) => (feedbackWatcherToken = token),
+      },
     ).then((u) => {
       // The route may have changed while the subscribe was in flight.
       if (cancelled) u();
-      else unwatch = u;
+      else {
+        unwatch = u;
+        if (native) askRefresh();
+      }
     });
     return () => {
       cancelled = true;
+      watchAbort.abort();
+      feedbackWatcherToken = 0;
       unwatch?.();
       unwatchStatus?.();
-      stallKick = () => {};
+      stallKick = (_inputFps, _decodedFps, _paintFps) => {};
       if (pendingFrame) {
         pendingFrame.close();
         pendingFrame = null;
       }
-      try {
-        if (decoder && decoder.state !== "closed") decoder.close();
-      } catch {
-        // already closed
-      }
-      decoder = null;
+      closeDecoder();
     };
   });
 
@@ -1105,9 +1128,8 @@
     // a console mid-chord (⌘W closes this very window) must not leave
     // the remote holding the modifier. The strip's armed modifiers too:
     // its own unmount discharge would fire after the route is gone.
-    keys.releaseAll();
+    releaseRemoteInput();
     releaseStrip();
-    touchMouse.reset();
     // UI resets synchronously; the await is only so a console window's
     // teardown reaches the backend before the webview dies. Bounded — a
     // wedged daemon must never hold a closing window hostage.
@@ -1373,8 +1395,17 @@
   // never disagree about where the cursor is. `heldButtons` stays the
   // single registry of what the remote believes is pressed.
   const virt = { x: 0.5, y: 0.5 };
-  function sendVirt() {
-    app.sendConsoleInput({ kind: "mouse_move", x: virt.x, y: virt.y, screen: controlScreen });
+  const heldButtons = makeRemoteButtonTracker((routeId, action) => {
+    void sendInput(routeId, action);
+  });
+  function sendVirt(routeId: string | null = app.consoleControlLive) {
+    if (!routeId) return;
+    void sendInput(routeId, {
+      kind: "mouse_move",
+      x: virt.x,
+      y: virt.y,
+      screen: controlScreen,
+    });
   }
   // The TeamViewer camera: zoomed in, the view keeps the remote cursor
   // CENTERED. Every steer pans the picture so the cursor slides back to the
@@ -1492,14 +1523,14 @@
     },
     button: (button, down) => {
       if (down) {
+        const routeId = app.consoleControlLive;
+        if (!routeId) return;
         // Land the cursor exactly where the trackpad believes it is,
         // then press — the same order the mouse path uses.
-        sendVirt();
-        app.sendConsoleInput({ kind: "mouse_button", button, down: true });
-        heldButtons.add(button);
+        sendVirt(routeId);
+        heldButtons.press(routeId, button);
       } else {
-        if (!heldButtons.delete(button)) return;
-        app.sendConsoleInput({ kind: "mouse_button", button, down: false });
+        heldButtons.release(button);
       }
     },
     wheel: (dx, dy) => app.sendConsoleInput({ kind: "wheel", dx, dy }),
@@ -1510,10 +1541,17 @@
       openMenu = null;
     },
   });
-  // Control dropping mid-gesture: whatever the fingers were holding lifts
-  // while the route can still carry it.
+  // Control dropping or changing routes mid-gesture lifts every held button
+  // through the exact route that received its press.
   $effect(() => {
-    if (!app.consoleControl) untrack(() => touchMouse.reset());
+    const routeAtStart = app.consoleControl ? app.consoleControlLive : null;
+    return () => {
+      if (!routeAtStart) return;
+      untrack(() => {
+        touchMouse.reset();
+        heldButtons.releaseAll();
+      });
+    };
   });
 
   // ---- pointer lock (theater mouse capture) --------------------------
@@ -1525,7 +1563,9 @@
   // browser's own gesture) releases; leaving theater or control drops it.
   let pointerLocked = $state(false);
   function lockChanged() {
+    const wasLocked = pointerLocked;
     pointerLocked = document.pointerLockElement === stageEl;
+    if (wasLocked && !pointerLocked) heldButtons.releaseAll();
   }
   function maybePointerLock() {
     if (theater && stagePointerActive && !pointerLocked) {
@@ -1587,6 +1627,12 @@
   }
 
   function onPointerButton(e: PointerEvent, down: boolean) {
+    if (!down && e.pointerType !== "touch") {
+      const released = heldButtons.release(e.button);
+      panFrom = null;
+      if (released) e.preventDefault();
+      return;
+    }
     // Real buttons living ON the stage ("Return video here") own their
     // taps: capturing the pointer here would retarget the derived click
     // onto the stage and the button would never fire.
@@ -1633,6 +1679,8 @@
       }
       return;
     }
+    const routeId = app.consoleControlLive;
+    if (!routeId) return;
     if (down) {
       // Hold the pointer for the whole press: a mouse drag that wanders
       // off the element keeps streaming its moves here, and the matching
@@ -1649,32 +1697,18 @@
     if (down) maybePointerLock();
     if (pointerLocked) {
       e.preventDefault();
-      app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
-      if (down) heldButtons.add(e.button);
-      else heldButtons.delete(e.button);
+      heldButtons.press(routeId, e.button);
       return;
     }
     const p = normPoint(e);
-    if (!p) {
-      // A release outside the streamed frame (a captured drag that wandered
-      // onto the letterbox bars or past the edge before lifting): still lift
-      // the button we pressed, or the remote is stranded mid-drag. Presses
-      // outside the frame stay ignored, as ever.
-      if (!down && heldButtons.delete(e.button)) {
-        e.preventDefault();
-        app.sendConsoleInput({ kind: "mouse_button", button: e.button, down: false });
-      }
-      return;
-    }
+    if (!p) return;
     e.preventDefault();
     // Land the cursor exactly where the click happened, then click.
     virt.x = p.x;
     virt.y = p.y;
     updateCrosshair();
-    app.sendConsoleInput({ kind: "mouse_move", ...p, screen: controlScreen });
-    app.sendConsoleInput({ kind: "mouse_button", button: e.button, down });
-    if (down) heldButtons.add(e.button);
-    else heldButtons.delete(e.button);
+    void sendInput(routeId, { kind: "mouse_move", ...p, screen: controlScreen });
+    heldButtons.press(routeId, e.button);
   }
 
   // Buttons currently pressed on the remote, so a pointer that *cancels*
@@ -1682,14 +1716,17 @@
   // pointer mid-drag) can lift what it pressed — its matching pointerup is
   // never coming, and without this the remote is stranded mid-drag with a
   // button held.
-  const heldButtons = new Set<number>();
   function onPointerCancel(e: PointerEvent) {
     if (e.pointerType === "touch") touchMouse.cancel(e);
     panFrom = null;
-    for (const b of heldButtons) {
-      app.sendConsoleInput({ kind: "mouse_button", button: b, down: false });
-    }
-    heldButtons.clear();
+    heldButtons.releaseAll();
+  }
+  function onLostPointerCapture(e: PointerEvent) {
+    // A normal touch pointerup releases capture after touchMouse.up already
+    // consumed it. Mouse capture loss has no second state machine to protect.
+    if (e.pointerType === "touch") return;
+    panFrom = null;
+    heldButtons.releaseAll();
   }
 
   // iPhone/iPad WebKit: touches already arrive as Pointer Events (that's
@@ -1738,6 +1775,13 @@
   // `code` rides along, and held keys are lifted in a burst whenever
   // their keyups can no longer arrive (blur, control off, session end).
   const keys = makeKeyForwarder((a) => app.sendConsoleInput(a));
+
+  function releaseRemoteInput() {
+    touchMouse.reset();
+    heldButtons.releaseAll();
+    keys.releaseAll();
+    panFrom = null;
+  }
 
   // The physical paste chord — Cmd+V (mac) / Ctrl+V (win·linux). `code` is
   // layout-independent, so this fires on the V key whatever it composes.
@@ -1893,10 +1937,11 @@
         onpointerdown={(e) => onPointerButton(e, true)}
         onpointerup={(e) => onPointerButton(e, false)}
         onpointercancel={onPointerCancel}
+        onlostpointercapture={onLostPointerCapture}
         onwheel={onWheel}
         onkeydown={(e) => onKey(e, true)}
         onkeyup={(e) => onKey(e, false)}
-        onblur={() => keys.releaseAll()}
+        onblur={releaseRemoteInput}
         oncontextmenu={(e) => app.consoleControl && e.preventDefault()}
       >
         {#if selectedPopped}

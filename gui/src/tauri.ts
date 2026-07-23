@@ -30,6 +30,9 @@ import type {
   UpdateStatus,
   VideoFrameMsg,
 } from "./types";
+import type { RouteHandle } from "./route-handle-state";
+
+export type { RouteHandle } from "./route-handle-state";
 
 interface ScanResult {
   node_id: string;
@@ -169,6 +172,17 @@ async function tryInvoke<T>(
   }
 }
 
+/** Invoke a command without converting a backend failure into `null`.
+ *  Store lifecycles use this when they can reconcile an optimistic route. */
+async function checkedInvoke<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T | null> {
+  if (!isTauri()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return (await invoke(cmd, args)) as T;
+}
+
 /** Mirror one diagnostic line into the backend's `tracing` log so a
  *  desktop session's *frontend* decisions land in the same capturable
  *  stream (`ALLMYSTUFF_GUI_LOG`) as the Rust side — no webview devtools to
@@ -195,13 +209,13 @@ export function scanSelf(): Promise<ScanResult | null> {
  *  the offer when the local daemon predates the track lane. MJPEG stays
  *  the floor both ends share, and `codec: "mjpeg"` forces it (the
  *  console's codec pill). */
-export function connectRoute(
+function connectRouteArgs(
   from: string,
   to: string,
   media: MediaKind,
   codec?: "auto" | "h264" | "mjpeg",
   session?: string | null,
-): Promise<string | null> {
+): Record<string, unknown> {
   const video =
     (media === "display" || media === "video") && codec !== "mjpeg"
       ? ["h264"]
@@ -210,13 +224,57 @@ export function connectRoute(
   // terminal Offer name an already-running host shell to attach to (shared,
   // tmux-style); null/undefined (and every non-terminal route) mints a fresh
   // one. Sent as null when absent so the backend's Option decodes cleanly.
-  return tryInvoke<string>("connect_route", {
+  return {
     from,
     to,
     media,
     video,
     session: session ?? null,
-  });
+  };
+}
+
+export function connectRoute(
+  from: string,
+  to: string,
+  media: MediaKind,
+  codec?: "auto" | "h264" | "mjpeg",
+  session?: string | null,
+): Promise<string | null> {
+  return tryInvoke<string>(
+    "connect_route",
+    connectRouteArgs(from, to, media, codec, session),
+  );
+}
+
+interface RouteHandleWire {
+  route_id: string;
+  generation: number;
+}
+
+/** Offer a route and retain the backend generation that owns this instance.
+ *  Unlike the legacy helper, backend failures reject so the store can undo
+ *  optimistic state instead of leaving a dead-looking local route behind. */
+export async function connectRouteHandle(
+  from: string,
+  to: string,
+  media: MediaKind,
+  codec?: "auto" | "h264" | "mjpeg",
+  session?: string | null,
+): Promise<RouteHandle | null> {
+  const result = await checkedInvoke<RouteHandleWire>(
+    "connect_route_handle",
+    connectRouteArgs(from, to, media, codec, session),
+  );
+  if (!result) return null;
+  if (
+    typeof result.route_id !== "string" ||
+    result.route_id.length === 0 ||
+    !Number.isSafeInteger(result.generation) ||
+    result.generation < 0
+  ) {
+    throw new Error("connect_route_handle returned an invalid route handle");
+  }
+  return { routeId: result.route_id, generation: result.generation };
 }
 
 /** The console's quality picks for a stream it's watching — each absent
@@ -248,8 +306,8 @@ export interface StreamTune {
 
 /** Ask the sender of `routeId` to stream with these picks. Best-effort:
  *  an old peer drops the ask and stays on automatic. */
-export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
-  return tryInvoke("tune_route", {
+function tuneRouteArgs(routeId: string, tune: StreamTune): Record<string, unknown> {
+  return {
     routeId,
     maxEdge: tune.maxEdge ?? null,
     bitrate: tune.bitrate ?? null,
@@ -258,7 +316,18 @@ export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
     priority: tune.priority ?? null,
     game: tune.game ?? null,
     mode: tune.mode ?? null,
-  });
+  };
+}
+
+export function tuneRoute(routeId: string, tune: StreamTune): Promise<null> {
+  return tryInvoke("tune_route", tuneRouteArgs(routeId, tune));
+}
+
+/** Tune with observable failure for stateful callers that can retry after the
+ *  matching route becomes active. Plain fire-and-forget callers keep using
+ *  the legacy helper above. */
+export async function tuneRouteChecked(routeId: string, tune: StreamTune): Promise<void> {
+  await checkedInvoke<null>("tune_route", tuneRouteArgs(routeId, tune));
 }
 
 /** The *effective* encode dials for a route — what the streamer is actually
@@ -324,20 +393,24 @@ export function refreshRoute(routeId: string): Promise<null> {
  *  best-effort (an old streamer drops it). */
 export function sendVideoFeedback(
   routeId: string,
+  watcherToken: number,
   recvFps: number,
   decodeFails: number,
   queueDepth: number,
 ): Promise<null> {
   return tryInvoke("video_feedback", {
     routeId,
+    watcherToken,
     recvFps,
     decodeFails,
     queueDepth,
   });
 }
 
-export function disconnectRoute(routeId: string): Promise<null> {
-  return tryInvoke("disconnect_route", { routeId });
+export function disconnectRoute(routeId: string, generation?: number): Promise<null> {
+  const args: Record<string, unknown> = { routeId };
+  if (generation !== undefined) args.generation = generation;
+  return tryInvoke("disconnect_route", args);
 }
 
 /** Claim a device as yours. The claim only takes if that device is in claim
@@ -591,16 +664,24 @@ function parseVideoPacket(
     sourceWidth: head.getUint32(12, true),
     sourceHeight: head.getUint32(16, true),
     seq: Number(head.getBigUint64(20, true)),
-    data: new Uint8Array(buf.slice(offset + 28, offset + len)),
+    // Keep the poll batch alive through this view instead of cloning every
+    // payload. A decoded 3440x1440 RGBA frame is almost 19 MiB, so the old
+    // slice doubled the largest allocation on every painted frame.
+    data: new Uint8Array(buf, offset + 28, len - 28),
   };
 }
 
+const VIDEO_WATCHER_STALE_ERROR = "VIDEO_WATCHER_STALE";
+
+function isStaleVideoWatcherError(error: unknown): boolean {
+  return String(error).includes(VIDEO_WATCHER_STALE_ERROR);
+}
+
 /** Stream one route's inbound video into this window by *pulling*: the
- *  backend queues raw packets per route and this drains them every
- *  display tick (`video_poll` → `[u32 len][packet]…`). A failed poll
- *  costs one tick and the next one recovers — unlike a push channel,
- *  where ordered delivery means one lost message silently freezes the
- *  stream while the backend keeps sending. `opts.decode` asks the backend
+ *  backend queues raw packets per route and an empty-to-non-empty event
+ *  drains them (`video_poll` → `[u32 len][packet]…`). Ready events are
+ *  latched across an active poll, so a coalesced wake cannot be lost.
+ *  `opts.decode` asks the backend
  *  to decode H.264 natively and deliver ready-to-paint RGBA (`raw`)
  *  packets — for webviews without WebCodecs, and the bottom rung of the
  *  console's decode ladder. Returns an unwatch fn (a no-op in web mode,
@@ -608,50 +689,206 @@ function parseVideoPacket(
 export async function watchVideo(
   routeId: string,
   cb: (f: VideoFrameMsg) => void,
-  opts?: { decode?: boolean },
+  opts?: {
+    decode?: boolean;
+    diagnostics?: boolean;
+    signal?: AbortSignal;
+    onRegistered?: (token: number) => void;
+  },
 ): Promise<() => void> {
-  if (!isTauri()) return () => {};
+  if (!isTauri() || opts?.signal?.aborted) return () => {};
   const { invoke } = await import("@tauri-apps/api/core");
   const { listen } = await import("@tauri-apps/api/event");
-  const token = (await invoke("video_watch", {
-    routeId,
-    decode: opts?.decode ?? false,
-  })) as number;
   let stopped = false;
+  let armed = false;
   let inFlight = false;
-  const tick = async () => {
-    if (stopped || inFlight) return;
+  let pending = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let token = 0;
+  let eventReadyAt = 0;
+  let diagPolls = 0;
+  let diagPackets = 0;
+  let diagBytes = 0;
+  let diagPollMs = 0;
+  let diagDispatchMs = 0;
+  let diagReadyWaitMs = 0;
+  let diagReadySamples = 0;
+
+  async function registerWatcher(): Promise<boolean> {
+    const retiredToken = token;
+    token = 0;
+    let backoffMs = 16;
+    let registrationError: unknown;
+    while (!stopped && !opts?.signal?.aborted && token === 0) {
+      try {
+        const candidate = (await invoke("video_watch", {
+          routeId,
+          decode: opts?.decode ?? false,
+        })) as number;
+        if (Number.isSafeInteger(candidate) && candidate > 0) token = candidate;
+      } catch (error) {
+        registrationError = error;
+      }
+      if (token === 0 && !opts?.signal?.aborted) {
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 1000);
+      }
+    }
+    if (retiredToken > 0 && retiredToken !== token) {
+      void invoke("video_unwatch", { routeId, token: retiredToken }).catch(() => {});
+    }
+    if (token > 0) {
+      opts?.onRegistered?.(token);
+      if (registrationError !== undefined && opts?.diagnostics) {
+        clientLog(
+          `[video-viewer] route=${routeId} registration recovered: ${String(registrationError)}`,
+        );
+      }
+      return true;
+    }
+    return false;
+  }
+
+  const signal = (fromReadyEvent = false) => {
+    if (stopped) return;
+    pending = true;
+    if (fromReadyEvent && !eventReadyAt) eventReadyAt = performance.now();
+    if (armed && !inFlight) void drain();
+  };
+
+  const drain = async () => {
+    if (stopped || !armed || inFlight) return;
     inFlight = true;
     try {
-      const batch = (await invoke("video_poll", { routeId })) as ArrayBuffer;
-      if (stopped || !(batch instanceof ArrayBuffer)) return;
-      const view = new DataView(batch);
-      let offset = 0;
-      while (offset + 4 <= batch.byteLength) {
-        const len = view.getUint32(offset, true);
-        offset += 4;
-        if (len === 0 || offset + len > batch.byteLength) break;
-        const packet = parseVideoPacket(batch, offset, len);
-        offset += len;
-        if (packet) cb(packet);
+      // Ready events can arrive while video_poll is awaiting its response.
+      // Keep that wake latched and drain again before releasing the pump.
+      do {
+        pending = false;
+        const started = performance.now();
+        if (eventReadyAt) {
+          diagReadyWaitMs += started - eventReadyAt;
+          diagReadySamples += 1;
+          eventReadyAt = 0;
+        }
+        const batch = (await invoke("video_poll", { routeId, token })) as ArrayBuffer;
+        const polled = performance.now();
+        if (stopped || !(batch instanceof ArrayBuffer)) continue;
+        const view = new DataView(batch);
+        let offset = 0;
+        let packets = 0;
+        while (offset + 4 <= batch.byteLength) {
+          const len = view.getUint32(offset, true);
+          offset += 4;
+          if (len === 0 || offset + len > batch.byteLength) break;
+          const packet = parseVideoPacket(batch, offset, len);
+          offset += len;
+          if (packet) {
+            packets += 1;
+            try {
+              cb(packet);
+            } catch (error) {
+              if (opts?.diagnostics) {
+                clientLog(
+                  `[video-viewer] route=${routeId} callback failed: ${String(error)}`,
+                );
+              }
+              // The backend batch is already drained. If one H.264 callback
+              // fails, continuity of the remaining access units is no longer
+              // proven, so explicitly request a clean entry and keep parsing.
+              void invoke("video_refresh", { routeId }).catch(() => {});
+            }
+          }
+        }
+        if (opts?.diagnostics) {
+          diagPolls += 1;
+          diagPackets += packets;
+          diagBytes += batch.byteLength;
+          diagPollMs += polled - started;
+          diagDispatchMs += performance.now() - polled;
+        }
+      } while (!stopped && pending);
+    } catch (error) {
+      // A failed local IPC round trip gets the old one-tick recovery delay,
+      // but only after an actual failure. Do not spin or poll while idle.
+      pending = false;
+      if (isStaleVideoWatcherError(error)) {
+        armed = false;
+        if (opts?.diagnostics) {
+          clientLog(
+            `[video-viewer] route=${routeId} watcher token retired; registering a replacement`,
+          );
+        }
+        if (await registerWatcher()) {
+          armed = true;
+          pending = true;
+        }
+        return;
       }
-    } catch {
-      // One missed poll; the next tick drains everything queued.
+      retryTimer ??= setTimeout(() => {
+        retryTimer = undefined;
+        signal();
+      }, 16);
     } finally {
       inFlight = false;
+      if (!stopped && pending) void drain();
     }
   };
-  // Drain on the backend's "queue went non-empty" poke — event delivery
-  // isn't timer-throttled, so an occluded (non-maximized) console keeps
-  // painting at full rate, and arrival-driven pulls beat the interval's
-  // worst-case 16 ms. The interval stays as the safety net.
+
+  // Listen before registering the watch so the first empty-to-non-empty poke
+  // cannot race ahead of this webview's subscription.
   const unlisten = await listen<string>("allmystuff://video-ready", (e) => {
-    if (e.payload === routeId) void tick();
+    if (e.payload === routeId) signal(true);
   });
-  const timer = setInterval(() => void tick(), 16);
+
+  // A node restart can make registration fail while the event pump is already
+  // reconnecting. Retry on the existing 16 ms local recovery cadence, backing
+  // off only as far as the node's existing one-second reconnect cadence. The
+  // caller's AbortSignal stops an obsolete route from retrying forever.
+  if (!(await registerWatcher()) || opts?.signal?.aborted) {
+    stopped = true;
+    unlisten();
+    if (token > 0) void invoke("video_unwatch", { routeId, token }).catch(() => {});
+    return () => {};
+  }
+  armed = true;
+  signal();
+
+  // Keep the established 16 ms safety heartbeat. Besides recovering a ready
+  // event lost during event-stream reconnect, the backend's stale-teardown
+  // fence treats a poll at least 32 ms after disconnect as proof that the
+  // replacement viewer is alive. Slowing this heartbeat can break rapid
+  // monitor or codec switches. Ready events still drain immediately, and the
+  // latch prevents an event arriving during a poll from being discarded.
+  const watchdog = setInterval(signal, 16);
+
+  // These local viewer-boundary timings use the existing opt-in development
+  // diagnostics setting. They do not create a peer message.
+  const diagTimer = opts?.diagnostics
+    ? setInterval(() => {
+        if (diagPolls > 0 || diagPackets > 0) {
+          const mib = diagBytes / (1024 * 1024);
+          const avgPoll = diagPolls ? diagPollMs / diagPolls : 0;
+          const avgDispatch = diagPolls ? diagDispatchMs / diagPolls : 0;
+          const avgReady = diagReadySamples ? diagReadyWaitMs / diagReadySamples : 0;
+          clientLog(
+            `[video-viewer] route=${routeId} polls=${diagPolls} packets=${diagPackets} bytes_mib=${mib.toFixed(2)} poll_ms_avg=${avgPoll.toFixed(3)} dispatch_ms_avg=${avgDispatch.toFixed(3)} ready_wait_ms_avg=${avgReady.toFixed(3)}`,
+          );
+        }
+        diagPolls = 0;
+        diagPackets = 0;
+        diagBytes = 0;
+        diagPollMs = 0;
+        diagDispatchMs = 0;
+        diagReadyWaitMs = 0;
+        diagReadySamples = 0;
+      }, 1000)
+    : undefined;
+
   return () => {
     stopped = true;
-    clearInterval(timer);
+    if (retryTimer !== undefined) clearTimeout(retryTimer);
+    clearInterval(watchdog);
+    if (diagTimer !== undefined) clearInterval(diagTimer);
     unlisten();
     void invoke("video_unwatch", { routeId, token }).catch(() => {});
   };

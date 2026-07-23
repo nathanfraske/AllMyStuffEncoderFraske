@@ -128,9 +128,9 @@ mod tests {
         assert_eq!(p.version, "0.2.4");
         assert!(p.features.iter().any(|f| f == "terminal"));
         assert!(p.capabilities.iter().any(|c| c.origin == "viewer"));
-        // A viewer phone offers two source-capable endpoints: touch control
-        // (input source) and the clipboard (duplex).
-        assert_eq!(p.summary.device_count, 2);
+        // A viewer phone offers one source-capable endpoint: touch control.
+        // Clipboard stays absent until the mobile shell has a real backend.
+        assert_eq!(p.summary.device_count, 1);
 
         // The whole profile round-trips through JSON like any other peer's.
         let json = serde_json::to_string(&p).unwrap();
@@ -150,8 +150,8 @@ mod tests {
         };
         let p = mobile_profile(&me, &cfg, 1, "0.2.4");
         assert_eq!(p.label, "Pixel 9");
-        // Host scope adds camera + mic + screen sources on top of the viewer's
-        // two (touch control + clipboard) → 5 offerable endpoints.
-        assert_eq!(p.summary.device_count, 5);
+        // Host scope adds camera + mic + screen sources on top of touch
+        // control, for four offerable endpoints.
+        assert_eq!(p.summary.device_count, 4);
     }
 }

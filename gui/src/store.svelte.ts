@@ -50,8 +50,9 @@ import {
   clientLog,
   closeThisWindow,
   connectRoute,
+  connectRouteHandle,
   labsSet,
-  tuneRoute,
+  tuneRouteChecked,
   type StreamTune,
   type VideoLocalEvent,
   consoleWindowTarget,
@@ -195,6 +196,17 @@ import {
   type SessionSnapshot,
   type WindowBehavior,
 } from "./tauri";
+import {
+  RouteHandleState,
+  type RouteConnectIntent,
+  type RouteHandle,
+} from "./route-handle-state";
+import {
+  planConsoleRouteRecovery,
+  reconcileAuthoritativeRouteSnapshot,
+  type ConsoleRouteBinding,
+  type ConsoleRouteRecovery,
+} from "./route-snapshot-state";
 import {
   CAP_TAG_ALLMYSTUFF,
   displayName,
@@ -718,6 +730,10 @@ class AppStore {
   /** One aggregate cap covers the whole peer, so unlike resolution/rate it
    *  follows the console across source changes instead of being per-monitor. */
   private consolePeerCapBps = $state<number | undefined>(undefined);
+  /** `undefined` normally means no aggregate override. This bit preserves an
+   *  explicit Auto reset while a route is still connecting, because the
+   *  backend represents that reset as zero rather than an absent field. */
+  private consolePeerCapAuto = false;
   /** The selected source's codec (which transport to *offer*). "auto" and
    *  "h264" both offer H.264; "mjpeg" forces the fallback. */
   get consoleCodec(): "auto" | "h264" | "mjpeg" {
@@ -763,6 +779,7 @@ class AppStore {
   videoPopoutLive = $state<string | null>(null);
   /** Owned-for-teardown route id (`cap:` popouts that created theirs). */
   private videoPopoutRouteId: string | null = null;
+  private videoPopoutEpoch = 0;
   /** Bumped when this popout should re-assert its frame watch — a console
    *  window booting may have briefly claimed the same route's watch slot
    *  before the popout census told it to back off (watch claims replace
@@ -2333,53 +2350,28 @@ class AppStore {
       }
     }
 
-    // Reflect live routes (active ones become catalog routes), and keep
-    // the per-route negotiation states for whoever watches one (a
-    // terminal tab telling "connecting" from "rejected" by its reason).
-    const states: Record<string, RouteLiveState> = {};
-    const sessions: Record<string, string> = {};
-    for (const lr of snap.routes ?? []) {
-      states[lr.route.id] = lr.state;
-      // The resolved terminal session id (multi-attach) the host bound this
-      // route to, when it sent one — the tab labels and re-queries by it.
-      if (lr.term_session) sessions[lr.route.id] = lr.term_session;
-      const active = lr.state.state === "active";
-      const id = lr.route.id;
-      const exists = this.catalog.routes.some((r) => r.id === id);
-      if (active && !exists) {
-        this.catalog.routes.push({ ...lr.route });
-      } else if (!active && exists) {
-        this.catalog.routes = this.catalog.routes.filter((r) => r.id !== id);
-      }
-    }
-    this.routeStates = states;
-    this.routeSessions = sessions;
-
-    // A console leg the far side REFUSED: the controlled machine rejects the
-    // control/clipboard route when our events fail its authorization gate
-    // (e.g. this device fell off its fleet roster). Flip the toggle off and
-    // say why — the old behaviour was a live-looking toggle typing into the
-    // void, which read as "controls just stopped working".
-    const refusal = (live: string | null): string | null => {
-      if (!live) return null;
-      const st = states[live];
-      return st?.state === "rejected" ? st.reason || "the far side refused it" : null;
-    };
-    const controlRefused = refusal(this.consoleControlLive);
-    if (controlRefused) {
-      this.toast("warn", `Keyboard & mouse ended: ${controlRefused}`);
-      if (this.consoleControlRouteId) void this.disconnect(this.consoleControlRouteId);
-      this.consoleControlRouteId = null;
-      this.consoleControlLive = null;
-      this.consoleControl = false;
-    }
-    const clipboardRefused = refusal(this.consoleClipboardLive);
-    if (clipboardRefused) {
-      this.toast("warn", `Clipboard passthrough ended: ${clipboardRefused}`);
-      if (this.consoleClipboardRouteId) void this.disconnect(this.consoleClipboardRouteId);
-      this.consoleClipboardRouteId = null;
-      this.consoleClipboardLive = null;
-      this.consoleClipboard = false;
+    // `routes` is a complete backend view when present. An explicit empty
+    // list therefore clears anything the backend no longer has. The only
+    // exception is a local offer still in flight, or a returned handle that
+    // has not appeared in a backend snapshot yet. Those remain visible as
+    // desired/pending rather than being mistaken for live or erased by a
+    // predecessor's final snapshot.
+    let states = this.routeStates;
+    if (snap.routes !== undefined) {
+      const bindings = this.consoleRouteBindings();
+      const reconciled = reconcileAuthoritativeRouteSnapshot(
+        this.catalog.routes,
+        snap.routes,
+        this.backendRouteHandles,
+        bindings.flatMap((binding) => (binding.routeId ? [binding.routeId] : [])),
+      );
+      this.catalog.routes = reconciled.routes;
+      this.routeStates = reconciled.states;
+      this.routeSessions = reconciled.sessions;
+      states = reconciled.states;
+      this.applyConsoleRouteRecoveries(
+        planConsoleRouteRecovery(bindings, reconciled.losses),
+      );
     }
 
     // Reconcile site mappings against what each host now advertises: a host
@@ -2405,10 +2397,142 @@ class AppStore {
     ) {
       this.startConsoleAutoLegs();
     }
+    if (
+      this.consoleTuneRetry &&
+      this.consoleTuneRetry.routeId === this.consoleVideoLive &&
+      this.consoleTuneRetry.sourceId === this.consoleInput &&
+      states[this.consoleTuneRetry.routeId]?.state === "active"
+    ) {
+      void this.flushConsoleTune();
+    }
 
     this.applyDurableShares(snap.shares ?? []);
     this.reconcileFleetRelationships();
     this.reconcileShares();
+  }
+
+  private consoleRouteBindings(): ConsoleRouteBinding[] {
+    const videoRoute = this.consoleVideoLive ?? this.consoleVideoRouteId;
+    const controlRoute = this.consoleControlLive ?? this.consoleControlRouteId;
+    const clipboardRoute = this.consoleClipboardLive ?? this.consoleClipboardRouteId;
+    return [
+      {
+        lane: "video",
+        routeId: videoRoute,
+        desired:
+          !!this.consoleNodeId &&
+          !!this.consoleInput &&
+          !this.isVideoPopped(`cap:${this.consoleInput ?? ""}`),
+      },
+      {
+        lane: "input",
+        routeId: controlRoute,
+        desired: this.consoleControl && !this.consoleUserOff.has("control"),
+      },
+      {
+        lane: "clipboard",
+        routeId: clipboardRoute,
+        desired: this.consoleClipboard && !this.consoleUserOff.has("clipboard"),
+      },
+    ];
+  }
+
+  private applyConsoleRouteRecoveries(recoveries: readonly ConsoleRouteRecovery[]) {
+    let reconnectVideo = false;
+    let reconnectControl = false;
+    let reconnectClipboard = false;
+
+    for (const recovery of recoveries) {
+      const detail =
+        recovery.loss.reason ||
+        (recovery.loss.cause === "rejected"
+          ? "the far side refused it"
+          : "the backend no longer reports the route");
+
+      if (recovery.lane === "video") {
+        if (
+          this.consoleVideoLive !== recovery.routeId &&
+          this.consoleVideoRouteId !== recovery.routeId
+        ) {
+          continue;
+        }
+        this.consoleVideoEpoch += 1;
+        this.consoleTuneAttempt += 1;
+        this.consoleTuneRetry = null;
+        this.consoleVideoLive = null;
+        this.consoleVideoRouteId = null;
+        if (recovery.action === "reconnect") {
+          reconnectVideo = true;
+          clientLog(`[routes] video route ${recovery.routeId} absent; reconnecting`);
+        } else {
+          clientLog(
+            `[routes] video route ${recovery.routeId} ended (${recovery.loss.cause}): ${detail}`,
+          );
+          this.toast("warn", `Screen stream ended: ${detail}`);
+        }
+        continue;
+      }
+
+      if (recovery.lane === "input") {
+        if (
+          this.consoleControlLive !== recovery.routeId &&
+          this.consoleControlRouteId !== recovery.routeId
+        ) {
+          continue;
+        }
+        this.consoleControlLive = null;
+        this.consoleControlRouteId = null;
+        this.consoleControl = false;
+        if (recovery.action === "reconnect") {
+          reconnectControl = true;
+          clientLog(`[routes] control route ${recovery.routeId} absent; reconnecting`);
+        } else {
+          this.consoleUserOff.add("control");
+          clientLog(
+            `[routes] control route ${recovery.routeId} ended (${recovery.loss.cause}): ${detail}`,
+          );
+          this.toast("warn", `Keyboard & mouse ended: ${detail}`);
+        }
+        continue;
+      }
+
+      if (
+        this.consoleClipboardLive !== recovery.routeId &&
+        this.consoleClipboardRouteId !== recovery.routeId
+      ) {
+        continue;
+      }
+      this.consoleClipboardLive = null;
+      this.consoleClipboardRouteId = null;
+      this.consoleClipboard = false;
+      if (recovery.action === "reconnect") {
+        reconnectClipboard = true;
+        clientLog(`[routes] clipboard route ${recovery.routeId} absent; reconnecting`);
+      } else {
+        this.consoleUserOff.add("clipboard");
+        clientLog(
+          `[routes] clipboard route ${recovery.routeId} ended (${recovery.loss.cause}): ${detail}`,
+        );
+        this.toast("warn", `Clipboard passthrough ended: ${detail}`);
+      }
+    }
+
+    if (reconnectVideo) {
+      // Reuse the established startup sequencing so video is offered first
+      // and any simultaneously missing control/clipboard legs follow it.
+      void this.wireConsoleFirstVideo();
+      return;
+    }
+    if (reconnectControl && this.consoleNodeId && !this.consoleUserOff.has("control")) {
+      this.toggleConsoleControl();
+    }
+    if (
+      reconnectClipboard &&
+      this.consoleNodeId &&
+      !this.consoleUserOff.has("clipboard")
+    ) {
+      this.toggleConsoleClipboard();
+    }
   }
 
   /** Project each node's **standing** onto the stored `relationship.kind`, the
@@ -2868,13 +2992,109 @@ class AppStore {
   /** When a real backend is connected, fire the actual mesh route offer.
    *  The backend's session snapshots then keep the route's live state in
    *  sync; in web mode this is a no-op and the local route stands in. */
+  private backendRouteHandles = new RouteHandleState();
+  private backendRouteReady = new Map<string, Promise<RouteHandle | null>>();
+
   private fireBackendConnect(
     from: string,
     to: string,
     media: MediaKind,
     codec?: "auto" | "h264" | "mjpeg",
-  ) {
-    if (this.backendConnected) void connectRoute(from, to, media, codec);
+  ): Promise<RouteHandle | null> {
+    if (!this.backendConnected) return Promise.resolve(null);
+    const routeId = `route:${from}\u2192${to}`;
+    const start = this.backendRouteHandles.begin(routeId);
+    const pending = this.completeBackendConnect(start.intent, start.displaced, from, to, media, codec);
+    this.backendRouteReady.set(routeId, pending);
+    void pending.finally(() => {
+      if (this.backendRouteReady.get(routeId) === pending) {
+        this.backendRouteReady.delete(routeId);
+      }
+    });
+    return pending;
+  }
+
+  private async completeBackendConnect(
+    intent: RouteConnectIntent,
+    displaced: RouteHandle | null,
+    from: string,
+    to: string,
+    media: MediaKind,
+    codec?: "auto" | "h264" | "mjpeg",
+  ): Promise<RouteHandle | null> {
+    if (displaced) {
+      await disconnectRoute(displaced.routeId, displaced.generation);
+      if (!this.backendRouteHandles.isCurrent(intent)) return null;
+    }
+
+    let handle: RouteHandle | null;
+    try {
+      handle = await connectRouteHandle(from, to, media, codec);
+    } catch (error) {
+      if (this.backendRouteHandles.fail(intent)) {
+        this.reconcileBackendConnectFailure(intent.routeId, error);
+      }
+      return null;
+    }
+
+    if (!handle) {
+      const error = new Error("connect_route_handle returned no handle");
+      if (this.backendRouteHandles.fail(intent)) {
+        this.reconcileBackendConnectFailure(intent.routeId, error);
+      }
+      return null;
+    }
+
+    const settlement = this.backendRouteHandles.settle(intent, handle);
+    if (!settlement.accepted) {
+      const current = this.backendRouteHandles.isCurrent(intent);
+      if (current && this.backendRouteHandles.fail(intent)) {
+        this.reconcileBackendConnectFailure(
+          intent.routeId,
+          new Error(`backend returned handle for ${handle.routeId}`),
+        );
+      }
+      // The connect completed after its local intent was closed or replaced.
+      // Close that exact generation so it cannot touch the newer instance.
+      await disconnectRoute(settlement.stale.routeId, settlement.stale.generation);
+      return null;
+    }
+
+    return handle;
+  }
+
+  private reconcileBackendConnectFailure(routeId: string, error: unknown) {
+    const visible =
+      this.consoleVideoLive === routeId ||
+      this.consoleAudioRouteId === routeId ||
+      this.consoleControlLive === routeId ||
+      this.consoleClipboardLive === routeId ||
+      this.videoPopoutLive === routeId ||
+      this.videoPopoutRouteId === routeId;
+
+    this.catalog.routes = this.catalog.routes.filter((r) => r.id !== routeId);
+    if (this.consoleVideoLive === routeId) this.consoleVideoLive = null;
+    if (this.consoleVideoRouteId === routeId) this.consoleVideoRouteId = null;
+    if (this.consoleAudioRouteId === routeId) {
+      this.consoleAudioRouteId = null;
+      this.consoleAudio = false;
+    }
+    if (this.consoleControlLive === routeId) this.consoleControlLive = null;
+    if (this.consoleControlRouteId === routeId) {
+      this.consoleControlRouteId = null;
+      this.consoleControl = false;
+    }
+    if (this.consoleClipboardLive === routeId) this.consoleClipboardLive = null;
+    if (this.consoleClipboardRouteId === routeId) {
+      this.consoleClipboardRouteId = null;
+      this.consoleClipboard = false;
+    }
+    if (this.videoPopoutLive === routeId) this.videoPopoutLive = null;
+    if (this.videoPopoutRouteId === routeId) this.videoPopoutRouteId = null;
+
+    const detail = errMsg(error);
+    clientLog(`[routes] connect failed for ${routeId}: ${detail}`);
+    if (visible) this.toast("warn", `Connection failed: ${detail}`);
   }
 
   private addRoute(from: string, to: string) {
@@ -2889,7 +3109,15 @@ class AppStore {
    *  callers that must outlive the call (a closing console window) await
    *  it, everyone else ignores it. */
   disconnect(routeId: string): Promise<unknown> {
-    const sent = this.backendConnected ? disconnectRoute(routeId) : Promise.resolve(null);
+    const invalidated = this.backendRouteHandles.invalidate(routeId);
+    this.backendRouteReady.delete(routeId);
+    const sent = !this.backendConnected
+      ? Promise.resolve(null)
+      : invalidated.handle
+        ? disconnectRoute(routeId, invalidated.handle.generation)
+        : invalidated.tracked
+          ? Promise.resolve(null)
+          : disconnectRoute(routeId);
     this.catalog.routes = this.catalog.routes.filter((r) => r.id !== routeId);
     return sent;
   }
@@ -3013,8 +3241,8 @@ class AppStore {
     this.consoleUserOff.clear();
     this.consoleInput = this.consoleVideoInputs(nodeId)[0]?.id ?? null;
     this.consoleCodecBySource = {};
-    this.consoleTuneBySource = {};
     this.consolePeerCapBps = undefined;
+    this.consolePeerCapAuto = false;
     if (isTauri() && !isMobile()) {
       // Census before the first wire: ping for popout windows and give
       // their `opened` answers a beat to land, so a console (re)opening
@@ -3146,6 +3374,9 @@ class AppStore {
     this.consoleAudio = false;
     this.consoleControl = false;
     this.consoleClipboard = false;
+    this.consoleVideoEpoch += 1;
+    this.consoleTuneAttempt += 1;
+    this.consoleTuneRetry = null;
     this.consoleAutoLegs = false;
     if (this.consoleAutoLegsFallback) {
       clearTimeout(this.consoleAutoLegsFallback);
@@ -3170,9 +3401,90 @@ class AppStore {
   /** Bumped per video (re)wire; an apply that awaited a teardown checks it
    *  before connecting, so rapid tab clicks can't interleave two wires. */
   private consoleVideoEpoch = 0;
+  private consoleTuneAttempt = 0;
+  private consoleTuneRetry: { routeId: string; sourceId: string } | null = null;
+
+  private desiredConsoleWireTune(sourceId: string): StreamTune {
+    const tune: StreamTune = {
+      ...(this.consoleTuneBySource[sourceId] ?? {}),
+      peerCapBps: this.consolePeerCapBps,
+      priority: true,
+    };
+    if (this.consolePeerCapAuto) tune.peerCapBps = 0;
+    return tune;
+  }
+
+  private async sendConsoleTuneForCurrent(
+    routeId: string,
+    sourceId: string,
+    tune: StreamTune,
+  ): Promise<boolean> {
+    if (
+      !this.backendConnected ||
+      this.consoleVideoLive !== routeId ||
+      this.consoleInput !== sourceId
+    ) {
+      return false;
+    }
+
+    const handle = this.backendRouteHandles.currentHandle(routeId);
+    const active = this.routeStates[routeId]?.state === "active";
+    if (!this.backendRouteHandles.canAddress(routeId, active)) {
+      this.consoleTuneRetry = { routeId, sourceId };
+      return false;
+    }
+
+    const generation = handle?.generation ?? null;
+    const attempt = ++this.consoleTuneAttempt;
+    try {
+      await tuneRouteChecked(routeId, tune);
+    } catch (error) {
+      const currentHandle = this.backendRouteHandles.currentHandle(routeId);
+      const sameGeneration =
+        generation === null
+          ? currentHandle === null
+          : currentHandle?.generation === generation;
+      if (
+        attempt === this.consoleTuneAttempt &&
+        sameGeneration &&
+        this.consoleVideoLive === routeId &&
+        this.consoleInput === sourceId
+      ) {
+        this.consoleTuneRetry = { routeId, sourceId };
+        clientLog(`[console] tune failed for ${routeId}: ${errMsg(error)}; retaining desired tune`);
+      }
+      return false;
+    }
+
+    const currentHandle = this.backendRouteHandles.currentHandle(routeId);
+    const sameGeneration =
+      generation === null ? currentHandle === null : currentHandle?.generation === generation;
+    if (
+      attempt === this.consoleTuneAttempt &&
+      sameGeneration &&
+      this.consoleVideoLive === routeId &&
+      this.consoleInput === sourceId
+    ) {
+      this.consoleTuneRetry = null;
+    }
+    return true;
+  }
+
+  private flushConsoleTune(): Promise<boolean> {
+    const routeId = this.consoleVideoLive;
+    const sourceId = this.consoleInput;
+    if (!routeId || !sourceId) return Promise.resolve(false);
+    return this.sendConsoleTuneForCurrent(
+      routeId,
+      sourceId,
+      this.desiredConsoleWireTune(sourceId),
+    );
+  }
 
   private async applyConsoleVideo() {
     const epoch = ++this.consoleVideoEpoch;
+    this.consoleTuneAttempt += 1;
+    this.consoleTuneRetry = null;
     if (this.consoleVideoRouteId) {
       const old = this.consoleVideoRouteId;
       this.consoleVideoRouteId = null;
@@ -3228,10 +3540,25 @@ class AppStore {
     // created it.
     this.consoleVideoLive = leg?.id ?? null;
     this.consoleVideoRouteId = leg?.created ? leg.id : null;
+    if (!leg) return;
+    if (leg.ready) {
+      const handle = await leg.ready;
+      if (
+        epoch !== this.consoleVideoEpoch ||
+        this.consoleInput !== inp.id ||
+        this.consoleVideoLive !== leg.id
+      ) {
+        return;
+      }
+      // A current null means the checked backend offer failed. Its failure
+      // path already removed the optimistic route and reconciled the surface.
+      if (this.backendConnected && !handle) return;
+    }
     // Carry the quality picks onto the fresh route and elect the selected
-    // source. Priority is a live scheduler hint inside the established media
-    // path; it does not reconnect the route or disturb the fast switch path.
-    if (leg) void tuneRoute(leg.id, { ...this.consoleTune, priority: true });
+    // source only after the matching backend generation exists. A newer
+    // switch cannot reach this point because both the video epoch and live
+    // route are checked after the asynchronous handle returns.
+    await this.flushConsoleTune();
   }
 
   /** Re-drive the console's video wire once a video input for the open
@@ -3259,6 +3586,7 @@ class AppStore {
     if (!s) return;
     if (Object.prototype.hasOwnProperty.call(patch, "peerCapBps")) {
       this.consolePeerCapBps = patch.peerCapBps;
+      this.consolePeerCapAuto = patch.peerCapBps == null;
     }
     // Aggregate policy and the transient priority election are not source
     // settings; keep only route-local dials in the per-source map.
@@ -3269,24 +3597,15 @@ class AppStore {
       ...this.consoleTuneBySource,
       [s]: { ...(this.consoleTuneBySource[s] ?? {}), ...routePatch },
     };
-    if (this.consoleVideoLive) {
-      const wireTune = { ...this.consoleTune, priority: true };
-      // Preserve absence for focus-only Tunes; zero is the explicit backend
-      // representation for the user's "All media: Auto" reset.
-      if (
-        Object.prototype.hasOwnProperty.call(patch, "peerCapBps") &&
-        patch.peerCapBps == null
-      ) {
-        wireTune.peerCapBps = 0;
-      }
-      void tuneRoute(this.consoleVideoLive, wireTune);
-    }
+    if (this.consoleVideoLive) void this.flushConsoleTune();
   }
 
   /** Window focus elects the active display without touching route topology. */
   prioritizeConsoleVideo() {
-    if (this.consoleVideoLive) {
-      void tuneRoute(this.consoleVideoLive, { priority: true });
+    const routeId = this.consoleVideoLive;
+    const sourceId = this.consoleInput;
+    if (routeId && sourceId) {
+      void this.sendConsoleTuneForCurrent(routeId, sourceId, { priority: true });
     }
   }
 
@@ -3516,7 +3835,7 @@ class AppStore {
     from: string,
     to: string,
     codec?: "auto" | "h264" | "mjpeg",
-  ): { id: string; created: boolean } | null {
+  ): { id: string; created: boolean; ready?: Promise<RouteHandle | null> } | null {
     // A dialed CEC customer never becomes "mine" or "shared" — the customer's
     // live consent grant is the authorization, and *their* node enforces it
     // (per offer for the screen, per frame for control). Routing these legs
@@ -3534,18 +3853,23 @@ class AppStore {
       if (!this.capability(from) || !this.capability(to)) return null;
       const id = `route:${from}→${to}`;
       const existedBefore = this.catalog.routes.some((r) => r.id === id);
+      let ready: Promise<RouteHandle | null> | undefined;
       if (!existedBefore) {
         this.addRoute(from, to);
-        this.fireBackendConnect(from, to, this.capability(from)!.media, codec);
+        ready = this.fireBackendConnect(from, to, this.capability(from)!.media, codec);
       }
-      return { id, created: !existedBefore };
+      return { id, created: !existedBefore, ready };
     }
     const id = `route:${from}→${to}`;
     const existedBefore = this.catalog.routes.some((r) => r.id === id);
     this.connect(from, to, codec);
     const existsNow = this.catalog.routes.some((r) => r.id === id);
     if (!existsNow) return null; // blocked / denied — nothing got wired
-    return { id, created: !existedBefore };
+    return {
+      id,
+      created: !existedBefore,
+      ready: this.backendRouteReady.get(id),
+    };
   }
 
   // ---- video popouts (one stream in its own OS window) --------------
@@ -3560,17 +3884,21 @@ class AppStore {
    *  the route never lands and never heals. Here the leg is wired directly;
    *  if the far side really wouldn't allow it, the host rejects and the popout
    *  shows that. Returns the route id and whether this call created it. */
-  private wirePopoutLeg(from: string, to: string): { id: string; created: boolean } | null {
+  private wirePopoutLeg(
+    from: string,
+    to: string,
+  ): { id: string; created: boolean; ready?: Promise<RouteHandle | null> } | null {
     const src = this.capability(from);
     const sink = this.capability(to);
     if (!src || !sink) return null;
     const id = `route:${from}→${to}`;
     const existedBefore = this.catalog.routes.some((r) => r.id === id);
+    let ready: Promise<RouteHandle | null> | undefined;
     if (!existedBefore) {
       this.addRoute(from, to);
-      this.fireBackendConnect(from, to, src.media);
+      ready = this.fireBackendConnect(from, to, src.media);
     }
-    return { id, created: !existedBefore };
+    return { id, created: !existedBefore, ready };
   }
 
   /** Whether the stream behind `key` is held in a popout window. */
@@ -3696,13 +4024,29 @@ class AppStore {
    *  sink, exactly as the console stage would; a `share:` key only
    *  watches the sender's existing route. Announces `opened` either way. */
   initVideoPopout(key: string) {
+    const epoch = ++this.videoPopoutEpoch;
     this.videoPopoutKey = key;
     if (key.startsWith("cap:")) {
       const cap = this.capability(key.slice(4));
       const sink = cap ? matchEndpoint(this.catalog, this.localId, cap.media, "consume") : null;
       const leg = cap && sink ? this.wirePopoutLeg(cap.id, sink.id) : null;
-      this.videoPopoutLive = leg?.id ?? null;
       this.videoPopoutRouteId = leg?.created ? leg.id : null;
+      this.videoPopoutLive = null;
+      if (leg?.ready) {
+        void leg.ready.then((handle) => {
+          if (
+            epoch !== this.videoPopoutEpoch ||
+            this.videoPopoutKey !== key ||
+            (leg.created && this.videoPopoutRouteId !== leg.id)
+          ) {
+            return;
+          }
+          if (this.backendConnected && !handle) return;
+          this.videoPopoutLive = leg.id;
+        });
+      } else {
+        this.videoPopoutLive = leg?.id ?? null;
+      }
     } else if (key.startsWith("share:")) {
       this.videoPopoutLive = key.slice(6);
     }
@@ -3716,6 +4060,7 @@ class AppStore {
   async closeVideoPopout() {
     const key = this.videoPopoutKey;
     if (!key) return;
+    this.videoPopoutEpoch += 1;
     this.videoPopoutKey = null;
     this.videoPopoutLive = null;
     const owned = this.videoPopoutRouteId;

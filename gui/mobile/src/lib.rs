@@ -179,6 +179,7 @@ pub fn run() {
             scan_full,
             client_log,
             commands::connect_route,
+            commands::connect_route_handle,
             commands::disconnect_route,
             commands::claim_node,
             commands::upgrade_node,

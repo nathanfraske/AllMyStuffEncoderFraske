@@ -539,10 +539,16 @@ impl DecodeBridge {
     }
 
     pub fn stop(&self, route_id: &str) {
-        if self.routes.lock().remove(route_id).is_some() {
+        let retired = self.routes.lock().remove(route_id);
+        if let Some(retired) = retired {
+            retired.stop.store(true, Ordering::SeqCst);
             // The start line names the decode path in use; the stop is
             // routine teardown (every tab switch in native mode).
             tracing::debug!("native H.264 decoder stopped for {route_id}");
+            // Route removal is the synchronization point for successor feeds.
+            // Join the retired driver worker off the node-control path so a
+            // slow decode call cannot block codec switching or another route.
+            std::thread::spawn(move || drop(retired));
         }
     }
 }
@@ -968,6 +974,7 @@ fn run_decode<F, G>(
     let mut zero_output_since: Option<Instant> = None;
     let mut zero_output_aus = 0u32;
     let mut zero_output_bytes = 0u64;
+    let mut zero_output_last_ts_us: Option<u64> = None;
     let mut last_queue_reset: Option<Instant> = None;
 
     while !stop.load(Ordering::SeqCst) {
@@ -985,11 +992,23 @@ fn run_decode<F, G>(
                         && zero_output_since.is_some_and(|t| t.elapsed() >= STATS_EVERY)
                     {
                         tracing::warn!(
-                            "video decoder for {route_id} accepted {zero_output_aus} AU(s) / {zero_output_bytes} bytes but has produced no picture"
+                            "video decoder for {route_id} accepted {zero_output_aus} AU(s) / {zero_output_bytes} bytes for {STATS_EVERY:?} but produced no picture; retiring the rung"
                         );
-                        zero_output_since = Some(Instant::now());
+                        #[cfg(all(windows, feature = "host"))]
+                        match decoder.as_ref() {
+                            Some(Active::H264(H264Rung::Nvdec(_))) => h264_runtime.demote(),
+                            Some(Active::Hevc(rung)) if rung.is_nvdec() => {
+                                let _ = hevc_runtime.demote_from_nvdec(hevc_nvdec_pinned);
+                            }
+                            _ => {}
+                        }
+                        decoder = None;
+                        waiting_key = true;
+                        on_glitch(zero_output_last_ts_us);
+                        zero_output_since = None;
                         zero_output_aus = 0;
                         zero_output_bytes = 0;
+                        zero_output_last_ts_us = None;
                     }
                     continue;
                 }
@@ -1044,6 +1063,7 @@ fn run_decode<F, G>(
             zero_output_since = None;
             zero_output_aus = 0;
             zero_output_bytes = 0;
+            zero_output_last_ts_us = None;
             if let Some(entry) = saved_entry {
                 // Re-enter immediately from the newest complete SPS/PPS/key
                 // unit. It is processed before any later queued delta.
@@ -1077,6 +1097,7 @@ fn run_decode<F, G>(
                 zero_output_since = None;
                 zero_output_aus = 0;
                 zero_output_bytes = 0;
+                zero_output_last_ts_us = None;
             }
         }
         if decoder.is_none() {
@@ -1135,6 +1156,7 @@ fn run_decode<F, G>(
                         last_err = Some(Instant::now());
                         tracing::warn!("decoder init for {route_id} failed: {e}");
                     }
+                    on_glitch(Some(au.ts_us));
                     continue;
                 }
             }
@@ -1229,6 +1251,7 @@ fn run_decode<F, G>(
                 zero_output_since = None;
                 zero_output_aus = 0;
                 zero_output_bytes = 0;
+                zero_output_last_ts_us = None;
                 on_glitch(Some(lost_ts_us));
                 continue;
             }
@@ -1241,6 +1264,7 @@ fn run_decode<F, G>(
         let mut delivery_observations = Vec::new();
         let frames_before = frames;
         let mut broke: Option<String> = None;
+        let mut zero_output_failure = false;
         match dec {
             Active::H264(rung) => match rung {
                 H264Rung::Software(dec) => {
@@ -1271,9 +1295,6 @@ fn run_decode<F, G>(
                 H264Rung::Nvdec(hw) => match hw.decode_typed(&au.data, au.ts_us) {
                     Ok(pics) => {
                         waiting_key = false;
-                        if !is_key {
-                            h264_runtime.note_delta_success();
-                        }
                         let (n, dims) = emit_nv_frames(
                             pics,
                             &on_frame,
@@ -1282,6 +1303,9 @@ fn run_decode<F, G>(
                             &mut delivery_spent,
                             &mut delivery_observations,
                         );
+                        if !is_key && n > 0 {
+                            h264_runtime.note_delta_success();
+                        }
                         if let Some(dims) = dims {
                             frames += n;
                             out_dims = dims;
@@ -1536,11 +1560,14 @@ fn run_decode<F, G>(
                 zero_output_since = None;
                 zero_output_aus = 0;
                 zero_output_bytes = 0;
+                zero_output_last_ts_us = None;
             } else {
                 zero_output_since.get_or_insert_with(Instant::now);
                 zero_output_aus = zero_output_aus.saturating_add(1);
                 zero_output_bytes = zero_output_bytes.saturating_add(au.data.len() as u64);
+                zero_output_last_ts_us = Some(au.ts_us);
                 if zero_output_aus >= ZERO_OUTPUT_AU_LIMIT {
+                    zero_output_failure = true;
                     broke = Some(format!(
                         "decoder accepted {zero_output_aus} AU(s) / {zero_output_bytes} bytes without producing a picture"
                     ));
@@ -1548,6 +1575,16 @@ fn run_decode<F, G>(
             }
         }
         if let Some(e) = broke {
+            if zero_output_failure {
+                #[cfg(all(windows, feature = "host"))]
+                match decoder.as_ref() {
+                    Some(Active::H264(H264Rung::Nvdec(_))) => h264_runtime.demote(),
+                    Some(Active::Hevc(rung)) if rung.is_nvdec() => {
+                        let _ = hevc_runtime.demote_from_nvdec(hevc_nvdec_pinned);
+                    }
+                    _ => {}
+                }
+            }
             // Corrupt bitstream (a lost unit upstream): drop the decoder,
             // re-enter at the next IDR. Rate-limited — at frame rate this
             // would otherwise be a log flood.
@@ -1560,6 +1597,7 @@ fn run_decode<F, G>(
             zero_output_since = None;
             zero_output_aus = 0;
             zero_output_bytes = 0;
+            zero_output_last_ts_us = None;
             // Frame health: name the AU that broke — a capable sender
             // heals with a wave instead of a keyframe wall.
             on_glitch(Some(au.ts_us));

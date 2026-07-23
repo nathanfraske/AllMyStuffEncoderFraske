@@ -772,6 +772,9 @@ impl StatusReporter {
 struct RouteVideo {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Process-local incarnation identity. A retiring worker may clean the
+    /// registry only while this exact generation is still installed.
+    generation: Arc<()>,
     /// Everything needed to restart this capture on a retune.
     mode: VideoMode,
     source: VideoSource,
@@ -795,9 +798,13 @@ struct RouteVideo {
 impl Drop for RouteVideo {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        // A capture backend can be stuck inside an OS or driver call. Joining
+        // here runs on the caller, which is often a Tokio route task, and can
+        // strand every later StopMedia/StartMedia action behind that call.
+        // Dropping JoinHandle detaches the worker; the stop flag asks a
+        // responsive backend to leave, and the worker's registration guard
+        // cleans an unexpected self-exit without blocking this path.
+        drop(self.thread.take());
     }
 }
 
@@ -958,6 +965,12 @@ impl AutoAdapt {
         }
     }
 
+    fn neutral(&self) {
+        let mut state = self.state.lock();
+        state.bad = 0;
+        state.good = 0;
+    }
+
     /// Fold one feedback report in; returns `Some((from, to))` when the cap
     /// stepped (0 = uncapped), for the caller to log. `now` is passed in so
     /// the streak/hold logic is unit-testable.
@@ -971,7 +984,7 @@ impl AutoAdapt {
         // `recv_fps` is a raw peer-controlled u32 off the feedback wire;
         // `saturating_mul` keeps a hostile value from wrapping (and from
         // aborting outright if overflow-checks are ever enabled).
-        let bad = fb.recv_fps.saturating_mul(4) < fps_target || fb.queue_depth > 24;
+        let bad = fb.queue_depth > 24 || fb.delay_trend_us_per_s > 20_000;
         let good = fb.recv_fps.saturating_mul(4) >= fps_target.saturating_mul(3)
             && fb.decode_fails == 0
             && fb.queue_depth <= 8;
@@ -1021,13 +1034,68 @@ impl AutoAdapt {
 
 #[derive(Default)]
 pub struct VideoBridge {
-    routes: Mutex<HashMap<String, RouteVideo>>,
+    routes: Arc<Mutex<HashMap<String, RouteVideo>>>,
     /// Per-route receiver health, keyed by route id (see [`RecvFeedback`]).
-    feedback: Mutex<HashMap<String, RecvFeedback>>,
+    feedback: Arc<Mutex<HashMap<String, RecvFeedback>>>,
     /// Recent loss-report instants per route — the density signal the GDR
     /// wave chooser reads (a lossy spell heals with a short, fat wave; a
     /// one-off keeps the smooth default).
-    loss_marks: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
+    loss_marks: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
+    /// Weak entries keep same-id worker bodies serialized even after their
+    /// RouteVideo registry entry is replaced. Dead route ids are discarded
+    /// opportunistically on the next capture start.
+    route_serials: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+}
+
+/// RAII ownership of a running capture worker's registry entry.
+///
+/// A backend may return normally, return an error, or unwind. In every case
+/// this guard retires the entry only if the same generation is still current.
+/// A predecessor therefore cannot erase a concurrently-installed successor.
+struct CaptureWorkerRegistration {
+    routes: std::sync::Weak<Mutex<HashMap<String, RouteVideo>>>,
+    feedback: std::sync::Weak<Mutex<HashMap<String, RecvFeedback>>>,
+    loss_marks: std::sync::Weak<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
+    route_id: String,
+    generation: Arc<()>,
+}
+
+impl Drop for CaptureWorkerRegistration {
+    fn drop(&mut self) {
+        let Some(routes) = self.routes.upgrade() else {
+            return;
+        };
+        let removed = {
+            let mut routes = routes.lock();
+            if !routes
+                .get(&self.route_id)
+                .is_some_and(|route| Arc::ptr_eq(&route.generation, &self.generation))
+            {
+                return;
+            }
+
+            // Keep the route lock across side-map cleanup. A same-id start
+            // cannot install its successor between the generation check and
+            // these removals, so this worker never erases successor state.
+            if let Some(feedback) = self.feedback.upgrade() {
+                feedback.lock().remove(&self.route_id);
+            }
+            if let Some(loss_marks) = self.loss_marks.upgrade() {
+                loss_marks.lock().remove(&self.route_id);
+            }
+            route_live().lock().remove(&self.route_id);
+            routes.remove(&self.route_id)
+        };
+        if removed.is_some() {
+            tracing::warn!(
+                "video capture worker for {} exited while still current; retired its route registration",
+                self.route_id
+            );
+        }
+        // Dropping the removed RouteVideo requests stop and detaches this
+        // thread's own JoinHandle. It never attempts a self-join.
+        drop(removed);
+    }
 }
 
 impl VideoBridge {
@@ -1055,11 +1123,10 @@ impl VideoBridge {
         S: Fn(VideoStatusState, Option<String>) + Send + Sync + 'static,
     {
         // `Effect::StartMedia` is deduplicated by the session state machine,
-        // so reaching this boundary means a real incarnation. A same-id
-        // predecessor can remain in the registry after its worker exited (or
-        // while a stale StopMedia is being ignored); stop and join it before
-        // the successor captures so callbacks and monitor sessions never
-        // overlap.
+        // so reaching this boundary means a real incarnation. Stop a same-id
+        // predecessor without waiting on its capture backend here. The shared
+        // per-route serial gate still prevents the successor's worker body
+        // from overlapping it.
         let displaced = self.take_existing_capture(&route_id);
         if displaced.is_some() {
             tracing::warn!("replacing prior video capture worker for same-id route {route_id}");
@@ -1077,6 +1144,17 @@ impl VideoBridge {
 
     fn take_existing_capture(&self, route_id: &str) -> Option<RouteVideo> {
         self.routes.lock().remove(route_id)
+    }
+
+    fn capture_serial(&self, route_id: &str) -> Arc<Mutex<()>> {
+        let mut serials = self.route_serials.lock();
+        serials.retain(|_, serial| serial.strong_count() > 0);
+        if let Some(serial) = serials.get(route_id).and_then(std::sync::Weak::upgrade) {
+            return serial;
+        }
+        let serial = Arc::new(Mutex::new(()));
+        serials.insert(route_id.to_string(), Arc::downgrade(&serial));
+        serial
     }
 
     /// The route ids with a live capture pump — for the mesh to sweep
@@ -1254,6 +1332,12 @@ impl VideoBridge {
         let refresh = Arc::new(AtomicBool::new(false));
         let idr_ms = Arc::new(AtomicU64::new(IDR_MS_TIGHT));
         let auto = AutoAdapt::new();
+        let generation = Arc::new(());
+        let serial = self.capture_serial(&route_id);
+        // The worker cannot finish and clean itself before its RouteVideo is
+        // installed. This is a start barrier only; sending never waits for
+        // capture or teardown.
+        let (registered_tx, registered_rx) = mpsc::channel::<()>();
         let (stop_thread, refresh_thread, idr_thread, auto_thread, cb) = (
             stop.clone(),
             refresh.clone(),
@@ -1264,7 +1348,30 @@ impl VideoBridge {
         let status_cb = on_status.clone();
         let id = route_id.clone();
         let src = source.clone();
+        let generation_thread = generation.clone();
+        let serial_thread = serial.clone();
+        let routes_thread = Arc::downgrade(&self.routes);
+        let feedback_thread = Arc::downgrade(&self.feedback);
+        let loss_marks_thread = Arc::downgrade(&self.loss_marks);
         let thread = std::thread::spawn(move || {
+            if registered_rx.recv().is_err() {
+                return;
+            }
+            let _registration = CaptureWorkerRegistration {
+                routes: routes_thread,
+                feedback: feedback_thread,
+                loss_marks: loss_marks_thread,
+                route_id: id.clone(),
+                generation: generation_thread,
+            };
+
+            // A stopped predecessor may still be blocked inside its backend.
+            // Waiting belongs to this detached worker, never the Tokio route
+            // task. Every generation for this route id uses the same gate.
+            let _same_id_serial = serial_thread.lock();
+            if stop_thread.load(Ordering::SeqCst) {
+                return;
+            }
             // This thread exists for the moments the machine is loaded, and
             // its sleeps pace a 60 fps budget — hold the 1 ms timer quantum
             // and boost the thread (priority, EcoQoS opt-out, P-core
@@ -1275,7 +1382,22 @@ impl VideoBridge {
                 VideoSource::Screen(_) => "screen",
                 VideoSource::Camera(_) => "camera",
             };
-            if let Err(e) = run_capture(
+            let packet_stop = stop_thread.clone();
+            let guarded_packet: Arc<dyn Fn(VideoPacket) -> bool + Send + Sync> =
+                Arc::new(move |packet| {
+                    if packet_stop.load(Ordering::SeqCst) {
+                        false
+                    } else {
+                        cb(packet)
+                    }
+                });
+            let status_stop = stop_thread.clone();
+            let guarded_status: OnStatus = Arc::new(move |state, detail| {
+                if !status_stop.load(Ordering::SeqCst) {
+                    status_cb(state, detail);
+                }
+            });
+            let result = run_capture(
                 &stop_thread,
                 &refresh_thread,
                 &idr_thread,
@@ -1284,12 +1406,16 @@ impl VideoBridge {
                 mode,
                 &src,
                 tune,
-                cb,
-                status_cb,
-            ) {
+                guarded_packet,
+                guarded_status,
+            );
+            if let Err(e) = result {
                 tracing::warn!("{what} capture for {id} stopped: {e}");
+            } else if !stop_thread.load(Ordering::SeqCst) {
+                tracing::warn!("{what} capture for {id} ended without a stop request");
             }
         });
+        let registration_id = route_id.clone();
         let displaced = {
             let mut routes = self.routes.lock();
             routes.insert(
@@ -1297,6 +1423,7 @@ impl VideoBridge {
                 RouteVideo {
                     stop,
                     thread: Some(thread),
+                    generation: generation.clone(),
                     mode,
                     source,
                     on_packet,
@@ -1308,12 +1435,28 @@ impl VideoBridge {
                 },
             )
         };
-        // Join any concurrently displaced capture thread (RouteVideo::drop) only after the
-        // routes lock is released — joining a thread under the lock would
-        // block every other route op, and on the async start path stall a
-        // tokio worker. `start_capture` normally removed its predecessor
-        // before spawning; the explicit drop also makes two racing starts safe.
+        // RouteVideo::drop only signals and detaches, but keep all destruction
+        // outside the registry lock. The serial gate preserves same-id worker
+        // ordering for two racing starts.
         drop(displaced);
+        if registered_tx.send(()).is_err() {
+            tracing::warn!(
+                "video capture worker for {registration_id} exited before its registry start barrier"
+            );
+            let removed = {
+                let mut routes = self.routes.lock();
+                if routes
+                    .get(&registration_id)
+                    .is_some_and(|route| Arc::ptr_eq(&route.generation, &generation))
+                {
+                    route_live().lock().remove(&registration_id);
+                    routes.remove(&registration_id)
+                } else {
+                    None
+                }
+            };
+            drop(removed);
+        }
     }
 
     /// Ask `route_id`'s encoder for a clean decode entry on its next
@@ -1490,6 +1633,27 @@ impl VideoBridge {
         est_kbps: u32,
         delay_trend_us_per_s: i32,
     ) {
+        // A registered viewer emits a zero-valued beat before its first frame
+        // so route teardown quarantine can prove the replacement is alive.
+        // It is ownership/liveness, not evidence about network or decode load.
+        if recv_fps == 0 && decode_fails == 0 && queue_depth == 0 {
+            tracing::debug!("video feedback {route_id}: viewer alive, awaiting first frame");
+            if let Some((idr_ms, auto)) = self
+                .routes
+                .lock()
+                .get(route_id)
+                .map(|route| (route.idr_ms.clone(), route.auto.clone()))
+            {
+                idr_ms.store(IDR_MS_TIGHT, Ordering::Relaxed);
+                auto.neutral();
+            }
+            if let Some(rate) = route_rates().lock().get(route_id).cloned() {
+                let mut adapt = rate.adapt.lock();
+                adapt.bad = 0;
+                adapt.good = 0;
+            }
+            return;
+        }
         let fb = RecvFeedback {
             recv_fps,
             decode_fails,
@@ -1628,7 +1792,7 @@ impl VideoBridge {
     /// Restart `route_id`'s capture with the viewer's quality picks.
     pub fn retune(&self, route_id: &str, tune: Tune) {
         // A duplicate of the current dials must not pay a capture restart —
-        // that's a thread teardown+join, a fresh encoder ladder, and an IDR
+        // that's a thread teardown, a fresh encoder ladder, and an IDR
         // hiccup. Slider/pill UIs re-send their value on release, and the
         // session layer applies no debounce, so the dedupe lives here.
         if self
@@ -1649,7 +1813,7 @@ impl VideoBridge {
             old.on_packet.clone(),
             old.on_status.clone(),
         );
-        drop(old); // joins the old capture thread; its session releases
+        drop(old); // signals the old worker; its detached body releases the session
         let posture = match tune.posture() {
             Posture::Reach => "reach",
             Posture::Balanced => "balanced",
@@ -1675,11 +1839,8 @@ impl VideoBridge {
     }
 
     pub fn stop(&self, route_id: &str) {
-        // Bind the removed route so its Drop (the capture-thread join) runs
-        // after the routes lock guard is released, never under it — an
-        // unbound `remove(..);` would drop the RouteVideo (and join) while the
-        // guard is still held (temporary drop order), blocking the lock on a
-        // thread join.
+        // Bind the removed route so its Drop runs after the routes lock guard
+        // is released. Destruction signals and detaches the capture worker.
         let removed = self.routes.lock().remove(route_id);
         self.feedback.lock().remove(route_id);
         // Reap the pollable live cell too, so a stopped route stops
@@ -5411,25 +5572,21 @@ fn rate_adapt_floor(tune: Tune) -> u32 {
 fn rate_adapt_step(
     state: &mut RateAdaptState,
     fb: &RecvFeedback,
-    target_fps: u32,
+    _target_fps: u32,
     current: u32,
     ceiling: u32,
     floor: u32,
     now: Instant,
 ) -> Option<u32> {
-    // Congestion evidence, most-direct first: the viewer's decode queue
-    // backing up, decode failures (loss), the arrival-rate estimate
-    // sagging below what we send, a sustained one-way-delay ramp, or the
-    // rendered cadence collapsing versus target.
+    // Congestion evidence is limited to backlog and path measurements.
     let est_sagging = fb.est_kbps > 0 && (fb.est_kbps as u64 * 1000) < (current as u64 * 85 / 100);
     let delay_ramping = fb.delay_trend_us_per_s > 20_000; // +20 ms of queue per second
-    let struggling = fb.queue_depth > 8
-        || fb.decode_fails > 0
-        || est_sagging
-        || delay_ramping
-        || (target_fps > 0
-            && fb.recv_fps > 0
-            && fb.recv_fps.saturating_mul(10) < target_fps.saturating_mul(7));
+                                                          // Low decoded cadence alone is ambiguous: an unchanged desktop is sent
+                                                          // only on the static refresh cadence, and decoder capability failures are
+                                                          // repaired by the decode ladder. Cut rate only on transport/backlog
+                                                          // evidence. This prevents clean hardware fallback or a still screen from
+                                                          // being misclassified as congestion.
+    let struggling = fb.queue_depth > 8 || est_sagging || delay_ramping;
     let held = state
         .last_step
         .is_some_and(|t| now.duration_since(t) < RATE_HOLD);
@@ -6469,6 +6626,24 @@ mod tests {
     }
 
     #[test]
+    fn static_cadence_and_decoder_fallback_do_not_cut_transport_rate() {
+        let mut state = RateAdaptState::default();
+        let now = Instant::now();
+        let static_clean = fb(1, 0, 0);
+        let capability_fallback = fb(60, 3, 0);
+        for sample in [static_clean, capability_fallback] {
+            for _ in 0..(RATE_BAD_STREAK + RATE_GOOD_STREAK) {
+                assert_eq!(
+                    rate_adapt_step(
+                        &mut state, &sample, 60, 40_000_000, 40_000_000, RATE_FLOOR, now,
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn policy_caps_recover_upward_without_erasing_congestion_backoff() {
         assert_eq!(
             rebase_rate_target(40_000_000, 40_000_000, 10_000_000),
@@ -6584,27 +6759,27 @@ mod tests {
         let auto = AutoAdapt::new();
         let t0 = Instant::now();
         // Two struggling reports: not yet a verdict.
-        assert_eq!(auto.observe(&fb(2, 2, 0), 60, t0), None);
-        assert_eq!(auto.observe(&fb(0, 1, 0), 60, t0), None);
+        assert_eq!(auto.observe(&fb(2, 2, 40), 60, t0), None);
+        assert_eq!(auto.observe(&fb(0, 1, 40), 60, t0), None);
         assert!(auto.edge_cap().is_none());
         // Third consecutive: step down one rung.
-        assert_eq!(auto.observe(&fb(4, 0, 0), 60, t0), Some((0, 2560)));
+        assert_eq!(auto.observe(&fb(4, 0, 40), 60, t0), Some((0, 2560)));
         assert_eq!(auto.edge_cap(), Some(2560));
         // Still struggling immediately after — held by the settle window,
         // no second step until it has had time to show up in feedback.
         for _ in 0..5 {
-            assert_eq!(auto.observe(&fb(0, 0, 0), 60, t0), None);
+            assert_eq!(auto.observe(&fb(0, 0, 40), 60, t0), None);
         }
         // Past the hold, the sustained stall steps again.
         let t1 = t0 + AUTO_DOWN_HOLD;
-        assert_eq!(auto.observe(&fb(0, 0, 0), 60, t1), Some((2560, 1920)));
+        assert_eq!(auto.observe(&fb(0, 0, 40), 60, t1), Some((2560, 1920)));
         // A healthy report in a bad streak resets it — no flappy verdicts.
         let t2 = t1 + AUTO_DOWN_HOLD;
-        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
-        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 40), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 40), 60, t2), None);
         assert_eq!(auto.observe(&fb(55, 0, 0), 60, t2), None); // healthy
-        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
-        assert_eq!(auto.observe(&fb(1, 0, 0), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 40), 60, t2), None);
+        assert_eq!(auto.observe(&fb(1, 0, 40), 60, t2), None);
         assert_eq!(auto.edge_cap(), Some(1920), "reset streak must not step");
     }
 
@@ -6638,7 +6813,7 @@ mod tests {
         let auto = AutoAdapt::new();
         let t1 = Instant::now();
         for _ in 0..AUTO_BAD_STREAK {
-            auto.observe(&fb(0, 0, 0), 60, t1);
+            auto.observe(&fb(0, 0, 40), 60, t1);
         }
         assert_eq!(auto.edge_cap(), Some(2560));
         let t2 = t1 + AUTO_UP_HOLD;
@@ -6961,19 +7136,48 @@ mod tests {
     }
 
     #[test]
-    fn existing_capture_worker_is_joined_before_successor_reuses_route_id() {
-        fn fake_route(exited: Arc<AtomicBool>) -> RouteVideo {
-            let stop = Arc::new(AtomicBool::new(false));
-            let thread_stop = stop.clone();
-            let thread = std::thread::spawn(move || {
-                while !thread_stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                exited.store(true, Ordering::SeqCst);
-            });
+    fn capture_worker_drop_signals_and_detaches_without_waiting_for_backend_exit() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert!(thread_stop.load(Ordering::SeqCst));
+            exited_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let route = RouteVideo {
+            stop: stop.clone(),
+            thread: Some(thread),
+            generation: Arc::new(()),
+            mode: VideoMode::Mjpeg,
+            source: VideoSource::Screen(None),
+            on_packet: Arc::new(|_| true),
+            on_status: Arc::new(|_, _| {}),
+            refresh: Arc::new(AtomicBool::new(false)),
+            idr_ms: Arc::new(AtomicU64::new(IDR_MS_TIGHT)),
+            tune: Tune::default(),
+            auto: AutoAdapt::new(),
+        };
+
+        // The worker is deliberately blocked independently of its stop flag.
+        // This line can complete only when RouteVideo::drop does not join it.
+        drop(route);
+        assert!(stop.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        exited_rx.recv().unwrap();
+    }
+
+    #[test]
+    fn worker_exit_cleanup_is_generation_exact_and_reaps_live_state() {
+        fn dormant_route(generation: Arc<()>) -> RouteVideo {
             RouteVideo {
-                stop,
-                thread: Some(thread),
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: None,
+                generation,
                 mode: VideoMode::Mjpeg,
                 source: VideoSource::Screen(None),
                 on_packet: Arc::new(|_| true),
@@ -6986,30 +7190,75 @@ mod tests {
         }
 
         let bridge = VideoBridge::new();
-        let old_exited = Arc::new(AtomicBool::new(false));
-        bridge
-            .routes
-            .lock()
-            .insert("same-id".into(), fake_route(old_exited.clone()));
-
-        let displaced = bridge
-            .take_existing_capture("same-id")
-            .expect("predecessor registry entry");
-        assert!(!bridge.routes.lock().contains_key("same-id"));
-        drop(displaced);
+        let route_id = "worker-exit-generation-test";
+        let serial_a = bridge.capture_serial(route_id);
+        let serial_b = bridge.capture_serial(route_id);
         assert!(
-            old_exited.load(Ordering::SeqCst),
-            "predecessor is stopped and joined before successor insertion"
+            Arc::ptr_eq(&serial_a, &serial_b),
+            "same-id generations must share the worker-serialization gate"
         );
 
-        let successor_exited = Arc::new(AtomicBool::new(false));
+        let old_generation = Arc::new(());
         bridge
             .routes
             .lock()
-            .insert("same-id".into(), fake_route(successor_exited.clone()));
-        assert!(bridge.routes.lock().contains_key("same-id"));
-        bridge.stop("same-id");
-        assert!(successor_exited.load(Ordering::SeqCst));
+            .insert(route_id.into(), dormant_route(old_generation.clone()));
+        let old_registration = CaptureWorkerRegistration {
+            routes: Arc::downgrade(&bridge.routes),
+            feedback: Arc::downgrade(&bridge.feedback),
+            loss_marks: Arc::downgrade(&bridge.loss_marks),
+            route_id: route_id.into(),
+            generation: old_generation,
+        };
+
+        let successor_generation = Arc::new(());
+        let displaced = bridge
+            .routes
+            .lock()
+            .insert(route_id.into(), dormant_route(successor_generation.clone()));
+        drop(displaced);
+        route_live()
+            .lock()
+            .insert(route_id.into(), Arc::new(RouteLive::default()));
+        bridge.feedback.lock().insert(
+            route_id.into(),
+            RecvFeedback {
+                recv_fps: 60,
+                decode_fails: 0,
+                queue_depth: 0,
+                est_kbps: 0,
+                delay_trend_us_per_s: 0,
+                at: Instant::now(),
+            },
+        );
+        bridge
+            .loss_marks
+            .lock()
+            .entry(route_id.into())
+            .or_default()
+            .push_back(Instant::now());
+        drop(old_registration);
+        assert!(bridge
+            .routes
+            .lock()
+            .get(route_id)
+            .is_some_and(|route| { Arc::ptr_eq(&route.generation, &successor_generation) }));
+        assert!(route_live().lock().contains_key(route_id));
+        assert!(bridge.feedback.lock().contains_key(route_id));
+        assert!(bridge.loss_marks.lock().contains_key(route_id));
+
+        let successor_registration = CaptureWorkerRegistration {
+            routes: Arc::downgrade(&bridge.routes),
+            feedback: Arc::downgrade(&bridge.feedback),
+            loss_marks: Arc::downgrade(&bridge.loss_marks),
+            route_id: route_id.into(),
+            generation: successor_generation,
+        };
+        drop(successor_registration);
+        assert!(!bridge.routes.lock().contains_key(route_id));
+        assert!(!route_live().lock().contains_key(route_id));
+        assert!(!bridge.feedback.lock().contains_key(route_id));
+        assert!(!bridge.loss_marks.lock().contains_key(route_id));
     }
 
     #[test]

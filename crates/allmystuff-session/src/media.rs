@@ -30,6 +30,12 @@ pub struct VideoFrame {
     pub t: MediaTagVideo,
     /// The route this frame belongs to.
     pub route: String,
+    /// Exact negotiated lifetime of the deterministic route id. New peers set
+    /// this on every MJPEG chunk so a delayed predecessor cannot seed the
+    /// successor's assembler after sequence numbers restart at zero. Absent
+    /// only for a legacy route whose control handshake also had no incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
     pub seq: u64,
     /// Encoded frame dimensions (after any sender-side downscale).
     pub width: u32,
@@ -60,6 +66,11 @@ pub struct InputEvent {
     /// Tag for demuxing off the shared media channel. Always `"input"`.
     pub t: MediaTagInput,
     pub route: String,
+    /// Exact negotiated lifetime of the deterministic route id. New peers set
+    /// this on every input frame; absent only for a legacy route whose control
+    /// handshake also had no incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
     pub seq: u64,
     #[serde(flatten)]
     pub action: InputAction,
@@ -741,6 +752,7 @@ impl VideoFrame {
         VideoFrame {
             t: MediaTagVideo::Video,
             route: route.into(),
+            incarnation: None,
             seq,
             width,
             height,
@@ -769,6 +781,7 @@ impl VideoFrame {
             .map(|(i, piece)| VideoFrame {
                 t: MediaTagVideo::Video,
                 route: self.route.clone(),
+                incarnation: self.incarnation.clone(),
                 seq: self.seq,
                 width: self.width,
                 height: self.height,
@@ -788,7 +801,7 @@ impl VideoFrame {
 /// out-of-range indices, ballooning totals) are dropped wholesale.
 #[derive(Debug, Default)]
 pub struct VideoAssembler {
-    partial: std::collections::HashMap<String, PartialFrame>,
+    partial: std::collections::HashMap<(String, Option<String>), PartialFrame>,
 }
 
 #[derive(Debug)]
@@ -808,17 +821,25 @@ impl VideoAssembler {
         Self::default()
     }
 
+    /// Forget an incomplete frame when a route lifetime ends or restarts.
+    /// Route ids are stable while capture sequence numbers restart at zero,
+    /// so retaining a predecessor partial would reject or mix the successor.
+    pub fn clear_route(&mut self, route: &str) {
+        self.partial.retain(|(id, _), _| id != route);
+    }
+
     /// Feed one inbound frame (or chunk). Returns the complete frame once
     /// every piece has arrived — immediately, for unchunked frames.
     pub fn push(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
+        let key = (frame.route.clone(), frame.incarnation.clone());
         if frame.chunks <= 1 {
-            self.partial.remove(&frame.route);
+            self.partial.remove(&key);
             return Some(frame);
         }
         if frame.chunks > MAX_CHUNKS || frame.chunk >= frame.chunks {
             return None;
         }
-        let entry = self.partial.entry(frame.route.clone());
+        let entry = self.partial.entry(key.clone());
         let p = match entry {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 if o.get().seq < frame.seq || o.get().parts.len() != frame.chunks as usize {
@@ -839,13 +860,13 @@ impl VideoAssembler {
         *slot = Some(frame.jpeg);
         let assembled_len: usize = p.parts.iter().flatten().map(Vec::len).sum();
         if assembled_len > MAX_FRAME_BYTES {
-            self.partial.remove(&frame.route);
+            self.partial.remove(&key);
             return None;
         }
         if p.received < frame.chunks {
             return None;
         }
-        let p = self.partial.remove(&frame.route)?;
+        let p = self.partial.remove(&key)?;
         let mut jpeg = Vec::with_capacity(assembled_len);
         for part in p.parts.into_iter().flatten() {
             jpeg.extend_from_slice(&part);
@@ -853,6 +874,7 @@ impl VideoAssembler {
         Some(VideoFrame {
             t: MediaTagVideo::Video,
             route: frame.route,
+            incarnation: frame.incarnation,
             seq: frame.seq,
             width: frame.width,
             height: frame.height,
@@ -877,9 +899,19 @@ impl PartialFrame {
 
 impl InputEvent {
     pub fn new(route: impl Into<String>, seq: u64, action: InputAction) -> Self {
+        Self::new_with_incarnation(route, None, seq, action)
+    }
+
+    pub fn new_with_incarnation(
+        route: impl Into<String>,
+        incarnation: Option<String>,
+        seq: u64,
+        action: InputAction,
+    ) -> Self {
         InputEvent {
             t: MediaTagInput::Input,
             route: route.into(),
+            incarnation,
             seq,
             action,
         }
@@ -952,6 +984,37 @@ mod tests {
             let back: InputEvent = serde_json::from_value(v).unwrap();
             assert_eq!(e, back);
         }
+    }
+
+    #[test]
+    fn input_event_incarnation_is_additive_and_legacy_safe() {
+        let fenced = InputEvent::new_with_incarnation(
+            "r1",
+            Some("41:9".into()),
+            7,
+            InputAction::MouseButton {
+                button: 0,
+                down: true,
+            },
+        );
+        let value = serde_json::to_value(&fenced).unwrap();
+        assert_eq!(value["incarnation"], "41:9");
+        assert_eq!(serde_json::from_value::<InputEvent>(value).unwrap(), fenced);
+
+        let legacy = serde_json::json!({
+            "t": "input",
+            "route": "r1",
+            "seq": 8,
+            "kind": "mouse_button",
+            "button": 0,
+            "down": false
+        });
+        let legacy: InputEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.incarnation, None);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("incarnation")
+            .is_none());
     }
 
     #[test]
@@ -1367,6 +1430,49 @@ mod tests {
             .push(new[new.len() - 1].clone())
             .expect("new frame completes");
         assert!(full.jpeg.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn clearing_a_route_allows_a_successor_sequence_to_restart_at_zero() {
+        let old = VideoFrame::new("r", 10_000, 8, 8, 8, 8, vec![9u8; 100]).into_chunks(40);
+        let new = VideoFrame::new("r", 0, 8, 8, 8, 8, vec![1u8; 100]).into_chunks(40);
+        let mut asm = VideoAssembler::new();
+        assert!(asm.push(old[0].clone()).is_none());
+
+        asm.clear_route("r");
+        let mut full = None;
+        for chunk in new {
+            full = asm.push(chunk).or(full);
+        }
+        let full = full.expect("successor frame completes from sequence zero");
+        assert_eq!(full.seq, 0);
+        assert!(full.jpeg.iter().all(|&byte| byte == 1));
+    }
+
+    #[test]
+    fn delayed_predecessor_after_clear_cannot_poison_fenced_successor() {
+        let mut predecessor = VideoFrame::new("r", 10_000, 8, 8, 8, 8, vec![9u8; 100]);
+        predecessor.incarnation = Some("boot-a:1".into());
+        let predecessor = predecessor.into_chunks(40);
+        let mut successor = VideoFrame::new("r", 0, 8, 8, 8, 8, vec![1u8; 100]);
+        successor.incarnation = Some("boot-a:2".into());
+        let successor = successor.into_chunks(40);
+        let mut asm = VideoAssembler::new();
+
+        asm.clear_route("r");
+        assert!(
+            asm.push(predecessor[0].clone()).is_none(),
+            "late predecessor starts only its own fenced partial"
+        );
+
+        let mut full = None;
+        for chunk in successor {
+            full = asm.push(chunk).or(full);
+        }
+        let full = full.expect("successor completes despite predecessor's larger sequence");
+        assert_eq!(full.incarnation.as_deref(), Some("boot-a:2"));
+        assert_eq!(full.seq, 0);
+        assert!(full.jpeg.iter().all(|&byte| byte == 1));
     }
 
     #[test]

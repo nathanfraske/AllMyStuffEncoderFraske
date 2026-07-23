@@ -15,8 +15,17 @@
 //! tray behaviour) stay desktop-only — the phone has no windows to open and
 //! the app store owns updates.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
+
 use serde_json::{json, Value};
 use tauri::Manager;
+
+static VIDEO_WATCH_LOCKS: LazyLock<
+    tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 /// The engine behind an `AppHandle`, for the commands whose desktop
 /// signatures are infallible (they answer a default, never an error). `None`
@@ -48,13 +57,35 @@ pub async fn connect_route(
 }
 
 #[tauri::command]
+pub async fn connect_route_handle(
+    state: tauri::State<'_, crate::engine::EngineState>,
+    from: String,
+    to: String,
+    media: String,
+    video: Option<Vec<String>>,
+    session: Option<String>,
+) -> Result<Value, String> {
+    state
+        .engine()?
+        .request(
+            "connect_route_handle",
+            json!({ "from": from, "to": to, "media": media, "video": video, "session": session }),
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn disconnect_route(
     state: tauri::State<'_, crate::engine::EngineState>,
     route_id: String,
+    generation: Option<u64>,
 ) -> Result<(), String> {
     state
         .engine()?
-        .request("disconnect_route", json!({ "route_id": route_id }))
+        .request(
+            "disconnect_route",
+            json!({ "route_id": route_id, "generation": generation }),
+        )
         .await?;
     Ok(())
 }
@@ -316,32 +347,51 @@ pub async fn clipboard_pull(
 // ---- video (watch / poll / tune) ------------------------------------------
 
 #[tauri::command]
-pub async fn video_watch(app: tauri::AppHandle, route_id: String, decode: Option<bool>) -> u64 {
+pub async fn video_watch(
+    app: tauri::AppHandle,
+    route_id: String,
+    decode: Option<bool>,
+) -> Result<u64, String> {
     let Some(engine) = engine_of(&app) else {
-        return 0;
+        return Err("mobile engine is not running".into());
     };
-    match engine
+    let route_lock = {
+        let mut locks = VIDEO_WATCH_LOCKS.lock().await;
+        locks
+            .entry(route_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _registration_guard = route_lock.lock().await;
+    let value = engine
         .request(
             "video_watch",
             json!({ "route_id": route_id, "decode": decode }),
         )
-        .await
-    {
-        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
-        Err(_) => 0,
+        .await?;
+    let token: u64 = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if token == 0 {
+        return Err("video_watch returned an invalid zero token".into());
     }
+    Ok(token)
 }
 
 #[tauri::command]
-pub async fn video_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
-    let bytes = match engine_of(&app) {
-        Some(engine) => engine
-            .request_bytes("video_poll", json!({ "route_id": route_id }))
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
+pub async fn video_poll(
+    app: tauri::AppHandle,
+    route_id: String,
+    token: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let Some(engine) = engine_of(&app) else {
+        return Err("mobile engine is not running".into());
     };
-    tauri::ipc::Response::new(bytes)
+    let bytes = engine
+        .request_bytes(
+            "video_poll",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -372,6 +422,7 @@ pub async fn video_refresh(
 pub async fn video_feedback(
     state: tauri::State<'_, crate::engine::EngineState>,
     route_id: String,
+    watcher_token: u64,
     recv_fps: u32,
     decode_fails: u32,
     queue_depth: u32,
@@ -382,6 +433,7 @@ pub async fn video_feedback(
             "video_feedback",
             json!({
                 "route_id": route_id,
+                "watcher_token": watcher_token,
                 "recv_fps": recv_fps,
                 "decode_fails": decode_fails,
                 "queue_depth": queue_depth,

@@ -1,3 +1,8 @@
+import {
+  assertWebGlFramebufferComplete,
+  assertWebGlNoError,
+} from "./webgl-health";
+
 // FSR1-style spatial upscaling for the video stage: a WebGL2 port of the
 // two-pass AMD FidelityFX Super Resolution 1.0 pipeline — EASU
 // (edge-adaptive spatial upsampling) followed by RCAS (robust
@@ -155,24 +160,61 @@ void main() {
 }`;
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
-  const s = gl.createShader(type)!;
+  const s = gl.createShader(type);
+  if (!s) throw new Error("WebGL could not allocate an FSR shader");
   gl.shaderSource(s, src);
   gl.compileShader(s);
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    throw new Error(gl.getShaderInfoLog(s) ?? "shader compile failed");
+    const detail = gl.getShaderInfoLog(s) ?? "shader compile failed";
+    gl.deleteShader(s);
+    throw new Error(detail);
   }
   return s;
 }
 
 function program(gl: WebGL2RenderingContext, fs: string): WebGLProgram {
-  const p = gl.createProgram()!;
-  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VS));
-  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
-  gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(p) ?? "program link failed");
+  let vertex: WebGLShader | null = null;
+  let fragment: WebGLShader | null = null;
+  let p: WebGLProgram | null = null;
+  try {
+    vertex = compile(gl, gl.VERTEX_SHADER, VS);
+    fragment = compile(gl, gl.FRAGMENT_SHADER, fs);
+    p = gl.createProgram();
+    if (!p) throw new Error("WebGL could not allocate an FSR program");
+    gl.attachShader(p, vertex);
+    gl.attachShader(p, fragment);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const detail = gl.getProgramInfoLog(p) ?? "program link failed";
+      gl.deleteProgram(p);
+      p = null;
+      throw new Error(detail);
+    }
+    assertWebGlNoError(gl, "FSR program setup");
+    return p;
+  } catch (error) {
+    if (p) gl.deleteProgram(p);
+    throw error;
+  } finally {
+    if (vertex) gl.deleteShader(vertex);
+    if (fragment) gl.deleteShader(fragment);
   }
-  return p;
+}
+
+function texture(gl: WebGL2RenderingContext, name: string): WebGLTexture {
+  const value = gl.createTexture();
+  if (!value) throw new Error(`WebGL could not allocate the FSR ${name} texture`);
+  return value;
+}
+
+function uniform(
+  gl: WebGL2RenderingContext,
+  p: WebGLProgram,
+  name: string,
+): WebGLUniformLocation {
+  const value = gl.getUniformLocation(p, name);
+  if (!value) throw new Error(`FSR shader is missing the ${name} uniform`);
+  return value;
 }
 
 /** The two-pass FSR1-style upscaler bound to one overlay canvas. */
@@ -180,77 +222,192 @@ export class Fsr1 {
   private gl: WebGL2RenderingContext;
   private easu: WebGLProgram;
   private rcas: WebGLProgram;
+  private easuSrc: WebGLUniformLocation;
+  private easuSrcSize: WebGLUniformLocation;
+  private easuDstSize: WebGLUniformLocation;
+  private rcasSrc: WebGLUniformLocation;
+  private rcasSrcSize: WebGLUniformLocation;
+  private rcasSharpness: WebGLUniformLocation;
   private srcTex: WebGLTexture;
   private midTex: WebGLTexture;
   private fbo: WebGLFramebuffer;
+  private srcSize = [0, 0];
   private midSize = [0, 0];
+  private lost = false;
+  private readonly contextLost = (event: Event) => {
+    // Prevent the browser's implicit restore. Program/texture state is not
+    // trustworthy after a loss, so the caller falls back to the base canvas
+    // and may construct a fresh engine on a later explicit retry.
+    event.preventDefault();
+    this.lost = true;
+    this.onUnavailable?.("WebGL2 context lost");
+  };
 
-  constructor(private canvas: HTMLCanvasElement) {
+  constructor(
+    private canvas: HTMLCanvasElement,
+    private onUnavailable?: (reason: string) => void,
+  ) {
     const gl = canvas.getContext("webgl2", {
       alpha: false,
       antialias: false,
       depth: false,
       stencil: false,
       preserveDrawingBuffer: false,
+      // If WebGL would fall back to a major software path, normal canvas
+      // scaling is safer. A CPU FSR pass competes directly with decode and
+      // remote input on the machines that most need the fallback.
+      failIfMajorPerformanceCaveat: true,
     });
     if (!gl) throw new Error("WebGL2 unavailable");
-    this.gl = gl;
-    this.easu = program(gl, EASU_FS);
-    this.rcas = program(gl, RCAS_FS);
-    this.srcTex = gl.createTexture()!;
-    this.midTex = gl.createTexture()!;
-    this.fbo = gl.createFramebuffer()!;
-    for (const t of [this.srcTex, this.midTex]) {
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (gl.isContextLost()) throw new Error("WebGL2 context is unavailable");
+    canvas.addEventListener("webglcontextlost", this.contextLost, false);
+    let easu: WebGLProgram | null = null;
+    let rcas: WebGLProgram | null = null;
+    let srcTex: WebGLTexture | null = null;
+    let midTex: WebGLTexture | null = null;
+    let fbo: WebGLFramebuffer | null = null;
+    try {
+      easu = program(gl, EASU_FS);
+      rcas = program(gl, RCAS_FS);
+      const easuSrc = uniform(gl, easu, "src");
+      const easuSrcSize = uniform(gl, easu, "srcSize");
+      const easuDstSize = uniform(gl, easu, "dstSize");
+      const rcasSrc = uniform(gl, rcas, "src");
+      const rcasSrcSize = uniform(gl, rcas, "srcSize");
+      const rcasSharpness = uniform(gl, rcas, "sharpness");
+      srcTex = texture(gl, "source");
+      midTex = texture(gl, "intermediate");
+      fbo = gl.createFramebuffer();
+      if (!fbo) throw new Error("WebGL could not allocate the FSR framebuffer");
+      for (const t of [srcTex, midTex]) {
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      }
+      assertWebGlNoError(gl, "FSR activation");
+      this.gl = gl;
+      this.easu = easu;
+      this.rcas = rcas;
+      this.easuSrc = easuSrc;
+      this.easuSrcSize = easuSrcSize;
+      this.easuDstSize = easuDstSize;
+      this.rcasSrc = rcasSrc;
+      this.rcasSrcSize = rcasSrcSize;
+      this.rcasSharpness = rcasSharpness;
+      this.srcTex = srcTex;
+      this.midTex = midTex;
+      this.fbo = fbo;
+    } catch (error) {
+      if (fbo) gl.deleteFramebuffer(fbo);
+      if (srcTex) gl.deleteTexture(srcTex);
+      if (midTex) gl.deleteTexture(midTex);
+      if (easu) gl.deleteProgram(easu);
+      if (rcas) gl.deleteProgram(rcas);
+      canvas.removeEventListener("webglcontextlost", this.contextLost, false);
+      gl.getExtension("WEBGL_lose_context")?.loseContext();
+      throw error;
     }
   }
 
-  /** Upscale `source` (the painted 2D canvas) to `dw`×`dh` device pixels. */
+  private assertNoError(stage: string) {
+    try {
+      assertWebGlNoError(this.gl, stage);
+    } catch (error) {
+      if (this.gl.isContextLost()) this.lost = true;
+      throw error;
+    }
+  }
+
+  /** Upscale `source` to `dw`×`dh` device pixels. */
   render(source: TexImageSource, sw: number, sh: number, dw: number, dh: number) {
     const gl = this.gl;
+    if (this.lost || gl.isContextLost()) {
+      throw new Error("WebGL2 context is unavailable");
+    }
+    if (
+      !Number.isInteger(sw) ||
+      !Number.isInteger(sh) ||
+      !Number.isInteger(dw) ||
+      !Number.isInteger(dh) ||
+      sw <= 0 ||
+      sh <= 0 ||
+      dw <= 0 ||
+      dh <= 0
+    ) {
+      throw new Error(`Invalid FSR dimensions ${sw}x${sh} -> ${dw}x${dh}`);
+    }
     if (this.canvas.width !== dw) this.canvas.width = dw;
     if (this.canvas.height !== dh) this.canvas.height = dh;
 
     gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    if (this.srcSize[0] !== sw || this.srcSize[1] !== sh) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      this.srcSize = [sw, sh];
+    } else {
+      // Preserve texture storage across frames. The old texImage2D call
+      // re-specified the full allocation for every decoded picture.
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    }
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
+    let midResized = false;
     if (this.midSize[0] !== dw || this.midSize[1] !== dh) {
       gl.bindTexture(gl.TEXTURE_2D, this.midTex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, dw, dh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       this.midSize = [dw, dh];
+      midResized = true;
     }
+    this.assertNoError("FSR texture upload");
 
     // Pass 1: EASU src -> mid.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.midTex, 0);
+    if (midResized) {
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        this.midTex,
+        0,
+      );
+      assertWebGlFramebufferComplete(gl, "FSR EASU target");
+      this.assertNoError("FSR EASU target");
+    }
     gl.viewport(0, 0, dw, dh);
     gl.useProgram(this.easu);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
-    gl.uniform1i(gl.getUniformLocation(this.easu, "src"), 0);
-    gl.uniform2f(gl.getUniformLocation(this.easu, "srcSize"), sw, sh);
-    gl.uniform2f(gl.getUniformLocation(this.easu, "dstSize"), dw, dh);
+    gl.uniform1i(this.easuSrc, 0);
+    gl.uniform2f(this.easuSrcSize, sw, sh);
+    gl.uniform2f(this.easuDstSize, dw, dh);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.assertNoError("FSR EASU pass");
 
     // Pass 2: RCAS mid -> screen.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, dw, dh);
     gl.useProgram(this.rcas);
     gl.bindTexture(gl.TEXTURE_2D, this.midTex);
-    gl.uniform1i(gl.getUniformLocation(this.rcas, "src"), 0);
-    gl.uniform2f(gl.getUniformLocation(this.rcas, "srcSize"), dw, dh);
-    gl.uniform1f(gl.getUniformLocation(this.rcas, "sharpness"), 0.87);
+    gl.uniform1i(this.rcasSrc, 0);
+    gl.uniform2f(this.rcasSrcSize, dw, dh);
+    gl.uniform1f(this.rcasSharpness, 0.87);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.assertNoError("FSR RCAS pass");
   }
 
   dispose() {
+    this.canvas.removeEventListener("webglcontextlost", this.contextLost, false);
+    if (!this.lost) {
+      this.gl.deleteFramebuffer(this.fbo);
+      this.gl.deleteTexture(this.srcTex);
+      this.gl.deleteTexture(this.midTex);
+      this.gl.deleteProgram(this.easu);
+      this.gl.deleteProgram(this.rcas);
+    }
     const lose = this.gl.getExtension("WEBGL_lose_context");
     lose?.loseContext();
+    this.lost = true;
   }
 }

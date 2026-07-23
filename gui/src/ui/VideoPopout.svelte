@@ -6,9 +6,9 @@
   // route it tears down on close; a `share:` popout merely watches the
   // sender's route, so closing it costs nothing but the window.
   //
-  // The stage always asks the backend to decode (`decode: true` — the
-  // console ladder's universal bottom rung, the same plane room tiles
-  // ride), so it blits RGBA / JPEG frames and works in every webview.
+  // The stage takes compressed H.264 through a hardware-preferred WebCodecs
+  // ladder. If both browser rungs fail, it re-watches through the backend's
+  // NVDEC/OpenH264 ladder. MJPEG remains the compatibility transport.
   // Hover reveals the controls: the quality pills for a stream this
   // window owns, and fullscreen in the corner everyone looks for it.
   // Input forwards over the picture exactly when a live control route to
@@ -18,17 +18,27 @@
   // Closing the window — the OS ✕, or a tab's "Return video here" ask
   // arriving over the local lane — runs the same teardown, announces
   // `closed`, and the tab that popped it re-wires itself.
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { Fsr1 } from "../fsr1";
   import ModePill from "./ModePill.svelte";
   import EffectiveReadout from "./EffectiveReadout.svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { makeRemoteButtonTracker } from "../remote-button-tracker";
   import { app } from "../store.svelte";
   import {
+    createH264FrameDecoder,
+    webCodecsH264Supported,
+    type H264DecoderStats,
+    type ViewerDecodePath,
+  } from "../video-decoder";
+  import {
+    clientLog,
     focusThisWindow,
     isWindowFullscreen,
     onThisWindowClose,
+    refreshRoute,
     sendInput,
+    sendVideoFeedback,
     toggleWindowFullscreen,
     tuneRoute,
     watchVideo,
@@ -86,7 +96,14 @@
   let fsrShow = $state(false);
   let fsrEngine: Fsr1 | null = null;
   let fsrDead = false;
-  function presentFsr(w: number, h: number) {
+  function disableFsr(reason: unknown) {
+    fsrDead = true;
+    fsrShow = false;
+    if (untrack(() => app.debugLoggingEnabled === true)) {
+      void clientLog(`[video-popout] FSR disabled: ${String(reason)}`);
+    }
+  }
+  function presentFsr(w: number, h: number, source?: TexImageSource) {
     const base = canvasEl;
     const gl = glCanvasEl;
     if (!base || !gl) return;
@@ -112,18 +129,23 @@
       return;
     }
     try {
-      fsrEngine ??= new Fsr1(gl);
+      fsrEngine ??= new Fsr1(gl, disableFsr);
       // Explicit CSS size = the content box; `inset: 0; margin: auto`
       // centers it over the letterboxed picture. The buffer is dpr-exact
       // underneath, so hi-DPI monitors get a crisp 1:1 present.
       gl.style.width = `${cw}px`;
       gl.style.height = `${ch}px`;
-      fsrEngine.render(base, w, h, dw, dh);
+      fsrEngine.render(source ?? base, w, h, dw, dh);
       fsrShow = true;
     } catch (e) {
-      console.warn("FSR upscale unavailable; plain scaling:", e);
-      fsrDead = true;
-      fsrShow = false;
+      const failed = fsrEngine;
+      fsrEngine = null;
+      try {
+        failed?.dispose();
+      } catch {
+        // The overlay is already fail-closed. Context teardown is best-effort.
+      }
+      disableFsr(e);
     }
   }
   function toggleFsr() {
@@ -156,7 +178,22 @@
   let frameH = $state(0);
   let fps = $state(0);
   let transport = $state("");
+  let decodePath = $state<ViewerDecodePath | "MJPEG">(
+    typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined"
+      ? "Native (NVDEC/OpenH264)"
+      : "WebCodecs (hardware requested)",
+  );
+  let nativeDecode = $state(
+    typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined",
+  );
   let frameCount = 0;
+  let inputFrameCount = 0;
+  let standaloneDecodedFrameCount = 0;
+  let lastH264DecodedFrameCount = 0;
+  let feedbackKind: "raw" | "h264" | "jpeg" | null = null;
+  let decoderStats = (): H264DecoderStats | null => null;
+  let feedbackWatcherToken = 0;
+  let checkDecoderStall = (_inputFps: number, _paintFps: number) => {};
   // Received bitrate (viewer truth): bytes seen this second → Mbps. The
   // effective panel shows it beside the sender's target when co-located.
   let recvMbps = $state(0);
@@ -286,23 +323,63 @@
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
+    if (!nativeDecode) {
+      void webCodecsH264Supported().then((supported) => {
+        if (!supported) nativeDecode = true;
+      });
+    }
+    let feedbackTick = 0;
+    let feedbackFailsSent = 0;
+    let feedbackRoute: string | null = null;
     const fpsTimer = setInterval(() => {
       fps = frameCount;
+      const inputFps = inputFrameCount;
       frameCount = 0;
+      inputFrameCount = 0;
       recvMbps = (inBytes * 8) / 1e6;
       inBytes = 0;
+      const route = app.videoPopoutLive;
+      const stats = decoderStats();
+      const h264DecodedFps = Math.max(
+        0,
+        (stats?.decodedFrames ?? 0) - lastH264DecodedFrameCount,
+      );
+      lastH264DecodedFrameCount = stats?.decodedFrames ?? 0;
+      const decodedFps =
+        feedbackKind === "h264" ? h264DecodedFps : standaloneDecodedFrameCount;
+      standaloneDecodedFrameCount = 0;
+      checkDecoderStall(inputFps, decodedFps);
+      if (route !== feedbackRoute) {
+        feedbackRoute = route;
+        feedbackFailsSent = 0;
+        feedbackTick = 0;
+      }
+      if (route && feedbackWatcherToken > 0 && ++feedbackTick % 2 === 0) {
+        const fails = stats?.decodeFails ?? 0;
+        void sendVideoFeedback(
+          route,
+          feedbackWatcherToken,
+          decodedFps,
+          Math.max(0, fails - feedbackFailsSent),
+          stats?.queueDepth ?? 0,
+        );
+        feedbackFailsSent = fails;
+      }
     }, 1000);
     // The OS chrome's ✕ runs the same teardown as a "Return video here"
     // ask — the close is held until the route teardown is on the wire.
     // Keys still held ride out first: the control route outlives this
     // window, so without the lift the far machine keeps the modifier.
     void onThisWindowClose(() => {
-      keys.releaseAll();
+      releaseRemoteInput();
       void app.closeVideoPopout();
     }).then((u) => (unlistenClose = u));
     return () => {
+      releaseRemoteInput();
       unlistenClose?.();
       clearInterval(fpsTimer);
+      fsrEngine?.dispose();
+      fsrEngine = null;
     };
   });
 
@@ -320,6 +397,8 @@
   // census tells it to back off, and we re-assert).
   $effect(() => {
     const route = app.videoPopoutLive;
+    const native = nativeDecode;
+    const diagnostics = untrack(() => app.debugLoggingEnabled === true);
     void app.videoPopoutRewatch;
     hasFrame = false;
     // Clear the prior stream's frame dims so `norm` can't letterbox pointer
@@ -329,11 +408,19 @@
     hostStatus = null;
     fps = 0;
     transport = "";
+    decodePath = native
+      ? "Native (NVDEC/OpenH264)"
+      : "WebCodecs (hardware requested)";
     frameCount = 0;
+    inputFrameCount = 0;
+    standaloneDecodedFrameCount = 0;
+    lastH264DecodedFrameCount = 0;
+    feedbackKind = null;
     recvMbps = 0;
     inBytes = 0;
     if (!route) return;
     let cancelled = false;
+    const watchAbort = new AbortController();
     let unwatch: (() => void) | undefined;
     let unwatchStatus: (() => void) | undefined;
 
@@ -345,7 +432,12 @@
       else unwatchStatus = u;
     });
 
-    const paint = (w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
+    const paint = (
+      w: number,
+      h: number,
+      draw: (ctx: CanvasRenderingContext2D) => void,
+      source?: TexImageSource,
+    ) => {
       const c = canvasEl;
       if (cancelled || !c) return;
       if (c.width !== w) c.width = w;
@@ -357,8 +449,36 @@
       frameH = h;
       hasFrame = true;
       frameCount += 1;
-      presentFsr(w, h);
+      presentFsr(w, h, source);
     };
+
+    const h264Decoder = native
+      ? null
+      : createH264FrameDecoder({
+          onFrame: (frame) => {
+            if (cancelled) return;
+            transport = "H.264";
+            paint(
+              frame.displayWidth,
+              frame.displayHeight,
+              (ctx) => ctx.drawImage(frame, 0, 0),
+              frame,
+            );
+          },
+          onFallback: (reason) => {
+            if (cancelled) return;
+            if (diagnostics) clientLog(`[video-popout] ${route}: ${reason}`);
+            nativeDecode = true;
+          },
+          onRefresh: () => void refreshRoute(route),
+          onPath: (nextPath) => (decodePath = nextPath),
+          onDecodeError: (error) => {
+            if (diagnostics) clientLog(`[video-popout] ${route}: ${String(error)}`);
+          },
+          onDebug: diagnostics ? (line) => clientLog(`[video-popout] ${route} ${line}`) : undefined,
+        });
+    decoderStats = () => h264Decoder?.stats() ?? null;
+    checkDecoderStall = (inputFps, paintFps) => h264Decoder?.checkStall(inputFps, paintFps);
 
     // MJPEG paint slot, latest-wins — the same supersede the console uses.
     // Each JPEG is a complete picture, so painting history is pure lag: the
@@ -376,6 +496,10 @@
           pendingJpeg = null;
           try {
             const bmp = await createImageBitmap(blob);
+            standaloneDecodedFrameCount += 1;
+            // UNPACK_FLIP_Y_WEBGL is ignored for ImageBitmap uploads. Route
+            // MJPEG through the already-painted canvas so FSR keeps the same
+            // top-to-bottom orientation as the ordinary canvas path.
             paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
             bmp.close();
           } catch {
@@ -392,30 +516,48 @@
       (f) => {
         if (cancelled) return;
         inBytes += f.data.byteLength;
+        inputFrameCount += 1;
+        feedbackKind = f.kind;
         if (f.kind === "raw") {
           transport = "H.264";
           if (f.data.byteLength !== f.width * f.height * 4) return;
+          standaloneDecodedFrameCount += 1;
           const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
           const img = new ImageData(pixels, f.width, f.height);
-          paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
+          paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0), img);
+        } else if (f.kind === "h264") {
+          transport = "H.264";
+          h264Decoder?.push(f);
         } else if (f.kind === "jpeg") {
           transport = "MJPEG";
+          decodePath = "MJPEG";
           pendingJpeg = new Blob([f.data], { type: "image/jpeg" });
           void paintNewestJpeg();
         }
-        // h264 never arrives here — decode: true means the backend hands
-        // this window ready-to-paint frames.
       },
-      { decode: true },
+      {
+        decode: native,
+        diagnostics,
+        signal: watchAbort.signal,
+        onRegistered: (token) => (feedbackWatcherToken = token),
+      },
     ).then((u) => {
       if (cancelled) u();
-      else unwatch = u;
+      else {
+        unwatch = u;
+        if (native) void refreshRoute(route);
+      }
     });
 
     return () => {
       cancelled = true;
+      watchAbort.abort();
+      feedbackWatcherToken = 0;
       unwatch?.();
       unwatchStatus?.();
+      h264Decoder?.close();
+      decoderStats = () => null;
+      checkDecoderStall = () => {};
     };
   });
 
@@ -444,6 +586,19 @@
   function send(action: InputAction) {
     if (controlRoute) void sendInput(controlRoute, action);
   }
+  function sendToRoute(routeId: string, action: InputAction) {
+    void sendInput(routeId, action);
+  }
+  const buttons = makeRemoteButtonTracker(sendToRoute);
+
+  // Release before a control-route change and at component teardown. The
+  // tracker retains the route used for each press, independent of live state.
+  $effect(() => {
+    const routeAtStart = controlActive ? controlRoute : null;
+    return () => {
+      if (routeAtStart) buttons.releaseAll();
+    };
+  });
 
   // The KVM rule: with control live, the window under the mouse is the one
   // the keyboard should reach — claim focus on hover, no click in between (a
@@ -468,7 +623,9 @@
   // control drops it too.
   let pointerLocked = $state(false);
   function lockChanged() {
+    const wasLocked = pointerLocked;
     pointerLocked = document.pointerLockElement === stageEl;
+    if (wasLocked && !pointerLocked) buttons.releaseAll();
   }
   function maybePointerLock() {
     if (fullscreen && controlActive && !pointerLocked) {
@@ -506,21 +663,34 @@
     send({ kind: "mouse_move", ...p, screen: controlScreen });
   }
   function onPointerButton(e: PointerEvent, down: boolean) {
-    if (!controlActive) return;
+    if (!down) {
+      if (buttons.release(e.button)) e.preventDefault();
+      return;
+    }
+    const routeId = controlRoute;
+    if (!controlActive || !routeId) return;
     // A click is the most reliable focus pin — land it on the stage so keys
     // forward even if the cursor was last over a hover-bar button.
-    if (down) stageEl?.focus({ preventScroll: true });
-    if (down) maybePointerLock();
+    stageEl?.focus({ preventScroll: true });
+    maybePointerLock();
     if (pointerLocked) {
       e.preventDefault();
-      send({ kind: "mouse_button", button: e.button, down });
+      buttons.press(routeId, e.button);
       return;
     }
     const p = norm(e);
     if (!p) return;
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is best-effort for stale or synthetic pointer ids.
+    }
     e.preventDefault();
-    send({ kind: "mouse_move", ...p, screen: controlScreen });
-    send({ kind: "mouse_button", button: e.button, down });
+    sendToRoute(routeId, { kind: "mouse_move", ...p, screen: controlScreen });
+    buttons.press(routeId, e.button);
+  }
+  function onPointerCancel() {
+    buttons.releaseAll();
   }
   function onWheel(e: WheelEvent) {
     if (!controlActive || !norm(e)) return;
@@ -533,6 +703,11 @@
   // are lifted in a burst — otherwise the far machine keeps a stuck
   // modifier.
   const keys = makeKeyForwarder(send);
+
+  function releaseRemoteInput() {
+    buttons.releaseAll();
+    keys.releaseAll();
+  }
 
   // Control forwarding — bound to the focusable surface element, so it only
   // fires while this window actually holds keyboard focus (the KVM rule). With
@@ -572,10 +747,12 @@
   onpointermove={onPointerMove}
   onpointerdown={(e) => onPointerButton(e, true)}
   onpointerup={(e) => onPointerButton(e, false)}
+  onpointercancel={onPointerCancel}
+  onlostpointercapture={onPointerCancel}
   onwheel={onWheel}
   onkeydown={(e) => onControlKey(e, true)}
   onkeyup={(e) => onControlKey(e, false)}
-  onblur={() => keys.releaseAll()}
+  onblur={releaseRemoteInput}
   oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   <canvas bind:this={canvasEl} class:waiting={!hasFrame}></canvas>
@@ -612,7 +789,9 @@
       <span class="chip"
         ><span class="chip-dot"></span>{frameW}×{frameH} · {fps} fps{transport
           ? ` · ${transport}`
-          : ""}{recvMbps ? ` · ${recvMbps >= 10 ? recvMbps.toFixed(0) : recvMbps.toFixed(1)} Mbps` : ""}</span
+          : ""}{decodePath ? ` · ${decodePath}` : ""}{recvMbps
+          ? ` · ${recvMbps >= 10 ? recvMbps.toFixed(0) : recvMbps.toFixed(1)} Mbps`
+          : ""}</span
       >
       <span class="pill-wrap">
         <button
