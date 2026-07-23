@@ -7204,6 +7204,40 @@ impl Mesh {
             }
         }
 
+        // Before the admit loop re-asserts our claimed-list, reconcile it against
+        // the signed governance. A device *another* owner evicted converges out of
+        // the signed roster network-wide, but that eviction never reached THIS
+        // owner's local member list — it's only pruned locally by the owner who
+        // authored the kick (`kick_member`). Left in place, the loop below would
+        // re-sign the device into the member log (a fresh, later-stamped admit that
+        // wins the last-writer-wins tie) and re-approve it — silently resurrecting
+        // an evicted device across the whole fleet, so co-owners "can't see it
+        // gone." Drop any locally listed device the signed logs have removed so the
+        // eviction sticks here too. Best-effort: an empty set (no fleet, an older
+        // daemon that doesn't report it, or a read error) prunes nothing, so a
+        // transient failure never drops a live member.
+        let signed_evicted = self.signed_evicted(&network).await;
+        if !signed_evicted.is_empty() {
+            let mut pruned = false;
+            for member in self.ownership.fleet_member_ids() {
+                if signed_evicted.contains(pubkey_part(&member)) {
+                    tracing::info!(
+                        "pruning {} from the local fleet list — the signed governance evicted it",
+                        short_id(&member)
+                    );
+                    let _ = self.ownership.kick_member(&member);
+                    pruned = true;
+                }
+            }
+            if pruned {
+                // Reflect the removal now: the authorised-controller cache and the
+                // GUI's fleet roster must both drop the evicted device immediately,
+                // not on the next poll.
+                self.refresh_fleet_authorization().await;
+                self.emit_owned().await;
+            }
+        }
+
         // Admit every fleet member by **signing** them into the closed
         // network's **member log** — a ratified `RoleGrant` authored by an owner
         // or manager. This is what makes membership signed and self-sufficient:
@@ -7520,6 +7554,38 @@ impl Mesh {
             .and_then(|s| s.get("roles"))
             .and_then(|v| v.as_object())
             .map(|roles| roles.keys().map(|k| pubkey_part(k).to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The canonical device ids the fleet's signed logs have **removed** —
+    /// evicted (or member-tier revoked), the authoritative "no longer in the
+    /// fleet" set the daemon projects from the member log. `ensure_fleet_network`
+    /// uses it to prune this owner's local claimed-list of a device *another*
+    /// owner evicted, whose eviction converged the signed roster but never
+    /// reached this device's local list — so the background admit loop stops
+    /// resurrecting it. Empty on any daemon/parse error (and against an older
+    /// daemon that doesn't report the field), so a transient read failure or a
+    /// version skew never prunes a live member — it just falls back to the old
+    /// (re-asserting) behaviour.
+    async fn signed_evicted(self: &Arc<Self>, network: &str) -> std::collections::HashSet<String> {
+        let data = match self
+            .client
+            .request(&Request::GovernanceState {
+                network: network.to_string(),
+            })
+            .await
+        {
+            Ok(r) if r.ok => r.data.unwrap_or(Value::Null),
+            _ => return std::collections::HashSet::new(),
+        };
+        data.get("evicted")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|k| pubkey_part(k).to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
