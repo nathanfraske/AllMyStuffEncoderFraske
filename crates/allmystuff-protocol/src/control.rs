@@ -97,6 +97,18 @@ pub enum Request {
         #[serde(default)]
         purge: bool,
     },
+    /// Forget **every** joined network on the daemon at once — a bulk
+    /// `NetworkRemove{purge:true}` that tears each down and deletes its roster +
+    /// signed governance state, keeping the device identity. The daemon exits
+    /// afterward so a fresh one reloads clean (matched by an app restart), rather
+    /// than a stale in-memory cache re-persisting what was just removed. Needs a
+    /// daemon that speaks this op; an older one replies with a parse error.
+    ForgetAllNetworks,
+    /// Factory reset — the daemon wipes its **entire** state directory
+    /// (`~/.myownmesh`: identity, config, every network, and the co-located
+    /// AllMyStuff ownership record) and exits so a fresh daemon mints a new
+    /// identity on empty state. The device becomes brand-new to every peer.
+    FactoryReset,
     NetworkUpdate {
         config: Value,
     },

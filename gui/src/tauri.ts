@@ -1408,6 +1408,24 @@ export async function fleetLeave(): Promise<void> {
   await invoke("fleet_leave");
 }
 
+/** Danger Zone: leave the fleet and forget every network the daemon holds,
+ *  keeping the device identity. The daemon exits so it reloads clean — pair
+ *  with `restartApp()`. No-op in web mode. */
+export async function resetNetworking(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("reset_networking");
+}
+
+/** Danger Zone: factory reset — wipe this device's entire state (identity,
+ *  config, all networks, fleet ownership) for a brand-new start. The daemon
+ *  wipes `~/.myownmesh` and exits — pair with `restartApp()`. No-op in web. */
+export async function factoryReset(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("factory_reset");
+}
+
 /** Evict a device from the fleet (owner-only; the backend enforces it).
  *  `code` is the owner's custody second factor when fleet MFA is enrolled.
  *  Throws with the reason when refused. */

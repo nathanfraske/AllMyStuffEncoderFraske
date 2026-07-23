@@ -177,6 +177,17 @@ pub struct Mesh {
     /// the fleet-conscription takeover (AMS-01). Refreshed on ownership changes
     /// and on a periodic tick.
     fleet_authorized: Mutex<std::collections::HashSet<String>>,
+    /// Canonical pubkeys of devices THIS node has sent an ownership `Claim` to
+    /// and is awaiting a `Claimed` confirmation from. An inbound
+    /// `OwnershipControl::Claimed` is honoured only when its authenticated
+    /// sender is in this set — and the entry is consumed on use — so an
+    /// *unsolicited* `Claimed` from an arbitrary peer can't drive itself into
+    /// this device's fleet member list and signed roster (which
+    /// [`Mesh::sender_may_control`] trusts), i.e. can't hand itself control of
+    /// this machine. The outbound-claim mirror of the per-sender guards the
+    /// other ownership arms already apply. In-memory only: a claim interrupted
+    /// by a restart simply needs re-issuing.
+    pending_claims: Mutex<std::collections::HashSet<String>>,
     /// Latest passive clock-skew sample per peer (ms; positive = the peer's
     /// wall clock reads ahead of ours) with when it landed, from the
     /// `sent_at` stamp presence adverts carry. Fed to the network verdict in
@@ -1887,6 +1898,7 @@ impl Mesh {
             peer_refresh_serial: tokio::sync::Mutex::new(()),
             ownership: Arc::new(Ownership::load()),
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
+            pending_claims: Mutex::new(std::collections::HashSet::new()),
             peer_clock_skew: Mutex::new(HashMap::new()),
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
             offer_first_seen: Mutex::new(HashMap::new()),
@@ -4888,6 +4900,46 @@ impl Mesh {
                                         reason: "the customer hasn't approved screen sharing \
                                                  for you (or revoked it)"
                                             .into(),
+                                    }),
+                                    &network,
+                                )
+                                .await;
+                            return;
+                        }
+                        // Media-source gate: a Display/Video/Audio offer whose
+                        // source endpoint is a capability on THIS machine makes
+                        // us capture our own screen/camera/microphone and stream
+                        // it to the offerer — every bit as sensitive as letting
+                        // them drive us, but `route_drive_plane` never classified
+                        // it, so the `authorized` computed above is
+                        // unconditionally true for it. Require the same
+                        // owner/fleet-or-explicit-grant authority here. (A known
+                        // CEC technician without live consent was already refused
+                        // just above; `sender_may_source_media` honours a
+                        // technician's live ScreenView grant and person-to-person
+                        // screen/camera/mic shares.)
+                        if hosts_here
+                            && matches!(
+                                route.media,
+                                MediaKind::Display | MediaKind::Video | MediaKind::Audio
+                            )
+                            && !self.sender_may_source_media(&from, route)
+                        {
+                            tracing::warn!(
+                                "media source offer {} from {} refused: not owner/fleet/share",
+                                route.id,
+                                short_id(&from)
+                            );
+                            let _ = self
+                                .send_control_on_network(
+                                    &from,
+                                    &ControlMessage::Route(RouteControl::Reject {
+                                        route_id: route.id.clone(),
+                                        incarnation: incarnation.clone(),
+                                        reason:
+                                            "not authorized: capturing this device's screen, \
+                                                 camera, or microphone needs owner/fleet or a share"
+                                                .into(),
                                     }),
                                     &network,
                                 )
@@ -8922,6 +8974,27 @@ impl Mesh {
                 }
             }
             OwnershipControl::Claimed { owner } => {
+                // Honour a claim confirmation only from a device THIS node
+                // actually sent a `Claim` to. Without this guard any
+                // authenticated peer could send an *unsolicited* `Claimed` and
+                // drive itself into our fleet member list *and* signed roster —
+                // both of which `sender_may_control` trusts — i.e. hand itself
+                // full control of this machine (input, shell, disk, clipboard).
+                // This is the outbound-claim mirror of the per-sender guards the
+                // sibling arms already apply (`Release`/`FleetKey` check the
+                // recorded owner). Consumed on use, so a replayed or duplicate
+                // confirmation is ignored.
+                if !self
+                    .pending_claims
+                    .lock()
+                    .remove(pubkey_part(from.as_str()))
+                {
+                    tracing::warn!(
+                        "ignoring unsolicited claim confirmation from {} — this device never claimed it",
+                        short_id(from.as_str())
+                    );
+                    return;
+                }
                 // The device we claimed (`from`) accepted us as its owner.
                 // Make the claim *do* something durable: mint our fleet key on
                 // the first adoption, record ourselves and the new device in
@@ -9509,6 +9582,14 @@ impl Mesh {
                 );
             }
         }
+        // Record that we're now awaiting this device's `Claimed` confirmation,
+        // so the inbound handler honours only a confirmation we actually
+        // solicited (see `pending_claims` / the `Claimed` arm). Recorded before
+        // the send; if the send fails the peer never answers, so the leftover
+        // entry is harmless.
+        self.pending_claims
+            .lock()
+            .insert(pubkey_part(&node).to_string());
         tracing::info!("claiming {} (sending ownership claim)", short_id(&node));
         let msg = ControlMessage::Ownership(OwnershipControl::Claim { owner: me.into() });
         self.send_control(&node, &msg).await
@@ -10760,6 +10841,48 @@ impl Mesh {
         self.refresh_profile_ownership().await;
         self.emit_owned().await;
         Ok(())
+    }
+
+    /// Danger Zone: leave the fleet **and** forget every network on the daemon —
+    /// clears this device's fleet membership and purges each mesh's roster +
+    /// signed governance state, keeping the device identity. A clean networking
+    /// slate for a wedged node. Leaves the fleet first (clears our ownership +
+    /// purges the fleet's closed network), then tells the daemon to forget the
+    /// rest; the daemon exits so a fresh one reloads clean, and the GUI restarts
+    /// the app around it. Best-effort per step — we're resetting regardless.
+    pub async fn reset_networking(self: &Arc<Self>) -> Result<(), String> {
+        let _ = self.fleet_leave().await;
+        if let Err(e) = self.client.request(&Request::ForgetAllNetworks).await {
+            // A pre-reset-op daemon can't parse it; the fleet leave above still
+            // did the important part. Surface it but don't fail the reset.
+            tracing::warn!("reset networking: daemon forget-all errored: {e}");
+        }
+        Ok(())
+    }
+
+    /// Danger Zone: factory reset — wipe this device back to brand-new. Clears
+    /// our local ownership record first (so the node can't re-persist
+    /// `allmystuff-ownership.json` after the daemon deletes it), then tells the
+    /// daemon to wipe its **entire** state directory (`~/.myownmesh`: identity,
+    /// config, every network, and our co-located ownership file) and exit. The
+    /// GUI restarts the app; a fresh node + daemon come up on empty state with a
+    /// new identity. The daemon's response may race its own exit, so a transport
+    /// error after the request is treated as "reset underway", not a failure.
+    pub async fn factory_reset(self: &Arc<Self>) -> Result<(), String> {
+        // Quiesce our ownership writer so it can't rewrite the file the daemon is
+        // about to delete. Best-effort — the daemon wipe is the authority, and
+        // we're restarting the whole stack regardless.
+        let _ = self.ownership.leave_fleet();
+        self.emit_owned().await;
+        match self.client.request(&Request::FactoryReset).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "factory reset: daemon request errored (it is likely already exiting): {e}"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Front-end command: kick `device` out of the fleet. Only the fleet
@@ -15151,6 +15274,49 @@ impl Mesh {
             && !self
                 .cec
                 .is_allowed(sender, allmystuff_cec_consent::Capability::ScreenView)
+    }
+
+    /// Whether `sender` may make THIS machine *source* (capture and stream) the
+    /// media `route` asks for — its screen, camera, or microphone. This is the
+    /// capture-side twin of [`Self::sender_may_drive`]: [`route_drive_plane`]
+    /// only ever classified the drive planes (input/terminal/files/sites/
+    /// clipboard), so a `Display`/`Video`/`Audio` *source* offer sailed past the
+    /// offer gate and reached `start_media` with no authorization at all — the
+    /// gap that let any authenticated peer pull this device's screen, webcam, or
+    /// mic. Owner and fleet may source anything; a dialed CEC technician's live
+    /// `ScreenView` consent covers the screen kinds (`Display`/`Video`; audio is
+    /// not part of the CEC consent model); otherwise it takes an explicit
+    /// person-to-person share this device extended that lets that person
+    /// *consume* this media on this capability (the "Receive your screen"
+    /// grant). Mirrors the owner/fleet → CEC → share layering of
+    /// [`Self::may_drive`]; screen viewing stays gated here at the offer (and
+    /// torn down by [`Self::spawn_cec_consent_sweep`]), never per frame.
+    fn sender_may_source_media(&self, sender: &str, route: &Route) -> bool {
+        if self.sender_may_control(sender) {
+            return true;
+        }
+        // A dialed CEC technician holds no fleet membership; their authority to
+        // view the screen is the customer's live ScreenView consent grant.
+        if matches!(route.media, MediaKind::Display | MediaKind::Video)
+            && self
+                .cec
+                .is_allowed(sender, allmystuff_cec_consent::Capability::ScreenView)
+        {
+            return true;
+        }
+        // An explicit share this device extended letting that person consume
+        // exactly this media on this capability (honours capability pinning and
+        // the media/role scope via the canonical `Grant::permits`).
+        let Some(person) = self.shares.person_for_node(pubkey_part(sender)) else {
+            return false;
+        };
+        self.shares.out_grants_for(&person.id).iter().any(|g| {
+            g.permits(
+                route.media,
+                allmystuff_graph::GrantRole::Consume,
+                &route.from,
+            )
+        })
     }
 
     /// Media keeps arriving for a route this side doesn't hold live — our

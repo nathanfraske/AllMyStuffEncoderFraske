@@ -65,6 +65,8 @@ import {
   fileSend,
   fleetKick,
   fleetLeave,
+  resetNetworking,
+  factoryReset,
   fleetSetName,
   fleetGrantRole,
   fleetRevokeRole,
@@ -8084,6 +8086,34 @@ class AppStore {
       : null;
     this.reconcileFleetRelationships();
     // No toast — the Fleet pane drops to its "No fleet yet" state.
+  }
+
+  // ---- Danger Zone (Settings → Updates) ----
+  // Each level reboots the whole stack after it clears state. The mesh daemon
+  // is the real datastore, so a reset that only deletes state on one layer can
+  // be undone by another layer's in-memory cache re-persisting it — the reboot
+  // is what makes the wipe actually stick. `restartApp()` relaunches the app
+  // (and the supervised node + daemon come back on clean state), so these calls
+  // normally end by relaunching rather than returning.
+
+  /** Leave the fleet, then reboot. */
+  async dangerLeaveFleet() {
+    await this.leaveFleet();
+    await restartApp();
+  }
+
+  /** Leave the fleet and forget every network (keeps the device identity),
+   *  then reboot. */
+  async dangerResetNetworking() {
+    await resetNetworking();
+    await restartApp();
+  }
+
+  /** Factory reset — wipe identity, config, all networks and fleet ownership,
+   *  then reboot into a brand-new device. */
+  async dangerFactoryReset() {
+    await factoryReset();
+    await restartApp();
   }
 
   /** Evict a member from the fleet (owner-only). Routes through the governance
