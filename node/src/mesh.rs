@@ -1891,7 +1891,7 @@ impl Mesh {
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
             offer_first_seen: Mutex::new(HashMap::new()),
             desired_routes: Mutex::new(HashMap::new()),
-            route_intent_generation: AtomicU64::new(fresh_boot_id()),
+            route_intent_generation: AtomicU64::new(fresh_js_counter_seed()),
             pending_teardowns: Mutex::new(HashMap::new()),
             last_status: Mutex::new(("unknown".into(), None)),
             reliable_control_workers: Arc::new(Mutex::new(HashMap::new())),
@@ -1918,7 +1918,7 @@ impl Mesh {
             daemon_session_epoch: Arc::new(AtomicU64::new(0)),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(VideoWatchRegistry::default()),
-            video_watch_token: AtomicU64::new(fresh_boot_id()),
+            video_watch_token: AtomicU64::new(fresh_js_counter_seed()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             network_subscriptions: Mutex::new(HashMap::new()),
             subscription_serial: tokio::sync::Mutex::new(()),
@@ -6670,12 +6670,7 @@ impl Mesh {
     /// console's decode ladder. Returns the claim token to pass back to
     /// [`Self::video_unwatch`].
     pub fn video_watch(self: &Arc<Self>, route_id: String, decode: bool) -> u64 {
-        let token = loop {
-            let token = self.video_watch_token.fetch_add(1, Ordering::Relaxed);
-            if token != 0 {
-                break token;
-            }
-        };
+        let token = next_js_safe_counter(&self.video_watch_token);
         let decode_epoch = if decode {
             self.video_watchers
                 .lock()
@@ -12242,15 +12237,7 @@ impl Mesh {
     }
 
     fn next_route_intent_generation(&self) -> u64 {
-        loop {
-            let generation = self
-                .route_intent_generation
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-            if generation != 0 {
-                return generation;
-            }
-        }
+        next_js_safe_counter(&self.route_intent_generation)
     }
 
     fn desired_route_is_current(&self, route_id: &str, generation: u64) -> bool {
@@ -17957,6 +17944,33 @@ fn fresh_boot_id() -> u64 {
     u64::from_le_bytes(bytes).max(1)
 }
 
+/// Largest integer that JavaScript can round-trip exactly through a JSON
+/// number. Route handles and watcher tokens cross the Tauri boundary as
+/// numbers, then return to Rust on disconnect/poll, so their process-local
+/// counters must stay inside this range.
+const JS_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
+
+fn fresh_js_counter_seed() -> u64 {
+    (fresh_boot_id() & JS_SAFE_INTEGER_MAX).max(1)
+}
+
+fn next_js_safe_counter(counter: &AtomicU64) -> u64 {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        let next = if current >= JS_SAFE_INTEGER_MAX {
+            1
+        } else {
+            current + 1
+        };
+        if counter
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 /// Log-friendly head of a mesh id — enough to tell two machines apart in a
 /// trace without drowning it in base32.
 fn short_id(id: &str) -> String {
@@ -18148,13 +18162,29 @@ mod tests {
     fn route_connect_handle_wire_shape_matches_frontend_contract() {
         let value = serde_json::to_value(RouteConnectHandle {
             route_id: "route:display".into(),
-            generation: 23,
+            generation: JS_SAFE_INTEGER_MAX,
         })
         .expect("serialize route handle");
         assert_eq!(
             value,
-            json!({ "route_id": "route:display", "generation": 23 })
+            json!({
+                "route_id": "route:display",
+                "generation": JS_SAFE_INTEGER_MAX
+            })
         );
+    }
+
+    #[test]
+    fn javascript_boundary_counters_are_exact_nonzero_and_wrap_safely() {
+        for _ in 0..256 {
+            let seed = fresh_js_counter_seed();
+            assert!((1..=JS_SAFE_INTEGER_MAX).contains(&seed));
+        }
+
+        let counter = AtomicU64::new(JS_SAFE_INTEGER_MAX - 1);
+        assert_eq!(next_js_safe_counter(&counter), JS_SAFE_INTEGER_MAX);
+        assert_eq!(next_js_safe_counter(&counter), 1);
+        assert_eq!(next_js_safe_counter(&counter), 2);
     }
 
     #[test]
