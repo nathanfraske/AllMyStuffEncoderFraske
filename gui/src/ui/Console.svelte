@@ -32,6 +32,7 @@
   import { app } from "../store.svelte";
   import { DecodeStallEvidence, h264CodecString } from "../video-decoder";
   import {
+    clientLog,
     closeThisWindow,
     focusThisWindow,
     isMobile,
@@ -197,6 +198,16 @@
   // the effective panel beside the sender's encode target when co-located.
   let recvMbps = $state(0);
   let inBytes = 0;
+  // Opt-in development timings for the final webview paint boundary. They
+  // remain plain counters so the ordinary renderer does not trigger Svelte
+  // work. The existing debug-logging toggle gates every clock read and log.
+  let paintBusyMs = 0;
+  let paintBusySamples = 0;
+  let paintBusyMaxMs = 0;
+  let paintIntervalMs = 0;
+  let paintIntervalSamples = 0;
+  let paintIntervalMaxMs = 0;
+  let lastPaintAt = 0;
   let queuePeek = () => 0;
   let stallKick = (_inputFps: number, _decodedFps: number, _paintFps: number) => {};
   let decodeModeNote = "";
@@ -648,11 +659,41 @@
       const decodedRate = decCount;
       inFps = inRate;
       decFps = decodedRate;
+      const receivedMbps = (inBytes * 8) / 1e6;
       frameCount = 0;
       inCount = 0;
       decCount = 0;
-      recvMbps = (inBytes * 8) / 1e6;
+      recvMbps = receivedMbps;
       inBytes = 0;
+      if (app.debugLoggingEnabled === true && (inRate > 0 || decodedRate > 0 || fps > 0)) {
+        clientLog(
+          `[video-pipeline] ${JSON.stringify({
+            route: app.consoleVideoLive,
+            decode_path: decodePath,
+            transport,
+            width: frameW,
+            height: frameH,
+            input_fps: inRate,
+            decoded_fps: decodedRate,
+            paint_fps: fps,
+            queue_depth: queuePeek(),
+            receive_mbps: receivedMbps,
+            paint_busy_ms_avg: paintBusySamples ? paintBusyMs / paintBusySamples : 0,
+            paint_busy_ms_max: paintBusyMaxMs,
+            paint_interval_ms_avg: paintIntervalSamples
+              ? paintIntervalMs / paintIntervalSamples
+              : 0,
+            paint_interval_ms_max: paintIntervalMaxMs,
+            decode_failures: decodeFails,
+          })}`,
+        );
+      }
+      paintBusyMs = 0;
+      paintBusySamples = 0;
+      paintBusyMaxMs = 0;
+      paintIntervalMs = 0;
+      paintIntervalSamples = 0;
+      paintIntervalMaxMs = 0;
       // Healthy: most of what arrives gets painted. Anything else is an
       // anomaly worth wearing on the chip.
       pipeDiag =
@@ -765,6 +806,13 @@
     decCount = 0;
     recvMbps = 0;
     inBytes = 0;
+    paintBusyMs = 0;
+    paintBusySamples = 0;
+    paintBusyMaxMs = 0;
+    paintIntervalMs = 0;
+    paintIntervalSamples = 0;
+    paintIntervalMaxMs = 0;
+    lastPaintAt = 0;
     // A new stream starts at its natural fit, with the trackpad cursor
     // re-centered, and any touch gesture from the old one is over — but
     // ONLY on an actual route change. The decode ladder re-runs this
@@ -923,7 +971,22 @@
       if (c.height !== h) c.height = h;
       const ctx = c.getContext("2d");
       if (!ctx) return;
+      const paintStarted = diagnostics ? performance.now() : 0;
+      if (diagnostics && lastPaintAt > 0) {
+        const interval = paintStarted - lastPaintAt;
+        paintIntervalMs += interval;
+        paintIntervalSamples += 1;
+        paintIntervalMaxMs = Math.max(paintIntervalMaxMs, interval);
+      }
       draw(ctx);
+      if (diagnostics) {
+        const paintedAt = performance.now();
+        const busy = paintedAt - paintStarted;
+        paintBusyMs += busy;
+        paintBusySamples += 1;
+        paintBusyMaxMs = Math.max(paintBusyMaxMs, busy);
+        lastPaintAt = paintedAt;
+      }
       frameW = w;
       frameH = h;
       hasFrame = true;
