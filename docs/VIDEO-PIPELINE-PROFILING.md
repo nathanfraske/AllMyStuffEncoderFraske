@@ -76,13 +76,18 @@ this backend profiler.
 
 ## Reproducible Windows field run
 
-The runner stops only the local GUI/backend, reuses the pinned running mesh
-daemon (preserving established ICE sessions), starts the requested candidate
-with profiling enabled, waits until the exact authenticated peer or source is
-advertised, runs the pinned production probe, flushes the trace, and restores
-the installed GUI. Add `-RestartMesh` only for an intentional cold transport
-test. It refuses an unreviewed probe hash and never uses the probe's diagnostic
-no-ICE-proof bypass.
+The runner stops the local GUI/backend and any running mesh daemon, then starts
+the hash-pinned daemon and requested candidate with profiling enabled. Restarting
+is required because the executable currently at a process path does not prove
+which bytes an existing Windows process already mapped. The runner waits until
+the exact authenticated peer or source is advertised, runs the pinned production
+probe, flushes the trace, and restores the installed GUI. It refuses an
+unreviewed probe hash and never uses the probe's diagnostic no-ICE-proof bypass.
+`-RestartMesh` remains accepted for compatibility but exact runs always restart
+the pinned daemon. The profiled backend also pauses its periodic full inventory
+rescans after the startup snapshot. This keeps Windows CIM and PowerShell device
+enumeration out of the timing window without changing the advertised devices
+used by the run.
 
 ```powershell
 .\scripts\run-video-profile.ps1 `
