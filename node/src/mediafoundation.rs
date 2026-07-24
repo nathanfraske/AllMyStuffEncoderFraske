@@ -595,3 +595,175 @@ fn variant_u32(v: u32) -> VARIANT {
 fn variant_bool(v: bool) -> VARIANT {
     VARIANT::from(v)
 }
+
+/// A/B/C comparison bench (added in a throwaway worktree of the upstream
+/// fork point — never committed). Mirrors the fork's bench parameters and
+/// content patterns exactly, so the numbers interleave against the fork's
+/// own benches on the same box:
+///  - pixel-loop rows match `win_capture`/`pixels` bench shapes (4K,
+///    same synthetic content, 30 iters)
+///  - the MF encode row matches `bench_mf_encode_call_latency` (1440p,
+///    60 fps, 30 Mbps, 150 frames, the same luma shift per frame)
+/// Run: `cargo test --release -- --ignored bench_abc --nocapture --test-threads=1`
+#[cfg(test)]
+mod abc_bench {
+    use super::*;
+
+    fn ms(d: Duration, n: u32) -> f64 {
+        d.as_secs_f64() * 1000.0 / f64::from(n)
+    }
+
+    #[test]
+    #[ignore = "bench — run with --ignored --nocapture"]
+    fn bench_abc_upstream_decomposition() {
+        // ---- capture-side per-damage-frame costs (4K), exactly the
+        // shipped upstream shapes: fresh zeroed alloc (copy_out), the
+        // BGRA->RGBA swizzle compiled in THIS crate (-Os), and the
+        // full-frame clone (`last_clean = Some(rgba.clone())`). The warm
+        // copy row is the fork's replacement shape (reused pages),
+        // measured here so both shapes come from one binary.
+        let (cw, chh) = (3840usize, 2160usize);
+        let pitch = cw * 4;
+        let src: Vec<u8> = (0..pitch * chh).map(|i| (i % 253) as u8).collect();
+        let n = 30u32;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(vec![0u8; cw * chh * 4]);
+        }
+        let zalloc = ms(t0.elapsed(), n);
+        let mut rgba = vec![0u8; cw * chh * 4];
+        let t0 = Instant::now();
+        for _ in 0..n {
+            for row in 0..chh {
+                let s = &src[row * pitch..][..cw * 4];
+                let d = &mut rgba[row * cw * 4..][..cw * 4];
+                for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                    dp[0] = sp[2];
+                    dp[1] = sp[1];
+                    dp[2] = sp[0];
+                    dp[3] = 255;
+                }
+            }
+            std::hint::black_box(&rgba);
+        }
+        let swizzle = ms(t0.elapsed(), n);
+        let t0 = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(rgba.clone());
+        }
+        let cold_clone = ms(t0.elapsed(), n);
+        let mut warm = rgba.clone();
+        let t0 = Instant::now();
+        for _ in 0..n {
+            warm.clear();
+            warm.extend_from_slice(&rgba);
+            std::hint::black_box(&warm);
+        }
+        let warm_copy = ms(t0.elapsed(), n);
+        println!(
+            "bench ABC upstream capture 4K: zalloc {zalloc:7.3} ms | swizzle(-Os) {swizzle:7.3} ms | cold clone {cold_clone:7.3} ms | warm copy {warm_copy:7.3} ms"
+        );
+
+        // ---- convert (pixels crate, O3 here too): the upstream path is
+        // scale_rgba_to_i420 with a fresh allocation per call. Same
+        // content and iters as the fork's pixels benches.
+        let synth: Vec<u8> = (0..cw * chh * 4).map(|i| (i * 31 % 251) as u8).collect();
+        let native = {
+            let t0 = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(allmystuff_pixels::scale_rgba_to_i420(
+                    &synth, 3840, 2160, 3840, 2160,
+                ));
+            }
+            ms(t0.elapsed(), n)
+        };
+        let scaled = {
+            let t0 = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(allmystuff_pixels::scale_rgba_to_i420(
+                    &synth, 3840, 2160, 1920, 1080,
+                ));
+            }
+            ms(t0.elapsed(), n)
+        };
+        println!(
+            "bench ABC upstream convert: scale_rgba_to_i420 4K->4K {native:7.3} ms | 4K->1080p {scaled:7.3} ms"
+        );
+
+        // ---- the encoder-side I420->NV12 interleave upstream pays inside
+        // every encode_i420 call (the fork deleted it) — at 4K (desktop
+        // native) and 1440p (the MF row's size, to subtract mentally).
+        for (w, h, tag) in [(3840usize, 2160usize, "4K"), (2560usize, 1440usize, "1440p")] {
+            let ysize = w * h;
+            let csize = (w / 2) * (h / 2);
+            let i420: Vec<u8> = (0..ysize + 2 * csize).map(|i| (i % 247) as u8).collect();
+            let mut nv12 = vec![0u8; ysize + 2 * csize];
+            let iters = 60u32;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                nv12[..ysize].copy_from_slice(&i420[..ysize]);
+                let u = &i420[ysize..ysize + csize];
+                let v = &i420[ysize + csize..ysize + 2 * csize];
+                let uv = &mut nv12[ysize..];
+                for i in 0..csize {
+                    uv[2 * i] = u[i];
+                    uv[2 * i + 1] = v[i];
+                }
+                std::hint::black_box(&nv12);
+            }
+            println!(
+                "bench ABC upstream ingest interleave {tag}: {:7.3} ms",
+                ms(t0.elapsed(), iters)
+            );
+        }
+
+        // ---- MF encode call (1440p, 30 Mbps, 150 frames, same luma shift
+        // as the fork's bench). NOTE: upstream's encode_i420 includes the
+        // interleave above in its timed cost, and its async pump can wait
+        // up to 1000 ms for output — max is the stall, not noise.
+        let (w, h) = (2560u32, 1440u32);
+        let hw = hardware_h264_mfts();
+        let Some(first) = hw.first() else {
+            println!("bench ABC upstream MF encode: SKIP (no hardware MFT)");
+            return;
+        };
+        let mut enc = match first.open(w, h, 60, 30_000_000) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("bench ABC upstream MF encode: SKIP ({e})");
+                return;
+            }
+        };
+        println!("bench ABC upstream MF encoder: {}", enc.label());
+        let (wu, hu) = (w as usize, h as usize);
+        let mut yuv = vec![128u8; wu * hu + 2 * ((wu / 2) * (hu / 2))];
+        let mut lat: Vec<Duration> = Vec::new();
+        let (mut fed, mut units, mut bytes) = (0u32, 0u32, 0u64);
+        for i in 0..150u32 {
+            for (j, v) in yuv[..wu * hu].iter_mut().enumerate() {
+                *v = ((j as u32).wrapping_add(i.wrapping_mul(7)) % 255) as u8;
+            }
+            let t = Instant::now();
+            let out = enc.encode_i420(&yuv, i == 0);
+            lat.push(t.elapsed());
+            fed += 1;
+            if let Ok(Some((d, _))) = out {
+                if !d.is_empty() {
+                    units += 1;
+                    bytes += d.len() as u64;
+                }
+            }
+        }
+        let mut ms_all: Vec<f64> = lat.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+        ms_all.sort_by(f64::total_cmp);
+        let avg: f64 = ms_all.iter().sum::<f64>() / ms_all.len() as f64;
+        let p95 = ms_all[(ms_all.len() * 95 / 100).min(ms_all.len() - 1)];
+        let max = ms_all[ms_all.len() - 1];
+        println!(
+            "bench ABC upstream MF encode call 1440p: avg {avg:6.2} ms · p95 {p95:6.2} ms · max {max:6.2} ms"
+        );
+        println!(
+            "bench ABC upstream MF units conservation: {units} units out of {fed} frames fed · {bytes} bytes"
+        );
+    }
+}
