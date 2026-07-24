@@ -265,7 +265,7 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
   function sendToRoute(routeId: string, action: InputAction) {
-    void sendInput(routeId, action);
+    return sendInput(routeId, action);
   }
   const buttons = makeRemoteButtonTracker(sendToRoute);
 
@@ -326,7 +326,7 @@
     } catch {
       // Capture is best-effort for stale or synthetic pointer ids.
     }
-    sendToRoute(routeId, { kind: "mouse_move", x: p.x, y: p.y });
+    void sendInput(routeId, { kind: "mouse_move", x: p.x, y: p.y }, true);
     buttons.press(routeId, e.button);
   }
   function onPointerUp(e: PointerEvent) {
@@ -344,7 +344,14 @@
   // `code` rides along, auto-repeat stays local, and keys still held when
   // the tile loses focus are lifted in a burst — otherwise the sharer's
   // machine keeps a stuck modifier.
-  const keys = makeKeyForwarder(send);
+  const keys = makeKeyForwarder((routeId, action) => sendInput(routeId, action));
+
+  $effect(() => {
+    const routeAtStart = controlActive ? controlRoute : null;
+    return () => {
+      if (routeAtStart) keys.releaseAll();
+    };
+  });
 
   function releaseRemoteInput() {
     buttons.releaseAll();
@@ -354,7 +361,7 @@
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!controlActive) return;
     e.preventDefault();
-    keys.onKey(e, down);
+    keys.onKey(controlRoute, e, down);
   }
 </script>
 

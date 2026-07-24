@@ -309,7 +309,13 @@ pub async fn send_input(
     state: tauri::State<'_, crate::engine::EngineState>,
     route_id: String,
     action: Value,
-) -> Result<(), String> {
+    ordered: Option<bool>,
+) -> Result<bool, String> {
+    // The shared frontend owns the per-route FIFO and latest-only motion
+    // lanes on mobile. Accept the desktop-compatible `ordered` argument and
+    // acknowledge only after the embedded node has accepted the request, so
+    // held-key/button ownership cannot be discarded before a matching up.
+    let _ = ordered;
     state
         .engine()?
         .request(
@@ -317,7 +323,7 @@ pub async fn send_input(
             json!({ "route_id": route_id, "action": action }),
         )
         .await?;
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]

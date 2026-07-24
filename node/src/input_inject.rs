@@ -43,7 +43,7 @@
 //! route/ownership gates pass. The thread starts lazily on the first
 //! event and dies with the app.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -55,6 +55,7 @@ use parking_lot::Mutex;
 
 use allmystuff_session::InputAction;
 
+#[derive(Debug)]
 enum Cmd {
     Event {
         route: String,
@@ -62,18 +63,44 @@ enum Cmd {
         session_epoch: u64,
         route_epoch: u64,
     },
-    FlushReleases,
 }
 
-/// AMS-06: the most input events queued for injection before excess is dropped.
-/// Legitimate remote control is consumed far faster than it's produced, so the
-/// queue normally holds a handful; this only ever bites a flood from an
-/// abusive controller, capping memory instead of growing it unbounded.
+/// AMS-06: the maximum accounted queue load. A newly admitted key/button down
+/// consumes one queue slot plus one reserved slot for its matching release.
+/// That keeps the queue bounded while ensuring saturation cannot strand an
+/// input that this process accepted as held.
 const INPUT_QUEUE_CAP: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PressToken {
+    route: String,
+    session_epoch: u64,
+    route_epoch: u64,
+    input: PressInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PressInput {
+    Key(String),
+    MouseButton(u8),
+}
+
+struct InputSender {
+    queue: Arc<Mutex<InputQueue>>,
+    wake: mpsc::SyncSender<()>,
+}
+
+struct InputQueue {
+    commands: VecDeque<Cmd>,
+    /// Downs accepted by this queue whose matching up has not been accepted
+    /// yet. Each entry owns one reserved unit in `accounted_len`.
+    admitted_presses: HashSet<PressToken>,
+    capacity: usize,
+}
 
 #[derive(Default)]
 pub struct Injector {
-    tx: Mutex<Option<mpsc::SyncSender<Cmd>>>,
+    tx: Mutex<Option<InputSender>>,
     session_epoch: Arc<AtomicU64>,
     next_route_epoch: AtomicU64,
     route_epochs: Arc<Mutex<HashMap<String, u64>>>,
@@ -96,6 +123,211 @@ struct PendingReleases {
     routes: HashSet<String>,
 }
 
+impl Cmd {
+    fn press_transition(&self) -> Option<(PressToken, bool)> {
+        let Self::Event {
+            route,
+            action,
+            session_epoch,
+            route_epoch,
+        } = self;
+        let (input, down) = match action {
+            InputAction::Key {
+                key, code, down, ..
+            } => (
+                PressInput::Key(KeyTracker::identity(key, code.as_deref())),
+                *down,
+            ),
+            InputAction::MouseButton { button, down } => (PressInput::MouseButton(*button), *down),
+            _ => return None,
+        };
+        Some((
+            PressToken {
+                route: route.clone(),
+                session_epoch: *session_epoch,
+                route_epoch: *route_epoch,
+                input,
+            },
+            down,
+        ))
+    }
+
+    fn is_lossy_continuous(&self) -> bool {
+        matches!(
+            self,
+            Self::Event {
+                action: InputAction::MouseMove { .. }
+                    | InputAction::MouseMoveRel { .. }
+                    | InputAction::Wheel { .. },
+                ..
+            }
+        )
+    }
+}
+
+impl InputQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            commands: VecDeque::new(),
+            admitted_presses: HashSet::new(),
+            capacity,
+        }
+    }
+
+    fn accounted_len(&self) -> usize {
+        self.commands.len() + self.admitted_presses.len()
+    }
+
+    /// Nonblocking admission with one reserved unit for every first down.
+    ///
+    /// A matching up exchanges its reservation for a queue slot, so it fits
+    /// even when the queue is otherwise saturated. New downs and best-effort
+    /// events evict continuous motion first, then fail closed if admitting
+    /// them would consume capacity reserved for an already accepted release.
+    fn enqueue(&mut self, cmd: Cmd) -> bool {
+        if self.coalesce_continuous(&cmd) {
+            return true;
+        }
+
+        if let Some((token, down)) = cmd.press_transition() {
+            if down {
+                if self.admitted_presses.contains(&token) {
+                    return self.enqueue_best_effort(cmd, 1);
+                }
+                if !self.make_room(2) {
+                    return false;
+                }
+                self.admitted_presses.insert(token);
+                self.commands.push_back(cmd);
+                debug_assert!(self.accounted_len() <= self.capacity);
+                return true;
+            }
+
+            if self.admitted_presses.remove(&token) {
+                // Removing the release reservation and appending the release
+                // leave the accounted length unchanged.
+                self.commands.push_back(cmd);
+                debug_assert!(self.accounted_len() <= self.capacity);
+                return true;
+            }
+        }
+
+        self.enqueue_best_effort(cmd, 1)
+    }
+
+    fn enqueue_best_effort(&mut self, cmd: Cmd, units: usize) -> bool {
+        if !self.make_room(units) {
+            return false;
+        }
+        self.commands.push_back(cmd);
+        debug_assert!(self.accounted_len() <= self.capacity);
+        true
+    }
+
+    fn make_room(&mut self, units: usize) -> bool {
+        while self.accounted_len().saturating_add(units) > self.capacity {
+            let Some(index) = self
+                .commands
+                .iter()
+                .position(|queued| queued.is_lossy_continuous())
+            else {
+                return false;
+            };
+            self.commands.remove(index);
+        }
+        true
+    }
+
+    /// Adjacent motion can be collapsed without crossing a click, key, route,
+    /// or generation boundary. Absolute motion keeps the freshest point;
+    /// relative motion and wheel input preserve total delta.
+    fn coalesce_continuous(&mut self, newer: &Cmd) -> bool {
+        let Some(Cmd::Event {
+            route: old_route,
+            action: old_action,
+            session_epoch: old_session_epoch,
+            route_epoch: old_route_epoch,
+        }) = self.commands.back_mut()
+        else {
+            return false;
+        };
+        let Cmd::Event {
+            route: new_route,
+            action: new_action,
+            session_epoch: new_session_epoch,
+            route_epoch: new_route_epoch,
+        } = newer;
+        if old_route != new_route
+            || old_session_epoch != new_session_epoch
+            || old_route_epoch != new_route_epoch
+        {
+            return false;
+        }
+
+        match (old_action, new_action) {
+            (
+                InputAction::MouseMove {
+                    x: old_x,
+                    y: old_y,
+                    screen: old_screen,
+                },
+                InputAction::MouseMove {
+                    x: new_x,
+                    y: new_y,
+                    screen: new_screen,
+                },
+            ) if old_screen == new_screen => {
+                *old_x = *new_x;
+                *old_y = *new_y;
+                true
+            }
+            (
+                InputAction::MouseMoveRel {
+                    dx: old_dx,
+                    dy: old_dy,
+                },
+                InputAction::MouseMoveRel {
+                    dx: new_dx,
+                    dy: new_dy,
+                },
+            )
+            | (
+                InputAction::Wheel {
+                    dx: old_dx,
+                    dy: old_dy,
+                },
+                InputAction::Wheel {
+                    dx: new_dx,
+                    dy: new_dy,
+                },
+            ) => {
+                let dx = *old_dx + *new_dx;
+                let dy = *old_dy + *new_dy;
+                if !dx.is_finite() || !dy.is_finite() {
+                    return false;
+                }
+                *old_dx = dx;
+                *old_dy = dy;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn clear_generation(&mut self, route: &str, session_epoch: u64, route_epoch: u64) {
+        self.admitted_presses.retain(|press| {
+            press.route != route
+                || press.session_epoch != session_epoch
+                || press.route_epoch != route_epoch
+        });
+    }
+
+    fn clear_session(&mut self, session_epoch: u64) {
+        self.admitted_presses
+            .retain(|press| press.session_epoch != session_epoch);
+    }
+}
+
 impl Injector {
     pub fn new() -> Self {
         Self::default()
@@ -110,12 +342,22 @@ impl Injector {
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
             .max(1);
-        let replaced = self
-            .route_epochs
-            .lock()
-            .insert(route.to_string(), route_epoch)
-            .is_some();
-        if replaced && self.tx.lock().is_some() {
+        let (replaced_route_epoch, session_epoch) = {
+            let mut route_epochs = self.route_epochs.lock();
+            let session_epoch = self.session_epoch.load(Ordering::SeqCst);
+            (
+                route_epochs.insert(route.to_string(), route_epoch),
+                session_epoch,
+            )
+        };
+        if let Some(replaced_route_epoch) = replaced_route_epoch {
+            let tx = self.tx.lock();
+            let Some(sender) = tx.as_ref() else { return };
+            sender
+                .queue
+                .lock()
+                .clear_generation(route, session_epoch, replaced_route_epoch);
+            drop(tx);
             self.pending_releases
                 .lock()
                 .routes
@@ -127,7 +369,8 @@ impl Injector {
     /// Capture the active generation before the caller checks route ownership.
     /// Unknown and already-ended route ids do not allocate bookkeeping.
     pub fn lease(&self, route: &str) -> Option<InputLease> {
-        let route_epoch = self.route_epochs.lock().get(route).copied()?;
+        let route_epochs = self.route_epochs.lock();
+        let route_epoch = route_epochs.get(route).copied()?;
         Some(InputLease {
             session_epoch: self.session_epoch.load(Ordering::SeqCst),
             route_epoch,
@@ -152,13 +395,21 @@ impl Injector {
     pub fn release_route(&self, route: &str) {
         // Removing the active generation is the fence. Unknown ids are a true
         // no-op, so rejected forged ids cannot grow this map or its pending set.
-        if self.route_epochs.lock().remove(route).is_none() {
-            return;
-        }
+        let (route_epoch, session_epoch) = {
+            let mut route_epochs = self.route_epochs.lock();
+            let Some(route_epoch) = route_epochs.remove(route) else {
+                return;
+            };
+            (route_epoch, self.session_epoch.load(Ordering::SeqCst))
+        };
         // Never spawns the thread: if it isn't running, nothing is held.
-        if self.tx.lock().is_none() {
-            return;
-        }
+        let tx = self.tx.lock();
+        let Some(sender) = tx.as_ref() else { return };
+        sender
+            .queue
+            .lock()
+            .clear_generation(route, session_epoch, route_epoch);
+        drop(tx);
         self.pending_releases
             .lock()
             .routes
@@ -170,11 +421,16 @@ impl Injector {
     /// Release the injector's authoritative held-input set instead of relying
     /// on the replacement session to enumerate routes that no longer exist.
     pub fn release_all(&self) {
-        self.session_epoch.fetch_add(1, Ordering::SeqCst);
-        self.route_epochs.lock().clear();
-        if self.tx.lock().is_none() {
-            return;
-        }
+        let retired_session_epoch = {
+            let mut route_epochs = self.route_epochs.lock();
+            let retired_session_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst);
+            route_epochs.clear();
+            retired_session_epoch
+        };
+        let tx = self.tx.lock();
+        let Some(sender) = tx.as_ref() else { return };
+        sender.queue.lock().clear_session(retired_session_epoch);
+        drop(tx);
         let mut pending = self.pending_releases.lock();
         pending.all = true;
         pending.routes.clear();
@@ -185,21 +441,32 @@ impl Injector {
     fn send_event(&self, cmd: Cmd) {
         let mut tx = self.tx.lock();
         if tx.is_none() {
-            // A *bounded* queue: a flood from an abusive controller drops excess
-            // (below) rather than growing memory without limit (AMS-06).
-            let (sender, rx) = mpsc::sync_channel::<Cmd>(INPUT_QUEUE_CAP);
+            // The wake channel only needs one token: commands live in the
+            // bounded policy queue, and one pending wake means the worker will
+            // observe every command already admitted there.
+            let (wake, rx) = mpsc::sync_channel::<()>(1);
+            let queue = Arc::new(Mutex::new(InputQueue::new(INPUT_QUEUE_CAP)));
             let session_epoch = self.session_epoch.clone();
             let route_epochs = self.route_epochs.clone();
             let pending_releases = self.pending_releases.clone();
+            let worker_queue = queue.clone();
             std::thread::spawn(move || {
-                run_injector(rx, session_epoch, route_epochs, pending_releases)
+                run_injector(
+                    rx,
+                    worker_queue,
+                    session_epoch,
+                    route_epochs,
+                    pending_releases,
+                )
             });
-            *tx = Some(sender);
+            *tx = Some(InputSender { queue, wake });
         }
-        if let Some(t) = tx.as_ref() {
-            match t.try_send(cmd) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {}
+        if let Some(sender) = tx.as_ref() {
+            if !sender.queue.lock().enqueue(cmd) {
+                return;
+            }
+            match sender.wake.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                 // The thread ended (platform refused); allow a retry on the next
                 // event rather than wedging forever.
                 Err(mpsc::TrySendError::Disconnected(_)) => *tx = None,
@@ -210,7 +477,7 @@ impl Injector {
     fn wake_releases(&self) {
         let mut tx = self.tx.lock();
         let Some(sender) = tx.as_ref() else { return };
-        match sender.try_send(Cmd::FlushReleases) {
+        match sender.wake.try_send(()) {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => *tx = None,
         }
@@ -218,7 +485,8 @@ impl Injector {
 }
 
 fn run_injector(
-    rx: mpsc::Receiver<Cmd>,
+    rx: mpsc::Receiver<()>,
+    queue: Arc<Mutex<InputQueue>>,
     session_epoch: Arc<AtomicU64>,
     route_epochs: Arc<Mutex<HashMap<String, u64>>>,
     pending_releases: Arc<Mutex<PendingReleases>>,
@@ -238,93 +506,218 @@ fn run_injector(
     // the next key resolves, and everything still down is lifted when the
     // route or daemon session goes away.
     let mut routes: HashMap<String, RouteInputState> = HashMap::new();
-    while let Ok(cmd) = rx.recv() {
-        flush_pending_releases(&mut enigo, &mut routes, &pending_releases);
-        let (route, action, event_session_epoch, event_route_epoch) = match cmd {
-            Cmd::Event {
+    // Cleanup state is kept separate from live route ids. That lets a reused
+    // route start a fresh generation while failed OS releases from its
+    // predecessor retain authority to retry on a later worker wake.
+    let mut release_retries = Vec::new();
+    let mut live_release_retries = Vec::new();
+    // A failed OS down is remembered until its matching up so the healing
+    // path for an unobserved down does not release an input we know failed.
+    let mut failed_presses = HashSet::new();
+    while rx.recv().is_ok() {
+        {
+            let current_session_epoch = session_epoch.load(Ordering::SeqCst);
+            let current_routes = route_epochs.lock();
+            failed_presses.retain(|press: &PressToken| {
+                press.session_epoch == current_session_epoch
+                    && current_routes.get(&press.route).copied() == Some(press.route_epoch)
+            });
+        }
+        loop {
+            retry_live_releases(
+                &mut enigo,
+                &mut routes,
+                &mut live_release_retries,
+                &session_epoch,
+                &route_epochs,
+            );
+            flush_pending_releases(
+                &mut enigo,
+                &mut routes,
+                &pending_releases,
+                &mut release_retries,
+            );
+            let Some(Cmd::Event {
                 route,
                 action,
-                session_epoch,
-                route_epoch,
-            } => (route, action, session_epoch, route_epoch),
-            Cmd::FlushReleases => continue,
-        };
-        if !event_generation_is_current(
-            &session_epoch,
-            &route_epochs,
-            &route,
-            event_session_epoch,
-            event_route_epoch,
-        ) {
-            continue;
-        }
-        // A viewer clicking or typing at a *dark* console is the "remote
-        // login wakes the machine" moment — relight the panel so the
-        // stream they're driving blind comes back. No-op while frames
-        // flow (rate-limited and gated inside).
-        if matches!(
-            action,
-            InputAction::MouseButton { .. } | InputAction::Key { .. }
-        ) {
-            crate::wake::force_display_on_if_dark();
-        }
-        let result = match action {
-            InputAction::MouseMove { x, y, screen } => {
-                let rect = screens.resolve(screen);
-                let (gx, gy) = rect.denorm(x, y);
-                move_mouse_global(&mut enigo, gx, gy)
+                session_epoch: event_session_epoch,
+                route_epoch: event_route_epoch,
+            }) = queue.lock().commands.pop_front()
+            else {
+                break;
+            };
+            if !event_generation_is_current(
+                &session_epoch,
+                &route_epochs,
+                &route,
+                event_session_epoch,
+                event_route_epoch,
+            ) {
+                continue;
             }
-            // Pointer-lock deltas: raw relative motion, straight through —
-            // games read this as camera movement, so no screen resolve, no
-            // clamping, no coalescing beyond what the sender already did.
-            InputAction::MouseMoveRel { dx, dy } => enigo
-                .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
-                .map_err(|e| e.to_string()),
-            InputAction::MouseButton { button, down } => match if down {
-                routes.entry(route).or_default().press_button(button)
-            } else {
-                routes.entry(route).or_default().release_button(button)
-            } {
-                Some(b) => enigo.button(b, direction(down)).map_err(|e| e.to_string()),
-                None => Ok(()),
-            },
-            InputAction::Wheel { dx, dy } => {
-                let mut r = Ok(());
-                if dy.abs() >= 0.5 {
-                    r = enigo
-                        .scroll(dy.round() as i32, Axis::Vertical)
-                        .map_err(|e| e.to_string());
-                }
-                if r.is_ok() && dx.abs() >= 0.5 {
-                    r = enigo
-                        .scroll(dx.round() as i32, Axis::Horizontal)
-                        .map_err(|e| e.to_string());
-                }
-                r
+            // A viewer clicking or typing at a *dark* console is the "remote
+            // login wakes the machine" moment — relight the panel so the
+            // stream they're driving blind comes back. No-op while frames
+            // flow (rate-limited and gated inside).
+            if matches!(
+                action,
+                InputAction::MouseButton { .. } | InputAction::Key { .. }
+            ) {
+                crate::wake::force_display_on_if_dark();
             }
-            InputAction::Key {
-                ref key,
-                ref code,
-                down,
-            } => {
-                let tracker = &mut routes.entry(route).or_default().keys;
-                let k = if down {
-                    tracker.press(key, code.as_deref())
-                } else {
-                    tracker.release(key, code.as_deref())
-                };
-                match k {
-                    Some(k) => enigo.key(k, direction(down)).map_err(|e| e.to_string()),
-                    None => Ok(()),
+            let mut failed_release = None;
+            let result = match action {
+                InputAction::MouseMove { x, y, screen } => {
+                    let rect = screens.resolve(screen);
+                    let (gx, gy) = rect.denorm(x, y);
+                    move_mouse_global(&mut enigo, gx, gy)
+                }
+                // Pointer-lock deltas: raw relative motion, straight through —
+                // adjacent queued deltas preserve total movement; injection
+                // still does no screen resolution or clamping.
+                InputAction::MouseMoveRel { dx, dy } => enigo
+                    .move_mouse(dx.round() as i32, dy.round() as i32, enigo::Coordinate::Rel)
+                    .map_err(|e| e.to_string()),
+                InputAction::MouseButton { button, down } => {
+                    let state = routes.entry(route.clone()).or_default();
+                    let input = PressInput::MouseButton(button);
+                    let press = PressToken {
+                        route: route.clone(),
+                        session_epoch: event_session_epoch,
+                        route_epoch: event_route_epoch,
+                        input: input.clone(),
+                    };
+                    if down {
+                        if state.holds_button(button)
+                            && cancel_live_release_retry(
+                                &mut live_release_retries,
+                                &route,
+                                event_session_epoch,
+                                event_route_epoch,
+                                &input,
+                            )
+                        {
+                            // The failed up left the OS input down. This new
+                            // down adopts it and cancels the retry instead of
+                            // letting a later retry release the new press.
+                            failed_presses.remove(&press);
+                            Ok(())
+                        } else {
+                            let result = inject_button_press(&mut enigo, state, button);
+                            if result.is_err() {
+                                failed_presses.insert(press);
+                            } else {
+                                failed_presses.remove(&press);
+                            }
+                            result
+                        }
+                    } else {
+                        let skip_release = suppress_unaccepted_release(
+                            &mut failed_presses,
+                            &press,
+                            state.holds_button(button),
+                        );
+                        let result = if skip_release {
+                            Ok(())
+                        } else {
+                            release_button(&mut enigo, state, button)
+                        };
+                        if result.is_err() && state.holds_button(button) {
+                            failed_release = Some(LiveReleaseRetry {
+                                route: route.clone(),
+                                session_epoch: event_session_epoch,
+                                route_epoch: event_route_epoch,
+                                input,
+                            });
+                        }
+                        result
+                    }
+                }
+                InputAction::Wheel { dx, dy } => {
+                    let mut r = Ok(());
+                    if dy.abs() >= 0.5 {
+                        r = enigo
+                            .scroll(dy.round() as i32, Axis::Vertical)
+                            .map_err(|e| e.to_string());
+                    }
+                    if r.is_ok() && dx.abs() >= 0.5 {
+                        r = enigo
+                            .scroll(dx.round() as i32, Axis::Horizontal)
+                            .map_err(|e| e.to_string());
+                    }
+                    r
+                }
+                InputAction::Key {
+                    ref key,
+                    ref code,
+                    down,
+                } => {
+                    let tracker = &mut routes.entry(route.clone()).or_default().keys;
+                    let identity = KeyTracker::identity(key, code.as_deref());
+                    let input = PressInput::Key(identity.clone());
+                    let press = PressToken {
+                        route: route.clone(),
+                        session_epoch: event_session_epoch,
+                        route_epoch: event_route_epoch,
+                        input: input.clone(),
+                    };
+                    if down {
+                        if tracker.holds_identity(&identity)
+                            && cancel_live_release_retry(
+                                &mut live_release_retries,
+                                &route,
+                                event_session_epoch,
+                                event_route_epoch,
+                                &input,
+                            )
+                        {
+                            failed_presses.remove(&press);
+                            Ok(())
+                        } else {
+                            let result =
+                                inject_key_press(&mut enigo, tracker, key, code.as_deref());
+                            if result.is_err() {
+                                failed_presses.insert(press);
+                            } else {
+                                failed_presses.remove(&press);
+                            }
+                            result
+                        }
+                    } else {
+                        let skip_release = suppress_unaccepted_release(
+                            &mut failed_presses,
+                            &press,
+                            tracker.holds_identity(&identity),
+                        );
+                        let result = if skip_release {
+                            Ok(())
+                        } else {
+                            release_key(&mut enigo, tracker, key, code.as_deref())
+                        };
+                        if result.is_err() && tracker.holds_identity(&identity) {
+                            failed_release = Some(LiveReleaseRetry {
+                                route: route.clone(),
+                                session_epoch: event_session_epoch,
+                                route_epoch: event_route_epoch,
+                                input,
+                            });
+                        }
+                        result
+                    }
+                }
+                // An input kind a newer viewer introduced that this build can't
+                // inject — nothing to do (it decoded as `Unknown` rather than
+                // failing the whole frame).
+                InputAction::Unknown => Ok(()),
+            };
+            if let Err(e) = result {
+                tracing::debug!("input injection event failed: {e}");
+            }
+            if let Some(retry) = failed_release {
+                if !live_release_retries.contains(&retry) {
+                    live_release_retries.push(retry);
                 }
             }
-            // An input kind a newer viewer introduced that this build can't
-            // inject — nothing to do (it decoded as `Unknown` rather than
-            // failing the whole frame).
-            InputAction::Unknown => Ok(()),
-        };
-        if let Err(e) = result {
-            tracing::debug!("input injection event failed: {e}");
         }
     }
 }
@@ -340,11 +733,137 @@ fn event_generation_is_current(
         && route_epochs.lock().get(route).copied() == Some(event_route_epoch)
 }
 
-fn flush_pending_releases(
-    enigo: &mut Enigo,
+trait ReleaseBackend {
+    fn release_button(&mut self, button: Button) -> Result<(), String>;
+    fn release_key(&mut self, key: Key) -> Result<(), String>;
+}
+
+trait PressBackend {
+    fn press_button(&mut self, button: Button) -> Result<(), String>;
+    fn press_key(&mut self, key: Key) -> Result<(), String>;
+}
+
+impl ReleaseBackend for Enigo {
+    fn release_button(&mut self, button: Button) -> Result<(), String> {
+        self.button(button, Direction::Release)
+            .map_err(|error| error.to_string())
+    }
+
+    fn release_key(&mut self, key: Key) -> Result<(), String> {
+        self.key(key, Direction::Release)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl PressBackend for Enigo {
+    fn press_button(&mut self, button: Button) -> Result<(), String> {
+        self.button(button, Direction::Press)
+            .map_err(|error| error.to_string())
+    }
+
+    fn press_key(&mut self, key: Key) -> Result<(), String> {
+        self.key(key, Direction::Press)
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct ReleaseRetry {
+    state: RouteInputState,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveReleaseRetry {
+    route: String,
+    session_epoch: u64,
+    route_epoch: u64,
+    input: PressInput,
+}
+
+impl LiveReleaseRetry {
+    fn is_still_held(&self, state: &RouteInputState) -> bool {
+        match &self.input {
+            PressInput::Key(identity) => state.keys.holds_identity(identity),
+            PressInput::MouseButton(button) => state.holds_button(*button),
+        }
+    }
+}
+
+fn cancel_live_release_retry(
+    retries: &mut Vec<LiveReleaseRetry>,
+    route: &str,
+    session_epoch: u64,
+    route_epoch: u64,
+    input: &PressInput,
+) -> bool {
+    let Some(index) = retries.iter().position(|retry| {
+        retry.route == route
+            && retry.session_epoch == session_epoch
+            && retry.route_epoch == route_epoch
+            && retry.input == *input
+    }) else {
+        return false;
+    };
+    retries.remove(index);
+    true
+}
+
+fn suppress_unaccepted_release(
+    failed_presses: &mut HashSet<PressToken>,
+    press: &PressToken,
+    currently_held: bool,
+) -> bool {
+    failed_presses.remove(press) && !currently_held
+}
+
+fn retry_live_releases<B: ReleaseBackend>(
+    backend: &mut B,
+    routes: &mut HashMap<String, RouteInputState>,
+    retries: &mut Vec<LiveReleaseRetry>,
+    session_epoch: &AtomicU64,
+    route_epochs: &Mutex<HashMap<String, u64>>,
+) {
+    let pending = std::mem::take(retries);
+    for retry in pending {
+        if !event_generation_is_current(
+            session_epoch,
+            route_epochs,
+            &retry.route,
+            retry.session_epoch,
+            retry.route_epoch,
+        ) {
+            // Route/session cleanup owns any held predecessor state after its
+            // generation is retired. Never look up a same-id successor.
+            continue;
+        }
+        let Some(state) = routes.get_mut(&retry.route) else {
+            continue;
+        };
+        if !retry.is_still_held(state) {
+            continue;
+        }
+        let result = match &retry.input {
+            PressInput::Key(identity) => release_held_key(backend, &mut state.keys, identity),
+            PressInput::MouseButton(button) => release_button(backend, state, *button),
+        };
+        if let Err(error) = result {
+            tracing::debug!(
+                "retrying live input release for {:?} failed: {error}",
+                retry.input
+            );
+            retries.push(retry);
+        }
+    }
+}
+
+fn flush_pending_releases<B: ReleaseBackend>(
+    backend: &mut B,
     routes: &mut HashMap<String, RouteInputState>,
     pending: &Mutex<PendingReleases>,
+    retries: &mut Vec<ReleaseRetry>,
 ) {
+    retry_failed_releases(backend, retries);
+
     let (release_all, release_routes) = {
         let mut pending = pending.lock();
         let all = std::mem::take(&mut pending.all);
@@ -352,15 +871,37 @@ fn flush_pending_releases(
         (all, routes)
     };
     if release_all {
-        for (_, mut state) in routes.drain() {
-            release_input_state(enigo, &mut state, "daemon session reset");
+        for (_, state) in routes.drain() {
+            retain_failed_releases(backend, retries, state, "daemon session reset");
         }
         return;
     }
     for route in release_routes {
-        if let Some(mut state) = routes.remove(&route) {
-            release_input_state(enigo, &mut state, "route end");
+        if let Some(state) = routes.remove(&route) {
+            retain_failed_releases(backend, retries, state, "route end");
         }
+    }
+}
+
+fn retry_failed_releases<B: ReleaseBackend>(backend: &mut B, retries: &mut Vec<ReleaseRetry>) {
+    let retired = std::mem::take(retries);
+    for mut retry in retired {
+        release_input_state(backend, &mut retry.state, retry.reason);
+        if !retry.state.is_empty() {
+            retries.push(retry);
+        }
+    }
+}
+
+fn retain_failed_releases<B: ReleaseBackend>(
+    backend: &mut B,
+    retries: &mut Vec<ReleaseRetry>,
+    mut state: RouteInputState,
+    reason: &'static str,
+) {
+    release_input_state(backend, &mut state, reason);
+    if !state.is_empty() {
+        retries.push(ReleaseRetry { state, reason });
     }
 }
 
@@ -418,14 +959,6 @@ fn move_mouse_global(_enigo: &mut Enigo, gx: i32, gy: i32) -> Result<(), String>
         } else {
             Err("SendInput refused the move".into())
         }
-    }
-}
-
-fn direction(down: bool) -> Direction {
-    if down {
-        Direction::Press
-    } else {
-        Direction::Release
     }
 }
 
@@ -557,43 +1090,134 @@ struct RouteInputState {
 }
 
 impl RouteInputState {
+    #[cfg(test)]
     fn press_button(&mut self, button: u8) -> Option<Button> {
         let injected = dom_button(button)?;
+        self.commit_button_press(button);
+        Some(injected)
+    }
+
+    fn commit_button_press(&mut self, button: u8) {
         self.pressed_buttons.retain(|held| *held != button);
         self.pressed_buttons.push(button);
-        Some(injected)
     }
 
-    fn release_button(&mut self, button: u8) -> Option<Button> {
-        let injected = dom_button(button)?;
-        if let Some(index) = self.pressed_buttons.iter().position(|held| *held == button) {
-            self.pressed_buttons.remove(index);
-        }
-        // Release even when the down was missed. This heals a route attached
-        // mid-drag instead of preserving an unknown held state.
-        Some(injected)
+    fn holds_button(&self, button: u8) -> bool {
+        self.pressed_buttons.contains(&button)
     }
 
-    fn release_buttons(&mut self) -> Vec<Button> {
-        self.pressed_buttons
-            .drain(..)
-            .rev()
-            .filter_map(dom_button)
-            .collect()
+    fn is_empty(&self) -> bool {
+        self.pressed_buttons.is_empty() && self.keys.is_empty()
     }
 }
 
-fn release_input_state(enigo: &mut Enigo, state: &mut RouteInputState, reason: &str) {
+fn inject_button_press<B: PressBackend>(
+    backend: &mut B,
+    state: &mut RouteInputState,
+    dom_button_id: u8,
+) -> Result<(), String> {
+    let Some(button) = dom_button(dom_button_id) else {
+        return Ok(());
+    };
+    backend.press_button(button)?;
+    state.commit_button_press(dom_button_id);
+    Ok(())
+}
+
+fn release_button<B: ReleaseBackend>(
+    backend: &mut B,
+    state: &mut RouteInputState,
+    dom_button_id: u8,
+) -> Result<(), String> {
+    let Some(button) = dom_button(dom_button_id) else {
+        return Ok(());
+    };
+    backend.release_button(button)?;
+    if let Some(index) = state
+        .pressed_buttons
+        .iter()
+        .position(|held| *held == dom_button_id)
+    {
+        state.pressed_buttons.remove(index);
+    }
+    // Release even when the down was missed. This heals a route attached
+    // mid-drag instead of preserving an unknown held state. A tracked down is
+    // removed only after the OS accepts the release, so failure can retry.
+    Ok(())
+}
+
+fn inject_key_press<B: PressBackend>(
+    backend: &mut B,
+    tracker: &mut KeyTracker,
+    key: &str,
+    code: Option<&str>,
+) -> Result<(), String> {
+    let Some((identity, injected)) = tracker.press_candidate(key, code) else {
+        return Ok(());
+    };
+    backend.press_key(injected)?;
+    tracker.commit_press(identity, injected);
+    Ok(())
+}
+
+fn release_key<B: ReleaseBackend>(
+    backend: &mut B,
+    tracker: &mut KeyTracker,
+    key: &str,
+    code: Option<&str>,
+) -> Result<(), String> {
+    let Some((injected, identity)) = tracker.release_candidate(key, code) else {
+        return Ok(());
+    };
+    backend.release_key(injected)?;
+    if let Some(identity) = identity {
+        tracker.commit_release(&identity);
+    }
+    Ok(())
+}
+
+fn release_held_key<B: ReleaseBackend>(
+    backend: &mut B,
+    tracker: &mut KeyTracker,
+    identity: &str,
+) -> Result<(), String> {
+    let Some(index) = tracker
+        .pressed
+        .iter()
+        .position(|(held, _)| held == identity)
+    else {
+        return Ok(());
+    };
+    let key = tracker.pressed[index].1;
+    backend.release_key(key)?;
+    tracker.pressed.remove(index);
+    Ok(())
+}
+
+fn release_input_state<B: ReleaseBackend>(
+    backend: &mut B,
+    state: &mut RouteInputState,
+    reason: &str,
+) {
     // End drags before lifting their modifier keys, matching a physical user
     // releasing the mouse and then unwinding the chord.
-    for button in state.release_buttons() {
-        if let Err(error) = enigo.button(button, Direction::Release) {
-            tracing::debug!("releasing {button:?} after {reason} failed: {error}");
+    let buttons = state
+        .pressed_buttons
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    for dom_button_id in buttons {
+        if let Err(error) = release_button(backend, state, dom_button_id) {
+            tracing::debug!(
+                "releasing {:?} after {reason} failed: {error}",
+                dom_button(dom_button_id)
+            );
         }
     }
-    for key in state.keys.release_all() {
-        if let Err(error) = enigo.key(key, Direction::Release) {
-            tracing::debug!("releasing {key:?} after {reason} failed: {error}");
+    for identity in state.keys.release_order() {
+        if let Err(error) = release_held_key(backend, &mut state.keys, &identity) {
+            tracing::debug!("releasing {identity:?} after {reason} failed: {error}");
         }
     }
 }
@@ -625,33 +1249,61 @@ impl KeyTracker {
         }
     }
 
-    /// A keydown: resolve what to inject and remember it as held.
+    /// A keydown helper for tests and already-accepted synthetic state.
+    #[cfg(test)]
     fn press(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
-        let k = self.resolve(key, code)?;
-        let id = Self::identity(key, code);
+        let (identity, injected) = self.press_candidate(key, code)?;
+        self.commit_press(identity, injected);
+        Some(injected)
+    }
+
+    /// Resolve a keydown without recording held state. The OS injection must
+    /// succeed before the caller commits the candidate.
+    fn press_candidate(&self, key: &str, code: Option<&str>) -> Option<(String, Key)> {
+        let injected = self.resolve(key, code)?;
+        Some((Self::identity(key, code), injected))
+    }
+
+    fn commit_press(&mut self, identity: String, injected: Key) {
         // Auto-repeat arrives as a burst of re-presses (the remote OS won't
         // repeat an injected key on its own); collapse them to a single held
         // entry so the eventual keyup still lifts exactly once.
-        self.pressed.retain(|(i, _)| *i != id);
-        self.pressed.push((id, k));
-        Some(k)
+        self.pressed.retain(|(held, _)| *held != identity);
+        self.pressed.push((identity, injected));
     }
 
-    /// A keyup: release exactly the key the matching keydown pressed. For
-    /// a down we never saw (an older sender, a mid-stream subscribe),
-    /// fall back to resolving fresh.
-    fn release(&mut self, key: &str, code: Option<&str>) -> Option<Key> {
+    fn holds_identity(&self, identity: &str) -> bool {
+        self.pressed.iter().any(|(held, _)| held == identity)
+    }
+
+    /// Resolve a keyup without forgetting its held-state authority. The caller
+    /// commits a tracked release only after the OS accepts it.
+    fn release_candidate(&self, key: &str, code: Option<&str>) -> Option<(Key, Option<String>)> {
         let id = Self::identity(key, code);
-        if let Some(i) = self.pressed.iter().position(|(i, _)| *i == id) {
-            return Some(self.pressed.remove(i).1);
+        if let Some((_, injected)) = self.pressed.iter().find(|(held, _)| *held == id) {
+            return Some((*injected, Some(id)));
         }
-        self.resolve(key, code)
+        self.resolve(key, code).map(|injected| (injected, None))
     }
 
-    /// Everything still held, in reverse press order (chords unwind the
-    /// way they wound up: the letter lifts before its modifier).
-    fn release_all(&mut self) -> Vec<Key> {
-        self.pressed.drain(..).rev().map(|(_, k)| k).collect()
+    fn commit_release(&mut self, identity: &str) {
+        if let Some(index) = self.pressed.iter().position(|(held, _)| held == identity) {
+            self.pressed.remove(index);
+        }
+    }
+
+    /// Held identities in reverse press order. Cleanup uses identities rather
+    /// than draining keys so an OS failure can leave only that key for retry.
+    fn release_order(&self) -> Vec<String> {
+        self.pressed
+            .iter()
+            .rev()
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pressed.is_empty()
     }
 
     /// DOM `KeyboardEvent.key` (+ physical `code`) → enigo key, steered by
@@ -802,6 +1454,265 @@ fn map_named(key: &str) -> Option<Key> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FakeReleaseBackend {
+        key_press_failures_remaining: usize,
+        button_press_failures_remaining: usize,
+        key_failures_remaining: usize,
+        button_failures_remaining: usize,
+        key_press_attempts: Vec<Key>,
+        button_press_attempts: Vec<Button>,
+        key_attempts: Vec<Key>,
+        button_attempts: Vec<Button>,
+    }
+
+    impl PressBackend for FakeReleaseBackend {
+        fn press_button(&mut self, button: Button) -> Result<(), String> {
+            self.button_press_attempts.push(button);
+            if self.button_press_failures_remaining > 0 {
+                self.button_press_failures_remaining -= 1;
+                return Err("scripted button press failure".into());
+            }
+            Ok(())
+        }
+
+        fn press_key(&mut self, key: Key) -> Result<(), String> {
+            self.key_press_attempts.push(key);
+            if self.key_press_failures_remaining > 0 {
+                self.key_press_failures_remaining -= 1;
+                return Err("scripted key press failure".into());
+            }
+            Ok(())
+        }
+    }
+
+    impl ReleaseBackend for FakeReleaseBackend {
+        fn release_button(&mut self, button: Button) -> Result<(), String> {
+            self.button_attempts.push(button);
+            if self.button_failures_remaining > 0 {
+                self.button_failures_remaining -= 1;
+                return Err("scripted button release failure".into());
+            }
+            Ok(())
+        }
+
+        fn release_key(&mut self, key: Key) -> Result<(), String> {
+            self.key_attempts.push(key);
+            if self.key_failures_remaining > 0 {
+                self.key_failures_remaining -= 1;
+                return Err("scripted key release failure".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn queued(action: InputAction) -> Cmd {
+        Cmd::Event {
+            route: "control-r1".into(),
+            action,
+            session_epoch: 7,
+            route_epoch: 11,
+        }
+    }
+
+    fn queued_key(key: &str, code: &str, down: bool) -> Cmd {
+        queued(InputAction::Key {
+            key: key.into(),
+            code: Some(code.into()),
+            down,
+        })
+    }
+
+    #[test]
+    fn saturated_discrete_queue_keeps_admitted_key_release_in_order() {
+        let mut queue = InputQueue::new(4);
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        // Auto-repeat consumes best-effort command slots but not additional
+        // release reservations.
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        assert_eq!(queue.accounted_len(), 4);
+
+        // The reserved unit exchanges for this keyup even though no ordinary
+        // slot is free.
+        assert!(queue.enqueue(queued_key("a", "KeyA", false)));
+        assert_eq!(queue.accounted_len(), 4);
+        assert!(queue.admitted_presses.is_empty());
+
+        let downs = queue
+            .commands
+            .into_iter()
+            .map(|cmd| match cmd {
+                Cmd::Event {
+                    action: InputAction::Key { down, .. },
+                    ..
+                } => down,
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(downs, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn saturated_discrete_queue_keeps_admitted_mouse_release_in_order() {
+        let mut queue = InputQueue::new(4);
+        for _ in 0..3 {
+            assert!(queue.enqueue(queued(InputAction::MouseButton {
+                button: 0,
+                down: true,
+            })));
+        }
+        assert_eq!(queue.accounted_len(), 4);
+
+        assert!(queue.enqueue(queued(InputAction::MouseButton {
+            button: 0,
+            down: false,
+        })));
+        assert_eq!(queue.accounted_len(), 4);
+        assert!(queue.admitted_presses.is_empty());
+
+        let downs = queue
+            .commands
+            .into_iter()
+            .map(|cmd| match cmd {
+                Cmd::Event {
+                    action: InputAction::MouseButton { down, .. },
+                    ..
+                } => down,
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(downs, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn saturation_evicts_oldest_continuous_input_before_discrete_press() {
+        let mut queue = InputQueue::new(6);
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        assert!(queue.enqueue(queued(InputAction::MouseMove {
+            x: 0.25,
+            y: 0.5,
+            screen: Some(1),
+        })));
+        assert!(queue.enqueue(queued(InputAction::Wheel { dx: 0.0, dy: 1.0 })));
+        assert!(queue.enqueue(queued(InputAction::MouseMoveRel { dx: 2.0, dy: 3.0 })));
+        assert_eq!(queue.accounted_len(), 5);
+
+        // A first down needs its command plus its future release reservation.
+        // Only the oldest lossy command is evicted; discrete order is intact.
+        assert!(queue.enqueue(queued_key("b", "KeyB", true)));
+        assert_eq!(queue.accounted_len(), 6);
+        assert!(queue.enqueue(queued_key("a", "KeyA", false)));
+        assert!(queue.enqueue(queued_key("b", "KeyB", false)));
+
+        let kinds = queue
+            .commands
+            .into_iter()
+            .map(|cmd| match cmd {
+                Cmd::Event {
+                    action: InputAction::Key { key, down, .. },
+                    ..
+                } => format!("{key}:{}", if down { "down" } else { "up" }),
+                Cmd::Event {
+                    action: InputAction::MouseMove { .. },
+                    ..
+                } => "absolute".into(),
+                Cmd::Event {
+                    action: InputAction::MouseMoveRel { .. },
+                    ..
+                } => "relative".into(),
+                Cmd::Event {
+                    action: InputAction::Wheel { .. },
+                    ..
+                } => "wheel".into(),
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["a:down", "wheel", "relative", "b:down", "a:up", "b:up"]
+        );
+    }
+
+    #[test]
+    fn adjacent_continuous_input_coalesces_without_crossing_a_click() {
+        let mut queue = InputQueue::new(8);
+        assert!(queue.enqueue(queued(InputAction::MouseMove {
+            x: 0.1,
+            y: 0.2,
+            screen: Some(1),
+        })));
+        assert!(queue.enqueue(queued(InputAction::MouseMove {
+            x: 0.8,
+            y: 0.9,
+            screen: Some(1),
+        })));
+        assert_eq!(queue.commands.len(), 1);
+        match &queue.commands[0] {
+            Cmd::Event {
+                action: InputAction::MouseMove { x, y, .. },
+                ..
+            } => assert_eq!((*x, *y), (0.8, 0.9)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(queue.enqueue(queued(InputAction::MouseButton {
+            button: 0,
+            down: true,
+        })));
+        assert!(queue.enqueue(queued(InputAction::MouseMoveRel { dx: 2.0, dy: -1.0 })));
+        assert!(queue.enqueue(queued(InputAction::MouseMoveRel { dx: 3.5, dy: 4.0 })));
+        assert_eq!(queue.commands.len(), 3);
+        match &queue.commands[2] {
+            Cmd::Event {
+                action: InputAction::MouseMoveRel { dx, dy },
+                ..
+            } => assert_eq!((*dx, *dy), (5.5, 3.0)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saturation_rejects_new_down_instead_of_spending_an_existing_release_reserve() {
+        let mut queue = InputQueue::new(4);
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        assert!(queue.enqueue(queued(InputAction::Unknown)));
+        assert_eq!(queue.accounted_len(), 4);
+
+        assert!(!queue.enqueue(queued_key("b", "KeyB", true)));
+        assert!(queue.enqueue(queued_key("a", "KeyA", false)));
+        assert_eq!(queue.accounted_len(), 4);
+        assert!(queue.admitted_presses.is_empty());
+    }
+
+    #[test]
+    fn route_and_session_cleanup_retire_only_matching_release_reservations() {
+        let mut queue = InputQueue::new(8);
+        assert!(queue.enqueue(queued_key("a", "KeyA", true)));
+        let other_generation = Cmd::Event {
+            route: "control-r1".into(),
+            action: InputAction::MouseButton {
+                button: 0,
+                down: true,
+            },
+            session_epoch: 7,
+            route_epoch: 12,
+        };
+        assert!(queue.enqueue(other_generation));
+        assert_eq!(queue.admitted_presses.len(), 2);
+
+        queue.clear_generation("control-r1", 7, 11);
+        assert_eq!(queue.admitted_presses.len(), 1);
+        assert!(queue
+            .admitted_presses
+            .iter()
+            .all(|press| press.route_epoch == 12));
+
+        queue.clear_session(7);
+        assert!(queue.admitted_presses.is_empty());
+    }
+
     #[test]
     fn printable_keys_inject_as_unicode() {
         let t = KeyTracker::default();
@@ -857,30 +1768,37 @@ mod tests {
     #[test]
     fn keyup_releases_what_its_keydown_pressed() {
         let mut t = KeyTracker::default();
+        let mut backend = FakeReleaseBackend::default();
         t.press("Shift", Some("ShiftLeft"));
         // Shift+1 goes down as the unshifted keycap '1' (the held Shift
         // composes the '!' on the remote)…
         assert_eq!(t.press("!", Some("Digit1")), Some(Key::Unicode('1')));
-        assert_eq!(t.release("Shift", Some("ShiftLeft")), Some(Key::Shift));
+        release_key(&mut backend, &mut t, "Shift", Some("ShiftLeft")).unwrap();
         // …and comes up as "1": the release lifts exactly the key that
         // went down, matched by its physical code regardless of the char.
-        assert_eq!(t.release("1", Some("Digit1")), Some(Key::Unicode('1')));
+        release_key(&mut backend, &mut t, "1", Some("Digit1")).unwrap();
         assert!(t.pressed.is_empty());
         // A keyup nothing matches (older sender) still resolves fresh.
-        assert_eq!(t.release("a", Some("KeyA")), Some(Key::Unicode('a')));
+        release_key(&mut backend, &mut t, "a", Some("KeyA")).unwrap();
+        assert_eq!(
+            backend.key_attempts,
+            vec![Key::Shift, Key::Unicode('1'), Key::Unicode('a')]
+        );
     }
 
     #[test]
     fn release_all_unwinds_in_reverse_press_order() {
-        let mut t = KeyTracker::default();
-        t.press("Control", Some("ControlLeft"));
-        t.press("Shift", Some("ShiftLeft"));
-        t.press("T", Some("KeyT"));
+        let mut state = RouteInputState::default();
+        state.keys.press("Control", Some("ControlLeft"));
+        state.keys.press("Shift", Some("ShiftLeft"));
+        state.keys.press("T", Some("KeyT"));
+        let mut backend = FakeReleaseBackend::default();
+        release_input_state(&mut backend, &mut state, "test");
         assert_eq!(
-            t.release_all(),
+            backend.key_attempts,
             vec![Key::Unicode('t'), Key::Shift, Key::Control]
         );
-        assert!(t.pressed.is_empty());
+        assert!(state.is_empty());
     }
 
     #[test]
@@ -977,17 +1895,296 @@ mod tests {
         // A repeated down remains one held state.
         assert_eq!(state.press_button(0), Some(Button::Left));
         assert_eq!(state.pressed_buttons, vec![2, 0]);
-        assert_eq!(state.release_buttons(), vec![Button::Left, Button::Right]);
-        assert!(state.pressed_buttons.is_empty());
+        let mut backend = FakeReleaseBackend::default();
+        release_input_state(&mut backend, &mut state, "test");
+        assert_eq!(backend.button_attempts, vec![Button::Left, Button::Right]);
+        assert!(state.is_empty());
     }
 
     #[test]
     fn mouse_up_heals_an_unobserved_down() {
         let mut state = RouteInputState::default();
-        assert_eq!(state.release_button(1), Some(Button::Middle));
+        let mut backend = FakeReleaseBackend::default();
+        release_button(&mut backend, &mut state, 1).unwrap();
+        assert_eq!(backend.button_attempts, vec![Button::Middle]);
         assert!(state.pressed_buttons.is_empty());
         assert_eq!(state.press_button(4), None);
         assert!(state.pressed_buttons.is_empty());
+    }
+
+    #[test]
+    fn failed_os_presses_do_not_commit_held_state() {
+        let mut state = RouteInputState::default();
+        let mut backend = FakeReleaseBackend {
+            key_press_failures_remaining: 1,
+            button_press_failures_remaining: 1,
+            ..Default::default()
+        };
+
+        assert!(inject_key_press(
+            &mut backend,
+            &mut state.keys,
+            "Control",
+            Some("ControlLeft")
+        )
+        .is_err());
+        assert!(!state.keys.held(Key::Control));
+        assert!(inject_button_press(&mut backend, &mut state, 0).is_err());
+        assert!(!state.holds_button(0));
+
+        let key_press = PressToken {
+            route: "control-r1".into(),
+            session_epoch: 7,
+            route_epoch: 11,
+            input: PressInput::Key("ControlLeft".into()),
+        };
+        let button_press = PressToken {
+            route: "control-r1".into(),
+            session_epoch: 7,
+            route_epoch: 11,
+            input: PressInput::MouseButton(0),
+        };
+        let mut failed_presses = HashSet::from([key_press.clone(), button_press.clone()]);
+        assert!(suppress_unaccepted_release(
+            &mut failed_presses,
+            &key_press,
+            state.keys.holds_identity("ControlLeft")
+        ));
+        assert!(suppress_unaccepted_release(
+            &mut failed_presses,
+            &button_press,
+            state.holds_button(0)
+        ));
+        assert!(failed_presses.is_empty());
+        assert!(backend.key_attempts.is_empty());
+        assert!(backend.button_attempts.is_empty());
+
+        inject_key_press(
+            &mut backend,
+            &mut state.keys,
+            "Control",
+            Some("ControlLeft"),
+        )
+        .unwrap();
+        inject_button_press(&mut backend, &mut state, 0).unwrap();
+        assert!(state.keys.held(Key::Control));
+        assert!(state.holds_button(0));
+        assert_eq!(backend.key_press_attempts, vec![Key::Control, Key::Control]);
+        assert_eq!(
+            backend.button_press_attempts,
+            vec![Button::Left, Button::Left]
+        );
+    }
+
+    #[test]
+    fn failed_live_releases_retry_on_the_next_worker_wake() {
+        let route = "control-r1".to_string();
+        let mut state = RouteInputState::default();
+        state.keys.press("Control", Some("ControlLeft"));
+        state.press_button(0);
+        let mut routes = HashMap::from([(route.clone(), state)]);
+        let session_epoch = AtomicU64::new(7);
+        let route_epochs = Mutex::new(HashMap::from([(route.clone(), 11)]));
+        let mut backend = FakeReleaseBackend {
+            key_failures_remaining: 1,
+            button_failures_remaining: 1,
+            ..Default::default()
+        };
+
+        let state = routes.get_mut(&route).unwrap();
+        assert!(release_key(
+            &mut backend,
+            &mut state.keys,
+            "Control",
+            Some("ControlLeft")
+        )
+        .is_err());
+        assert!(release_button(&mut backend, state, 0).is_err());
+        let mut retries = vec![
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: PressInput::Key("ControlLeft".into()),
+            },
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: PressInput::MouseButton(0),
+            },
+        ];
+
+        retry_live_releases(
+            &mut backend,
+            &mut routes,
+            &mut retries,
+            &session_epoch,
+            &route_epochs,
+        );
+        assert!(retries.is_empty());
+        assert!(routes.get(&route).unwrap().is_empty());
+        assert_eq!(backend.key_attempts, vec![Key::Control, Key::Control]);
+        assert_eq!(backend.button_attempts, vec![Button::Left, Button::Left]);
+    }
+
+    #[test]
+    fn stale_live_retry_never_releases_a_same_id_successor() {
+        let route = "control-r1".to_string();
+        let mut successor = RouteInputState::default();
+        successor.keys.press("a", Some("KeyA"));
+        successor.press_button(0);
+        let mut routes = HashMap::from([(route.clone(), successor)]);
+        let session_epoch = AtomicU64::new(7);
+        let route_epochs = Mutex::new(HashMap::from([(route.clone(), 12)]));
+        let mut retries = vec![
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: PressInput::Key("KeyA".into()),
+            },
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: PressInput::MouseButton(0),
+            },
+        ];
+        let mut backend = FakeReleaseBackend::default();
+
+        retry_live_releases(
+            &mut backend,
+            &mut routes,
+            &mut retries,
+            &session_epoch,
+            &route_epochs,
+        );
+        assert!(retries.is_empty());
+        assert!(routes.get(&route).unwrap().keys.holds_identity("KeyA"));
+        assert!(routes.get(&route).unwrap().holds_button(0));
+        assert!(backend.key_attempts.is_empty());
+        assert!(backend.button_attempts.is_empty());
+    }
+
+    #[test]
+    fn same_generation_repress_adopts_failed_release_without_later_keyup() {
+        let route = "control-r1".to_string();
+        let mut state = RouteInputState::default();
+        state.keys.press("a", Some("KeyA"));
+        state.press_button(0);
+        let mut routes = HashMap::from([(route.clone(), state)]);
+        let session_epoch = AtomicU64::new(7);
+        let route_epochs = Mutex::new(HashMap::from([(route.clone(), 11)]));
+        let key = PressInput::Key("KeyA".into());
+        let button = PressInput::MouseButton(0);
+        let mut retries = vec![
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: key.clone(),
+            },
+            LiveReleaseRetry {
+                route: route.clone(),
+                session_epoch: 7,
+                route_epoch: 11,
+                input: button.clone(),
+            },
+        ];
+
+        assert!(cancel_live_release_retry(&mut retries, &route, 7, 11, &key));
+        assert!(cancel_live_release_retry(
+            &mut retries,
+            &route,
+            7,
+            11,
+            &button
+        ));
+        assert!(retries.is_empty());
+
+        let mut backend = FakeReleaseBackend::default();
+        retry_live_releases(
+            &mut backend,
+            &mut routes,
+            &mut retries,
+            &session_epoch,
+            &route_epochs,
+        );
+        assert!(routes.get(&route).unwrap().keys.holds_identity("KeyA"));
+        assert!(routes.get(&route).unwrap().holds_button(0));
+        assert!(backend.key_attempts.is_empty());
+        assert!(backend.button_attempts.is_empty());
+    }
+
+    #[test]
+    fn failed_keyup_retains_retry_authority_until_success() {
+        let mut tracker = KeyTracker::default();
+        tracker.press("Control", Some("ControlLeft"));
+        let mut backend = FakeReleaseBackend {
+            key_failures_remaining: 1,
+            ..Default::default()
+        };
+
+        assert!(release_key(&mut backend, &mut tracker, "Control", Some("ControlLeft")).is_err());
+        assert!(tracker.held(Key::Control));
+
+        release_key(&mut backend, &mut tracker, "Control", Some("ControlLeft")).unwrap();
+        assert!(!tracker.held(Key::Control));
+        assert_eq!(backend.key_attempts, vec![Key::Control, Key::Control]);
+    }
+
+    #[test]
+    fn failed_mouseup_retains_retry_authority_until_success() {
+        let mut state = RouteInputState::default();
+        state.press_button(0);
+        let mut backend = FakeReleaseBackend {
+            button_failures_remaining: 1,
+            ..Default::default()
+        };
+
+        assert!(release_button(&mut backend, &mut state, 0).is_err());
+        assert_eq!(state.pressed_buttons, vec![0]);
+
+        release_button(&mut backend, &mut state, 0).unwrap();
+        assert!(state.pressed_buttons.is_empty());
+        assert_eq!(backend.button_attempts, vec![Button::Left, Button::Left]);
+    }
+
+    #[test]
+    fn failed_route_cleanup_retries_without_claiming_the_reused_route() {
+        let route = "control-r1".to_string();
+        let mut old_state = RouteInputState::default();
+        old_state.keys.press("Control", Some("ControlLeft"));
+        old_state.press_button(0);
+        let mut routes = HashMap::from([(route.clone(), old_state)]);
+        let pending = Mutex::new(PendingReleases {
+            all: false,
+            routes: HashSet::from([route.clone()]),
+        });
+        let mut retries = Vec::new();
+        let mut backend = FakeReleaseBackend {
+            key_failures_remaining: 1,
+            button_failures_remaining: 1,
+            ..Default::default()
+        };
+
+        flush_pending_releases(&mut backend, &mut routes, &pending, &mut retries);
+        assert!(routes.is_empty());
+        assert_eq!(retries.len(), 1);
+        assert!(!retries[0].state.is_empty());
+
+        // A successor may reuse the route id, but predecessor cleanup lives in
+        // the separate retry list and cannot consume the successor's state.
+        let mut successor = RouteInputState::default();
+        successor.keys.press("Shift", Some("ShiftLeft"));
+        routes.insert(route.clone(), successor);
+
+        flush_pending_releases(&mut backend, &mut routes, &pending, &mut retries);
+        assert!(retries.is_empty());
+        assert!(routes.get(&route).unwrap().keys.held(Key::Shift));
+        assert_eq!(backend.key_attempts, vec![Key::Control, Key::Control]);
+        assert_eq!(backend.button_attempts, vec![Button::Left, Button::Left]);
     }
 
     #[test]

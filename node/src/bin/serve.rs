@@ -495,15 +495,36 @@ fn init_logging(as_service: bool) {
     #[cfg(windows)]
     if as_service {
         if let Some(make) = winsvc::log_writer() {
+            let (verbose_layer, verbose_paths) = match cwd_log_writer(true) {
+                Some((verbose_make, paths)) => (
+                    Some(
+                        tracing_subscriber::fmt::layer()
+                            .with_target(true)
+                            .with_ansi(false)
+                            .with_writer(verbose_make)
+                            .with_filter(tracing_subscriber::EnvFilter::new(
+                                "warn,allmystuff_node=debug,allmystuff_serve=debug",
+                            )),
+                    ),
+                    paths,
+                ),
+                None => (None, Vec::new()),
+            };
             tracing_subscriber::registry()
-                .with(filter)
+                .with(verbose_layer)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_target(false)
                         .with_ansi(false)
-                        .with_writer(make),
+                        .with_writer(make)
+                        .with_filter(filter),
                 )
                 .init();
+            for path in &verbose_paths {
+                tracing::info!("verbose field log: {}", path.display());
+            }
+            #[cfg(feature = "field-telemetry")]
+            allmystuff_node::telemetry::start();
             return;
         }
     }
@@ -533,7 +554,7 @@ fn init_logging(as_service: bool) {
     // module (which device, which lane, which rung). This is what "send
     // me the log" points at; soft-absent when the cwd isn't writable
     // (Program Files installs), and `ALLMYSTUFF_CWD_LOG=0` turns it off.
-    let (verbose_layer, verbose_paths) = match cwd_log_writer() {
+    let (verbose_layer, verbose_paths) = match cwd_log_writer(as_service) {
         Some((make, paths)) => (
             Some(
                 tracing_subscriber::fmt::layer()
@@ -561,7 +582,7 @@ fn init_logging(as_service: bool) {
     }
     // The field-test telemetry line rides the log just initialized —
     // CPU + per-engine GPU busy + VRAM every 5 s, vendor-neutral.
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "field-telemetry"))]
     allmystuff_node::telemetry::start();
 }
 
@@ -587,7 +608,9 @@ fn init_logging(as_service: bool) {
 /// local opt-in for the next backend start; `ALLMYSTUFF_CWD_LOG` remains the
 /// highest-priority one-shot override. Compiling the `field-telemetry` feature
 /// does not implicitly enable this verbose file.
-fn cwd_log_writer() -> Option<(
+fn cwd_log_writer(
+    as_service: bool,
+) -> Option<(
     impl Fn() -> TeeHandle + Send + Sync + 'static,
     Vec<std::path::PathBuf>,
 )> {
@@ -620,15 +643,17 @@ fn cwd_log_writer() -> Option<(
             paths.push(p);
         }
     }
-    if let Some(d) = dirs::data_local_dir() {
-        if let Some((f, p)) = open_rotating(d.join("AllMyStuff").join("logs")) {
+    if !as_service {
+        if let Some(d) = dirs::data_local_dir() {
+            if let Some((f, p)) = open_rotating(d.join("AllMyStuff").join("logs")) {
+                files.push(f);
+                paths.push(p);
+            }
+        }
+        if let Some((f, p)) = open_rotating(std::path::PathBuf::from(".")) {
             files.push(f);
             paths.push(p);
         }
-    }
-    if let Some((f, p)) = open_rotating(std::path::PathBuf::from(".")) {
-        files.push(f);
-        paths.push(p);
     }
     if files.is_empty() {
         return None;

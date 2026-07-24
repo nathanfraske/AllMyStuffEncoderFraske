@@ -12,19 +12,25 @@
 //!      `target/{release,debug}/myownmesh` (the both-repos dev setup).
 //!   3. **Prebuilt release asset** — download
 //!      `myownmesh-<platform>.tar.gz` from MyOwnMesh's GitHub Releases for
-//!      the pinned tag (fast — no WebRTC native build). Falls back to
-//!      `cargo install --git` if the download is unreachable.
+//!      the pinned tag and verify its checked-in SHA-256 before extraction.
 //!
-//! Everything is best-effort: on any failure we stamp a zero-byte stub at
-//! the sidecar slot (so `tauri_build`'s existence check passes) and the
-//! runtime falls back to PATH / sibling discovery in `daemon_spawn.rs`.
-//! Set `ALLMYSTUFF_SKIP_SIDECAR=1` to skip the fetch entirely (offline /
-//! CI builds that only verify compilation).
+//! Development builds are best-effort: on failure we stamp a zero-byte stub
+//! at the sidecar slot and the runtime falls back to PATH / sibling discovery
+//! in `daemon_spawn.rs`. Release builds set
+//! `ALLMYSTUFF_REQUIRE_SIDECAR=1`, which turns that failure into a hard error.
+//! Set `ALLMYSTUFF_SKIP_SIDECAR=1` to skip the fetch entirely for offline CI
+//! builds that only verify compilation.
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod sidecar_platform;
+use sidecar_platform::{invalidate_sidecar, release_platform_name, stage_file_atomic};
 
 fn main() {
     if let Err(e) = bundle_myownmesh_sidecar() {
@@ -33,8 +39,11 @@ fn main() {
              builds; at runtime it falls back to a sibling MyOwnMesh build, \
              `myownmesh` on PATH, or MYOWNMESH_BIN"
         );
-        if let Err(stub_err) = write_sidecar_stub() {
-            println!("cargo:warning=could not write sidecar stub: {stub_err}");
+        write_sidecar_stub().unwrap_or_else(|stub_err| {
+            panic!("could not invalidate failed myownmesh sidecar bundle: {stub_err}")
+        });
+        if env::var_os("ALLMYSTUFF_REQUIRE_SIDECAR").is_some() {
+            panic!("required myownmesh sidecar could not be bundled: {e}");
         }
     }
     // The node binary the service runs (`allmystuff-serve`). Bundling it inside
@@ -47,8 +56,11 @@ fn main() {
              still builds; at runtime it falls back to a sibling node build, \
              `allmystuff-serve` on PATH, or the install dirs"
         );
-        if let Err(stub_err) = write_serve_stub() {
-            println!("cargo:warning=could not write serve sidecar stub: {stub_err}");
+        write_serve_stub().unwrap_or_else(|stub_err| {
+            panic!("could not invalidate failed allmystuff-serve sidecar bundle: {stub_err}")
+        });
+        if env::var_os("ALLMYSTUFF_REQUIRE_SIDECAR").is_some() {
+            panic!("required allmystuff-serve sidecar could not be bundled: {e}");
         }
     }
     tauri_build::build();
@@ -84,6 +96,88 @@ fn rev_file() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".myownmesh-rev"))
 }
 
+/// Release tag, immutable tag commit, and official per-platform archive hashes.
+fn release_metadata_file() -> PathBuf {
+    PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join(".myownmesh-release-sha256"))
+        .unwrap_or_else(|| PathBuf::from(".myownmesh-release-sha256"))
+}
+
+#[derive(Debug)]
+struct ReleaseMetadata {
+    tag: String,
+    commit: String,
+    hashes: BTreeMap<String, String>,
+}
+
+fn read_release_metadata(path: &Path) -> Result<ReleaseMetadata, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("read release metadata {}: {e}", path.display()))?;
+    let mut entries = BTreeMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let key = fields
+            .next()
+            .ok_or_else(|| format!("{}:{}: missing key", path.display(), index + 1))?;
+        let value = fields
+            .next()
+            .ok_or_else(|| format!("{}:{}: missing value", path.display(), index + 1))?;
+        if fields.next().is_some() {
+            return Err(format!(
+                "{}:{}: expected exactly two fields",
+                path.display(),
+                index + 1
+            ));
+        }
+        if entries.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!(
+                "{}:{}: duplicate key {key}",
+                path.display(),
+                index + 1
+            ));
+        }
+    }
+
+    let tag = entries
+        .remove("tag")
+        .ok_or_else(|| format!("{}: missing tag", path.display()))?;
+    let commit = entries
+        .remove("commit")
+        .ok_or_else(|| format!("{}: missing commit", path.display()))?;
+    if !is_lower_hex(&commit, 40) {
+        return Err(format!(
+            "{}: commit must be a 40-character lowercase hexadecimal SHA",
+            path.display()
+        ));
+    }
+    for (platform, hash) in &entries {
+        if !is_lower_hex(hash, 64) {
+            return Err(format!(
+                "{}: hash for {platform} must be 64 lowercase hexadecimal characters",
+                path.display()
+            ));
+        }
+    }
+    Ok(ReleaseMetadata {
+        tag,
+        commit,
+        hashes: entries,
+    })
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn bundle_myownmesh_sidecar() -> Result<(), String> {
     // The runtime needs the triple to find the dev-staged sidecar name.
     println!("cargo:rustc-env=DAEMON_SIDECAR_TRIPLE={}", target_triple());
@@ -95,8 +189,13 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
         println!("cargo:rustc-env=MYOWNMESH_PIN={r}");
     }
     println!("cargo:rerun-if-changed={}", rev_file().display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        release_metadata_file().display()
+    );
     println!("cargo:rerun-if-env-changed=MYOWNMESH_BIN");
     println!("cargo:rerun-if-env-changed=ALLMYSTUFF_SKIP_SIDECAR");
+    println!("cargo:rerun-if-env-changed=ALLMYSTUFF_REQUIRE_SIDECAR");
 
     let bin_dir = binaries_dir();
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
@@ -117,7 +216,8 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     if let Ok(p) = env::var("MYOWNMESH_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
-            let sig = format!("bin:{}:{}", p.display(), file_mtime(&p));
+            println!("cargo:rerun-if-changed={}", p.display());
+            let sig = format!("bin:{}:{}", p.display(), sha256_file(&p)?);
             if !staged_matches(&sidecar, &sentinel, &sig) {
                 stage(&p, &sidecar)?;
                 let _ = fs::write(&sentinel, &sig);
@@ -162,7 +262,7 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
             (Some(_), None) => true,
         };
         if acceptable {
-            let sig = format!("sib:{}:{}", p.display(), file_mtime(&p));
+            let sig = format!("sib:{}:{}", p.display(), sha256_file(&p)?);
             if !staged_matches(&sidecar, &sentinel, &sig) {
                 stage(&p, &sidecar)?;
                 let _ = fs::write(&sentinel, &sig);
@@ -179,9 +279,32 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
         );
     }
 
-    // 3. Prebuilt release asset (tagged rev), else cargo install.
+    // 3. Prebuilt release asset for a tag, or a source build for a raw rev.
     let rev = rev.ok_or("no .myownmesh-rev pin and no override/sibling daemon")?;
-    let sig = format!("rev:{rev}");
+    let (sig, expected_hash) = if rev.starts_with('v') {
+        let metadata = read_release_metadata(&release_metadata_file())?;
+        if metadata.tag != rev {
+            return Err(format!(
+                "release metadata tag {} does not match pin {rev}",
+                metadata.tag
+            ));
+        }
+        let platform = release_platform_name(&target_triple())?;
+        let hash = metadata
+            .hashes
+            .get(platform)
+            .cloned()
+            .ok_or_else(|| format!("release metadata has no hash for {platform}"))?;
+        (
+            format!(
+                "release:{}:{}:{}:{}",
+                metadata.tag, metadata.commit, platform, hash
+            ),
+            Some(hash),
+        )
+    } else {
+        (format!("rev:{rev}"), None)
+    };
     if staged_matches(&sidecar, &sentinel, &sig) {
         return Ok(());
     }
@@ -189,16 +312,8 @@ fn bundle_myownmesh_sidecar() -> Result<(), String> {
     let staging = out_dir.join("myownmesh-staging");
     fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
 
-    let staged_bin = if rev.starts_with('v') {
-        match download_release_asset(&rev, &staging) {
-            Ok(bin) => bin,
-            Err(dl_err) => {
-                println!(
-                    "cargo:warning=release download failed ({dl_err}); building via cargo install"
-                );
-                cargo_install(&rev, &staging)?
-            }
-        }
+    let staged_bin = if let Some(expected_hash) = expected_hash {
+        download_release_asset(&rev, &expected_hash, &staging)?
     } else {
         cargo_install(&rev, &staging)?
     };
@@ -220,17 +335,6 @@ fn staged_matches(sidecar: &Path, sentinel: &Path, sig: &str) -> bool {
         && fs::read_to_string(sentinel)
             .map(|s| s.trim() == sig)
             .unwrap_or(false)
-}
-
-/// A file's mtime in unix seconds (0 when unreadable) — enough cache key
-/// for "the sibling was rebuilt".
-fn file_mtime(p: &Path) -> u64 {
-    p.metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Ask a daemon binary its version (`myownmesh 0.2.1` → `(0, 2, 1)`).
@@ -258,13 +362,6 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// Copy `src` into the sidecar slot and mark it executable.
-fn stage(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::copy(src, dst).map_err(|e| format!("copy {} → {}: {e}", src.display(), dst.display()))?;
-    make_executable(dst);
-    Ok(())
-}
-
 fn sibling_daemon() -> Option<PathBuf> {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?)
         .parent()?
@@ -281,22 +378,14 @@ fn sibling_daemon() -> Option<PathBuf> {
     None
 }
 
-/// MyOwnMesh release platform name for a Rust target triple.
-fn release_platform_name(triple: &str) -> Result<&'static str, String> {
-    Ok(match triple {
-        t if t.contains("x86_64") && t.contains("linux") => "linux-x86_64",
-        t if t.contains("aarch64") && t.contains("linux") => "linux-aarch64",
-        t if t.contains("x86_64") && t.contains("apple") => "macos-x86_64",
-        t if t.contains("aarch64") && t.contains("apple") => "macos-aarch64",
-        t if t.contains("x86_64") && t.contains("windows") => "windows-x86_64",
-        other => return Err(format!("no release platform mapping for target {other}")),
-    })
-}
-
 /// Download + extract `myownmesh-<platform>.{tar.gz,zip}` for `tag`,
 /// returning the path to the extracted binary. Shells out to `curl` +
 /// `tar` / `Expand-Archive` so the build needs no extra crates.
-fn download_release_asset(tag: &str, staging: &Path) -> Result<PathBuf, String> {
+fn download_release_asset(
+    tag: &str,
+    expected_hash: &str,
+    staging: &Path,
+) -> Result<PathBuf, String> {
     let triple = target_triple();
     let platform = release_platform_name(&triple)?;
     let windows = triple.contains("windows");
@@ -317,6 +406,12 @@ fn download_release_asset(tag: &str, staging: &Path) -> Result<PathBuf, String> 
     }
     if fs::metadata(&archive).map(|m| m.len()).unwrap_or(0) == 0 {
         return Err("downloaded archive is empty".into());
+    }
+    let actual_hash = sha256_file(&archive)?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "SHA-256 mismatch for {asset}: expected {expected_hash}, got {actual_hash}"
+        ));
     }
 
     if windows {
@@ -357,6 +452,30 @@ fn download_release_asset(tag: &str, staging: &Path) -> Result<PathBuf, String> 
     }
     validate_binary(&bin)?;
     Ok(bin)
+}
+
+fn stage(src: &Path, dst: &Path) -> Result<(), String> {
+    validate_binary(src)?;
+    stage_file_atomic(src, dst)?;
+    make_executable(dst);
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("open {} for SHA-256: {e}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("read {} for SHA-256: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// Sanity-check the extracted binary's magic bytes — guard against an HTML
@@ -408,10 +527,9 @@ fn write_sidecar_stub() -> Result<(), String> {
     let bin_dir = binaries_dir();
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
     let p = sidecar_path();
-    if !p.exists() {
-        fs::write(&p, b"").map_err(|e| e.to_string())?;
-        make_executable(&p);
-    }
+    let sentinel = bin_dir.join(".bundled-rev");
+    invalidate_sidecar(&p, &sentinel)?;
+    make_executable(&p);
     Ok(())
 }
 
@@ -439,7 +557,8 @@ fn bundle_serve_sidecar() -> Result<(), String> {
         "allmystuff-serve not built (cargo build --release --manifest-path \
          node/Cargo.toml --bin allmystuff-serve) and no ALLMYSTUFF_SERVE_BIN override",
     )?;
-    let sig = format!("serve:{}:{}", src.display(), file_mtime(&src));
+    println!("cargo:rerun-if-changed={}", src.display());
+    let sig = format!("serve:{}:{}", src.display(), sha256_file(&src)?);
     let sentinel = bin_dir.join(".bundled-serve");
     if !staged_matches(&sidecar, &sentinel, &sig) {
         stage(&src, &sidecar)?;
@@ -491,10 +610,9 @@ fn write_serve_stub() -> Result<(), String> {
     let bin_dir = binaries_dir();
     fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
     let p = serve_sidecar_path();
-    if !p.exists() {
-        fs::write(&p, b"").map_err(|e| e.to_string())?;
-        make_executable(&p);
-    }
+    let sentinel = bin_dir.join(".bundled-serve");
+    invalidate_sidecar(&p, &sentinel)?;
+    make_executable(&p);
     Ok(())
 }
 

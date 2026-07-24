@@ -1,5 +1,7 @@
 import { mount } from "svelte";
 import App from "./ui/App.svelte";
+import { handleUnhandledRejection } from "./promise-rejection";
+import { clientLog } from "./tauri";
 import "./app.css";
 
 // Surface uncaught errors *in the window itself*. A blank webview — especially a
@@ -24,9 +26,15 @@ function showFatal(label: string, err: unknown): void {
 }
 
 window.addEventListener("error", (e) => showFatal("Uncaught error", e.error ?? e.message));
-window.addEventListener("unhandledrejection", (e) =>
-  showFatal("Unhandled promise rejection", e.reason),
-);
+window.addEventListener("unhandledrejection", (e) => {
+  handleUnhandledRejection(e, import.meta.env.DEV, showFatal, (label, reason) => {
+    console.error(label, reason);
+    const detail = reason instanceof Error
+      ? reason.stack || reason.message
+      : String(reason);
+    clientLog(`[ui] ${label}: ${detail}`);
+  });
+});
 
 let app: ReturnType<typeof mount> | undefined;
 try {

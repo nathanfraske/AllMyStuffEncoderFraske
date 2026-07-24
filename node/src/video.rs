@@ -933,6 +933,12 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    /// Native RGBA frames drained from the backend watcher toward the local
+    /// viewer during this feedback interval.
+    pub native_viewer_drained: u32,
+    /// Native RGBA frames superseded before the local viewer could drain them
+    /// during this feedback interval.
+    pub native_viewer_superseded: u32,
     /// The viewer's chunk-train bottleneck estimate (kbps; 0 = none yet) —
     /// dispersion of the pacer's own timed bursts, measured at arrival.
     pub est_kbps: u32,
@@ -958,6 +964,12 @@ pub struct PipelineFeedback {
     /// One-way-delay trend (µs of added delay per second, signed).
     #[serde(default)]
     pub delay_trend_us_per_s: i32,
+    /// Native backend-to-viewer flow counters. These diagnose local RGBA
+    /// handoff pressure independently of compressed-link congestion.
+    #[serde(default)]
+    pub native_viewer_drained: u32,
+    #[serde(default)]
+    pub native_viewer_superseded: u32,
     /// Receive-side audio arrival variation and live jitter-buffer state.
     /// These share the peer-wide feedback report because audio is reserved
     /// before video by the allocator.
@@ -982,6 +994,8 @@ impl PipelineFeedback {
     pub fn to_ext(&self) -> serde_json::Value {
         if self.est_kbps == 0
             && self.delay_trend_us_per_s == 0
+            && self.native_viewer_drained == 0
+            && self.native_viewer_superseded == 0
             && self.audio_arrival_jitter_us == 0
             && self.audio_target_ms == 0
             && self.audio_buffered_ms == 0
@@ -1064,6 +1078,10 @@ struct AdaptState {
     bad: u32,
     good: u32,
     last_step: Option<Instant>,
+    /// Once this route has proven that decoded RGBA cannot cross its local
+    /// viewer boundary at the current scale, do not probe larger scales again
+    /// until a manual retune or fresh route creates a new controller.
+    local_delivery_limited: bool,
 }
 
 impl AutoAdapt {
@@ -1091,7 +1109,18 @@ impl AutoAdapt {
     /// Fold one feedback report in; returns `Some((from, to))` when the cap
     /// stepped (0 = uncapped), for the caller to log. `now` is passed in so
     /// the streak/hold logic is unit-testable.
+    #[cfg(test)]
     fn observe(&self, fb: &RecvFeedback, fps_target: u32, now: Instant) -> Option<(u32, u32)> {
+        self.observe_with_output_edge(fb, fps_target, 0, now)
+    }
+
+    fn observe_with_output_edge(
+        &self,
+        fb: &RecvFeedback,
+        fps_target: u32,
+        current_output_edge: u32,
+        now: Instant,
+    ) -> Option<(u32, u32)> {
         // Struggling: arriving at under a quarter of the encode rate (the
         // field failure was 0–6 fps of 60), or a queue backing far up.
         // Healthy: at least three quarters of it, decoding cleanly, queue
@@ -1101,14 +1130,40 @@ impl AutoAdapt {
         // `recv_fps` is a raw peer-controlled u32 off the feedback wire;
         // `saturating_mul` keeps a hostile value from wrapping (and from
         // aborting outright if overflow-checks are ever enabled).
-        let bad = fb.queue_depth > 24 || fb.delay_trend_us_per_s > 20_000;
+        let native_samples = fb
+            .native_viewer_drained
+            .saturating_add(fb.native_viewer_superseded);
+        // The existing healthy boundary is at least three quarters of target.
+        // Apply its exact complement to a full target-rate sample at the native
+        // viewer seam: if more than one quarter was superseded, the bottleneck
+        // is local raw-frame delivery, not compressed network bitrate.
+        let native_delivery_bad = native_samples >= fps_target.max(1)
+            && fb.native_viewer_superseded.saturating_mul(4) > native_samples;
+        let native_delivery_cap = native_delivery_bad.then(|| {
+            native_delivery_cap_for_observed_flow(
+                self.edge.load(Ordering::Relaxed),
+                current_output_edge,
+                fb.native_viewer_drained,
+                native_samples,
+            )
+        });
+        let bad = fb.queue_depth > 24 || fb.delay_trend_us_per_s > 20_000 || native_delivery_bad;
         let good = fb.recv_fps.saturating_mul(4) >= fps_target.saturating_mul(3)
             && fb.decode_fails == 0
-            && fb.queue_depth <= 8;
+            && fb.queue_depth <= 8
+            && fb.native_viewer_superseded == 0;
         let mut st = self.state.lock();
         if bad {
-            st.bad += 1;
+            // Local native delivery counters are exact route-owned evidence,
+            // so they do not need three network-observation streaks. Take at
+            // most one rung per feedback report, then re-measure that rung.
+            st.bad = if native_delivery_bad {
+                AUTO_BAD_STREAK
+            } else {
+                st.bad.saturating_add(1)
+            };
             st.good = 0;
+            st.local_delivery_limited |= native_delivery_bad;
         } else if good {
             st.good += 1;
             st.bad = 0;
@@ -1121,19 +1176,31 @@ impl AutoAdapt {
             st.last_step.is_none_or(|t| now.duration_since(t) >= hold)
         };
         if st.bad >= AUTO_BAD_STREAK && held_for(AUTO_DOWN_HOLD, &st) {
-            // Next rung strictly below the current cap (uncapped → first).
-            let Some(next) = AUTO_EDGES.iter().copied().find(|&e| cur == 0 || e < cur) else {
+            // Network pressure takes one rung at a time. Exact native
+            // drained/superseded counts can select a lower rung immediately:
+            // spending settle windows on caps at or above the pixels already
+            // being produced cannot improve a saturated local RGBA handoff.
+            let next = native_delivery_cap
+                .flatten()
+                .or_else(|| AUTO_EDGES.iter().copied().find(|&e| cur == 0 || e < cur));
+            let Some(next) = next else {
                 st.bad = 0; // already at the floor — nothing left to give
                 return None;
             };
             self.edge.store(next, Ordering::Relaxed);
+            let local_delivery_limited = st.local_delivery_limited;
             *st = AdaptState {
                 last_step: Some(now),
+                local_delivery_limited,
                 ..AdaptState::default()
             };
             return Some((cur, next));
         }
-        if st.good >= AUTO_GOOD_STREAK && cur != 0 && held_for(AUTO_UP_HOLD, &st) {
+        if st.good >= AUTO_GOOD_STREAK
+            && cur != 0
+            && !st.local_delivery_limited
+            && held_for(AUTO_UP_HOLD, &st)
+        {
             let next = match AUTO_EDGES.iter().position(|&e| e == cur) {
                 Some(0) | None => 0,
                 Some(i) => AUTO_EDGES[i - 1],
@@ -1147,6 +1214,49 @@ impl AutoAdapt {
         }
         None
     }
+}
+
+/// Pick the highest configured edge whose pixel count fits the native
+/// viewer's measured drain share. Both frame rate and pixel format are fixed
+/// during one feedback interval, so byte capacity scales with edge squared.
+/// The comparison stays integer-exact:
+///
+/// `candidate^2 * produced <= current^2 * drained`.
+///
+/// If even the lowest rung is above the measured capacity, use that floor.
+/// A zero current output means the encoder has not published dimensions yet,
+/// so the ordinary one-rung controller remains in charge.
+fn native_delivery_cap_for_observed_flow(
+    current_cap: u32,
+    current_output_edge: u32,
+    drained: u32,
+    produced: u32,
+) -> Option<u32> {
+    if current_output_edge == 0 || produced == 0 || drained >= produced {
+        return None;
+    }
+    let effective_edge = if current_cap == 0 {
+        current_output_edge
+    } else {
+        current_cap.min(current_output_edge)
+    };
+    let capacity = u128::from(effective_edge)
+        .saturating_mul(u128::from(effective_edge))
+        .saturating_mul(u128::from(drained));
+    let candidate = AUTO_EDGES.iter().copied().find(|&edge| {
+        edge < effective_edge
+            && u128::from(edge)
+                .saturating_mul(u128::from(edge))
+                .saturating_mul(u128::from(produced))
+                <= capacity
+    });
+    candidate.or_else(|| {
+        AUTO_EDGES
+            .iter()
+            .rev()
+            .copied()
+            .find(|&edge| edge < effective_edge)
+    })
 }
 
 #[derive(Default)]
@@ -1998,13 +2108,20 @@ impl VideoBridge {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
-        est_kbps: u32,
-        delay_trend_us_per_s: i32,
+        pipeline: PipelineFeedback,
     ) {
+        let native_viewer_drained = pipeline.native_viewer_drained;
+        let native_viewer_superseded = pipeline.native_viewer_superseded;
+        let est_kbps = pipeline.est_kbps;
         // A registered viewer emits a zero-valued beat before its first frame
         // so route teardown quarantine can prove the replacement is alive.
         // It is ownership/liveness, not evidence about network or decode load.
-        if recv_fps == 0 && decode_fails == 0 && queue_depth == 0 {
+        if recv_fps == 0
+            && decode_fails == 0
+            && queue_depth == 0
+            && pipeline.native_viewer_drained == 0
+            && pipeline.native_viewer_superseded == 0
+        {
             tracing::debug!("video feedback {route_id}: viewer alive, awaiting first frame");
             if let Some((idr_ms, auto)) = self
                 .routes
@@ -2026,11 +2143,24 @@ impl VideoBridge {
             recv_fps,
             decode_fails,
             queue_depth,
-            est_kbps,
-            delay_trend_us_per_s,
+            native_viewer_drained: pipeline.native_viewer_drained,
+            native_viewer_superseded: pipeline.native_viewer_superseded,
+            est_kbps: pipeline.est_kbps,
+            delay_trend_us_per_s: pipeline.delay_trend_us_per_s,
             at: Instant::now(),
         };
         self.feedback.lock().insert(route_id.to_string(), fb);
+        if native_viewer_drained > 0 || native_viewer_superseded > 0 {
+            let total = native_viewer_drained.saturating_add(native_viewer_superseded);
+            let line = format!(
+                "native viewer handoff {route_id}: {native_viewer_drained}/{total} RGBA frame(s) drained, {native_viewer_superseded} superseded"
+            );
+            if native_viewer_superseded.saturating_mul(4) > total {
+                tracing::info!("{line}");
+            } else {
+                tracing::debug!("{line}");
+            }
+        }
         if decode_fails > 0 || queue_depth > 8 {
             tracing::info!(
                 "video feedback {route_id}: viewer {recv_fps} fps · {decode_fails} decode-fail · queue {queue_depth}{}",
@@ -2134,7 +2264,18 @@ impl VideoBridge {
         if (!auto_adapt_enabled() && !tune.policy_auto_resolution) || tune.max_edge.is_some() {
             return;
         }
-        if let Some((from, to)) = auto.observe(&fb, tune.fps(), Instant::now()) {
+        let current_output_edge = route_live()
+            .lock()
+            .get(route_id)
+            .map(|live| {
+                live.out_w
+                    .load(Ordering::Relaxed)
+                    .max(live.out_h.load(Ordering::Relaxed))
+            })
+            .unwrap_or(0);
+        if let Some((from, to)) =
+            auto.observe_with_output_edge(&fb, tune.fps(), current_output_edge, Instant::now())
+        {
             let name = |e: u32| {
                 if e == 0 {
                     "native".to_string()
@@ -7027,6 +7168,8 @@ mod tests {
             recv_fps,
             decode_fails,
             queue_depth,
+            native_viewer_drained: 0,
+            native_viewer_superseded: 0,
             est_kbps: 0,
             delay_trend_us_per_s: 0,
             at: Instant::now(),
@@ -7446,6 +7589,91 @@ mod tests {
     }
 
     #[test]
+    fn auto_adapt_reacts_to_full_interval_native_handoff_pressure() {
+        let limited = RecvFeedback {
+            // Exact steady-state shape measured on the 1080p60 Ray NVDEC
+            // field run: 27 frames drained and 95 superseded in one report.
+            native_viewer_drained: 27,
+            native_viewer_superseded: 95,
+            ..fb(13, 0, 0)
+        };
+        let auto = AutoAdapt::new();
+        let now = Instant::now();
+
+        assert_eq!(
+            auto.observe_with_output_edge(&limited, 60, 1920, now),
+            Some((0, 960)),
+            "a 1080p stream must not waste holds on ineffective 2560/1920 caps"
+        );
+        assert_eq!(
+            auto.observe_with_output_edge(&limited, 60, 1920, now),
+            None,
+            "a native handoff report must not bypass the post-rebuild settle hold"
+        );
+
+        let clean = RecvFeedback {
+            native_viewer_drained: 60,
+            ..fb(60, 0, 0)
+        };
+        let after_up_hold = now + AUTO_DOWN_HOLD + AUTO_UP_HOLD;
+        for _ in 0..AUTO_GOOD_STREAK {
+            assert_eq!(
+                auto.observe_with_output_edge(&clean, 60, 960, after_up_hold),
+                None
+            );
+        }
+        assert_eq!(
+            auto.edge_cap(),
+            Some(960),
+            "a route with a measured local handoff limit must not oscillate upward"
+        );
+    }
+
+    #[test]
+    fn native_handoff_cap_scales_from_the_actual_output_not_an_ineffective_cap() {
+        assert_eq!(
+            native_delivery_cap_for_observed_flow(0, 3840, 60, 120),
+            Some(2560)
+        );
+        assert_eq!(
+            native_delivery_cap_for_observed_flow(2560, 1920, 27, 122),
+            Some(960),
+            "a stale cap above the live output must not consume another settle window"
+        );
+        assert_eq!(
+            native_delivery_cap_for_observed_flow(960, 960, 27, 122),
+            None,
+            "the configured floor must remain a floor"
+        );
+    }
+
+    #[test]
+    fn auto_adapt_ignores_partial_native_handoff_samples() {
+        let partial = RecvFeedback {
+            native_viewer_drained: 10,
+            native_viewer_superseded: 10,
+            ..fb(60, 0, 0)
+        };
+        let auto = AutoAdapt::new();
+        assert_eq!(auto.observe(&partial, 60, Instant::now()), None);
+        assert!(auto.edge_cap().is_none());
+    }
+
+    #[test]
+    fn pipeline_feedback_round_trips_native_handoff_counters() {
+        let feedback = PipelineFeedback {
+            native_viewer_drained: 47,
+            native_viewer_superseded: 13,
+            ..PipelineFeedback::default()
+        };
+        let ext = feedback.to_ext();
+        assert!(!ext.is_null());
+        let decoded: PipelineFeedback = serde_json::from_value(ext).expect("feedback extension");
+        assert_eq!(decoded.native_viewer_drained, 47);
+        assert_eq!(decoded.native_viewer_superseded, 13);
+    }
+
+    #[test]
     fn h264_ladder_picks_a_backend_that_emits_a_frame() {
         // Runs the real step-down ladder: it tries each hardware encoder
         // (NVENC/VA-API/…) and frame-send-tests it; on a box without a GPU
@@ -7781,6 +8009,8 @@ mod tests {
                 recv_fps: 30,
                 decode_fails,
                 queue_depth,
+                native_viewer_drained: 0,
+                native_viewer_superseded: 0,
                 est_kbps: 0,
                 delay_trend_us_per_s: 0,
                 at: Instant::now(),
@@ -7800,6 +8030,8 @@ mod tests {
             recv_fps: 30,
             decode_fails: 0,
             queue_depth: 0,
+            native_viewer_drained: 0,
+            native_viewer_superseded: 0,
             est_kbps: 0,
             delay_trend_us_per_s: 0,
             at: Instant::now() - (FEEDBACK_FRESH + Duration::from_secs(1)),
@@ -7811,11 +8043,11 @@ mod tests {
     fn receiver_feedback_is_recorded_latest_wins_and_clears_with_the_route() {
         let vb = VideoBridge::new();
         assert!(vb.latest_feedback("r1").is_none());
-        vb.note_feedback("r1", 28, 3, 1, 0, 0);
+        vb.note_feedback("r1", 28, 3, 1, PipelineFeedback::default());
         let fb = vb.latest_feedback("r1").expect("recorded");
         assert_eq!((fb.recv_fps, fb.decode_fails, fb.queue_depth), (28, 3, 1));
         // A fresher report replaces the old one.
-        vb.note_feedback("r1", 30, 0, 0, 0, 0);
+        vb.note_feedback("r1", 30, 0, 0, PipelineFeedback::default());
         assert_eq!(vb.latest_feedback("r1").map(|f| f.decode_fails), Some(0));
         // Tearing the route down drops its feedback (no unbounded growth).
         vb.stop("r1");
@@ -7909,7 +8141,7 @@ mod tests {
                 .target_bitrate_bps,
             12_000_000
         );
-        bridge.note_feedback(route_id, 0, 0, 0, 0, 0);
+        bridge.note_feedback(route_id, 0, 0, 0, PipelineFeedback::default());
         {
             let adapt = current.adapt.lock();
             assert_eq!((adapt.bad, adapt.good), (0, 0));
@@ -8034,6 +8266,8 @@ mod tests {
                 recv_fps: 60,
                 decode_fails: 0,
                 queue_depth: 0,
+                native_viewer_drained: 0,
+                native_viewer_superseded: 0,
                 est_kbps: 0,
                 delay_trend_us_per_s: 0,
                 at: Instant::now(),

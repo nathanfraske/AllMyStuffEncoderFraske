@@ -26,9 +26,10 @@
   // the pen one (see console-touch.ts): drags glide the cursor,
   // tap-then-drag holds the button, and two fingers pinch-zoom the view.
   import { flushSync, onMount, untrack } from "svelte";
-  import { makeKeyForwarder } from "../input-keys";
+  import { makeKeyForwarder, makeRemoteKeyTracker } from "../input-keys";
   import { makeRemoteButtonTracker } from "../remote-button-tracker";
   import { makeTouchMouse, type ViewTransform } from "../console-touch";
+  import { detectSymmetricActiveRegion, type ActiveRegion } from "../active-region";
   import { app } from "../store.svelte";
   import { DecodeStallEvidence, h264CodecString } from "../video-decoder";
   import {
@@ -540,20 +541,16 @@
   // down, so those keyups would die on the floor and the remote would
   // keep the modifier. This registry lets the release hygiene lift them
   // while the route still carries (mirroring keys.releaseAll()).
-  const stripHeld = new Map<string, { key: string; code?: string }>();
+  const stripKeys = makeRemoteKeyTracker((routeId, action) => sendInput(routeId, action));
   function sendFromStrip(a: InputAction) {
     if (a.kind === "key") {
-      const id = a.code || a.key;
-      if (a.down) stripHeld.set(id, { key: a.key, code: a.code });
-      else stripHeld.delete(id);
+      stripKeys.onKey(app.consoleControlLive, a);
+      return;
     }
     app.sendConsoleInput(a);
   }
   function releaseStrip() {
-    for (const [, k] of [...stripHeld].reverse()) {
-      app.sendConsoleInput({ kind: "key", key: k.key, code: k.code, down: false });
-    }
-    stripHeld.clear();
+    stripKeys.releaseAll();
   }
 
   // ---- pinch zoom / pan (the view transform) ---------------------------
@@ -1051,6 +1048,7 @@
         const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
         const img = new ImageData(pixels, f.width, f.height);
         paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
+        maybeDetectRaw(f.data, f.width, f.height);
         return;
       }
       // H.264 — decode entry is a key unit; deltas before one wait. Every
@@ -1250,7 +1248,7 @@
   //
   // The active region of the streamed frame in 0..1 fractions (the desktop
   // inside any baked-in black bars); the full frame until detection runs.
-  let activeRegion = $state({ x0: 0, y0: 0, x1: 1, y1: 1 });
+  let activeRegion = $state<ActiveRegion>({ x0: 0, y0: 0, x1: 1, y1: 1 });
   // The bars are baked pixels with no sidechannel (HDMI reports only the signal
   // size, the SPS only the coded size), so they must be measured off the frame —
   // but they're STATIC for a source mode, so this is a one-shot: it measures on
@@ -1278,12 +1276,22 @@
   // copy — the exact "video is choppy and ~100 ms behind while the mouse is
   // instant" regression. Sampling the frame we were handed sidesteps the
   // canvas entirely. `src` is the VideoFrame / ImageBitmap that was painted.
-  function maybeDetect(src: CanvasImageSource) {
+  function beginActiveRegionSample() {
     if (detectLocked || aspectChoice !== "auto" || !stagePointerActive) return;
     const now = performance.now();
     if (now - lastDetectAt < 1000) return;
     lastDetectAt = now;
+    return true;
+  }
+
+  function maybeDetect(src: CanvasImageSource) {
+    if (!beginActiveRegionSample()) return;
     detectActiveRegion(src);
+  }
+
+  function maybeDetectRaw(data: Uint8Array, width: number, height: number) {
+    if (!beginActiveRegionSample()) return;
+    applyDetectedActiveRegion(detectSymmetricActiveRegion(data, width, height));
   }
 
   // Measure the frame's active region: mirror the decoded FRAME into the small
@@ -1305,79 +1313,24 @@
     if (!ctx) return;
     const w = DETECT_W;
     const h = DETECT_H;
-    const DARK = 24;
-    const median = (a: number[]) => a.slice().sort((p, q) => p - q)[a.length >> 1];
-
-    let x0 = 0;
-    let x1 = w;
-    let y0 = 0;
-    let y1 = h;
-    let found = false; // did the frame carry real (non-black) content this pass?
     try {
       ctx.drawImage(src, 0, 0, w, h);
       const data = ctx.getImageData(0, 0, w, h).data;
-      const bright = (x: number, y: number) => {
-        const px = (y * w + x) * 4;
-        return data[px] > DARK || data[px + 1] > DARK || data[px + 2] > DARK;
-      };
-      const L: number[] = [];
-      const R: number[] = [];
-      for (let k = 1; k <= 6; k++) {
-        const y = Math.floor((h * k) / 7);
-        let l = 0;
-        while (l < w && !bright(l, y)) l++;
-        let rr = w - 1;
-        while (rr > l && !bright(rr, y)) rr--;
-        if (l < rr) {
-          L.push(l);
-          R.push(rr);
-        }
-      }
-      const T: number[] = [];
-      const B: number[] = [];
-      for (let k = 1; k <= 6; k++) {
-        const x = Math.floor((w * k) / 7);
-        let t = 0;
-        while (t < h && !bright(x, t)) t++;
-        let b = h - 1;
-        while (b > t && !bright(x, b)) b--;
-        if (t < b) {
-          T.push(t);
-          B.push(b);
-        }
-      }
-      found = L.length >= 4;
-      if (L.length >= 4) {
-        x0 = median(L);
-        x1 = median(R) + 1;
-      }
-      if (T.length >= 4) {
-        y0 = median(T);
-        y1 = median(B) + 1;
-      }
+      applyDetectedActiveRegion(detectSymmetricActiveRegion(data, w, h));
     } catch {
       return; // canvas not readable this tick — keep the last region
     }
 
-    // A near-all-black frame (screensaver, dark boot screen) tells us nothing —
-    // don't measure or lock on it, just try again on the next tick.
-    if (!found) {
+  }
+
+  function applyDetectedActiveRegion(next: ActiveRegion | null) {
+    // A near-all-black frame (screensaver, dark boot screen) tells us nothing.
+    // Do not measure or lock on it; try again on the next sample.
+    if (!next) {
       detectPrev = null;
       return;
     }
 
-    const barL = x0;
-    const barR = w - x1;
-    const barT = y0;
-    const barB = h - y1;
-    const okX = Math.min(barL, barR) > w * 0.015 && Math.abs(barL - barR) < w * 0.02;
-    const okY = Math.min(barT, barB) > h * 0.015 && Math.abs(barT - barB) < h * 0.02;
-    const next = {
-      x0: okX ? x0 / w : 0,
-      x1: okX ? x1 / w : 1,
-      y0: okY ? y0 / h : 0,
-      y1: okY ? y1 / h : 1,
-    };
     activeRegion = next;
     // Lock once two consecutive content-bearing frames agree — then stop
     // sampling entirely until the next re-wire resets it.
@@ -1458,17 +1411,15 @@
   // never disagree about where the cursor is. `heldButtons` stays the
   // single registry of what the remote believes is pressed.
   const virt = { x: 0.5, y: 0.5 };
-  const heldButtons = makeRemoteButtonTracker((routeId, action) => {
-    void sendInput(routeId, action);
-  });
-  function sendVirt(routeId: string | null = app.consoleControlLive) {
+  const heldButtons = makeRemoteButtonTracker((routeId, action) => sendInput(routeId, action));
+  function sendVirt(routeId: string | null = app.consoleControlLive, ordered = false) {
     if (!routeId) return;
     void sendInput(routeId, {
       kind: "mouse_move",
       x: virt.x,
       y: virt.y,
       screen: controlScreen,
-    });
+    }, ordered);
   }
   // The TeamViewer camera: zoomed in, the view keeps the remote cursor
   // CENTERED. Every steer pans the picture so the cursor slides back to the
@@ -1590,7 +1541,7 @@
         if (!routeId) return;
         // Land the cursor exactly where the trackpad believes it is,
         // then press — the same order the mouse path uses.
-        sendVirt(routeId);
+        sendVirt(routeId, true);
         heldButtons.press(routeId, button);
       } else {
         heldButtons.release(button);
@@ -1770,7 +1721,7 @@
     virt.x = p.x;
     virt.y = p.y;
     updateCrosshair();
-    void sendInput(routeId, { kind: "mouse_move", ...p, screen: controlScreen });
+    void sendInput(routeId, { kind: "mouse_move", ...p, screen: controlScreen }, true);
     heldButtons.press(routeId, e.button);
   }
 
@@ -1837,7 +1788,17 @@
   // Key forwarding with the bookkeeping combinations need: the physical
   // `code` rides along, and held keys are lifted in a burst whenever
   // their keyups can no longer arrive (blur, control off, session end).
-  const keys = makeKeyForwarder((a) => app.sendConsoleInput(a));
+  const keys = makeKeyForwarder((routeId, action) => sendInput(routeId, action));
+  $effect(() => {
+    const routeAtStart = app.consoleControl ? app.consoleControlLive : null;
+    return () => {
+      if (!routeAtStart) return;
+      untrack(() => {
+        keys.releaseAll();
+        stripKeys.releaseAll();
+      });
+    };
+  });
 
   function releaseRemoteInput() {
     touchMouse.reset();
@@ -1920,7 +1881,7 @@
       return;
     }
     if (!down && chordHandled.delete(e.code || e.key)) return; // straggler keyup
-    keys.onKey(e, down);
+    keys.onKey(app.consoleControlLive, e, down);
   }
 
   function toggleControl() {

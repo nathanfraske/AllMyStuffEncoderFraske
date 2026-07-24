@@ -587,7 +587,7 @@
     if (controlRoute) void sendInput(controlRoute, action);
   }
   function sendToRoute(routeId: string, action: InputAction) {
-    void sendInput(routeId, action);
+    return sendInput(routeId, action);
   }
   const buttons = makeRemoteButtonTracker(sendToRoute);
 
@@ -686,7 +686,7 @@
       // Capture is best-effort for stale or synthetic pointer ids.
     }
     e.preventDefault();
-    sendToRoute(routeId, { kind: "mouse_move", ...p, screen: controlScreen });
+    void sendInput(routeId, { kind: "mouse_move", ...p, screen: controlScreen }, true);
     buttons.press(routeId, e.button);
   }
   function onPointerCancel() {
@@ -702,7 +702,14 @@
   // `code` rides along, and keys still held when this window loses focus
   // are lifted in a burst — otherwise the far machine keeps a stuck
   // modifier.
-  const keys = makeKeyForwarder(send);
+  const keys = makeKeyForwarder((routeId, action) => sendInput(routeId, action));
+
+  $effect(() => {
+    const routeAtStart = controlActive ? controlRoute : null;
+    return () => {
+      if (routeAtStart) keys.releaseAll();
+    };
+  });
 
   function releaseRemoteInput() {
     buttons.releaseAll();
@@ -715,7 +722,7 @@
   function onControlKey(e: KeyboardEvent, down: boolean) {
     if (!controlActive) return;
     e.preventDefault();
-    keys.onKey(e, down);
+    keys.onKey(controlRoute, e, down);
   }
 
   // No-control keys ride the window so they work without the surface being

@@ -64,6 +64,10 @@ OS installer bundles (`.deb` / `.dmg` / `.msi`) are signed/notarized by their
 own platform toolchains and are out of scope for this key. The bundled
 `myownmesh` sidecar is pinned via `.myownmesh-rev` and built here, so it ships
 inside these signed archives rather than carrying a separate signature.
+Its official release archive SHA-256 is pinned per platform in
+`.myownmesh-release-sha256`. The GUI build verifies that hash before extraction,
+and release CI sets `ALLMYSTUFF_REQUIRE_SIDECAR=1` so a missing, stale, or
+incorrect daemon fails the release instead of producing an installer.
 
 ## Rotation
 

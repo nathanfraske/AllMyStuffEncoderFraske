@@ -21,6 +21,9 @@ param(
     [ValidateSet('auto', 'nvdec', 'openh264')]
     [string]$Decoder = 'auto',
 
+    [ValidateSet('native', 'compressed')]
+    [string]$Delivery = 'native',
+
     [ValidateRange(1, 120)]
     [int]$Seconds = 8,
 
@@ -56,6 +59,7 @@ param(
     [string]$OutputRoot,
 
     [switch]$NoRewatch,
+    [switch]$MotionPalette,
     [switch]$RestartMesh,
     [switch]$NoRestoreGui
 )
@@ -65,6 +69,9 @@ Set-StrictMode -Version Latest
 $ProfileParameterSet = $PSCmdlet.ParameterSetName
 if ($Label -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
     throw 'profile label contains unsupported characters'
+}
+if ($MotionPalette -and $Delivery -ne 'native') {
+    throw '-MotionPalette requires -Delivery native'
 }
 
 if ($ProfileParameterSet -eq 'Remote') {
@@ -499,6 +506,7 @@ try {
     for ($index = 0; $index -lt $targets.Count; $index++) {
         $target = $targets[$index]
         $probeArgs = @('--seconds', "$Seconds", '--cycles', "$Cycles", '--mode', $Mode,
+            '--delivery', $Delivery,
             '--active-timeout', '20', '--first-frame-timeout', '12')
         if ($PSCmdlet.ParameterSetName -eq 'Source') {
             $probeArgs += @('--source', $target)
@@ -507,6 +515,7 @@ try {
         }
         if ($ResizeEdge -gt 0) { $probeArgs += @('--resize-edge', "$ResizeEdge") }
         if ($Fps -gt 0) { $probeArgs += @('--fps', "$Fps") }
+        if ($MotionPalette) { $probeArgs += '--motion-palette' }
         if ($NoRewatch) { $probeArgs += '--no-rewatch' }
         $currentProbeLog = if ($targets.Count -eq 1) {
             $ProbeLog
@@ -649,11 +658,13 @@ $manifest = [ordered]@{
     expected_local_node = $ExpectedLocalNode
     mode = $Mode
     decoder = $Decoder
+    delivery = $Delivery
     seconds = $Seconds
     cycles = $Cycles
     resize_edge = $ResizeEdge
     fps = $Fps
     rewatch = -not $NoRewatch
+    motion_palette = [bool]$MotionPalette
     probe_exit = $probeExit
     probes = $probeResults
     backend_sha256 = Get-Sha256 $Backend

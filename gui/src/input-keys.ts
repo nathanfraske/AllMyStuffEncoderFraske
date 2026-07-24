@@ -1,76 +1,198 @@
-// Keyboard forwarding for the remote-control surfaces (the console stage,
-// a room tile being driven), built around the assumption that key
-// *combinations* are the norm: every event carries the physical
-// `KeyboardEvent.code` alongside the layout-resolved `key` (the far side
-// resolves chords through it), and held keys are tracked so they can be
-// lifted in a burst when the sender can no longer promise their keyups —
-// the window blurring mid-Alt+Tab, control toggling off, the session
-// closing. Without the burst the remote keeps a stuck modifier, which
-// reads as "the machine went haywire" until someone walks over and taps
-// Ctrl on its real keyboard.
-
 import type { InputAction } from "./types";
 
-/** Modifier keys: kept out of the ⌘-quirk sweep (releasing a still-held
- *  Shift would betray the very next chord). */
 const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph"]);
 
-export interface KeyForwarder {
-  /** Forward one keydown/keyup. Auto-repeat *is* forwarded — as repeated
-   *  presses, because a synthetically injected key doesn't auto-repeat on
-   *  the remote OS the way a held hardware key does; callers gate and
-   *  `preventDefault()`. */
-  onKey(e: KeyboardEvent, down: boolean): void;
-  /** Lift everything still held (in reverse press order). Call when the
-   *  matching keyups can no longer arrive — blur, control off, close. */
-  releaseAll(): void;
+export type RemoteKeyAction = Extract<InputAction, { kind: "key" }>;
+type SendKey = (routeId: string, action: RemoteKeyAction) => Promise<boolean>;
+
+interface HeldKey {
+  id: string;
+  routeId: string;
+  key: string;
+  code?: string;
+  downAccepted: Promise<boolean>;
+  releasePending: boolean;
 }
 
-export function makeKeyForwarder(send: (action: InputAction) => void): KeyForwarder {
-  // Held keys by physical code (key value when the code is empty) —
-  // insertion order is press order.
-  const held = new Map<string, { key: string; code?: string }>();
+interface KeyAuthority {
+  transition(routeId: string | null, action: RemoteKeyAction, repeat?: boolean): void;
+  releaseAll(): number;
+  heldCount(): number;
+}
 
-  const lift = (id: string) => {
-    const h = held.get(id);
-    if (!h) return;
-    held.delete(id);
-    send({ kind: "key", key: h.key, code: h.code, down: false });
+export interface RemoteKeyTracker {
+  onKey(routeId: string | null, action: RemoteKeyAction): void;
+  releaseAll(): number;
+  heldCount(): number;
+}
+
+export interface KeyForwarder {
+  /**
+   * Forward one key transition. A keydown captures `routeId`; its keyup uses
+   * that captured route even if the UI has switched routes in the meantime.
+   */
+  onKey(routeId: string | null, event: KeyboardEvent, down: boolean): void;
+  /** Queue lifts for everything still held or awaiting a lift. */
+  releaseAll(): number;
+  /** Includes releases awaiting their local enqueue acknowledgement. */
+  heldCount(): number;
+}
+
+function makeKeyAuthority(send: SendKey): KeyAuthority {
+  const active = new Map<string, HeldKey>();
+  const authorities = new Set<HeldKey>();
+  const transitionTails = new Map<string, Promise<void>>();
+
+  const schedule = (id: string, transition: () => Promise<boolean>): Promise<boolean> => {
+    const prior = transitionTails.get(id) ?? Promise.resolve();
+    const submitted = prior.then(transition).catch(() => false);
+    const tail = submitted.then(
+      () => undefined,
+      () => undefined,
+    );
+    transitionTails.set(id, tail);
+    void tail.then(() => {
+      if (transitionTails.get(id) === tail) transitionTails.delete(id);
+    });
+    return submitted;
+  };
+
+  const retire = (entry: HeldKey) => {
+    authorities.delete(entry);
+    if (active.get(entry.id) === entry) active.delete(entry.id);
+  };
+
+  const release = (entry: HeldKey) => {
+    if (entry.releasePending) return;
+    entry.releasePending = true;
+    if (active.get(entry.id) === entry) active.delete(entry.id);
+
+    void schedule(entry.id, async () => {
+      const downAccepted = await entry.downAccepted;
+      if (!downAccepted) {
+        retire(entry);
+        return true;
+      }
+      const accepted = await send(entry.routeId, {
+        kind: "key",
+        key: entry.key,
+        code: entry.code,
+        down: false,
+      }).catch(() => false);
+      if (accepted) retire(entry);
+      else {
+        entry.releasePending = false;
+        if (!active.has(entry.id)) active.set(entry.id, entry);
+      }
+      return accepted;
+    });
   };
 
   return {
-    onKey(e: KeyboardEvent, down: boolean) {
-      const code = e.code || undefined;
-      const id = e.code || e.key;
-      // Auto-repeat: the remote OS only repeats its own hardware keys, never
-      // an injected (XTEST / SendInput / CGEvent) press — so a held key would
-      // type exactly once. Drive the repeat from here instead: forward each
-      // auto-repeat as another press and let the injector re-press it, already
-      // paced at the user's own key-repeat rate by the webview. Skip modifiers
-      // (a repeated Shift/Ctrl only churns the wire) and leave `held` alone —
-      // the key is already tracked from its first press.
-      if (e.repeat) {
-        if (down && !MODIFIER_KEYS.has(e.key)) send({ kind: "key", key: e.key, code, down: true });
+    transition(routeId, action, repeat = false) {
+      const id = action.code || action.key;
+      const prior = active.get(id);
+
+      if (repeat) {
+        if (action.down && prior && !MODIFIER_KEYS.has(prior.key)) {
+          void schedule(prior.id, () =>
+            send(prior.routeId, {
+              kind: "key",
+              key: prior.key,
+              code: prior.code,
+              down: true,
+            }),
+          );
+        }
         return;
       }
-      if (down) {
-        held.delete(id); // re-press keeps press order honest
-        held.set(id, { key: e.key, code });
-      } else {
-        held.delete(id);
-      }
-      send({ kind: "key", key: e.key, code, down });
-      // macOS webviews swallow the keyup of any key released while ⌘ is
-      // still down — when ⌘ lifts, lift everything non-modifier with it,
-      // or the remote keeps typing the last chord's letter.
-      if (!down && e.key === "Meta") {
-        for (const [id, h] of [...held]) {
-          if (!MODIFIER_KEYS.has(h.key)) lift(id);
+
+      if (!action.down) {
+        if (prior) release(prior);
+        // macOS webviews can swallow non-modifier keyups while Command
+        // remains held. When Command lifts, explicitly lift those keys too.
+        if (action.key === "Meta") {
+          for (const held of [...authorities]) {
+            if (!MODIFIER_KEYS.has(held.key)) release(held);
+          }
         }
+        return;
       }
+      if (!routeId) return;
+
+      // A second non-repeat press cannot transfer the first press's authority
+      // to another route. Treat the malformed duplicate as cleanup only.
+      if (prior) {
+        release(prior);
+        return;
+      }
+
+      const entry: HeldKey = {
+        id,
+        routeId,
+        key: action.key,
+        code: action.code,
+        downAccepted: Promise.resolve(false),
+        releasePending: false,
+      };
+      active.set(id, entry);
+      authorities.add(entry);
+      entry.downAccepted = schedule(entry.id, () =>
+        send(routeId, {
+          kind: "key",
+          key: entry.key,
+          code: entry.code,
+          down: true,
+        }).catch(() => false),
+      );
+      void entry.downAccepted.then((accepted) => {
+        if (!accepted && !entry.releasePending) retire(entry);
+      });
     },
+
     releaseAll() {
-      for (const id of [...held.keys()].reverse()) lift(id);
+      const pending = [...authorities].reverse();
+      for (const entry of pending) release(entry);
+      return pending.length;
     },
+
+    heldCount: () => authorities.size,
+  };
+}
+
+/**
+ * Tracks programmatic key actions, such as the on-screen keyboard, using the
+ * same route ownership and acknowledgement rules as physical keys.
+ */
+export function makeRemoteKeyTracker(send: SendKey): RemoteKeyTracker {
+  const authority = makeKeyAuthority(send);
+  return {
+    onKey: (routeId, action) => authority.transition(routeId, action),
+    releaseAll: authority.releaseAll,
+    heldCount: authority.heldCount,
+  };
+}
+
+/**
+ * Tracks physical keyboard authority until the matching release has been
+ * accepted by the local input FIFO.
+ */
+export function makeKeyForwarder(send: SendKey): KeyForwarder {
+  const authority = makeKeyAuthority(send);
+  return {
+    onKey(routeId, event, down) {
+      authority.transition(
+        routeId,
+        {
+          kind: "key",
+          key: event.key,
+          code: event.code || undefined,
+          down,
+        },
+        event.repeat,
+      );
+    },
+    releaseAll: authority.releaseAll,
+    heldCount: authority.heldCount,
   };
 }

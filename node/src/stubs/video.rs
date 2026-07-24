@@ -209,6 +209,8 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    pub native_viewer_drained: u32,
+    pub native_viewer_superseded: u32,
     /// Wire-parity with the real bridge: the viewer's link estimate and
     /// delay trend still arrive; recorded, never acted on (no encoder).
     pub est_kbps: u32,
@@ -227,6 +229,10 @@ pub struct PipelineFeedback {
     #[serde(default)]
     pub delay_trend_us_per_s: i32,
     #[serde(default)]
+    pub native_viewer_drained: u32,
+    #[serde(default)]
+    pub native_viewer_superseded: u32,
+    #[serde(default)]
     pub audio_arrival_jitter_us: u64,
     #[serde(default)]
     pub audio_target_ms: u32,
@@ -242,6 +248,8 @@ impl PipelineFeedback {
     pub fn to_ext(&self) -> serde_json::Value {
         if self.est_kbps == 0
             && self.delay_trend_us_per_s == 0
+            && self.native_viewer_drained == 0
+            && self.native_viewer_superseded == 0
             && self.audio_arrival_jitter_us == 0
             && self.audio_target_ms == 0
             && self.audio_buffered_ms == 0
@@ -399,8 +407,7 @@ impl VideoBridge {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
-        est_kbps: u32,
-        delay_trend_us_per_s: i32,
+        pipeline: PipelineFeedback,
     ) {
         self.feedback.lock().insert(
             route_id.to_string(),
@@ -408,8 +415,10 @@ impl VideoBridge {
                 recv_fps,
                 decode_fails,
                 queue_depth,
-                est_kbps,
-                delay_trend_us_per_s,
+                native_viewer_drained: pipeline.native_viewer_drained,
+                native_viewer_superseded: pipeline.native_viewer_superseded,
+                est_kbps: pipeline.est_kbps,
+                delay_trend_us_per_s: pipeline.delay_trend_us_per_s,
                 at: Instant::now(),
             },
         );

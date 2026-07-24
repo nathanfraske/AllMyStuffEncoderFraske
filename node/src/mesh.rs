@@ -344,6 +344,12 @@ pub struct Mesh {
     /// push channel's ordered delivery meant one lost message silently
     /// froze the stream forever while the backend kept counting frames.
     video_watchers: Mutex<VideoWatchRegistry>,
+    /// Monotonic process-local order for network-tagged base64 video events.
+    /// It is diagnostic/recovery metadata only and never reaches a peer.
+    base64_video_sequence: AtomicU64,
+    /// Dependency fence armed when the bounded base64 dispatcher omits an AU
+    /// or its payload cannot be admitted.
+    base64_video_recovery: Mutex<Base64VideoRecovery>,
     /// Process-random seed plus a monotonic increment for local watcher
     /// claims. A GUI surviving a node restart must never have its old token
     /// alias the first watcher created by the replacement process.
@@ -528,6 +534,8 @@ impl VideoWatchRegistry {
             watcher.queue.clear();
             watcher.awaiting_key = !watcher.decode;
             watcher.last_poll = None;
+            watcher.native_drained = 0;
+            watcher.native_superseded = 0;
             if watcher.decode {
                 watcher.decode_epoch = next_native_decode_epoch();
             }
@@ -539,6 +547,8 @@ impl VideoWatchRegistry {
             watcher.queue.clear();
             watcher.awaiting_key = !watcher.decode;
             watcher.last_poll = None;
+            watcher.native_drained = 0;
+            watcher.native_superseded = 0;
             if watcher.decode {
                 watcher.decode_epoch = next_native_decode_epoch();
             }
@@ -548,6 +558,8 @@ impl VideoWatchRegistry {
                 watcher.queue.clear();
                 watcher.awaiting_key = !watcher.decode;
                 watcher.last_poll = None;
+                watcher.native_drained = 0;
+                watcher.native_superseded = 0;
                 if watcher.decode {
                     watcher.decode_epoch = next_native_decode_epoch();
                 }
@@ -565,6 +577,8 @@ impl VideoWatchRegistry {
         self.prune_standby(&route_id, now);
         if let Some(mut displaced) = self.current.insert(route_id.clone(), watcher) {
             displaced.queue.clear();
+            displaced.native_drained = 0;
+            displaced.native_superseded = 0;
             // A never-polled registration has not proved that a live window
             // owns it. A recently polled claim may be restored if an obsolete
             // late registration displaced it and then immediately unwinds.
@@ -594,6 +608,8 @@ impl VideoWatchRegistry {
             if let Some(mut watcher) = restored {
                 watcher.queue.clear();
                 watcher.awaiting_key = !watcher.decode;
+                watcher.native_drained = 0;
+                watcher.native_superseded = 0;
                 self.current.insert(route_id.to_string(), watcher);
             }
             return Some((removed_decode, restored_decode));
@@ -645,6 +661,12 @@ struct VideoWatcher {
     /// A post-disconnect-request poll is stronger liveness evidence than mere
     /// watcher presence because `video_unwatch` is fire-and-forget.
     last_poll: Option<Instant>,
+    /// Native decode only: complete RGBA pictures drained toward the local
+    /// viewer since the last receiver-feedback report.
+    native_drained: u32,
+    /// Native decode only: complete RGBA pictures replaced by a fresher
+    /// picture before the local viewer could drain them.
+    native_superseded: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,6 +699,90 @@ struct QueuedVideoEvent {
     value: Value,
     route_id: String,
     generation: u64,
+    /// Process-local admission order on the daemon event stream. A queued
+    /// key that predates a later dropped AU must never reopen that damaged
+    /// dependency chain when the worker eventually reaches it.
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base64VideoRecoveryAdmission {
+    Accept,
+    HoldDependent,
+    RepairCandidate,
+}
+
+/// Receive-side dependency fence for the legacy base64 event path.
+///
+/// The dispatcher and its decoder worker run concurrently. Recording the
+/// dropped event's sequence preserves their exact order: already-queued AUs
+/// before the loss remain safe, while only a clean entry after the loss may
+/// reopen delivery. Route generation is part of the key so a predecessor
+/// cannot damage a same-id successor.
+#[derive(Default)]
+struct Base64VideoRecovery {
+    /// Route id -> (exact route generation, newest dropped event sequence).
+    /// Only one generation is current for a route, so this avoids allocating
+    /// a composite lookup key on every inbound AU.
+    dropped_after: HashMap<String, (u64, u64)>,
+}
+
+impl Base64VideoRecovery {
+    fn note_drop(&mut self, route_id: &str, generation: u64, sequence: u64) {
+        self.dropped_after
+            .entry(route_id.to_string())
+            .and_modify(|current| {
+                if current.0 == generation {
+                    current.1 = current.1.max(sequence);
+                } else {
+                    *current = (generation, sequence);
+                }
+            })
+            .or_insert((generation, sequence));
+    }
+
+    fn admission(
+        &self,
+        route_id: &str,
+        generation: u64,
+        sequence: u64,
+        decode_entry: bool,
+    ) -> Base64VideoRecoveryAdmission {
+        let Some((dropped_generation, dropped_sequence)) =
+            self.dropped_after.get(route_id).copied()
+        else {
+            return Base64VideoRecoveryAdmission::Accept;
+        };
+        if dropped_generation != generation {
+            return Base64VideoRecoveryAdmission::Accept;
+        }
+        if sequence <= dropped_sequence {
+            Base64VideoRecoveryAdmission::Accept
+        } else if decode_entry {
+            Base64VideoRecoveryAdmission::RepairCandidate
+        } else {
+            Base64VideoRecoveryAdmission::HoldDependent
+        }
+    }
+
+    /// Clear only after downstream accepted the repair AU. A concurrent later
+    /// drop has a higher sequence and therefore remains armed.
+    fn complete_repair(&mut self, route_id: &str, generation: u64, sequence: u64) -> bool {
+        if self
+            .dropped_after
+            .get(route_id)
+            .is_some_and(|current| current.0 == generation && current.1 < sequence)
+        {
+            self.dropped_after.remove(route_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_route(&mut self, route_id: &str) {
+        self.dropped_after.remove(route_id);
+    }
 }
 
 fn queued_video_binding_matches(
@@ -863,6 +969,13 @@ const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimum spacing between decode-recovery asks for one route.
 const VIDEO_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Short burst allowance shared by the legacy daemon event handoff and the
+/// pass-through viewer queue. Six access units are about 100 ms at 60 fps.
+/// This is intentionally separate from `VIDEO_HANDOFF_FRAMES`: that one-frame
+/// bound is for a per-route capture handoff whose producer can immediately
+/// repair a drop, while this queue carries dependency-chained inbound H.264.
+const BASE64_VIDEO_EVENT_BURST_FRAMES: usize = 6;
 
 fn reserve_video_refresh(
     asks: &mut HashMap<String, Instant>,
@@ -1431,6 +1544,11 @@ const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3
 const CEC_CONNECT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 const OFFER_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Missed-event safety net while an input route can hold OS state. Immediate
+/// peer drops are event-driven; this only bounds recovery when that best-effort
+/// event stream lagged. It matches the existing two-second control-consent
+/// liveness check and is deliberately independent of offer retry policy.
+const ACTIVE_INPUT_PEER_SWEEP: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonContext {
@@ -1588,6 +1706,18 @@ struct State {
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
     peer_networks: HashMap<String, PeerNetworkState>,
+    /// The daemon's peer events name the wire-level `network_id`, while every
+    /// control request and route pin uses this device's `config_id`. Preserve
+    /// both aliases from the same NetworksList snapshot so a `peer/dropped`
+    /// event can retire only the exact local PeerSession it describes.
+    network_id_to_config_id: HashMap<String, String>,
+    config_id_to_network_id: HashMap<String, String>,
+    /// Peers for which an authoritative local-daemon event or PeersList
+    /// snapshot proved that no joined data-plane path remains. This is
+    /// separate from an absent cache entry: absence at startup means "not
+    /// learned yet" and may probe, while this set means "known unreachable"
+    /// and must not fall back to the primary network.
+    peer_unreachable: std::collections::HashSet<String>,
     /// Daemon-confirmed outbound network for an exact route lifetime. Peer
     /// reachability can span several meshes and its preferred path may change
     /// as unrelated traffic arrives. Media must remain on the path that
@@ -1629,9 +1759,37 @@ struct State {
 /// move the route to another PeerSession.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteNetworkPin {
+    peer: String,
     network: String,
     network_epoch: u64,
     confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LostPeerRoutePath {
+    route_id: String,
+    incarnation: Option<String>,
+    peer: String,
+    pin: RouteNetworkPin,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PeerPathUpdate {
+    lost_routes: Vec<LostPeerRoutePath>,
+    recovered_peers: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct PeerRefreshCommit {
+    paths: PeerPathUpdate,
+    link_changes: Vec<(String, String, crate::video::LinkClass)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JoinedNetworkSnapshot {
+    config_ids: Vec<String>,
+    network_id_to_config_id: HashMap<String, String>,
+    config_id_to_network_id: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1644,15 +1802,18 @@ enum RouteNetworkObservation {
 fn observe_route_network(
     pins: &mut HashMap<(String, Option<String>), RouteNetworkPin>,
     key: (String, Option<String>),
+    peer: &str,
     network: &str,
     network_epoch: u64,
     observation: RouteNetworkObservation,
 ) -> bool {
+    let peer = pubkey_part(peer);
     match pins.get_mut(&key) {
         None => {
             pins.insert(
                 key,
                 RouteNetworkPin {
+                    peer: peer.to_string(),
                     network: network.to_string(),
                     network_epoch,
                     confirmed: observation != RouteNetworkObservation::OutboundOffer,
@@ -1660,13 +1821,19 @@ fn observe_route_network(
             );
             true
         }
-        Some(pin) if pin.network == network && pin.network_epoch == network_epoch => {
+        Some(pin)
+            if pin.peer == peer && pin.network == network && pin.network_epoch == network_epoch =>
+        {
             if observation != RouteNetworkObservation::OutboundOffer {
                 pin.confirmed = true;
             }
             true
         }
-        Some(pin) if !pin.confirmed && observation == RouteNetworkObservation::InboundAccept => {
+        Some(pin)
+            if pin.peer == peer
+                && !pin.confirmed
+                && observation == RouteNetworkObservation::InboundAccept =>
+        {
             pin.network = network.to_string();
             pin.network_epoch = network_epoch;
             pin.confirmed = true;
@@ -1713,12 +1880,13 @@ struct PeerNetworkState {
     /// Last network that carried a confirmed outbound send or inbound app
     /// frame. It is tried first but never treated as the peer's only path.
     preferred: Option<String>,
-    /// Paths in the latest daemon peer snapshot. A later PeersList response may
-    /// replace this evidence without erasing paths independently proven by app
-    /// traffic.
+    /// Paths in the latest daemon peer snapshot. A successful PeersList
+    /// response is authoritative for its network and replaces both this set
+    /// and any older observed evidence for that path. A failed request leaves
+    /// the existing evidence untouched.
     daemon_reachable: std::collections::HashSet<String>,
     /// Paths proven by an authenticated inbound frame or a confirmed outbound
-    /// daemon send during this joined-network generation.
+    /// daemon send since the latest authoritative snapshot for that network.
     observed_reachable: std::collections::HashSet<String>,
 }
 
@@ -1979,6 +2147,9 @@ impl Mesh {
                 network_epochs: HashMap::new(),
                 network_epoch_clock: 0,
                 peer_networks: HashMap::new(),
+                network_id_to_config_id: HashMap::new(),
+                config_id_to_network_id: HashMap::new(),
+                peer_unreachable: std::collections::HashSet::new(),
                 route_networks: HashMap::new(),
                 peer_features: HashMap::new(),
                 peer_links: HashMap::new(),
@@ -2024,6 +2195,8 @@ impl Mesh {
             daemon_session_epoch: Arc::new(AtomicU64::new(0)),
             video_in: Mutex::new(VideoAssembler::new()),
             video_watchers: Mutex::new(VideoWatchRegistry::default()),
+            base64_video_sequence: AtomicU64::new(0),
+            base64_video_recovery: Mutex::new(Base64VideoRecovery::default()),
             video_watch_token: AtomicU64::new(fresh_js_counter_seed()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
             network_subscriptions: Mutex::new(HashMap::new()),
@@ -2766,10 +2939,16 @@ impl Mesh {
             let key = (route_id.to_string(), route.incarnation.clone());
             if let Some(pin) = st.route_networks.get(&key) {
                 let current_epoch = st.network_epochs.get(&pin.network).copied();
-                return (st.networks.contains(&pin.network)
+                return (pin.peer == pubkey_part(peer)
+                    && st.networks.contains(&pin.network)
                     && current_epoch == Some(pin.network_epoch)
-                    && pin.confirmed)
-                    .then(|| pin.network.clone());
+                    && pin.confirmed
+                    && !st.peer_unreachable.contains(pubkey_part(peer))
+                    && st
+                        .peer_networks
+                        .get(pubkey_part(peer))
+                        .is_none_or(|paths| paths.contains(&pin.network)))
+                .then(|| pin.network.clone());
             }
             // A fenced lifetime must never move to another PeerSession merely
             // because the exact path disappeared. Its owner will retire it and
@@ -2847,6 +3026,9 @@ impl Mesh {
 
     fn peer_reachable_networks(&self, peer: &str) -> Vec<String> {
         let state = self.state.lock();
+        if state.peer_unreachable.contains(pubkey_part(peer)) {
+            return Vec::new();
+        }
         let mut networks = state
             .peer_networks
             .get(pubkey_part(peer))
@@ -2892,7 +3074,8 @@ impl Mesh {
         };
         let key = (route_id.to_string(), route.incarnation.clone());
         let Some(pin) = state.route_networks.get(&key).filter(|pin| {
-            pin.confirmed
+            pin.peer == pubkey_part(peer)
+                && pin.confirmed
                 && state.network_epochs.get(&pin.network).copied() == Some(pin.network_epoch)
         }) else {
             return crate::video::LinkClass::Unknown;
@@ -2957,8 +3140,10 @@ impl Mesh {
         };
         match route_path {
             Some((Some(pin), joined, epochs)) => {
-                return if joined.contains(&pin.network)
+                return if pin.peer == pubkey_part(peer)
+                    && joined.contains(&pin.network)
                     && epochs.get(&pin.network).copied() == Some(pin.network_epoch)
+                    && candidates.contains(&pin.network)
                 {
                     vec![pin.network]
                 } else {
@@ -3014,6 +3199,7 @@ impl Mesh {
             if !observe_route_network(
                 &mut st.route_networks,
                 key,
+                peer,
                 network,
                 network_epoch,
                 RouteNetworkObservation::OutboundOffer,
@@ -3084,7 +3270,9 @@ impl Mesh {
         let current_network_epoch = state.network_epochs.get(network).copied();
         match state.route_networks.get(&key) {
             Some(pin)
-                if pin.network == network && current_network_epoch == Some(pin.network_epoch) =>
+                if pin.peer == pubkey_part(peer)
+                    && pin.network == network
+                    && current_network_epoch == Some(pin.network_epoch) =>
             {
                 true
             }
@@ -3100,10 +3288,7 @@ impl Mesh {
                     && route.origin == allmystuff_session::Origin::Outbound
                     && route.state == RouteState::Offered
                     && current_network_epoch.is_some()
-                    && matches!(
-                        message,
-                        ControlMessage::Route(RouteControl::Reject { .. })
-                    ) =>
+                    && matches!(message, ControlMessage::Route(RouteControl::Reject { .. })) =>
             {
                 // A reliable Offer can be acknowledged on a different
                 // PeerSession than the daemon-accepted fast attempt. The exact
@@ -3187,6 +3372,7 @@ impl Mesh {
         if !observe_route_network(
             &mut state.route_networks,
             key,
+            peer,
             network,
             network_epoch,
             observation,
@@ -3217,13 +3403,13 @@ impl Mesh {
     /// first offer/update already lands on the right mesh, and the peer's reply
     /// keeps the mapping fresh thereafter.
     ///
-    /// Records only a network the daemon reports the peer **reachable** on, and
-    /// never clobbers one already learned from an inbound frame (that one is
-    /// proven to carry traffic to us) — it just fills the gap. The stored id is
-    /// the network's `config_id`, matching what an inbound frame records and what
-    /// [`Mesh::prune_unjoined_peers`] reconciles against.
+    /// Every successful PeersList response is authoritative for that one
+    /// network. It replaces both daemon and prior frame observations on that
+    /// path; a failed request changes nothing. This is what lets a lagged event
+    /// subscriber recover a missed `peer/dropped` transition instead of keeping
+    /// an old inbound frame as reachability evidence forever.
     async fn refresh_peer_networks(self: &Arc<Self>) {
-        let _refresh = self.peer_refresh_serial.lock().await;
+        let refresh = self.peer_refresh_serial.lock().await;
         let epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
         let (client_id, generation, networks) = {
             let state = self.state.lock();
@@ -3234,7 +3420,8 @@ impl Mesh {
             )
         };
         let Some(client_id) = client_id else { return };
-        for network in networks {
+        let mut snapshots = Vec::new();
+        for network in &networks {
             let Ok(resp) = self
                 .client
                 .request(&Request::PeersList {
@@ -3244,7 +3431,7 @@ impl Mesh {
             else {
                 continue;
             };
-            if !self.network_snapshot_is_current(epoch, client_id, generation, &network) {
+            if !self.network_snapshot_is_current(epoch, client_id, generation, network) {
                 return;
             }
             let Some(peers) = resp
@@ -3255,96 +3442,89 @@ impl Mesh {
             else {
                 continue;
             };
-            let changed = {
-                let mut st = self.state.lock();
-                if st.client_id != Some(client_id)
-                    || st.network_generation != generation
-                    || !st.networks.contains(&network)
-                    || self.daemon_session_epoch.load(Ordering::SeqCst) != epoch
-                {
-                    return;
-                }
-                // This PeersList is the current truth for this network. Clear
-                // only this path from prior observations, then add its live
-                // rows back. Failed PeersList requests never reach here and
-                // therefore never destructively erase a path.
-                for paths in st.peer_networks.values_mut() {
-                    paths.daemon_reachable.remove(&network);
-                    if paths.preferred.as_deref() == Some(network.as_str())
-                        && !paths.contains(&network)
-                    {
-                        paths.preferred = None;
-                    }
-                }
-                seed_peer_networks(&mut st.peer_networks, peers, &network);
-                seed_peer_links(&mut st.peer_links, peers, &network)
-            };
+            snapshots.push((network.clone(), peers.clone()));
+        }
+        if snapshots.is_empty() {
+            return;
+        }
+        let commit = {
+            let mut state = self.state.lock();
+            if state.client_id != Some(client_id)
+                || state.network_generation != generation
+                || self.daemon_session_epoch.load(Ordering::SeqCst) != epoch
+            {
+                return;
+            }
+            apply_authoritative_peer_snapshots(&mut state, &snapshots)
+        };
+        drop(refresh);
+
+        self.reconcile_peer_path_update(commit.paths).await;
+        for (network, peer, class) in commit.link_changes {
             // A peer's link class landing (or flipping — an ICE-restart
             // handoff can move a link LAN→STUN mid-life) re-gates its live
             // streams' automatic dials. Compose the allocator plan with the
             // new class before touching a route so a successor cannot inherit
             // the preceding policy generation's cap.
-            for (peer, class) in changed {
-                let route_ids = self
-                    .video
-                    .route_ids()
-                    .into_iter()
-                    .filter(|route_id| {
-                        self.route_peer(route_id).is_some_and(|p| {
-                            pubkey_part(&p) == peer
-                                && self.network_for_route(route_id, &p).as_deref()
-                                    == Some(network.as_str())
-                        })
+            let route_ids = self
+                .video
+                .route_ids()
+                .into_iter()
+                .filter(|route_id| {
+                    self.route_peer(route_id).is_some_and(|p| {
+                        pubkey_part(&p) == peer
+                            && self.network_for_route(route_id, &p).as_deref()
+                                == Some(network.as_str())
                     })
-                    .collect::<Vec<_>>();
-                if route_ids.is_empty() {
-                    continue;
-                }
-                let changed_route_ids = route_ids.iter().cloned().collect::<HashSet<_>>();
+                })
+                .collect::<Vec<_>>();
+            if route_ids.is_empty() {
+                continue;
+            }
+            let changed_route_ids = route_ids.iter().cloned().collect::<HashSet<_>>();
+            let policy_plans = {
+                let serial = self.video_policy_apply_serial.lock();
+                // PCM suspension mutates audio accounting. Do it before
+                // the link-class recompute, then publish only the final
+                // generation.
+                self.stop_policy_pcm_for_peer(&peer, &serial);
                 let policy_plans = {
-                    let serial = self.video_policy_apply_serial.lock();
-                    // PCM suspension mutates audio accounting. Do it before
-                    // the link-class recompute, then publish only the final
-                    // generation.
-                    self.stop_policy_pcm_for_peer(&peer, &serial);
-                    let policy_plans = {
-                        let mut policy = self.media_policy.lock();
-                        for route_id in &route_ids {
-                            let _ = policy.register_route(
-                                &peer,
-                                route_id,
-                                class == crate::video::LinkClass::Lan,
-                            );
-                        }
-                        policy.plans_for_peer(&peer)
-                    };
-                    for plan in &policy_plans {
-                        let cap = Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32);
-                        if changed_route_ids.contains(&plan.route_id) {
-                            if self.video.retune_link_policy(
-                                &plan.route_id,
-                                class,
-                                cap,
-                                plan.auto_resolution,
-                            ) {
-                                tracing::info!(
+                    let mut policy = self.media_policy.lock();
+                    for route_id in &route_ids {
+                        let _ = policy.register_route(
+                            &peer,
+                            route_id,
+                            class == crate::video::LinkClass::Lan,
+                        );
+                    }
+                    policy.plans_for_peer(&peer)
+                };
+                for plan in &policy_plans {
+                    let cap = Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32);
+                    if changed_route_ids.contains(&plan.route_id) {
+                        if self.video.retune_link_policy(
+                            &plan.route_id,
+                            class,
+                            cap,
+                            plan.auto_resolution,
+                        ) {
+                            tracing::info!(
                                     "link to {} classified {:?} — restarted {route_id} once with the current video policy",
                                     short_id(&peer),
                                     class,
                                     route_id = plan.route_id,
                                 );
-                            }
-                        } else {
-                            // Rebalancing one route can change a sibling's
-                            // share even when its link class did not move.
-                            self.video
-                                .apply_policy_cap(&plan.route_id, cap, plan.auto_resolution);
                         }
+                    } else {
+                        // Rebalancing one route can change a sibling's
+                        // share even when its link class did not move.
+                        self.video
+                            .apply_policy_cap(&plan.route_id, cap, plan.auto_resolution);
                     }
-                    policy_plans
-                };
-                self.send_effective_plans(policy_plans).await;
-            }
+                }
+                policy_plans
+            };
+            self.send_effective_plans(policy_plans).await;
         }
     }
 
@@ -3412,6 +3592,10 @@ impl Mesh {
         // AllMyStuff app died (daemon still up, so it looks present) used to
         // sit "awaiting accept" forever — a black console with no error.
         self.spawn_offer_reaper();
+        // A held key must not depend on best-effort event history. While an
+        // input route is active, reuse the existing route-sweep cadence to
+        // compare its pinned path with authoritative daemon peer snapshots.
+        self.spawn_active_input_peer_sweep();
 
         // Enforce CEC consent by teardown on a ~2s sweep rather than on every
         // input frame: a lapsed grant (revoke/expiry) tears the session's
@@ -3452,7 +3636,7 @@ impl Mesh {
                 // the same bounded queue depths already reviewed for the
                 // video/audio pipelines. Control events remain ordered here.
                 let (video_event_tx, mut video_event_rx) =
-                    mpsc::channel::<QueuedVideoEvent>(usize::from(VIDEO_HANDOFF_FRAMES));
+                    mpsc::channel::<QueuedVideoEvent>(BASE64_VIDEO_EVENT_BURST_FRAMES);
                 let (audio_event_tx, mut audio_event_rx) =
                     mpsc::channel::<Value>(usize::from(AUDIO_HANDOFF_PACKETS));
                 let video_mesh = mesh.clone();
@@ -3461,10 +3645,7 @@ impl Mesh {
                         if !video_mesh.daemon_context_is_current(daemon_epoch, client_id) {
                             break;
                         }
-                        video_mesh.handle_base64_video_value(
-                            event.value,
-                            (event.route_id, event.generation),
-                        );
+                        video_mesh.handle_base64_video_value(event);
                     }
                 });
                 let audio_mesh = mesh.clone();
@@ -3567,6 +3748,10 @@ impl Mesh {
             value,
             route_id,
             generation,
+            sequence: self
+                .base64_video_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1),
         })
     }
 
@@ -3595,13 +3780,40 @@ impl Mesh {
 
     fn note_base64_video_dispatch_drop(self: &Arc<Self>, event: &QueuedVideoEvent) {
         self.note_base64_media_dispatch_drop("video", &event.value);
-        if self.video_generation_is_current(&event.route_id, event.generation) {
-            let mesh = self.clone();
-            let route_id = event.route_id.clone();
-            crate::spawn(async move {
-                let _ = mesh.request_refresh_for_recovery(route_id).await;
-            });
+        self.arm_base64_video_recovery(event, "bounded dispatcher overflow");
+    }
+
+    fn arm_base64_video_recovery(self: &Arc<Self>, event: &QueuedVideoEvent, reason: &'static str) {
+        let armed = commit_current_video_generation(
+            &self.video_route_generations,
+            &event.route_id,
+            event.generation,
+            || {
+                self.base64_video_recovery.lock().note_drop(
+                    &event.route_id,
+                    event.generation,
+                    event.sequence,
+                );
+                true
+            },
+        ) == Some(true);
+        if !armed {
+            return;
         }
+        if self.diag_ok(&format!("base64-video-damage:{}", event.route_id)) {
+            tracing::warn!(
+                route = %event.route_id,
+                generation = event.generation,
+                sequence = event.sequence,
+                reason,
+                "legacy compressed video dependency chain damaged; holding later deltas for a clean entry"
+            );
+        }
+        let mesh = self.clone();
+        let route_id = event.route_id.clone();
+        crate::spawn(async move {
+            let _ = mesh.request_refresh_for_recovery(route_id).await;
+        });
     }
 
     /// Tear down process-local media state before installing a daemon's fresh
@@ -3642,6 +3854,9 @@ impl Mesh {
             state.network_epochs.clear();
             state.route_networks.clear();
             state.peer_networks.clear();
+            state.network_id_to_config_id.clear();
+            state.config_id_to_network_id.clear();
+            state.peer_unreachable.clear();
             state.peer_links.clear();
             state.session.take()
         };
@@ -3699,6 +3914,7 @@ impl Mesh {
         self.audio_encoders.lock().clear();
         *self.video_in.lock() = VideoAssembler::new();
         self.video_watchers.lock().reset_for_reconnect();
+        *self.base64_video_recovery.lock() = Base64VideoRecovery::default();
         self.video_arrivals.lock().clear();
         self.video_in_stats.lock().clear();
         self.video_diag_last.lock().clear();
@@ -3771,7 +3987,8 @@ impl Mesh {
         // same-LAN claimer with zero setup.
         self.ensure_claim_networks().await;
         // Every joined network; route control/media operate on the primary.
-        let networks = self.fetch_networks().await;
+        let network_snapshot = self.fetch_networks().await;
+        let networks = network_snapshot.config_ids.clone();
         let primary = networks.first().cloned();
 
         {
@@ -3781,6 +3998,9 @@ impl Mesh {
             st.profile = Some(profile.clone());
             st.network = primary.clone();
             st.networks = networks.clone();
+            st.network_id_to_config_id = network_snapshot.network_id_to_config_id;
+            st.config_id_to_network_id = network_snapshot.config_id_to_network_id;
+            st.peer_unreachable.clear();
             st.network_generation = st.network_generation.wrapping_add(1);
             reconcile_network_epochs(&mut st, &networks, true);
         }
@@ -3834,16 +4054,18 @@ impl Mesh {
                             let profile_id = profiled.profile_id;
                             let f = profiled.frame;
                             match f.kind {
-                                MEDIA_KIND_VIDEO => mesh.handle_video_inbound_profiled(
-                                    &source_network,
-                                    &f.from,
-                                    f.stream,
-                                    f.rtp_timestamp,
-                                    f.key,
-                                    f.data,
-                                    profile_id,
-                                    None,
-                                ),
+                                MEDIA_KIND_VIDEO => {
+                                    mesh.handle_video_inbound_profiled(
+                                        &source_network,
+                                        &f.from,
+                                        f.stream,
+                                        f.rtp_timestamp,
+                                        f.key,
+                                        f.data,
+                                        profile_id,
+                                        None,
+                                    );
+                                }
                                 MEDIA_KIND_AUDIO => mesh.handle_audio_inbound(
                                     &source_network,
                                     &f.from,
@@ -4059,6 +4281,21 @@ impl Mesh {
                     for peer in replay_peers {
                         mesh.replay_desired_routes(Some(&peer)).await;
                     }
+                }
+            }
+        });
+    }
+
+    fn spawn_active_input_peer_sweep(self: &Arc<Self>) {
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(ACTIVE_INPUT_PEER_SWEEP).await;
+                let Some(mesh) = mesh.upgrade() else { break };
+                let active_input =
+                    session_has_active_input_route(mesh.state.lock().session.as_ref());
+                if active_input {
+                    mesh.refresh_peer_networks().await;
                 }
             }
         });
@@ -4387,28 +4624,15 @@ impl Mesh {
         }
     }
 
-    /// All joined networks' config ids. The daemon wraps the list as
-    /// `{ "networks": [...] }`, so we read that field (an earlier version
-    /// called `as_array()` on the wrapper and always got nothing — which left
-    /// presence un-subscribed and peers unable to see each other).
-    async fn fetch_networks(&self) -> Vec<String> {
+    /// All joined networks and both of their daemon-defined identities. Route
+    /// traffic addresses the per-device `config_id`; peer lifecycle events
+    /// carry the wire `network_id`. Discarding the latter made an authenticated
+    /// `peer/dropped` event impossible to reconcile with an exact route pin.
+    async fn fetch_networks(&self) -> JoinedNetworkSnapshot {
         let Some(resp) = self.client.request(&Request::NetworksList).await.ok() else {
-            return Vec::new();
+            return JoinedNetworkSnapshot::default();
         };
-        resp.data
-            .as_ref()
-            .and_then(|d| d.get("networks"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|n| {
-                        n.get("config_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        joined_network_snapshot(resp.data.as_ref())
     }
 
     fn build_profile(&self, me: &str, label_override: Option<String>) -> NodeProfile {
@@ -4583,22 +4807,22 @@ impl Mesh {
         self.claim_network_allowed(network)
     }
 
-    fn handle_base64_video_value(self: &Arc<Self>, value: Value, expected: (String, u64)) {
+    fn handle_base64_video_value(self: &Arc<Self>, event: QueuedVideoEvent) {
+        let value = &event.value;
         let network = value.get("network").and_then(Value::as_str).unwrap_or("");
         let from = value.get("from").and_then(Value::as_str).unwrap_or("");
         let stream = value.get("stream").and_then(Value::as_u64).unwrap_or(0) as u8;
-        let (expected_route, expected_generation) = &expected;
         let (current_route, current_generation) =
             self.video_route_generation_for_lane(network, from, stream);
         if !queued_video_binding_matches(
             current_route.as_deref(),
             current_generation,
-            expected_route,
-            *expected_generation,
+            &event.route_id,
+            event.generation,
         ) {
             tracing::debug!(
-                route = %expected_route,
-                generation = expected_generation,
+                route = %event.route_id,
+                generation = event.generation,
                 network,
                 peer = %short_id(from),
                 stream,
@@ -4607,6 +4831,7 @@ impl Mesh {
             return;
         }
         let Some(data) = value.get("data").and_then(Value::as_str) else {
+            self.arm_base64_video_recovery(&event, "missing base64 payload");
             return;
         };
         let key = value.get("key").and_then(Value::as_bool).unwrap_or(false);
@@ -4621,12 +4846,14 @@ impl Mesh {
                 encoded_bytes = data.len(),
                 "dropping oversized base64 video frame before decode"
             );
+            self.arm_base64_video_recovery(&event, "oversized base64 payload");
             return;
         }
         // Base64 fallback path (a daemon without the binary media-source
         // pipe): decode here so the handler always gets raw bytes.
         use base64::Engine as _;
         let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            self.arm_base64_video_recovery(&event, "invalid base64 payload");
             return;
         };
         self.handle_video_inbound_profiled(
@@ -4637,7 +4864,7 @@ impl Mesh {
             key,
             data,
             0,
-            Some(expected),
+            Some((event.route_id, event.generation, event.sequence)),
         );
     }
 
@@ -4665,7 +4892,7 @@ impl Mesh {
             }
             "video_inbound" => {
                 if let Some(event) = self.bind_base64_video_event(value) {
-                    self.handle_base64_video_value(event.value, (event.route_id, event.generation));
+                    self.handle_base64_video_value(event);
                 }
             }
             "audio_inbound" => {
@@ -4700,14 +4927,59 @@ impl Mesh {
             }
             "event" => {
                 if let Some(event) = value.get("event") {
+                    let peer_event =
+                        event.get("event_kind").and_then(Value::as_str) == Some("peer");
+                    let peer_kind = event.get("kind").and_then(Value::as_str);
+                    if peer_event && peer_kind == Some("dropped") {
+                        if let (Some(network_id), Some(device)) = (
+                            event.get("network_id").and_then(Value::as_str),
+                            event.get("device_id").and_then(Value::as_str),
+                        ) {
+                            let update = {
+                                let mut state = self.state.lock();
+                                apply_peer_path_dropped(&mut state, network_id, device)
+                            };
+                            let mesh = self.clone();
+                            let network_id = network_id.to_string();
+                            let device = device.to_string();
+                            crate::spawn(async move {
+                                if let Some(update) = update {
+                                    tracing::warn!(
+                                        peer = %short_id(&device),
+                                        network_id,
+                                        "local daemon reported peer path dropped; retiring its exact route lifetimes"
+                                    );
+                                    mesh.reconcile_peer_path_update(update).await;
+                                } else {
+                                    tracing::warn!(
+                                        peer = %short_id(&device),
+                                        network_id,
+                                        "peer drop named an unmapped network; refreshing authoritative peer paths"
+                                    );
+                                }
+                                // Re-read every joined network after the prompt
+                                // exact-path retirement. This discovers an
+                                // alternate path or a fast reconnect and replays
+                                // retained outbound intent there.
+                                mesh.refresh_peer_networks().await;
+                            });
+                        }
+                    }
                     // Connection establishment is a claim-status trigger: a
                     // peer just went live for app traffic ("approved"), so
                     // re-assert presence + fleet roster straight at it —
                     // there is no heartbeat to catch it up later.
-                    let approved = event.get("event_kind").and_then(|v| v.as_str()) == Some("peer")
-                        && event.get("kind").and_then(|v| v.as_str()) == Some("approved");
+                    let approved = peer_event && peer_kind == Some("approved");
                     if approved {
-                        if let Some(device) = event.get("device_id").and_then(|v| v.as_str()) {
+                        if let (Some(network_id), Some(device)) = (
+                            event.get("network_id").and_then(Value::as_str),
+                            event.get("device_id").and_then(Value::as_str),
+                        ) {
+                            let recovered = {
+                                let mut state = self.state.lock();
+                                apply_peer_path_reachable(&mut state, network_id, device)
+                            }
+                            .unwrap_or(false);
                             let mesh = self.clone();
                             let device = device.to_string();
                             crate::spawn(async move {
@@ -4718,6 +4990,29 @@ impl Mesh {
                                 // falls back to the primary network and is dropped.
                                 mesh.refresh_peer_networks().await;
                                 mesh.ownership_check(Some(&device)).await;
+                                if recovered {
+                                    mesh.replay_desired_routes(Some(&device)).await;
+                                }
+                            });
+                        }
+                    }
+                    if peer_event && peer_kind == Some("unshelved") {
+                        if let (Some(network_id), Some(device)) = (
+                            event.get("network_id").and_then(Value::as_str),
+                            event.get("device_id").and_then(Value::as_str),
+                        ) {
+                            let recovered = {
+                                let mut state = self.state.lock();
+                                apply_peer_path_reachable(&mut state, network_id, device)
+                            }
+                            .unwrap_or(false);
+                            let mesh = self.clone();
+                            let device = device.to_string();
+                            crate::spawn(async move {
+                                mesh.refresh_peer_networks().await;
+                                if recovered {
+                                    mesh.replay_desired_routes(Some(&device)).await;
+                                }
                             });
                         }
                     }
@@ -4779,6 +5074,17 @@ impl Mesh {
                     self.sink.emit("allmystuff://event", event.clone());
                 }
             }
+            "lagged" => {
+                let skipped = value.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+                tracing::warn!(
+                    skipped,
+                    "local daemon event subscriber lagged; refreshing authoritative peer paths"
+                );
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    mesh.refresh_peer_networks().await;
+                });
+            }
             _ => {}
         }
     }
@@ -4793,8 +5099,16 @@ impl Mesh {
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
         // several networks we're on).
-        if channel != CHANNEL_PRESENCE && !network.is_empty() && !from.is_empty() {
-            self.note_peer_network_observed(&from, &network);
+        if channel != CHANNEL_PRESENCE
+            && !network.is_empty()
+            && !from.is_empty()
+            && self.note_peer_network_observed(&from, &network)
+        {
+            let mesh = self.clone();
+            let peer = from.clone();
+            crate::spawn(async move {
+                mesh.replay_desired_routes(Some(&peer)).await;
+            });
         }
         match channel {
             CHANNEL_PRESENCE => {
@@ -4857,8 +5171,12 @@ impl Mesh {
                     }
                     // Presence can steer the preferred return path only after
                     // its peer identity and boot lifetime have passed the gate.
-                    if !network.is_empty() {
-                        self.note_peer_network_observed(&from, &network);
+                    if !network.is_empty() && self.note_peer_network_observed(&from, &network) {
+                        let mesh = self.clone();
+                        let peer = from.clone();
+                        crate::spawn(async move {
+                            mesh.replay_desired_routes(Some(&peer)).await;
+                        });
                     }
                     self.state
                         .lock()
@@ -6173,6 +6491,7 @@ impl Mesh {
         self.video_arrivals.lock().remove(route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
+        self.base64_video_recovery.lock().reset_route(route_id);
         self.video_decode.stop(route_id);
         self.video_watchers
             .lock()
@@ -6393,15 +6712,15 @@ impl Mesh {
         key: bool,
         data: Vec<u8>,
         profile_id: u64,
-        expected: Option<(String, u64)>,
-    ) {
+        expected: Option<(String, u64, u64)>,
+    ) -> bool {
         let canon = pubkey_part(from).to_string();
         let (current_route, current_generation) = if expected.is_some() {
             self.video_route_generation_for_lane(network, from, stream)
         } else {
             (self.video_route_for_lane(network, from, stream), None)
         };
-        if let Some((expected_route, generation)) = expected.as_ref() {
+        if let Some((expected_route, generation, _)) = expected.as_ref() {
             if !queued_video_binding_matches(
                 current_route.as_deref(),
                 current_generation,
@@ -6416,7 +6735,7 @@ impl Mesh {
                     stream,
                     "dropping queued base64 H.264 after its lane or route generation changed"
                 );
-                return;
+                return false;
             }
         }
         let Some(route_id) = current_route else {
@@ -6431,7 +6750,7 @@ impl Mesh {
                 );
             }
             self.nack_dead_lane(network, from, "video", stream);
-            return;
+            return false;
         };
         self.clear_dead_lane(network, from, "video", stream);
         if !self.inbound_route_network_ok(&route_id, from, network) {
@@ -6443,7 +6762,7 @@ impl Mesh {
                     "dropping H.264 from a network that does not own this route lifetime"
                 );
             }
-            return;
+            return false;
         }
         match self.inbound_video_disposition(&route_id, from) {
             InboundVideoDisposition::Accept => {}
@@ -6453,7 +6772,7 @@ impl Mesh {
                         "early H.264 sample for {route_id} dropped during Offer→Accept; replacement route left intact"
                     );
                 }
-                return;
+                return false;
             }
             InboundVideoDisposition::Reject => {
                 if self.diag_ok(&format!("gate:{route_id}")) {
@@ -6463,10 +6782,11 @@ impl Mesh {
                     );
                 }
                 self.nack_dead_route(network, from, &route_id);
-                return;
+                return false;
             }
         }
-        if let Some((expected_route, generation)) = expected {
+        if let Some((expected_route, generation, sequence)) = expected {
+            let decode_entry = key || crate::video_decode::is_decode_entry(&data);
             let committed = commit_current_video_generation(
                 &self.video_route_generations,
                 &expected_route,
@@ -6480,7 +6800,24 @@ impl Mesh {
                     {
                         return false;
                     }
-                    self.commit_video_inbound_profiled(
+                    let recovery_admission = self.base64_video_recovery.lock().admission(
+                        &expected_route,
+                        generation,
+                        sequence,
+                        decode_entry,
+                    );
+                    if recovery_admission == Base64VideoRecoveryAdmission::HoldDependent {
+                        if self.diag_ok(&format!("base64-video-hold:{expected_route}")) {
+                            tracing::warn!(
+                                route = %expected_route,
+                                generation,
+                                sequence,
+                                "holding legacy compressed delta after an omitted access unit"
+                            );
+                        }
+                        return false;
+                    }
+                    let accepted = self.commit_video_inbound_profiled(
                         from,
                         route_id,
                         rtp_timestamp,
@@ -6488,28 +6825,50 @@ impl Mesh {
                         data,
                         profile_id,
                     );
-                    true
+                    if accepted
+                        && recovery_admission == Base64VideoRecoveryAdmission::RepairCandidate
+                        && self.base64_video_recovery.lock().complete_repair(
+                            &expected_route,
+                            generation,
+                            sequence,
+                        )
+                    {
+                        tracing::info!(
+                            route = %expected_route,
+                            generation,
+                            sequence,
+                            "legacy compressed dependency chain reopened on an accepted clean entry"
+                        );
+                    }
+                    accepted
                 },
             );
-            if committed != Some(true) {
-                tracing::debug!(
-                    route = %expected_route,
-                    generation,
-                    network,
-                    peer = %short_id(from),
-                    stream,
-                    "dropping queued base64 H.264 at final decoder/watcher admission after its binding changed"
-                );
+            match committed {
+                None => {
+                    tracing::debug!(
+                        route = %expected_route,
+                        generation,
+                        network,
+                        peer = %short_id(from),
+                        stream,
+                        "dropping queued base64 H.264 at final admission after its route generation changed"
+                    );
+                }
+                Some(false) => {
+                    tracing::debug!(
+                        route = %expected_route,
+                        generation,
+                        network,
+                        peer = %short_id(from),
+                        stream,
+                        "queued base64 H.264 was held for recovery or rejected by its local decoder/viewer queue"
+                    );
+                }
+                Some(true) => {}
             }
+            committed == Some(true)
         } else {
-            self.commit_video_inbound_profiled(
-                from,
-                route_id,
-                rtp_timestamp,
-                key,
-                data,
-                profile_id,
-            );
+            self.commit_video_inbound_profiled(from, route_id, rtp_timestamp, key, data, profile_id)
         }
     }
 
@@ -6526,7 +6885,7 @@ impl Mesh {
         key: bool,
         data: Vec<u8>,
         profile_id: u64,
-    ) {
+    ) -> bool {
         // The arrival side of the sender's "route active — streaming"
         // line: one INFO per stream, so a healthy hop is attributable
         // from this end too (the MJPEG path has logged its first frame
@@ -6543,7 +6902,7 @@ impl Mesh {
             crate::spawn(async move {
                 let _ = mesh.request_refresh_for_recovery(refresh_route).await;
             });
-            return;
+            return false;
         }
         self.note_video_in(&route_id, "H.264", data.len());
         // Time the pacer's chunk trains as they land — the bandwidth
@@ -6572,7 +6931,7 @@ impl Mesh {
             let decode_epoch = decode_epoch.expect("native decoder claim checked above");
             let glitch_mesh = Arc::downgrade(self);
             let glitch_rid = route_id.clone();
-            let _accepted = self.video_decode.feed_profiled(
+            self.video_decode.feed_profiled(
                 &route_id,
                 Au { ts_us, key, data },
                 profile_id,
@@ -6614,7 +6973,7 @@ impl Mesh {
                         });
                     }
                 },
-            );
+            )
         } else {
             // NOT latest_wins: H.264 deltas must all reach the decoder in
             // order — freshest-wins happens after decode (enqueue_decoded) or
@@ -6637,8 +6996,10 @@ impl Mesh {
                     crate::spawn(async move {
                         let _ = mesh.request_refresh_for_recovery(route_id).await;
                     });
+                    false
                 }
-                WatcherEnqueue::Accepted | WatcherEnqueue::Dropped => {}
+                WatcherEnqueue::Accepted => true,
+                WatcherEnqueue::Dropped => false,
             }
         }
     }
@@ -6657,10 +7018,12 @@ impl Mesh {
         profile_id: u64,
         frame_ts_us: Option<u64>,
     ) -> WatcherEnqueue {
-        // About 100 ms at 60 fps. Encoded H.264 must remain ordered, but a
-        // one-second (formerly two-to-four-second) WebCodecs backlog is
-        // already stale. Overflow below re-enters only on a key unit.
-        const MAX_QUEUED: usize = 6;
+        // About 100 ms at 60 fps. Encoded H.264 must remain ordered. Treat
+        // this packet count as a stale-viewer threshold only when the local
+        // consumer has also stopped polling. An authenticated WAN path can
+        // deliver several buffered access units as one short burst; clearing
+        // a recently polled watch in that case creates an avoidable
+        // refresh/keyframe loop even though the next poll drains the batch.
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             drop(map);
@@ -6689,7 +7052,9 @@ impl Mesh {
             }
             w.queue.clear();
             w.awaiting_key = false;
-        } else if w.queue.len() >= MAX_QUEUED {
+        } else if w.queue.len() >= BASE64_VIDEO_EVENT_BURST_FRAMES
+            && !watcher_claim_is_recent(w, Instant::now())
+        {
             // H.264 backlog: skip forward to the NEWEST queued key unit —
             // decode re-enters there cleanly, and the viewer jumps to
             // near-live instead of replaying the whole backlog. The ipc
@@ -6711,7 +7076,9 @@ impl Mesh {
                 Some(_) => {
                     // The only key is already at the front and the queue is
                     // still at cap — the chain itself outgrew the bound.
-                    tracing::debug!("video queue for {route_id} unread for a second — cleared");
+                    tracing::debug!(
+                        "video queue for {route_id} stopped being polled with a key at its front — cleared"
+                    );
                     w.queue.clear();
                     if !packet_is_key {
                         w.awaiting_key = true;
@@ -6779,6 +7146,9 @@ impl Mesh {
             return;
         }
         let was_empty = w.queue.is_empty();
+        w.native_superseded = w
+            .native_superseded
+            .saturating_add(u32::try_from(w.queue.len()).unwrap_or(u32::MAX));
         w.queue.clear();
         w.queue
             .push_back(ViewerPacket::new(packet, profile_id, Some(frame_ts_us)));
@@ -7120,6 +7490,8 @@ impl Mesh {
                 queue: std::collections::VecDeque::new(),
                 awaiting_key: false,
                 last_poll: None,
+                native_drained: 0,
+                native_superseded: 0,
             },
         );
         if !decode {
@@ -7193,6 +7565,11 @@ impl Mesh {
             .last_poll
             .replace(polled_at)
             .map(|last| polled_at.saturating_duration_since(last));
+        if w.decode {
+            w.native_drained = w
+                .native_drained
+                .saturating_add(u32::try_from(w.queue.len()).unwrap_or(u32::MAX));
+        }
         let packets = std::mem::take(&mut w.queue);
         drop(map);
 
@@ -9124,14 +9501,8 @@ impl Mesh {
                         );
                         self.video.force_idr(&route_id);
                     }
-                    self.video.note_feedback(
-                        &route_id,
-                        recv_fps,
-                        decode_fails,
-                        queue_depth,
-                        pf.est_kbps,
-                        pf.delay_trend_us_per_s,
-                    );
+                    self.video
+                        .note_feedback(&route_id, recv_fps, decode_fails, queue_depth, pf);
                     if pf.audio_underruns > 0 {
                         tracing::info!(
                             "audio health {route_id}: {} underruns / {} frames, jitter {} us, buffer {}/{} ms",
@@ -11531,7 +11902,8 @@ impl Mesh {
         let epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
         let client_id = { self.state.lock().client_id };
         let Some(client_id) = client_id else { return };
-        let networks = self.fetch_networks().await;
+        let network_snapshot = self.fetch_networks().await;
+        let networks = network_snapshot.config_ids.clone();
         if !self.daemon_context_is_current(epoch, client_id) {
             return;
         }
@@ -11548,6 +11920,8 @@ impl Mesh {
             reconcile_network_epochs(&mut st, &networks, rotate_existing);
             st.networks = networks.clone();
             st.network = primary.clone();
+            st.network_id_to_config_id = network_snapshot.network_id_to_config_id;
+            st.config_id_to_network_id = network_snapshot.config_id_to_network_id;
             st.network_generation
         };
         let (replay_peers, missing_routes) = self.retire_unjoined_route_paths().await;
@@ -11613,6 +11987,96 @@ impl Mesh {
         self.ensure_open_meshes_auto_approve().await;
         self.advertise_capabilities().await;
         self.broadcast_presence().await;
+        self.emit_snapshot();
+    }
+
+    /// Retire route lifetimes pinned to a daemon PeerSession that disappeared,
+    /// then replay only still-owned outbound intent on a currently reachable
+    /// path. Each record includes peer, wire incarnation, and the exact pin
+    /// snapshot. A delayed predecessor task therefore cannot tear down a
+    /// same-id successor that installed a different incarnation or pin.
+    async fn reconcile_peer_path_update(self: &Arc<Self>, update: PeerPathUpdate) {
+        if update.lost_routes.is_empty() && update.recovered_peers.is_empty() {
+            return;
+        }
+        let mut replay_peers = update.recovered_peers;
+        let mut missing_routes = Vec::new();
+        for lost in update.lost_routes {
+            let lifecycle = self.lock_route_lifecycle(&lost.route_id).await;
+            let facts = {
+                let mut state = self.state.lock();
+                let key = (lost.route_id.clone(), lost.incarnation.clone());
+                if state.route_networks.get(&key) != Some(&lost.pin) {
+                    None
+                } else {
+                    let facts = state
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.route(&lost.route_id))
+                        .filter(|route| {
+                            route.incarnation == lost.incarnation
+                                && pubkey_part(route.peer.as_str()) == lost.peer
+                        })
+                        .map(|route| (route.peer.to_string(), route.origin, route.is_active()));
+                    if facts.is_some() {
+                        if let Some(session) = state.session.as_mut() {
+                            let _ = session.teardown(&lost.route_id);
+                        }
+                    }
+                    state.route_networks.remove(&key);
+                    facts
+                }
+            };
+            let Some((peer, origin, was_active)) = facts else {
+                drop(lifecycle);
+                continue;
+            };
+            if was_active {
+                self.apply_stop_media_locked(lost.route_id.clone(), lost.incarnation.clone());
+            }
+            let desired_matches =
+                self.desired_routes
+                    .lock()
+                    .get(&lost.route_id)
+                    .is_some_and(|route| {
+                        pubkey_part(&route.peer) == pubkey_part(&peer)
+                            && route.current_incarnation == lost.incarnation
+                    });
+            let peer_reachable = {
+                let state = self.state.lock();
+                !state.peer_unreachable.contains(pubkey_part(&peer))
+                    && state
+                        .peer_networks
+                        .get(pubkey_part(&peer))
+                        .is_some_and(|paths| !paths.is_empty())
+            };
+            if peer_reachable {
+                if origin == allmystuff_session::Origin::Outbound && desired_matches {
+                    replay_peers.insert(peer);
+                } else if origin == allmystuff_session::Origin::Inbound {
+                    missing_routes.push((peer, lost.route_id, lost.incarnation));
+                }
+            }
+            drop(lifecycle);
+        }
+
+        for (peer, route_id, incarnation) in missing_routes {
+            let message = ControlMessage::Route(RouteControl::MissingRoute {
+                route_id: route_id.clone(),
+                incarnation,
+            });
+            if let Err(error) = self.send_control(&peer, &message).await {
+                tracing::debug!(
+                    route = %route_id,
+                    peer = %short_id(&peer),
+                    error = %error,
+                    "could not request a successor after the pinned peer path disappeared"
+                );
+            }
+        }
+        for peer in replay_peers {
+            Box::pin(self.replay_desired_routes(Some(&peer))).await;
+        }
         self.emit_snapshot();
     }
 
@@ -11744,6 +12208,7 @@ impl Mesh {
                 return;
             }
             for peer in &stale {
+                st.peer_unreachable.insert(peer.clone());
                 st.peer_networks.remove(peer);
                 st.peer_features.remove(peer);
                 st.peer_boots.remove(peer);
@@ -16672,9 +17137,24 @@ impl Mesh {
                     audio_underrun_frames.saturating_add(feedback.underrun_frames);
             }
         }
+        let (native_viewer_drained, native_viewer_superseded) = {
+            let mut watchers = self.video_watchers.lock();
+            watchers
+                .get_mut(&route_id)
+                .filter(|watcher| watcher.decode)
+                .map(|watcher| {
+                    (
+                        std::mem::take(&mut watcher.native_drained),
+                        std::mem::take(&mut watcher.native_superseded),
+                    )
+                })
+                .unwrap_or_default()
+        };
         let ext = crate::video::PipelineFeedback {
             est_kbps,
             delay_trend_us_per_s,
+            native_viewer_drained,
+            native_viewer_superseded,
             audio_arrival_jitter_us,
             audio_target_ms,
             audio_buffered_ms,
@@ -17150,6 +17630,9 @@ impl Mesh {
     /// site opens, but nothing connects."
     fn peer_network_candidates(&self, peer: &str) -> Vec<String> {
         let st = self.state.lock();
+        if st.peer_unreachable.contains(pubkey_part(peer)) {
+            return Vec::new();
+        }
         ordered_send_candidates(
             st.peer_networks.get(pubkey_part(peer)),
             st.network.as_ref(),
@@ -17161,15 +17644,17 @@ impl Mesh {
     /// tunnel traffic that follows (site/input frames ride the slot) sticks to
     /// a mesh that provably reaches the peer — until the next inbound frame or
     /// confirmed send updates it again.
-    fn note_peer_network(&self, peer: &str, network: &str) {
+    fn note_peer_network(&self, peer: &str, network: &str) -> bool {
         let mut st = self.state.lock();
         if !st.networks.iter().any(|joined| joined == network) {
-            return;
+            return false;
         }
         let key = pubkey_part(peer).to_string();
+        let recovered = st.peer_unreachable.remove(&key);
         let paths = st.peer_networks.entry(key).or_default();
         paths.observed_reachable.insert(network.to_string());
         paths.preferred = Some(network.to_string());
+        recovered
     }
 
     /// Record a path that carried traffic *from* a peer. This proves
@@ -17177,19 +17662,19 @@ impl Mesh {
     /// daemon-confirmed outbound preference once one exists; otherwise use the
     /// observed path only as the first probe and let send_control replace it
     /// after a confirmed dispatch.
-    fn note_peer_network_observed(&self, peer: &str, network: &str) {
+    fn note_peer_network_observed(&self, peer: &str, network: &str) -> bool {
         let mut state = self.state.lock();
         if !state.networks.iter().any(|joined| joined == network) {
-            return;
+            return false;
         }
-        let paths = state
-            .peer_networks
-            .entry(pubkey_part(peer).to_string())
-            .or_default();
+        let peer = pubkey_part(peer).to_string();
+        let recovered = state.peer_unreachable.remove(&peer);
+        let paths = state.peer_networks.entry(peer).or_default();
         paths.observed_reachable.insert(network.to_string());
         if paths.preferred.is_none() {
             paths.preferred = Some(network.to_string());
         }
+        recovered
     }
 
     fn queue_reliable_control(
@@ -17504,7 +17989,7 @@ impl Mesh {
                 .error
                 .unwrap_or_else(|| "channel send failed".into()));
         }
-        self.note_peer_network(peer, network);
+        let _ = self.note_peer_network(peer, network);
         Ok(())
     }
 
@@ -17544,7 +18029,7 @@ impl Mesh {
                 .await;
             match resp {
                 Ok(r) if r.ok => {
-                    self.note_peer_network(peer, &network);
+                    let _ = self.note_peer_network(peer, &network);
                     self.note_outbound_offer_network(peer, message, &network);
                     return Ok(());
                 }
@@ -18273,6 +18758,9 @@ fn route_control_network_key(message: &ControlMessage) -> Option<(&str, Option<&
 }
 
 fn network_for_peer_locked(state: &State, peer: &str) -> Option<String> {
+    if state.peer_unreachable.contains(pubkey_part(peer)) {
+        return None;
+    }
     state
         .peer_networks
         .get(pubkey_part(peer))
@@ -18298,6 +18786,210 @@ fn network_for_peer_locked(state: &State, peer: &str) -> Option<String> {
                 .filter(|network| state.networks.contains(*network))
                 .cloned()
         })
+}
+
+fn joined_network_snapshot(data: Option<&Value>) -> JoinedNetworkSnapshot {
+    let mut snapshot = JoinedNetworkSnapshot::default();
+    let Some(networks) = data
+        .and_then(|data| data.get("networks"))
+        .and_then(Value::as_array)
+    else {
+        return snapshot;
+    };
+    for network in networks {
+        let Some(config_id) = network
+            .get("config_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let network_id = network
+            .get("network_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(config_id);
+        if snapshot.network_id_to_config_id.contains_key(network_id)
+            || snapshot.config_id_to_network_id.contains_key(config_id)
+        {
+            continue;
+        }
+        snapshot.config_ids.push(config_id.to_string());
+        snapshot
+            .network_id_to_config_id
+            .insert(network_id.to_string(), config_id.to_string());
+        snapshot
+            .config_id_to_network_id
+            .insert(config_id.to_string(), network_id.to_string());
+    }
+    snapshot
+}
+
+fn config_id_for_event_network(state: &State, event_network_id: &str) -> Option<String> {
+    state
+        .network_id_to_config_id
+        .get(event_network_id)
+        .cloned()
+        // Older daemons used the control key in both places.
+        .or_else(|| {
+            state
+                .networks
+                .contains(&event_network_id.to_string())
+                .then(|| event_network_id.to_string())
+        })
+}
+
+fn peer_path_set(state: &State) -> std::collections::HashSet<(String, String)> {
+    state
+        .peer_networks
+        .iter()
+        .flat_map(|(peer, paths)| {
+            paths
+                .networks()
+                .into_iter()
+                .map(|network| (peer.clone(), network.clone()))
+        })
+        .collect()
+}
+
+fn lost_route_paths(
+    state: &State,
+    lost_paths: &std::collections::HashSet<(String, String)>,
+) -> Vec<LostPeerRoutePath> {
+    let mut lost = state
+        .route_networks
+        .iter()
+        .filter(|(_, pin)| lost_paths.contains(&(pin.peer.clone(), pin.network.clone())))
+        .map(|((route_id, incarnation), pin)| LostPeerRoutePath {
+            route_id: route_id.clone(),
+            incarnation: incarnation.clone(),
+            peer: pin.peer.clone(),
+            pin: pin.clone(),
+        })
+        .collect::<Vec<_>>();
+    lost.sort_by(|a, b| {
+        (&a.route_id, &a.incarnation, &a.peer).cmp(&(&b.route_id, &b.incarnation, &b.peer))
+    });
+    lost
+}
+
+fn apply_authoritative_peer_snapshots(
+    state: &mut State,
+    snapshots: &[(String, Vec<Value>)],
+) -> PeerRefreshCommit {
+    let before_paths = peer_path_set(state);
+    let known_before = state
+        .peer_networks
+        .keys()
+        .chain(state.peer_unreachable.iter())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut link_changes = Vec::new();
+
+    for (network, peers) in snapshots {
+        let reachable = peers
+            .iter()
+            .filter(|peer| status_is_reachable(peer.get("status").and_then(Value::as_str)))
+            .filter_map(|peer| peer.get("device_id").and_then(Value::as_str))
+            .map(|peer| pubkey_part(peer).to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        for paths in state.peer_networks.values_mut() {
+            paths.daemon_reachable.remove(network);
+            paths.observed_reachable.remove(network);
+            if paths.preferred.as_deref() == Some(network.as_str()) && !paths.contains(network) {
+                paths.preferred = None;
+            }
+        }
+        seed_peer_networks(&mut state.peer_networks, peers, network);
+        state
+            .peer_links
+            .retain(|(path, peer), _| path != network || reachable.contains(peer));
+        let reachable_rows = peers
+            .iter()
+            .filter(|peer| status_is_reachable(peer.get("status").and_then(Value::as_str)))
+            .cloned()
+            .collect::<Vec<_>>();
+        link_changes.extend(
+            seed_peer_links(&mut state.peer_links, &reachable_rows, network)
+                .into_iter()
+                .map(|(peer, class)| (network.clone(), peer, class)),
+        );
+    }
+
+    let after_paths = peer_path_set(state);
+    let lost_paths = before_paths
+        .difference(&after_paths)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut recovered_peers = std::collections::BTreeSet::new();
+    let peers = known_before
+        .into_iter()
+        .chain(state.peer_networks.keys().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    for peer in peers {
+        let reachable = state
+            .peer_networks
+            .get(&peer)
+            .is_some_and(|paths| !paths.is_empty());
+        if reachable {
+            if state.peer_unreachable.remove(&peer) {
+                recovered_peers.insert(peer);
+            }
+        } else if before_paths
+            .iter()
+            .any(|(before_peer, _)| before_peer == &peer)
+            || state.peer_unreachable.contains(&peer)
+        {
+            state.peer_unreachable.insert(peer);
+        }
+    }
+
+    PeerRefreshCommit {
+        paths: PeerPathUpdate {
+            lost_routes: lost_route_paths(state, &lost_paths),
+            recovered_peers,
+        },
+        link_changes,
+    }
+}
+
+fn apply_peer_path_dropped(
+    state: &mut State,
+    event_network_id: &str,
+    peer: &str,
+) -> Option<PeerPathUpdate> {
+    let network = config_id_for_event_network(state, event_network_id)?;
+    let peer = pubkey_part(peer).to_string();
+    let paths = state.peer_networks.entry(peer.clone()).or_default();
+    paths.daemon_reachable.remove(&network);
+    paths.observed_reachable.remove(&network);
+    if paths.preferred.as_deref() == Some(network.as_str()) {
+        paths.preferred = None;
+    }
+    state.peer_links.remove(&(network.clone(), peer.clone()));
+    if paths.is_empty() {
+        state.peer_unreachable.insert(peer.clone());
+    }
+    let lost_paths = [(peer, network)].into_iter().collect();
+    Some(PeerPathUpdate {
+        lost_routes: lost_route_paths(state, &lost_paths),
+        recovered_peers: std::collections::BTreeSet::new(),
+    })
+}
+
+fn apply_peer_path_reachable(
+    state: &mut State,
+    event_network_id: &str,
+    peer: &str,
+) -> Option<bool> {
+    let network = config_id_for_event_network(state, event_network_id)?;
+    let peer = pubkey_part(peer).to_string();
+    let recovered = state.peer_unreachable.remove(&peer);
+    let paths = state.peer_networks.entry(peer).or_default();
+    paths.daemon_reachable.insert(network.clone());
+    paths.preferred = Some(network);
+    Some(recovered)
 }
 
 fn reconcile_network_epochs(state: &mut State, networks: &[String], rotate_existing: bool) {
@@ -18388,6 +19080,14 @@ fn watcher_poll_proves_liveness(last_poll: Option<Instant>, disconnect_started: 
 /// remembers, not one you can reach right now.
 fn status_is_reachable(status: Option<&str>) -> bool {
     matches!(status, Some("active") | Some("shelved"))
+}
+
+fn session_has_active_input_route(session: Option<&Session>) -> bool {
+    session.is_some_and(|session| {
+        session
+            .routes()
+            .any(|route| route.state == RouteState::Active && route.route.media == MediaKind::Input)
+    })
 }
 
 fn seed_peer_networks(map: &mut HashMap<String, PeerNetworkState>, peers: &[Value], network: &str) {
@@ -19443,6 +20143,81 @@ mod tests {
     }
 
     #[test]
+    fn base64_drop_requires_a_later_accepted_entry() {
+        let mut recovery = Base64VideoRecovery::default();
+        recovery.note_drop("route:test", 7, 10);
+
+        assert_eq!(
+            recovery.admission("route:test", 7, 9, true),
+            Base64VideoRecoveryAdmission::Accept,
+            "a key already queued before the omitted AU is safe but cannot repair later loss"
+        );
+        assert!(!recovery.complete_repair("route:test", 7, 9));
+        assert_eq!(
+            recovery.admission("route:test", 7, 11, false),
+            Base64VideoRecoveryAdmission::HoldDependent
+        );
+        assert_eq!(
+            recovery.admission("route:test", 7, 12, true),
+            Base64VideoRecoveryAdmission::RepairCandidate
+        );
+        assert_eq!(
+            recovery.admission("route:test", 7, 13, false),
+            Base64VideoRecoveryAdmission::HoldDependent,
+            "downstream rejection leaves the repair candidate uncommitted"
+        );
+        assert!(recovery.complete_repair("route:test", 7, 12));
+        assert_eq!(
+            recovery.admission("route:test", 7, 13, false),
+            Base64VideoRecoveryAdmission::Accept
+        );
+    }
+
+    #[test]
+    fn later_base64_drop_invalidates_an_older_repair_candidate() {
+        let mut recovery = Base64VideoRecovery::default();
+        recovery.note_drop("route:test", 3, 20);
+        assert_eq!(
+            recovery.admission("route:test", 3, 22, true),
+            Base64VideoRecoveryAdmission::RepairCandidate
+        );
+
+        recovery.note_drop("route:test", 3, 25);
+        assert!(!recovery.complete_repair("route:test", 3, 22));
+        assert_eq!(
+            recovery.admission("route:test", 3, 26, false),
+            Base64VideoRecoveryAdmission::HoldDependent
+        );
+        assert_eq!(
+            recovery.admission("route:test", 3, 27, true),
+            Base64VideoRecoveryAdmission::RepairCandidate
+        );
+        assert!(recovery.complete_repair("route:test", 3, 27));
+    }
+
+    #[test]
+    fn base64_recovery_is_generation_scoped_and_retired_with_the_route() {
+        let mut recovery = Base64VideoRecovery::default();
+        recovery.note_drop("route:test", 1, 30);
+        assert_eq!(
+            recovery.admission("route:test", 2, 31, false),
+            Base64VideoRecoveryAdmission::Accept,
+            "a predecessor loss cannot hold its same-id successor"
+        );
+
+        recovery.note_drop("route:test", 2, 32);
+        assert_eq!(
+            recovery.admission("route:test", 2, 33, false),
+            Base64VideoRecoveryAdmission::HoldDependent
+        );
+        recovery.reset_route("route:test");
+        assert_eq!(
+            recovery.admission("route:test", 2, 33, false),
+            Base64VideoRecoveryAdmission::Accept
+        );
+    }
+
+    #[test]
     fn recovery_requires_a_delivered_key_from_the_current_epoch() {
         let recovery = VideoRecovery::new("test:epoch");
         let (arm, drops, first_epoch) = recovery.mark_drop(Some(false));
@@ -19733,6 +20508,7 @@ mod tests {
                 state.route_networks.insert(
                     (route_id.to_string(), incarnation),
                     RouteNetworkPin {
+                        peer: "sender".into(),
                         network: "net".into(),
                         network_epoch: 1,
                         confirmed: true,
@@ -19837,10 +20613,120 @@ mod tests {
         // event storm while the consumer already has one outstanding poke.
         mesh.enqueue_decoded(route, vec![4, 5, 6], 2, 20);
         assert_eq!(sink.ready.load(Ordering::Relaxed), 1);
+        {
+            let watchers = mesh.video_watchers.lock();
+            let watcher = watchers.get(route).expect("native watcher");
+            assert_eq!(watcher.native_drained, 0);
+            assert_eq!(watcher.native_superseded, 1);
+        }
 
         assert!(!mesh.video_poll(route).is_empty());
+        {
+            let watchers = mesh.video_watchers.lock();
+            let watcher = watchers.get(route).expect("native watcher");
+            assert_eq!(watcher.native_drained, 1);
+            assert_eq!(watcher.native_superseded, 1);
+        }
         mesh.enqueue_decoded(route, vec![7, 8, 9], 3, 30);
         assert_eq!(sink.ready.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn native_viewer_flow_counters_do_not_cross_a_reconnect() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        mesh.video_watch(route.to_string(), true);
+
+        mesh.enqueue_decoded(route, vec![1], 1, 10);
+        mesh.enqueue_decoded(route, vec![2], 2, 20);
+        assert!(!mesh.video_poll(route).is_empty());
+        {
+            let watchers = mesh.video_watchers.lock();
+            let watcher = watchers.get(route).expect("native watcher");
+            assert_eq!((watcher.native_drained, watcher.native_superseded), (1, 1));
+        }
+
+        mesh.video_watchers.lock().reset_route_for_reconnect(route);
+        let watchers = mesh.video_watchers.lock();
+        let watcher = watchers.get(route).expect("preserved watcher");
+        assert_eq!((watcher.native_drained, watcher.native_superseded), (0, 0));
+    }
+
+    fn install_passthrough_watcher(mesh: &Mesh, route: &str, last_poll: Instant) {
+        mesh.video_watchers.lock().claim(
+            route.to_string(),
+            VideoWatcher {
+                token: 1,
+                decode: false,
+                decode_epoch: 0,
+                queue: std::collections::VecDeque::new(),
+                awaiting_key: false,
+                last_poll: Some(last_poll),
+                native_drained: 0,
+                native_superseded: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn active_passthrough_watcher_keeps_a_short_wan_burst_decodable() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        install_passthrough_watcher(&mesh, route, Instant::now());
+
+        for seq in 0..7 {
+            assert_eq!(
+                mesh.enqueue_for_watcher(
+                    route,
+                    h264_ipc_bytes(seq, seq == 0, &[seq as u8]),
+                    false,
+                    seq,
+                    Some(seq),
+                ),
+                WatcherEnqueue::Accepted
+            );
+        }
+
+        let watchers = mesh.video_watchers.lock();
+        let watcher = watchers.get(route).expect("pass-through watcher");
+        assert_eq!(watcher.queue.len(), 7);
+        assert!(!watcher.awaiting_key);
+    }
+
+    #[test]
+    fn stale_passthrough_watcher_still_bounds_and_rekeys_its_backlog() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        install_passthrough_watcher(
+            &mesh,
+            route,
+            Instant::now() - VIDEO_LOCAL_POLL_OBSERVE - Duration::from_millis(1),
+        );
+
+        for seq in 0..6 {
+            assert_eq!(
+                mesh.enqueue_for_watcher(
+                    route,
+                    h264_ipc_bytes(seq, seq == 0, &[seq as u8]),
+                    false,
+                    seq,
+                    Some(seq),
+                ),
+                WatcherEnqueue::Accepted
+            );
+        }
+        assert_eq!(
+            mesh.enqueue_for_watcher(route, h264_ipc_bytes(6, false, &[6]), false, 6, Some(6),),
+            WatcherEnqueue::NeedsRefresh
+        );
+
+        let watchers = mesh.video_watchers.lock();
+        let watcher = watchers.get(route).expect("pass-through watcher");
+        assert!(watcher.queue.is_empty());
+        assert!(watcher.awaiting_key);
     }
 
     #[test]
@@ -20287,12 +21173,11 @@ mod tests {
             session: None,
         });
 
-        assert!(mesh
+        assert!(!mesh
             .state
             .lock()
             .route_networks
-            .get(&(route.id.clone(), incarnation.clone()))
-            .is_none());
+            .contains_key(&(route.id.clone(), incarnation.clone())));
         assert!(mesh.inbound_route_control_path_ok("peer", &accept, "network-b"));
         {
             let mut state = mesh.state.lock();
@@ -20310,12 +21195,7 @@ mod tests {
                     } if started.id == route.id && started_incarnation == &incarnation
                 )
             }));
-            Mesh::commit_inbound_route_network_locked(
-                &mut state,
-                "peer",
-                &accept,
-                "network-b",
-            );
+            Mesh::commit_inbound_route_network_locked(&mut state, "peer", &accept, "network-b");
             let live = state.session.as_ref().unwrap().route(&route.id).unwrap();
             assert_eq!(live.state, RouteState::Active);
             assert_eq!(
@@ -20323,6 +21203,7 @@ mod tests {
                     .route_networks
                     .get(&(route.id.clone(), incarnation.clone())),
                 Some(&RouteNetworkPin {
+                    peer: "peer".into(),
                     network: "network-b".into(),
                     network_epoch: 8,
                     confirmed: true,
@@ -20356,12 +21237,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .handle(NodeId::from("peer"), reject.clone());
-            Mesh::commit_inbound_route_network_locked(
-                &mut state,
-                "peer",
-                &reject,
-                "network-b",
-            );
+            Mesh::commit_inbound_route_network_locked(&mut state, "peer", &reject, "network-b");
             let live = state.session.as_ref().unwrap().route(&route.id).unwrap();
             assert!(matches!(live.state, RouteState::Rejected { .. }));
             assert!(!state
@@ -20387,6 +21263,7 @@ mod tests {
         assert_eq!(
             mesh.state.lock().route_networks.get(&key),
             Some(&RouteNetworkPin {
+                peer: "peer".into(),
                 network: "network-a".into(),
                 network_epoch: 7,
                 confirmed: false,
@@ -20406,19 +21283,21 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .handle(NodeId::from("peer"), reject.clone());
-            Mesh::commit_inbound_route_network_locked(
-                &mut state,
-                "peer",
-                &reject,
-                "network-b",
-            );
+            Mesh::commit_inbound_route_network_locked(&mut state, "peer", &reject, "network-b");
             assert!(matches!(
-                state.session.as_ref().unwrap().route(&route.id).unwrap().state,
+                state
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .route(&route.id)
+                    .unwrap()
+                    .state,
                 RouteState::Rejected { .. }
             ));
             assert_eq!(
                 state.route_networks.get(&key),
                 Some(&RouteNetworkPin {
+                    peer: "peer".into(),
                     network: "network-a".into(),
                     network_epoch: 7,
                     confirmed: false,
@@ -20432,6 +21311,7 @@ mod tests {
         confirmed_mesh.state.lock().route_networks.insert(
             (confirmed_route.id.clone(), Some("11:3".into())),
             RouteNetworkPin {
+                peer: "peer".into(),
                 network: "network-a".into(),
                 network_epoch: 7,
                 confirmed: true,
@@ -20664,6 +21544,369 @@ mod tests {
     }
 
     #[test]
+    fn joined_network_snapshot_preserves_wire_and_config_aliases() {
+        let data = json!({
+            "networks": [
+                {
+                    "config_id": "local-config-a",
+                    "network_id": "wire-network-a"
+                },
+                {
+                    "config_id": "local-config-b",
+                    "network_id": "wire-network-b"
+                }
+            ]
+        });
+        let snapshot = joined_network_snapshot(Some(&data));
+        assert_eq!(
+            snapshot.config_ids,
+            vec!["local-config-a", "local-config-b"]
+        );
+        assert_eq!(
+            snapshot
+                .network_id_to_config_id
+                .get("wire-network-a")
+                .map(String::as_str),
+            Some("local-config-a")
+        );
+        assert_eq!(
+            snapshot
+                .config_id_to_network_id
+                .get("local-config-b")
+                .map(String::as_str),
+            Some("wire-network-b")
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_removes_stale_observed_path_after_event_lag() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = term_route("me:input", "peer:input", MediaKind::Input);
+        let incarnation = Some("20:1".to_string());
+        {
+            let mut state = mesh.state.lock();
+            state.networks = vec!["config-a".into(), "config-b".into()];
+            state.peer_networks.insert(
+                "peer".into(),
+                PeerNetworkState {
+                    preferred: Some("config-a".into()),
+                    observed_reachable: ["config-a".into(), "config-b".into()]
+                        .into_iter()
+                        .collect(),
+                    ..PeerNetworkState::default()
+                },
+            );
+            state.route_networks.insert(
+                (route.id.clone(), incarnation.clone()),
+                RouteNetworkPin {
+                    peer: "peer".into(),
+                    network: "config-a".into(),
+                    network_epoch: 1,
+                    confirmed: true,
+                },
+            );
+        }
+        let snapshots = vec![
+            (
+                "config-a".to_string(),
+                vec![json!({ "device_id": "peer", "status": "offline" })],
+            ),
+            (
+                "config-b".to_string(),
+                vec![json!({ "device_id": "peer", "status": "active" })],
+            ),
+        ];
+        let commit = {
+            let mut state = mesh.state.lock();
+            apply_authoritative_peer_snapshots(&mut state, &snapshots)
+        };
+        assert_eq!(
+            commit
+                .paths
+                .lost_routes
+                .iter()
+                .map(|route| route.route_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![route.id.as_str()]
+        );
+        let state = mesh.state.lock();
+        assert!(!state.peer_networks["peer"].contains("config-a"));
+        assert!(state.peer_networks["peer"].contains("config-b"));
+        assert!(!state.peer_unreachable.contains("peer"));
+    }
+
+    #[tokio::test]
+    async fn dropped_path_retires_its_input_route_but_preserves_another_network_route() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let lost_route = term_route("me:input", "peer:input", MediaKind::Input);
+        let kept_route = term_route("me:screen", "peer:view", MediaKind::Display);
+        let lost_incarnation = Some("21:1".to_string());
+        let kept_incarnation = Some("21:2".to_string());
+        let mut session = Session::new("me");
+        for (route, incarnation) in [
+            (&lost_route, &lost_incarnation),
+            (&kept_route, &kept_incarnation),
+        ] {
+            let _ = session.offer_terminal_with_incarnation(
+                route.clone(),
+                "peer",
+                vec!["h264".into()],
+                Vec::new(),
+                None,
+                incarnation.clone(),
+            );
+            let _ = session.handle(
+                NodeId::from("peer"),
+                ControlMessage::Route(RouteControl::Accept {
+                    route_id: route.id.clone(),
+                    incarnation: incarnation.clone(),
+                    session: None,
+                }),
+            );
+        }
+        {
+            let mut state = mesh.state.lock();
+            state.networks = vec!["config-a".into(), "config-b".into()];
+            state.network_id_to_config_id = [
+                ("wire-a".to_string(), "config-a".to_string()),
+                ("wire-b".to_string(), "config-b".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            state.config_id_to_network_id = [
+                ("config-a".to_string(), "wire-a".to_string()),
+                ("config-b".to_string(), "wire-b".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            state.network_epochs.insert("config-a".into(), 1);
+            state.network_epochs.insert("config-b".into(), 2);
+            state.peer_networks.insert(
+                "peer".into(),
+                PeerNetworkState {
+                    preferred: Some("config-a".into()),
+                    daemon_reachable: ["config-a".into(), "config-b".into()].into_iter().collect(),
+                    ..PeerNetworkState::default()
+                },
+            );
+            state.route_networks.insert(
+                (lost_route.id.clone(), lost_incarnation.clone()),
+                RouteNetworkPin {
+                    peer: "peer".into(),
+                    network: "config-a".into(),
+                    network_epoch: 1,
+                    confirmed: true,
+                },
+            );
+            state.route_networks.insert(
+                (kept_route.id.clone(), kept_incarnation.clone()),
+                RouteNetworkPin {
+                    peer: "peer".into(),
+                    network: "config-b".into(),
+                    network_epoch: 2,
+                    confirmed: true,
+                },
+            );
+            state.session = Some(session);
+        }
+        mesh.active_media_incarnations
+            .lock()
+            .insert(lost_route.id.clone(), lost_incarnation.clone());
+        mesh.active_media_incarnations
+            .lock()
+            .insert(kept_route.id.clone(), kept_incarnation.clone());
+        mesh.injector.activate_route(&lost_route.id);
+        assert!(mesh.injector.lease(&lost_route.id).is_some());
+
+        let update = {
+            let mut state = mesh.state.lock();
+            apply_peer_path_dropped(&mut state, "wire-a", "peer")
+                .expect("wire network id maps to its local config id")
+        };
+        assert_eq!(
+            update
+                .lost_routes
+                .iter()
+                .map(|route| route.route_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![lost_route.id.as_str()]
+        );
+        {
+            let state = mesh.state.lock();
+            assert!(!state.peer_unreachable.contains("peer"));
+            assert!(state.peer_networks["peer"].contains("config-b"));
+        }
+
+        mesh.reconcile_peer_path_update(update).await;
+        let state = mesh.state.lock();
+        assert_eq!(
+            state
+                .session
+                .as_ref()
+                .unwrap()
+                .route(&lost_route.id)
+                .map(|route| &route.state),
+            Some(&RouteState::TornDown)
+        );
+        assert_eq!(
+            state
+                .session
+                .as_ref()
+                .unwrap()
+                .route(&kept_route.id)
+                .map(|route| &route.state),
+            Some(&RouteState::Active)
+        );
+        assert!(state
+            .route_networks
+            .contains_key(&(kept_route.id.clone(), kept_incarnation.clone())));
+        drop(state);
+        assert!(mesh.injector.lease(&lost_route.id).is_none());
+        assert_eq!(
+            mesh.active_media_incarnations.lock().get(&kept_route.id),
+            Some(&kept_incarnation)
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_drop_cleanup_cannot_teardown_rapid_same_id_successor() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = term_route("me:input", "peer:input", MediaKind::Input);
+        let predecessor = Some("31:1".to_string());
+        let successor = Some("31:2".to_string());
+        let active_session = |incarnation: Option<String>| {
+            let mut session = Session::new("me");
+            let _ = session.offer_terminal_with_incarnation(
+                route.clone(),
+                "peer",
+                Vec::new(),
+                Vec::new(),
+                None,
+                incarnation.clone(),
+            );
+            let _ = session.handle(
+                NodeId::from("peer"),
+                ControlMessage::Route(RouteControl::Accept {
+                    route_id: route.id.clone(),
+                    incarnation,
+                    session: None,
+                }),
+            );
+            session
+        };
+        {
+            let mut state = mesh.state.lock();
+            state.networks = vec!["config-a".into()];
+            state
+                .network_id_to_config_id
+                .insert("wire-a".into(), "config-a".into());
+            state
+                .config_id_to_network_id
+                .insert("config-a".into(), "wire-a".into());
+            state.network_epochs.insert("config-a".into(), 1);
+            state.peer_networks.insert(
+                "peer".into(),
+                PeerNetworkState {
+                    daemon_reachable: ["config-a".into()].into_iter().collect(),
+                    ..PeerNetworkState::default()
+                },
+            );
+            state.route_networks.insert(
+                (route.id.clone(), predecessor.clone()),
+                RouteNetworkPin {
+                    peer: "peer".into(),
+                    network: "config-a".into(),
+                    network_epoch: 1,
+                    confirmed: true,
+                },
+            );
+            state.session = Some(active_session(predecessor.clone()));
+        }
+        let delayed_update = {
+            let mut state = mesh.state.lock();
+            apply_peer_path_dropped(&mut state, "wire-a", "peer").unwrap()
+        };
+
+        // The daemon reconnects and a fresh route incarnation wins before the
+        // asynchronous predecessor cleanup acquires the route lifecycle lock.
+        {
+            let mut state = mesh.state.lock();
+            assert_eq!(
+                apply_peer_path_reachable(&mut state, "wire-a", "peer"),
+                Some(true)
+            );
+            state.session = Some(active_session(successor.clone()));
+            state.route_networks.insert(
+                (route.id.clone(), successor.clone()),
+                RouteNetworkPin {
+                    peer: "peer".into(),
+                    network: "config-a".into(),
+                    network_epoch: 1,
+                    confirmed: true,
+                },
+            );
+        }
+        mesh.active_media_incarnations
+            .lock()
+            .insert(route.id.clone(), successor.clone());
+
+        mesh.reconcile_peer_path_update(delayed_update).await;
+        let state = mesh.state.lock();
+        let live = state.session.as_ref().unwrap().route(&route.id).unwrap();
+        assert_eq!(live.incarnation, successor);
+        assert_eq!(live.state, RouteState::Active);
+        assert!(!state
+            .route_networks
+            .contains_key(&(route.id.clone(), predecessor)));
+        assert!(state
+            .route_networks
+            .contains_key(&(route.id.clone(), successor.clone())));
+        drop(state);
+        assert_eq!(
+            mesh.active_media_incarnations.lock().get(&route.id),
+            Some(&successor)
+        );
+    }
+
+    #[test]
+    fn active_input_missed_event_sweep_is_narrow_and_two_seconds() {
+        assert_eq!(ACTIVE_INPUT_PEER_SWEEP, std::time::Duration::from_secs(2));
+        let input = term_route("me:input", "peer:input", MediaKind::Input);
+        let generic = term_route("me:terminal", "peer:terminal", MediaKind::Generic);
+        let mut session = Session::new("me");
+        let _ = session.offer_terminal_with_incarnation(
+            generic.clone(),
+            "peer",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("41:1".into()),
+        );
+        assert!(!session_has_active_input_route(Some(&session)));
+        let _ = session.offer_terminal_with_incarnation(
+            input.clone(),
+            "peer",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("41:2".into()),
+        );
+        assert!(!session_has_active_input_route(Some(&session)));
+        let _ = session.handle(
+            NodeId::from("peer"),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: input.id,
+                incarnation: Some("41:2".into()),
+                session: None,
+            }),
+        );
+        assert!(session_has_active_input_route(Some(&session)));
+    }
+
+    #[test]
     fn exact_missing_route_may_recover_over_surviving_data_path_without_repinning() {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));
@@ -20702,6 +21945,7 @@ mod tests {
             state.route_networks.insert(
                 (route.id.clone(), incarnation.clone()),
                 RouteNetworkPin {
+                    peer: "peer".into(),
                     network: "lost-a".into(),
                     network_epoch: 1,
                     confirmed: true,
@@ -20780,6 +22024,7 @@ mod tests {
             state.route_networks.insert(
                 (route.id.clone(), predecessor.clone()),
                 RouteNetworkPin {
+                    peer: "peer".into(),
                     network: "lost-a".into(),
                     network_epoch: 1,
                     confirmed: true,

@@ -30,6 +30,7 @@ import type {
   UpdateStatus,
   VideoFrameMsg,
 } from "./types";
+import { makeInputDispatcher } from "./input-dispatch";
 import type { RouteHandle } from "./route-handle-state";
 
 export type { RouteHandle } from "./route-handle-state";
@@ -182,6 +183,21 @@ async function checkedInvoke<T>(
   const { invoke } = await import("@tauri-apps/api/core");
   return (await invoke(cmd, args)) as T;
 }
+
+const inputDispatcher = makeInputDispatcher(async (routeId, action, ordered) => {
+  try {
+    return (
+      (await checkedInvoke<boolean>("send_input", {
+        routeId,
+        action,
+        ordered,
+      })) === true
+    );
+  } catch (error) {
+    console.warn("backend command send_input failed:", error);
+    return false;
+  }
+});
 
 /** Mirror one diagnostic line into the backend's `tracing` log so a
  *  desktop session's *frontend* decisions land in the same capturable
@@ -620,9 +636,19 @@ export function consoleWindowTarget(): string | null {
   return new URLSearchParams(window.location.search).get("console");
 }
 
-/** Forward one keyboard/mouse event down an active outbound input route. */
-export function sendInput(routeId: string, action: InputAction): Promise<null> {
-  return tryInvoke("send_input", { routeId, action });
+/**
+ * Forward one keyboard/mouse event down an active outbound input route.
+ *
+ * Key/button/wheel events are submitted through a route-scoped local FIFO.
+ * Pointer motion is latest-only and independent. Set `ordered` for a cursor
+ * re-seat that must precede a click on the same route.
+ */
+export function sendInput(
+  routeId: string,
+  action: InputAction,
+  ordered = false,
+): Promise<boolean> {
+  return inputDispatcher.send(routeId, action, ordered);
 }
 
 /** Read this machine's clipboard and push it down an active outbound
@@ -713,6 +739,72 @@ export async function watchVideo(
   let diagDispatchMs = 0;
   let diagReadyWaitMs = 0;
   let diagReadySamples = 0;
+  let diagPresentationWaitMs = 0;
+  let diagPresentationBusyMs = 0;
+  let diagPresentationSamples = 0;
+  let diagPresentationSuperseded = 0;
+  let pendingRaw: VideoFrameMsg | null = null;
+  let rawPresentationBlocked = false;
+  let rawFrameRequest: number | undefined;
+  let rawFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const dispatchFrame = (packet: VideoFrameMsg) => {
+    try {
+      cb(packet);
+    } catch (error) {
+      if (opts?.diagnostics) {
+        clientLog(
+          `[video-viewer] route=${routeId} callback failed: ${String(error)}`,
+        );
+      }
+      // The backend batch is already drained. If one H.264 callback fails,
+      // continuity of the remaining access units is no longer proven.
+      void invoke("video_refresh", { routeId }).catch(() => {});
+    }
+  };
+
+  // A native frame is a complete picture. Hold only the newest one until the
+  // browser gets a presentation opportunity, then allow the next large local
+  // IPC drain. Without this fence, a ready event received during an 8 MiB
+  // poll starts another poll in the same task and can starve Chromium's paint.
+  const scheduleRawPresentation = (packet: VideoFrameMsg) => {
+    if (pendingRaw) diagPresentationSuperseded += 1;
+    pendingRaw = packet;
+    if (rawPresentationBlocked) return;
+    rawPresentationBlocked = true;
+    const queuedAt = performance.now();
+    let presented = false;
+    const present = () => {
+      if (presented) return;
+      presented = true;
+      if (rawFrameRequest !== undefined) {
+        cancelAnimationFrame(rawFrameRequest);
+        rawFrameRequest = undefined;
+      }
+      if (rawFallbackTimer !== undefined) {
+        clearTimeout(rawFallbackTimer);
+        rawFallbackTimer = undefined;
+      }
+      const frame = pendingRaw;
+      pendingRaw = null;
+      const busyStarted = performance.now();
+      if (!stopped && frame) dispatchFrame(frame);
+      const finished = performance.now();
+      if (opts?.diagnostics) {
+        diagPresentationWaitMs += busyStarted - queuedAt;
+        diagPresentationBusyMs += finished - busyStarted;
+        diagPresentationSamples += 1;
+      }
+      rawPresentationBlocked = false;
+      if (!stopped && pending && !inFlight) void drain();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      rawFrameRequest = requestAnimationFrame(present);
+    }
+    // Occluded webviews can throttle rAF. Keep the established 16 ms local
+    // liveness cadence while still yielding out of the current IPC task.
+    rawFallbackTimer = setTimeout(present, 16);
+  };
 
   async function registerWatcher(): Promise<boolean> {
     const retiredToken = token;
@@ -753,11 +845,11 @@ export async function watchVideo(
     if (stopped) return;
     pending = true;
     if (fromReadyEvent && !eventReadyAt) eventReadyAt = performance.now();
-    if (armed && !inFlight) void drain();
+    if (armed && !inFlight && !rawPresentationBlocked) void drain();
   };
 
   const drain = async () => {
-    if (stopped || !armed || inFlight) return;
+    if (stopped || !armed || inFlight || rawPresentationBlocked) return;
     inFlight = true;
     try {
       // Ready events can arrive while video_poll is awaiting its response.
@@ -784,18 +876,10 @@ export async function watchVideo(
           offset += len;
           if (packet) {
             packets += 1;
-            try {
-              cb(packet);
-            } catch (error) {
-              if (opts?.diagnostics) {
-                clientLog(
-                  `[video-viewer] route=${routeId} callback failed: ${String(error)}`,
-                );
-              }
-              // The backend batch is already drained. If one H.264 callback
-              // fails, continuity of the remaining access units is no longer
-              // proven, so explicitly request a clean entry and keep parsing.
-              void invoke("video_refresh", { routeId }).catch(() => {});
+            if (packet.kind === "raw" && opts?.decode) {
+              scheduleRawPresentation(packet);
+            } else {
+              dispatchFrame(packet);
             }
           }
         }
@@ -806,7 +890,7 @@ export async function watchVideo(
           diagPollMs += polled - started;
           diagDispatchMs += performance.now() - polled;
         }
-      } while (!stopped && pending);
+      } while (!stopped && pending && !rawPresentationBlocked);
     } catch (error) {
       // A failed local IPC round trip gets the old one-tick recovery delay,
       // but only after an actual failure. Do not spin or poll while idle.
@@ -830,7 +914,7 @@ export async function watchVideo(
       }, 16);
     } finally {
       inFlight = false;
-      if (!stopped && pending) void drain();
+      if (!stopped && pending && !rawPresentationBlocked) void drain();
     }
   };
 
@@ -870,8 +954,14 @@ export async function watchVideo(
           const avgPoll = diagPolls ? diagPollMs / diagPolls : 0;
           const avgDispatch = diagPolls ? diagDispatchMs / diagPolls : 0;
           const avgReady = diagReadySamples ? diagReadyWaitMs / diagReadySamples : 0;
+          const avgPresentationWait = diagPresentationSamples
+            ? diagPresentationWaitMs / diagPresentationSamples
+            : 0;
+          const avgPresentationBusy = diagPresentationSamples
+            ? diagPresentationBusyMs / diagPresentationSamples
+            : 0;
           clientLog(
-            `[video-viewer] route=${routeId} polls=${diagPolls} packets=${diagPackets} bytes_mib=${mib.toFixed(2)} poll_ms_avg=${avgPoll.toFixed(3)} dispatch_ms_avg=${avgDispatch.toFixed(3)} ready_wait_ms_avg=${avgReady.toFixed(3)}`,
+            `[video-viewer] route=${routeId} polls=${diagPolls} packets=${diagPackets} bytes_mib=${mib.toFixed(2)} poll_ms_avg=${avgPoll.toFixed(3)} dispatch_ms_avg=${avgDispatch.toFixed(3)} ready_wait_ms_avg=${avgReady.toFixed(3)} present_wait_ms_avg=${avgPresentationWait.toFixed(3)} present_busy_ms_avg=${avgPresentationBusy.toFixed(3)} present_superseded=${diagPresentationSuperseded}`,
           );
         }
         diagPolls = 0;
@@ -881,12 +971,20 @@ export async function watchVideo(
         diagDispatchMs = 0;
         diagReadyWaitMs = 0;
         diagReadySamples = 0;
+        diagPresentationWaitMs = 0;
+        diagPresentationBusyMs = 0;
+        diagPresentationSamples = 0;
+        diagPresentationSuperseded = 0;
       }, 1000)
     : undefined;
 
   return () => {
     stopped = true;
     if (retryTimer !== undefined) clearTimeout(retryTimer);
+    if (rawFrameRequest !== undefined) cancelAnimationFrame(rawFrameRequest);
+    if (rawFallbackTimer !== undefined) clearTimeout(rawFallbackTimer);
+    pendingRaw = null;
+    rawPresentationBlocked = false;
     clearInterval(watchdog);
     if (diagTimer !== undefined) clearInterval(diagTimer);
     unlisten();
@@ -2100,9 +2198,10 @@ export async function siteMappings(): Promise<SiteMappingInfo[]> {
 }
 
 /** Ask a co-owned fleet machine for its full site list (to manage its
- *  exposure from its drawer). The reply arrives via {@link onNodeSites}. */
+ *  exposure from its drawer). The reply arrives via {@link onNodeSites}.
+ *  Failures remain observable so callers can record diagnostics. */
 export function siteRemoteList(node: string): Promise<null> {
-  return tryInvoke("site_remote_list", { node });
+  return checkedInvoke("site_remote_list", { node });
 }
 
 /** Tell a co-owned fleet machine to advertise exactly `exposed` (id → name). */

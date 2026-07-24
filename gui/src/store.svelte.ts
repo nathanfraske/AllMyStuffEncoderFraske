@@ -3387,11 +3387,10 @@ class AppStore {
     return Promise.allSettled(pending);
   }
 
-  /** Forward one keyboard/mouse event down the console's control route.
-   *  Fire-and-forget — at pointer-move rates a lost event is meaningless. */
-  sendConsoleInput(action: InputAction) {
-    if (!this.consoleControlLive) return;
-    void sendInput(this.consoleControlLive, action);
+  /** Forward one keyboard/mouse event down the console's control route. */
+  sendConsoleInput(action: InputAction): Promise<boolean> {
+    if (!this.consoleControlLive) return Promise.resolve(false);
+    return sendInput(this.consoleControlLive, action);
   }
 
   /** Switch which remote source the console is showing. */
@@ -5126,7 +5125,9 @@ class AppStore {
    *  the drawer via {@link applyNodeSites}. */
   ensureDeviceSites(nodeId: string) {
     if (this.isMe(nodeId) || !this.backendConnected) return;
-    void siteRemoteList(nodeId);
+    void siteRemoteList(nodeId).catch((e) => {
+      clientLog(`[sites] remote list failed for ${canonicalNodeId(nodeId)}: ${errMsg(e)}`);
+    });
   }
 
   /** Expose a service on a managed machine under `name` — locally persisted,
@@ -8445,17 +8446,16 @@ class AppStore {
     // the spinner keeps going until `settleRefreshing` sees the details change
     // (or the timeout fires). Only a failed nudge stops it here.
     try {
-      // Kick an in-place transport reconnect at this one node too — renegotiate
-      // ICE on its link (and re-seed discovery if we'd lost it), the per-node
-      // twin of the top bar's refresh. Non-destructive: no leave, no teardown.
-      // Fire-and-forget so a quiet link doesn't hold up the detail re-pull.
-      void networkReconnect({ peer: canon });
+      // Refresh over the existing application data path. This action must not
+      // redial signaling or renegotiate ICE.
       await requestNodeRefresh(nodeId);
       await this.syncMeshGraph();
       await this.refreshSession();
       // Re-request its exposed sites (the backend gates this to managed peers;
       // a refusal is harmless).
-      void siteRemoteList(nodeId);
+      void siteRemoteList(nodeId).catch((e) => {
+        clientLog(`[refresh] site list failed for ${canon}: ${errMsg(e)}`);
+      });
       this.toast("info", `Refreshing ${n.label}…`);
     } catch {
       this.endRefresh(canon);

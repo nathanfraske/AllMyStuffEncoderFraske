@@ -2936,8 +2936,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh"
-version = "0.3.1"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
+version = "0.3.2"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.2#28c9e27f89fdb8c2af9a9691a0fe0271befbe060"
 dependencies = [
  "anyhow",
  "clap",
@@ -2961,8 +2961,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.3.1"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
+version = "0.3.2"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.2#28c9e27f89fdb8c2af9a9691a0fe0271befbe060"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2995,8 +2995,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-services"
-version = "0.3.1"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
+version = "0.3.2"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.2#28c9e27f89fdb8c2af9a9691a0fe0271befbe060"
 dependencies = [
  "async-trait",
  "myownmesh-core",
@@ -3010,8 +3010,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.3.1"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
+version = "0.3.2"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.2#28c9e27f89fdb8c2af9a9691a0fe0271befbe060"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3036,8 +3036,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-updater"
-version = "0.3.1"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
+version = "0.3.2"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.2#28c9e27f89fdb8c2af9a9691a0fe0271befbe060"
 dependencies = [
  "hex",
  "minisign-verify",

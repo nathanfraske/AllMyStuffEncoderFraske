@@ -1,0 +1,11 @@
+# MyOwnMesh release archive hashes copied from the official v0.3.2 .sha256 assets.
+# Keep the tag, tag commit, and every platform hash in sync with .myownmesh-rev.
+tag v0.3.2
+commit 28c9e27f89fdb8c2af9a9691a0fe0271befbe060
+linux-x86_64 3a8e57dd0b707714df04e10407680b588a8639ecc95bcb75c393d867139affd4
+linux-aarch64 afcc1ee620e46c4c161c4365ccbed6c3134603d6033894d5449a2431bdbcc2aa
+linux-aarch64-musl 68374433c555229da2a8a320e243f0da5f46514a776ed3243253d3e591ca0004
+linux-riscv64 20aad34f1209f7597605a4d556e5461cd80bfadf6e6fed2ecd7bacf6591222e6
+macos-x86_64 785f2061418ef8973d6180434250b5457356e06de2488f8ed8e128b321846870
+macos-aarch64 b6ad194df9c51aedf247596c4dc279c7b905aa097f426afa8f6f5f3c83e4f336
+windows-x86_64 d1be7512a94d19727391905c73585e13a4bf26692c5dd2bc517a7e5ca87da593
