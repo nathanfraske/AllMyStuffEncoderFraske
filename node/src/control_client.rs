@@ -23,7 +23,7 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use allmystuff_protocol::control::{
@@ -31,6 +31,28 @@ use allmystuff_protocol::control::{
     MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
 };
 pub use allmystuff_protocol::{Request, Response};
+
+/// Default deadline for a local IPC request or subscription handshake.
+///
+/// Established event and media streams intentionally do not use this deadline:
+/// they are expected to remain idle between messages or frames.
+pub(crate) const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn read_line_with_timeout<R>(
+    reader: &mut R,
+    buf: &mut String,
+    timeout: Duration,
+    timeout_context: &'static str,
+    read_context: &'static str,
+) -> Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    tokio::time::timeout(timeout, reader.read_line(buf))
+        .await
+        .context(timeout_context)?
+        .context(read_context)
+}
 
 /// A decoded local media-pipe frame plus process-local profiler correlation.
 /// `profile_id` is never part of [`InboundFrame`] and is never serialized.
@@ -152,7 +174,7 @@ impl ControlClient {
     /// reads one back, closes. No pooling (a local round trip is cheap and
     /// pooling muddies daemon-restart semantics).
     pub async fn request(&self, req: &Request) -> Result<Response> {
-        self.request_with_timeout(req, Duration::from_secs(5)).await
+        self.request_with_timeout(req, LOCAL_REQUEST_TIMEOUT).await
     }
 
     /// [`Self::request`] with a caller-sized read deadline — for the ops
@@ -179,9 +201,14 @@ impl ControlClient {
         writer.flush().await.context("flush request")?;
 
         let mut buf = String::new();
-        let n = tokio::time::timeout(read_timeout, reader.read_line(&mut buf))
-            .await
-            .context("daemon response timed out")??;
+        let n = read_line_with_timeout(
+            &mut reader,
+            &mut buf,
+            read_timeout,
+            "daemon response timed out",
+            "read daemon response",
+        )
+        .await?;
         if n == 0 {
             bail!("daemon closed the connection without a response");
         }
@@ -206,7 +233,14 @@ impl ControlClient {
         writer.flush().await.context("flush subscribe")?;
 
         let mut ack = String::new();
-        let n = reader.read_line(&mut ack).await.context("read ack")?;
+        let n = read_line_with_timeout(
+            &mut reader,
+            &mut ack,
+            LOCAL_REQUEST_TIMEOUT,
+            "daemon event subscription acknowledgement timed out",
+            "read subscribe ack",
+        )
+        .await?;
         if n == 0 {
             bail!("daemon closed the connection before the subscribe ack");
         }
@@ -324,10 +358,14 @@ impl ControlClient {
             .context("flush media-source handshake")?;
 
         let mut ack = String::new();
-        let n = reader
-            .read_line(&mut ack)
-            .await
-            .context("read media-source ack")?;
+        let n = read_line_with_timeout(
+            &mut reader,
+            &mut ack,
+            LOCAL_REQUEST_TIMEOUT,
+            "daemon media-source acknowledgement timed out",
+            "read media-source ack",
+        )
+        .await?;
         if n == 0 {
             bail!("daemon closed the connection before the media-source ack");
         }
@@ -811,4 +849,31 @@ fn spawn_response_drain(reader: interprocess::local_socket::tokio::RecvHalf) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acknowledgement_read_rejects_a_silent_peer_at_its_deadline() {
+        let (_peer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+
+        let error = read_line_with_timeout(
+            &mut reader,
+            &mut line,
+            Duration::from_millis(25),
+            "test acknowledgement timed out",
+            "read test acknowledgement",
+        )
+        .await
+        .expect_err("a silent, still-connected peer must hit the setup deadline");
+
+        assert!(
+            format!("{error:#}").contains("test acknowledgement timed out"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

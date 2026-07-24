@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-bridge"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-consent"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-cec-protocol",
  "serde",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-cec-protocol"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-graph"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-inventory"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-mobile-core"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -134,13 +134,14 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-node"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-bridge",
  "allmystuff-cec-consent",
  "allmystuff-cec-protocol",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-mobile-core",
  "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
@@ -153,6 +154,7 @@ dependencies = [
  "interprocess",
  "libc",
  "libloading 0.8.9",
+ "memchr",
  "openh264",
  "opus",
  "parking_lot",
@@ -173,7 +175,7 @@ version = "0.1.0"
 
 [[package]]
 name = "allmystuff-protocol"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-graph",
  "serde",
@@ -182,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-session"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
@@ -193,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "allmystuff-updater"
-version = "0.2.43"
+version = "0.2.47"
 dependencies = [
  "dirs 5.0.1",
  "flate2",
@@ -2934,8 +2936,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh"
-version = "0.3.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
+version = "0.3.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2959,8 +2961,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.3.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
+version = "0.3.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2993,8 +2995,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-services"
-version = "0.3.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
+version = "0.3.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
 dependencies = [
  "async-trait",
  "myownmesh-core",
@@ -3008,8 +3010,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.3.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
+version = "0.3.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3034,8 +3036,8 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-updater"
-version = "0.3.0"
-source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.0#fe97a53c6080eb7ae276ede5c86ec0b290cebd05"
+version = "0.3.1"
+source = "git+https://github.com/mrjeeves/MyOwnMesh?tag=v0.3.1#dfde929c5bf37a694b2f293cf8a89ad20a948fa0"
 dependencies = [
  "hex",
  "minisign-verify",

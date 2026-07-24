@@ -1,10 +1,9 @@
 <script lang="ts">
   // One member's share inside a room panel — their screen or their
   // camera, told apart by the route's media — a lean cousin of the
-  // console stage. It always asks the backend to decode (`decode: true`,
-  // the console ladder's universal bottom rung), so the tile just blits
-  // RGBA / JPEG frames and works in every webview; a member who wants the
-  // full-quality path opens a console on the sharer instead.
+  // console stage. It uses the same hardware-preferred WebCodecs ladder as
+  // the larger viewers, with native NVDEC/OpenH264 fallback for webviews
+  // that cannot sustain H.264. MJPEG remains the compatibility path.
   //
   // The picture letterboxes like every call app's: `object-fit: contain`
   // inside the tile, black bars top/bottom *or* left/right as the shapes
@@ -18,9 +17,21 @@
   // the share out into its own OS window or takes it fullscreen; a
   // popped tile holds a big "Return video here" in its middle so a
   // stream lost to another monitor is always one click from home.
+  import { onMount, untrack } from "svelte";
   import { makeKeyForwarder } from "../input-keys";
+  import { makeRemoteButtonTracker } from "../remote-button-tracker";
   import { app } from "../store.svelte";
-  import { clientLog, focusThisWindow, isTauri, sendInput, toggleWindowFullscreen, watchVideo } from "../tauri";
+  import {
+    clientLog,
+    focusThisWindow,
+    isTauri,
+    refreshRoute,
+    sendInput,
+    sendVideoFeedback,
+    toggleWindowFullscreen,
+    watchVideo,
+  } from "../tauri";
+  import { createH264FrameDecoder, webCodecsH264Supported } from "../video-decoder";
   import { type InputAction, type MeshNode, type Route } from "../types";
 
   let { route, member, windowed = false }: { route: Route; member: MeshNode; windowed?: boolean } =
@@ -37,10 +48,21 @@
   // (and pointer normalization) works against.
   let frameW = $state(0);
   let frameH = $state(0);
+  let nativeDecode = $state(
+    typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined",
+  );
   // Fullscreen ("theater"): the tile takes the whole window over (CSS),
   // and — when the room has its own OS window — the window goes
   // fullscreen too, so exactly this video fills the screen.
   let theater = $state(false);
+
+  onMount(() => {
+    if (!nativeDecode) {
+      void webCodecsH264Supported().then((supported) => {
+        if (!supported) nativeDecode = true;
+      });
+    }
+  });
 
   const who = $derived(app.roomWho(member.id));
   // A video route is a camera feed; a display route is a screen share —
@@ -79,6 +101,8 @@
 
   $effect(() => {
     const routeId = route.id;
+    const native = nativeDecode;
+    const diagnostics = untrack(() => app.debugLoggingEnabled === true);
     // A popped tile stops watching entirely — the popout window owns the
     // frame watch (claims replace each other), and the tile shows the
     // Return button instead.
@@ -87,8 +111,18 @@
       return;
     }
     let cancelled = false;
+    const watchAbort = new AbortController();
     let unwatch: (() => void) | null = null;
     hasFrame = false;
+    frameW = 0;
+    frameH = 0;
+    let inputFrames = 0;
+    let standaloneDecodedFrames = 0;
+    let lastH264DecodedFrames = 0;
+    let feedbackKind: "raw" | "h264" | "jpeg" | null = null;
+    let feedbackTick = 0;
+    let feedbackFailsSent = 0;
+    let watcherToken = 0;
 
     // The receive side's mirror of the backend's "expecting frames from X"
     // line: a tile that watches but never reports a first frame is the
@@ -112,43 +146,116 @@
       if (wasFirst) clientLog(`[room-call] tile: first frame on ${routeId} (${w}×${h})`);
     };
 
-    // JPEG bitmap decodes are async — chain them so frames paint in order.
-    let drawChain = Promise.resolve();
+    const h264Decoder = native
+      ? null
+      : createH264FrameDecoder({
+          onFrame: (frame) => {
+            if (cancelled) return;
+            paint(frame.displayWidth, frame.displayHeight, (ctx) =>
+              ctx.drawImage(frame, 0, 0),
+            );
+          },
+          onFallback: (reason) => {
+            if (cancelled) return;
+            if (diagnostics) clientLog(`[room-call] ${routeId}: ${reason}`);
+            nativeDecode = true;
+          },
+          onRefresh: () => void refreshRoute(routeId),
+          onDecodeError: (error) => {
+            if (diagnostics) clientLog(`[room-call] ${routeId}: ${String(error)}`);
+          },
+          onDebug: diagnostics ? (line) => clientLog(`[room-call] ${routeId} ${line}`) : undefined,
+        });
+
+    // JPEG is independently decodable. Keep only the newest pending picture
+    // so a busy room grid cannot accumulate seconds of presentation history.
+    let pendingJpeg: Blob | null = null;
+    let jpegPainting = false;
+    const paintNewestJpeg = async () => {
+      if (jpegPainting) return;
+      jpegPainting = true;
+      try {
+        while (!cancelled && pendingJpeg) {
+          const blob = pendingJpeg;
+          pendingJpeg = null;
+          try {
+            const bitmap = await createImageBitmap(blob);
+            standaloneDecodedFrames += 1;
+            paint(bitmap.width, bitmap.height, (ctx) => ctx.drawImage(bitmap, 0, 0));
+            bitmap.close();
+          } catch {
+            // A torn standalone frame is superseded by the next one.
+          }
+        }
+      } finally {
+        jpegPainting = false;
+      }
+    };
+
+    const feedbackTimer = setInterval(() => {
+      const inputFps = inputFrames;
+      const stats = h264Decoder?.stats();
+      const h264DecodedFps = Math.max(
+        0,
+        (stats?.decodedFrames ?? 0) - lastH264DecodedFrames,
+      );
+      lastH264DecodedFrames = stats?.decodedFrames ?? 0;
+      const decodedFps = feedbackKind === "h264" ? h264DecodedFps : standaloneDecodedFrames;
+      inputFrames = 0;
+      standaloneDecodedFrames = 0;
+      h264Decoder?.checkStall(inputFps, decodedFps);
+      if (watcherToken > 0 && ++feedbackTick % 2 === 0) {
+        const fails = stats?.decodeFails ?? 0;
+        void sendVideoFeedback(
+          routeId,
+          watcherToken,
+          decodedFps,
+          Math.max(0, fails - feedbackFailsSent),
+          stats?.queueDepth ?? 0,
+        );
+        feedbackFailsSent = fails;
+      }
+    }, 1000);
 
     void watchVideo(
       routeId,
       (f) => {
         if (cancelled) return;
+        inputFrames += 1;
+        feedbackKind = f.kind;
         if (f.kind === "raw") {
           if (f.data.byteLength !== f.width * f.height * 4) return;
+          standaloneDecodedFrames += 1;
           const pixels = new Uint8ClampedArray(f.data.buffer, f.data.byteOffset, f.data.byteLength);
           const img = new ImageData(pixels, f.width, f.height);
           paint(f.width, f.height, (ctx) => ctx.putImageData(img, 0, 0));
+        } else if (f.kind === "h264") {
+          h264Decoder?.push(f);
         } else if (f.kind === "jpeg") {
-          const blob = new Blob([f.data], { type: "image/jpeg" });
-          drawChain = drawChain.then(async () => {
-            if (cancelled) return;
-            try {
-              const bmp = await createImageBitmap(blob);
-              paint(bmp.width, bmp.height, (ctx) => ctx.drawImage(bmp, 0, 0));
-              bmp.close();
-            } catch {
-              // A torn frame decodes as nothing; the next one stands alone.
-            }
-          });
+          pendingJpeg = new Blob([f.data], { type: "image/jpeg" });
+          void paintNewestJpeg();
         }
-        // h264 never arrives here — decode: true means the backend hands
-        // this tile ready-to-paint frames.
       },
-      { decode: true },
+      {
+        decode: native,
+        diagnostics,
+        signal: watchAbort.signal,
+        onRegistered: (token) => (watcherToken = token),
+      },
     ).then((u) => {
       if (cancelled) u();
-      else unwatch = u;
+      else {
+        unwatch = u;
+        if (native) void refreshRoute(routeId);
+      }
     });
 
     return () => {
       cancelled = true;
+      watchAbort.abort();
       unwatch?.();
+      clearInterval(feedbackTimer);
+      h264Decoder?.close();
     };
   });
 
@@ -157,6 +264,19 @@
   function send(action: InputAction) {
     if (controlRoute) void sendInput(controlRoute, action);
   }
+  function sendToRoute(routeId: string, action: InputAction) {
+    void sendInput(routeId, action);
+  }
+  const buttons = makeRemoteButtonTracker(sendToRoute);
+
+  // The cleanup runs before a control-route change and again at component
+  // teardown. Each lift uses the route captured by the matching press.
+  $effect(() => {
+    const routeAtStart = controlActive ? controlRoute : null;
+    return () => {
+      if (routeAtStart) buttons.releaseAll();
+    };
+  });
 
   function claimFocus() {
     // The KVM rule: with control live, the surface under the mouse is the
@@ -175,7 +295,7 @@
   // like the console stage, so clicks land where they look like they do.
   function norm(e: PointerEvent): { x: number; y: number } | null {
     const c = canvasEl;
-    if (!c || !frameW || !frameH) return null;
+    if (!c || !hasFrame || !frameW || !frameH) return null;
     const r = c.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return null;
     const scale = Math.min(r.width / frameW, r.height / frameH);
@@ -196,16 +316,24 @@
     if (p) send({ kind: "mouse_move", x: p.x, y: p.y });
   }
   function onPointerDown(e: PointerEvent) {
-    if (!controlActive) return;
+    const routeId = controlRoute;
+    if (!controlActive || !routeId) return;
     (e.currentTarget as HTMLElement).focus();
     const p = norm(e);
     if (!p) return;
-    send({ kind: "mouse_move", x: p.x, y: p.y });
-    send({ kind: "mouse_button", button: e.button, down: true });
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is best-effort for stale or synthetic pointer ids.
+    }
+    sendToRoute(routeId, { kind: "mouse_move", x: p.x, y: p.y });
+    buttons.press(routeId, e.button);
   }
   function onPointerUp(e: PointerEvent) {
-    if (!controlActive) return;
-    send({ kind: "mouse_button", button: e.button, down: false });
+    if (buttons.release(e.button)) e.preventDefault();
+  }
+  function onPointerCancel() {
+    buttons.releaseAll();
   }
   function onWheel(e: WheelEvent) {
     if (!controlActive) return;
@@ -217,6 +345,11 @@
   // the tile loses focus are lifted in a burst — otherwise the sharer's
   // machine keeps a stuck modifier.
   const keys = makeKeyForwarder(send);
+
+  function releaseRemoteInput() {
+    buttons.releaseAll();
+    keys.releaseAll();
+  }
 
   function onKey(e: KeyboardEvent, down: boolean) {
     if (!controlActive) return;
@@ -244,10 +377,13 @@
   onpointermove={onPointerMove}
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
+  onpointercancel={onPointerCancel}
+  onlostpointercapture={onPointerCancel}
   onwheel={onWheel}
   onkeydown={(e) => onKey(e, true)}
   onkeyup={(e) => onKey(e, false)}
-  onblur={() => keys.releaseAll()}
+  onblur={releaseRemoteInput}
+  oncontextmenu={(e) => controlActive && e.preventDefault()}
 >
   {#if popped}
     <!-- The stream lives in its own window right now; this is its way

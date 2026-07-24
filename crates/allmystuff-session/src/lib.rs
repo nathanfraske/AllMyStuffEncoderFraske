@@ -29,6 +29,50 @@ use allmystuff_protocol::{
     AppControl, ControlMessage, NodeProfile, OwnershipControl, RouteControl, ShareControl,
 };
 
+/// MyOwnMesh presents the same device in two forms: a human-facing id with a
+/// five-character suffix and the bare public id used on channel delivery.
+/// Route ownership must compare the stable public-id part or a valid peer can
+/// neither activate nor stop its own route after crossing that boundary.
+fn canonical_node_id(id: &NodeId) -> NodeId {
+    let raw = id.as_str();
+    if let Some((body, suffix)) = raw.rsplit_once('-') {
+        if suffix.len() == 5 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return NodeId::from(body);
+        }
+    }
+    id.clone()
+}
+
+/// Route incarnations introduced by `route-incarnation-v1` are the offerer's
+/// presence boot id and a monotonically increasing sequence, written as
+/// `<boot>:<sequence>`. The ordering lets the state machine distinguish a
+/// successor from a delayed predecessor without keeping an unbounded set of
+/// tombstones.
+fn parse_route_incarnation(value: &str) -> Option<(u64, u64)> {
+    let (boot, sequence) = value.split_once(':')?;
+    if sequence.contains(':') {
+        return None;
+    }
+    let boot = boot.parse().ok()?;
+    let sequence = sequence.parse().ok()?;
+    (boot != 0 && sequence != 0).then_some((boot, sequence))
+}
+
+fn incarnation_is_newer(
+    current: Option<&str>,
+    candidate: Option<&str>,
+    advertised_peer_boot: u64,
+) -> bool {
+    let Some(candidate) = candidate.and_then(parse_route_incarnation) else {
+        return false;
+    };
+    match current.and_then(parse_route_incarnation) {
+        Some(current) if current.0 == candidate.0 => candidate.1 > current.1,
+        Some(current) => advertised_peer_boot == candidate.0 && advertised_peer_boot != current.0,
+        None => advertised_peer_boot == candidate.0,
+    }
+}
+
 pub use allmystuff_protocol::{CHANNEL_CONTROL, CHANNEL_PRESENCE};
 pub use audio::AudioFrame;
 pub use media::{
@@ -72,6 +116,10 @@ pub struct LiveRoute {
     pub peer: NodeId,
     pub origin: Origin,
     pub state: RouteState,
+    /// Opaque wire lifetime for a deterministic route id. `None` is the
+    /// compatibility mode used with peers that predate incarnation fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
     /// Video transports the offerer can consume (display routes; see
     /// [`RouteControl::Offer`]). On an outbound route these are what we
     /// asked for; on an inbound one, what the peer can decode — the
@@ -111,16 +159,26 @@ pub enum Effect {
         message: ControlMessage,
     },
     /// Start carrying media for this now-active route.
-    StartMedia(Route),
+    StartMedia {
+        route: Route,
+        incarnation: Option<String>,
+    },
     /// Stop carrying media for this route id.
-    StopMedia(String),
+    StopMedia {
+        route_id: String,
+        incarnation: Option<String>,
+    },
     /// Force a clean decode entry (an IDR / fresh frame) on a route this
     /// machine streams — the viewer's decoder lost its place and asked.
-    RefreshMedia(String),
+    RefreshMedia {
+        route_id: String,
+        incarnation: Option<String>,
+    },
     /// Restart a streamed route's capture with the viewer's quality
     /// picks (`None` = that dial stays automatic).
     TuneMedia {
         route_id: String,
+        incarnation: Option<String>,
         max_edge: Option<u32>,
         bitrate: Option<u32>,
         fps: Option<u32>,
@@ -135,6 +193,7 @@ pub enum Effect {
     /// stream — recovery cadence now, auto-scaling later.
     VideoFeedback {
         route_id: String,
+        incarnation: Option<String>,
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
@@ -190,13 +249,14 @@ impl Session {
     /// Record (or refresh) a peer's presence advert. Ignores our own echo.
     /// Returns `true` if this was new or changed.
     pub fn apply_presence(&mut self, profile: NodeProfile) -> bool {
-        if profile.node == self.me {
+        let canonical = canonical_node_id(&profile.node);
+        if canonical == canonical_node_id(&self.me) {
             return false;
         }
-        match self.peers.get(&profile.node) {
+        match self.peers.get(&canonical) {
             Some(existing) if existing == &profile => false,
             _ => {
-                self.peers.insert(profile.node.clone(), profile);
+                self.peers.insert(canonical, profile);
                 true
             }
         }
@@ -207,13 +267,14 @@ impl Session {
     }
 
     pub fn peer(&self, id: &NodeId) -> Option<&NodeProfile> {
-        self.peers.get(id)
+        self.peers.get(&canonical_node_id(id))
     }
 
     /// Drop a peer that left, tearing down any routes with it.
     pub fn drop_peer(&mut self, id: &NodeId) -> Vec<Effect> {
-        self.peers.remove(id);
-        self.reap_peer_routes(id)
+        let canonical = canonical_node_id(id);
+        self.peers.remove(&canonical);
+        self.reap_peer_routes(&canonical)
     }
 
     /// Tear down a peer's active routes WITHOUT forgetting the peer — for
@@ -223,18 +284,25 @@ impl Session {
     /// (the orphaned-streamer failure: media warned as "no route maps to
     /// it" on the far end for as long as the capture lives).
     pub fn reap_peer_routes(&mut self, id: &NodeId) -> Vec<Effect> {
+        let canonical = canonical_node_id(id);
         let mut effects = Vec::new();
         let ids: Vec<String> = self
             .routes
             .iter()
-            .filter(|(_, r)| &r.peer == id && r.is_active())
+            .filter(|(_, r)| r.peer == canonical && r.is_active())
             .map(|(rid, _)| rid.clone())
             .collect();
         for rid in ids {
-            if let Some(r) = self.routes.get_mut(&rid) {
+            let incarnation = if let Some(r) = self.routes.get_mut(&rid) {
                 r.state = RouteState::TornDown;
-            }
-            effects.push(Effect::StopMedia(rid));
+                r.incarnation.clone()
+            } else {
+                None
+            };
+            effects.push(Effect::StopMedia {
+                route_id: rid,
+                incarnation,
+            });
         }
         effects
     }
@@ -253,7 +321,19 @@ impl Session {
         video: Vec<String>,
         audio: Vec<String>,
     ) -> ControlMessage {
-        self.offer_terminal(route, peer, video, audio, None)
+        self.offer_with_incarnation(route, peer, video, audio, None)
+    }
+
+    /// [`offer`](Self::offer) with an optional route lifetime fence.
+    pub fn offer_with_incarnation(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        incarnation: Option<String>,
+    ) -> ControlMessage {
+        self.offer_terminal_with_incarnation(route, peer, video, audio, None, incarnation)
     }
 
     /// [`offer`](Self::offer) with a terminal **session** to attach to —
@@ -269,7 +349,21 @@ impl Session {
         audio: Vec<String>,
         session: Option<String>,
     ) -> ControlMessage {
-        let peer = peer.into();
+        self.offer_terminal_with_incarnation(route, peer, video, audio, session, None)
+    }
+
+    /// [`offer_terminal`](Self::offer_terminal) with an optional route
+    /// lifetime fence negotiated by the backend.
+    pub fn offer_terminal_with_incarnation(
+        &mut self,
+        route: Route,
+        peer: impl Into<NodeId>,
+        video: Vec<String>,
+        audio: Vec<String>,
+        session: Option<String>,
+        incarnation: Option<String>,
+    ) -> ControlMessage {
+        let peer = canonical_node_id(&peer.into());
         self.routes.insert(
             route.id.clone(),
             LiveRoute {
@@ -277,6 +371,7 @@ impl Session {
                 peer,
                 origin: Origin::Outbound,
                 state: RouteState::Offered,
+                incarnation: incarnation.clone(),
                 video: video.clone(),
                 audio: audio.clone(),
                 term_session: session.clone(),
@@ -284,6 +379,7 @@ impl Session {
         );
         ControlMessage::Route(RouteControl::Offer {
             route,
+            incarnation,
             video,
             audio,
             session,
@@ -322,15 +418,40 @@ impl Session {
         }
     }
 
+    /// Expire an outbound offer only if it is still the same wire lifetime
+    /// that scheduled the deadline. Deterministic route ids may be reused
+    /// before an older timeout task runs, so a route-id-only deadline can
+    /// otherwise reject the successor.
+    pub fn expire_offer_incarnation(
+        &mut self,
+        route_id: &str,
+        incarnation: Option<&str>,
+        reason: impl Into<String>,
+    ) -> bool {
+        match self.routes.get_mut(route_id) {
+            Some(r)
+                if r.origin == Origin::Outbound
+                    && r.state == RouteState::Offered
+                    && r.incarnation.as_deref() == incarnation =>
+            {
+                r.state = RouteState::Rejected {
+                    reason: reason.into(),
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Locally tear a route down. Returns the message to send the peer (if
     /// the route was known) so they stop too.
     pub fn teardown(&mut self, route_id: &str) -> Option<ControlMessage> {
         let r = self.routes.get_mut(route_id)?;
-        let peer = r.peer.clone();
+        let incarnation = r.incarnation.clone();
         r.state = RouteState::TornDown;
-        let _ = peer;
         Some(ControlMessage::Route(RouteControl::Teardown {
             route_id: route_id.to_string(),
+            incarnation,
         }))
     }
 
@@ -350,6 +471,7 @@ impl Session {
 
     /// Drive the state machine from a control message a peer sent us.
     pub fn handle(&mut self, from: NodeId, message: ControlMessage) -> Vec<Effect> {
+        let from = canonical_node_id(&from);
         match message {
             ControlMessage::Route(rc) => self.handle_route(from, rc),
             ControlMessage::Share(sc) => vec![Effect::Share { from, message: sc }],
@@ -378,10 +500,28 @@ impl Session {
         match rc {
             RouteControl::Offer {
                 route,
+                incarnation,
                 video,
                 audio,
                 session,
             } => {
+                // A fenced Offer is only meaningful after the matching
+                // presence advert has established the offerer's current boot.
+                // This check must run even when the route table is empty: a
+                // delayed Offer from before an app/daemon restart otherwise
+                // becomes the first route in the fresh Session and starts
+                // media again. A genuine new-boot Offer that outruns presence
+                // is deliberately left unacknowledged; capable offerers retry
+                // the exact incarnation, so it is accepted after presence
+                // arrives without ever admitting an unverifiable old boot.
+                if let Some(value) = incarnation.as_deref() {
+                    let Some((offer_boot, _)) = parse_route_incarnation(value) else {
+                        return Vec::new();
+                    };
+                    if self.peers.get(&from).map(|peer| peer.boot) != Some(offer_boot) {
+                        return Vec::new();
+                    }
+                }
                 // A duplicate Offer for a route we have already accepted and
                 // started. The daemon redelivers the same Offer once per
                 // shared network (and a re-offer can arrive while the route is
@@ -393,18 +533,82 @@ impl Session {
                 // Re-ack so a genuinely lost `Accept` still lands, but never
                 // re-insert (it would clobber a host-resolved `term_session`)
                 // and never restart media.
-                if self
-                    .routes
-                    .get(&route.id)
-                    .is_some_and(|r| r.origin == Origin::Inbound && r.is_active())
-                {
-                    return vec![Effect::Send {
-                        peer: from,
-                        message: ControlMessage::Route(RouteControl::Accept {
-                            route_id: route.id,
-                            session: None,
-                        }),
-                    }];
+                let advertised_peer_boot = self.peers.get(&from).map_or(0, |p| p.boot);
+                let mut replaced = None;
+                if let Some(existing) = self.routes.get(&route.id) {
+                    if existing.peer != from {
+                        return Vec::new();
+                    }
+                    // An inbound Offer cannot take over the state slot for a
+                    // route we offered. Route ids encode direction, so this is
+                    // either a collision or a delayed message from an older
+                    // lifecycle.
+                    if existing.origin != Origin::Inbound {
+                        return Vec::new();
+                    }
+
+                    if existing.incarnation == incarnation {
+                        match &existing.state {
+                            RouteState::Active => {
+                                return vec![Effect::Send {
+                                    peer: from,
+                                    message: ControlMessage::Route(RouteControl::Accept {
+                                        route_id: route.id,
+                                        incarnation,
+                                        session: existing.term_session.clone(),
+                                    }),
+                                }];
+                            }
+                            RouteState::Incoming if incarnation.is_some() => return Vec::new(),
+                            RouteState::Rejected { reason } if incarnation.is_some() => {
+                                return vec![Effect::Send {
+                                    peer: from,
+                                    message: ControlMessage::Route(RouteControl::Reject {
+                                        route_id: route.id,
+                                        incarnation,
+                                        reason: reason.clone(),
+                                    }),
+                                }];
+                            }
+                            RouteState::TornDown if incarnation.is_some() => {
+                                return vec![Effect::Send {
+                                    peer: from,
+                                    message: ControlMessage::Route(RouteControl::Teardown {
+                                        route_id: route.id,
+                                        incarnation,
+                                    }),
+                                }];
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // A different token is only a successor when its
+                        // monotonic sequence proves it, or its boot matches the
+                        // peer's latest presence advert. Otherwise it is a
+                        // delayed predecessor and must not resurrect.
+                        if !incarnation_is_newer(
+                            existing.incarnation.as_deref(),
+                            incarnation.as_deref(),
+                            advertised_peer_boot,
+                        ) {
+                            return Vec::new();
+                        }
+                        if matches!(existing.state, RouteState::Active | RouteState::Incoming)
+                            && !self.auto_accept
+                        {
+                            return vec![Effect::Send {
+                                peer: from,
+                                message: ControlMessage::Route(RouteControl::Reject {
+                                    route_id: route.id,
+                                    incarnation,
+                                    reason: "route id already active".into(),
+                                }),
+                            }];
+                        }
+                        if existing.is_active() {
+                            replaced = Some(existing.incarnation.clone());
+                        }
+                    }
                 }
                 let accept = self.auto_accept;
                 let state = if accept {
@@ -419,6 +623,7 @@ impl Session {
                         peer: from.clone(),
                         origin: Origin::Inbound,
                         state,
+                        incarnation: incarnation.clone(),
                         video,
                         audio,
                         // The session the viewer asked to attach to (a
@@ -435,22 +640,46 @@ impl Session {
                     // the Accept carrying the resolved id from `start_media`;
                     // this first Accept (no session) starts the viewer's
                     // media at once, exactly as v1.
-                    vec![
+                    let mut effects = Vec::new();
+                    if let Some(old_incarnation) = replaced {
+                        effects.push(Effect::StopMedia {
+                            route_id: route.id.clone(),
+                            incarnation: old_incarnation,
+                        });
+                    }
+                    effects.extend([
                         Effect::Send {
                             peer: from,
                             message: ControlMessage::Route(RouteControl::Accept {
                                 route_id: route.id.clone(),
+                                incarnation: incarnation.clone(),
                                 session: None,
                             }),
                         },
-                        Effect::StartMedia(route),
-                    ]
+                        Effect::StartMedia {
+                            route,
+                            incarnation,
+                        },
+                    ]);
+                    effects
                 } else {
                     Vec::new()
                 }
             }
-            RouteControl::Accept { route_id, session } => {
+            RouteControl::Accept {
+                route_id,
+                incarnation,
+                session,
+            } => {
                 if let Some(r) = self.routes.get_mut(&route_id) {
+                    // Route ids are deterministic and therefore guessable.
+                    // Authentication of the transport identifies `from`, but
+                    // only the peer recorded on this route may acknowledge it.
+                    // Gate before recording the optional terminal session so a
+                    // foreign Accept cannot mutate or activate the route.
+                    if r.peer != from || r.incarnation != incarnation {
+                        return Vec::new();
+                    }
                     // The host's accept may echo the resolved terminal session
                     // id (which shell this route actually attached to) — record
                     // it so the viewer's UI can show "shared with N" and
@@ -462,12 +691,19 @@ impl Session {
                     }
                     if r.origin == Origin::Outbound && r.state == RouteState::Offered {
                         r.state = RouteState::Active;
-                        return vec![Effect::StartMedia(r.route.clone())];
+                        return vec![Effect::StartMedia {
+                            route: r.route.clone(),
+                            incarnation: r.incarnation.clone(),
+                        }];
                     }
                 }
                 Vec::new()
             }
-            RouteControl::Reject { route_id, reason } => {
+            RouteControl::Reject {
+                route_id,
+                incarnation,
+                reason,
+            } => {
                 // Only the route's own peer may reject it — the same rule
                 // Refresh/Tune enforce; without it any node could kill
                 // others' routes by name. A reject can now also land on an
@@ -481,30 +717,42 @@ impl Session {
                 // that side — the receiver's NACK marked the route rejected
                 // while the orphan capture streamed on regardless.
                 if let Some(r) = self.routes.get_mut(&route_id) {
-                    if r.peer == from {
+                    if r.peer == from && r.incarnation == incarnation {
                         let stop = r.is_active();
                         r.state = RouteState::Rejected { reason };
                         if stop {
-                            return vec![Effect::StopMedia(route_id)];
+                            return vec![Effect::StopMedia {
+                                route_id,
+                                incarnation: r.incarnation.clone(),
+                            }];
                         }
                     }
                 }
                 Vec::new()
             }
-            RouteControl::Refresh { route_id } => {
+            RouteControl::Refresh {
+                route_id,
+                incarnation,
+            } => {
                 // Only honoured for a live route, asked by its own peer —
                 // anyone else has no business re-keying the stream.
                 if self
                     .routes
                     .get(&route_id)
-                    .is_some_and(|r| r.is_active() && r.peer == from)
+                    .is_some_and(|r| {
+                        r.is_active() && r.peer == from && r.incarnation == incarnation
+                    })
                 {
-                    return vec![Effect::RefreshMedia(route_id)];
+                    return vec![Effect::RefreshMedia {
+                        route_id,
+                        incarnation,
+                    }];
                 }
                 Vec::new()
             }
             RouteControl::Tune {
                 route_id,
+                incarnation,
                 max_edge,
                 bitrate,
                 fps,
@@ -515,10 +763,13 @@ impl Session {
                 if self
                     .routes
                     .get(&route_id)
-                    .is_some_and(|r| r.is_active() && r.peer == from)
+                    .is_some_and(|r| {
+                        r.is_active() && r.peer == from && r.incarnation == incarnation
+                    })
                 {
                     return vec![Effect::TuneMedia {
                         route_id,
+                        incarnation,
                         max_edge,
                         bitrate,
                         fps,
@@ -531,6 +782,7 @@ impl Session {
             }
             RouteControl::VideoFeedback {
                 route_id,
+                incarnation,
                 recv_fps,
                 decode_fails,
                 queue_depth,
@@ -542,10 +794,13 @@ impl Session {
                 if self
                     .routes
                     .get(&route_id)
-                    .is_some_and(|r| r.is_active() && r.peer == from)
+                    .is_some_and(|r| {
+                        r.is_active() && r.peer == from && r.incarnation == incarnation
+                    })
                 {
                     return vec![Effect::VideoFeedback {
                         route_id,
+                        incarnation,
                         recv_fps,
                         decode_fails,
                         queue_depth,
@@ -555,17 +810,32 @@ impl Session {
                 }
                 Vec::new()
             }
-            RouteControl::Teardown { route_id } => {
+            RouteControl::Teardown {
+                route_id,
+                incarnation,
+            } => {
                 let mut effects = Vec::new();
                 if let Some(r) = self.routes.get_mut(&route_id) {
+                    // Defense in depth: callers currently gate the peer too,
+                    // but the route state machine must be safe on its own.
+                    if r.peer != from || r.incarnation != incarnation {
+                        return effects;
+                    }
                     let was_active = r.is_active();
                     r.state = RouteState::TornDown;
                     if was_active {
-                        effects.push(Effect::StopMedia(route_id));
+                        effects.push(Effect::StopMedia {
+                            route_id,
+                            incarnation: r.incarnation.clone(),
+                        });
                     }
                 }
                 effects
             }
+            // The backend owns teardown retry bookkeeping. The pure session
+            // state is already terminal locally, so the acknowledgement has
+            // no state-machine effect.
+            RouteControl::TeardownAck { .. } => Vec::new(),
             // The terminal-sessions picker plane (a viewer asking a host to
             // list its open shells, and the host's answer) touches no route
             // state — the backend handles it directly against the terminal
@@ -578,7 +848,7 @@ impl Session {
             // media plane (it routes inbound H.264), not the state machine —
             // handled in the mesh before it reaches here, like the terminal
             // picker plane above. The session just ignores it.
-            RouteControl::VideoLane { .. } => Vec::new(),
+            RouteControl::VideoLane { .. } | RouteControl::MissingRoute { .. } => Vec::new(),
             // The lane-shaped NACK is likewise the mesh's to translate: only
             // the backend knows its lane→route pins, so it resolves the lane
             // and feeds the result back through this state machine as a
@@ -643,6 +913,12 @@ mod tests {
         }
     }
 
+    fn apply_peer_boot(session: &mut Session, node: &str, boot: u64) {
+        let mut peer = profile(node);
+        peer.boot = boot;
+        assert!(session.apply_presence(peer));
+    }
+
     #[test]
     fn presence_tracks_peers_and_ignores_self_echo() {
         let mut s = Session::new("this");
@@ -651,6 +927,99 @@ mod tests {
         assert!(!s.apply_presence(profile("this"))); // our own echo
         assert_eq!(s.peers().count(), 1);
         assert!(s.peer(&"desk".into()).is_some());
+    }
+
+    #[test]
+    fn peer_identity_is_canonical_across_display_and_channel_forms() {
+        let mut s = Session::new("this-LOCAL");
+        let mut peer = profile("desk-AB12C");
+        peer.boot = 7;
+        assert!(s.apply_presence(peer));
+        assert!(s.peer(&"desk".into()).is_some());
+        assert!(s.peer(&"desk-AB12C".into()).is_some());
+
+        let _ = s.offer_with_incarnation(
+            route("r1"),
+            "desk-AB12C",
+            Vec::new(),
+            Vec::new(),
+            Some("99:1".into()),
+        );
+        let accepted = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: Some("99:1".into()),
+                session: None,
+            }),
+        );
+        assert!(matches!(
+            accepted.as_slice(),
+            [Effect::StartMedia { .. }]
+        ));
+
+        for control in [
+            RouteControl::Refresh {
+                route_id: "r1".into(),
+                incarnation: Some("99:1".into()),
+            },
+            RouteControl::Tune {
+                route_id: "r1".into(),
+                incarnation: Some("99:1".into()),
+                max_edge: None,
+                bitrate: None,
+                fps: None,
+                game: false,
+                mode: None,
+                ext: serde_json::Value::Null,
+            },
+            RouteControl::VideoFeedback {
+                route_id: "r1".into(),
+                incarnation: Some("99:1".into()),
+                recv_fps: 60,
+                decode_fails: 0,
+                queue_depth: 0,
+                lost_ts_us: None,
+                ext: serde_json::Value::Null,
+            },
+        ] {
+            assert_eq!(
+                s.handle("desk".into(), ControlMessage::Route(control))
+                    .len(),
+                1
+            );
+        }
+
+        let stopped = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Teardown {
+                route_id: "r1".into(),
+                incarnation: Some("99:1".into()),
+            }),
+        );
+        assert!(matches!(stopped.as_slice(), [Effect::StopMedia { .. }]));
+    }
+
+    #[test]
+    fn suffixed_peer_reap_stops_a_route_stored_from_bare_channel_identity() {
+        let mut s = Session::new("host");
+        apply_peer_boot(&mut s, "viewer-AB12C", 7);
+        let _ = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("7:1".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+
+        let effects = s.reap_peer_routes(&"viewer-AB12C".into());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
     }
 
     #[test]
@@ -667,11 +1036,60 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r1".into(),
+                incarnation: None,
                 session: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
-        assert!(matches!(effects.as_slice(), [Effect::StartMedia(r)] if r.id == "r1"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartMedia { route, .. }] if route.id == "r1"
+        ));
+    }
+
+    #[test]
+    fn foreign_accept_cannot_activate_or_mutate_an_outbound_route() {
+        let mut s = Session::new("this");
+        s.offer(route("r1"), "desk", Vec::new(), Vec::new());
+
+        let effects = s.handle(
+            "intruder".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: None,
+                session: Some("foreign-session".into()),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        let route = s.route("r1").unwrap();
+        assert_eq!(route.state, RouteState::Offered);
+        assert_eq!(route.term_session, None);
+    }
+
+    #[test]
+    fn foreign_teardown_cannot_stop_an_active_route() {
+        let mut s = Session::new("this");
+        s.offer(route("r1"), "desk", Vec::new(), Vec::new());
+        s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: None,
+                session: None,
+            }),
+        );
+
+        let effects = s.handle(
+            "intruder".into(),
+            ControlMessage::Route(RouteControl::Teardown {
+                route_id: "r1".into(),
+                incarnation: None,
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(s.route("r1").unwrap().state, RouteState::Active);
     }
 
     #[test]
@@ -700,10 +1118,14 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t1".into(),
+                incarnation: None,
                 session: Some("term-2".into()),
             }),
         );
-        assert!(matches!(effects.as_slice(), [Effect::StartMedia(r)] if r.id == "t1"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartMedia { route, .. }] if route.id == "t1"
+        ));
         assert_eq!(
             s.route("t1").unwrap().term_session.as_deref(),
             Some("term-2")
@@ -719,6 +1141,7 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t2".into(),
+                incarnation: None,
                 session: None,
             }),
         );
@@ -727,6 +1150,7 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "t2".into(),
+                incarnation: None,
                 session: Some("term-5".into()),
             }),
         );
@@ -749,6 +1173,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("t1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: Some("term-2".into()),
@@ -773,6 +1198,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -786,7 +1212,7 @@ mod tests {
         )));
         assert!(effects
             .iter()
-            .any(|e| matches!(e, Effect::StartMedia(r) if r.id == "r1")));
+            .any(|e| matches!(e, Effect::StartMedia { route, .. } if route.id == "r1")));
     }
 
     #[test]
@@ -802,6 +1228,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -813,6 +1240,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 // A re-offer might still carry the viewer's original ask;
@@ -822,7 +1250,9 @@ mod tests {
         );
         // No second StartMedia…
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::StartMedia(_))),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartMedia { .. })),
             "a duplicate Offer must not restart media"
         );
         // …only a re-ack…
@@ -846,6 +1276,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -863,6 +1294,7 @@ mod tests {
             "desk".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
+                incarnation: None,
                 reason: "device busy".into(),
             }),
         );
@@ -882,6 +1314,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -891,10 +1324,14 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Teardown {
                 route_id: "r1".into(),
+                incarnation: None,
             }),
         );
         assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
-        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
     }
 
     #[test]
@@ -904,13 +1341,17 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
             }),
         );
         let effects = s.drop_peer(&"this".into());
-        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
         assert!(s.peer(&"this".into()).is_none());
     }
 
@@ -923,6 +1364,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -930,7 +1372,10 @@ mod tests {
         );
         let had_peer = s.peer(&"this".into()).is_some();
         let effects = s.reap_peer_routes(&"this".into());
-        assert!(matches!(effects.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
         assert_eq!(s.peer(&"this".into()).is_some(), had_peer);
         // A second reap finds nothing active — it never double-stops.
         assert!(s.reap_peer_routes(&"this".into()).is_empty());
@@ -944,16 +1389,18 @@ mod tests {
             "peer".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r1".into(),
+                incarnation: None,
                 session: None,
             }),
         );
-        assert!(matches!(fx.as_slice(), [Effect::StartMedia(_)]));
+        assert!(matches!(fx.as_slice(), [Effect::StartMedia { .. }]));
         // A stranger's reject is ignored — any node could otherwise kill
         // routes by name.
         let fx = s.handle(
             "mallory".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
+                incarnation: None,
                 reason: "nope".into(),
             }),
         );
@@ -966,10 +1413,14 @@ mod tests {
             "peer".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
+                incarnation: None,
                 reason: "route not live here".into(),
             }),
         );
-        assert!(matches!(fx.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
         assert!(matches!(
             s.route("r1").unwrap().state,
             RouteState::Rejected { .. }
@@ -989,17 +1440,21 @@ mod tests {
             "viewer".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
             }),
         );
-        assert!(fx.iter().any(|e| matches!(e, Effect::StartMedia(_))));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::StartMedia { .. })));
         // A stranger's reject still bounces off the peer check.
         let fx = s.handle(
             "mallory".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
+                incarnation: None,
                 reason: "nope".into(),
             }),
         );
@@ -1010,10 +1465,14 @@ mod tests {
             "viewer".into(),
             ControlMessage::Route(RouteControl::Reject {
                 route_id: "r1".into(),
+                incarnation: None,
                 reason: "route not live here".into(),
             }),
         );
-        assert!(matches!(fx.as_slice(), [Effect::StopMedia(id)] if id == "r1"));
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::StopMedia { route_id, .. }] if route_id == "r1"
+        ));
         assert!(matches!(
             s.route("r1").unwrap().state,
             RouteState::Rejected { .. }
@@ -1038,11 +1497,111 @@ mod tests {
             "peer".into(),
             ControlMessage::Route(RouteControl::Accept {
                 route_id: "r2".into(),
+                incarnation: None,
                 session: None,
             }),
         );
         assert!(!s.expire_offer("r2", "too late"));
         assert!(s.route("r2").unwrap().is_active());
+    }
+
+    #[test]
+    fn an_old_offer_deadline_cannot_expire_a_same_id_successor() {
+        let mut s = Session::new("desk");
+        let _ = s.offer_with_incarnation(
+            route("r1"),
+            "peer",
+            Vec::new(),
+            Vec::new(),
+            Some("7:1".into()),
+        );
+        let _ = s.offer_with_incarnation(
+            route("r1"),
+            "peer",
+            Vec::new(),
+            Vec::new(),
+            Some("7:2".into()),
+        );
+
+        assert!(!s.expire_offer_incarnation("r1", Some("7:1"), "old deadline"));
+        assert_eq!(s.route("r1").unwrap().state, RouteState::Offered);
+        assert!(s.expire_offer_incarnation("r1", Some("7:2"), "no answer"));
+    }
+
+    #[test]
+    fn stale_accept_cannot_activate_a_same_id_successor() {
+        let mut s = Session::new("this");
+        let _ = s.offer_with_incarnation(
+            route("r1"),
+            "desk",
+            Vec::new(),
+            Vec::new(),
+            Some("7:2".into()),
+        );
+
+        let stale = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: Some("7:1".into()),
+                session: None,
+            }),
+        );
+        assert!(stale.is_empty());
+        assert_eq!(s.route("r1").unwrap().state, RouteState::Offered);
+
+        let current = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: Some("7:2".into()),
+                session: None,
+            }),
+        );
+        assert!(matches!(
+            current.as_slice(),
+            [Effect::StartMedia {
+                incarnation: Some(incarnation),
+                ..
+            }] if incarnation == "7:2"
+        ));
+    }
+
+    #[test]
+    fn stale_reject_and_teardown_cannot_stop_a_same_id_successor() {
+        let mut s = Session::new("this");
+        let _ = s.offer_with_incarnation(
+            route("r1"),
+            "desk",
+            Vec::new(),
+            Vec::new(),
+            Some("7:2".into()),
+        );
+        let _ = s.handle(
+            "desk".into(),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "r1".into(),
+                incarnation: Some("7:2".into()),
+                session: None,
+            }),
+        );
+
+        for stale in [
+            RouteControl::Reject {
+                route_id: "r1".into(),
+                incarnation: Some("7:1".into()),
+                reason: "late".into(),
+            },
+            RouteControl::Teardown {
+                route_id: "r1".into(),
+                incarnation: Some("7:1".into()),
+            },
+        ] {
+            assert!(s
+                .handle("desk".into(), ControlMessage::Route(stale))
+                .is_empty());
+            assert!(s.route("r1").unwrap().is_active());
+        }
     }
 
     #[test]
@@ -1052,6 +1611,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Offer {
                 route: route("r1"),
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: None,
@@ -1062,13 +1622,18 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Refresh {
                 route_id: "r1".into(),
+                incarnation: None,
             }),
         );
-        assert!(matches!(fx.as_slice(), [Effect::RefreshMedia(id)] if id == "r1"));
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::RefreshMedia { route_id, .. }] if route_id == "r1"
+        ));
         let fx = s.handle(
             "this".into(),
             ControlMessage::Route(RouteControl::Tune {
                 route_id: "r1".into(),
+                incarnation: None,
                 max_edge: Some(1920),
                 bitrate: None,
                 fps: Some(60),
@@ -1088,6 +1653,7 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::VideoFeedback {
                 route_id: "r1".into(),
+                incarnation: None,
                 recv_fps: 28,
                 decode_fails: 3,
                 queue_depth: 1,
@@ -1104,6 +1670,7 @@ mod tests {
                 queue_depth: 1,
                 lost_ts_us: Some(123_456),
                 ext,
+                ..
             }]
                 if route_id == "r1" && ext["est_kbps"] == 12_000 && ext["delay_trend_us_per_s"] == -40
         );
@@ -1113,6 +1680,7 @@ mod tests {
             "stranger".into(),
             ControlMessage::Route(RouteControl::Refresh {
                 route_id: "r1".into(),
+                incarnation: None,
             }),
         );
         assert!(fx.is_empty());
@@ -1121,15 +1689,352 @@ mod tests {
             "this".into(),
             ControlMessage::Route(RouteControl::Teardown {
                 route_id: "r1".into(),
+                incarnation: None,
             }),
         );
         let fx = s.handle(
             "this".into(),
             ControlMessage::Route(RouteControl::Refresh {
                 route_id: "r1".into(),
+                incarnation: None,
             }),
         );
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn exact_duplicate_offer_reacks_without_restarting_media() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let offer = || {
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:7".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            })
+        };
+        let first = s.handle("viewer".into(), offer());
+        assert!(first
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartMedia { .. })));
+
+        let duplicate = s.handle("viewer".into(), offer());
+        assert!(matches!(
+            duplicate.as_slice(),
+            [Effect::Send {
+                message: ControlMessage::Route(RouteControl::Accept {
+                    incarnation: Some(incarnation),
+                    ..
+                }),
+                ..
+            }] if incarnation == "9:7"
+        ));
+    }
+
+    #[test]
+    fn newer_incarnation_replaces_active_media_in_stop_then_start_order() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let make_offer = |incarnation: &str| {
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some(incarnation.into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            })
+        };
+        let _ = s.handle("viewer".into(), make_offer("9:1"));
+        let effects = s.handle("viewer".into(), make_offer("9:2"));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::StopMedia {
+                    incarnation: Some(old),
+                    ..
+                },
+                Effect::Send {
+                    message: ControlMessage::Route(RouteControl::Accept {
+                        incarnation: Some(accepted),
+                        ..
+                    }),
+                    ..
+                },
+                Effect::StartMedia {
+                    incarnation: Some(new),
+                    ..
+                }
+            ] if old == "9:1" && accepted == "9:2" && new == "9:2"
+        ));
+        assert_eq!(
+            s.route("r1").unwrap().incarnation.as_deref(),
+            Some("9:2")
+        );
+    }
+
+    #[test]
+    fn terminal_incarnation_cannot_be_resurrected_by_its_retried_offer() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let make_offer = |incarnation: &str| {
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some(incarnation.into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            })
+        };
+        let _ = s.handle("viewer".into(), make_offer("9:1"));
+        let _ = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Teardown {
+                route_id: "r1".into(),
+                incarnation: Some("9:1".into()),
+            }),
+        );
+
+        let retried = s.handle("viewer".into(), make_offer("9:1"));
+        assert!(matches!(
+            retried.as_slice(),
+            [Effect::Send {
+                message: ControlMessage::Route(RouteControl::Teardown {
+                    incarnation: Some(incarnation),
+                    ..
+                }),
+                ..
+            }] if incarnation == "9:1"
+        ));
+        assert_eq!(s.route("r1").unwrap().state, RouteState::TornDown);
+
+        let successor = s.handle("viewer".into(), make_offer("9:2"));
+        assert!(successor
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartMedia { .. })));
+        let rejected = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Reject {
+                route_id: "r1".into(),
+                incarnation: Some("9:2".into()),
+                reason: "closed".into(),
+            }),
+        );
+        assert!(matches!(
+            rejected.as_slice(),
+            [Effect::StopMedia { .. }]
+        ));
+
+        let retried = s.handle("viewer".into(), make_offer("9:2"));
+        assert!(matches!(
+            retried.as_slice(),
+            [Effect::Send {
+                message: ControlMessage::Route(RouteControl::Reject {
+                    incarnation: Some(incarnation),
+                    ..
+                }),
+                ..
+            }] if incarnation == "9:2"
+        ));
+        assert!(matches!(
+            s.route("r1").unwrap().state,
+            RouteState::Rejected { .. }
+        ));
+
+        let successor = s.handle("viewer".into(), make_offer("9:3"));
+        assert!(successor
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartMedia { .. })));
+    }
+
+    #[test]
+    fn legacy_offer_cannot_downgrade_an_active_fenced_route() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let _ = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:2".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        let effects = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: None,
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            s.route("r1").unwrap().incarnation.as_deref(),
+            Some("9:2")
+        );
+        assert!(s.route("r1").unwrap().is_active());
+    }
+
+    #[test]
+    fn prompting_does_not_orphan_an_active_route_during_replacement() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let _ = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:1".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        s.auto_accept = false;
+        let effects = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:2".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send {
+                message: ControlMessage::Route(RouteControl::Reject {
+                    incarnation: Some(incarnation),
+                    ..
+                }),
+                ..
+            }] if incarnation == "9:2"
+        ));
+        assert_eq!(
+            s.route("r1").unwrap().incarnation.as_deref(),
+            Some("9:1")
+        );
+        assert!(s.route("r1").unwrap().is_active());
+    }
+
+    #[test]
+    fn stale_refresh_tune_and_feedback_do_not_touch_successor_media() {
+        let mut s = Session::new("desk");
+        apply_peer_boot(&mut s, "viewer", 9);
+        let _ = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:2".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+
+        let stale_controls = [
+            RouteControl::Refresh {
+                route_id: "r1".into(),
+                incarnation: Some("9:1".into()),
+            },
+            RouteControl::Tune {
+                route_id: "r1".into(),
+                incarnation: Some("9:1".into()),
+                max_edge: Some(720),
+                bitrate: Some(4_000_000),
+                fps: Some(30),
+                game: false,
+                mode: None,
+                ext: serde_json::Value::Null,
+            },
+            RouteControl::VideoFeedback {
+                route_id: "r1".into(),
+                incarnation: Some("9:1".into()),
+                recv_fps: 1,
+                decode_fails: 1,
+                queue_depth: 1,
+                lost_ts_us: Some(1),
+                ext: serde_json::Value::Null,
+            },
+        ];
+        for control in stale_controls {
+            assert!(s
+                .handle("viewer".into(), ControlMessage::Route(control))
+                .is_empty());
+        }
+        assert!(s.route("r1").unwrap().is_active());
+    }
+
+    #[test]
+    fn fenced_offer_waits_for_matching_presence_before_first_insert() {
+        let mut s = Session::new("desk");
+        let offer = ControlMessage::Route(RouteControl::Offer {
+            route: route("r1"),
+            incarnation: Some("9:1".into()),
+            video: Vec::new(),
+            audio: Vec::new(),
+            session: None,
+        });
+
+        assert!(s.handle("viewer".into(), offer.clone()).is_empty());
+        assert!(s.route("r1").is_none());
+
+        let mut current = profile("viewer");
+        current.boot = 9;
+        assert!(s.apply_presence(current));
+        assert!(s
+            .handle("viewer".into(), offer)
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartMedia { .. })));
+        assert!(s.route("r1").unwrap().is_active());
+    }
+
+    #[test]
+    fn delayed_predecessor_offer_cannot_seed_an_empty_restarted_session() {
+        let mut s = Session::new("desk");
+        let mut current = profile("viewer");
+        current.boot = 10;
+        assert!(s.apply_presence(current));
+
+        let effects = s.handle(
+            "viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: Some("9:7".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(s.route("r1").is_none());
+    }
+
+    #[test]
+    fn legacy_first_offer_remains_compatible_without_presence() {
+        let mut s = Session::new("desk");
+        let effects = s.handle(
+            "legacy-viewer".into(),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route("r1"),
+                incarnation: None,
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartMedia { .. })));
+        assert!(s.route("r1").unwrap().is_active());
     }
 
     #[test]

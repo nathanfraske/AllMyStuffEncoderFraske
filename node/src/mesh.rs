@@ -13,7 +13,7 @@
 //! Everything the front-end sees comes through `allmystuff://session`
 //! snapshots emitted after each change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,17 +21,19 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::UiSink;
 
 use allmystuff_graph::{Grant, MediaKind, NodeId, Person, PersonId, Route};
-use allmystuff_protocol::control::{MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
+use allmystuff_protocol::control::{MAX_MEDIA_FRAME_BYTES, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage, KvmControl,
     NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request, RoomMessage, RouteControl,
     ShareControl, SharedFileMeta, SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL,
-    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, FEATURE_MEDIA_INCARNATION,
+    FEATURE_ROUTE_INCARNATION, FEATURE_ROUTE_TEARDOWN_ACK, LOCAL_CLAIM_NETWORK_ID,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -157,6 +159,12 @@ pub struct Mesh {
     /// the downloader; the room host only ever carries the *list*.
     shared: Mutex<HashMap<String, SharedReg>>,
     state: Mutex<State>,
+    /// Serializes joined-network snapshots from fetch through commit so an
+    /// older async response cannot overwrite a newer daemon session.
+    network_sync_serial: tokio::sync::Mutex<()>,
+    /// Serializes daemon peer snapshots. Inbound observations remain
+    /// independent and are never erased by these snapshot refreshes.
+    peer_refresh_serial: tokio::sync::Mutex<()>,
     /// This device's persisted ownership record — who owns it and whether
     /// it's currently offering itself for adoption (claim mode).
     ownership: Arc<Ownership>,
@@ -184,11 +192,41 @@ pub struct Mesh {
     /// in the wire protocol and the session is clock-free, so this is where
     /// "awaiting accept" gets its timer; entries leave when the route stops
     /// being an outbound `Offered`.
-    offer_first_seen: Mutex<HashMap<String, std::time::Instant>>,
+    offer_first_seen: Mutex<HashMap<(String, Option<String>), std::time::Instant>>,
+    /// User-owned outbound route intent, independent of the daemon-backed
+    /// [`Session`]. A daemon event-socket restart destroys observed routes,
+    /// lanes, and media resources, but it must not silently turn an open
+    /// console off. Bring-up replays these exact endpoint/media requests with
+    /// a fresh wire incarnation. Explicit disconnect and peer terminal
+    /// responses remove the intent before any asynchronous cleanup begins.
+    desired_routes: Mutex<HashMap<String, DesiredRoute>>,
+    /// Process-local generation returned to GUI callers. It fences a delayed
+    /// local close from route A after deterministic route id reuse has already
+    /// installed route B, including legacy peers that have no wire
+    /// incarnation.
+    route_intent_generation: AtomicU64,
+    /// Exact teardowns awaiting an application-level acknowledgement. The
+    /// daemon's reliable-send ack is transport-level and can succeed with no
+    /// peer app subscriber, so these are retried on the existing offer sweep.
+    pending_teardowns: Mutex<HashMap<(String, Option<String>), PendingTeardown>>,
     /// The daemon-link status as last emitted on `allmystuff://subscription`
     /// — answered back by [`Mesh::mesh_status`], because the emit itself is
     /// one-shot and a late-subscribing GUI misses it.
     last_status: Mutex<(String, Option<String>)>,
+    /// Short-lived reliable-control workers, one per exact route lifetime.
+    /// Independent routes cannot head-of-line block each other. Each worker's
+    /// pending mailbox has one coalescing slot per reliable protocol kind, so
+    /// repeated state cannot grow an unbounded FIFO while a daemon send stalls.
+    reliable_control_workers: Arc<Mutex<HashMap<ReliableControlKey, ReliableControlWorkerHandle>>>,
+    reliable_control_worker_seq: AtomicU64,
+    /// Cancels every in-flight reliable request as soon as a daemon session is
+    /// retired. A transport acknowledgement from a replacement daemon must
+    /// never make an old Offer or Teardown look delivered.
+    reliable_control_epoch: watch::Sender<u64>,
+    /// Epoch and event-subscriber client id installed by the current bring-up.
+    /// This is separate from the route Session so worker fencing can be checked
+    /// without treating a partially-reset State as current.
+    active_daemon_context: Arc<Mutex<Option<DaemonContext>>>,
     /// Last non-empty fleet roster we read from the closed network's signed
     /// roster (`fleet_roster_value`). A member-side resilience cache — the
     /// symmetric twin of the owner's durable `fleet_members()` fallback: the
@@ -225,6 +263,12 @@ pub struct Mesh {
     /// Peer-wide budgets, focus election, requested/effective policy, and the
     /// viewer's cached remote plans. It contains no transport state.
     media_policy: Mutex<MediaPolicyController>,
+    /// Latest effective-plan echo per route. ICE-path control sends can wait
+    /// on a slow daemon, so the inbound event pump only updates this queue and
+    /// one detached worker drains it. Replacements coalesce by route.
+    effective_plan_echoes: Mutex<HashMap<(String, Option<String>), (u64, EffectivePlan)>>,
+    effective_plan_echo_running: AtomicBool,
+    effective_plan_echo_epoch: AtomicU64,
     /// Last full legacy Tune fields sent for each watched route. A v1
     /// priority-only message repeats them so an older peer that ignores the
     /// extension keeps its current quality instead of resetting to Auto.
@@ -258,7 +302,14 @@ pub struct Mesh {
     /// Without the bump, a network refresh on one side left the *other* side
     /// (same boot id, peer still "known") silent, stranding the connection
     /// until both sides refreshed or an app restarted.
-    boot_id: AtomicU64,
+    /// Presence boot id and route sequence under one lock. They must advance
+    /// atomically or a reset can mint `new_boot:N` before `new_boot:1`, making
+    /// the receiver reject the real successor as older.
+    route_incarnation_clock: Mutex<RouteIncarnationClock>,
+    /// Daemon-session fence captured by every inbound binary media-source
+    /// task. A task from an old event subscription may remain alive if its
+    /// pipe does; it must not dispatch frames into the replacement Session.
+    daemon_session_epoch: Arc<AtomicU64>,
     /// Reassembles chunked inbound video frames (a frame bigger than the
     /// data channel's ~64 KiB message ceiling arrives in pieces).
     video_in: Mutex<VideoAssembler>,
@@ -268,13 +319,29 @@ pub struct Mesh {
     /// refresh): a pull that fails costs one tick, where the previous
     /// push channel's ordered delivery meant one lost message silently
     /// froze the stream forever while the backend kept counting frames.
-    video_watchers: Mutex<HashMap<String, VideoWatcher>>,
+    video_watchers: Mutex<VideoWatchRegistry>,
+    /// Process-random seed plus a monotonic increment for local watcher
+    /// claims. A GUI surviving a node restart must never have its old token
+    /// alias the first watcher created by the replacement process.
+    video_watch_token: AtomicU64,
     /// Whether the local daemon speaks the video track lane (`video_*`
     /// ops, myownmesh ≥ 0.2.1). Probed at session start; while false the
     /// app neither offers nor picks H.264 — screen shares ride MJPEG and
     /// a single loud log says why. This is what keeps a stale daemon a
     /// slow stream instead of a black one.
     daemon_video: std::sync::atomic::AtomicBool,
+    /// Subscription health is network-scoped. A successful VideoSubscribe on
+    /// mesh A says nothing about mesh B, yet the old global flag negotiated
+    /// H.264 to peers reachable only on B and produced a route with no inbound
+    /// video sink. Successful entries are retained and failed entries are
+    /// retried for the daemon session's lifetime.
+    network_subscriptions: Mutex<HashMap<String, NetworkSubscriptionState>>,
+    /// Serializes initial subscription passes with the background healer so
+    /// two sync triggers do not issue duplicate requests for the same slot.
+    subscription_serial: tokio::sync::Mutex<()>,
+    /// Daemon session epoch whose retry worker is active. One worker observes
+    /// the current joined set until reset advances `daemon_session_epoch`.
+    subscription_retry_epoch: AtomicU64,
     /// Inbound per-route counters (frames, bytes), logged every few
     /// seconds — the receive half of the dial-in line the sender's
     /// `StreamStats` provides.
@@ -329,13 +396,20 @@ pub struct Mesh {
     /// when the stream starts and held until teardown, so an unrelated route
     /// coming or going never renumbers a live stream's lane. The viewer is
     /// told the binding ([`RouteControl::VideoLane`]) and demuxes by it.
-    video_lane_pins: Mutex<HashMap<String, u8>>,
+    video_lane_pins: Mutex<HashMap<String, OutboundVideoLanePin>>,
     /// Process-local incarnation of each outbound video route. Route ids are
     /// intentionally stable across a rapid codec/source re-offer, so the id
     /// alone cannot tell a queued AU from the capture instance that produced
     /// it. The generation is never serialized: it only fences stale callbacks
     /// and queued work before they reach the existing media plane.
     video_route_generations: Mutex<VideoRouteGenerations>,
+    /// Wire lifetime of each route whose local media resources are currently
+    /// running. Stop effects must match this exact value, for every media kind,
+    /// so a delayed predecessor stop cannot tear down a same-id successor.
+    active_media_incarnations: Mutex<HashMap<String, Option<String>>>,
+    /// Serializes every route-id keyed resource start/stop across async effect
+    /// batches, direct disconnects, and same-id replacement.
+    route_lifecycle_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// A very small, process-local guard around a screen switch. The viewer
     /// tears the old display route down and offers the new one on separate
     /// local node-control requests; a delayed duplicate teardown can therefore
@@ -351,7 +425,9 @@ pub struct Mesh {
     /// `video_lane_binds[P][L]` — authoritative over the positional guess.
     /// Empty for a peer that doesn't announce (older build): that peer's lanes
     /// fall back to the positional sort.
-    video_lane_binds: Mutex<HashMap<String, HashMap<u8, String>>>,
+    /// Keyed by `(network, canonical peer)`: lane ids are scoped to one
+    /// WebRTC PeerSession, not globally to a peer that shares several meshes.
+    video_lane_binds: Mutex<HashMap<(String, String), HashMap<u8, VideoLaneBinding>>>,
     /// The disabled-networks park store, when the embedding process shares
     /// one (the node binary's `network_set_enabled` seam). Consulted by
     /// [`Mesh::ensure_claim_networks`] so a deliberately switched-off local
@@ -389,6 +465,144 @@ struct LegacyVideoTune {
     fps: Option<u32>,
     game: bool,
     mode: Option<String>,
+    peer_cap_bps: Option<u64>,
+    priority: bool,
+}
+
+#[derive(Default)]
+struct VideoWatchRegistry {
+    current: HashMap<String, VideoWatcher>,
+    standby: HashMap<String, Vec<VideoWatcher>>,
+}
+
+impl std::ops::Deref for VideoWatchRegistry {
+    type Target = HashMap<String, VideoWatcher>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.current
+    }
+}
+
+impl std::ops::DerefMut for VideoWatchRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.current
+    }
+}
+
+impl VideoWatchRegistry {
+    fn clear(&mut self) {
+        self.current.clear();
+        self.standby.clear();
+    }
+
+    /// Preserve window claims across a daemon/session reconnect while
+    /// discarding every byte and decoder callback tied to the vanished media
+    /// lifetime. This keeps an already-open viewer's token valid, but forces
+    /// raw H.264 to wait for a clean entry and requires a real post-reconnect
+    /// poll before the claim counts as liveness evidence.
+    fn reset_for_reconnect(&mut self) {
+        for watcher in self.current.values_mut().chain(
+            self.standby
+                .values_mut()
+                .flat_map(|watchers| watchers.iter_mut()),
+        ) {
+            watcher.queue.clear();
+            watcher.awaiting_key = !watcher.decode;
+            watcher.last_poll = None;
+            if watcher.decode {
+                watcher.decode_epoch = next_native_decode_epoch();
+            }
+        }
+    }
+
+    fn reset_route_for_reconnect(&mut self, route_id: &str) {
+        if let Some(watcher) = self.current.get_mut(route_id) {
+            watcher.queue.clear();
+            watcher.awaiting_key = !watcher.decode;
+            watcher.last_poll = None;
+            if watcher.decode {
+                watcher.decode_epoch = next_native_decode_epoch();
+            }
+        }
+        if let Some(watchers) = self.standby.get_mut(route_id) {
+            for watcher in watchers {
+                watcher.queue.clear();
+                watcher.awaiting_key = !watcher.decode;
+                watcher.last_poll = None;
+                if watcher.decode {
+                    watcher.decode_epoch = next_native_decode_epoch();
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, route_id: &str) -> Option<VideoWatcher> {
+        self.standby.remove(route_id);
+        self.current.remove(route_id)
+    }
+
+    fn claim(&mut self, route_id: String, watcher: VideoWatcher) {
+        let now = Instant::now();
+        self.prune_standby(&route_id, now);
+        if let Some(mut displaced) = self.current.insert(route_id.clone(), watcher) {
+            displaced.queue.clear();
+            // A never-polled registration has not proved that a live window
+            // owns it. A recently polled claim may be restored if an obsolete
+            // late registration displaced it and then immediately unwinds.
+            if watcher_claim_is_recent(&displaced, now) {
+                self.standby.entry(route_id).or_default().push(displaced);
+            }
+        }
+    }
+
+    /// Release one claim. If it owned the route, restore the most recently
+    /// displaced live claim so a late obsolete registration cannot leave the
+    /// intended window armed on a stale token with no backend owner.
+    fn release(&mut self, route_id: &str, token: u64) -> Option<(bool, Option<bool>)> {
+        if self
+            .current
+            .get(route_id)
+            .is_some_and(|watcher| watcher.token == token)
+        {
+            let removed_decode = self.current.remove(route_id)?.decode;
+            let now = Instant::now();
+            self.prune_standby(route_id, now);
+            let restored = self.standby.get_mut(route_id).and_then(Vec::pop);
+            if self.standby.get(route_id).is_some_and(Vec::is_empty) {
+                self.standby.remove(route_id);
+            }
+            let restored_decode = restored.as_ref().map(|watcher| watcher.decode);
+            if let Some(mut watcher) = restored {
+                watcher.queue.clear();
+                watcher.awaiting_key = !watcher.decode;
+                self.current.insert(route_id.to_string(), watcher);
+            }
+            return Some((removed_decode, restored_decode));
+        }
+
+        if let Some(standby) = self.standby.get_mut(route_id) {
+            standby.retain(|watcher| watcher.token != token);
+            if standby.is_empty() {
+                self.standby.remove(route_id);
+            }
+        }
+        None
+    }
+
+    fn prune_standby(&mut self, route_id: &str, now: Instant) {
+        if let Some(standby) = self.standby.get_mut(route_id) {
+            standby.retain(|watcher| watcher_claim_is_recent(watcher, now));
+            if standby.is_empty() {
+                self.standby.remove(route_id);
+            }
+        }
+    }
+}
+
+fn watcher_claim_is_recent(watcher: &VideoWatcher, now: Instant) -> bool {
+    watcher
+        .last_poll
+        .is_some_and(|last| now.saturating_duration_since(last) <= VIDEO_LOCAL_POLL_OBSERVE)
 }
 
 /// One console window's claim on a route's inbound packets: the queue it
@@ -401,6 +615,9 @@ struct VideoWatcher {
     /// Whether this window asked the backend to decode H.264 for it
     /// (raw RGBA frames out) instead of passing access units through.
     decode: bool,
+    /// Stable across native-to-native watch handoff while one decoder worker
+    /// remains live; renewed after any pass-through or teardown boundary.
+    decode_epoch: u64,
     queue: std::collections::VecDeque<ViewerPacket>,
     /// Raw H.264 only: once a reference chain is dropped, dependent AUs are
     /// refused until a key unit arrives.
@@ -408,7 +625,12 @@ struct VideoWatcher {
     /// Updated by the window's 16 ms safety poll even when no frame arrived.
     /// A post-disconnect-request poll is stronger liveness evidence than mere
     /// watcher presence because `video_unwatch` is fire-and-forget.
-    last_poll: Instant,
+    last_poll: Option<Instant>,
+}
+
+fn next_native_decode_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// One packet waiting at the local backend-to-viewer boundary. Profiling
@@ -553,6 +775,21 @@ const TERM_INIT_ROWS: u16 = 24;
 /// Media-plane send failures repeat at frame rate; warn at most this often.
 const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Current MyOwnMesh peer setup pre-negotiates only lane 0. Opening lane 1+
+/// creates an RTP track and schedules a new SDP offer through signaling. The
+/// product boundary forbids video work from causing signaling activity, so
+/// this client may use only the lane already present in the initial session.
+/// Extra simultaneous streams take the legacy data-channel fallback until the
+/// daemon can report a measured, fixed pre-negotiated pool separately from its
+/// dynamic lane ceiling.
+const PRENEGOTIATED_MEDIA_LANES: u8 = 1;
+
+/// The current daemon-to-node binary media-source frame omits its network id.
+/// A source pipe can outlive a one-to-many network transition, so even opening
+/// it during a one-network moment is unsafe. Keep the network-tagged event path
+/// until a versioned binary frame makes this true.
+const MEDIA_SOURCE_HAS_NETWORK_IDENTITY: bool = false;
+
 /// One item on a route-local video queue. Generation, recovery, and profiler
 /// metadata are strictly process-local: the packet reaches the established
 /// media sender with the same bytes and duration as before.
@@ -560,6 +797,7 @@ struct VideoOut {
     peer: String,
     route_id: String,
     generation: u64,
+    incarnation: Option<String>,
     packet: VideoPacket,
     recovery_epoch: u64,
     recovery: Arc<VideoRecovery>,
@@ -1087,6 +1325,142 @@ const SITE_NACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3
 /// unreachable and the session honestly ends. (Delivery ≠ decision — the
 /// customer can take as long as they like to click once the prompt is up.)
 const CEC_CONNECT_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+const OFFER_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonContext {
+    epoch: u64,
+    client_id: ClientId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReliableControlKind {
+    Offer,
+    Accept,
+    Reject,
+    Teardown,
+    VideoLane,
+    DeadLane,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReliableControlScope {
+    Route {
+        route_id: String,
+        incarnation: Option<String>,
+    },
+    DeadLane {
+        media: String,
+        lane: u8,
+        networks: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReliableControlKey {
+    peer: String,
+    scope: ReliableControlScope,
+}
+
+#[derive(Clone)]
+struct ReliableControlOut {
+    peer: String,
+    networks: Vec<String>,
+    payload: Value,
+    kind: ReliableControlKind,
+    daemon: DaemonContext,
+}
+
+#[derive(Default)]
+struct ReliableControlPending {
+    order: VecDeque<ReliableControlKind>,
+    jobs: HashMap<ReliableControlKind, ReliableControlOut>,
+}
+
+impl ReliableControlPending {
+    /// Keep only the newest unsent value of each protocol kind. Replacing a
+    /// kind moves it to the tail, preserving a legacy no-incarnation
+    /// `Teardown` barrier before a same-id successor `Offer`.
+    fn push(&mut self, job: ReliableControlOut) -> bool {
+        let kind = job.kind;
+        let replaced = self.jobs.insert(kind, job).is_some();
+        if replaced {
+            self.order.retain(|pending| *pending != kind);
+        }
+        self.order.push_back(kind);
+        replaced
+    }
+
+    fn pop(&mut self) -> Option<ReliableControlOut> {
+        while let Some(kind) = self.order.pop_front() {
+            if let Some(job) = self.jobs.remove(&kind) {
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.jobs.len()
+    }
+}
+
+struct ReliableControlWorkerHandle {
+    worker_id: u64,
+    daemon: DaemonContext,
+    pending: Arc<Mutex<ReliableControlPending>>,
+}
+
+#[derive(Clone)]
+struct DesiredRoute {
+    route: Route,
+    peer: String,
+    requested_video: Vec<String>,
+    requested_audio: Vec<String>,
+    term_session: Option<String>,
+    local_generation: u64,
+    current_incarnation: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingTeardown {
+    peer: String,
+    message: ControlMessage,
+    network: Option<String>,
+    created: Instant,
+}
+
+/// Stable local handle for one explicit route intent. `route_id` describes
+/// endpoints and may be reused; `generation` identifies the caller's exact
+/// local lifetime so a late close cannot tear down its successor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RouteConnectHandle {
+    pub route_id: String,
+    pub generation: u64,
+}
+
+struct RouteLifecycleGuard {
+    route_id: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Drop for RouteLifecycleGuard {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut locks = self.locks.lock();
+        if locks
+            .get(&self.route_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.lock))
+            && Arc::strong_count(&self.lock) == 2
+        {
+            locks.remove(&self.route_id);
+        }
+    }
+}
 
 struct State {
     session: Option<Session>,
@@ -1096,11 +1470,27 @@ struct State {
     /// Every joined network. Presence is broadcast on all of them so peers
     /// find each other regardless of which network the daemon lists first.
     networks: Vec<String>,
+    /// Monotonic local generation for the joined network set. Async peer-list
+    /// responses must match it before changing reachability or link class.
+    network_generation: u64,
+    /// Per-config incarnation of the local daemon PeerSession. A config id can
+    /// leave and rejoin unchanged, so the string alone cannot validate an old
+    /// route pin.
+    network_epochs: HashMap<String, u64>,
+    network_epoch_clock: u64,
     /// Which network each peer was last seen on (canonical pubkey → network
     /// config_id). You can be on several networks at once and a given peer may
     /// only share one of them, so control/media must be addressed to the
     /// network that peer actually lives on — not a single "primary" mesh.
-    peer_networks: HashMap<String, String>,
+    peer_networks: HashMap<String, PeerNetworkState>,
+    /// Daemon-confirmed outbound network for an exact route lifetime. Peer
+    /// reachability can span several meshes and its preferred path may change
+    /// as unrelated traffic arrives. Media must remain on the path that
+    /// actually carried this route's Offer/Accept, otherwise a later presence
+    /// or control exchange can move dependent frames to a network where the
+    /// route was never established. The incarnation in the key prevents a
+    /// delayed predecessor from steering a same-id successor.
+    route_networks: HashMap<(String, Option<String>), RouteNetworkPin>,
     /// App features each peer last advertised (canonical pubkey → feature
     /// list from its presence profile). Read to decide whether a peer can
     /// ride the media-lane pool — `FEATURE_MEDIA_LANES` present means both
@@ -1111,14 +1501,233 @@ struct State {
     /// gate's signal for how generous the AUTOMATIC video dials may be.
     /// A peer with no reported pair (ICE unsettled, old daemon) simply isn't
     /// in the map: transient unknowns must never downgrade a learned class.
-    peer_links: HashMap<String, crate::video::LinkClass>,
+    peer_links: HashMap<(String, String), crate::video::LinkClass>,
     /// Last presence boot id seen per peer (canonical pubkey). A boot id we
     /// haven't recorded means the peer just (re)started and missed our
     /// adverts — we answer with our state directly. This is what lets
     /// gossip be event-driven instead of a heartbeat.
     peer_boots: HashMap<String, u64>,
+    /// Every nonzero boot superseded for a still-reachable peer. Boot ids are
+    /// random epochs, not ordered counters, so this tombstone set is the only
+    /// sound way to reject an old presence duplicate that arrives later on a
+    /// second network. Entries are released when the peer leaves every joined
+    /// network.
+    peer_retired_boots: HashMap<String, std::collections::HashSet<u64>>,
     client_id: Option<ClientId>,
     profile: Option<NodeProfile>,
+}
+
+/// One immutable data-plane path for an exact route lifetime. An outbound
+/// Offer installs a tentative path after the local daemon accepts the send.
+/// The peer's authenticated Accept confirms the path and may replace that
+/// tentative choice once. After confirmation, ordinary route controls cannot
+/// move the route to another PeerSession.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteNetworkPin {
+    network: String,
+    network_epoch: u64,
+    confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteNetworkObservation {
+    OutboundOffer,
+    InboundOffer,
+    InboundAccept,
+}
+
+fn observe_route_network(
+    pins: &mut HashMap<(String, Option<String>), RouteNetworkPin>,
+    key: (String, Option<String>),
+    network: &str,
+    network_epoch: u64,
+    observation: RouteNetworkObservation,
+) -> bool {
+    match pins.get_mut(&key) {
+        None => {
+            pins.insert(
+                key,
+                RouteNetworkPin {
+                    network: network.to_string(),
+                    network_epoch,
+                    confirmed: observation != RouteNetworkObservation::OutboundOffer,
+                },
+            );
+            true
+        }
+        Some(pin) if pin.network == network && pin.network_epoch == network_epoch => {
+            if observation != RouteNetworkObservation::OutboundOffer {
+                pin.confirmed = true;
+            }
+            true
+        }
+        Some(pin) if !pin.confirmed && observation == RouteNetworkObservation::InboundAccept => {
+            pin.network = network.to_string();
+            pin.network_epoch = network_epoch;
+            pin.confirmed = true;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NetworkSubscriptionState {
+    daemon_epoch: u64,
+    client_id: ClientId,
+    channels: std::collections::HashSet<String>,
+    video: bool,
+    audio: bool,
+}
+
+impl NetworkSubscriptionState {
+    fn new(daemon_epoch: u64, client_id: ClientId) -> Self {
+        Self {
+            daemon_epoch,
+            client_id,
+            channels: std::collections::HashSet::new(),
+            video: false,
+            audio: false,
+        }
+    }
+
+    fn belongs_to(&self, daemon_epoch: u64, client_id: ClientId) -> bool {
+        self.daemon_epoch == daemon_epoch && self.client_id == client_id
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SubscriptionTarget {
+    Channel(String),
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PeerNetworkState {
+    /// Last network that carried a confirmed outbound send or inbound app
+    /// frame. It is tried first but never treated as the peer's only path.
+    preferred: Option<String>,
+    /// Paths in the latest daemon peer snapshot. A later PeersList response may
+    /// replace this evidence without erasing paths independently proven by app
+    /// traffic.
+    daemon_reachable: std::collections::HashSet<String>,
+    /// Paths proven by an authenticated inbound frame or a confirmed outbound
+    /// daemon send during this joined-network generation.
+    observed_reachable: std::collections::HashSet<String>,
+}
+
+impl PeerNetworkState {
+    fn contains(&self, network: &str) -> bool {
+        self.daemon_reachable.contains(network) || self.observed_reachable.contains(network)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.daemon_reachable.is_empty() && self.observed_reachable.is_empty()
+    }
+
+    fn retain_joined(&mut self, joined: &std::collections::HashSet<String>) {
+        self.daemon_reachable
+            .retain(|network| joined.contains(network));
+        self.observed_reachable
+            .retain(|network| joined.contains(network));
+    }
+
+    fn networks(&self) -> std::collections::HashSet<&String> {
+        self.daemon_reachable
+            .iter()
+            .chain(self.observed_reachable.iter())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerBootDisposition {
+    Current,
+    Fresh,
+    Retired,
+    LegacyDowngrade,
+}
+
+fn peer_boot_disposition(
+    current: Option<u64>,
+    retired: Option<&std::collections::HashSet<u64>>,
+    candidate: u64,
+) -> PeerBootDisposition {
+    if candidate == 0 {
+        return if current.is_some_and(|boot| boot != 0) {
+            PeerBootDisposition::LegacyDowngrade
+        } else {
+            PeerBootDisposition::Current
+        };
+    }
+    if current == Some(candidate) {
+        return PeerBootDisposition::Current;
+    }
+    if retired.is_some_and(|boots| boots.contains(&candidate)) {
+        return PeerBootDisposition::Retired;
+    }
+    PeerBootDisposition::Fresh
+}
+
+fn admit_peer_boot(
+    boots: &mut HashMap<String, u64>,
+    retired_boots: &mut HashMap<String, std::collections::HashSet<u64>>,
+    peer: &str,
+    candidate: u64,
+) -> PeerBootDisposition {
+    let current = boots.get(peer).copied();
+    let disposition = peer_boot_disposition(current, retired_boots.get(peer), candidate);
+    if disposition == PeerBootDisposition::Fresh {
+        if let Some(retired) = current.filter(|boot| *boot != 0) {
+            retired_boots
+                .entry(peer.to_string())
+                .or_default()
+                .insert(retired);
+        }
+        boots.insert(peer.to_string(), candidate);
+    }
+    disposition
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoLaneBinding {
+    route_id: String,
+    incarnation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundVideoLanePin {
+    network: String,
+    lane: u8,
+}
+
+#[derive(Debug)]
+struct RouteIncarnationClock {
+    boot: u64,
+    sequence: u64,
+}
+
+impl RouteIncarnationClock {
+    fn new() -> Self {
+        Self {
+            boot: fresh_boot_id(),
+            sequence: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.boot = fresh_boot_id();
+        self.sequence = 0;
+    }
+
+    fn next(&mut self) -> String {
+        if self.sequence == u64::MAX {
+            self.reset();
+        }
+        self.sequence += 1;
+        format!("{}:{}", self.boot, self.sequence)
+    }
 }
 
 /// M2 — the pacer's requested-vs-actual gap ledger (a minute at a time),
@@ -1182,6 +1791,14 @@ fn pace_gap_until(
     requested.min(deadline.saturating_duration_since(now))
 }
 
+fn base64_media_len_allowed(encoded_len: usize) -> bool {
+    let max_encoded = MAX_MEDIA_FRAME_BYTES
+        .saturating_add(2)
+        .div_ceil(3)
+        .saturating_mul(4);
+    encoded_len <= max_encoded
+}
+
 fn suppress_dependent_after_drop(awaiting_key: bool, key: Option<bool>) -> bool {
     awaiting_key && key == Some(false)
 }
@@ -1221,6 +1838,7 @@ impl Mesh {
         // plus one persistent writer is the ordering boundary for dependent
         // frames, even while focus changes its priority classification.
         let (audio_out, audio_rx) = mpsc::channel::<AudioOut>(usize::from(AUDIO_HANDOFF_PACKETS));
+        let (reliable_control_epoch, _) = watch::channel(0);
         Arc::new(Mesh {
             client: client.clone(),
             media_pipe: MediaPipe::new(client.clone()),
@@ -1252,24 +1870,41 @@ impl Mesh {
                 session: None,
                 network: None,
                 networks: Vec::new(),
+                network_generation: 0,
+                network_epochs: HashMap::new(),
+                network_epoch_clock: 0,
                 peer_networks: HashMap::new(),
+                route_networks: HashMap::new(),
                 peer_features: HashMap::new(),
                 peer_links: HashMap::new(),
                 peer_boots: HashMap::new(),
+                peer_retired_boots: HashMap::new(),
                 client_id: None,
                 profile: None,
             }),
+            network_sync_serial: tokio::sync::Mutex::new(()),
+            peer_refresh_serial: tokio::sync::Mutex::new(()),
             ownership: Arc::new(Ownership::load()),
             fleet_authorized: Mutex::new(std::collections::HashSet::new()),
             peer_clock_skew: Mutex::new(HashMap::new()),
             clock_skew_warned: std::sync::atomic::AtomicBool::new(false),
             offer_first_seen: Mutex::new(HashMap::new()),
+            desired_routes: Mutex::new(HashMap::new()),
+            route_intent_generation: AtomicU64::new(fresh_boot_id()),
+            pending_teardowns: Mutex::new(HashMap::new()),
             last_status: Mutex::new(("unknown".into(), None)),
+            reliable_control_workers: Arc::new(Mutex::new(HashMap::new())),
+            reliable_control_worker_seq: AtomicU64::new(0),
+            reliable_control_epoch,
+            active_daemon_context: Arc::new(Mutex::new(None)),
             fleet_roster_cache: Mutex::new(Vec::new()),
             shares: Arc::new(Shares::load()),
             audio_out,
             audio_rx: Mutex::new(Some(audio_rx)),
             media_policy: Mutex::new(MediaPolicyController::default()),
+            effective_plan_echoes: Mutex::new(HashMap::new()),
+            effective_plan_echo_running: AtomicBool::new(false),
+            effective_plan_echo_epoch: AtomicU64::new(1),
             requested_video_tunes: Mutex::new(HashMap::new()),
             input_seq: AtomicU64::new(0),
             clipboard_seq: AtomicU64::new(0),
@@ -1277,10 +1912,15 @@ impl Mesh {
             clipboard: ClipboardService::spawn(),
             clip_inbound: Mutex::new(HashMap::new()),
             clip_pull_at: Mutex::new(HashMap::new()),
-            boot_id: AtomicU64::new(fresh_boot_id()),
+            route_incarnation_clock: Mutex::new(RouteIncarnationClock::new()),
+            daemon_session_epoch: Arc::new(AtomicU64::new(0)),
             video_in: Mutex::new(VideoAssembler::new()),
-            video_watchers: Mutex::new(HashMap::new()),
+            video_watchers: Mutex::new(VideoWatchRegistry::default()),
+            video_watch_token: AtomicU64::new(fresh_boot_id()),
             daemon_video: std::sync::atomic::AtomicBool::new(false),
+            network_subscriptions: Mutex::new(HashMap::new()),
+            subscription_serial: tokio::sync::Mutex::new(()),
+            subscription_retry_epoch: AtomicU64::new(0),
             video_in_stats: Mutex::new(HashMap::new()),
             video_diag_last: Mutex::new(HashMap::new()),
             dead_lane_since: Mutex::new(HashMap::new()),
@@ -1294,6 +1934,8 @@ impl Mesh {
             daemon_media_pipes: std::sync::atomic::AtomicBool::new(false),
             video_lane_pins: Mutex::new(HashMap::new()),
             video_route_generations: Mutex::new(VideoRouteGenerations::default()),
+            active_media_incarnations: Mutex::new(HashMap::new()),
+            route_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             video_switch_guards: Mutex::new(VideoSwitchGuards::default()),
             video_lane_binds: Mutex::new(HashMap::new()),
             disabled_networks: Mutex::new(None),
@@ -1352,8 +1994,9 @@ impl Mesh {
                             // another's route.
                             match mesh.audio_lane(&route, &peer, true) {
                                 Some(lane) => {
-                                    let r =
-                                        mesh.send_audio_track(&peer, lane, duration_us, data).await;
+                                    let r = mesh
+                                        .send_audio_track(&peer, &route, lane, duration_us, data)
+                                        .await;
                                     (peer, r)
                                 }
                                 None => {
@@ -1379,7 +2022,7 @@ impl Mesh {
     }
 
     fn spawn_video_forwarder(self: &Arc<Self>, mut video_rx: mpsc::Receiver<VideoOut>) {
-        let mesh = self.clone();
+        let mesh = Arc::clone(self);
         crate::spawn(async move {
             // These writers belong to exactly one route incarnation. Every AU
             // from that route therefore crosses the same local socket in
@@ -1401,6 +2044,7 @@ impl Mesh {
                         &out.peer,
                         &out.route_id,
                         out.generation,
+                        out.incarnation,
                         out.packet,
                         out.recovery_epoch,
                         &out.recovery,
@@ -1435,6 +2079,7 @@ impl Mesh {
         peer: &str,
         route_id: &str,
         generation: u64,
+        incarnation: Option<String>,
         packet: VideoPacket,
         packet_epoch: u64,
         recovery: &VideoRecovery,
@@ -1449,7 +2094,8 @@ impl Mesh {
             return Ok(());
         }
         match packet {
-            VideoPacket::Jpeg(frame) => {
+            VideoPacket::Jpeg(mut frame) => {
+                frame.incarnation = incarnation;
                 for chunk in frame.into_chunks(MAX_JPEG_CHUNK_BYTES) {
                     // Teardown/re-offer can run while a large frame is being
                     // chunked. Stop at the first generation change so the
@@ -1518,7 +2164,12 @@ impl Mesh {
     }
 
     async fn send_media_value(&self, peer: &str, payload: Value) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let route_id = payload.get("route").and_then(Value::as_str);
+        let network = match route_id {
+            Some(route_id) => self.network_for_route(route_id, peer),
+            None => self.network_for_peer(peer),
+        };
+        let Some(network) = network else {
             return Err("no shared network".into());
         };
         let class = self.classify_local_media(&payload);
@@ -1550,7 +2201,7 @@ impl Mesh {
         profile_id: u64,
         payload: Value,
     ) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let Some(network) = self.network_for_route(route_id, peer) else {
             return Err("no shared network".into());
         };
         pipe.send_profiled(
@@ -1906,7 +2557,7 @@ impl Mesh {
         duration_us: u64,
         profile_id: u64,
     ) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let Some(network) = self.network_for_route(route_id, peer) else {
             return Err("no shared network".into());
         };
         // Binary media pipe when the daemon speaks it; otherwise the legacy
@@ -1948,11 +2599,12 @@ impl Mesh {
     async fn send_audio_track(
         &self,
         peer: &str,
+        route_id: &str,
         lane: u8,
         duration_us: u64,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        let Some(network) = self.network_for_peer(peer) else {
+        let Some(network) = self.network_for_route(route_id, peer) else {
             return Err("no shared network".into());
         };
         if self.daemon_media_pipes.load(Ordering::SeqCst) {
@@ -1981,10 +2633,409 @@ impl Mesh {
     /// peer that only shares a secondary network with us.
     fn network_for_peer(&self, peer: &str) -> Option<String> {
         let st = self.state.lock();
-        st.peer_networks
+        network_for_peer_locked(&st, peer)
+    }
+
+    /// Resolve media for one exact route lifetime. A route pin is installed
+    /// only after the daemon confirms an outbound lifecycle message on that
+    /// network. The peer-wide preference remains the bootstrap/fail-safe when
+    /// no exact pin exists, but unrelated traffic can no longer move a live
+    /// route between meshes.
+    fn network_for_route(&self, route_id: &str, peer: &str) -> Option<String> {
+        let st = self.state.lock();
+        let route = st
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id));
+        if let Some(route) =
+            route.filter(|route| pubkey_part(route.peer.as_str()) == pubkey_part(peer))
+        {
+            if route.state != RouteState::Active
+                || self.active_media_incarnations.lock().get(route_id) != Some(&route.incarnation)
+            {
+                return None;
+            }
+            let key = (route_id.to_string(), route.incarnation.clone());
+            if let Some(pin) = st.route_networks.get(&key) {
+                let current_epoch = st.network_epochs.get(&pin.network).copied();
+                return (st.networks.contains(&pin.network)
+                    && current_epoch == Some(pin.network_epoch)
+                    && pin.confirmed)
+                    .then(|| pin.network.clone());
+            }
+            // A fenced lifetime must never move to another PeerSession merely
+            // because the exact path disappeared. Its owner will retire it and
+            // negotiate a fresh incarnation. Legacy lifetimes have no such
+            // identity and are safe to infer only in a single-network session.
+            if route.incarnation.is_some() || st.networks.len() != 1 {
+                return None;
+            }
+        }
+        network_for_peer_locked(&st, peer)
+    }
+
+    fn network_video_ready(&self, network: &str) -> bool {
+        let daemon_epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
+        let Some(client_id) = self.state.lock().client_id else {
+            return false;
+        };
+        let ready = self
+            .network_subscriptions
+            .lock()
+            .get(network)
+            .is_some_and(|state| state.belongs_to(daemon_epoch, client_id) && state.video);
+        ready
+            && self.daemon_session_epoch.load(Ordering::SeqCst) == daemon_epoch
+            && self.state.lock().client_id == Some(client_id)
+    }
+
+    fn network_audio_ready(&self, network: &str) -> bool {
+        let daemon_epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
+        let Some(client_id) = self.state.lock().client_id else {
+            return false;
+        };
+        let ready = self
+            .network_subscriptions
+            .lock()
+            .get(network)
+            .is_some_and(|state| state.belongs_to(daemon_epoch, client_id) && state.audio);
+        ready
+            && self.daemon_session_epoch.load(Ordering::SeqCst) == daemon_epoch
+            && self.state.lock().client_id == Some(client_id)
+    }
+
+    fn daemon_context_is_current(&self, epoch: u64, client_id: ClientId) -> bool {
+        self.daemon_session_epoch.load(Ordering::SeqCst) == epoch
+            && *self.active_daemon_context.lock() == Some(DaemonContext { epoch, client_id })
+    }
+
+    fn network_snapshot_is_current(
+        &self,
+        epoch: u64,
+        client_id: ClientId,
+        generation: u64,
+        network: &str,
+    ) -> bool {
+        if self.daemon_session_epoch.load(Ordering::SeqCst) != epoch {
+            return false;
+        }
+        let state = self.state.lock();
+        state.client_id == Some(client_id)
+            && state.network_generation == generation
+            && state.networks.iter().any(|joined| joined == network)
+    }
+
+    fn peer_video_ready(&self, peer: &str) -> bool {
+        self.peer_reachable_networks(peer)
+            .iter()
+            .any(|network| self.network_video_ready(network))
+    }
+
+    fn peer_audio_ready(&self, peer: &str) -> bool {
+        self.peer_reachable_networks(peer)
+            .iter()
+            .any(|network| self.network_audio_ready(network))
+    }
+
+    fn peer_reachable_networks(&self, peer: &str) -> Vec<String> {
+        let state = self.state.lock();
+        let mut networks = state
+            .peer_networks
             .get(pubkey_part(peer))
-            .cloned()
-            .or_else(|| st.network.clone())
+            .map(|paths| {
+                paths
+                    .networks()
+                    .into_iter()
+                    .filter(|network| state.networks.contains(*network))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // Before the first peer-list or inbound observation there is no proven
+        // path. Probe joined networks for compatibility. Once evidence exists,
+        // media readiness must be evaluated only on those actual peer paths.
+        if networks.is_empty() {
+            networks = state.networks.clone();
+        }
+        networks.sort();
+        networks.dedup();
+        networks
+    }
+
+    fn route_video_ready(&self, route_id: &str, peer: &str) -> bool {
+        self.network_for_route(route_id, peer)
+            .is_some_and(|network| self.network_video_ready(&network))
+    }
+
+    fn route_audio_ready(&self, route_id: &str, peer: &str) -> bool {
+        self.network_for_route(route_id, peer)
+            .is_some_and(|network| self.network_audio_ready(&network))
+    }
+
+    fn route_link_class(&self, route_id: &str, peer: &str) -> crate::video::LinkClass {
+        let state = self.state.lock();
+        let Some(route) = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .filter(|route| pubkey_part(route.peer.as_str()) == pubkey_part(peer))
+        else {
+            return crate::video::LinkClass::Unknown;
+        };
+        let key = (route_id.to_string(), route.incarnation.clone());
+        let Some(pin) = state.route_networks.get(&key).filter(|pin| {
+            pin.confirmed
+                && state.network_epochs.get(&pin.network).copied() == Some(pin.network_epoch)
+        }) else {
+            return crate::video::LinkClass::Unknown;
+        };
+        state
+            .peer_links
+            .get(&(pin.network.clone(), pubkey_part(peer).to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Use one exact data-plane path for every control in a route lifetime.
+    /// Only an Offer with no pin probes peer candidates. Once a path is pinned,
+    /// failure is surfaced so recovery creates a fresh route incarnation.
+    fn route_network_candidates(&self, peer: &str, message: &ControlMessage) -> Vec<String> {
+        let mut candidates = self.peer_network_candidates(peer);
+        let (needs_video, needs_audio) = match message {
+            ControlMessage::Route(RouteControl::Offer { video, audio, .. }) => {
+                (!video.is_empty(), !audio.is_empty())
+            }
+            _ => route_control_network_key(message)
+                .and_then(|(route_id, incarnation)| {
+                    self.state
+                        .lock()
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.route(route_id))
+                        .filter(|route| route.incarnation.as_deref() == incarnation)
+                        .map(|route| (!route.video.is_empty(), !route.audio.is_empty()))
+                })
+                .unwrap_or((false, false)),
+        };
+        if needs_video || needs_audio {
+            let reachable = self.peer_reachable_networks(peer);
+            candidates.retain(|network| {
+                reachable.contains(network)
+                    && (!needs_video || self.network_video_ready(network))
+                    && (!needs_audio || self.network_audio_ready(network))
+            });
+        }
+        let Some((route_id, incarnation)) = route_control_network_key(message) else {
+            return candidates;
+        };
+        let route_path = {
+            let st = self.state.lock();
+            let current = st
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .is_some_and(|route| {
+                    pubkey_part(route.peer.as_str()) == pubkey_part(peer)
+                        && route.incarnation.as_deref() == incarnation
+                });
+            current.then(|| {
+                let key = (route_id.to_string(), incarnation.map(str::to_string));
+                (
+                    st.route_networks.get(&key).cloned(),
+                    st.networks.clone(),
+                    st.network_epochs.clone(),
+                )
+            })
+        };
+        match route_path {
+            Some((Some(pin), joined, epochs)) => {
+                return if joined.contains(&pin.network)
+                    && epochs.get(&pin.network).copied() == Some(pin.network_epoch)
+                {
+                    vec![pin.network]
+                } else {
+                    Vec::new()
+                };
+            }
+            Some((None, _, _))
+                if incarnation.is_some()
+                    && !matches!(message, ControlMessage::Route(RouteControl::Offer { .. })) =>
+            {
+                return Vec::new();
+            }
+            _ => {}
+        }
+        candidates
+    }
+
+    /// Tentatively bind a newly dispatched outbound Offer. No other outbound
+    /// control is allowed to install or move a route path.
+    fn note_outbound_offer_network(&self, peer: &str, message: &ControlMessage, network: &str) {
+        if !matches!(message, ControlMessage::Route(RouteControl::Offer { .. })) {
+            return;
+        }
+        let Some((route_id, incarnation)) = route_control_network_key(message) else {
+            return;
+        };
+        let mut st = self.state.lock();
+        if !st.networks.iter().any(|joined| joined == network) {
+            return;
+        }
+        let Some(network_epoch) = st.network_epochs.get(network).copied() else {
+            return;
+        };
+        let current = st
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                pubkey_part(route.peer.as_str()) == pubkey_part(peer)
+                    && route.incarnation.as_deref() == incarnation
+                    && matches!(
+                        route.state,
+                        RouteState::Offered | RouteState::Incoming | RouteState::Active
+                    )
+            });
+        if current {
+            let key = (route_id.to_string(), incarnation.map(str::to_string));
+            if !observe_route_network(
+                &mut st.route_networks,
+                key,
+                network,
+                network_epoch,
+                RouteNetworkObservation::OutboundOffer,
+            ) {
+                tracing::warn!(
+                    route = %route_id,
+                    network,
+                    disposition = "outbound_offer_path_change_refused",
+                    "route lifetime is already pinned to another data-plane network"
+                );
+            }
+        }
+    }
+
+    /// Validate an authenticated inbound route control against the immutable
+    /// path for its exact lifetime. An Accept may confirm a different path
+    /// while the outbound Offer pin is still tentative. No control may move a
+    /// confirmed route.
+    fn inbound_route_control_path_ok(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        network: &str,
+    ) -> bool {
+        let state = self.state.lock();
+        if !state.networks.iter().any(|joined| joined == network) {
+            return false;
+        }
+        let Some((route_id, incarnation)) = route_control_network_key(message) else {
+            return true;
+        };
+        let exact_route = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .filter(|route| {
+                pubkey_part(route.peer.as_str()) == pubkey_part(peer)
+                    && route.incarnation.as_deref() == incarnation
+            });
+
+        // A new inbound Offer has no route table entry yet. A same-id
+        // successor likewise has a new incarnation and may establish its own
+        // independent path.
+        if matches!(message, ControlMessage::Route(RouteControl::Offer { .. }))
+            && exact_route.is_none()
+        {
+            return true;
+        }
+        let Some(route) = exact_route else {
+            return false;
+        };
+        let key = (route_id.to_string(), route.incarnation.clone());
+        let current_network_epoch = state.network_epochs.get(network).copied();
+        match state.route_networks.get(&key) {
+            Some(pin)
+                if pin.network == network && current_network_epoch == Some(pin.network_epoch) =>
+            {
+                true
+            }
+            Some(pin)
+                if !pin.confirmed
+                    && matches!(message, ControlMessage::Route(RouteControl::Accept { .. })) =>
+            {
+                true
+            }
+            None => {
+                // Legacy peers cannot name route lifetimes. Preserve their
+                // single-network behavior, but never guess in a multi-network
+                // session or for a fenced route.
+                route.incarnation.is_none()
+                    && state.networks.len() == 1
+                    && state.networks[0] == network
+            }
+            _ => false,
+        }
+    }
+
+    /// Commit an inbound Offer/Accept path after the Session accepted the
+    /// message. The state lock covers both the route identity check and the
+    /// pin transition, preventing teardown or same-id replacement ABA.
+    fn commit_inbound_route_network_locked(
+        state: &mut State,
+        peer: &str,
+        message: &ControlMessage,
+        network: &str,
+    ) {
+        let observation = match message {
+            ControlMessage::Route(RouteControl::Offer { .. }) => {
+                RouteNetworkObservation::InboundOffer
+            }
+            ControlMessage::Route(RouteControl::Accept { .. }) => {
+                RouteNetworkObservation::InboundAccept
+            }
+            _ => return,
+        };
+        if !state.networks.iter().any(|joined| joined == network) {
+            return;
+        }
+        let Some(network_epoch) = state.network_epochs.get(network).copied() else {
+            return;
+        };
+        let Some((route_id, incarnation)) = route_control_network_key(message) else {
+            return;
+        };
+        let current = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                pubkey_part(route.peer.as_str()) == pubkey_part(peer)
+                    && route.incarnation.as_deref() == incarnation
+                    && matches!(
+                        route.state,
+                        RouteState::Offered | RouteState::Incoming | RouteState::Active
+                    )
+            });
+        if !current {
+            return;
+        }
+        let key = (route_id.to_string(), incarnation.map(str::to_string));
+        if !observe_route_network(
+            &mut state.route_networks,
+            key,
+            network,
+            network_epoch,
+            observation,
+        ) {
+            tracing::warn!(
+                route = %route_id,
+                network,
+                observation = ?observation,
+                disposition = "confirmed_route_path_change_refused",
+                "inbound control attempted to move an active route to another data-plane network"
+            );
+        }
     }
 
     /// Seed `peer_networks` from the daemon's per-network peer list — the same
@@ -2009,7 +3060,17 @@ impl Mesh {
     /// the network's `config_id`, matching what an inbound frame records and what
     /// [`Mesh::prune_unjoined_peers`] reconciles against.
     async fn refresh_peer_networks(self: &Arc<Self>) {
-        let networks = { self.state.lock().networks.clone() };
+        let _refresh = self.peer_refresh_serial.lock().await;
+        let epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
+        let (client_id, generation, networks) = {
+            let state = self.state.lock();
+            (
+                state.client_id,
+                state.network_generation,
+                state.networks.clone(),
+            )
+        };
+        let Some(client_id) = client_id else { return };
         for network in networks {
             let Ok(resp) = self
                 .client
@@ -2020,6 +3081,9 @@ impl Mesh {
             else {
                 continue;
             };
+            if !self.network_snapshot_is_current(epoch, client_id, generation, &network) {
+                return;
+            }
             let Some(peers) = resp
                 .data
                 .as_ref()
@@ -2030,8 +3094,27 @@ impl Mesh {
             };
             let changed = {
                 let mut st = self.state.lock();
+                if st.client_id != Some(client_id)
+                    || st.network_generation != generation
+                    || !st.networks.contains(&network)
+                    || self.daemon_session_epoch.load(Ordering::SeqCst) != epoch
+                {
+                    return;
+                }
+                // This PeersList is the current truth for this network. Clear
+                // only this path from prior observations, then add its live
+                // rows back. Failed PeersList requests never reach here and
+                // therefore never destructively erase a path.
+                for paths in st.peer_networks.values_mut() {
+                    paths.daemon_reachable.remove(&network);
+                    if paths.preferred.as_deref() == Some(network.as_str())
+                        && !paths.contains(&network)
+                    {
+                        paths.preferred = None;
+                    }
+                }
                 seed_peer_networks(&mut st.peer_networks, peers, &network);
-                seed_peer_links(&mut st.peer_links, peers)
+                seed_peer_links(&mut st.peer_links, peers, &network)
             };
             // A peer's link class landing (or flipping — an ICE-restart
             // handoff can move a link LAN→STUN mid-life) re-gates its live
@@ -2044,8 +3127,11 @@ impl Mesh {
                     .route_ids()
                     .into_iter()
                     .filter(|route_id| {
-                        self.route_peer(route_id)
-                            .is_some_and(|p| pubkey_part(&p) == peer)
+                        self.route_peer(route_id).is_some_and(|p| {
+                            pubkey_part(&p) == peer
+                                && self.network_for_route(route_id, &p).as_deref()
+                                    == Some(network.as_str())
+                        })
                     })
                     .collect::<Vec<_>>();
                 if route_ids.is_empty() {
@@ -2101,7 +3187,18 @@ impl Mesh {
         if let Some(id) = self.local_node_id() {
             return Some(id);
         }
-        self.fetch_identity().await
+        if let Some(id) = self.fetch_identity().await {
+            return Some(id);
+        }
+        // During a daemon/event-socket restart the ephemeral Session is
+        // intentionally absent, but the last authenticated local profile is
+        // still enough to preserve a user's route intent. Bring-up will replay
+        // that intent after it confirms the daemon identity again.
+        self.state
+            .lock()
+            .profile
+            .as_ref()
+            .map(|profile| profile.node.to_string())
     }
 
     /// Bring the session online and keep it online: identify, pick a
@@ -2167,9 +3264,58 @@ impl Mesh {
                     }
                 };
                 mesh.bring_up(client_id).await;
+                let daemon_epoch = mesh.daemon_session_epoch.load(Ordering::SeqCst);
+                // Base64 media can be large enough that decoding it inline
+                // starves route control and presence on the daemon's single
+                // event stream. Keep the event reader hot and hand media to
+                // the same bounded queue depths already reviewed for the
+                // video/audio pipelines. Control events remain ordered here.
+                let (video_event_tx, mut video_event_rx) =
+                    mpsc::channel::<Value>(usize::from(VIDEO_HANDOFF_FRAMES));
+                let (audio_event_tx, mut audio_event_rx) =
+                    mpsc::channel::<Value>(usize::from(AUDIO_HANDOFF_PACKETS));
+                let video_mesh = mesh.clone();
+                crate::spawn(async move {
+                    while let Some(value) = video_event_rx.recv().await {
+                        if !video_mesh.daemon_context_is_current(daemon_epoch, client_id) {
+                            break;
+                        }
+                        video_mesh.handle_value(value).await;
+                    }
+                });
+                let audio_mesh = mesh.clone();
+                crate::spawn(async move {
+                    while let Some(value) = audio_event_rx.recv().await {
+                        if !audio_mesh.daemon_context_is_current(daemon_epoch, client_id) {
+                            break;
+                        }
+                        audio_mesh.handle_value(value).await;
+                    }
+                });
                 while let Some(value) = rx.recv().await {
-                    mesh.handle_value(value).await;
+                    match value.get("kind").and_then(Value::as_str) {
+                        Some("video_inbound") => {
+                            if let Err(error) = video_event_tx.try_send(value) {
+                                let dropped = error.into_inner();
+                                mesh.note_base64_media_dispatch_drop("video", &dropped);
+                            }
+                        }
+                        Some("audio_inbound") => {
+                            if let Err(error) = audio_event_tx.try_send(value) {
+                                let dropped = error.into_inner();
+                                mesh.note_base64_media_dispatch_drop("audio", &dropped);
+                            }
+                        }
+                        _ => mesh.handle_value(value).await,
+                    }
                 }
+                drop(video_event_tx);
+                drop(audio_event_tx);
+                mesh.retire_daemon_event_context(client_id);
+                // The local injector outlives the daemon event socket. Release
+                // every held key and mouse button as soon as that socket dies,
+                // even if the daemon never reaches a replacement bring-up.
+                mesh.injector.release_all();
                 // Stream ended: the daemon died or dropped the socket. Say
                 // so, then go re-subscribe — this loop *is* the retry.
                 tracing::warn!("mesh: daemon event stream ended — reconnecting");
@@ -2179,13 +3325,92 @@ impl Mesh {
         });
     }
 
+    /// Invalidate work tied to a daemon event client as soon as its socket
+    /// ends. Waiting for the next successful bring-up left a reconnect gap in
+    /// which reliable-control and media workers could still target the dead
+    /// client. The client-id check makes a delayed old task harmless if a
+    /// successor context has already been installed.
+    fn retire_daemon_event_context(&self, client_id: ClientId) {
+        let retired = {
+            let mut active = self.active_daemon_context.lock();
+            if active.is_some_and(|context| context.client_id == client_id) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
+        if !retired {
+            return;
+        }
+        let daemon_epoch = self
+            .daemon_session_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        self.reliable_control_epoch.send_replace(daemon_epoch);
+        self.reliable_control_workers.lock().clear();
+        let mut state = self.state.lock();
+        if state.client_id == Some(client_id) {
+            state.client_id = None;
+            state.network_generation = state.network_generation.wrapping_add(1);
+        }
+    }
+
+    /// Record a bounded event-pump drop without blocking the daemon reader.
+    /// A dropped H.264 access unit invalidates dependent deltas, so ask for a
+    /// fresh keyframe through the existing route-control data message. Audio
+    /// loss is left to the existing jitter buffer and PLC path.
+    fn note_base64_media_dispatch_drop(self: &Arc<Self>, media: &'static str, value: &Value) {
+        let network = value.get("network").and_then(Value::as_str).unwrap_or("");
+        let from = value.get("from").and_then(Value::as_str).unwrap_or("");
+        let lane = value.get("stream").and_then(Value::as_u64).unwrap_or(0) as u8;
+        let key = format!("event-media-drop:{network}:{media}:{}:{lane}", pubkey_part(from));
+        if self.diag_ok(&key) {
+            tracing::warn!(
+                peer = %short_id(from),
+                network,
+                media,
+                lane,
+                "bounded daemon media dispatcher dropped an overloaded packet"
+            );
+        }
+        if media == "video" {
+            if let Some(route_id) = self.video_route_for_lane(network, from, lane) {
+                let mesh = self.clone();
+                crate::spawn(async move {
+                    let _ = mesh.request_refresh(route_id).await;
+                });
+            }
+        }
+    }
+
     /// Tear down process-local media state before installing a daemon's fresh
     /// session. The restarted daemon owns none of the old lanes/routes; keeping
     /// allocator ids, captures, decoders, or lane bindings would let a later
     /// route inherit stale priority and audio reservations. Deliberately do not
     /// send lane-close requests here: they would target the new daemon and could
     /// race a successor route onto the same positional lane.
-    fn reset_media_for_fresh_session(&self) {
+    async fn reset_media_for_fresh_session(&self) {
+        let daemon_epoch = self
+            .daemon_session_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        *self.active_daemon_context.lock() = None;
+        self.reliable_control_epoch.send_replace(daemon_epoch);
+        let retired_reliable_workers = {
+            let mut workers = self.reliable_control_workers.lock();
+            let count = workers.len();
+            workers.clear();
+            count
+        };
+        if retired_reliable_workers != 0 {
+            tracing::info!(
+                daemon_epoch,
+                retired_reliable_workers,
+                "retired stale reliable route-control workers for fresh daemon session"
+            );
+        }
+        self.rotate_route_boot();
         // Invalidate every old route gate atomically before doing any teardown
         // work. The rest of bring-up awaits identity/network queries; leaving
         // the old Session visible during those awaits would let a late media
@@ -2193,8 +3418,17 @@ impl Mesh {
         let old_session = {
             let mut state = self.state.lock();
             state.client_id = None;
+            state.network_generation = state.network_generation.wrapping_add(1);
+            state.network_epochs.clear();
+            state.route_networks.clear();
+            state.peer_networks.clear();
+            state.peer_links.clear();
             state.session.take()
         };
+        // The injector, not the vanished daemon session, is authoritative for
+        // what this process still holds on the OS. Lift every old key and mouse
+        // button before installing replacement routes.
+        self.injector.release_all();
         let mut routes = std::collections::BTreeSet::new();
         if let Some(session) = old_session.as_ref() {
             routes.extend(
@@ -2221,6 +3455,7 @@ impl Mesh {
             );
         }
         for route_id in &routes {
+            let _lifecycle = self.lock_route_lifecycle(route_id).await;
             self.video_route_generations.lock().retire(route_id);
             self.audio.stop(route_id);
             self.video.stop(route_id);
@@ -2228,12 +3463,17 @@ impl Mesh {
         }
 
         self.media_policy.lock().reset();
-        self.requested_video_tunes.lock().clear();
+        self.effective_plan_echo_epoch
+            .fetch_add(1, Ordering::SeqCst);
+        self.effective_plan_echoes.lock().clear();
+        // Keep the user's requested quality posture beside desired route
+        // intent. The replacement route replays it after activation; clearing
+        // it here is what made a daemon reconnect silently fall back to Auto.
         self.pcm_audio_routes.lock().clear();
         self.audio_decoders.lock().clear();
         self.audio_encoders.lock().clear();
         *self.video_in.lock() = VideoAssembler::new();
-        self.video_watchers.lock().clear();
+        self.video_watchers.lock().reset_for_reconnect();
         self.video_arrivals.lock().clear();
         self.video_in_stats.lock().clear();
         self.video_diag_last.lock().clear();
@@ -2241,9 +3481,11 @@ impl Mesh {
         self.refresh_asks.lock().clear();
         self.video_lane_pins.lock().clear();
         self.video_lane_binds.lock().clear();
+        self.active_media_incarnations.lock().clear();
         *self.video_switch_guards.lock() = VideoSwitchGuards::default();
         self.daemon_video.store(false, Ordering::SeqCst);
         self.daemon_audio.store(false, Ordering::SeqCst);
+        self.network_subscriptions.lock().clear();
         self.daemon_media_pipes.store(false, Ordering::SeqCst);
         self.daemon_lanes.store(1, Ordering::SeqCst);
     }
@@ -2255,7 +3497,7 @@ impl Mesh {
     /// everything is re-established, and peers re-learn us from the fresh
     /// presence broadcast.
     async fn bring_up(self: &Arc<Self>, client_id: ClientId) {
-        self.reset_media_for_fresh_session();
+        self.reset_media_for_fresh_session().await;
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
@@ -2264,6 +3506,37 @@ impl Mesh {
             .await
             .unwrap_or_else(|| NodeId::this().to_string());
         let label = self.fetch_identity_label().await;
+        // Capability fields that presence advertises must be known before the
+        // profile is built and broadcast. Probing lane count later during
+        // VideoSubscribe left every fresh session permanently advertising a
+        // single lane even when the daemon reported a pool.
+        let daemon_status = self
+            .client
+            .request(&Request::Status)
+            .await
+            .ok()
+            .and_then(|response| response.data);
+        if let Some(lanes) = daemon_status
+            .as_ref()
+            .and_then(|data| data.get("media_lanes"))
+            .and_then(Value::as_u64)
+        {
+            if lanes > u64::from(PRENEGOTIATED_MEDIA_LANES) {
+                tracing::info!(
+                    reported_lanes = lanes,
+                    usable_lanes = PRENEGOTIATED_MEDIA_LANES,
+                    "dynamic media lanes require SDP renegotiation; restricting video/audio to pre-negotiated lane 0"
+                );
+            }
+            self.daemon_lanes
+                .store(PRENEGOTIATED_MEDIA_LANES, Ordering::SeqCst);
+        }
+        let media_pipes = daemon_status
+            .as_ref()
+            .and_then(|data| data.get("media_pipes"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.daemon_media_pipes.store(media_pipes, Ordering::SeqCst);
         let profile = self.build_profile(&me, label);
         // Join the claim-rendezvous networks *before* listing networks, so
         // the LAN claim network (and the claim-code network, when public
@@ -2282,23 +3555,20 @@ impl Mesh {
             st.profile = Some(profile.clone());
             st.network = primary.clone();
             st.networks = networks.clone();
+            st.network_generation = st.network_generation.wrapping_add(1);
+            reconcile_network_epochs(&mut st, &networks, true);
         }
+        let daemon_epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
+        *self.active_daemon_context.lock() = Some(DaemonContext {
+            epoch: daemon_epoch,
+            client_id,
+        });
 
         // Probe the daemon's binary-media-pipe capability up front (the version
         // pin can't gate it — the feature predates a release). This gates the
         // inbound source pipe below and the outbound sends in
         // `send_video_track`/`send_audio_track`. A daemon without it (an older
         // build still on the socket) keeps streaming over the base64 path.
-        let media_pipes = self
-            .client
-            .request(&Request::Status)
-            .await
-            .ok()
-            .and_then(|r| r.data)
-            .and_then(|d| d.get("media_pipes").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
-        self.daemon_media_pipes.store(media_pipes, Ordering::SeqCst);
-
         // Inbound media (H.264/Opus from peers) rides a dedicated binary pipe —
         // no base64 — instead of the JSON event socket. Open it for our event
         // `client_id` before subscribing video/audio, so the daemon has the
@@ -2306,7 +3576,13 @@ impl Mesh {
         // skip the pipe entirely — its pumps then emit base64
         // `video_inbound`/`audio_inbound` events, which the value dispatcher
         // below still decodes and handles.
-        if media_pipes {
+        // The v1 binary source frame omits its network id. It is unambiguous
+        // only when one network is joined; with two PeerSessions the same
+        // peer+lane can exist independently on both. In that case leave the
+        // binary sink unregistered so the daemon uses its base64 event path,
+        // whose VideoInbound/AudioInbound events carry `network`.
+        if media_pipes && MEDIA_SOURCE_HAS_NETWORK_IDENTITY && networks.len() == 1 {
+            let source_network = networks[0].clone();
             let (media_tx, mut media_rx) = mpsc::channel::<ProfiledInboundFrame>(256);
             match self
                 .client
@@ -2318,13 +3594,22 @@ impl Mesh {
                         "binary media pipes active — H.264/Opus carry raw over the IPC (no base64) in both directions"
                     );
                     let mesh = self.clone();
+                    let source_epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
                     crate::spawn(async move {
                         while let Some(mut profiled) = media_rx.recv().await {
+                            if mesh.daemon_session_epoch.load(Ordering::SeqCst) != source_epoch {
+                                tracing::debug!(
+                                    source_epoch,
+                                    "retiring stale daemon media-source task"
+                                );
+                                break;
+                            }
                             profiled.record_dispatch_wait();
                             let profile_id = profiled.profile_id;
                             let f = profiled.frame;
                             match f.kind {
                                 MEDIA_KIND_VIDEO => mesh.handle_video_inbound_profiled(
+                                    &source_network,
                                     &f.from,
                                     f.stream,
                                     f.rtp_timestamp,
@@ -2333,6 +3618,7 @@ impl Mesh {
                                     profile_id,
                                 ),
                                 MEDIA_KIND_AUDIO => mesh.handle_audio_inbound(
+                                    &source_network,
                                     &f.from,
                                     f.stream,
                                     f.rtp_timestamp,
@@ -2350,6 +3636,11 @@ impl Mesh {
                     self.daemon_media_pipes.store(false, Ordering::SeqCst);
                 }
             }
+        } else if media_pipes {
+            tracing::warn!(
+                networks = networks.len(),
+                "binary media-source v1 omits network identity and can outlive network-set changes; using network-tagged events to prevent cross-mesh lane aliasing"
+            );
         } else {
             tracing::info!(
                 "daemon has no binary media pipes — inbound video/audio arrive as base64 events (rebuild myownmesh from this branch to enable the binary pipes)"
@@ -2385,6 +3676,13 @@ impl Mesh {
             self.emit_status("live", None);
         }
 
+        // The daemon-backed Session above is intentionally fresh. Reinstall
+        // only routes the local user still wants, after channel subscriptions
+        // and presence/ownership adverts are in place. A control Offer may
+        // still outrun its presence message on another SCTP channel; fenced
+        // receivers hold it out and the existing offer sweep retries it.
+        self.replay_desired_routes(None).await;
+
         // No periodic re-broadcast: gossip is event-driven. Late joiners are
         // covered twice over — the daemon's "peer approved" event triggers a
         // targeted ownership check at them, and a presence advert carrying a
@@ -2404,14 +3702,50 @@ impl Mesh {
     /// late `Accept` after expiry is harmless (the route reads rejected
     /// here; re-connecting mints a fresh route id).
     fn spawn_offer_reaper(self: &Arc<Self>) {
-        const SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
-        const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
         let mesh = Arc::downgrade(self);
         crate::spawn(async move {
             loop {
-                tokio::time::sleep(SWEEP).await;
+                tokio::time::sleep(OFFER_SWEEP).await;
                 let Some(mesh) = mesh.upgrade() else { break };
-                let mut expired: Vec<String> = Vec::new();
+                let teardown_retries = {
+                    let now = Instant::now();
+                    let mut pending = mesh.pending_teardowns.lock();
+                    pending.retain(|(route_id, incarnation), teardown| {
+                        let keep = now.duration_since(teardown.created) < OFFER_TIMEOUT;
+                        if !keep {
+                            tracing::warn!(
+                                route = %route_id,
+                                incarnation = ?incarnation,
+                                peer = %short_id(&teardown.peer),
+                                "route teardown acknowledgement timed out; retiring retry state"
+                            );
+                        }
+                        keep
+                    });
+                    pending.values().cloned().collect::<Vec<_>>()
+                };
+                for teardown in teardown_retries {
+                    let result = if let Some(network) = teardown.network.as_deref() {
+                        mesh.send_control_retry_on_network(
+                            &teardown.peer,
+                            &teardown.message,
+                            network,
+                        )
+                        .await
+                    } else {
+                        mesh.send_control_retry(&teardown.peer, &teardown.message)
+                            .await
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(
+                            peer = %short_id(&teardown.peer),
+                            error = %error,
+                            "route teardown retry did not reach the peer app"
+                        );
+                    }
+                }
+                let mut expired: Vec<(String, Option<String>)> = Vec::new();
+                let mut retries: Vec<(String, ControlMessage)> = Vec::new();
                 {
                     let mut seen = mesh.offer_first_seen.lock();
                     let mut st = mesh.state.lock();
@@ -2419,40 +3753,85 @@ impl Mesh {
                         seen.clear();
                         continue;
                     };
-                    let offered: Vec<String> = session
+                    let offered: std::collections::HashSet<(String, Option<String>)> = session
                         .routes()
                         .filter(|r| {
                             r.origin == allmystuff_session::Origin::Outbound
                                 && r.state == allmystuff_session::RouteState::Offered
                         })
-                        .map(|r| r.route.id.clone())
+                        .map(|r| (r.route.id.clone(), r.incarnation.clone()))
                         .collect();
                     // Anything no longer an unanswered outbound offer stops
                     // being timed (accepted, rejected, torn down, gone).
-                    seen.retain(|id, _| offered.contains(id));
+                    seen.retain(|key, _| offered.contains(key));
                     let now = std::time::Instant::now();
-                    for id in offered {
-                        let first = *seen.entry(id.clone()).or_insert(now);
-                        if now.duration_since(first) >= OFFER_TIMEOUT
-                            && session.expire_offer(
+                    for (id, incarnation) in offered {
+                        let key = (id.clone(), incarnation.clone());
+                        let first = *seen.entry(key.clone()).or_insert(now);
+                        let did_expire = now.duration_since(first) >= OFFER_TIMEOUT
+                            && session.expire_offer_incarnation(
                                 &id,
+                                incarnation.as_deref(),
                                 "no answer from the far side — its AllMyStuff app may not be \
                                  running (its mesh daemon can still advertise it)",
-                            )
-                        {
-                            seen.remove(&id);
-                            expired.push(id);
+                            );
+                        if did_expire {
+                            seen.remove(&key);
+                            expired.push(key);
+                        } else if let Some(route) = session.route(&id).filter(|route| {
+                            route.state == RouteState::Offered && route.incarnation == incarnation
+                        }) {
+                            retries.push((
+                                route.peer.to_string(),
+                                ControlMessage::Route(RouteControl::Offer {
+                                    route: route.route.clone(),
+                                    incarnation: route.incarnation.clone(),
+                                    video: route.video.clone(),
+                                    audio: route.audio.clone(),
+                                    session: route.term_session.clone(),
+                                }),
+                            ));
                         }
                     }
                 }
+                for (peer, message) in retries {
+                    if let Err(error) = mesh.send_control_retry(&peer, &message).await {
+                        tracing::debug!(
+                            peer = %short_id(&peer),
+                            error = %error,
+                            "route offer retry did not reach the peer"
+                        );
+                    }
+                }
                 if !expired.is_empty() {
-                    for id in &expired {
+                    {
+                        let mut state = mesh.state.lock();
+                        for key in &expired {
+                            state.route_networks.remove(key);
+                        }
+                    }
+                    let replay_peers = {
+                        let desired = mesh.desired_routes.lock();
+                        expired
+                            .iter()
+                            .filter_map(|(id, _)| desired.get(id).map(|route| route.peer.clone()))
+                            .collect::<std::collections::BTreeSet<_>>()
+                    };
+                    for (id, _) in &expired {
                         tracing::warn!(
                             "route offer {id} went unanswered for {OFFER_TIMEOUT:?} — expired \
                              (is the far side's AllMyStuff app running?)"
                         );
                     }
                     mesh.emit_snapshot();
+                    // The Session attempt is ephemeral; the user's still-open
+                    // console intent is not. Rebuild it with a fresh wire
+                    // incarnation on the same established app-data path. This
+                    // also recovers a same-boot outage where no new presence
+                    // event exists to trigger replay.
+                    for peer in replay_peers {
+                        mesh.replay_desired_routes(Some(&peer)).await;
+                    }
                 }
             }
         });
@@ -2526,6 +3905,7 @@ impl Mesh {
                     match st.session.as_ref() {
                         Some(session) => session
                             .routes()
+                            .filter(|r| r.is_active())
                             .map(|r| {
                                 (
                                     r.peer.as_str().to_string(),
@@ -2816,7 +4196,7 @@ impl Mesh {
             // spoken for (or one that was never put into claim mode).
             owner: self.ownership.owner().map(NodeId::from),
             claimable: self.ownership.claimable(),
-            boot: self.boot_id.load(Ordering::Relaxed),
+            boot: self.route_incarnation_clock.lock().boot,
             // This build can host mesh-native terminals on every OS the
             // app ships for (openpty / ConPTY) — advertise it so peers
             // know to offer one. Runtime spawn failures still degrade
@@ -2827,25 +4207,7 @@ impl Mesh {
             // can't hear them. Camera streaming likewise rides every OS
             // (V4L2 / AVFoundation / Media Foundation); a camera that
             // won't open at route time degrades in-band too (`vstat`).
-            features: {
-                let mut f = vec![
-                    allmystuff_protocol::FEATURE_FILES.to_string(),
-                    allmystuff_protocol::FEATURE_ROOMS.to_string(),
-                    allmystuff_protocol::FEATURE_SITES.to_string(),
-                ];
-                // Hosting a shell or a camera stream needs the capture
-                // planes — a capture-less build (iOS) must not invite
-                // offers its stubs would refuse.
-                #[cfg(feature = "host")]
-                {
-                    f.push(allmystuff_protocol::FEATURE_TERMINAL.to_string());
-                    f.push(allmystuff_protocol::FEATURE_CAMERA.to_string());
-                }
-                if self.daemon_lanes.load(Ordering::SeqCst) > 1 {
-                    f.push(allmystuff_protocol::FEATURE_MEDIA_LANES.to_string());
-                }
-                f
-            },
+            features: Self::advertised_features(),
             // Only the services the owner opted to expose (the exposed set is
             // the host's allow-list); a scan that found a dozen listeners
             // advertises only those, each under its chosen name. Empty until
@@ -3007,6 +4369,7 @@ impl Mesh {
                 self.handle_channel(channel, from, network, payload).await;
             }
             "video_inbound" => {
+                let network = value.get("network").and_then(|v| v.as_str()).unwrap_or("");
                 let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
                 let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
                     return;
@@ -3017,15 +4380,29 @@ impl Mesh {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                if self.video_route_for_lane(network, from, stream).is_none() {
+                    self.nack_dead_lane(network, from, "video", stream);
+                    return;
+                }
+                if !base64_media_len_allowed(data.len()) {
+                    tracing::warn!(
+                        peer = %short_id(from),
+                        network,
+                        encoded_bytes = data.len(),
+                        "dropping oversized base64 video frame before decode"
+                    );
+                    return;
+                }
                 // Base64 fallback path (a daemon without the binary media-source
                 // pipe): decode here so the handler always gets raw bytes.
                 use base64::Engine as _;
                 let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
                     return;
                 };
-                self.handle_video_inbound(from, stream, rtp_timestamp, key, data);
+                self.handle_video_inbound(network, from, stream, rtp_timestamp, key, data);
             }
             "audio_inbound" => {
+                let network = value.get("network").and_then(|v| v.as_str()).unwrap_or("");
                 let from = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
                 let Some(data) = value.get("data").and_then(|v| v.as_str()) else {
                     return;
@@ -3035,11 +4412,24 @@ impl Mesh {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
                 let stream = value.get("stream").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                if self.audio_route_for_lane(network, from, stream).is_none() {
+                    self.nack_dead_lane(network, from, "audio", stream);
+                    return;
+                }
+                if !base64_media_len_allowed(data.len()) {
+                    tracing::warn!(
+                        peer = %short_id(from),
+                        network,
+                        encoded_bytes = data.len(),
+                        "dropping oversized base64 audio frame before decode"
+                    );
+                    return;
+                }
                 use base64::Engine as _;
                 let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
                     return;
                 };
-                self.handle_audio_inbound(from, stream, rtp_timestamp, data);
+                self.handle_audio_inbound(network, from, stream, rtp_timestamp, data);
             }
             "event" => {
                 if let Some(event) = value.get("event") {
@@ -3136,11 +4526,8 @@ impl Mesh {
         // Remember which network this peer is reachable on, so control/media
         // we send back goes to the right one (a peer may share only one of the
         // several networks we're on).
-        if !network.is_empty() && !from.is_empty() {
-            self.state
-                .lock()
-                .peer_networks
-                .insert(pubkey_part(&from).to_string(), network.clone());
+        if channel != CHANNEL_PRESENCE && !network.is_empty() && !from.is_empty() {
+            self.note_peer_network_observed(&from, &network);
         }
         match channel {
             CHANNEL_PRESENCE => {
@@ -3167,13 +4554,49 @@ impl Mesh {
                     // neither condition fires again. `boot == 0` is an older
                     // heartbeating peer. Our own echo never replies to itself.
                     let canon = pubkey_part(profile.node.as_str()).to_string();
+                    if canon != pubkey_part(&from) {
+                        tracing::warn!(
+                            from = %short_id(&from),
+                            claimed = %short_id(profile.node.as_str()),
+                            "dropping presence whose body node does not match its authenticated channel sender"
+                        );
+                        return;
+                    }
+                    let is_self = self
+                        .local_node_id()
+                        .is_some_and(|me| pubkey_part(&me) == canon);
+                    let boot_disposition = if is_self {
+                        PeerBootDisposition::Current
+                    } else {
+                        let mut state = self.state.lock();
+                        let State {
+                            peer_boots,
+                            peer_retired_boots,
+                            ..
+                        } = &mut *state;
+                        admit_peer_boot(peer_boots, peer_retired_boots, &canon, profile.boot)
+                    };
+                    if matches!(
+                        boot_disposition,
+                        PeerBootDisposition::Retired | PeerBootDisposition::LegacyDowngrade
+                    ) {
+                        tracing::warn!(
+                            from = %short_id(&from),
+                            boot = profile.boot,
+                            disposition = ?boot_disposition,
+                            "dropping stale peer presence before it can change routes, capabilities, authorization, or path preference"
+                        );
+                        return;
+                    }
+                    // Presence can steer the preferred return path only after
+                    // its peer identity and boot lifetime have passed the gate.
+                    if !network.is_empty() {
+                        self.note_peer_network_observed(&from, &network);
+                    }
                     self.state
                         .lock()
                         .peer_features
                         .insert(canon.clone(), profile.features.clone());
-                    let is_self = self
-                        .local_node_id()
-                        .is_some_and(|me| pubkey_part(&me) == canon);
                     // A stamped advert is a free clock-skew sample: the
                     // sender's wall clock at send vs ours at receipt
                     // (delivery is one data-channel hop — milliseconds,
@@ -3183,10 +4606,7 @@ impl Mesh {
                         let sample = profile.sent_at as i64 - unix_now_ms() as i64;
                         self.note_peer_clock(&canon, sample);
                     }
-                    let new_boot = profile.boot != 0 && !is_self && {
-                        let mut st = self.state.lock();
-                        st.peer_boots.insert(canon, profile.boot) != Some(profile.boot)
-                    };
+                    let new_boot = boot_disposition == PeerBootDisposition::Fresh;
                     // Whether this peer's presence was already on file *before*
                     // we fold in this advert. A peer we don't yet know gets an
                     // answer regardless of boot id, so a single dropped first
@@ -3342,6 +4762,19 @@ impl Mesh {
                                 self.sink.emit("cec://help", json!({ "watchers": reached }));
                             }
                         }
+                        if new_boot {
+                            // A fresh peer app boot cannot retain any route
+                            // from the previous lifetime, so outstanding
+                            // teardown confirmations are now proven complete.
+                            self.pending_teardowns.lock().retain(|_, teardown| {
+                                pubkey_part(&teardown.peer) != pubkey_part(&from)
+                            });
+                        }
+                        let mesh = self.clone();
+                        let replay_peer = from.clone();
+                        crate::spawn(async move {
+                            mesh.replay_desired_routes(Some(&replay_peer)).await;
+                        });
                     }
                     if changed {
                         self.emit_snapshot();
@@ -3383,7 +4816,10 @@ impl Mesh {
                     // StartMedia in one step), and a shell — or this disk —
                     // is owner/fleet-only, the same rule as input injection,
                     // enforced before any reply exists.
-                    if let ControlMessage::Route(RouteControl::Offer { route, .. }) = &msg {
+                    if let ControlMessage::Route(RouteControl::Offer {
+                        route, incarnation, ..
+                    }) = &msg
+                    {
                         // Log every inbound offer at the point it's received, so
                         // a host's node log shows whether an offer even arrived
                         // (vs. an offerer stuck "awaiting accept" because nothing
@@ -3418,14 +4854,16 @@ impl Mesh {
                                 short_id(&from)
                             );
                             let _ = self
-                                .send_control(
+                                .send_control_on_network(
                                     &from,
                                     &ControlMessage::Route(RouteControl::Reject {
                                         route_id: route.id.clone(),
+                                        incarnation: incarnation.clone(),
                                         reason: "the customer hasn't approved screen sharing \
                                                  for you (or revoked it)"
                                             .into(),
                                     }),
+                                    &network,
                                 )
                                 .await;
                             return;
@@ -3439,15 +4877,56 @@ impl Mesh {
                                 short_id(&from)
                             );
                             let _ = self
-                                .send_control(
+                                .send_control_on_network(
                                     &from,
                                     &ControlMessage::Route(RouteControl::Reject {
                                         route_id: route.id.clone(),
+                                        incarnation: incarnation.clone(),
                                         reason,
                                     }),
+                                    &network,
                                 )
                                 .await;
                             return;
+                        }
+
+                        // A fenced offer is only meaningful after presence has
+                        // bound its boot to this peer. Presence and control use
+                        // separate application channels, so the offer can
+                        // legally arrive first or the one-shot presence frame
+                        // can be lost. Ask for the profile on the existing data
+                        // channel instead of silently dropping every retry for
+                        // this boot forever. The existing per-peer backoff keeps
+                        // repeated offers from turning this into a request loop.
+                        if let Some(incarnation) = incarnation.as_deref() {
+                            let advertised_boot = route_incarnation_boot(incarnation);
+                            let learned_boot = self
+                                .state
+                                .lock()
+                                .session
+                                .as_ref()
+                                .and_then(|session| session.peer(&NodeId::from(from.as_str())))
+                                .map(|profile| profile.boot);
+                            if advertised_boot.is_none() || learned_boot != advertised_boot {
+                                tracing::warn!(
+                                    route = %route.id,
+                                    from = %short_id(&from),
+                                    advertised_boot = ?advertised_boot,
+                                    learned_boot = ?learned_boot,
+                                    disposition = "presence_required",
+                                    "fenced route offer arrived before matching peer presence"
+                                );
+                                if advertised_boot.is_some() && self.allow_profile_request(&from) {
+                                    let _ = self
+                                        .send_control_on_network(
+                                            &from,
+                                            &ControlMessage::ProfileRequest,
+                                            &network,
+                                        )
+                                        .await;
+                                }
+                                return;
+                            }
                         }
                     }
                     // Only a periodic viewer report produced after the close's
@@ -3467,12 +4946,97 @@ impl Mesh {
                         }
                     }
 
+                    if let ControlMessage::Route(RouteControl::TeardownAck {
+                        route_id,
+                        incarnation,
+                    }) = &msg
+                    {
+                        let key = (route_id.clone(), incarnation.clone());
+                        let mut pending = self.pending_teardowns.lock();
+                        let matches = pending.get(&key).is_some_and(|teardown| {
+                            pubkey_part(&teardown.peer) == pubkey_part(&from)
+                                && teardown
+                                    .network
+                                    .as_deref()
+                                    .is_none_or(|expected| expected == network)
+                        });
+                        if matches {
+                            pending.remove(&key);
+                            tracing::debug!(
+                                route = %route_id,
+                                from = %short_id(&from),
+                                "peer app acknowledged route teardown"
+                            );
+                        } else {
+                            tracing::warn!(
+                                route = %route_id,
+                                from = %short_id(&from),
+                                disposition = "unexpected_teardown_ack_ignored",
+                                "route teardown acknowledgement did not match a pending exact lifetime"
+                            );
+                        }
+                        return;
+                    }
+
+                    // MissingRoute/DeadLane recovery deliberately challenges a
+                    // sender with the exact Accept for the lifetime it still
+                    // considers active. If this side no longer has that exact
+                    // outbound offer, answer with an exact terminal response.
+                    // A delayed Accept for predecessor A therefore cannot touch
+                    // same-id successor B, while the orphaned A encoder still
+                    // converges to StopMedia on its owner.
+                    if let ControlMessage::Route(RouteControl::Accept {
+                        route_id,
+                        incarnation: Some(incarnation),
+                        ..
+                    }) = &msg
+                    {
+                        let terminal = {
+                            let state = self.state.lock();
+                            let route = state
+                                .session
+                                .as_ref()
+                                .and_then(|session| session.route(route_id));
+                            exact_accept_terminal_response(route_id, &from, incarnation, route)
+                        };
+                        if let Some(terminal) = terminal {
+                            tracing::warn!(
+                                route = %route_id,
+                                from = %short_id(&from),
+                                incarnation = %incarnation,
+                                disposition = "exact_accept_reconciled_terminal",
+                                "received an Accept for a route lifetime that is not live here"
+                            );
+                            let _ = self
+                                .send_control_on_network(&from, &terminal, &network)
+                                .await;
+                            return;
+                        }
+                    }
+
+                    if !self.inbound_route_control_path_ok(&from, &msg, &network) {
+                        if route_control_network_key(&msg).is_some() {
+                            tracing::warn!(
+                                from = %short_id(&from),
+                                network = %network,
+                                disposition = "route_path_mismatch_ignored",
+                                "inbound route control did not arrive on its exact data-plane path"
+                            );
+                            return;
+                        }
+                    }
+
                     // Teardown used to be the one destructive route control
                     // that was not peer-checked. Authentication, guard choice,
                     // and (when committing) Session mutation are one state-lock
                     // transaction, so a same-id replacement cannot enter in
                     // between and be killed by an old peer message.
-                    if let ControlMessage::Route(RouteControl::Teardown { route_id }) = &msg {
+                    if let ControlMessage::Route(RouteControl::Teardown {
+                        route_id,
+                        incarnation: route_incarnation,
+                    }) = &msg
+                    {
+                        let lifecycle = self.lock_route_lifecycle(route_id).await;
                         let (facts, gate, effects) = {
                             let mut st = self.state.lock();
                             let Some(session) = st.session.as_mut() else {
@@ -3495,9 +5059,14 @@ impl Mesh {
                                 );
                                 return;
                             }
-                            let eligible = facts.as_ref().is_some_and(|(_, state, media)| {
-                                *state == RouteState::Active
-                                    && matches!(media, MediaKind::Display | MediaKind::Video)
+                            let eligible = session.route(route_id).is_some_and(|route| {
+                                route.state == RouteState::Active
+                                    && matches!(
+                                        route.route.media,
+                                        MediaKind::Display | MediaKind::Video
+                                    )
+                                    && route.incarnation.is_none()
+                                    && route_incarnation.is_none()
                             });
                             let gate = if eligible {
                                 self.video_switch_guards.lock().gate_inbound_teardown(
@@ -3509,12 +5078,16 @@ impl Mesh {
                                 InboundVideoTeardownGate::Commit
                             };
                             let effects = if matches!(gate, InboundVideoTeardownGate::Commit) {
-                                session.handle(
+                                let effects = session.handle(
                                     NodeId::from(from.as_str()),
                                     ControlMessage::Route(RouteControl::Teardown {
                                         route_id: route_id.clone(),
+                                        incarnation: route_incarnation.clone(),
                                     }),
-                                )
+                                );
+                                st.route_networks
+                                    .remove(&(route_id.clone(), route_incarnation.clone()));
+                                effects
                             } else {
                                 Vec::new()
                             };
@@ -3547,6 +5120,7 @@ impl Mesh {
                                 );
                                 let mesh = self.clone();
                                 let route_id = route_id.clone();
+                                let route_incarnation = route_incarnation.clone();
                                 crate::spawn(async move {
                                     mesh.commit_quarantined_video_teardown(
                                         route_id,
@@ -3554,6 +5128,7 @@ impl Mesh {
                                         network,
                                         token,
                                         incarnation,
+                                        route_incarnation,
                                     )
                                     .await;
                                 });
@@ -3584,17 +5159,61 @@ impl Mesh {
                                     disposition = "commit",
                                     "inbound route teardown"
                                 );
-                                self.process_effects(effects).await;
+                                self.remove_desired_route_exact(
+                                    &from,
+                                    route_id,
+                                    route_incarnation.as_deref(),
+                                );
+                                let mut deferred = Vec::new();
+                                for effect in effects {
+                                    match effect {
+                                        Effect::StopMedia {
+                                            route_id,
+                                            incarnation,
+                                        } => self.apply_stop_media_locked(route_id, incarnation),
+                                        other => deferred.push(other),
+                                    }
+                                }
+                                drop(lifecycle);
+                                self.process_effects(deferred).await;
+                                if self.peer_supports_teardown_ack(&from) {
+                                    let _ = self
+                                        .send_control_on_network(
+                                            &from,
+                                            &ControlMessage::Route(RouteControl::TeardownAck {
+                                                route_id: route_id.clone(),
+                                                incarnation: route_incarnation.clone(),
+                                            }),
+                                            &network,
+                                        )
+                                        .await;
+                                }
                                 self.emit_snapshot();
                                 return;
                             }
                         }
-                    } else if let ControlMessage::Route(RouteControl::Reject { route_id, reason }) =
-                        &msg
+                    } else if let ControlMessage::Route(RouteControl::Reject {
+                        route_id,
+                        incarnation,
+                        reason,
+                    }) = &msg
                     {
                         tracing::info!(
                             "inbound route reject for {route_id} from {}: {reason}",
                             short_id(&from)
+                        );
+                        self.remove_desired_route_exact(&from, route_id, incarnation.as_deref());
+                    } else if let ControlMessage::Route(RouteControl::Accept {
+                        route_id,
+                        incarnation,
+                        session,
+                    }) = &msg
+                    {
+                        self.update_desired_terminal_session(
+                            &from,
+                            route_id,
+                            incarnation.as_deref(),
+                            session.as_deref(),
                         );
                     }
                     // Site management (list a co-owned machine's sites,
@@ -3617,11 +5236,15 @@ impl Mesh {
                                 json!({ "from": from, "sessions": sessions }),
                             );
                         }
-                        ControlMessage::Route(RouteControl::VideoLane { route_id, lane }) => {
+                        ControlMessage::Route(RouteControl::VideoLane {
+                            route_id,
+                            incarnation,
+                            lane,
+                        }) => {
                             // The streamer told us which track lane this route's
                             // H.264 rides — record it so inbound samples demux to
                             // the right console window by binding, not by guess.
-                            self.record_video_lane(&from, &route_id, lane);
+                            self.record_video_lane(&network, &from, &route_id, incarnation, lane);
                         }
                         ControlMessage::Route(RouteControl::DeadLane { media, lane }) => {
                             // A receiver says our media on that lane has no
@@ -3629,7 +5252,19 @@ impl Mesh {
                             // name). Resolve the lane back to the route we
                             // pinned it to and fold it through the session as
                             // that route's Reject — stopping the encoder.
-                            self.handle_dead_lane(&from, &media, lane).await;
+                            self.handle_dead_lane(&network, &from, &media, lane).await;
+                        }
+                        ControlMessage::Route(RouteControl::MissingRoute {
+                            route_id,
+                            incarnation,
+                        }) => {
+                            self.handle_missing_route(
+                                &network,
+                                &from,
+                                &route_id,
+                                incarnation.as_deref(),
+                            )
+                            .await;
                         }
                         ControlMessage::ProfileRequest => {
                             // A peer's refresh asks us to re-announce — send our
@@ -3643,6 +5278,21 @@ impl Mesh {
                             self.send_presence_to(&from).await;
                         }
                         msg => {
+                            let route_path_message = msg.clone();
+                            let terminal_route_key = match &route_path_message {
+                                ControlMessage::Route(RouteControl::Reject {
+                                    route_id,
+                                    incarnation,
+                                    ..
+                                }) => Some((route_id.clone(), incarnation.clone())),
+                                _ => None,
+                            };
+                            let accepted_route = match &msg {
+                                ControlMessage::Route(RouteControl::Accept {
+                                    route_id, ..
+                                }) => Some(route_id.clone()),
+                                _ => None,
+                            };
                             // A Reject landing on one of our client-side site
                             // mappings is the host saying its route is gone (a
                             // reconnect / network change tore it down). Grab the
@@ -3663,12 +5313,26 @@ impl Mesh {
                             };
                             let effects = {
                                 let mut st = self.state.lock();
-                                st.session
+                                let effects = st
+                                    .session
                                     .as_mut()
                                     .map(|s| s.handle(NodeId::from(from.as_str()), msg))
-                                    .unwrap_or_default()
+                                    .unwrap_or_default();
+                                Self::commit_inbound_route_network_locked(
+                                    &mut st,
+                                    &from,
+                                    &route_path_message,
+                                    &network,
+                                );
+                                if let Some(key) = terminal_route_key.as_ref() {
+                                    st.route_networks.remove(key);
+                                }
+                                effects
                             };
                             self.process_effects(effects).await;
+                            if let Some(route_id) = accepted_route {
+                                self.replay_requested_video_tune(&route_id).await;
+                            }
                             if let Some((old_route, (node, host_port, local_port))) = heal_site {
                                 // Guarantee the dead route is fully cleared — a
                                 // reject on a not-yet-active offer emits no
@@ -3697,7 +5361,13 @@ impl Mesh {
                     return;
                 };
                 match media {
-                    MediaPayload::Audio(frame) => self.audio.feed(&frame.route, &frame),
+                    MediaPayload::Audio(frame) => {
+                        if self.inbound_media_ok(&frame.route, &from, MediaKind::Audio)
+                            && self.inbound_route_network_ok(&frame.route, &from, &network)
+                        {
+                            self.audio.feed(&frame.route, &frame);
+                        }
+                    }
                     MediaPayload::Video(frame) => {
                         // Surface frames only for a route this session knows
                         // is live, sinks here, and belongs to the sender —
@@ -3723,9 +5393,30 @@ impl Mesh {
                                     frame.route,
                                     short_id(&from)
                                 );
-                                self.nack_dead_route(&from, &frame.route);
+                                self.nack_dead_route(&network, &from, &frame.route);
                                 return;
                             }
+                        }
+                        if !self.inbound_route_network_ok(&frame.route, &from, &network) {
+                            tracing::debug!(
+                                route = %frame.route,
+                                network = %network,
+                                "dropped MJPEG frame from a network that does not own this route lifetime"
+                            );
+                            return;
+                        }
+                        if !self.inbound_video_incarnation_ok(
+                            &frame.route,
+                            &from,
+                            frame.incarnation.as_deref(),
+                        ) {
+                            tracing::debug!(
+                                route = %frame.route,
+                                network = %network,
+                                incarnation = ?frame.incarnation,
+                                "dropped MJPEG chunk from a predecessor route lifetime"
+                            );
+                            return;
                         }
                         let full = { self.video_in.lock().push(frame) };
                         if let Some(full) = full {
@@ -3758,7 +5449,9 @@ impl Mesh {
                         // asleep", "camera failed"…). Gated like the frames
                         // it stands in for; the console window shows it on
                         // the stage.
-                        if !self.inbound_video_ok(&status.route, &from) {
+                        if !self.inbound_video_ok(&status.route, &from)
+                            || !self.inbound_route_network_ok(&status.route, &from, &network)
+                        {
                             return;
                         }
                         tracing::info!(
@@ -3795,9 +5488,27 @@ impl Mesh {
                         // `sender_may_drive_admitted` / `spawn_cec_consent_sweep`):
                         // a lapsed grant tears the route down within a couple of
                         // seconds, so here a live CEC route just passes.
-                        let route_ok = self.inbound_media_ok(&ev.route, &from, MediaKind::Input);
+                        // Capture the injector generation before checking the
+                        // route. If teardown runs at any later point, its
+                        // release invalidates this lease and the queued event
+                        // cannot re-press input after cleanup.
+                        let input_lease = self.injector.lease(&ev.route);
+                        let route_ok = self.inbound_media_ok_incarnation(
+                            &ev.route,
+                            &from,
+                            MediaKind::Input,
+                            ev.incarnation.as_deref(),
+                        ) && self
+                            .inbound_route_network_ok(&ev.route, &from, &network);
                         if route_ok && self.sender_may_drive_admitted(&from, DrivePlane::Input) {
-                            self.injector.apply(&ev.route, ev.action);
+                            if let Some(lease) = input_lease {
+                                self.injector.apply(&ev.route, ev.action, lease);
+                            } else if self.diag_ok(&format!("input-lease:{}", ev.route)) {
+                                tracing::warn!(
+                                    "dropped input for active route {} because its local lifetime was not registered",
+                                    ev.route
+                                );
+                            }
                         } else {
                             // Refusing silently is how "controls just stopped
                             // working" went undiagnosable — say which gate
@@ -3805,10 +5516,26 @@ impl Mesh {
                             self.refuse_control_frame(&from, &ev.route, "input", route_ok);
                         }
                     }
-                    MediaPayload::Terminal(frame) => self.handle_term_frame(&from, frame),
-                    MediaPayload::File(frame) => self.handle_file_frame(&from, frame),
-                    MediaPayload::Clipboard(frame) => self.handle_clipboard_frame(&from, frame),
-                    MediaPayload::Site(frame) => self.handle_site_frame(&from, frame),
+                    MediaPayload::Terminal(frame) => {
+                        if self.inbound_route_network_ok(&frame.route, &from, &network) {
+                            self.handle_term_frame(&from, frame);
+                        }
+                    }
+                    MediaPayload::File(frame) => {
+                        if self.inbound_route_network_ok(&frame.route, &from, &network) {
+                            self.handle_file_frame(&from, frame);
+                        }
+                    }
+                    MediaPayload::Clipboard(frame) => {
+                        if self.inbound_route_network_ok(&frame.route, &from, &network) {
+                            self.handle_clipboard_frame(&from, frame);
+                        }
+                    }
+                    MediaPayload::Site(frame) => {
+                        if self.inbound_route_network_ok(&frame.route, &from, &network) {
+                            self.handle_site_frame(&from, frame);
+                        }
+                    }
                 }
             }
             CHANNEL_ROOMS => {
@@ -3873,6 +5600,7 @@ impl Mesh {
     /// the viewer-side lane→route binding.
     fn release_video_lanes(self: &Arc<Self>, route_id: &str) {
         self.note_video_route_stopped(route_id);
+        self.video_in.lock().clear_route(route_id);
         self.video_arrivals.lock().remove(route_id);
         self.video_in_stats.lock().remove(route_id);
         self.refresh_asks.lock().remove(route_id);
@@ -3891,7 +5619,7 @@ impl Mesh {
         // Viewer side: drop any lane binding that pointed at this route.
         let mut binds = self.video_lane_binds.lock();
         for per_peer in binds.values_mut() {
-            per_peer.retain(|_, r| r != route_id);
+            per_peer.retain(|_, binding| binding.route_id != route_id);
         }
         binds.retain(|_, per_peer| !per_peer.is_empty());
     }
@@ -3998,16 +5726,18 @@ impl Mesh {
         from: String,
         network: String,
         token: u64,
-        incarnation: u64,
+        guard_incarnation: u64,
+        route_incarnation: Option<String>,
     ) {
         tokio::time::sleep(VIDEO_INBOUND_TEARDOWN_QUARANTINE).await;
+        let lifecycle = self.lock_route_lifecycle(&route_id).await;
         let (effects, state_before, media) = {
             let mut st = self.state.lock();
             let Some(session) = st.session.as_mut() else {
                 self.video_switch_guards.lock().take_pending_if_current(
                     &route_id,
                     token,
-                    incarnation,
+                    guard_incarnation,
                 );
                 return;
             };
@@ -4015,25 +5745,26 @@ impl Mesh {
                 self.video_switch_guards.lock().take_pending_if_current(
                     &route_id,
                     token,
-                    incarnation,
+                    guard_incarnation,
                 );
                 return;
             };
             if route.state != RouteState::Active
                 || !matches!(route.route.media, MediaKind::Display | MediaKind::Video)
                 || pubkey_part(route.peer.as_str()) != pubkey_part(&from)
+                || route.incarnation != route_incarnation
             {
                 self.video_switch_guards.lock().take_pending_if_current(
                     &route_id,
                     token,
-                    incarnation,
+                    guard_incarnation,
                 );
                 return;
             }
             if !self.video_switch_guards.lock().take_pending_if_current(
                 &route_id,
                 token,
-                incarnation,
+                guard_incarnation,
             ) {
                 return;
             }
@@ -4043,8 +5774,11 @@ impl Mesh {
                 NodeId::from(from.as_str()),
                 ControlMessage::Route(RouteControl::Teardown {
                     route_id: route_id.clone(),
+                    incarnation: route_incarnation.clone(),
                 }),
             );
+            st.route_networks
+                .remove(&(route_id.clone(), route_incarnation.clone()));
             (effects, state_before, media)
         };
         let generation = self.video_route_generations.lock().current(&route_id);
@@ -4056,11 +5790,35 @@ impl Mesh {
             media = ?media,
             generation = ?generation,
             token,
-            incarnation,
+            guard_incarnation,
             disposition = "quarantine_expired_commit",
             "inbound route teardown"
         );
-        self.process_effects(effects).await;
+        self.remove_desired_route_exact(&from, &route_id, route_incarnation.as_deref());
+        let mut deferred = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::StopMedia {
+                    route_id,
+                    incarnation,
+                } => self.apply_stop_media_locked(route_id, incarnation),
+                other => deferred.push(other),
+            }
+        }
+        drop(lifecycle);
+        self.process_effects(deferred).await;
+        if self.peer_supports_teardown_ack(&from) {
+            let _ = self
+                .send_control_on_network(
+                    &from,
+                    &ControlMessage::Route(RouteControl::TeardownAck {
+                        route_id: route_id.clone(),
+                        incarnation: route_incarnation,
+                    }),
+                    &network,
+                )
+                .await;
+        }
         self.emit_snapshot();
     }
 
@@ -4088,40 +5846,6 @@ impl Mesh {
             .is_current(route_id, generation)
     }
 
-    /// Ask the daemon to close a media lane toward `peer` — the
-    /// lifecycle-side of the pinned-lane free above. Spawned + logged:
-    /// teardown must never block on the daemon, and a failure only means
-    /// the lane idles until the connection ends (the pre-0.2.34 world).
-    fn close_daemon_media_lane(self: &Arc<Self>, peer: &str, kind: &'static str, lane: u8) {
-        let Some(network) = self.network_for_peer(peer) else {
-            return;
-        };
-        let client = self.client.clone();
-        let peer = pubkey_part(peer).to_string();
-        crate::spawn(async move {
-            match client
-                .request(&Request::MediaLaneClose {
-                    network,
-                    peer: peer.clone(),
-                    kind: kind.to_string(),
-                    lane,
-                })
-                .await
-            {
-                Ok(resp) if resp.ok => {
-                    tracing::debug!("closed {kind} lane {lane} toward {}", short_id(&peer));
-                }
-                Ok(resp) => {
-                    tracing::debug!(
-                        "daemon declined {kind} lane close (older daemon?): {:?}",
-                        resp.error
-                    );
-                }
-                Err(e) => tracing::debug!("{kind} lane close failed: {e}"),
-            }
-        });
-    }
-
     /// Stop legacy PCM captures as soon as the same peer gains a governed
     /// video plan. Raw PCM is retained only for uncapped legacy/audio-only
     /// sessions; it is far larger than every encoded-audio reservation and
@@ -4147,23 +5871,17 @@ impl Mesh {
             );
             self.audio.stop(&route_id);
             // The route itself is still Active. Remove only its aggregate
-            // reservation: release_audio_lanes also closes a positional daemon
-            // lane and is correct exclusively after route teardown.
+            // reservation. The pre-negotiated daemon lane stays idle until its
+            // PeerSession ends.
             self.audio_encoders.lock().remove(&route_id);
             self.media_policy.lock().remove_audio_route(&route_id);
         }
     }
 
-    /// The audio twin of [`Self::release_video_lanes`]: drop the route's
-    /// Opus decoder when it ends — and close the daemon audio lane the
-    /// end freed. Audio lanes are positional, not pinned like video
-    /// ([`Self::audio_lane`]: a route streams on its rank among the
-    /// peer's live Opus routes), so the lane that goes idle is the old
-    /// **top** one — every survivor above the ended route shifts down —
-    /// which is why the index closed here is the survivor count, not the
-    /// ended route's own rank. A survivor mid-shift or a new route racing
-    /// in is fine: the daemon (≥ 0.2.35) drains a closed lane for a grace
-    /// window and a write inside it revives the track with no SDP work.
+    /// The audio twin of [`Self::release_video_lanes`]: drop route-local codec
+    /// and policy state. Pre-negotiated lane 0 stays idle until its existing
+    /// PeerSession ends. Closing it by peer-wide preference can target another
+    /// network's independent lane 0 and may change the peer-connection tracks.
     fn release_audio_lanes(self: &Arc<Self>, route_id: &str) {
         self.pcm_audio_routes.lock().remove(route_id);
         self.audio_decoders.lock().remove(route_id);
@@ -4180,30 +5898,6 @@ impl Mesh {
             let mesh = self.clone();
             crate::spawn(async move { mesh.send_effective_plans(policy_plans).await });
         }
-        let Some(peer) = self.route_peer(route_id) else {
-            return;
-        };
-        let cap = self.effective_audio_lanes(&peer);
-        if cap == 0 {
-            return;
-        }
-        // Excluding the ended route by id (rather than trusting it to be
-        // gone) keeps the count right at every call site: teardown leaves
-        // the route in the session map (only flipped to TornDown), and
-        // the StopMedia effect can run either side of that flip.
-        let survivors = self
-            .sorted_media_routes(&peer, true, "opus")
-            .iter()
-            .filter(|id| id.as_str() != route_id)
-            .count();
-        // Lanes [0, survivors) are still owned; lane `survivors` is the
-        // one this end vacated — when it had one at all. An overflow
-        // route beyond the pool frees nothing (survivors >= cap), and
-        // closing a lane that never opened is the daemon's idempotent
-        // no-op, so a non-Opus route ending here costs nothing.
-        if survivors < cap as usize {
-            self.close_daemon_media_lane(&peer, "audio", survivors as u8);
-        }
     }
 
     /// One Opus frame arrived on a peer's audio lane `stream`. It belongs
@@ -4214,29 +5908,35 @@ impl Mesh {
     /// route's playback ring.
     fn handle_audio_inbound(
         self: &Arc<Self>,
+        network: &str,
         from: &str,
         stream: u8,
         rtp_timestamp: u32,
         data: Vec<u8>,
     ) {
-        let Some(route_id) = self.audio_route_for_lane(from, stream) else {
+        let Some(route_id) = self.audio_route_for_lane(network, from, stream) else {
             // The audio twin of the video lane's "no route for it" warn
             // (rate-limited the same way): Opus arriving with nowhere to
             // decode it is the caller-hears-nothing drop, and it used to be
             // a DEBUG whisper while the room sat silent.
-            if self.diag_ok(&format!("audio-lane:{}:{stream}", pubkey_part(from))) {
+            if self.diag_ok(&format!(
+                "audio-lane:{network}:{}:{stream}",
+                pubkey_part(from)
+            )) {
                 tracing::warn!(
                     "Opus frames arriving from {} on lane {stream} but no route maps to it — dropped (caller hears nothing)",
                     short_id(from)
                 );
             }
-            self.nack_dead_lane(from, "audio", stream);
+            self.nack_dead_lane(network, from, "audio", stream);
             return;
         };
-        self.clear_dead_lane(from, "audio", stream);
-        if !self.inbound_media_ok(&route_id, from, MediaKind::Audio) {
+        self.clear_dead_lane(network, from, "audio", stream);
+        if !self.inbound_media_ok(&route_id, from, MediaKind::Audio)
+            || !self.inbound_route_network_ok(&route_id, from, network)
+        {
             tracing::debug!("audio frame for {route_id} refused (route not live here)");
-            self.nack_dead_route(from, &route_id);
+            self.nack_dead_route(network, from, &route_id);
             return;
         }
         let profile = audio_profile_for_mode(self.media_mode_for_peer(from));
@@ -4325,13 +6025,14 @@ impl Mesh {
     /// ready-to-paint RGBA frames.
     fn handle_video_inbound(
         self: &Arc<Self>,
+        network: &str,
         from: &str,
         stream: u8,
         rtp_timestamp: u32,
         key: bool,
         data: Vec<u8>,
     ) {
-        self.handle_video_inbound_profiled(from, stream, rtp_timestamp, key, data, 0);
+        self.handle_video_inbound_profiled(network, from, stream, rtp_timestamp, key, data, 0);
     }
 
     /// Binary media-pipe twin carrying a process-local profiler id from the
@@ -4339,6 +6040,7 @@ impl Mesh {
     /// network or any daemon protocol frame.
     fn handle_video_inbound_profiled(
         self: &Arc<Self>,
+        network: &str,
         from: &str,
         stream: u8,
         rtp_timestamp: u32,
@@ -4347,21 +6049,32 @@ impl Mesh {
         profile_id: u64,
     ) {
         let canon = pubkey_part(from).to_string();
-        let Some(route_id) = self.video_route_for_lane(from, stream) else {
+        let Some(route_id) = self.video_route_for_lane(network, from, stream) else {
             // The sender is streaming the track lane at us but no route
             // here maps to it — the one-sided stream the viewer reads as
             // "connecting forever". Loud (rate-limited): this exact drop
             // was a debug whisper while the stage sat black.
-            if self.diag_ok(&format!("lane:{canon}:{stream}")) {
+            if self.diag_ok(&format!("lane:{network}:{canon}:{stream}")) {
                 tracing::warn!(
                     "H.264 samples arriving from {} on lane {stream} but no route maps to it — dropped (viewer shows nothing)",
                     short_id(from)
                 );
             }
-            self.nack_dead_lane(from, "video", stream);
+            self.nack_dead_lane(network, from, "video", stream);
             return;
         };
-        self.clear_dead_lane(from, "video", stream);
+        self.clear_dead_lane(network, from, "video", stream);
+        if !self.inbound_route_network_ok(&route_id, from, network) {
+            if self.diag_ok(&format!("route-network:{route_id}:{network}")) {
+                tracing::warn!(
+                    route = %route_id,
+                    network = %network,
+                    peer = %short_id(from),
+                    "dropping H.264 from a network that does not own this route lifetime"
+                );
+            }
+            return;
+        }
         match self.inbound_video_disposition(&route_id, from) {
             InboundVideoDisposition::Accept => {}
             InboundVideoDisposition::Pending => {
@@ -4379,7 +6092,7 @@ impl Mesh {
                         self.route_diag(&route_id, from)
                     );
                 }
-                self.nack_dead_route(from, &route_id);
+                self.nack_dead_route(network, from, &route_id);
                 return;
             }
         }
@@ -4405,11 +6118,13 @@ impl Mesh {
         // Time the pacer's chunk trains as they land — the bandwidth
         // estimate + delay trend the feedback loop reports back (M3/T1.1).
         self.note_video_arrival(&route_id, rtp_timestamp, data.len());
-        let wants_decode = self
+        let decode_epoch = self
             .video_watchers
             .lock()
             .get(&route_id)
-            .is_some_and(|w| w.decode);
+            .filter(|watcher| watcher.decode)
+            .map(|watcher| watcher.decode_epoch);
+        let wants_decode = decode_epoch.is_some();
         if first {
             tracing::info!(
                 "first H.264 sample for {route_id} from {} ({} bytes, key={key}, native decode={wants_decode})",
@@ -4422,6 +6137,7 @@ impl Mesh {
         if wants_decode {
             let mesh = Arc::downgrade(self);
             let rid = route_id.clone();
+            let decode_epoch = decode_epoch.expect("native decoder claim checked above");
             let glitch_mesh = Arc::downgrade(self);
             let glitch_rid = route_id.clone();
             self.video_decode.feed_profiled(
@@ -4430,7 +6146,13 @@ impl Mesh {
                 profile_id,
                 move |packet, frame_id, frame_ts_us| {
                     if let Some(mesh) = mesh.upgrade() {
-                        mesh.enqueue_decoded(&rid, packet, frame_id, frame_ts_us);
+                        mesh.enqueue_decoded_for_epoch(
+                            &rid,
+                            decode_epoch,
+                            packet,
+                            frame_id,
+                            frame_ts_us,
+                        );
                     }
                 },
                 move |lost_ts_us| {
@@ -4591,11 +6313,34 @@ impl Mesh {
     /// packets append instead, because H.264 deltas must all reach their
     /// decoder; that distinction is the whole reason for two enqueues.
     fn enqueue_decoded(&self, route_id: &str, packet: Vec<u8>, profile_id: u64, frame_ts_us: u64) {
+        let Some(epoch) = self
+            .video_watchers
+            .lock()
+            .get(route_id)
+            .filter(|watcher| watcher.decode)
+            .map(|watcher| watcher.decode_epoch)
+        else {
+            return;
+        };
+        self.enqueue_decoded_for_epoch(route_id, epoch, packet, profile_id, frame_ts_us);
+    }
+
+    fn enqueue_decoded_for_epoch(
+        &self,
+        route_id: &str,
+        decode_epoch: u64,
+        packet: Vec<u8>,
+        profile_id: u64,
+        frame_ts_us: u64,
+    ) {
         let mut map = self.video_watchers.lock();
         let Some(w) = map.get_mut(route_id) else {
             tracing::debug!("no console window watching {route_id} — decoded frame dropped");
             return;
         };
+        if !w.decode || w.decode_epoch != decode_epoch {
+            return;
+        }
         let was_empty = w.queue.is_empty();
         w.queue.clear();
         w.queue
@@ -4629,24 +6374,24 @@ impl Mesh {
         video: Vec<String>,
         session: Option<String>,
     ) -> Result<String, String> {
-        // Only advertise transports the *whole* local stack can consume.
-        // H.264 decode is always covered (WebCodecs where the webview has
-        // it, the native decoder where it doesn't) — but inbound samples
-        // arrive via the daemon, and an old one would negotiate a stream
-        // it can't deliver.
-        let video = if video.is_empty() {
-            video
-        } else {
-            // This list is a one-shot decision for the whole session —
-            // wait out the bring-up race before stripping anything.
-            self.await_video_bringup().await;
-            if self.daemon_video.load(Ordering::SeqCst) {
-                video
-            } else {
-                Vec::new()
-            }
-        };
-        let me = self.local_node_id().ok_or("mesh not ready")?;
+        self.connect_term_handle(from, to, media, video, session)
+            .await
+            .map(|handle| handle.route_id)
+    }
+
+    /// Handle-returning form used by GUI callers that must fence a delayed
+    /// local close from a same-id successor. The legacy string-returning form
+    /// remains for CLI and embedding compatibility.
+    pub async fn connect_term_handle(
+        self: &Arc<Self>,
+        from: String,
+        to: String,
+        media: String,
+        video: Vec<String>,
+        session: Option<String>,
+    ) -> Result<RouteConnectHandle, String> {
+        let requested_video = video;
+        let me = self.resolve_local_id().await.ok_or("mesh not ready")?;
         let media = parse_media(&media);
         let route = Route {
             id: format!("route:{from}→{to}"),
@@ -4656,18 +6401,6 @@ impl Mesh {
         };
         let from_node = node_of(&from);
         let to_node = node_of(&to);
-        // Audio accepts mirror video's: when we're the *sink* of an audio
-        // route and our daemon speaks the audio lane, ask for Opus — the
-        // source side picks the lane when its own stack can carry it,
-        // and PCM frames over the media channel stay the floor.
-        let audio = if media == MediaKind::Audio
-            && to_node == me
-            && self.daemon_audio.load(Ordering::SeqCst)
-        {
-            vec!["opus".to_string()]
-        } else {
-            Vec::new()
-        };
         // Self / loopback is decided by *canonical* node id: the route's
         // endpoints carry the suffixed display id the UI built them from,
         // while `me` is the bare node id, so a raw `==` would miss a genuine
@@ -4676,36 +6409,153 @@ impl Mesh {
         let from_is_me = same_node(&from_node, &me);
         let to_is_me = same_node(&to_node, &me);
         let peer = if from_is_me { to_node } else { from_node };
+        // Receive readiness belongs to the peer's candidate networks, not to
+        // one process-wide boolean. Preserve requested transports separately
+        // so a later daemon-session replay can restore them after a dark
+        // network's supervised subscription heals.
+        let video = if requested_video.is_empty() {
+            Vec::new()
+        } else {
+            self.await_video_bringup(&peer).await;
+            if self.peer_video_ready(&peer) {
+                requested_video.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        let requested_audio = if media == MediaKind::Audio && to_is_me {
+            vec!["opus".to_string()]
+        } else {
+            Vec::new()
+        };
+        let audio = if requested_audio.is_empty() || !self.peer_audio_ready(&peer) {
+            Vec::new()
+        } else {
+            requested_audio.clone()
+        };
+        let local_generation = self.next_route_intent_generation();
+        let handle = RouteConnectHandle {
+            route_id: route.id.clone(),
+            generation: local_generation,
+        };
+        // Connect and disconnect for a deterministic route id share this
+        // critical section. Desired-intent generation, Session lifetime, and
+        // the first wire Offer therefore advance as one ordered operation;
+        // a delayed close for predecessor A cannot remove or tear down B.
+        let lifecycle = self.lock_route_lifecycle(&route.id).await;
+        let previous_incarnation = {
+            self.active_media_incarnations
+                .lock()
+                .get(&route.id)
+                .cloned()
+        };
+        if let Some(previous_incarnation) = previous_incarnation {
+            self.apply_stop_media_locked(route.id.clone(), previous_incarnation);
+        }
+        self.pending_teardowns
+            .lock()
+            .retain(|(pending_route, _), _| pending_route != &route.id);
+        self.state
+            .lock()
+            .route_networks
+            .retain(|(pinned_route, _), _| pinned_route != &route.id);
+        self.desired_routes.lock().insert(
+            route.id.clone(),
+            DesiredRoute {
+                route: route.clone(),
+                peer: peer.clone(),
+                requested_video: requested_video.clone(),
+                requested_audio: requested_audio.clone(),
+                term_session: session.clone(),
+                local_generation,
+                current_incarnation: None,
+            },
+        );
+
+        // A daemon event reconnect deliberately removes the ephemeral Session.
+        // Preserve the user's intent and return its handle instead of failing
+        // the UI action. `bring_up` replays every desired route once the fresh
+        // local subscriptions and presence profile are installed.
+        if self.state.lock().session.is_none() {
+            tracing::info!(
+                route = %route.id,
+                generation = local_generation,
+                "route intent retained while the mesh session is rebuilding"
+            );
+            drop(lifecycle);
+            return Ok(handle);
+        }
 
         if from_is_me && to_is_me {
             // Local loopback (e.g. this machine's mic to its own speakers):
             // no peer to negotiate with — record it active and stream now.
             // Offer-then-Accept drives the session to Active and yields the
             // StartMedia effect we process below.
-            let effects = {
+            let incarnation = self.next_route_incarnation(&me);
+            if let Some(desired) = self.desired_routes.lock().get_mut(&route.id) {
+                if desired.local_generation == local_generation {
+                    desired.current_incarnation = incarnation.clone();
+                }
+            }
+            let (offer, effects) = {
                 let mut st = self.state.lock();
-                let s = st.session.as_mut().ok_or("mesh not ready")?;
+                let Some(s) = st.session.as_mut() else {
+                    tracing::info!(
+                        route = %route.id,
+                        generation = local_generation,
+                        "loopback route intent deferred to fresh mesh session"
+                    );
+                    drop(st);
+                    drop(lifecycle);
+                    return Ok(handle);
+                };
                 // Loopback terminals carry the attach session too, so two
                 // local windows can share one local shell (multi-attach to
                 // yourself); harmless `None` on every other loopback route.
-                let _ = s.offer_terminal(
+                let offer = s.offer_terminal_with_incarnation(
                     route.clone(),
                     me.as_str(),
                     Vec::new(),
                     Vec::new(),
                     session.clone(),
+                    incarnation.clone(),
                 );
-                s.handle(
+                let effects = s.handle(
                     NodeId::from(me.as_str()),
                     ControlMessage::Route(RouteControl::Accept {
                         route_id: route.id.clone(),
+                        incarnation,
                         session: None,
                     }),
-                )
+                );
+                (offer, effects)
             };
+            let Some(loopback_network) = self
+                .route_network_candidates(&me, &offer)
+                .into_iter()
+                .next()
+            else {
+                self.desired_routes.lock().remove(&route.id);
+                if let Some(session) = self.state.lock().session.as_mut() {
+                    let _ = session.teardown(&route.id);
+                }
+                drop(lifecycle);
+                return Err("no joined data-plane network for loopback route".into());
+            };
+            {
+                let mut state = self.state.lock();
+                Self::commit_inbound_route_network_locked(
+                    &mut state,
+                    &me,
+                    &offer,
+                    &loopback_network,
+                );
+            }
+            drop(lifecycle);
             self.process_effects(effects).await;
+            self.replay_requested_video_tune(&route.id).await;
             self.emit_snapshot();
-            return Ok(route.id);
+            return Ok(handle);
         }
 
         if matches!(route.media, MediaKind::Display | MediaKind::Video) {
@@ -4721,25 +6571,43 @@ impl Mesh {
                 );
             }
         }
+        let incarnation = self.next_route_incarnation(peer.as_str());
+        if let Some(desired) = self.desired_routes.lock().get_mut(&route.id) {
+            if desired.local_generation == local_generation {
+                desired.current_incarnation = incarnation.clone();
+            }
+        }
         let msg = {
             let mut st = self.state.lock();
-            let s = st.session.as_mut().ok_or("mesh not ready")?;
-            s.offer_terminal(route.clone(), peer.as_str(), video, audio, session)
+            let Some(s) = st.session.as_mut() else {
+                tracing::info!(
+                    route = %route.id,
+                    generation = local_generation,
+                    "remote route intent deferred to fresh mesh session"
+                );
+                drop(st);
+                drop(lifecycle);
+                return Ok(handle);
+            };
+            s.offer_terminal_with_incarnation(
+                route.clone(),
+                peer.as_str(),
+                video.clone(),
+                audio.clone(),
+                session.clone(),
+                incarnation.clone(),
+            )
         };
         if let Err(e) = self.send_control(&peer, &msg).await {
             // The peer never saw the offer — drop it rather than leave a
             // phantom half-open route in the session.
             tracing::warn!(
-                "route {} offer to {} undeliverable: {e}",
+                "route {} offer to {} not dispatched on the fast path: {e}; retaining it for retry",
                 route.id,
                 short_id(&peer)
             );
-            let mut st = self.state.lock();
-            if let Some(s) = st.session.as_mut() {
-                let _ = s.teardown(&route.id);
-            }
-            return Err(e);
         }
+        drop(lifecycle);
         // The accept lands moments later as the route's "active" line; an
         // offer that goes nowhere has its own warns above and below. At
         // INFO (not DEBUG) so a default-level capture shows the whole
@@ -4751,7 +6619,7 @@ impl Mesh {
             short_id(&peer)
         );
         self.emit_snapshot();
-        Ok(route.id)
+        Ok(handle)
     }
 
     /// Register interest in one route's inbound frames (replacing any
@@ -4762,14 +6630,23 @@ impl Mesh {
     /// units — for webviews without WebCodecs, and the last rung of the
     /// console's decode ladder. Returns the claim token to pass back to
     /// [`Self::video_unwatch`].
-    pub fn video_watch(&self, route_id: String, decode: bool) -> u64 {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let token = NEXT.fetch_add(1, Ordering::Relaxed);
-        if !decode {
-            // A pass-through watcher replacing a decoding one (input
-            // switch, ladder reset) leaves no orphan decoder behind.
-            self.video_decode.stop(&route_id);
-        }
+    pub fn video_watch(self: &Arc<Self>, route_id: String, decode: bool) -> u64 {
+        let token = loop {
+            let token = self.video_watch_token.fetch_add(1, Ordering::Relaxed);
+            if token != 0 {
+                break token;
+            }
+        };
+        let decode_epoch = if decode {
+            self.video_watchers
+                .lock()
+                .get(&route_id)
+                .filter(|watcher| watcher.decode)
+                .map(|watcher| watcher.decode_epoch)
+                .unwrap_or_else(next_native_decode_epoch)
+        } else {
+            0
+        };
         // One line per watch claim, so a viewer-side log shows which
         // window holds each stream and on which decode path — the missing
         // half of "frames flowing but no window watching".
@@ -4802,55 +6679,101 @@ impl Mesh {
                 .lock()
                 .retain(|k, _| !k.starts_with(&prefix));
         }
-        self.video_watchers.lock().insert(
-            route_id,
+        self.video_watchers.lock().claim(
+            route_id.clone(),
             VideoWatcher {
                 token,
                 decode,
+                decode_epoch,
                 queue: std::collections::VecDeque::new(),
                 awaiting_key: false,
-                last_poll: Instant::now(),
+                last_poll: None,
             },
         );
+        if !decode {
+            // Publish pass-through ownership before stopping the old decoder.
+            // stop can wait for its worker; inbound AUs and late callbacks in
+            // that interval must see the successor mode and token.
+            self.video_decode.stop(&route_id);
+            let mesh = self.clone();
+            let refresh_route = route_id.clone();
+            crate::spawn(async move {
+                let _ = mesh.request_refresh(refresh_route).await;
+            });
+        }
         token
     }
 
     /// Release a watch claim — only if `token` still owns the route. A
     /// late unwatch from a replaced watcher is a no-op instead of
     /// deleting its successor's queue.
-    pub fn video_unwatch(&self, route_id: &str, token: u64) {
-        let mut map = self.video_watchers.lock();
-        if map.get(route_id).is_some_and(|w| w.token == token) {
-            map.remove(route_id);
-            drop(map);
+    pub fn video_unwatch(self: &Arc<Self>, route_id: &str, token: u64) {
+        let release = self.video_watchers.lock().release(route_id, token);
+        let Some((removed_decode, restored_decode)) = release else {
+            return;
+        };
+        if !removed_decode && restored_decode == Some(true) {
+            if let Some(restored) = self.video_watchers.lock().get_mut(route_id) {
+                restored.decode_epoch = next_native_decode_epoch();
+            }
+        }
+        if restored_decode != Some(true) {
             self.video_decode.stop(route_id);
         }
+        if restored_decode.is_some_and(|decode| decode != removed_decode || !decode) {
+            let mesh = self.clone();
+            let route_id = route_id.to_string();
+            crate::spawn(async move {
+                let _ = mesh.request_refresh(route_id).await;
+            });
+        }
+    }
+
+    /// Validate a GUI-originated health report against the active local watch.
+    /// This token never leaves the machine; it prevents a displaced webview
+    /// from keeping a route alive or adapting its sender after losing ownership.
+    pub fn video_watcher_is_current(&self, route_id: &str, token: u64) -> bool {
+        self.video_watchers
+            .lock()
+            .get(route_id)
+            .is_some_and(|watcher| watcher.token == token)
     }
 
     /// Drain everything queued for `route_id` while measuring the viewer-side
     /// lock, poll cadence, and queue residence. Framing happens after this
     /// returns, outside the watcher lock.
-    fn drain_video_poll(&self, route_id: &str) -> std::collections::VecDeque<ViewerPacket> {
+    fn drain_video_poll(
+        &self,
+        route_id: &str,
+        token: Option<u64>,
+    ) -> std::collections::VecDeque<ViewerPacket> {
         let lock_started = crate::pipeline_profile::stamp();
         let mut map = self.video_watchers.lock();
         let lock_acquired = crate::pipeline_profile::stamp();
         let Some(w) = map.get_mut(route_id) else {
             return std::collections::VecDeque::new();
         };
+        if token.is_some_and(|token| token != w.token) {
+            return std::collections::VecDeque::new();
+        }
         let polled_at = Instant::now();
-        let poll_cadence = polled_at.saturating_duration_since(w.last_poll);
-        w.last_poll = polled_at;
+        let poll_cadence = w
+            .last_poll
+            .replace(polled_at)
+            .map(|last| polled_at.saturating_duration_since(last));
         let packets = std::mem::take(&mut w.queue);
         drop(map);
 
-        crate::pipeline_profile::record_at(
-            route_id,
-            0,
-            None,
-            crate::pipeline_profile::Stage::ViewerPollCadence,
-            poll_cadence,
-            polled_at,
-        );
+        if let Some(poll_cadence) = poll_cadence {
+            crate::pipeline_profile::record_at(
+                route_id,
+                0,
+                None,
+                crate::pipeline_profile::Stage::ViewerPollCadence,
+                poll_cadence,
+                polled_at,
+            );
+        }
         if let (Some(started), Some(ended)) = (lock_started, lock_acquired) {
             crate::pipeline_profile::record_at(
                 route_id,
@@ -4880,8 +6803,8 @@ impl Mesh {
     /// segmented writer. The resulting on-socket payload remains byte-for-byte
     /// identical to [`Self::video_poll`], but native RGBA frames are not copied
     /// into an intermediate batch allocation.
-    pub(crate) fn video_poll_batch(&self, route_id: &str) -> VideoPollBatch {
-        let packets = self.drain_video_poll(route_id);
+    pub(crate) fn video_poll_batch(&self, route_id: &str, token: Option<u64>) -> VideoPollBatch {
+        let packets = self.drain_video_poll(route_id, token);
         if packets.is_empty() {
             return VideoPollBatch::new(packets);
         }
@@ -4901,7 +6824,11 @@ impl Mesh {
     /// Compatibility form of [`Self::video_poll_batch`] for in-process
     /// callers: one contiguous `[u32 len][packet]...` payload.
     pub fn video_poll(&self, route_id: &str) -> Vec<u8> {
-        let packets = self.drain_video_poll(route_id);
+        self.video_poll_for(route_id, None)
+    }
+
+    pub fn video_poll_for(&self, route_id: &str, token: Option<u64>) -> Vec<u8> {
+        let packets = self.drain_video_poll(route_id, token);
         if packets.is_empty() {
             return Vec::new();
         }
@@ -4919,6 +6846,38 @@ impl Mesh {
     }
 
     pub async fn disconnect(self: &Arc<Self>, route_id: String) -> Result<(), String> {
+        self.disconnect_expected(route_id, None).await
+    }
+
+    /// Tear down a local route intent, optionally requiring the exact
+    /// process-local generation returned by [`Self::connect_term_handle`].
+    /// Generation-less callers retain the legacy behavior; current GUI
+    /// callers always provide it for ABA-safe display switching.
+    pub async fn disconnect_expected(
+        self: &Arc<Self>,
+        route_id: String,
+        expected_generation: Option<u64>,
+    ) -> Result<(), String> {
+        // Fast rejection avoids entering the monitor-switch observation window
+        // for an already-proven stale close. This is only an optimization; the
+        // generation is checked again under the route lifecycle lock below.
+        if let Some(expected) = expected_generation {
+            let current = self
+                .desired_routes
+                .lock()
+                .get(&route_id)
+                .map(|route| route.local_generation);
+            if current != Some(expected) {
+                tracing::warn!(
+                    route = %route_id,
+                    expected_generation = expected,
+                    current_generation = ?current,
+                    disposition = "stale_local_teardown_ignored",
+                    "local route teardown generation mismatch"
+                );
+                return Ok(());
+            }
+        }
         if let Some(hit) = self.take_early_video_teardown_guard(&route_id) {
             // Do not infer intent from watcher *presence*: unwatch is a
             // separate fire-and-forget command and can lag. A window that polls
@@ -4961,9 +6920,49 @@ impl Mesh {
                 hit.predecessor,
             );
         }
-        let msg = {
+        let lifecycle = self.lock_route_lifecycle(&route_id).await;
+
+        // Validate and remove the exact desired lifetime only after every
+        // await and under the same lock used by connect/replay. If successor B
+        // installed while delayed close A was observing watcher liveness, this
+        // second check returns without touching B's Session or media resources.
+        {
+            let mut desired = self.desired_routes.lock();
+            if let Some(expected) = expected_generation {
+                let current = desired.get(&route_id).map(|route| route.local_generation);
+                if current != Some(expected) {
+                    tracing::warn!(
+                        route = %route_id,
+                        expected_generation = expected,
+                        current_generation = ?current,
+                        disposition = "stale_local_teardown_ignored_after_wait",
+                        "local route teardown generation changed before commit"
+                    );
+                    drop(lifecycle);
+                    return Ok(());
+                }
+            }
+            desired.remove(&route_id);
+        }
+        self.requested_video_tunes.lock().remove(&route_id);
+
+        let (msg, peer, route_network) = {
             let mut st = self.state.lock();
-            st.session.as_mut().and_then(|s| s.teardown(&route_id))
+            let route_facts = st
+                .session
+                .as_ref()
+                .and_then(|session| session.route(&route_id))
+                .map(|route| (route.peer.to_string(), route.incarnation.clone()));
+            let route_network = route_facts
+                .as_ref()
+                .and_then(|(_, incarnation)| {
+                    st.route_networks
+                        .remove(&(route_id.clone(), incarnation.clone()))
+                })
+                .map(|pin| pin.network);
+            let peer = route_facts.map(|(peer, _)| peer);
+            let message = st.session.as_mut().and_then(|s| s.teardown(&route_id));
+            (message, peer, route_network)
         };
         tracing::info!("local route teardown committing for {route_id}");
         self.audio.stop(&route_id);
@@ -4980,6 +6979,7 @@ impl Mesh {
         self.video_watchers.lock().remove(&route_id);
         self.release_video_lanes(&route_id);
         self.release_audio_lanes(&route_id);
+        self.active_media_incarnations.lock().remove(&route_id);
         self.terminal.stop(&route_id);
         self.files.stop(&route_id);
         // The unmapping (client) side gets no local StopMedia effect — only
@@ -4987,9 +6987,32 @@ impl Mesh {
         // here, or they'd leak (the port stays bound, the accept loop runs).
         self.sites.stop_route(&route_id);
         self.drop_downloads(&route_id);
-        if let (Some(msg), Some(peer)) = (&msg, self.route_peer(&route_id)) {
-            // Best-effort: the route is gone locally either way.
-            let _ = self.send_control(&peer, msg).await;
+        if let (Some(msg), Some(peer)) = (&msg, peer) {
+            if self.peer_supports_teardown_ack(&peer) {
+                if let ControlMessage::Route(RouteControl::Teardown {
+                    route_id,
+                    incarnation,
+                }) = msg
+                {
+                    self.pending_teardowns.lock().insert(
+                        (route_id.clone(), incarnation.clone()),
+                        PendingTeardown {
+                            peer: peer.clone(),
+                            message: msg.clone(),
+                            network: route_network.clone(),
+                            created: Instant::now(),
+                        },
+                    );
+                }
+            }
+            // Transport delivery is best-effort here; capable peers confirm
+            // consumption with TeardownAck and the existing sweep retries
+            // until that arrives or a fresh peer boot proves old state gone.
+            let _ = if let Some(network) = route_network.as_deref() {
+                self.send_control_on_network(&peer, msg, network).await
+            } else {
+                self.send_control(&peer, msg).await
+            };
         }
         self.emit_snapshot();
         Ok(())
@@ -6386,6 +8409,70 @@ impl Mesh {
         }
     }
 
+    /// Commit one exact StopMedia while the caller owns the route lifecycle
+    /// lock. Keeping the body non-async lets inbound teardown mutate Session
+    /// and retire its resources in one critical section, including legacy
+    /// routes whose wire incarnation is `None`.
+    fn apply_stop_media_locked(self: &Arc<Self>, id: String, incarnation: Option<String>) {
+        let owns_resources = {
+            let mut active = self.active_media_incarnations.lock();
+            let matches = active
+                .get(&id)
+                .is_some_and(|running| running == &incarnation);
+            if matches {
+                active.remove(&id);
+            }
+            matches
+        };
+        if !owns_resources {
+            tracing::warn!(
+                "stale StopMedia for {id} ignored because its route incarnation does not own the local resources"
+            );
+            return;
+        }
+        self.state
+            .lock()
+            .route_networks
+            .remove(&(id.clone(), incarnation.clone()));
+        let stop_state = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(&id))
+            .map(|route| format!("{:?}", route.state))
+            .unwrap_or_else(|| "absent".into());
+        tracing::info!("session StopMedia committing for {id} (route state {stop_state})");
+        self.audio.stop(&id);
+        self.video.stop(&id);
+        let policy_plans = self.media_policy.lock().remove_route(&id);
+        for plan in &policy_plans {
+            self.video.apply_policy_cap(
+                &plan.route_id,
+                Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
+                plan.auto_resolution,
+            );
+        }
+        self.queue_effective_plans(policy_plans);
+        let reconnecting = self.desired_routes.lock().contains_key(&id);
+        if reconnecting {
+            self.video_watchers.lock().reset_route_for_reconnect(&id);
+        } else {
+            self.video_watchers.lock().remove(&id);
+            self.requested_video_tunes.lock().remove(&id);
+        }
+        self.release_video_lanes(&id);
+        self.release_audio_lanes(&id);
+        self.injector.release_route(&id);
+        self.terminal.detach(&id);
+        self.term_pumps.lock().remove(&id);
+        self.term_rx_seq.lock().remove(&id);
+        self.term_in_seq.lock().remove(&id);
+        self.files.stop(&id);
+        self.sites.stop_route(&id);
+        self.drop_downloads(&id);
+    }
+
     async fn process_effects(self: &Arc<Self>, effects: Vec<Effect>) {
         for e in effects {
             match e {
@@ -6393,12 +8480,9 @@ impl Mesh {
                     // Replies ride best-effort; the failure is already logged.
                     let _ = self.send_control(&peer.to_string(), &message).await;
                 }
-                Effect::StartMedia(route) => {
-                    // The sender's transport pick inside start_media is
-                    // one-shot too — same bring-up race guard, only for
-                    // routes that carry a picture.
+                Effect::StartMedia { route, incarnation } => {
+                    let _lifecycle = self.lock_route_lifecycle(&route.id).await;
                     if matches!(route.media, MediaKind::Display | MediaKind::Video) {
-                        self.await_video_bringup().await;
                         let still_active = self
                             .state
                             .lock()
@@ -6406,7 +8490,9 @@ impl Mesh {
                             .as_ref()
                             .and_then(|s| s.route(&route.id))
                             .is_some_and(|live| {
-                                live.state == RouteState::Active && live.route == route
+                                live.state == RouteState::Active
+                                    && live.route == route
+                                    && live.incarnation == incarnation
                             });
                         if !still_active {
                             tracing::warn!(
@@ -6415,13 +8501,32 @@ impl Mesh {
                             );
                             continue;
                         }
+                        self.video_in.lock().clear_route(&route.id);
                         self.note_video_route_started(&route);
+                    }
+                    if !self.claim_media_incarnation_if_active(&route.id, incarnation.as_deref()) {
+                        tracing::warn!(
+                            "stale StartMedia for {} ignored after its route lifetime changed",
+                            route.id
+                        );
+                        continue;
+                    }
+                    if route.media == MediaKind::Input {
+                        self.injector.activate_route(&route.id);
                     }
                     self.start_media(&route)
                 }
-                Effect::RefreshMedia(id) => self.video.force_idr(&id),
+                Effect::RefreshMedia {
+                    route_id,
+                    incarnation,
+                } => {
+                    if self.route_is_active_incarnation(&route_id, incarnation.as_deref()) {
+                        self.video.force_idr(&route_id);
+                    }
+                }
                 Effect::TuneMedia {
                     route_id,
+                    incarnation,
                     max_edge,
                     bitrate,
                     fps,
@@ -6429,6 +8534,9 @@ impl Mesh {
                     mode,
                     ext,
                 } => {
+                    if !self.route_is_active_incarnation(&route_id, incarnation.as_deref()) {
+                        continue;
+                    }
                     let legacy_dials_absent = max_edge.is_none()
                         && bitrate.is_none()
                         && fps.is_none()
@@ -6438,6 +8546,7 @@ impl Mesh {
                     let mut policy_auto_resolution = false;
                     let mut plans_to_echo = Vec::new();
                     let mut audio_profile_update = None;
+                    let mut effective_video_mode = None;
                     let mut election_only = false;
                     if let Some(envelope) = PolicyEnvelope::from_ext(&ext) {
                         match envelope.payload {
@@ -6466,12 +8575,8 @@ impl Mesh {
                                 capabilities,
                             } if ext_route == route_id => {
                                 if let Some(peer) = self.route_peer(&route_id) {
-                                    let lan = self
-                                        .state
-                                        .lock()
-                                        .peer_links
-                                        .get(pubkey_part(&peer))
-                                        .is_some_and(|c| *c == crate::video::LinkClass::Lan);
+                                    let lan = self.route_link_class(&route_id, &peer)
+                                        == crate::video::LinkClass::Lan;
                                     election_only = request.priority_only
                                         || (request.priority
                                             && request.peer_cap_bps.is_none()
@@ -6502,6 +8607,7 @@ impl Mesh {
                                     if let Some(plan) =
                                         plans_to_echo.iter().find(|plan| plan.route_id == route_id)
                                     {
+                                        effective_video_mode = Some(plan.effective_mode);
                                         policy_cap =
                                             Some(plan.route_budget_bps.min(u64::from(u32::MAX))
                                                 as u32);
@@ -6529,7 +8635,7 @@ impl Mesh {
                             bitrate,
                             fps,
                             game,
-                            mode.as_deref(),
+                            resolved_encoder_mode(mode.as_deref(), effective_video_mode),
                             policy_cap,
                             policy_auto_resolution,
                         );
@@ -6546,16 +8652,20 @@ impl Mesh {
                     if let Some((peer, mode)) = audio_profile_update {
                         self.apply_audio_profile_for_peer(&peer, mode);
                     }
-                    self.send_effective_plans(plans_to_echo).await;
+                    self.queue_effective_plans(plans_to_echo);
                 }
                 Effect::VideoFeedback {
                     route_id,
+                    incarnation,
                     recv_fps,
                     decode_fails,
                     queue_depth,
                     lost_ts_us,
                     ext,
                 } => {
+                    if !self.route_is_active_incarnation(&route_id, incarnation.as_deref()) {
+                        continue;
+                    }
                     // The pipeline's own feedback shape lives in the opaque
                     // ext — parse it here, at the backend edge, so the
                     // wire crates never learned what a bandwidth estimate
@@ -6563,16 +8673,14 @@ impl Mesh {
                     let pf = crate::video::PipelineFeedback::from_ext(&ext);
                     if let Some(ts) = lost_ts_us {
                         // Frame health: the viewer named the AU that died.
-                        // A GDR (game) route heals with an immediate
-                        // refresh-wave restart — spread intra, no keyframe
-                        // wall; everything else keeps the IDR refresh the
-                        // feedback path already drives. (Targeted
-                        // reference invalidation rides the ts-mapping
-                        // follow-up.)
+                        // This signal follows decoder or queue abandonment.
+                        // The receiver now rejects dependent frames until a key
+                        // AU, so a GDR wave alone cannot recover it. Force an
+                        // IDR until soft damage has a distinct recovery signal.
                         tracing::info!(
-                            "frame health {route_id}: viewer lost AU at {ts} µs — targeted refresh"
+                            "frame health {route_id}: viewer lost AU at {ts} us; forcing IDR"
                         );
-                        self.video.route_wave_or_refresh(&route_id);
+                        self.video.force_idr(&route_id);
                     }
                     self.video.note_feedback(
                         &route_id,
@@ -6606,81 +8714,15 @@ impl Mesh {
                                 plan.auto_resolution,
                             );
                         }
-                        self.send_effective_plans(plans).await;
+                        self.queue_effective_plans(plans);
                     }
                 }
-                Effect::StopMedia(id) => {
-                    // Effects are produced after the session mutates the route
-                    // to TornDown/Rejected. If another task has already
-                    // installed a same-id nonterminal successor, this stop
-                    // belongs to the displaced incarnation and must not tear
-                    // down the replacement by id. Offered/Incoming count too:
-                    // early media can legitimately outrun Accept, and that is
-                    // exactly the ABA window seen in the field logs.
-                    let successor_is_live = self
-                        .state
-                        .lock()
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.route(&id))
-                        .is_some_and(|r| {
-                            matches!(
-                                r.state,
-                                RouteState::Offered | RouteState::Incoming | RouteState::Active
-                            ) && matches!(r.route.media, MediaKind::Display | MediaKind::Video)
-                        });
-                    if successor_is_live {
-                        tracing::warn!(
-                            "stale StopMedia for {id} ignored because a same-id video successor is nonterminal"
-                        );
-                        continue;
-                    }
-                    let stop_state = self
-                        .state
-                        .lock()
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.route(&id))
-                        .map(|r| format!("{:?}", r.state))
-                        .unwrap_or_else(|| "absent".into());
-                    tracing::info!(
-                        "session StopMedia committing for {id} (route state {stop_state})"
-                    );
-                    self.audio.stop(&id);
-                    self.video.stop(&id);
-                    let policy_plans = self.media_policy.lock().remove_route(&id);
-                    for plan in &policy_plans {
-                        self.video.apply_policy_cap(
-                            &plan.route_id,
-                            Some(plan.route_budget_bps.min(u64::from(u32::MAX)) as u32),
-                            plan.auto_resolution,
-                        );
-                    }
-                    self.send_effective_plans(policy_plans).await;
-                    self.video_watchers.lock().remove(&id);
-                    self.requested_video_tunes.lock().remove(&id);
-                    self.release_video_lanes(&id);
-                    self.release_audio_lanes(&id);
-                    // A control route ending mid-chord must not leave this
-                    // machine holding the keys it injected.
-                    self.injector.release_route(&id);
-                    // A terminal route ending is one *viewer* leaving, not the
-                    // shell dying: detach (keep the shared shell alive for the
-                    // other attachers, host or remote; the last one leaving
-                    // arms the idle reaper), never kill. Closing a tab on one
-                    // machine must not end a session another still has open.
-                    self.terminal.detach(&id);
-                    // Drop this route's terminal pump/dedup bookkeeping so a
-                    // later route reusing the id starts clean (and the maps
-                    // never grow unbounded over a long session).
-                    self.term_pumps.lock().remove(&id);
-                    self.term_rx_seq.lock().remove(&id);
-                    self.term_in_seq.lock().remove(&id);
-                    self.files.stop(&id);
-                    // A site route ending closes its local listener (client
-                    // side) and every tunneled connection it carried.
-                    self.sites.stop_route(&id);
-                    self.drop_downloads(&id);
+                Effect::StopMedia {
+                    route_id: id,
+                    incarnation,
+                } => {
+                    let _lifecycle = self.lock_route_lifecycle(&id).await;
+                    self.apply_stop_media_locked(id, incarnation);
                 }
                 Effect::Share { from, message } => self.handle_share(from, message).await,
                 Effect::Ownership { from, message } => self.handle_ownership(from, message).await,
@@ -7545,7 +9587,7 @@ impl Mesh {
         claimables.find(|id| {
             st.peer_networks
                 .get(pubkey_part(id))
-                .is_some_and(|net| net == network)
+                .is_some_and(|paths| paths.contains(network))
         })
     }
 
@@ -8911,15 +10953,30 @@ impl Mesh {
     /// on, not just the ones present at launch. Re-subscribing an existing
     /// channel is idempotent on the daemon.
     pub async fn sync_networks(self: &Arc<Self>) {
+        let _sync = self.network_sync_serial.lock().await;
+        let epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
         let client_id = { self.state.lock().client_id };
         let Some(client_id) = client_id else { return };
         let networks = self.fetch_networks().await;
+        if !self.daemon_context_is_current(epoch, client_id) {
+            return;
+        }
         let primary = networks.first().cloned();
-        {
+        let generation = {
             let mut st = self.state.lock();
+            if st.client_id != Some(client_id)
+                || self.daemon_session_epoch.load(Ordering::SeqCst) != epoch
+            {
+                return;
+            }
+            let rotate_existing = st.networks == networks;
+            st.network_generation = st.network_generation.wrapping_add(1);
+            reconcile_network_epochs(&mut st, &networks, rotate_existing);
             st.networks = networks.clone();
             st.network = primary.clone();
-        }
+            st.network_generation
+        };
+        let (replay_peers, missing_routes) = self.retire_unjoined_route_paths().await;
         // A network reset (one disabled, removed, or left — its config_id is
         // gone from the joined set) leaves behind ghosts: peers and the
         // network-derived data we cached for them while it was up. Drop those
@@ -8927,13 +10984,52 @@ impl Mesh {
         // long-lived state (shares, fleet membership + the signed-roster cache,
         // the saved networks, exposed sites) is untouched (see
         // [`Mesh::prune_unjoined_peers`]).
-        self.prune_unjoined_peers().await;
         self.subscribe_channels(client_id, &networks).await;
+        if !self.daemon_context_is_current(epoch, client_id)
+            || self.state.lock().network_generation != generation
+        {
+            return;
+        }
         // The joined set changed — re-learn each connected peer's network from
         // the daemon peer list so a peer reachable only on a newly-arrived or
         // re-enabled mesh (e.g. the fleet network) is addressed there, not the
         // primary fallback.
         self.refresh_peer_networks().await;
+        if !self.daemon_context_is_current(epoch, client_id)
+            || self.state.lock().network_generation != generation
+        {
+            return;
+        }
+        // The fetch/commit/subscription/peer-refresh transaction is complete.
+        // Release the sync gate before processing Session effects because an
+        // ownership effect can legitimately request another network sync.
+        drop(_sync);
+        // Prune only after the daemon's surviving per-network peer sets have
+        // been refreshed. Otherwise a peer reachable on both removed A and
+        // surviving B can be torn down solely because its last frame used A.
+        self.prune_unjoined_peers().await;
+        if !self.daemon_context_is_current(epoch, client_id)
+            || self.state.lock().network_generation != generation
+        {
+            return;
+        }
+        for (peer, route_id, incarnation) in missing_routes {
+            let message = ControlMessage::Route(RouteControl::MissingRoute {
+                route_id: route_id.clone(),
+                incarnation,
+            });
+            if let Err(error) = self.send_control(&peer, &message).await {
+                tracing::warn!(
+                    route = %route_id,
+                    peer = %short_id(&peer),
+                    error = %error,
+                    "could not request a fresh route lifetime after its data-plane network disappeared"
+                );
+            }
+        }
+        for peer in replay_peers {
+            Box::pin(self.replay_desired_routes(Some(&peer))).await;
+        }
         // The joined set just changed (a create / join / import / re-enable, or
         // the fleet network arriving). Reconcile open-mesh policy now so a mesh
         // doesn't wait for the next ownership broadcast to drop its approval
@@ -8944,6 +11040,89 @@ impl Mesh {
         self.advertise_capabilities().await;
         self.broadcast_presence().await;
         self.emit_snapshot();
+    }
+
+    /// Retire every exact route whose immutable data-plane network is no
+    /// longer joined. Local media stops before any fresh Offer is allowed.
+    /// Outbound user intent is replayed by the caller after subscriptions and
+    /// peer reachability have converged. For inbound routes, the owning peer is
+    /// asked to mint the successor lifetime on a surviving app-data path.
+    async fn retire_unjoined_route_paths(
+        self: &Arc<Self>,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        Vec<(String, String, Option<String>)>,
+    ) {
+        let lost_keys = {
+            let state = self.state.lock();
+            state
+                .route_networks
+                .iter()
+                .filter(|(_, pin)| {
+                    !state.networks.contains(&pin.network)
+                        || state.network_epochs.get(&pin.network).copied()
+                            != Some(pin.network_epoch)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut replay_peers = std::collections::BTreeSet::new();
+        let mut missing_routes = Vec::new();
+        for (route_id, incarnation) in lost_keys {
+            let lifecycle = self.lock_route_lifecycle(&route_id).await;
+            let facts = {
+                let mut state = self.state.lock();
+                let key = (route_id.clone(), incarnation.clone());
+                let still_lost = state.route_networks.get(&key).is_some_and(|pin| {
+                    !state.networks.contains(&pin.network)
+                        || state.network_epochs.get(&pin.network).copied()
+                            != Some(pin.network_epoch)
+                });
+                if !still_lost {
+                    None
+                } else {
+                    let facts = state
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.route(&route_id))
+                        .filter(|route| route.incarnation == incarnation)
+                        .map(|route| (route.peer.to_string(), route.origin, route.is_active()));
+                    // A same-id successor may have replaced the lost lifetime
+                    // while this retirement task waited for the route lock.
+                    // Retire Session state only when it is still the exact
+                    // incarnation represented by the stale pin.
+                    if facts.is_some() {
+                        if let Some(session) = state.session.as_mut() {
+                            let _ = session.teardown(&route_id);
+                        }
+                    }
+                    state.route_networks.remove(&key);
+                    facts
+                }
+            };
+            let Some((peer, origin, was_active)) = facts else {
+                drop(lifecycle);
+                continue;
+            };
+            if was_active {
+                self.apply_stop_media_locked(route_id.clone(), incarnation.clone());
+            }
+            let desired_matches = self
+                .desired_routes
+                .lock()
+                .get(&route_id)
+                .is_some_and(|route| {
+                    pubkey_part(&route.peer) == pubkey_part(&peer)
+                        && route.current_incarnation == incarnation
+                });
+            if origin == allmystuff_session::Origin::Outbound && desired_matches {
+                replay_peers.insert(peer);
+            } else if origin == allmystuff_session::Origin::Inbound {
+                missing_routes.push((peer, route_id, incarnation));
+            }
+            drop(lifecycle);
+        }
+        (replay_peers, missing_routes)
     }
 
     /// Clear the ephemeral, network-derived caches for peers no longer
@@ -8965,11 +11144,26 @@ impl Mesh {
         let (effects, dropped) = {
             let mut st = self.state.lock();
             let joined: std::collections::HashSet<String> = st.networks.iter().cloned().collect();
-            // Peers whose last-seen network is gone from the joined set.
+            for paths in st.peer_networks.values_mut() {
+                paths.retain_joined(&joined);
+                if paths
+                    .preferred
+                    .as_ref()
+                    .is_some_and(|network| !paths.contains(network))
+                {
+                    paths.preferred = None;
+                }
+            }
+            st.peer_links
+                .retain(|(network, _), _| joined.contains(network));
+            // A peer is stale only when no surviving network still proves it
+            // reachable. The former single last-seen slot dropped multi-homed
+            // peers merely because their most recent advert used a removed
+            // network.
             let stale: std::collections::HashSet<String> = st
                 .peer_networks
                 .iter()
-                .filter(|(_, net)| !joined.contains(net.as_str()))
+                .filter(|(_, paths)| paths.is_empty())
                 .map(|(peer, _)| peer.clone())
                 .collect();
             if stale.is_empty() {
@@ -8979,6 +11173,9 @@ impl Mesh {
                 st.peer_networks.remove(peer);
                 st.peer_features.remove(peer);
                 st.peer_boots.remove(peer);
+                st.peer_retired_boots.remove(peer);
+                st.peer_links
+                    .retain(|(_, route_peer), _| route_peer != peer);
             }
             // Drop the same peers (matched by canonical pubkey) from the live
             // session, tearing down any routes to them.
@@ -8999,17 +11196,11 @@ impl Mesh {
         };
         if dropped > 0 {
             tracing::info!("network reset: cleared {dropped} stale peer(s) from a removed network");
-            // We just threw away everything we knew about those peers (their
-            // profile, features, network, boot id). As far as their state goes
-            // we're now a fresh incarnation, so refresh our boot id: the *next*
-            // presence advert carries a new one, which is what makes a peer
-            // that never reset — same boot id on file, still holding us as a
-            // `known` peer — actually re-send its state instead of treating our
-            // advert as old news. This is the fix for "refresh on one side
-            // breaks the connection until *both* sides refresh": without it the
-            // resetting side discarded its caches but the other side never
-            // re-fed them.
-            self.boot_id.store(fresh_boot_id(), Ordering::Relaxed);
+            // This is a peer-cache change, not a restart of our application
+            // route epoch. Rotating the global boot here would make every
+            // surviving peer reap healthy routes because an unrelated peer
+            // disappeared. A forgotten peer is already answered when its next
+            // presence arrives because it is no longer `known` locally.
         }
         // Boxed to break the async-fn cycle: `process_effects` can route back
         // through ownership/`sync_networks`, and without indirection the
@@ -9024,7 +11215,263 @@ impl Mesh {
     /// addressed to whichever network the *sender* last saw us on always has a
     /// subscriber here. (The fleet's `OwnedRoster` gossip channel is gone —
     /// membership is the closed network's signed roster now.)
-    async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
+    async fn subscribe_channels(self: &Arc<Self>, client_id: ClientId, networks: &[String]) {
+        let daemon_epoch = self.daemon_session_epoch.load(Ordering::SeqCst);
+        if self.state.lock().client_id != Some(client_id) {
+            return;
+        }
+        let serial = self.subscription_serial.lock().await;
+        if self.daemon_session_epoch.load(Ordering::SeqCst) != daemon_epoch
+            || self.state.lock().client_id != Some(client_id)
+        {
+            return;
+        }
+        {
+            let joined = networks
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let mut health = self.network_subscriptions.lock();
+            health.retain(|network, _| joined.contains(network));
+            for network in networks {
+                let replace = health
+                    .get(network)
+                    .is_none_or(|state| !state.belongs_to(daemon_epoch, client_id));
+                if replace {
+                    health.insert(
+                        network.clone(),
+                        NetworkSubscriptionState::new(daemon_epoch, client_id),
+                    );
+                }
+            }
+        }
+
+        // Preserve the existing immediate retry envelope, but issue all
+        // missing slots in parallel so one dark mesh cannot delay a healthy
+        // mesh's presence, control, or video subscription.
+        let mut missing = usize::MAX;
+        for attempt in 0..3u32 {
+            missing = self
+                .subscribe_missing_once(client_id, daemon_epoch, networks, attempt)
+                .await;
+            if missing == 0 {
+                break;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt + 1))).await;
+            }
+        }
+        drop(serial);
+
+        if missing > 0 {
+            tracing::error!(
+                missing,
+                "mesh subscription set is degraded; healthy networks remain live and missing slots will retry for this daemon session"
+            );
+        }
+        self.emit_subscription_health(missing);
+        self.start_subscription_retry_worker(client_id, daemon_epoch);
+    }
+
+    async fn subscribe_missing_once(
+        &self,
+        client_id: ClientId,
+        daemon_epoch: u64,
+        networks: &[String],
+        attempt: u32,
+    ) -> usize {
+        let targets = {
+            let health = self.network_subscriptions.lock();
+            let mut targets = Vec::new();
+            for network in networks {
+                let Some(current) = health
+                    .get(network)
+                    .filter(|state| state.belongs_to(daemon_epoch, client_id))
+                    .cloned()
+                else {
+                    continue;
+                };
+                for channel in required_subscription_channels() {
+                    if !current.channels.contains(channel) {
+                        targets.push((
+                            network.clone(),
+                            SubscriptionTarget::Channel(channel.to_string()),
+                        ));
+                    }
+                }
+                if !current.video {
+                    targets.push((network.clone(), SubscriptionTarget::Video));
+                }
+                if !current.audio {
+                    targets.push((network.clone(), SubscriptionTarget::Audio));
+                }
+            }
+            targets
+        };
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (network, target) in targets {
+            let client = self.client.clone();
+            let request = match &target {
+                SubscriptionTarget::Channel(channel) => Request::ChannelSubscribe {
+                    client_id,
+                    network: network.clone(),
+                    channel: channel.clone(),
+                },
+                SubscriptionTarget::Video => Request::VideoSubscribe {
+                    client_id,
+                    network: network.clone(),
+                },
+                SubscriptionTarget::Audio => Request::AudioSubscribe {
+                    client_id,
+                    network: network.clone(),
+                },
+            };
+            tasks.spawn(async move {
+                let outcome = client
+                    .request(&request)
+                    .await
+                    .map(|response| (response.ok, response.error))
+                    .map_err(|error| error.to_string());
+                (network, target, outcome)
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            let Ok((network, target, outcome)) = result else {
+                tracing::warn!(attempt, "subscription attempt task failed to join");
+                continue;
+            };
+            match outcome {
+                Ok((true, _)) => {
+                    if self.daemon_session_epoch.load(Ordering::SeqCst) != daemon_epoch {
+                        continue;
+                    }
+                    let mut health = self.network_subscriptions.lock();
+                    let Some(current) = health
+                        .get_mut(&network)
+                        .filter(|state| state.belongs_to(daemon_epoch, client_id))
+                    else {
+                        continue;
+                    };
+                    match target {
+                        SubscriptionTarget::Channel(channel) => {
+                            current.channels.insert(channel);
+                        }
+                        SubscriptionTarget::Video => current.video = true,
+                        SubscriptionTarget::Audio => current.audio = true,
+                    }
+                }
+                Ok((false, error)) => tracing::warn!(
+                    network = %network,
+                    target = ?target,
+                    attempt,
+                    "subscription refused: {}",
+                    error.as_deref().unwrap_or("(no error)")
+                ),
+                Err(error) => tracing::warn!(
+                    network = %network,
+                    target = ?target,
+                    attempt,
+                    "subscription failed: {error}"
+                ),
+            }
+        }
+
+        if self.daemon_session_epoch.load(Ordering::SeqCst) != daemon_epoch
+            || self.state.lock().client_id != Some(client_id)
+        {
+            return 0;
+        }
+        let health = self.network_subscriptions.lock();
+        self.daemon_video.store(
+            health
+                .values()
+                .any(|state| state.belongs_to(daemon_epoch, client_id) && state.video),
+            Ordering::SeqCst,
+        );
+        self.daemon_audio.store(
+            health
+                .values()
+                .any(|state| state.belongs_to(daemon_epoch, client_id) && state.audio),
+            Ordering::SeqCst,
+        );
+        subscription_missing_count(&health, daemon_epoch, client_id, networks)
+    }
+
+    fn emit_subscription_health(&self, missing: usize) {
+        let health = self.network_subscriptions.lock();
+        let networks = health
+            .iter()
+            .map(|(network, state)| {
+                json!({
+                    "network": network,
+                    "channels": state.channels.len(),
+                    "video": state.video,
+                    "audio": state.audio,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.sink.emit(
+            "allmystuff://subscription-health",
+            json!({
+                "status": if missing == 0 { "healthy" } else { "degraded" },
+                "missing": missing,
+                "networks": networks,
+            }),
+        );
+    }
+
+    fn start_subscription_retry_worker(self: &Arc<Self>, client_id: ClientId, epoch: u64) {
+        if self.daemon_session_epoch.load(Ordering::SeqCst) != epoch
+            || self.state.lock().client_id != Some(client_id)
+        {
+            return;
+        }
+        if self.subscription_retry_epoch.swap(epoch, Ordering::SeqCst) == epoch {
+            return;
+        }
+        let mesh = Arc::downgrade(self);
+        crate::spawn(async move {
+            loop {
+                tokio::time::sleep(OFFER_SWEEP).await;
+                let Some(mesh) = mesh.upgrade() else { return };
+                if mesh.daemon_session_epoch.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                let networks = {
+                    let state = mesh.state.lock();
+                    if state.client_id != Some(client_id) {
+                        return;
+                    }
+                    state.networks.clone()
+                };
+                if networks.is_empty() {
+                    continue;
+                }
+                let serial = mesh.subscription_serial.lock().await;
+                if mesh.daemon_session_epoch.load(Ordering::SeqCst) != epoch
+                    || mesh.state.lock().client_id != Some(client_id)
+                {
+                    return;
+                }
+                let missing = mesh
+                    .subscribe_missing_once(client_id, epoch, &networks, 3)
+                    .await;
+                drop(serial);
+                if missing > 0 {
+                    tracing::warn!(
+                        missing,
+                        "subscription healer still has dark slots; healthy networks remain usable"
+                    );
+                }
+                mesh.emit_subscription_health(missing);
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    async fn subscribe_channels_legacy(&self, client_id: ClientId, networks: &[String]) {
         let channels = [
             CHANNEL_PRESENCE,
             CHANNEL_CONTROL,
@@ -9124,8 +11571,15 @@ impl Mesh {
                         .and_then(|r| r.data)
                     {
                         if let Some(n) = d.get("media_lanes").and_then(|v| v.as_u64()) {
+                            if n > u64::from(PRENEGOTIATED_MEDIA_LANES) {
+                                tracing::debug!(
+                                    reported_lanes = n,
+                                    usable_lanes = PRENEGOTIATED_MEDIA_LANES,
+                                    "ignoring dynamic media-lane ceiling at the no-signaling boundary"
+                                );
+                            }
                             self.daemon_lanes
-                                .store(n.clamp(1, 255) as u8, Ordering::SeqCst);
+                                .store(PRENEGOTIATED_MEDIA_LANES, Ordering::SeqCst);
                         }
                         let pipes = d
                             .get("media_pipes")
@@ -9227,7 +11681,9 @@ impl Mesh {
                         .and_then(|s| s.route(&route.id))
                         .map(|r| r.audio.iter().any(|a| a == "opus"))
                         .unwrap_or(false);
-                    let lane = accepts_opus && self.audio_lane(&route.id, &to_node, true).is_some();
+                    let lane = accepts_opus
+                        && self.route_audio_ready(&route.id, &to_node)
+                        && self.audio_lane(&route.id, &to_node, true).is_some();
                     if policy_enforced && !lane {
                         tracing::warn!(
                             "audio unavailable for {}: peer lacks a usable Opus lane; legacy PCM \
@@ -9588,6 +12044,54 @@ impl Mesh {
         }
     }
 
+    /// The capability list this node advertises. Desktop/server `host` builds
+    /// retain the hardware-derived bridge contract. A capture-less mobile
+    /// build uses the mobile-core viewer/controller contract instead of
+    /// trimming desktop capabilities after the fact. That provides the
+    /// synthetic Display and Audio sinks a remote desktop needs, while never
+    /// advertising the inert desktop control, system-audio, or clipboard
+    /// endpoints backed by no-op stubs on this build.
+    fn advertised_capabilities(
+        inv: &allmystuff_inventory::Inventory,
+        node: &allmystuff_graph::NodeId,
+    ) -> Vec<allmystuff_graph::Capability> {
+        #[cfg(feature = "host")]
+        {
+            allmystuff_bridge::capabilities_with_screens(inv, node, &crate::video::extra_screens())
+        }
+        #[cfg(not(feature = "host"))]
+        {
+            let _ = inv;
+            allmystuff_mobile_core::mobile_capabilities(
+                node,
+                allmystuff_mobile_core::MobileScope::ViewerController,
+            )
+        }
+    }
+
+    /// Feature tags must describe the same platform profile as the capability
+    /// list. Desktop keeps its existing host feature set. Capture-less mobile
+    /// starts with the mobile-core contract, then adds the lifecycle features
+    /// implemented by this shared Mesh engine.
+    fn advertised_features() -> Vec<String> {
+        #[cfg(feature = "host")]
+        let mut features = vec![
+            allmystuff_protocol::FEATURE_FILES.to_string(),
+            allmystuff_protocol::FEATURE_ROOMS.to_string(),
+            allmystuff_protocol::FEATURE_SITES.to_string(),
+            allmystuff_protocol::FEATURE_TERMINAL.to_string(),
+            allmystuff_protocol::FEATURE_CAMERA.to_string(),
+        ];
+        #[cfg(not(feature = "host"))]
+        let mut features = allmystuff_mobile_core::mobile_features(
+            allmystuff_mobile_core::MobileScope::ViewerController,
+        );
+        features.push(FEATURE_ROUTE_INCARNATION.to_string());
+        features.push(FEATURE_ROUTE_TEARDOWN_ACK.to_string());
+        features.push(FEATURE_MEDIA_INCARNATION.to_string());
+        features
+    }
+
     /// The ids of the **active** codec media routes between us and `peer` in
     /// one direction, sorted — the shared, signalling-free basis for lane
     /// assignment: both ends compute the identical list from their own copy of
@@ -9602,23 +12106,6 @@ impl Mesh {
     /// basis to active routes keeps the two ends agreeing on a stable lane for
     /// the whole life of each stream (both ends process Active/Teardown), so
     /// an unrelated route coming or going no longer reshuffles a live one.
-    /// The capability list this node advertises. On a `host` build it is the
-    /// bridge's list verbatim. A capture-less build (iOS) strips the sources
-    /// it cannot serve — the synthetic screen and any camera — so peers are
-    /// never invited to open a stream the stub planes would refuse. Sinks
-    /// (video-view, audio out) and the mic (real under `audio-io`) stay.
-    fn advertised_capabilities(
-        inv: &allmystuff_inventory::Inventory,
-        node: &allmystuff_graph::NodeId,
-    ) -> Vec<allmystuff_graph::Capability> {
-        #[allow(unused_mut)]
-        let mut caps =
-            allmystuff_bridge::capabilities_with_screens(inv, node, &crate::video::extra_screens());
-        #[cfg(not(feature = "host"))]
-        caps.retain(|c| c.origin != "screen" && c.origin != "camera");
-        caps
-    }
-
     fn sorted_media_routes(&self, peer: &str, outbound: bool, codec: &str) -> Vec<String> {
         let Some(me) = self.local_node_id() else {
             return Vec::new();
@@ -9649,6 +12136,330 @@ impl Mesh {
         ids
     }
 
+    fn peer_supports_route_incarnation(&self, peer: &str) -> bool {
+        let canon = pubkey_part(peer);
+        let advertised = self
+            .state
+            .lock()
+            .peer_features
+            .get(canon)
+            .is_some_and(|features| features.iter().any(|f| f == FEATURE_ROUTE_INCARNATION));
+        advertised
+            || self
+                .local_node_id()
+                .is_some_and(|local| same_node(&local, peer))
+    }
+
+    fn peer_supports_teardown_ack(&self, peer: &str) -> bool {
+        let canon = pubkey_part(peer);
+        self.state
+            .lock()
+            .peer_features
+            .get(canon)
+            .is_some_and(|features| features.iter().any(|f| f == FEATURE_ROUTE_TEARDOWN_ACK))
+            || self
+                .local_node_id()
+                .is_some_and(|local| same_node(&local, peer))
+    }
+
+    fn peer_supports_media_incarnation(&self, peer: &str) -> bool {
+        let canon = pubkey_part(peer);
+        self.state
+            .lock()
+            .peer_features
+            .get(canon)
+            .is_some_and(|features| features.iter().any(|f| f == FEATURE_MEDIA_INCARNATION))
+            || self
+                .local_node_id()
+                .is_some_and(|local| same_node(&local, peer))
+    }
+
+    /// Rotate the presence/route boot as one published state transition. Any
+    /// peer that receives a successor route token must also be able to learn
+    /// the same boot from our cached profile; resetting only the clock makes
+    /// every subsequent fenced Offer look stale.
+    fn rotate_route_boot(&self) -> u64 {
+        let boot = {
+            let mut clock = self.route_incarnation_clock.lock();
+            clock.reset();
+            clock.boot
+        };
+        if let Some(profile) = self.state.lock().profile.as_mut() {
+            profile.boot = boot;
+        }
+        boot
+    }
+
+    /// Allocate the next ordered route lifetime for a peer that advertised the
+    /// fence. Older peers receive no field and retain the legacy wire shape.
+    fn next_route_incarnation(&self, peer: &str) -> Option<String> {
+        if !self.peer_supports_route_incarnation(peer) {
+            return None;
+        }
+        Some(self.route_incarnation_clock.lock().next())
+    }
+
+    fn next_route_intent_generation(&self) -> u64 {
+        loop {
+            let generation = self
+                .route_intent_generation
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if generation != 0 {
+                return generation;
+            }
+        }
+    }
+
+    fn desired_route_is_current(&self, route_id: &str, generation: u64) -> bool {
+        self.desired_routes
+            .lock()
+            .get(route_id)
+            .is_some_and(|desired| desired.local_generation == generation)
+    }
+
+    fn remove_desired_route_exact(
+        &self,
+        peer: &str,
+        route_id: &str,
+        incarnation: Option<&str>,
+    ) -> bool {
+        let mut desired = self.desired_routes.lock();
+        let matches = desired.get(route_id).is_some_and(|route| {
+            pubkey_part(&route.peer) == pubkey_part(peer)
+                && route.current_incarnation.as_deref() == incarnation
+        });
+        if matches {
+            desired.remove(route_id);
+            self.requested_video_tunes.lock().remove(route_id);
+        }
+        matches
+    }
+
+    fn update_desired_terminal_session(
+        &self,
+        peer: &str,
+        route_id: &str,
+        incarnation: Option<&str>,
+        session: Option<&str>,
+    ) {
+        let Some(session) = session else { return };
+        if let Some(desired) = self.desired_routes.lock().get_mut(route_id) {
+            if pubkey_part(&desired.peer) == pubkey_part(peer)
+                && desired.current_incarnation.as_deref() == incarnation
+            {
+                desired.term_session = Some(session.to_string());
+            }
+        }
+    }
+
+    /// Rebuild user-owned outbound routes after the daemon session or a peer
+    /// app lifetime changes. This only recreates RouteControl on the existing
+    /// application data channel. It does not create or modify signaling,
+    /// discovery, SDP, ICE candidates, or STUN/TURN configuration.
+    async fn replay_desired_routes(self: &Arc<Self>, only_peer: Option<&str>) {
+        let desired = self
+            .desired_routes
+            .lock()
+            .values()
+            .filter(|route| {
+                only_peer.is_none_or(|peer| pubkey_part(peer) == pubkey_part(&route.peer))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for desired_route in desired {
+            if !self
+                .desired_route_is_current(&desired_route.route.id, desired_route.local_generation)
+            {
+                continue;
+            }
+            let route_id = desired_route.route.id.clone();
+
+            let (message, effects, peer, local) = {
+                let _lifecycle = self.lock_route_lifecycle(&route_id).await;
+                // Re-read the intent after acquiring the lock. A concurrent
+                // replay or connect can update the same generation's current
+                // wire incarnation while this task is waiting; comparing with
+                // the stale pre-lock clone would needlessly replace it again.
+                let Some(current_desired) = self
+                    .desired_routes
+                    .lock()
+                    .get(&route_id)
+                    .filter(|current| current.local_generation == desired_route.local_generation)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let peer = current_desired.peer.clone();
+                let local = self.local_node_id().is_some_and(|me| same_node(&me, &peer));
+
+                let already_current = self
+                    .state
+                    .lock()
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.route(&route_id))
+                    .is_some_and(|route| {
+                        matches!(
+                            route.state,
+                            RouteState::Offered | RouteState::Incoming | RouteState::Active
+                        ) && route.incarnation == current_desired.current_incarnation
+                    });
+                if already_current {
+                    continue;
+                }
+
+                // Allocate only while holding the route lock. Two concurrent
+                // replays can no longer mint inc1/inc2 and install them in the
+                // opposite order.
+                let incarnation = self.next_route_incarnation(&peer);
+
+                {
+                    let mut routes = self.desired_routes.lock();
+                    let Some(current) = routes.get_mut(&route_id) else {
+                        continue;
+                    };
+                    if current.local_generation != current_desired.local_generation {
+                        continue;
+                    }
+                    current.current_incarnation = incarnation.clone();
+                }
+
+                let video = if self.peer_video_ready(&peer) {
+                    current_desired.requested_video.clone()
+                } else {
+                    Vec::new()
+                };
+                let audio = if self.peer_audio_ready(&peer) {
+                    current_desired.requested_audio.clone()
+                } else {
+                    Vec::new()
+                };
+                let mut state = self.state.lock();
+                let Some(session) = state.session.as_mut() else {
+                    continue;
+                };
+                let message = session.offer_terminal_with_incarnation(
+                    current_desired.route.clone(),
+                    peer.as_str(),
+                    video,
+                    audio,
+                    current_desired.term_session.clone(),
+                    incarnation.clone(),
+                );
+                let effects = if local {
+                    session.handle(
+                        NodeId::from(peer.as_str()),
+                        ControlMessage::Route(RouteControl::Accept {
+                            route_id: route_id.clone(),
+                            incarnation,
+                            session: current_desired.term_session.clone(),
+                        }),
+                    )
+                } else {
+                    Vec::new()
+                };
+                (message, effects, peer, local)
+            };
+
+            if local {
+                // A loopback replay can reach ownership handling, which may
+                // reconcile networks and re-enter desired-route replay. Keep
+                // that recovery edge heap-indirected so the async future has a
+                // finite type, matching the network-prune replay path.
+                Box::pin(self.process_effects(effects)).await;
+            } else if let Err(error) = self.send_control(&peer, &message).await {
+                tracing::warn!(
+                    route = %route_id,
+                    peer = %short_id(&peer),
+                    error = %error,
+                    "desired route replay remains queued for the next sweep/presence event"
+                );
+            } else {
+                tracing::info!(
+                    route = %route_id,
+                    peer = %short_id(&peer),
+                    "desired route replayed after session recovery"
+                );
+            }
+            self.emit_snapshot();
+        }
+    }
+
+    fn route_incarnation(&self, route_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .and_then(|route| route.incarnation.clone())
+    }
+
+    fn route_is_active_incarnation(&self, route_id: &str, incarnation: Option<&str>) -> bool {
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                route.state == RouteState::Active && route.incarnation.as_deref() == incarnation
+            })
+    }
+
+    async fn lock_route_lifecycle(&self, route_id: &str) -> RouteLifecycleGuard {
+        let lock = {
+            let mut locks = self.route_lifecycle_locks.lock();
+            locks
+                .entry(route_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.clone().lock_owned().await;
+        RouteLifecycleGuard {
+            route_id: route_id.to_string(),
+            lock,
+            guard: Some(guard),
+            locks: self.route_lifecycle_locks.clone(),
+        }
+    }
+
+    fn claim_media_incarnation_if_active(&self, route_id: &str, incarnation: Option<&str>) -> bool {
+        let state = self.state.lock();
+        let active = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                route.state == RouteState::Active && route.incarnation.as_deref() == incarnation
+            });
+        if active {
+            self.active_media_incarnations
+                .lock()
+                .insert(route_id.to_string(), incarnation.map(str::to_string));
+        }
+        active
+    }
+
+    fn peer_media_lane_count(&self, peer: &str) -> u8 {
+        let canon = pubkey_part(peer);
+        self.state
+            .lock()
+            .peer_features
+            .get(canon)
+            .and_then(|features| {
+                features.iter().find_map(|feature| {
+                    feature
+                        .strip_prefix("media-lanes:")
+                        .and_then(|count| count.parse::<u8>().ok())
+                        .filter(|count| *count > 0)
+                })
+            })
+            // The old binary tag proves support for lane 0 only. It does not
+            // prove the receiver provisioned the same pool size as us.
+            .unwrap_or(1)
+    }
+
     /// The media-lane pool size we and `peer` can both use for video: 0 when the
     /// local daemon has no track lane at all (everything MJPEG), 1 when either
     /// side predates the lane pool (only lane 0; extra streams fall back to
@@ -9659,7 +12470,11 @@ impl Mesh {
             return 0;
         }
         if self.peer_supports_lanes(peer) {
-            self.daemon_lanes.load(Ordering::SeqCst).max(1)
+            self.daemon_lanes
+                .load(Ordering::SeqCst)
+                .max(1)
+                .min(self.peer_media_lane_count(peer))
+                .min(PRENEGOTIATED_MEDIA_LANES)
         } else {
             1
         }
@@ -9671,7 +12486,11 @@ impl Mesh {
             return 0;
         }
         if self.peer_supports_lanes(peer) {
-            self.daemon_lanes.load(Ordering::SeqCst).max(1)
+            self.daemon_lanes
+                .load(Ordering::SeqCst)
+                .max(1)
+                .min(self.peer_media_lane_count(peer))
+                .min(PRENEGOTIATED_MEDIA_LANES)
         } else {
             1
         }
@@ -9681,8 +12500,9 @@ impl Mesh {
     fn peer_supports_lanes(&self, peer: &str) -> bool {
         let canon = pubkey_part(peer);
         self.state.lock().peer_features.get(canon).is_some_and(|f| {
-            f.iter()
-                .any(|x| x == allmystuff_protocol::FEATURE_MEDIA_LANES)
+            f.iter().any(|x| {
+                x == allmystuff_protocol::FEATURE_MEDIA_LANES || x.starts_with("media-lanes:")
+            })
         })
     }
 
@@ -9702,6 +12522,7 @@ impl Mesh {
         if cap == 0 {
             return None;
         }
+        let network = self.network_for_route(route_id, peer)?;
         let peer_canon = pubkey_part(peer);
         // The whole get/compute/insert runs under the pin lock — two screens
         // activating at once can never both pick "lane 0" (the lock serialises
@@ -9710,8 +12531,8 @@ impl Mesh {
         // sibling route not yet visible there left its lane looking free, and
         // both screens collapsed onto one track.
         let mut pins = self.video_lane_pins.lock();
-        let lane = free_lane_for_peer(&pins, peer_canon, route_id, cap)?;
-        pins.insert(route_id.to_string(), lane);
+        let lane = free_lane_for_peer(&pins, &network, peer_canon, route_id, cap)?;
+        pins.insert(route_id.to_string(), OutboundVideoLanePin { network, lane });
         Some(lane)
     }
 
@@ -9723,7 +12544,11 @@ impl Mesh {
     /// [`Self::video_route_for_lane`], never here.
     fn video_lane(&self, route_id: &str, peer: &str, outbound: bool) -> Option<u8> {
         if outbound {
-            return self.video_lane_pins.lock().get(route_id).copied();
+            return self
+                .video_lane_pins
+                .lock()
+                .get(route_id)
+                .map(|pin| pin.lane);
         }
         let cap = self.effective_video_lanes(peer);
         if cap == 0 {
@@ -9742,9 +12567,17 @@ impl Mesh {
         if cap == 0 {
             return None;
         }
-        let idx = self
-            .sorted_media_routes(peer, outbound, "opus")
+        let network = outbound
+            .then(|| self.network_for_route(route_id, peer))
+            .flatten();
+        let routes = self.sorted_media_routes(peer, outbound, "opus");
+        let idx = routes
             .iter()
+            .filter(|id| {
+                network.as_ref().is_none_or(|network| {
+                    self.network_for_route(id, peer).as_deref() == Some(network.as_str())
+                })
+            })
             .position(|id| id == route_id)?;
         (idx < cap as usize).then_some(idx as u8)
     }
@@ -9752,15 +12585,67 @@ impl Mesh {
     /// Record the lane→route binding a streamer announced
     /// ([`RouteControl::VideoLane`]) so inbound H.264 on that lane routes to
     /// the right console window regardless of the local route order.
-    fn record_video_lane(&self, peer: &str, route_id: &str, lane: u8) {
+    fn record_video_lane(
+        &self,
+        network: &str,
+        peer: &str,
+        route_id: &str,
+        incarnation: Option<String>,
+        lane: u8,
+    ) {
         let canon = pubkey_part(peer).to_string();
+        let cap = self.effective_video_lanes(peer);
+        let valid = if lane < cap {
+            let state = self.state.lock();
+            let current = state
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .is_some_and(|route| {
+                    route.state == RouteState::Active
+                        && pubkey_part(route.peer.as_str()) == canon
+                        && route.incarnation == incarnation
+                        && route.video.iter().any(|codec| codec == "h264")
+                });
+            let path_matches = state
+                .route_networks
+                .get(&(route_id.to_string(), incarnation.clone()))
+                .is_some_and(|pin| {
+                    pin.confirmed
+                        && pin.network == network
+                        && state.network_epochs.get(network).copied() == Some(pin.network_epoch)
+                });
+            current && path_matches
+        } else {
+            false
+        };
+        if !valid {
+            tracing::warn!(
+                route = %route_id,
+                peer = %short_id(peer),
+                network = %network,
+                lane,
+                cap,
+                "ignoring video-lane binding that does not match an active route lifetime"
+            );
+            return;
+        }
         let mut binds = self.video_lane_binds.lock();
-        let per_peer = binds.entry(canon).or_default();
+        let bind_key = (network.to_string(), canon);
+        let per_peer = binds.entry(bind_key).or_default();
         // A lane is reused only after its previous route tore down (which
         // clears its binding), so overwriting here just records the current
         // owner; drop any other lane that stale-pointed at this same route.
-        per_peer.retain(|l, r| *l == lane || r != route_id);
-        per_peer.insert(lane, route_id.to_string());
+        per_peer.retain(|l, binding| {
+            *l == lane || binding.route_id != route_id || binding.incarnation != incarnation
+        });
+        per_peer.insert(
+            lane,
+            VideoLaneBinding {
+                route_id: route_id.to_string(),
+                incarnation,
+            },
+        );
     }
 
     /// The route whose inbound video samples arrive on `lane` from `peer`.
@@ -9773,16 +12658,58 @@ impl Mesh {
     /// one monitor's frames in another monitor's window (and `None` simply
     /// leaves that window holding its last frame until the real binding lands).
     ///
-    /// Only a peer that has announced *nothing* (an older build that doesn't
-    /// pin/announce, or the brief moment before its first announce) uses the
-    /// positional sort — exactly the pre-binding behaviour.
-    fn video_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
+    /// Only a peer that predates route incarnation uses the positional sort.
+    /// A capable peer with no binding yet returns `None` until its reliable
+    /// exact-lifetime VideoLane arrives.
+    fn video_route_for_lane(&self, network: &str, peer: &str, lane: u8) -> Option<String> {
         let canon = pubkey_part(peer);
-        {
+        let bind_key = (network.to_string(), canon.to_string());
+        let announced = {
             let binds = self.video_lane_binds.lock();
-            if let Some(per_peer) = binds.get(canon) {
-                return per_peer.get(&lane).cloned();
+            if let Some(per_peer) = binds.get(&bind_key) {
+                match per_peer.get(&lane) {
+                    Some(binding) => Some(binding.clone()),
+                    None => return None,
+                }
+            } else {
+                None
             }
+        };
+        if let Some(binding) = announced {
+            let lifetime_current = {
+                let state = self.state.lock();
+                state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.route(&binding.route_id))
+                    .is_some_and(|route| {
+                        route.state == RouteState::Active
+                            && pubkey_part(route.peer.as_str()) == canon
+                            && route.incarnation == binding.incarnation
+                    })
+            };
+            let current =
+                lifetime_current && self.inbound_route_network_ok(&binding.route_id, peer, network);
+            if current {
+                return Some(binding.route_id);
+            }
+            let mut binds = self.video_lane_binds.lock();
+            if let Some(per_peer) = binds.get_mut(&bind_key) {
+                if per_peer.get(&lane) == Some(&binding) {
+                    per_peer.remove(&lane);
+                }
+                if per_peer.is_empty() {
+                    binds.remove(&bind_key);
+                }
+            }
+            return None;
+        }
+        // A peer that negotiated route lifetimes also reliably announces the
+        // exact VideoLane binding. Until it arrives, dropping the first access
+        // units is safe; positional guessing can poison the wrong monitor's
+        // decoder whenever lane allocation order differs from route sort order.
+        if self.peer_supports_route_incarnation(peer) {
+            return None;
         }
         // No binding announced yet (a fresh peer, or every lane freed when the
         // last route to it tore down). Positional over the peer's active h264
@@ -9790,6 +12717,7 @@ impl Mesh {
         if let Some(r) = self
             .sorted_media_routes(peer, false, "h264")
             .into_iter()
+            .filter(|route_id| self.inbound_route_network_ok(route_id, peer, network))
             .nth(lane as usize)
         {
             return Some(r);
@@ -9805,6 +12733,7 @@ impl Mesh {
         // keeps multi-monitor correct, and an authoritative binding (above)
         // still wins the instant the streamer's VideoLane announce lands.
         let mut watched = self.watched_video_routes_from(canon);
+        watched.retain(|route_id| self.inbound_route_network_ok(route_id, peer, network));
         watched.sort_unstable();
         watched.into_iter().nth(lane as usize)
     }
@@ -9828,9 +12757,10 @@ impl Mesh {
     }
 
     /// The audio twin of [`Self::video_route_for_lane`].
-    fn audio_route_for_lane(&self, peer: &str, lane: u8) -> Option<String> {
+    fn audio_route_for_lane(&self, network: &str, peer: &str, lane: u8) -> Option<String> {
         self.sorted_media_routes(peer, false, "opus")
             .into_iter()
+            .filter(|route_id| self.inbound_route_network_ok(route_id, peer, network))
             .nth(lane as usize)
     }
 
@@ -9846,10 +12776,10 @@ impl Mesh {
     /// h264 and pinned capable pairs on MJPEG for the whole session. A
     /// daemon that truly predates the track lane never flips the flag —
     /// the timeout falls through to the honest MJPEG pick.
-    async fn await_video_bringup(&self) {
+    async fn await_video_bringup(&self, peer: &str) {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
         let by = std::time::Instant::now() + DEADLINE;
-        while !self.daemon_video.load(Ordering::SeqCst) && std::time::Instant::now() < by {
+        while !self.peer_video_ready(peer) && std::time::Instant::now() < by {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
@@ -9863,17 +12793,18 @@ impl Mesh {
             .and_then(|s| s.route(&route.id))
             .map(|r| r.video.iter().any(|v| v == "h264"))
             .unwrap_or(false);
-        let daemon_video = self.daemon_video.load(Ordering::SeqCst);
-        if accepts_h264 && !daemon_video {
+        let route_video_ready = self.route_video_ready(&route.id, to_node);
+        if accepts_h264 && !route_video_ready {
             tracing::warn!(
-                "route {} — viewer accepts H.264 but the local daemon predates the track lane (needs myownmesh ≥ 0.2.1); streaming MJPEG",
+                "route {} — viewer accepts H.264 but its exact network has no confirmed local video subscription; streaming MJPEG",
                 route.id
             );
         }
         // Pin a track lane for this route now (lowest free in the peer's
         // pool). A pin is what lets us tell the viewer a stable binding; no
         // pin (pool exhausted / no daemon lane) means MJPEG, exactly as v1.
-        if accepts_h264 && self.assign_video_lane(to_node, &route.id).is_some() {
+        if accepts_h264 && route_video_ready && self.assign_video_lane(to_node, &route.id).is_some()
+        {
             VideoMode::H264
         } else {
             VideoMode::Mjpeg
@@ -9889,11 +12820,13 @@ impl Mesh {
         let Some(lane) = self.video_lane(route_id, peer, true) else {
             return;
         };
+        let incarnation = self.route_incarnation(route_id);
         if let Err(e) = self
             .send_control(
                 peer,
                 &ControlMessage::Route(RouteControl::VideoLane {
                     route_id: route_id.to_string(),
+                    incarnation,
                     lane,
                 }),
             )
@@ -9917,6 +12850,7 @@ impl Mesh {
         let status_peer = peer.clone();
         let status_route = route.id.clone();
         let route_id = route.id.clone();
+        let route_incarnation = self.route_incarnation(&route_id);
         let generation = self.begin_video_generation(&route_id);
         let recovery = Arc::new(VideoRecovery::new(&route_id));
         // One route, one ordered AU queue, one persistent local writer. Focus
@@ -9929,13 +12863,7 @@ impl Mesh {
         // link the daemon has classified host↔host. Unknown (ICE not yet
         // introspected) starts conservative; the nudge below upgrades the
         // live stream as soon as the class lands.
-        let link = {
-            let st = self.state.lock();
-            st.peer_links
-                .get(pubkey_part(to_node))
-                .copied()
-                .unwrap_or_default()
-        };
+        let link = self.route_link_class(&route.id, to_node);
         // A first governed video route makes legacy PCM invalid. Suspend it
         // before taking any policy snapshot so the encoder and readout see one
         // final allocator generation rather than racing an intermediate plan.
@@ -10030,6 +12958,7 @@ impl Mesh {
                     peer: peer.clone(),
                     route_id: route_id.clone(),
                     generation,
+                    incarnation: route_incarnation.clone(),
                     packet,
                     recovery_epoch: epoch,
                     recovery: capture_recovery.clone(),
@@ -10214,6 +13143,7 @@ impl Mesh {
             }
         }
         self.emit_snapshot();
+        let incarnation = self.route_incarnation(route_id);
         let mesh = self.clone();
         let peer = peer.to_string();
         let route_id = route_id.to_string();
@@ -10224,6 +13154,7 @@ impl Mesh {
                     &peer,
                     &ControlMessage::Route(RouteControl::Accept {
                         route_id,
+                        incarnation,
                         session: Some(session),
                     }),
                 )
@@ -11143,6 +14074,7 @@ impl Mesh {
         let seq = self.site_seq.fetch_add(1, Ordering::Relaxed);
         let from = format!("{node}:site");
         let to = format!("{me}:site-view:{}-{seq}", host_port);
+        let incarnation = self.next_route_incarnation(&node);
         let route_id = format!("route:{from}→{to}");
         // Offer the route through the session (drives offer→accept→active).
         let msg = {
@@ -11154,7 +14086,7 @@ impl Mesh {
                 to: to.clone().into(),
                 media: MediaKind::Generic,
             };
-            s.offer(route, node.as_str(), Vec::new(), Vec::new())
+            s.offer_with_incarnation(route, node.as_str(), Vec::new(), Vec::new(), incarnation)
         };
         if let Err(e) = self.send_control(&node, &msg).await {
             let mut st = self.state.lock();
@@ -11273,6 +14205,7 @@ impl Mesh {
                     &from,
                     &ControlMessage::Route(RouteControl::Reject {
                         route_id: route,
+                        incarnation: None,
                         reason: "route not live on this device — re-offer to reconnect".into(),
                     }),
                 )
@@ -11846,6 +14779,66 @@ impl Mesh {
             && pubkey_part(r.peer.as_str()) == pubkey_part(sender)
     }
 
+    /// A media sample must arrive on the network that established this exact
+    /// route lifetime. Peer and lane are insufficient because one peer can
+    /// have an independent lane 0 in each network's PeerSession.
+    fn inbound_route_network_ok(&self, route_id: &str, sender: &str, network: &str) -> bool {
+        let state = self.state.lock();
+        let Some(route) = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .filter(|route| pubkey_part(route.peer.as_str()) == pubkey_part(sender))
+        else {
+            return false;
+        };
+        let key = (route_id.to_string(), route.incarnation.clone());
+        match state.route_networks.get(&key) {
+            Some(pin) => {
+                pin.confirmed
+                    && pin.network == network
+                    && state.network_epochs.get(network).copied() == Some(pin.network_epoch)
+            }
+            // Legacy/binary-v1 compatibility is unambiguous only when this
+            // daemon session has exactly one joined network.
+            None => {
+                route.incarnation.is_none()
+                    && state.networks.len() == 1
+                    && state.networks[0] == network
+            }
+        }
+    }
+
+    /// Input is destructive state, not a replaceable media sample. In addition
+    /// to the ordinary active-route/peer gate, require the event to name the
+    /// exact negotiated lifetime. A delayed key-down from predecessor A then
+    /// cannot be injected under same-id successor B. Legacy peers remain
+    /// compatible because both the route and its events carry `None`.
+    fn inbound_media_ok_incarnation(
+        &self,
+        route_id: &str,
+        sender: &str,
+        media: MediaKind,
+        incarnation: Option<&str>,
+    ) -> bool {
+        let Some(me) = self.local_node_id() else {
+            return false;
+        };
+        let state = self.state.lock();
+        let Some(route) = state
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+        else {
+            return false;
+        };
+        route.is_active()
+            && route.route.media == media
+            && node_of(route.route.to.as_str()) == me
+            && pubkey_part(route.peer.as_str()) == pubkey_part(sender)
+            && route.incarnation.as_deref() == incarnation
+    }
+
     /// Classify inbound screen/camera media without conflating the normal
     /// Offer→Accept gap with an orphan route. A destructive NACK is correct for
     /// a dead/foreign route, but not for an authenticated same-id re-offer whose
@@ -11862,6 +14855,32 @@ impl Mesh {
             route.is_some_and(|r| node_of(r.route.to.as_str()) == me),
             route.is_some_and(|r| pubkey_part(r.peer.as_str()) == pubkey_part(sender)),
         )
+    }
+
+    /// New peers bind every MJPEG chunk to the route incarnation. Legacy
+    /// senders did not carry this field, so an absent value remains acceptable
+    /// only when the authenticated sender did not advertise the binding
+    /// feature. A present value is always checked, regardless of feature tags.
+    fn inbound_video_incarnation_ok(
+        &self,
+        route_id: &str,
+        sender: &str,
+        incarnation: Option<&str>,
+    ) -> bool {
+        let require_exact =
+            incarnation.is_some() || self.peer_supports_media_incarnation(sender);
+        if !require_exact {
+            return true;
+        }
+        self.state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(route_id))
+            .is_some_and(|route| {
+                pubkey_part(route.peer.as_str()) == pubkey_part(sender)
+                    && route.incarnation.as_deref() == incarnation
+            })
     }
 
     /// [`Self::inbound_media_ok`] for the frame kinds two media share:
@@ -12047,22 +15066,38 @@ impl Mesh {
     /// (`Reject` on an active route now returns `StopMedia`), instead of
     /// capturing + encoding into the void indefinitely. An older sender
     /// ignores a Reject for an active route — exactly today's behaviour.
-    fn nack_dead_route(self: &Arc<Self>, from: &str, route_id: &str) {
+    fn nack_dead_route(self: &Arc<Self>, network: &str, from: &str, route_id: &str) {
         if !self.diag_ok(&format!("nack:{route_id}")) {
             return;
         }
         let mesh = self.clone();
+        let network = network.to_string();
         let from = from.to_string();
         let route_id = route_id.to_string();
         crate::spawn(async move {
+            if mesh.peer_supports_route_incarnation(&from) {
+                let _ = mesh
+                    .send_control_on_network(
+                        &from,
+                        &ControlMessage::Route(RouteControl::MissingRoute {
+                            incarnation: mesh.route_incarnation(&route_id),
+                            route_id,
+                        }),
+                        &network,
+                    )
+                    .await;
+                return;
+            }
             let _ = mesh
-                .send_control(
+                .send_control_on_network(
                     &from,
                     &ControlMessage::Route(RouteControl::Reject {
                         route_id,
+                        incarnation: None,
                         reason: "route not live on the receiving side — re-offer to reconnect"
                             .into(),
                     }),
+                    &network,
                 )
                 .await;
         });
@@ -12086,8 +15121,27 @@ impl Mesh {
     /// other diagnostic while the condition persists. An older sender
     /// doesn't know the message and drops it — it keeps streaming exactly
     /// as today.
-    fn nack_dead_lane(self: &Arc<Self>, from: &str, media: &'static str, lane: u8) {
-        let key = format!("deadlane:{media}:{}:{lane}", pubkey_part(from));
+    fn nack_dead_lane(self: &Arc<Self>, network: &str, from: &str, media: &'static str, lane: u8) {
+        // A lane number alone cannot distinguish predecessor A from same-lane
+        // successor B. Only peers that negotiated route incarnations can turn
+        // this into the non-destructive exact-Accept challenge below. For a
+        // legacy peer, keep the stream and diagnostic rather than risk killing
+        // the wrong live route.
+        if !self.peer_supports_route_incarnation(from) {
+            if self.diag_ok(&format!(
+                "deadlane-legacy:{network}:{media}:{}:{lane}",
+                pubkey_part(from)
+            )) {
+                tracing::warn!(
+                    peer = %short_id(from),
+                    media,
+                    lane,
+                    "unmapped legacy media lane cannot be reconciled safely without route incarnation"
+                );
+            }
+            return;
+        }
+        let key = format!("deadlane:{network}:{media}:{}:{lane}", pubkey_part(from));
         {
             let mut since = self.dead_lane_since.lock();
             let now = std::time::Instant::now();
@@ -12104,15 +15158,17 @@ impl Mesh {
             short_id(from)
         );
         let mesh = self.clone();
+        let network = network.to_string();
         let from = from.to_string();
         crate::spawn(async move {
             let _ = mesh
-                .send_control(
+                .send_control_on_network(
                     &from,
                     &ControlMessage::Route(RouteControl::DeadLane {
                         media: media.into(),
                         lane,
                     }),
+                    &network,
                 )
                 .await;
         });
@@ -12121,9 +15177,192 @@ impl Mesh {
     /// The lane resolved to a route again — forget its "unmapped since"
     /// mark so a later unmapped spell starts a fresh [`WARN_EVERY`] grace
     /// instead of inheriting an old clock and NACKing instantly.
-    fn clear_dead_lane(&self, from: &str, media: &str, lane: u8) {
-        let key = format!("deadlane:{media}:{}:{lane}", pubkey_part(from));
+    fn clear_dead_lane(&self, network: &str, from: &str, media: &str, lane: u8) {
+        let key = format!("deadlane:{network}:{media}:{}:{lane}", pubkey_part(from));
         self.dead_lane_since.lock().remove(&key);
+    }
+
+    /// Answer a receiver's route/lane challenge with the exact active
+    /// lifetime. A receiver that still owns it treats this as an idempotent
+    /// Accept; an empty or terminal receiver returns an exact terminal
+    /// response. That makes route-id-only and lane-only diagnostics safe under
+    /// deterministic id/lane reuse.
+    async fn handle_missing_route(
+        self: &Arc<Self>,
+        network: &str,
+        from: &str,
+        route_id: &str,
+        incarnation: Option<&str>,
+    ) {
+        let (current_incarnation, pinned_network, outbound) = {
+            let state = self.state.lock();
+            let Some(route) = state
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .filter(|route| {
+                    matches!(route.state, RouteState::Offered | RouteState::Active)
+                        && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                })
+            else {
+                return;
+            };
+            let key = (route_id.to_string(), route.incarnation.clone());
+            (
+                route.incarnation.clone(),
+                state
+                    .route_networks
+                    .get(&key)
+                    .filter(|pin| {
+                        pin.confirmed
+                            && state.network_epochs.get(&pin.network).copied()
+                                == Some(pin.network_epoch)
+                    })
+                    .map(|pin| pin.network.clone()),
+                route.origin == allmystuff_session::Origin::Outbound,
+            )
+        };
+
+        if pinned_network.as_deref() == Some(network)
+            && (!outbound || current_incarnation.is_none())
+        {
+            self.reannounce_route_challenge(from, route_id, Some(network))
+                .await;
+            return;
+        }
+
+        // A recovery request can replace user-owned outbound intent only when
+        // it names the exact fenced lifetime. This applies on the same path as
+        // well: the receiver is explicitly saying it no longer has that route,
+        // so re-sending Accept would only elicit a terminal response. Legacy
+        // MissingRoute has no incarnation and cannot safely churn a same-id
+        // successor.
+        if !outbound
+            || current_incarnation.as_deref() != incarnation
+            || current_incarnation.is_none()
+        {
+            tracing::warn!(
+                route = %route_id,
+                from = %short_id(from),
+                network,
+                incarnation = ?incarnation,
+                disposition = "missing_route_reoffer_ignored",
+                "missing-route recovery did not identify the current outbound lifetime"
+            );
+            return;
+        }
+
+        let lifecycle = self.lock_route_lifecycle(route_id).await;
+        let desired_matches = self
+            .desired_routes
+            .lock()
+            .get(route_id)
+            .is_some_and(|desired| {
+                pubkey_part(&desired.peer) == pubkey_part(from)
+                    && desired.current_incarnation.as_deref() == incarnation
+            });
+        if !desired_matches {
+            return;
+        }
+        let was_active = {
+            let mut state = self.state.lock();
+            let current = state
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .is_some_and(|route| {
+                    matches!(route.state, RouteState::Offered | RouteState::Active)
+                        && route.origin == allmystuff_session::Origin::Outbound
+                        && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                        && route.incarnation.as_deref() == incarnation
+                });
+            if !current {
+                return;
+            }
+            let active = state
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .is_some_and(|route| route.is_active());
+            if let Some(session) = state.session.as_mut() {
+                let _ = session.teardown(route_id);
+            }
+            state
+                .route_networks
+                .remove(&(route_id.to_string(), current_incarnation.clone()));
+            active
+        };
+        if was_active {
+            self.apply_stop_media_locked(route_id.to_string(), current_incarnation);
+        }
+        drop(lifecycle);
+        tracing::warn!(
+            route = %route_id,
+            from = %short_id(from),
+            network,
+            disposition = "fresh_incarnation_reoffer",
+            "peer reported the exact route missing on a surviving data-plane network"
+        );
+        self.replay_desired_routes(Some(from)).await;
+    }
+
+    async fn reannounce_route_challenge(
+        self: &Arc<Self>,
+        from: &str,
+        route_id: &str,
+        network: Option<&str>,
+    ) {
+        let route_info = {
+            let state = self.state.lock();
+            state
+                .session
+                .as_ref()
+                .and_then(|session| session.route(route_id))
+                .filter(|route| {
+                    route.state == RouteState::Active
+                        && pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                })
+                .filter(|route| {
+                    let Some(network) = network else { return true };
+                    let key = (route_id.to_string(), route.incarnation.clone());
+                    match state.route_networks.get(&key) {
+                        Some(pin) => {
+                            pin.confirmed
+                                && pin.network == network
+                                && state.network_epochs.get(network).copied()
+                                    == Some(pin.network_epoch)
+                        }
+                        None => {
+                            route.incarnation.is_none()
+                                && state.networks.len() == 1
+                                && state.networks[0] == network
+                        }
+                    }
+                })
+                .map(|route| {
+                    (
+                        route.incarnation.clone(),
+                        route.term_session.clone(),
+                        route.route.media,
+                    )
+                })
+        };
+        let Some((incarnation, session, media)) = route_info else {
+            return;
+        };
+        let response = ControlMessage::Route(RouteControl::Accept {
+            route_id: route_id.to_string(),
+            incarnation,
+            session,
+        });
+        let _ = if let Some(network) = network {
+            self.send_control_on_network(from, &response, network).await
+        } else {
+            self.send_control(from, &response).await
+        };
+        if matches!(media, MediaKind::Display | MediaKind::Video) {
+            self.announce_video_lane(route_id, from).await;
+        }
     }
 
     /// A receiver told us media we're sending it on track `lane` has no
@@ -12139,7 +15378,17 @@ impl Mesh {
     /// outbound route returns `StopMedia`, which stops the capture that was
     /// encoding into the void. Resolving nothing is a quiet no-op — the
     /// stream already stopped, or an earlier NACK already landed.
-    async fn handle_dead_lane(self: &Arc<Self>, from: &str, media: &str, lane: u8) {
+    async fn handle_dead_lane(self: &Arc<Self>, network: &str, from: &str, media: &str, lane: u8) {
+        if !self.peer_supports_route_incarnation(from) {
+            tracing::warn!(
+                peer = %short_id(from),
+                media,
+                lane,
+                disposition = "legacy_dead_lane_ignored",
+                "lane-only dead-route report cannot safely select a deterministic route lifetime"
+            );
+            return;
+        }
         let canon = pubkey_part(from).to_string();
         let route_id = match media {
             "video" => {
@@ -12149,21 +15398,25 @@ impl Mesh {
                 let candidates: Vec<String> = {
                     let pins = self.video_lane_pins.lock();
                     pins.iter()
-                        .filter(|(_, l)| **l == lane)
+                        .filter(|(_, pin)| pin.network == network && pin.lane == lane)
                         .map(|(r, _)| r.clone())
                         .collect()
                 };
                 candidates.into_iter().find(|rid| {
-                    let st = self.state.lock();
-                    st.session
-                        .as_ref()
-                        .and_then(|s| s.route(rid))
-                        .is_some_and(|r| pubkey_part(r.peer.as_str()) == canon)
+                    let peer_matches = {
+                        let st = self.state.lock();
+                        st.session
+                            .as_ref()
+                            .and_then(|s| s.route(rid))
+                            .is_some_and(|r| pubkey_part(r.peer.as_str()) == canon)
+                    };
+                    peer_matches && self.inbound_route_network_ok(rid, from, network)
                 })
             }
             "audio" => self
                 .sorted_media_routes(from, true, "opus")
                 .into_iter()
+                .filter(|route_id| self.inbound_route_network_ok(route_id, from, network))
                 .nth(lane as usize),
             // A media kind a newer build introduced — nothing of ours to
             // stop; ignore it exactly like an Unknown control message.
@@ -12177,29 +15430,11 @@ impl Mesh {
             return;
         };
         tracing::warn!(
-            "receiver {} reports our {media} on lane {lane} maps to no route on its side — \
-             stopping {route_id}",
+            "receiver {} reports our {media} lane {lane} has no route; re-announcing {route_id}",
             short_id(from)
         );
-        let effects = {
-            let mut st = self.state.lock();
-            st.session
-                .as_mut()
-                .map(|s| {
-                    s.handle(
-                        NodeId::from(from),
-                        ControlMessage::Route(RouteControl::Reject {
-                            route_id,
-                            reason: "no route on the receiving side maps to this stream's lane \
-                                     — re-offer to reconnect"
-                                .into(),
-                        }),
-                    )
-                })
-                .unwrap_or_default()
-        };
-        self.process_effects(effects).await;
-        self.emit_snapshot();
+        self.reannounce_route_challenge(from, &route_id, Some(network))
+            .await;
     }
 
     /// An inbound input/clipboard frame failed a gate. Historically this was
@@ -12218,6 +15453,9 @@ impl Mesh {
         plane: &str,
         route_ok: bool,
     ) {
+        // Do not release input state based on a refused frame. The sender may
+        // be foreign or stale and route ids are guessable. Authoritative route
+        // teardown/reset paths own cleanup and are generation-fenced.
         if !self.diag_ok(&format!("refuse:{plane}:{route_id}")) {
             return;
         }
@@ -12256,6 +15494,7 @@ impl Mesh {
                 "reason": reason,
             }),
         );
+        let incarnation = self.route_incarnation(route_id);
         let mesh = self.clone();
         let from = from.to_string();
         let route_id = route_id.to_string();
@@ -12263,7 +15502,11 @@ impl Mesh {
             let _ = mesh
                 .send_control(
                     &from,
-                    &ControlMessage::Route(RouteControl::Reject { route_id, reason }),
+                    &ControlMessage::Route(RouteControl::Reject {
+                        route_id,
+                        incarnation,
+                        reason,
+                    }),
                 )
                 .await;
         });
@@ -12292,10 +15535,14 @@ impl Mesh {
             asks.insert(route_id.clone(), now);
         }
         let peer = self.route_peer(&route_id).ok_or("unknown route")?;
+        let incarnation = self.route_incarnation(&route_id);
         tracing::debug!("asking {} to re-key {route_id}", short_id(&peer));
         self.send_control(
             &peer,
-            &ControlMessage::Route(RouteControl::Refresh { route_id }),
+            &ControlMessage::Route(RouteControl::Refresh {
+                route_id,
+                incarnation,
+            }),
         )
         .await
     }
@@ -12472,33 +15719,122 @@ impl Mesh {
     }
 
     async fn send_effective_plans(&self, plans: Vec<EffectivePlan>) {
-        for mut plan in plans {
-            if let Some(dials) = self.video.route_dials(&plan.route_id) {
-                plan.encoder = dials.encoder_label;
-                plan.codec = dials.codec.to_string();
-            }
-            let Some(peer) = self.route_peer(&plan.route_id) else {
-                continue;
-            };
-            let ext = PolicyEnvelope::effective(plan.clone()).into_ext(Value::Null);
-            if let Err(e) = self
-                .send_control(
-                    &peer,
-                    &ControlMessage::Route(RouteControl::Tune {
-                        route_id: plan.route_id,
-                        max_edge: None,
-                        bitrate: None,
-                        fps: None,
-                        game: false,
-                        mode: None,
-                        ext,
-                    }),
-                )
-                .await
-            {
-                tracing::debug!("effective media plan to {} failed: {e}", short_id(&peer));
+        for plan in plans {
+            let incarnation = self.route_incarnation(&plan.route_id);
+            self.send_effective_plan_exact(plan, incarnation).await;
+        }
+    }
+
+    async fn send_effective_plan_exact(
+        &self,
+        mut plan: EffectivePlan,
+        incarnation: Option<String>,
+    ) {
+        if let Some(dials) = self.video.route_dials(&plan.route_id) {
+            plan.encoder = dials.encoder_label;
+            plan.codec = dials.codec.to_string();
+        }
+        let peer = self
+            .state
+            .lock()
+            .session
+            .as_ref()
+            .and_then(|session| session.route(&plan.route_id))
+            .filter(|route| route.state == RouteState::Active && route.incarnation == incarnation)
+            .map(|route| route.peer.to_string());
+        let Some(peer) = peer else { return };
+        let ext = PolicyEnvelope::effective(plan.clone()).into_ext(Value::Null);
+        if let Err(error) = self
+            .send_control(
+                &peer,
+                &ControlMessage::Route(RouteControl::Tune {
+                    route_id: plan.route_id,
+                    incarnation,
+                    max_edge: None,
+                    bitrate: None,
+                    fps: None,
+                    game: false,
+                    mode: None,
+                    ext,
+                }),
+            )
+            .await
+        {
+            tracing::debug!(
+                "effective media plan to {} failed: {error}",
+                short_id(&peer)
+            );
+        }
+    }
+
+    /// Coalesce effective-plan echoes and deliver them away from the inbound
+    /// daemon event pump. A stalled local ChannelSendTo request can therefore
+    /// no longer stop later input, terminal, or media events from being read.
+    fn queue_effective_plans(self: &Arc<Self>, plans: Vec<EffectivePlan>) {
+        if plans.is_empty() {
+            return;
+        }
+        let epoch = self.effective_plan_echo_epoch.load(Ordering::SeqCst);
+        // Read Session before taking the pending-map lock. The delivery worker
+        // also consults Session, so keeping these lock domains separate avoids
+        // an inversion with teardown/policy paths that already hold State.
+        let plans = plans
+            .into_iter()
+            .map(|plan| {
+                let incarnation = self.route_incarnation(&plan.route_id);
+                (plan, incarnation)
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut pending = self.effective_plan_echoes.lock();
+            for (plan, incarnation) in plans {
+                pending.insert((plan.route_id.clone(), incarnation), (epoch, plan));
             }
         }
+        if self
+            .effective_plan_echo_running
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let mesh = self.clone();
+        crate::spawn(async move {
+            loop {
+                let current_epoch = mesh.effective_plan_echo_epoch.load(Ordering::SeqCst);
+                let drained = {
+                    let mut pending = mesh.effective_plan_echoes.lock();
+                    pending.drain().collect::<Vec<_>>()
+                };
+                let plans = drained
+                    .into_iter()
+                    .filter_map(|((route_id, incarnation), (epoch, plan))| {
+                        (epoch == current_epoch
+                            && mesh.route_is_active_incarnation(&route_id, incarnation.as_deref()))
+                        .then_some((plan, incarnation))
+                    })
+                    .collect::<Vec<_>>();
+                if !plans.is_empty() {
+                    for (plan, incarnation) in plans {
+                        mesh.send_effective_plan_exact(plan, incarnation).await;
+                    }
+                    continue;
+                }
+
+                mesh.effective_plan_echo_running
+                    .store(false, Ordering::SeqCst);
+                if mesh.effective_plan_echoes.lock().is_empty() {
+                    break;
+                }
+                if mesh
+                    .effective_plan_echo_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 
     pub async fn request_tune(
@@ -12512,6 +15848,35 @@ impl Mesh {
     ) -> Result<(), String> {
         self.request_policy_tune(route_id, max_edge, bitrate, fps, game, mode, None, false)
             .await
+    }
+
+    async fn replay_requested_video_tune(self: &Arc<Self>, route_id: &str) {
+        let Some(tune) = self.requested_video_tunes.lock().get(route_id).cloned() else {
+            return;
+        };
+        if !self.route_is_active_incarnation(route_id, self.route_incarnation(route_id).as_deref())
+        {
+            return;
+        }
+        if let Err(error) = self
+            .request_policy_tune(
+                route_id.to_string(),
+                tune.max_edge,
+                tune.bitrate,
+                tune.fps,
+                tune.game,
+                tune.mode,
+                tune.peer_cap_bps,
+                tune.priority,
+            )
+            .await
+        {
+            tracing::debug!(
+                route = %route_id,
+                error = %error,
+                "deferred video tune did not reach the active peer"
+            );
+        }
     }
 
     /// Policy-aware sibling of [`Self::request_tune`]. The legacy public call
@@ -12529,7 +15894,6 @@ impl Mesh {
         peer_cap_bps: Option<u64>,
         priority: bool,
     ) -> Result<(), String> {
-        let peer = self.route_peer(&route_id).ok_or("unknown route")?;
         let priority_only = priority
             && max_edge.is_none()
             && bitrate.is_none()
@@ -12538,11 +15902,10 @@ impl Mesh {
             && mode.is_none()
             && peer_cap_bps.is_none();
         let wire_tune = if priority_only {
-            self.requested_video_tunes
-                .lock()
-                .get(&route_id)
-                .cloned()
-                .unwrap_or_default()
+            let mut requested = self.requested_video_tunes.lock();
+            let tune = requested.entry(route_id.clone()).or_default();
+            tune.priority = true;
+            tune.clone()
         } else {
             let tune = LegacyVideoTune {
                 max_edge,
@@ -12550,11 +15913,23 @@ impl Mesh {
                 fps,
                 game,
                 mode: mode.clone(),
+                peer_cap_bps,
+                priority,
             };
             self.requested_video_tunes
                 .lock()
                 .insert(route_id.clone(), tune.clone());
             tune
+        };
+        let Some(peer) = self.route_peer(&route_id) else {
+            // Connect and Tune are separate local commands. Preserve the
+            // user's requested posture when Tune wins that race; the route's
+            // Accept/replay path sends it once the exact route exists.
+            tracing::debug!(
+                route = %route_id,
+                "video tune recorded before route creation; deferring delivery"
+            );
+            return Ok(());
         };
         // The streaming side logs the retune it actually applies — one
         // line per pill change across the pair is plenty.
@@ -12584,10 +15959,12 @@ impl Mesh {
         let ext =
             PolicyEnvelope::request(route_id.clone(), policy, self.local_media_capabilities())
                 .into_ext(Value::Null);
+        let incarnation = self.route_incarnation(&route_id);
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::Tune {
                 route_id,
+                incarnation,
                 max_edge: wire_tune.max_edge,
                 bitrate: wire_tune.bitrate,
                 fps: wire_tune.fps,
@@ -12663,10 +16040,12 @@ impl Mesh {
             audio_underrun_frames,
         }
         .to_ext();
+        let incarnation = self.route_incarnation(&route_id);
         self.send_control(
             &peer,
             &ControlMessage::Route(RouteControl::VideoFeedback {
                 route_id,
+                incarnation,
                 recv_fps,
                 decode_fails,
                 queue_depth,
@@ -12685,7 +16064,7 @@ impl Mesh {
         action: InputAction,
     ) -> Result<(), String> {
         let me = self.local_node_id().ok_or("mesh not ready")?;
-        let peer = {
+        let (peer, incarnation) = {
             let st = self.state.lock();
             let r = st
                 .session
@@ -12698,10 +16077,10 @@ impl Mesh {
             {
                 return Err("route isn't an active outbound control link".into());
             }
-            r.peer.to_string()
+            (r.peer.to_string(), r.incarnation.clone())
         };
         let seq = self.input_seq.fetch_add(1, Ordering::Relaxed);
-        let ev = InputEvent::new(route_id, seq, action);
+        let ev = InputEvent::new_with_incarnation(route_id, incarnation, seq, action);
         let payload = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
         self.send_media_value(&peer, payload).await
     }
@@ -13142,10 +16521,267 @@ impl Mesh {
     /// confirmed send updates it again.
     fn note_peer_network(&self, peer: &str, network: &str) {
         let mut st = self.state.lock();
-        let key = pubkey_part(peer).to_string();
-        if st.peer_networks.get(&key).map(String::as_str) != Some(network) {
-            st.peer_networks.insert(key, network.to_string());
+        if !st.networks.iter().any(|joined| joined == network) {
+            return;
         }
+        let key = pubkey_part(peer).to_string();
+        let paths = st.peer_networks.entry(key).or_default();
+        paths.observed_reachable.insert(network.to_string());
+        paths.preferred = Some(network.to_string());
+    }
+
+    /// Record a path that carried traffic *from* a peer. This proves
+    /// reachability but not that the topology carries our frames back. Keep a
+    /// daemon-confirmed outbound preference once one exists; otherwise use the
+    /// observed path only as the first probe and let send_control replace it
+    /// after a confirmed dispatch.
+    fn note_peer_network_observed(&self, peer: &str, network: &str) {
+        let mut state = self.state.lock();
+        if !state.networks.iter().any(|joined| joined == network) {
+            return;
+        }
+        let paths = state
+            .peer_networks
+            .entry(pubkey_part(peer).to_string())
+            .or_default();
+        paths.observed_reachable.insert(network.to_string());
+        if paths.preferred.is_none() {
+            paths.preferred = Some(network.to_string());
+        }
+    }
+
+    fn queue_reliable_control(
+        &self,
+        peer: &str,
+        networks: Vec<String>,
+        message: &ControlMessage,
+        payload: Value,
+    ) {
+        let peer = pubkey_part(peer).to_string();
+        let Some((scope, kind)) = reliable_control_identity(message, &networks) else {
+            tracing::warn!(
+                peer = %short_id(&peer),
+                "reliable route-control message has no bounded worker identity"
+            );
+            return;
+        };
+        let Some(daemon) = *self.active_daemon_context.lock() else {
+            tracing::debug!(
+                peer = %short_id(&peer),
+                ?kind,
+                "reliable route-control confirmation skipped without an active daemon context"
+            );
+            return;
+        };
+        if self.daemon_session_epoch.load(Ordering::SeqCst) != daemon.epoch {
+            tracing::debug!(
+                peer = %short_id(&peer),
+                ?kind,
+                daemon_epoch = daemon.epoch,
+                "reliable route-control confirmation skipped during daemon reset"
+            );
+            return;
+        }
+        let key = ReliableControlKey {
+            peer: peer.clone(),
+            scope,
+        };
+        let job = ReliableControlOut {
+            peer: peer.clone(),
+            networks,
+            payload,
+            kind,
+            daemon,
+        };
+        let mut workers = self.reliable_control_workers.lock();
+        if let Some(worker) = workers.get(&key) {
+            if worker.daemon == daemon {
+                let replaced = worker.pending.lock().push(job);
+                if replaced {
+                    tracing::debug!(
+                        peer = %short_id(&peer),
+                        ?kind,
+                        daemon_epoch = daemon.epoch,
+                        "coalesced superseded reliable route-control confirmation"
+                    );
+                }
+                return;
+            }
+            workers.remove(&key);
+        }
+
+        let worker_id = self
+            .reliable_control_worker_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let pending = Arc::new(Mutex::new(ReliableControlPending::default()));
+        workers.insert(
+            key.clone(),
+            ReliableControlWorkerHandle {
+                worker_id,
+                daemon,
+                pending: pending.clone(),
+            },
+        );
+        drop(workers);
+
+        let client = self.client.clone();
+        let daemon_epoch = self.daemon_session_epoch.clone();
+        let active_daemon_context = self.active_daemon_context.clone();
+        let epoch_rx = self.reliable_control_epoch.subscribe();
+        let workers = self.reliable_control_workers.clone();
+        crate::spawn(async move {
+            Self::run_reliable_control_worker(
+                client,
+                daemon_epoch,
+                active_daemon_context,
+                epoch_rx,
+                workers,
+                key,
+                worker_id,
+                job,
+            )
+            .await;
+        });
+    }
+
+    async fn run_reliable_control_worker(
+        client: Arc<ControlClient>,
+        daemon_epoch: Arc<AtomicU64>,
+        active_daemon_context: Arc<Mutex<Option<DaemonContext>>>,
+        mut epoch_rx: watch::Receiver<u64>,
+        workers: Arc<Mutex<HashMap<ReliableControlKey, ReliableControlWorkerHandle>>>,
+        key: ReliableControlKey,
+        worker_id: u64,
+        first_job: ReliableControlOut,
+    ) {
+        let mut job = first_job;
+        loop {
+            if !Self::deliver_reliable_control(
+                &client,
+                &daemon_epoch,
+                &active_daemon_context,
+                &mut epoch_rx,
+                &job,
+            )
+            .await
+            {
+                let mut map = workers.lock();
+                if map
+                    .get(&key)
+                    .is_some_and(|worker| worker.worker_id == worker_id)
+                {
+                    map.remove(&key);
+                }
+                return;
+            }
+
+            // Queueing takes this same map lock before touching `pending`.
+            // A concurrent enqueue therefore either lands before this pop or
+            // observes our removal and creates a fresh worker.
+            let next = {
+                let mut map = workers.lock();
+                let Some(worker) = map.get(&key).filter(|worker| worker.worker_id == worker_id)
+                else {
+                    return;
+                };
+                let next = worker.pending.lock().pop();
+                if next.is_none() {
+                    map.remove(&key);
+                }
+                next
+            };
+            let Some(next) = next else {
+                return;
+            };
+            job = next;
+        }
+    }
+
+    async fn await_reliable_control_response<F, T>(
+        expected_epoch: u64,
+        epoch_rx: &mut watch::Receiver<u64>,
+        response: F,
+    ) -> Option<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if *epoch_rx.borrow_and_update() != expected_epoch {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = epoch_rx.changed() => None,
+            output = response => Some(output),
+        }
+    }
+
+    async fn deliver_reliable_control(
+        client: &ControlClient,
+        daemon_epoch: &AtomicU64,
+        active_daemon_context: &Mutex<Option<DaemonContext>>,
+        epoch_rx: &mut watch::Receiver<u64>,
+        job: &ReliableControlOut,
+    ) -> bool {
+        let context_is_current = || {
+            daemon_epoch.load(Ordering::SeqCst) == job.daemon.epoch
+                && *active_daemon_context.lock() == Some(job.daemon)
+        };
+        if !context_is_current() {
+            tracing::debug!(
+                peer = %short_id(&job.peer),
+                ?job.kind,
+                daemon_epoch = job.daemon.epoch,
+                "retired stale reliable route-control confirmation before send"
+            );
+            return false;
+        }
+
+        let mut last_error = String::new();
+        for network in &job.networks {
+            if !context_is_current() {
+                return false;
+            }
+            let request = Request::ChannelSendReliable {
+                network: network.clone(),
+                channel: CHANNEL_CONTROL.to_string(),
+                peer: job.peer.clone(),
+                payload: job.payload.clone(),
+                ttl_ms: OFFER_TIMEOUT.as_millis() as u64,
+            };
+            let response = client.request_with_timeout(&request, OFFER_TIMEOUT + OFFER_SWEEP);
+            let Some(response) =
+                Self::await_reliable_control_response(job.daemon.epoch, epoch_rx, response).await
+            else {
+                tracing::debug!(
+                    peer = %short_id(&job.peer),
+                    ?job.kind,
+                    daemon_epoch = job.daemon.epoch,
+                    "cancelled stalled reliable route-control send on daemon reset"
+                );
+                return false;
+            };
+            if !context_is_current() {
+                return false;
+            }
+            match response {
+                Ok(response) if response.ok => return true,
+                Ok(response) => {
+                    last_error = response
+                        .error
+                        .unwrap_or_else(|| "reliable channel send failed".into());
+                }
+                Err(error) => last_error = error.to_string(),
+            }
+        }
+        tracing::debug!(
+            peer = %short_id(&job.peer),
+            ?job.kind,
+            daemon_epoch = job.daemon.epoch,
+            error = %last_error,
+            "reliable route-control confirmation did not complete; fast-path delivery remains in effect"
+        );
+        true
     }
 
     /// Send a control message to one peer, reporting whether the daemon
@@ -13163,11 +16799,95 @@ impl Mesh {
     /// follow a route offer ride the proven mesh instead of the last one a
     /// presence advert happened to arrive on.
     async fn send_control(&self, peer: &str, message: &ControlMessage) -> Result<(), String> {
-        let candidates = self.peer_network_candidates(peer);
+        self.send_control_inner(peer, message, true).await
+    }
+
+    /// Send a recovery/control message back through the exact network on which
+    /// its triggering frame arrived. Lane ids are network-scoped, so letting a
+    /// DeadLane challenge fall through a peer-wide candidate list can target a
+    /// different PeerSession's unrelated lane 0.
+    async fn send_control_on_network(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        network: &str,
+    ) -> Result<(), String> {
+        self.send_control_on_network_inner(peer, message, network, true)
+            .await
+    }
+
+    async fn send_control_retry_on_network(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        network: &str,
+    ) -> Result<(), String> {
+        self.send_control_on_network_inner(peer, message, network, false)
+            .await
+    }
+
+    async fn send_control_on_network_inner(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        network: &str,
+        queue_reliable: bool,
+    ) -> Result<(), String> {
+        if !self
+            .state
+            .lock()
+            .networks
+            .iter()
+            .any(|joined| joined == network)
+        {
+            return Err(format!("network {network} is no longer joined"));
+        }
+        let payload = serde_json::to_value(message).map_err(|error| error.to_string())?;
+        if queue_reliable && route_control_requires_reliable_delivery(message) {
+            self.queue_reliable_control(peer, vec![network.to_string()], message, payload.clone());
+        }
+        let response = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.to_string(),
+                channel: CHANNEL_CONTROL.to_string(),
+                peer: pubkey_part(peer).to_string(),
+                payload,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "channel send failed".into()));
+        }
+        self.note_peer_network(peer, network);
+        Ok(())
+    }
+
+    /// Retry path for a lifecycle message already represented by one durable
+    /// worker job. Repeating the fast application delivery is what reaches a
+    /// peer app that subscribed after the daemon acknowledged the first copy;
+    /// enqueueing another reliable job on every sweep would only build a
+    /// duplicate backlog behind a stalled network candidate.
+    async fn send_control_retry(&self, peer: &str, message: &ControlMessage) -> Result<(), String> {
+        self.send_control_inner(peer, message, false).await
+    }
+
+    async fn send_control_inner(
+        &self,
+        peer: &str,
+        message: &ControlMessage,
+        queue_reliable: bool,
+    ) -> Result<(), String> {
+        let candidates = self.route_network_candidates(peer, message);
         if candidates.is_empty() {
             return Err(format!("no shared network with {peer}"));
         }
         let payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        if queue_reliable && route_control_requires_reliable_delivery(message) {
+            self.queue_reliable_control(peer, candidates.clone(), message, payload.clone());
+        }
         let mut last_err = String::new();
         for network in candidates {
             let resp = self
@@ -13182,6 +16902,7 @@ impl Mesh {
             match resp {
                 Ok(r) if r.ok => {
                     self.note_peer_network(peer, &network);
+                    self.note_outbound_offer_network(peer, message, &network);
                     return Ok(());
                 }
                 Ok(r) => {
@@ -13327,23 +17048,25 @@ fn same_node(a: &str, b: &str) -> bool {
 /// unit-tested. A pinned route's peer is the `to` node of its id
 /// (`route:<from>→<to>`); pins for other peers don't constrain this one.
 fn free_lane_for_peer(
-    pins: &std::collections::HashMap<String, u8>,
+    pins: &std::collections::HashMap<String, OutboundVideoLanePin>,
+    network: &str,
     peer_canon: &str,
     route_id: &str,
     cap: u8,
 ) -> Option<u8> {
-    if let Some(&lane) = pins.get(route_id) {
-        return Some(lane);
+    if let Some(pin) = pins.get(route_id) {
+        return (pin.network == network).then_some(pin.lane);
     }
     let used: std::collections::HashSet<u8> = pins
         .iter()
-        .filter(|(rid, _)| {
-            rid.as_str() != route_id
+        .filter(|(rid, pin)| {
+            pin.network == network
+                && rid.as_str() != route_id
                 && rid
                     .split_once('→')
                     .is_some_and(|(_, to)| pubkey_part(&node_of(to)) == peer_canon)
         })
-        .map(|(_, &l)| l)
+        .map(|(_, pin)| pin.lane)
         .collect();
     (0..cap).find(|l| !used.contains(l))
 }
@@ -13369,6 +17092,16 @@ fn audio_profile_for_mode(mode: MediaMode) -> AudioProfile {
         MediaMode::Game => AudioProfile::Game,
         MediaMode::Studio | MediaMode::StudioLossless => AudioProfile::Studio,
     }
+}
+
+/// Resolve the actual encoder posture. A policy plan is authoritative over
+/// the legacy requested string, so an unsupported Studio Lossless request
+/// downgraded to Studio cannot still open an HEVC QP0 encoder.
+fn resolved_encoder_mode<'a>(
+    legacy_mode: Option<&'a str>,
+    effective_mode: Option<MediaMode>,
+) -> Option<&'a str> {
+    effective_mode.map(MediaMode::wire_name).or(legacy_mode)
 }
 
 // ---- refresh round-trip backoff -------------------------------------------
@@ -13662,6 +17395,286 @@ fn pubkey_part(id: &str) -> &str {
     id
 }
 
+/// Extract the presence boot from a negotiated route incarnation. The full
+/// shape is validated here, not just the prefix, so a malformed token never
+/// triggers a profile association or reaches the route state machine.
+fn route_incarnation_boot(value: &str) -> Option<u64> {
+    let (boot, sequence) = value.split_once(':')?;
+    if sequence.contains(':') {
+        return None;
+    }
+    let boot = boot.parse::<u64>().ok()?;
+    let sequence = sequence.parse::<u64>().ok()?;
+    (boot != 0 && sequence != 0).then_some(boot)
+}
+
+fn exact_accept_terminal_response(
+    route_id: &str,
+    from: &str,
+    incarnation: &str,
+    route: Option<&allmystuff_session::LiveRoute>,
+) -> Option<ControlMessage> {
+    match route {
+        Some(route)
+            if pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                && route.origin == allmystuff_session::Origin::Outbound
+                && route.incarnation.as_deref() == Some(incarnation)
+                && matches!(route.state, RouteState::Offered | RouteState::Active) =>
+        {
+            None
+        }
+        Some(route)
+            if pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                && route.incarnation.as_deref() == Some(incarnation)
+                && route.state == RouteState::TornDown =>
+        {
+            Some(ControlMessage::Route(RouteControl::Teardown {
+                route_id: route_id.to_string(),
+                incarnation: Some(incarnation.to_string()),
+            }))
+        }
+        Some(route)
+            if pubkey_part(route.peer.as_str()) == pubkey_part(from)
+                && route.incarnation.as_deref() == Some(incarnation) =>
+        {
+            let reason = match &route.state {
+                RouteState::Rejected { reason } => reason.clone(),
+                _ => "route not live on the receiving side".into(),
+            };
+            Some(ControlMessage::Route(RouteControl::Reject {
+                route_id: route_id.to_string(),
+                incarnation: Some(incarnation.to_string()),
+                reason,
+            }))
+        }
+        _ => Some(ControlMessage::Route(RouteControl::Reject {
+            route_id: route_id.to_string(),
+            incarnation: Some(incarnation.to_string()),
+            reason: "route not live on the receiving side".into(),
+        })),
+    }
+}
+
+fn route_control_requires_reliable_delivery(message: &ControlMessage) -> bool {
+    matches!(
+        message,
+        ControlMessage::Route(
+            RouteControl::Offer { .. }
+                | RouteControl::Accept { .. }
+                | RouteControl::Reject { .. }
+                | RouteControl::Teardown { .. }
+                | RouteControl::VideoLane { .. }
+                | RouteControl::DeadLane { .. }
+        )
+    )
+}
+
+fn reliable_control_identity(
+    message: &ControlMessage,
+    networks: &[String],
+) -> Option<(ReliableControlScope, ReliableControlKind)> {
+    let (scope, kind) = match message {
+        ControlMessage::Route(RouteControl::Offer {
+            route, incarnation, ..
+        }) => (
+            ReliableControlScope::Route {
+                route_id: route.id.clone(),
+                incarnation: incarnation.clone(),
+            },
+            ReliableControlKind::Offer,
+        ),
+        ControlMessage::Route(RouteControl::Accept {
+            route_id,
+            incarnation,
+            ..
+        }) => (
+            ReliableControlScope::Route {
+                route_id: route_id.clone(),
+                incarnation: incarnation.clone(),
+            },
+            ReliableControlKind::Accept,
+        ),
+        ControlMessage::Route(RouteControl::Reject {
+            route_id,
+            incarnation,
+            ..
+        }) => (
+            ReliableControlScope::Route {
+                route_id: route_id.clone(),
+                incarnation: incarnation.clone(),
+            },
+            ReliableControlKind::Reject,
+        ),
+        ControlMessage::Route(RouteControl::Teardown {
+            route_id,
+            incarnation,
+        }) => (
+            ReliableControlScope::Route {
+                route_id: route_id.clone(),
+                incarnation: incarnation.clone(),
+            },
+            ReliableControlKind::Teardown,
+        ),
+        ControlMessage::Route(RouteControl::VideoLane {
+            route_id,
+            incarnation,
+            ..
+        }) => (
+            ReliableControlScope::Route {
+                route_id: route_id.clone(),
+                incarnation: incarnation.clone(),
+            },
+            ReliableControlKind::VideoLane,
+        ),
+        ControlMessage::Route(RouteControl::DeadLane { media, lane }) => (
+            ReliableControlScope::DeadLane {
+                media: media.clone(),
+                lane: *lane,
+                networks: networks.to_vec(),
+            },
+            ReliableControlKind::DeadLane,
+        ),
+        _ => return None,
+    };
+    Some((scope, kind))
+}
+
+/// Exact route lifetime carried by controls that must stay on one data-plane
+/// network. This helper selects an existing pin only. Pin installation is
+/// deliberately limited to outbound Offer and authenticated inbound
+/// Offer/Accept observations.
+fn route_control_network_key(message: &ControlMessage) -> Option<(&str, Option<&str>)> {
+    match message {
+        ControlMessage::Route(RouteControl::Offer {
+            route, incarnation, ..
+        }) => Some((&route.id, incarnation.as_deref())),
+        ControlMessage::Route(
+            RouteControl::Accept {
+                route_id,
+                incarnation,
+                ..
+            }
+            | RouteControl::Refresh {
+                route_id,
+                incarnation,
+            }
+            | RouteControl::Tune {
+                route_id,
+                incarnation,
+                ..
+            }
+            | RouteControl::VideoFeedback {
+                route_id,
+                incarnation,
+                ..
+            }
+            | RouteControl::VideoLane {
+                route_id,
+                incarnation,
+                ..
+            }
+            | RouteControl::Reject {
+                route_id,
+                incarnation,
+                ..
+            }
+            | RouteControl::Teardown {
+                route_id,
+                incarnation,
+            }
+            | RouteControl::TeardownAck {
+                route_id,
+                incarnation,
+            },
+        ) => Some((route_id, incarnation.as_deref())),
+        _ => None,
+    }
+}
+
+fn network_for_peer_locked(state: &State, peer: &str) -> Option<String> {
+    state
+        .peer_networks
+        .get(pubkey_part(peer))
+        .and_then(|paths| {
+            paths
+                .preferred
+                .as_ref()
+                .filter(|network| paths.contains(network) && state.networks.contains(*network))
+                .cloned()
+                .or_else(|| {
+                    paths
+                        .networks()
+                        .into_iter()
+                        .filter(|network| state.networks.contains(*network))
+                        .min()
+                        .cloned()
+                })
+        })
+        .or_else(|| {
+            state
+                .network
+                .as_ref()
+                .filter(|network| state.networks.contains(*network))
+                .cloned()
+        })
+}
+
+fn reconcile_network_epochs(state: &mut State, networks: &[String], rotate_existing: bool) {
+    let joined = networks
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    state
+        .network_epochs
+        .retain(|network, _| joined.contains(network));
+    for network in networks {
+        if rotate_existing || !state.network_epochs.contains_key(network) {
+            state.network_epoch_clock = state.network_epoch_clock.wrapping_add(1);
+            if state.network_epoch_clock == 0 {
+                state.network_epoch_clock = 1;
+            }
+            state
+                .network_epochs
+                .insert(network.clone(), state.network_epoch_clock);
+        }
+    }
+}
+
+fn required_subscription_channels() -> [&'static str; 6] {
+    [
+        CHANNEL_PRESENCE,
+        CHANNEL_CONTROL,
+        CHANNEL_MEDIA,
+        CHANNEL_ROOMS,
+        allmystuff_cec_protocol::CHANNEL_CONTROL,
+        allmystuff_cec_protocol::CHANNEL_PRESENCE,
+    ]
+}
+
+fn subscription_missing_count(
+    health: &HashMap<String, NetworkSubscriptionState>,
+    daemon_epoch: u64,
+    client_id: ClientId,
+    networks: &[String],
+) -> usize {
+    networks
+        .iter()
+        .map(|network| {
+            let Some(state) = health
+                .get(network)
+                .filter(|state| state.belongs_to(daemon_epoch, client_id))
+            else {
+                return required_subscription_channels().len() + 2;
+            };
+            let channels = required_subscription_channels()
+                .into_iter()
+                .filter(|channel| !state.channels.contains(*channel))
+                .count();
+            channels + usize::from(!state.video) + usize::from(!state.audio)
+        })
+        .sum()
+}
+
 /// Video feedback is generated repeatedly by a window that still owns the
 /// route, even for a static screen whose paint rate is zero. One-shot
 /// setup/tune controls are intentionally excluded: they can already be in
@@ -13673,8 +17686,8 @@ fn inbound_video_feedback_liveness_route_id(msg: &ControlMessage) -> Option<&str
     }
 }
 
-fn watcher_poll_proves_liveness(last_poll: Instant, disconnect_started: Instant) -> bool {
-    last_poll >= disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE
+fn watcher_poll_proves_liveness(last_poll: Option<Instant>, disconnect_started: Instant) -> bool {
+    last_poll.is_some_and(|last| last >= disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE)
 }
 
 /// Fold one network's daemon peer list into the `pubkey → network` map that
@@ -13696,14 +17709,16 @@ fn status_is_reachable(status: Option<&str>) -> bool {
     matches!(status, Some("active") | Some("shelved"))
 }
 
-fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], network: &str) {
+fn seed_peer_networks(map: &mut HashMap<String, PeerNetworkState>, peers: &[Value], network: &str) {
     for p in peers {
         if !status_is_reachable(p.get("status").and_then(|v| v.as_str())) {
             continue;
         }
         if let Some(id) = p.get("device_id").and_then(|v| v.as_str()) {
             map.entry(pubkey_part(id).to_string())
-                .or_insert_with(|| network.to_string());
+                .or_default()
+                .daemon_reachable
+                .insert(network.to_string());
         }
     }
 }
@@ -13714,13 +17729,23 @@ fn seed_peer_networks(map: &mut HashMap<String, String>, peers: &[Value], networ
 /// multi-homed peer's tunnel finds its live mesh — is testable on its own;
 /// [`Mesh::peer_network_candidates`] feeds it the live state.
 fn ordered_send_candidates(
-    slot: Option<&String>,
+    paths: Option<&PeerNetworkState>,
     primary: Option<&String>,
     joined: &[String],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for n in slot.into_iter().chain(primary).chain(joined) {
-        if !out.contains(n) {
+    let mut reachable = paths
+        .map(|paths| paths.networks().into_iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    reachable.sort_unstable();
+    for n in paths
+        .and_then(|paths| paths.preferred.as_ref())
+        .into_iter()
+        .chain(reachable)
+        .chain(primary)
+        .chain(joined)
+    {
+        if joined.contains(n) && !out.contains(n) {
             out.push(n.clone());
         }
     }
@@ -13754,8 +17779,9 @@ fn link_class_of(peer: &Value) -> crate::video::LinkClass {
 /// recovery. Pure (no daemon, no lock), like [`seed_peer_networks`], so
 /// the keep-on-unknown rule is unit-tested.
 fn seed_peer_links(
-    map: &mut HashMap<String, crate::video::LinkClass>,
+    map: &mut HashMap<(String, String), crate::video::LinkClass>,
     peers: &[Value],
+    network: &str,
 ) -> Vec<(String, crate::video::LinkClass)> {
     use crate::video::LinkClass;
     let mut changed = Vec::new();
@@ -13767,10 +17793,11 @@ fn seed_peer_links(
         if class == LinkClass::Unknown {
             continue;
         }
-        let key = pubkey_part(id).to_string();
+        let peer = pubkey_part(id).to_string();
+        let key = (network.to_string(), peer.clone());
         if map.get(&key) != Some(&class) {
-            map.insert(key.clone(), class);
-            changed.push((key, class));
+            map.insert(key, class);
+            changed.push((peer, class));
         }
     }
     changed
@@ -13955,6 +17982,101 @@ fn parse_media(s: &str) -> MediaKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reliable_test_job(kind: ReliableControlKind, marker: &str) -> ReliableControlOut {
+        ReliableControlOut {
+            peer: "peer".into(),
+            networks: vec!["network".into()],
+            payload: json!({ "marker": marker }),
+            kind,
+            daemon: DaemonContext {
+                epoch: 7,
+                client_id: ClientId(11),
+            },
+        }
+    }
+
+    #[test]
+    fn reliable_control_pending_is_protocol_bounded_and_preserves_teardown_barrier() {
+        let mut pending = ReliableControlPending::default();
+        assert!(!pending.push(reliable_test_job(ReliableControlKind::Offer, "old-offer")));
+        assert!(!pending.push(reliable_test_job(ReliableControlKind::Teardown, "teardown")));
+        assert!(pending.push(reliable_test_job(
+            ReliableControlKind::Offer,
+            "successor-offer"
+        )));
+        assert!(!pending.push(reliable_test_job(
+            ReliableControlKind::VideoLane,
+            "old-lane"
+        )));
+        assert!(pending.push(reliable_test_job(
+            ReliableControlKind::VideoLane,
+            "successor-lane"
+        )));
+
+        // One slot per reliable route-control kind, with duplicates replacing
+        // in place instead of extending a FIFO.
+        assert_eq!(pending.len(), 3);
+        let teardown = pending.pop().expect("teardown barrier");
+        let offer = pending.pop().expect("successor offer");
+        let lane = pending.pop().expect("successor lane");
+        assert_eq!(teardown.kind, ReliableControlKind::Teardown);
+        assert_eq!(offer.kind, ReliableControlKind::Offer);
+        assert_eq!(offer.payload["marker"], "successor-offer");
+        assert_eq!(lane.kind, ReliableControlKind::VideoLane);
+        assert_eq!(lane.payload["marker"], "successor-lane");
+        assert!(pending.pop().is_none());
+    }
+
+    #[test]
+    fn reliable_dead_lane_workers_are_scoped_to_the_exact_network() {
+        let message = ControlMessage::Route(RouteControl::DeadLane {
+            media: "video".into(),
+            lane: 0,
+        });
+        let (network_a, kind_a) =
+            reliable_control_identity(&message, &["network-a".into()]).expect("reliable identity");
+        let (network_b, kind_b) =
+            reliable_control_identity(&message, &["network-b".into()]).expect("reliable identity");
+
+        assert_eq!(kind_a, ReliableControlKind::DeadLane);
+        assert_eq!(kind_b, ReliableControlKind::DeadLane);
+        assert_ne!(network_a, network_b);
+    }
+
+    #[tokio::test]
+    async fn daemon_epoch_change_cancels_a_stalled_reliable_send() {
+        let (epoch_tx, mut epoch_rx) = watch::channel(41u64);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stalled = async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        };
+        let task = tokio::spawn(async move {
+            Mesh::await_reliable_control_response(41, &mut epoch_rx, stalled).await
+        });
+
+        started_rx.await.expect("stalled send entered");
+        epoch_tx.send_replace(42);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("epoch reset must cancel the in-flight send")
+            .expect("worker task");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn route_connect_handle_wire_shape_matches_frontend_contract() {
+        let value = serde_json::to_value(RouteConnectHandle {
+            route_id: "route:display".into(),
+            generation: 23,
+        })
+        .expect("serialize route handle");
+        assert_eq!(
+            value,
+            json!({ "route_id": "route:display", "generation": 23 })
+        );
+    }
 
     #[test]
     fn jpeg_rate_gate_enforces_wire_rate_and_recovers_on_cap_change() {
@@ -14229,6 +18351,7 @@ mod tests {
     fn zero_fps_feedback_is_still_a_static_viewer_heartbeat() {
         let feedback = ControlMessage::Route(RouteControl::VideoFeedback {
             route_id: "route:static".into(),
+            incarnation: None,
             recv_fps: 0,
             decode_fails: 0,
             queue_depth: 0,
@@ -14243,6 +18366,7 @@ mod tests {
             inbound_video_feedback_liveness_route_id(&ControlMessage::Route(
                 RouteControl::Refresh {
                     route_id: "route:static".into(),
+                    incarnation: None,
                 },
             )),
             None,
@@ -14253,16 +18377,13 @@ mod tests {
     #[test]
     fn local_switch_guard_requires_a_mature_post_disconnect_poll() {
         let disconnect_started = Instant::now();
+        assert!(!watcher_poll_proves_liveness(None, disconnect_started));
         assert!(!watcher_poll_proves_liveness(
-            disconnect_started + Duration::from_millis(1),
-            disconnect_started,
-        ));
-        assert!(!watcher_poll_proves_liveness(
-            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE - Duration::from_millis(1),
+            Some(disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE - Duration::from_millis(1)),
             disconnect_started,
         ));
         assert!(watcher_poll_proves_liveness(
-            disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE,
+            Some(disconnect_started + VIDEO_LOCAL_POLL_PROOF_MIN_AGE),
             disconnect_started,
         ));
         assert!(VIDEO_LOCAL_POLL_OBSERVE > VIDEO_LOCAL_POLL_PROOF_MIN_AGE);
@@ -14363,6 +18484,60 @@ mod tests {
         assert_eq!(recovery.suppressed.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg(not(feature = "host"))]
+    #[test]
+    fn captureless_live_profile_matches_the_mobile_viewer_contract() {
+        let node = NodeId::from("phone-test");
+        let inventory = allmystuff_inventory::scan();
+        let capabilities = Mesh::advertised_capabilities(&inventory, &node);
+        let expected = allmystuff_mobile_core::mobile_capabilities(
+            &node,
+            allmystuff_mobile_core::MobileScope::ViewerController,
+        );
+        assert_eq!(capabilities, expected);
+
+        assert!(capabilities.iter().any(|capability| {
+            capability.id.as_str() == "phone-test:display-in"
+                && capability.media == MediaKind::Display
+                && capability.flow == allmystuff_graph::Flow::Sink
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.id.as_str() == "phone-test:audio-out"
+                && capability.media == MediaKind::Audio
+                && capability.flow == allmystuff_graph::Flow::Sink
+        }));
+        assert!(capabilities.iter().all(|capability| {
+            !matches!(
+                capability.origin.as_str(),
+                "control" | "system" | "clipboard" | "screen" | "camera"
+            )
+        }));
+
+        let mut expected_features = allmystuff_mobile_core::mobile_features(
+            allmystuff_mobile_core::MobileScope::ViewerController,
+        );
+        expected_features.push(FEATURE_ROUTE_INCARNATION.to_string());
+        expected_features.push(FEATURE_ROUTE_TEARDOWN_ACK.to_string());
+        assert_eq!(Mesh::advertised_features(), expected_features);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn host_feature_advertisement_is_unchanged() {
+        assert_eq!(
+            Mesh::advertised_features(),
+            vec![
+                allmystuff_protocol::FEATURE_FILES.to_string(),
+                allmystuff_protocol::FEATURE_ROOMS.to_string(),
+                allmystuff_protocol::FEATURE_SITES.to_string(),
+                allmystuff_protocol::FEATURE_TERMINAL.to_string(),
+                allmystuff_protocol::FEATURE_CAMERA.to_string(),
+                FEATURE_ROUTE_INCARNATION.to_string(),
+                FEATURE_ROUTE_TEARDOWN_ACK.to_string(),
+            ]
+        );
+    }
+
     fn term_route(from: &str, to: &str, media: MediaKind) -> Route {
         Route {
             id: format!("route:{from}→{to}"),
@@ -14370,6 +18545,230 @@ mod tests {
             to: to.into(),
             media,
         }
+    }
+
+    fn test_profile(node: &str, boot: u64, features: Vec<String>) -> NodeProfile {
+        NodeProfile {
+            protocol: PROTOCOL_VERSION,
+            node: node.into(),
+            label: node.into(),
+            hostname: node.into(),
+            summary: allmystuff_protocol::InventorySummary {
+                os: "test".into(),
+                cpu: "test".into(),
+                ram_bytes: 1,
+                device_count: 0,
+                product: "test".into(),
+            },
+            capabilities: Vec::new(),
+            owner: None,
+            claimable: false,
+            boot,
+            features,
+            sites: Vec::new(),
+            version: String::new(),
+            fleet_name: String::new(),
+            fleet_owner: String::new(),
+            kvm: None,
+            sent_at: 0,
+        }
+    }
+
+    fn inbound_test_route(id: &str, media: MediaKind, source: &str, sink: &str) -> Route {
+        Route {
+            id: id.into(),
+            from: source.into(),
+            to: sink.into(),
+            media,
+        }
+    }
+
+    #[test]
+    fn delayed_input_from_predecessor_cannot_inject_under_same_id_successor() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let mut session = Session::new("receiver");
+        assert!(session.apply_presence(test_profile(
+            "sender",
+            7,
+            vec![FEATURE_ROUTE_INCARNATION.into()]
+        )));
+        let route = inbound_test_route(
+            "route:stable-input",
+            MediaKind::Input,
+            "sender:control",
+            "receiver:input",
+        );
+        let _ = session.handle(
+            NodeId::from("sender"),
+            ControlMessage::Route(RouteControl::Offer {
+                route: route.clone(),
+                incarnation: Some("7:1".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        let _ = session.handle(
+            NodeId::from("sender"),
+            ControlMessage::Route(RouteControl::Offer {
+                route,
+                incarnation: Some("7:2".into()),
+                video: Vec::new(),
+                audio: Vec::new(),
+                session: None,
+            }),
+        );
+        mesh.state.lock().session = Some(session);
+
+        assert!(!mesh.inbound_media_ok_incarnation(
+            "route:stable-input",
+            "sender",
+            MediaKind::Input,
+            Some("7:1")
+        ));
+        assert!(!mesh.inbound_media_ok_incarnation(
+            "route:stable-input",
+            "sender",
+            MediaKind::Input,
+            None
+        ));
+        assert!(mesh.inbound_media_ok_incarnation(
+            "route:stable-input",
+            "sender",
+            MediaKind::Input,
+            Some("7:2")
+        ));
+    }
+
+    #[test]
+    fn stale_lane_challenge_cannot_stop_same_id_successor() {
+        let route = inbound_test_route(
+            "route:stable-video",
+            MediaKind::Display,
+            "receiver:screen",
+            "sender:display",
+        );
+        let mut session = Session::new("receiver");
+        let _ = session.offer_with_incarnation(
+            route,
+            "sender",
+            vec!["h264".into()],
+            Vec::new(),
+            Some("7:2".into()),
+        );
+        let _ = session.handle(
+            NodeId::from("sender"),
+            ControlMessage::Route(RouteControl::Accept {
+                route_id: "route:stable-video".into(),
+                incarnation: Some("7:2".into()),
+                session: None,
+            }),
+        );
+
+        assert!(exact_accept_terminal_response(
+            "route:stable-video",
+            "sender",
+            "7:2",
+            session.route("route:stable-video")
+        )
+        .is_none());
+
+        let stale_terminal = exact_accept_terminal_response(
+            "route:stable-video",
+            "sender",
+            "7:1",
+            session.route("route:stable-video"),
+        )
+        .expect("a stale proof receives an exact stale-lifetime terminal response");
+        assert!(matches!(
+            &stale_terminal,
+            ControlMessage::Route(RouteControl::Reject {
+                incarnation: Some(incarnation),
+                ..
+            }) if incarnation == "7:1"
+        ));
+        assert!(session
+            .handle(NodeId::from("sender"), stale_terminal)
+            .is_empty());
+        assert_eq!(
+            session.route("route:stable-video").unwrap().state,
+            RouteState::Active
+        );
+
+        assert!(matches!(
+            exact_accept_terminal_response("missing", "sender", "7:1", None),
+            Some(ControlMessage::Route(RouteControl::Reject {
+                incarnation: Some(incarnation),
+                ..
+            })) if incarnation == "7:1"
+        ));
+    }
+
+    #[test]
+    fn dynamic_multilane_peer_is_limited_to_pre_negotiated_lane_zero() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        mesh.daemon_video.store(true, Ordering::SeqCst);
+        mesh.daemon_lanes.store(2, Ordering::SeqCst);
+        let features = vec![
+            FEATURE_ROUTE_INCARNATION.into(),
+            allmystuff_protocol::FEATURE_MEDIA_LANES.into(),
+            format!("{}:2", allmystuff_protocol::FEATURE_MEDIA_LANES),
+        ];
+        let mut session = Session::new("receiver");
+        assert!(session.apply_presence(test_profile("sender", 7, features.clone())));
+        for (id, source, incarnation) in [
+            ("route:z-started-first", "sender:screen:2", "7:1"),
+            ("route:a-started-second", "sender:screen:1", "7:2"),
+        ] {
+            let _ = session.handle(
+                NodeId::from("sender"),
+                ControlMessage::Route(RouteControl::Offer {
+                    route: inbound_test_route(id, MediaKind::Display, source, "receiver:display"),
+                    incarnation: Some(incarnation.into()),
+                    video: vec!["h264".into()],
+                    audio: Vec::new(),
+                    session: None,
+                }),
+            );
+        }
+        {
+            let mut state = mesh.state.lock();
+            state.networks = vec!["net".into()];
+            state.network = Some("net".into());
+            state.peer_features.insert("sender".into(), features);
+            state.session = Some(session);
+        }
+
+        assert_eq!(
+            mesh.video_route_for_lane("net", "sender", 0),
+            None,
+            "a capable peer must not use lexical fallback before VideoLane"
+        );
+        mesh.record_video_lane(
+            "net",
+            "sender",
+            "route:z-started-first",
+            Some("7:1".into()),
+            0,
+        );
+        mesh.record_video_lane(
+            "net",
+            "sender",
+            "route:a-started-second",
+            Some("7:2".into()),
+            1,
+        );
+        assert_eq!(
+            mesh.video_route_for_lane("net", "sender", 0).as_deref(),
+            Some("route:z-started-first")
+        );
+        assert_eq!(
+            mesh.video_route_for_lane("net", "sender", 1),
+            None,
+            "lane 1 would trigger SDP renegotiation and must remain unavailable"
+        );
     }
 
     struct NoopSink;
@@ -14416,6 +18815,60 @@ mod tests {
         assert!(!mesh.video_poll(route).is_empty());
         mesh.enqueue_decoded(route, vec![7, 8, 9], 3, 30);
         assert_eq!(sink.ready.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn displaced_video_watcher_cannot_drain_successor_queue() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        let stale = mesh.video_watch(route.to_string(), true);
+        let current = mesh.video_watch(route.to_string(), true);
+
+        mesh.enqueue_decoded(route, vec![1, 2, 3], 1, 10);
+        assert!(mesh.video_poll_for(route, Some(stale)).is_empty());
+        assert!(!mesh.video_poll_for(route, Some(current)).is_empty());
+    }
+
+    #[test]
+    fn releasing_late_watch_restores_displaced_live_claim() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        let intended = mesh.video_watch(route.to_string(), true);
+        // Registration is not liveness proof. The intended watcher must have
+        // completed a token-valid poll before it may be restored.
+        assert!(mesh.video_poll_for(route, Some(intended)).is_empty());
+        let obsolete_late = mesh.video_watch(route.to_string(), true);
+
+        mesh.video_unwatch(route, obsolete_late);
+        mesh.enqueue_decoded(route, vec![1, 2, 3], 1, 10);
+        assert!(!mesh.video_poll_for(route, Some(intended)).is_empty());
+    }
+
+    #[test]
+    fn never_polled_or_expired_standby_watch_is_not_resurrected() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:test-watch";
+
+        let never_polled = mesh.video_watch(route.to_string(), true);
+        let replacement = mesh.video_watch(route.to_string(), true);
+        mesh.video_unwatch(route, replacement);
+        assert!(!mesh.video_watcher_is_current(route, never_polled));
+
+        let recently_live = mesh.video_watch(route.to_string(), true);
+        assert!(mesh.video_poll_for(route, Some(recently_live)).is_empty());
+        let replacement = mesh.video_watch(route.to_string(), true);
+        {
+            let mut watchers = mesh.video_watchers.lock();
+            let standby = watchers.standby.get_mut(route).unwrap();
+            standby.last_mut().unwrap().last_poll =
+                Some(Instant::now() - VIDEO_LOCAL_POLL_OBSERVE - Duration::from_millis(1));
+        }
+        mesh.video_unwatch(route, replacement);
+        assert!(!mesh.video_watcher_is_current(route, recently_live));
+        assert!(!mesh.video_watchers.lock().contains_key(route));
     }
 
     #[test]
@@ -14496,29 +18949,68 @@ mod tests {
         let _mesh = Mesh::new(client, Arc::new(NoopSink));
     }
 
-    /// The presence boot id is the re-sync trigger: a peer answers another's
-    /// advert with its own state only when the boot id is one it hasn't
-    /// recorded. A network reset drops our peer caches, so we *refresh* the
-    /// boot id (see [`Mesh::prune_unjoined_peers`]) — otherwise the side that
-    /// reset re-advertises the same id and the other side, still holding us as
-    /// `known`, never re-feeds the state we just threw away (the "refresh on one
-    /// side strands the connection until both refresh" bug). Guard the two
-    /// invariants that mechanism rests on: the id is never 0 (0 is reserved for
-    /// pre-field peers), and a refresh actually changes it.
+    /// Only a destructive local Session reset rotates this node's route boot.
+    /// Peer/network cache pruning leaves it alone so surviving peers do not
+    /// tear down unrelated healthy routes.
     #[test]
-    fn network_reset_refreshes_a_nonzero_presence_boot_id() {
+    fn explicit_session_reset_refreshes_a_nonzero_presence_boot_id() {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));
-        let before = mesh.boot_id.load(Ordering::Relaxed);
+        let before = mesh.route_incarnation_clock.lock().boot;
         assert_ne!(
             before, 0,
             "boot id is never 0 — 0 means a peer without the field"
         );
-        // What the prune does after clearing a reset network's peer caches.
-        mesh.boot_id.store(fresh_boot_id(), Ordering::Relaxed);
-        let after = mesh.boot_id.load(Ordering::Relaxed);
+        mesh.rotate_route_boot();
+        let after = mesh.route_incarnation_clock.lock().boot;
         assert_ne!(after, 0, "a refreshed boot id is still non-zero");
-        assert_ne!(before, after, "a network reset must change the boot id");
+        assert_ne!(before, after, "a Session reset must change the boot id");
+    }
+
+    #[test]
+    fn delayed_retired_or_legacy_presence_cannot_regress_current_boot() {
+        let mut boots = HashMap::new();
+        let mut retired = HashMap::new();
+
+        assert_eq!(
+            admit_peer_boot(&mut boots, &mut retired, "peer", 11),
+            PeerBootDisposition::Fresh
+        );
+        assert_eq!(
+            admit_peer_boot(&mut boots, &mut retired, "peer", 22),
+            PeerBootDisposition::Fresh
+        );
+        assert_eq!(boots.get("peer"), Some(&22));
+        assert!(retired.get("peer").is_some_and(|set| set.contains(&11)));
+
+        assert_eq!(
+            admit_peer_boot(&mut boots, &mut retired, "peer", 11),
+            PeerBootDisposition::Retired
+        );
+        assert_eq!(
+            admit_peer_boot(&mut boots, &mut retired, "peer", 0),
+            PeerBootDisposition::LegacyDowngrade
+        );
+        assert_eq!(boots.get("peer"), Some(&22));
+        assert_eq!(
+            admit_peer_boot(&mut boots, &mut retired, "peer", 22),
+            PeerBootDisposition::Current
+        );
+    }
+
+    #[test]
+    fn route_incarnation_clock_resets_boot_and_sequence_atomically() {
+        let mut clock = RouteIncarnationClock::new();
+        let first = clock.next();
+        let original_boot = first.split_once(':').unwrap().0.to_string();
+        assert_eq!(first, format!("{original_boot}:1"));
+        assert_eq!(clock.next(), format!("{original_boot}:2"));
+
+        clock.reset();
+        let successor = clock.next();
+        let (successor_boot, successor_sequence) = successor.split_once(':').unwrap();
+        assert_ne!(successor_boot, original_boot);
+        assert_eq!(successor_sequence, "1");
     }
 
     /// Regression guard for the screen/audio outage: the engine fires tasks
@@ -14699,6 +19191,11 @@ mod tests {
     #[test]
     fn ordered_send_candidates_tries_slot_then_primary_then_the_rest() {
         let slot = "cec-help".to_string();
+        let paths = PeerNetworkState {
+            preferred: Some(slot.clone()),
+            observed_reachable: [slot.clone()].into_iter().collect(),
+            ..PeerNetworkState::default()
+        };
         let primary = "joining".to_string();
         let joined = vec![
             "joining".to_string(),
@@ -14711,7 +19208,7 @@ mod tests {
         // multi-homed peer (a KVM on fleet + local-claim + help mesh at once)
         // fall through to the mesh that actually carries our frames.
         assert_eq!(
-            ordered_send_candidates(Some(&slot), Some(&primary), &joined),
+            ordered_send_candidates(Some(&paths), Some(&primary), &joined),
             vec![
                 "cec-help".to_string(),
                 "joining".to_string(),
@@ -14737,12 +19234,104 @@ mod tests {
     }
 
     #[test]
+    fn inbound_observation_cannot_steal_confirmed_outbound_path() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        mesh.state.lock().networks = vec!["confirmed-b".into(), "inbound-a".into()];
+        mesh.note_peer_network("peer", "confirmed-b");
+        mesh.note_peer_network_observed("peer", "inbound-a");
+
+        assert_eq!(
+            mesh.network_for_peer("peer").as_deref(),
+            Some("confirmed-b")
+        );
+        let state = mesh.state.lock();
+        let paths = state.peer_networks.get("peer").unwrap();
+        assert!(paths.contains("confirmed-b"));
+        assert!(paths.contains("inbound-a"));
+    }
+
+    #[test]
+    fn exact_route_pin_survives_peer_preference_changes_but_not_successor_reuse() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = Route {
+            id: "route:me:screen->peer:view".into(),
+            from: "me:screen".into(),
+            to: "peer:view".into(),
+            media: MediaKind::Display,
+        };
+        let offer_a = {
+            let mut state = mesh.state.lock();
+            state.networks = vec!["route-net".into(), "other-net".into()];
+            state.network = Some("other-net".into());
+            state.peer_networks.insert(
+                "peer".into(),
+                PeerNetworkState {
+                    preferred: Some("other-net".into()),
+                    observed_reachable: ["route-net".into(), "other-net".into()]
+                        .into_iter()
+                        .collect(),
+                    ..PeerNetworkState::default()
+                },
+            );
+            let mut session = Session::new("me");
+            let offer = session.offer_terminal_with_incarnation(
+                route.clone(),
+                "peer",
+                vec!["h264".into()],
+                Vec::new(),
+                None,
+                Some("11:1".into()),
+            );
+            state.session = Some(session);
+            offer
+        };
+
+        mesh.note_outbound_offer_network("peer", &offer_a, "route-net");
+        assert_eq!(
+            mesh.network_for_route(&route.id, "peer").as_deref(),
+            Some("route-net"),
+            "peer-wide preference must not move an established route"
+        );
+
+        // Replace the Session route with the same deterministic id but a new
+        // lifetime. The predecessor pin must not steer or silently migrate the
+        // successor before its own Offer is dispatched.
+        {
+            let mut state = mesh.state.lock();
+            let mut session = Session::new("me");
+            let _ = session.offer_terminal_with_incarnation(
+                route.clone(),
+                "peer",
+                vec!["h264".into()],
+                Vec::new(),
+                None,
+                Some("11:2".into()),
+            );
+            state.session = Some(session);
+        }
+        assert_eq!(
+            mesh.network_for_route(&route.id, "peer"),
+            None,
+            "a predecessor pin must not alias a same-id successor"
+        );
+    }
+
+    #[test]
     fn seed_peer_networks_fills_gaps_for_reachable_peers_only() {
         use serde_json::json;
-        let mut map: HashMap<String, String> = HashMap::new();
+        let mut map: HashMap<String, PeerNetworkState> = HashMap::new();
         // An inbound frame already proved this peer reachable on the fleet mesh —
         // that mapping carries traffic to us and must survive the peer-list seed.
-        map.insert("alice".into(), "fleet".into());
+        map.insert(
+            "alice".into(),
+            PeerNetworkState {
+                preferred: Some("fleet".into()),
+                observed_reachable: ["fleet".to_string()].into_iter().collect(),
+                ..PeerNetworkState::default()
+            },
+        );
         let peers = vec![
             // alice is also listed on the public mesh, but her proven mapping stands.
             json!({ "device_id": "alice-AB12C", "status": "active" }),
@@ -14758,10 +19347,15 @@ mod tests {
         ];
         seed_peer_networks(&mut map, &peers, "public");
         // Proven inbound mapping is never clobbered…
-        assert_eq!(map.get("alice").map(String::as_str), Some("fleet"));
+        assert_eq!(
+            map.get("alice")
+                .and_then(|paths| paths.preferred.as_deref()),
+            Some("fleet")
+        );
+        assert!(map["alice"].daemon_reachable.contains("public"));
         // …a gap is filled, keyed by canonical pubkey (suffix stripped)…
-        assert_eq!(map.get("bob").map(String::as_str), Some("public"));
-        assert_eq!(map.get("carol").map(String::as_str), Some("public"));
+        assert!(map["bob"].daemon_reachable.contains("public"));
+        assert!(map["carol"].daemon_reachable.contains("public"));
         // …and an unreachable peer claims no slot.
         assert_eq!(map.get("dave"), None);
         assert_eq!(map.get("erin"), None);
@@ -14771,7 +19365,7 @@ mod tests {
     fn seed_peer_links_classifies_and_keeps_on_unknown() {
         use crate::video::LinkClass;
         use serde_json::json;
-        let mut map: HashMap<String, LinkClass> = HashMap::new();
+        let mut map: HashMap<(String, String), LinkClass> = HashMap::new();
         // First sighting: host↔host is LAN, anything reflexive/relayed is WAN.
         let peers = vec![
             json!({ "device_id": "alice-AB12C",
@@ -14785,12 +19379,21 @@ mod tests {
             json!({ "device_id": "dave", "selected_pair": null }),
             json!({ "device_id": "erin" }),
         ];
-        let changed = seed_peer_links(&mut map, &peers);
-        assert_eq!(map.get("alice"), Some(&LinkClass::Lan));
-        assert_eq!(map.get("bob"), Some(&LinkClass::Wan));
-        assert_eq!(map.get("carol"), Some(&LinkClass::Wan));
-        assert_eq!(map.get("dave"), None);
-        assert_eq!(map.get("erin"), None);
+        let changed = seed_peer_links(&mut map, &peers, "public");
+        assert_eq!(
+            map.get(&("public".into(), "alice".into())),
+            Some(&LinkClass::Lan)
+        );
+        assert_eq!(
+            map.get(&("public".into(), "bob".into())),
+            Some(&LinkClass::Wan)
+        );
+        assert_eq!(
+            map.get(&("public".into(), "carol".into())),
+            Some(&LinkClass::Wan)
+        );
+        assert_eq!(map.get(&("public".into(), "dave".into())), None);
+        assert_eq!(map.get(&("public".into(), "erin".into())), None);
         assert_eq!(
             changed.len(),
             3,
@@ -14800,17 +19403,20 @@ mod tests {
         // A transient unknown (the daemon clears the pair on an ICE blip)
         // must KEEP the learned class — never downgrade a stream on a wobble.
         let blip = vec![json!({ "device_id": "alice-AB12C", "selected_pair": null })];
-        let changed = seed_peer_links(&mut map, &blip);
+        let changed = seed_peer_links(&mut map, &blip, "public");
         assert!(changed.is_empty());
-        assert_eq!(map.get("alice"), Some(&LinkClass::Lan));
+        assert_eq!(
+            map.get(&("public".into(), "alice".into())),
+            Some(&LinkClass::Lan)
+        );
 
         // A real reclassification (ICE-restart handoff LAN→STUN) reports the
         // change exactly once; a steady-state repeat reports nothing.
         let handoff = vec![json!({ "device_id": "alice-AB12C",
                 "selected_pair": { "local": "host", "remote": "peer_reflexive" } })];
-        let changed = seed_peer_links(&mut map, &handoff);
+        let changed = seed_peer_links(&mut map, &handoff, "public");
         assert_eq!(changed, vec![("alice".to_string(), LinkClass::Wan)]);
-        assert!(seed_peer_links(&mut map, &handoff).is_empty());
+        assert!(seed_peer_links(&mut map, &handoff, "public").is_empty());
     }
 
     #[test]
@@ -14925,39 +19531,84 @@ mod tests {
     #[test]
     fn video_lanes_pin_distinct_per_peer_and_reuse_when_freed() {
         use std::collections::HashMap;
-        let mut pins: HashMap<String, u8> = HashMap::new();
+        let mut pins: HashMap<String, OutboundVideoLanePin> = HashMap::new();
+        let network = "network-a";
         let r0 = "route:host:screen:0→viewerkey-ab3d9:sink".to_string();
         let r1 = "route:host:screen:1→viewerkey-ab3d9:sink".to_string();
         let cap = 8;
 
         // First screen to this viewer takes lane 0…
-        let l0 = free_lane_for_peer(&pins, "viewerkey", &r0, cap).unwrap();
-        pins.insert(r0.clone(), l0);
+        let l0 = free_lane_for_peer(&pins, network, "viewerkey", &r0, cap).unwrap();
+        pins.insert(
+            r0.clone(),
+            OutboundVideoLanePin {
+                network: network.into(),
+                lane: l0,
+            },
+        );
         // …the second can NOT reuse it — it must get a fresh lane.
-        let l1 = free_lane_for_peer(&pins, "viewerkey", &r1, cap).unwrap();
-        pins.insert(r1.clone(), l1);
+        let l1 = free_lane_for_peer(&pins, network, "viewerkey", &r1, cap).unwrap();
+        pins.insert(
+            r1.clone(),
+            OutboundVideoLanePin {
+                network: network.into(),
+                lane: l1,
+            },
+        );
         assert_ne!(l0, l1, "two screens to one viewer never share a lane");
         assert_eq!((l0, l1), (0, 1));
 
         // Asking again for an already-pinned route returns its pin (idempotent).
-        assert_eq!(free_lane_for_peer(&pins, "viewerkey", &r0, cap), Some(0));
+        assert_eq!(
+            free_lane_for_peer(&pins, network, "viewerkey", &r0, cap),
+            Some(0)
+        );
 
         // A route to a DIFFERENT viewer is independent — it can reuse lane 0.
         let other = "route:host:screen:0→otherkey-77zzz:sink".to_string();
-        assert_eq!(free_lane_for_peer(&pins, "otherkey", &other, cap), Some(0));
+        assert_eq!(
+            free_lane_for_peer(&pins, network, "otherkey", &other, cap),
+            Some(0)
+        );
+
+        // The same peer owns an independent lane pool in another PeerSession.
+        let other_network = "network-b";
+        let r_other_network = "route:host:screen:3→viewerkey-ab3d9:sink".to_string();
+        assert_eq!(
+            free_lane_for_peer(
+                &pins,
+                other_network,
+                "viewerkey",
+                &r_other_network,
+                cap,
+            ),
+            Some(0)
+        );
 
         // Freeing the first screen's pin lets the next route reuse lane 0.
         pins.remove(&r0);
         let r2 = "route:host:screen:2→viewerkey-ab3d9:sink".to_string();
-        assert_eq!(free_lane_for_peer(&pins, "viewerkey", &r2, cap), Some(0));
+        assert_eq!(
+            free_lane_for_peer(&pins, network, "viewerkey", &r2, cap),
+            Some(0)
+        );
 
         // A full pool yields None (the extra stream falls back to MJPEG).
-        let mut full: HashMap<String, u8> = HashMap::new();
+        let mut full: HashMap<String, OutboundVideoLanePin> = HashMap::new();
         for l in 0..2u8 {
-            full.insert(format!("route:host:screen:{l}→viewerkey-ab3d9:sink"), l);
+            full.insert(
+                format!("route:host:screen:{l}→viewerkey-ab3d9:sink"),
+                OutboundVideoLanePin {
+                    network: network.into(),
+                    lane: l,
+                },
+            );
         }
         let r_extra = "route:host:screen:9→viewerkey-ab3d9:sink".to_string();
-        assert_eq!(free_lane_for_peer(&full, "viewerkey", &r_extra, 2), None);
+        assert_eq!(
+            free_lane_for_peer(&full, network, "viewerkey", &r_extra, 2),
+            None
+        );
     }
 
     #[test]
@@ -15002,6 +19653,23 @@ mod tests {
         // A bare node id has no device half.
         assert_eq!(device_of("desk"), None);
         assert_eq!(node_of("desk"), "desk");
+    }
+
+    #[test]
+    fn negotiated_video_mode_overrides_an_unsupported_lossless_request() {
+        assert_eq!(
+            resolved_encoder_mode(Some("studio-lossless"), Some(MediaMode::Studio)),
+            Some("studio")
+        );
+        assert_eq!(
+            resolved_encoder_mode(Some("studio-lossless"), Some(MediaMode::StudioLossless)),
+            Some("studio-lossless")
+        );
+        assert_eq!(
+            resolved_encoder_mode(Some("game"), None),
+            Some("game"),
+            "legacy peers without a policy plan retain the requested posture"
+        );
     }
 
     #[test]

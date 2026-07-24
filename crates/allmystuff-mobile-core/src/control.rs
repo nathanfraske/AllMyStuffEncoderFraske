@@ -142,6 +142,9 @@ pub fn kvm_web_site(profile: &NodeProfile) -> Option<&SiteAdvert> {
 pub fn refresh_video(route_id: impl Into<String>) -> ControlMessage {
     ControlMessage::Route(RouteControl::Refresh {
         route_id: route_id.into(),
+        // Stateless mobile helpers do not own the live route lifetime. The
+        // embedded Mesh path supplies an exact incarnation when it has one.
+        incarnation: None,
     })
 }
 
@@ -162,6 +165,7 @@ pub fn tune(
 ) -> ControlMessage {
     ControlMessage::Route(RouteControl::Tune {
         route_id: route_id.into(),
+        incarnation: None,
         max_edge,
         bitrate,
         fps,
@@ -184,6 +188,7 @@ pub fn video_feedback(
 ) -> ControlMessage {
     ControlMessage::Route(RouteControl::VideoFeedback {
         route_id: route_id.into(),
+        incarnation: None,
         recv_fps,
         decode_fails,
         queue_depth,
@@ -374,6 +379,7 @@ mod tests {
         assert_eq!(j["t"], "route");
         assert_eq!(j["kind"], "refresh");
         assert_eq!(j["route_id"], "route:desk:screen→phone:display-in");
+        assert!(j.get("incarnation").is_none());
 
         // Tune with a cellular-friendly cap; unset fields are omitted.
         let j = v(&tune("route:r", Some(1280), Some(1_500_000), None));
@@ -381,6 +387,7 @@ mod tests {
         assert_eq!(j["max_edge"], 1280);
         assert_eq!(j["bitrate"], 1_500_000);
         assert!(j.get("fps").is_none() || j["fps"].is_null());
+        assert!(j.get("incarnation").is_none());
 
         // All-automatic tune carries only the route id.
         let j = v(&tune("route:r", None, None, None));
@@ -391,6 +398,10 @@ mod tests {
         assert_eq!(j["recv_fps"], 24);
         assert_eq!(j["decode_fails"], 3);
         assert_eq!(j["queue_depth"], 1);
+        assert!(
+            j.get("incarnation").is_none(),
+            "stateless feedback must not claim an unowned route lifetime"
+        );
 
         let j = v(&list_terminal_sessions());
         assert_eq!(j["kind"], "terminal_sessions_request");
