@@ -6,6 +6,9 @@ The first sandbox cut is a headless, black-box AllMyStuff instance. It runs a
 real `allmystuff-serve`, its pinned MyOwnMesh sidecar, and the production video
 probe from a sealed portable bundle.
 
+The dated smoke-test evidence and remaining limits are recorded in
+`docs/SANDBOX-HARNESS-VALIDATION-20260726.md`.
+
 The harness does not replace, stop, restart, or reuse the installed
 AllMyStuff stack. It also does not use the installed identity or state.
 
