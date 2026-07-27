@@ -103,9 +103,8 @@ audio-io = ["dep:cpal", "dep:libloading"]
 ffmpeg-next = { version = "6.1", optional = true }
 
 # Async runtime — control-socket client + the media-plane tasks. "process"
-# backs the daemon self-update the spawner runs when the installed myownmesh
-# is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
-# shutdown.
+# backs daemon launch plus the explicitly opted-in MyOwnMesh updater;
+# "signal" handles SIGINT/SIGTERM for a clean serve shutdown.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process", "signal"] }
 
 # Local IPC: same crate the daemon uses, so control-socket address
@@ -135,6 +134,7 @@ allmystuff-inventory = { path = "../crates/allmystuff-inventory" }
 allmystuff-graph = { path = "../crates/allmystuff-graph" }
 allmystuff-protocol = { path = "../crates/allmystuff-protocol" }
 allmystuff-bridge = { path = "../crates/allmystuff-bridge" }
+allmystuff-mobile-core = { path = "../crates/allmystuff-mobile-core" }
 allmystuff-session = { path = "../crates/allmystuff-session" }
 allmystuff-updater = { path = "../crates/allmystuff-updater" }
 # CEC Support: the wire contract (Support-ID derivation, Silent-mesh constants,

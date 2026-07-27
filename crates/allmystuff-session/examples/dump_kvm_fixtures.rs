@@ -174,6 +174,7 @@ fn main() {
         "control_route_offer_site",
         to_value(&ControlMessage::Route(RouteControl::Offer {
             route: site_route.clone(),
+            incarnation: None,
             video: Vec::new(),
             audio: Vec::new(),
             session: None,
@@ -183,6 +184,7 @@ fn main() {
         "control_route_accept",
         to_value(&ControlMessage::Route(RouteControl::Accept {
             route_id: site_route.id.to_string(),
+            incarnation: None,
             session: None,
         })),
     );

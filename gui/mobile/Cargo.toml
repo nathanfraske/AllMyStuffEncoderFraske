@@ -60,6 +60,9 @@ tauri-plugin-shell = "2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Production route commands serialize per-route mutations with Tokio's async
+# mutex. Keep the runtime/time/macros features test-only below.
+tokio = { version = "1", features = ["sync"] }
 
 # The phone's transport-agnostic brain: its capability model and the
 # client-side media planes. Pure Rust, no native deps — it gives us a real

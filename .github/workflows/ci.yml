@@ -26,6 +26,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Verify MyOwnMesh release metadata
+        if: matrix.os == 'ubuntu-latest'
+        shell: pwsh
+        run: ./scripts/check-myownmesh-release.ps1
       - name: rustfmt
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
@@ -54,6 +58,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: gui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test
       - run: pnpm check
       - run: pnpm build
 

@@ -198,10 +198,16 @@ mod tests {
         match classify(CHANNEL_CONTROL, "desk", accept) {
             Some(Inbound::Control {
                 from,
-                msg: ControlMessage::Route(RouteControl::Accept { route_id, session }),
+                msg:
+                    ControlMessage::Route(RouteControl::Accept {
+                        route_id,
+                        incarnation,
+                        session,
+                    }),
             }) => {
                 assert_eq!(from, "desk");
                 assert_eq!(route_id, "route:x→y");
+                assert_eq!(incarnation, None);
                 assert_eq!(session.as_deref(), Some("term-2"));
             }
             other => panic!("expected a route accept, got {other:?}"),

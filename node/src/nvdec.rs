@@ -29,6 +29,8 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::core::PCSTR;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -39,6 +41,13 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
 type CuResult = i32;
 const CUDA_SUCCESS: CuResult = 0;
+
+/// `CUVIDPARSERPARAMS::ulErrorThreshold`. NVIDIA defines 0 as strict
+/// validation (report every parser error) and 100 as ignoring every
+/// non-compliance check. Our own encoders emit conforming Annex-B, so strict
+/// parsing is both operable and the right failure boundary: a damaged AU must
+/// reach the bridge's re-key path, never become a plausibly-painted picture.
+const PARSER_ERROR_THRESHOLD: u32 = 0;
 
 type CuContext = *mut c_void;
 type CuVideoParser = *mut c_void;
@@ -138,6 +147,117 @@ struct ParserDispInfo {
     timestamp: i64,
 }
 const _: () = assert!(std::mem::size_of::<ParserDispInfo>() == 24);
+
+// `cuvidDecodeStatus` values from NVIDIA's `cuviddec.h`. Keep the driver value
+// as a u32 rather than a Rust enum: a future driver returning a new reserved
+// value must be rejected safely instead of creating an invalid enum value.
+const CUVID_DECODE_STATUS_INVALID: u32 = 0;
+const CUVID_DECODE_STATUS_IN_PROGRESS: u32 = 1;
+const CUVID_DECODE_STATUS_SUCCESS: u32 = 2;
+const CUVID_DECODE_STATUS_ERROR: u32 = 8;
+const CUVID_DECODE_STATUS_ERROR_CONCEALED: u32 = 9;
+
+/// `CUVIDGETDECODESTATUS` from NVIDIA's `cuviddec.h`.
+#[repr(C)]
+struct DecodeStatus {
+    decode_status: u32,
+    reserved: [u32; 31],
+    reserved_ptrs: [*mut c_void; 8],
+}
+const _: () = assert!(std::mem::size_of::<DecodeStatus>() == 192);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PictureHealth {
+    Clean,
+    Invalid,
+    InProgress,
+    Corrupt,
+    CorruptConcealed,
+    Unknown(u32),
+}
+
+fn picture_health(status: u32) -> PictureHealth {
+    match status {
+        CUVID_DECODE_STATUS_SUCCESS => PictureHealth::Clean,
+        CUVID_DECODE_STATUS_INVALID => PictureHealth::Invalid,
+        CUVID_DECODE_STATUS_IN_PROGRESS => PictureHealth::InProgress,
+        CUVID_DECODE_STATUS_ERROR => PictureHealth::Corrupt,
+        CUVID_DECODE_STATUS_ERROR_CONCEALED => PictureHealth::CorruptConcealed,
+        other => PictureHealth::Unknown(other),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NvdecStatusCounters {
+    pub queries: u64,
+    pub clean: u64,
+    pub concealed: u64,
+    pub corrupt: u64,
+    pub unsettled: u64,
+    pub api_errors: u64,
+}
+
+static STATUS_QUERIES: AtomicU64 = AtomicU64::new(0);
+static STATUS_CLEAN: AtomicU64 = AtomicU64::new(0);
+static STATUS_CONCEALED: AtomicU64 = AtomicU64::new(0);
+static STATUS_CORRUPT: AtomicU64 = AtomicU64::new(0);
+static STATUS_UNSETTLED: AtomicU64 = AtomicU64::new(0);
+static STATUS_API_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide receive diagnostics. These are only rendered by the existing
+/// opt-in/debug decoder stats line; normal logs remain quiet.
+pub(crate) fn status_counters() -> NvdecStatusCounters {
+    NvdecStatusCounters {
+        queries: STATUS_QUERIES.load(Ordering::Relaxed),
+        clean: STATUS_CLEAN.load(Ordering::Relaxed),
+        concealed: STATUS_CONCEALED.load(Ordering::Relaxed),
+        corrupt: STATUS_CORRUPT.load(Ordering::Relaxed),
+        unsettled: STATUS_UNSETTLED.load(Ordering::Relaxed),
+        api_errors: STATUS_API_ERRORS.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NvdecErrorKind {
+    Backend,
+    BitstreamCorrupt,
+}
+
+/// A typed error keeps known bitstream corruption distinct from a hardware
+/// backend failure. The receive ladder must re-key on corruption without
+/// retrying the same known-bad AU through another decoder and painting its
+/// concealment.
+#[derive(Debug)]
+pub(crate) struct NvdecError {
+    kind: NvdecErrorKind,
+    message: String,
+}
+
+impl NvdecError {
+    fn backend(message: impl Into<String>) -> Self {
+        Self {
+            kind: NvdecErrorKind::Backend,
+            message: message.into(),
+        }
+    }
+
+    fn corrupt(message: impl Into<String>) -> Self {
+        Self {
+            kind: NvdecErrorKind::BitstreamCorrupt,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn is_bitstream_corrupt(&self) -> bool {
+        self.kind == NvdecErrorKind::BitstreamCorrupt
+    }
+}
+
+impl fmt::Display for NvdecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// The readable prefix of the otherwise-opaque `CUVIDPICPARAMS`.
 #[repr(C)]
@@ -281,6 +401,8 @@ struct Cuvid {
         unsafe extern "system" fn(*mut CuVideoDecoder, *mut DecodeCreateInfo) -> CuResult,
     destroy_decoder: unsafe extern "system" fn(CuVideoDecoder) -> CuResult,
     decode_picture: unsafe extern "system" fn(CuVideoDecoder, *mut c_void) -> CuResult,
+    get_decode_status:
+        unsafe extern "system" fn(CuVideoDecoder, i32, *mut DecodeStatus) -> CuResult,
     map_video_frame: unsafe extern "system" fn(
         CuVideoDecoder,
         i32,
@@ -322,6 +444,10 @@ fn tables() -> Result<&'static Tables, String> {
             create_decoder: load_fn!(cuvid_dll, "cuvidCreateDecoder", _),
             destroy_decoder: load_fn!(cuvid_dll, "cuvidDestroyDecoder", _),
             decode_picture: load_fn!(cuvid_dll, "cuvidDecodePicture", _),
+            // Required for the NVDEC rung: if an old driver lacks the API,
+            // table loading fails softly and the existing decoder ladder uses
+            // OpenH264/D3D11VA instead of painting unverifiable hardware output.
+            get_decode_status: load_fn!(cuvid_dll, "cuvidGetDecodeStatus", _),
             map_video_frame: load_fn!(cuvid_dll, "cuvidMapVideoFrame64", _),
             unmap_video_frame: load_fn!(cuvid_dll, "cuvidUnmapVideoFrame64", _),
         };
@@ -665,7 +791,7 @@ impl NvdecHevc {
             params.codec_type = codec.id();
             params.max_num_decode_surfaces = 20; // sequence callback overrides
             params.clock_rate = 1_000_000; // timestamps in µs
-            params.error_threshold = 100;
+            params.error_threshold = PARSER_ERROR_THRESHOLD;
             params.max_display_delay = 0; // low latency: display == decode order for IPP
             params.user_data = &mut *state as *mut State as *mut c_void;
             params.pfn_sequence_callback = Some(on_sequence);
@@ -704,18 +830,27 @@ impl NvdecHevc {
     /// call). An `Err` means the session is wedged — drop it and re-enter
     /// at the sender's next IDR, exactly the openh264 recovery shape.
     pub fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<NvFrame>, String> {
+        self.decode_typed(au, ts_us).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn decode_typed(
+        &mut self,
+        au: &[u8],
+        ts_us: u64,
+    ) -> Result<Vec<NvFrame>, NvdecError> {
         if au.is_empty() {
             return Ok(Vec::new());
         }
-        let payload_size = u32::try_from(au.len())
-            .map_err(|_| format!("NVDEC input too large ({} bytes)", au.len()))?;
+        let payload_size = u32::try_from(au.len()).map_err(|_| {
+            NvdecError::backend(format!("NVDEC input too large ({} bytes)", au.len()))
+        })?;
         unsafe {
             if self.parser.is_null() {
-                return Err("NVDEC parser is not available".into());
+                return Err(NvdecError::backend("NVDEC parser is not available"));
             }
             let status = (self.tables.cuda.ctx_set_current)(self.ctx);
             if status != CUDA_SUCCESS {
-                return Err(format!("cuCtxSetCurrent: {status}"));
+                return Err(NvdecError::backend(format!("cuCtxSetCurrent: {status}")));
             }
             self.state.ready.clear();
             let mut packet = SourceDataPacket {
@@ -726,10 +861,14 @@ impl NvdecHevc {
             };
             let status = (self.tables.cuvid.parse_video_data)(self.parser, &mut packet);
             if let Some(e) = self.state.error.take() {
-                return Err(e);
+                return Err(NvdecError::backend(e));
             }
             if status != CUDA_SUCCESS {
-                return Err(format!("cuvidParseVideoData: {status}"));
+                // With a strict parser threshold, rejection is the expected
+                // signal for a syntactically damaged/truncated access unit.
+                return Err(NvdecError::corrupt(format!(
+                    "cuvidParseVideoData rejected a damaged AU: {status}"
+                )));
             }
             let mut out = Vec::with_capacity(self.state.ready.len());
             let ready = std::mem::take(&mut self.state.ready);
@@ -742,16 +881,18 @@ impl NvdecHevc {
 
     /// Map one decoded surface and copy its NV12 down to host memory
     /// (tight `w`-byte rows).
-    unsafe fn map_out(&mut self, pic_idx: i32, ts: i64) -> Result<NvFrame, String> {
+    unsafe fn map_out(&mut self, pic_idx: i32, ts: i64) -> Result<NvFrame, NvdecError> {
         let (w, h) = (self.state.display_width, self.state.display_height);
         if self.state.decoder.is_null() || w < 2 || h < 2 || w % 2 != 0 || h % 2 != 0 {
-            return Err(format!("NVDEC output state is invalid ({w}x{h})"));
+            return Err(NvdecError::backend(format!(
+                "NVDEC output state is invalid ({w}x{h})"
+            )));
         }
         let need = (w as usize)
             .checked_mul(h as usize)
             .and_then(|pixels| pixels.checked_mul(3))
             .map(|bytes| bytes / 2)
-            .ok_or("NVDEC output size overflow")?;
+            .ok_or_else(|| NvdecError::backend("NVDEC output size overflow"))?;
         // The mapped surface is target-sized (display-sized — see the
         // create info): its chroma plane starts after `target_height`
         // luma rows.
@@ -767,13 +908,71 @@ impl NvdecHevc {
             &mut proc_params,
         );
         if status != CUDA_SUCCESS {
-            return Err(format!("cuvidMapVideoFrame64: {status}"));
+            return Err(NvdecError::backend(format!(
+                "cuvidMapVideoFrame64: {status}"
+            )));
         }
         if dptr == 0 || pitch < w {
             let _ = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
-            return Err(format!(
+            return Err(NvdecError::backend(format!(
                 "cuvidMapVideoFrame64 returned invalid surface (ptr {dptr:#x}, pitch {pitch}, width {w})"
-            ));
+            )));
+        }
+
+        // `cuvidMapVideoFrame` synchronizes this output picture. Query its
+        // hardware decode result before allocating/copying bytes: NVIDIA can
+        // return a superficially complete surface whose damaged regions were
+        // concealed from stale references. Such a surface is never paintable.
+        let mut decode_status: DecodeStatus = std::mem::zeroed();
+        STATUS_QUERIES.fetch_add(1, Ordering::Relaxed);
+        let query =
+            (self.tables.cuvid.get_decode_status)(self.state.decoder, pic_idx, &mut decode_status);
+        if query != CUDA_SUCCESS {
+            STATUS_API_ERRORS.fetch_add(1, Ordering::Relaxed);
+            let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+            return Err(NvdecError::backend(format!(
+                "cuvidGetDecodeStatus (picture {pic_idx}): {query} (unmap {unmap})"
+            )));
+        }
+        match picture_health(decode_status.decode_status) {
+            PictureHealth::Clean => {
+                STATUS_CLEAN.fetch_add(1, Ordering::Relaxed);
+            }
+            PictureHealth::CorruptConcealed => {
+                STATUS_CONCEALED.fetch_add(1, Ordering::Relaxed);
+                let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+                return Err(NvdecError::corrupt(format!(
+                    "NVDEC picture {pic_idx} was corrupted and concealed; refusing to paint (unmap {unmap})"
+                )));
+            }
+            PictureHealth::Corrupt => {
+                STATUS_CORRUPT.fetch_add(1, Ordering::Relaxed);
+                let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+                return Err(NvdecError::corrupt(format!(
+                    "NVDEC picture {pic_idx} was corrupted and could not be concealed; refusing to paint (unmap {unmap})"
+                )));
+            }
+            PictureHealth::Invalid => {
+                STATUS_UNSETTLED.fetch_add(1, Ordering::Relaxed);
+                let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+                return Err(NvdecError::backend(format!(
+                    "NVDEC picture {pic_idx} returned invalid decode status; refusing to paint (unmap {unmap})"
+                )));
+            }
+            PictureHealth::InProgress => {
+                STATUS_UNSETTLED.fetch_add(1, Ordering::Relaxed);
+                let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+                return Err(NvdecError::backend(format!(
+                    "NVDEC picture {pic_idx} was still in progress after mapping; refusing to paint (unmap {unmap})"
+                )));
+            }
+            PictureHealth::Unknown(raw) => {
+                STATUS_UNSETTLED.fetch_add(1, Ordering::Relaxed);
+                let unmap = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
+                return Err(NvdecError::backend(format!(
+                    "NVDEC picture {pic_idx} returned unknown decode status {raw}; refusing to paint (unmap {unmap})"
+                )));
+            }
         }
         let mut nv12 = vec![0u8; need];
         // DMA into the page-locked staging when we have it (full-rate
@@ -815,10 +1014,12 @@ impl NvdecHevc {
         );
         let status = (self.tables.cuvid.unmap_video_frame)(self.state.decoder, dptr);
         if luma != CUDA_SUCCESS || chroma != CUDA_SUCCESS {
-            return Err(format!("cuMemcpy2D: {luma}/{chroma}"));
+            return Err(NvdecError::backend(format!("cuMemcpy2D: {luma}/{chroma}")));
         }
         if status != CUDA_SUCCESS {
-            return Err(format!("cuvidUnmapVideoFrame64: {status}"));
+            return Err(NvdecError::backend(format!(
+                "cuvidUnmapVideoFrame64: {status}"
+            )));
         }
         if staged {
             unsafe {
@@ -869,7 +1070,15 @@ impl NvdecH264 {
     }
 
     pub fn decode(&mut self, au: &[u8], ts_us: u64) -> Result<Vec<NvFrame>, String> {
-        self.0.decode(au, ts_us)
+        self.decode_typed(au, ts_us).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn decode_typed(
+        &mut self,
+        au: &[u8],
+        ts_us: u64,
+    ) -> Result<Vec<NvFrame>, NvdecError> {
+        self.0.decode_typed(au, ts_us)
     }
 }
 
@@ -1140,6 +1349,22 @@ unsafe fn band_avx2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvdec_status_policy_only_admits_completed_clean_pictures() {
+        assert_eq!(picture_health(0), PictureHealth::Invalid);
+        assert_eq!(picture_health(1), PictureHealth::InProgress);
+        assert_eq!(picture_health(2), PictureHealth::Clean);
+        assert_eq!(picture_health(8), PictureHealth::Corrupt);
+        assert_eq!(picture_health(9), PictureHealth::CorruptConcealed);
+        assert_eq!(picture_health(7), PictureHealth::Unknown(7));
+        assert_eq!(picture_health(10), PictureHealth::Unknown(10));
+    }
+
+    #[test]
+    fn nvdec_parser_rejects_any_noncompliance() {
+        assert_eq!(PARSER_ERROR_THRESHOLD, 0);
+    }
 
     /// The SIMD lane's whole contract: byte-identical output to the
     /// scalar reference on every size class — vector-width multiples,

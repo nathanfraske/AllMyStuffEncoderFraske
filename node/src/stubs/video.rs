@@ -41,7 +41,18 @@ pub enum VideoPacket {
         key: bool,
         /// Capture-tick pacing for the RTP clock (1/fps).
         duration_us: u64,
+        /// Process-local development-profiler correlation; never serialized.
+        profile_id: u64,
     },
+}
+
+impl VideoPacket {
+    pub(crate) fn profile_id(&self) -> u64 {
+        match self {
+            Self::Jpeg(_) => 0,
+            Self::H264 { profile_id, .. } => *profile_id,
+        }
+    }
 }
 
 /// Whether per-stream dial-in stats log at info — mirrored so shared call
@@ -77,12 +88,15 @@ pub struct Tune {
     pub link: LinkClass,
     pub game: bool,
     pub mode: Option<Posture>,
+    pub policy_cap_bps: Option<u32>,
+    pub policy_auto_resolution: bool,
 }
 
 /// Mirror of the real module's posture dial (capture-less builds carry
 /// the type so `mesh.rs` compiles identically).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Posture {
+    Reach,
     #[default]
     Balanced,
     Game,
@@ -93,6 +107,7 @@ pub enum Posture {
 /// Mirror of the real module's wire-name parse.
 pub fn parse_posture(s: &str) -> Option<Posture> {
     match s {
+        "reach" => Some(Posture::Reach),
         "game" => Some(Posture::Game),
         "studio" => Some(Posture::Studio),
         "studio-lossless" => Some(Posture::StudioLossless),
@@ -194,6 +209,8 @@ pub struct RecvFeedback {
     pub recv_fps: u32,
     pub decode_fails: u32,
     pub queue_depth: u32,
+    pub native_viewer_drained: u32,
+    pub native_viewer_superseded: u32,
     /// Wire-parity with the real bridge: the viewer's link estimate and
     /// delay trend still arrive; recorded, never acted on (no encoder).
     pub est_kbps: u32,
@@ -211,11 +228,34 @@ pub struct PipelineFeedback {
     pub est_kbps: u32,
     #[serde(default)]
     pub delay_trend_us_per_s: i32,
+    #[serde(default)]
+    pub native_viewer_drained: u32,
+    #[serde(default)]
+    pub native_viewer_superseded: u32,
+    #[serde(default)]
+    pub audio_arrival_jitter_us: u64,
+    #[serde(default)]
+    pub audio_target_ms: u32,
+    #[serde(default)]
+    pub audio_buffered_ms: u32,
+    #[serde(default)]
+    pub audio_underruns: u64,
+    #[serde(default)]
+    pub audio_underrun_frames: u64,
 }
 
 impl PipelineFeedback {
     pub fn to_ext(&self) -> serde_json::Value {
-        if self.est_kbps == 0 && self.delay_trend_us_per_s == 0 {
+        if self.est_kbps == 0
+            && self.delay_trend_us_per_s == 0
+            && self.native_viewer_drained == 0
+            && self.native_viewer_superseded == 0
+            && self.audio_arrival_jitter_us == 0
+            && self.audio_target_ms == 0
+            && self.audio_buffered_ms == 0
+            && self.audio_underruns == 0
+            && self.audio_underrun_frames == 0
+        {
             return serde_json::Value::Null;
         }
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
@@ -240,6 +280,16 @@ pub struct RouteDials {
     pub edge_cap: u32,
     pub out_w: u32,
     pub out_h: u32,
+    pub peer_budget_bps: u64,
+    pub route_budget_bps: u64,
+    pub route_ceiling_bps: u64,
+    pub priority: bool,
+    pub audio_packet_ms: u16,
+    pub audio_jitter_ms: u16,
+    pub audio_fec: bool,
+    pub video_queue_depth: u8,
+    pub audio_queue_depth: u8,
+    pub degradation_reasons: Vec<String>,
 }
 
 /// Handle the mesh holds either way; capture starts fail loudly, everything
@@ -296,8 +346,21 @@ impl VideoBridge {
         false
     }
 
+    /// Capture-less mirror of the real bridge's combined link and allocator
+    /// policy generation.
+    pub fn retune_link_policy(
+        &self,
+        _route_id: &str,
+        _link: LinkClass,
+        _policy_cap_bps: Option<u32>,
+        _policy_auto_resolution: bool,
+    ) -> bool {
+        false
+    }
+
     /// A viewer's Tune against a stream this build can't produce — accepted
     /// and ignored, matching the real bridge's signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn retune_dials(
         &self,
         _route_id: &str,
@@ -306,6 +369,16 @@ impl VideoBridge {
         _fps: Option<u32>,
         _game: bool,
         _mode: Option<&str>,
+        _policy_cap_bps: Option<u32>,
+        _policy_auto_resolution: bool,
+    ) {
+    }
+
+    pub fn apply_policy_cap(
+        &self,
+        _route_id: &str,
+        _policy_cap_bps: Option<u32>,
+        _policy_auto_resolution: bool,
     ) {
     }
 
@@ -334,8 +407,7 @@ impl VideoBridge {
         recv_fps: u32,
         decode_fails: u32,
         queue_depth: u32,
-        est_kbps: u32,
-        delay_trend_us_per_s: i32,
+        pipeline: PipelineFeedback,
     ) {
         self.feedback.lock().insert(
             route_id.to_string(),
@@ -343,8 +415,10 @@ impl VideoBridge {
                 recv_fps,
                 decode_fails,
                 queue_depth,
-                est_kbps,
-                delay_trend_us_per_s,
+                native_viewer_drained: pipeline.native_viewer_drained,
+                native_viewer_superseded: pipeline.native_viewer_superseded,
+                est_kbps: pipeline.est_kbps,
+                delay_trend_us_per_s: pipeline.delay_trend_us_per_s,
                 at: Instant::now(),
             },
         );

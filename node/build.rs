@@ -8,9 +8,10 @@
 //!    dev-staged sidecar name (`myownmesh-<triple>`).
 //!  * **`MYOWNMESH_PIN`** — the daemon version the app is built against,
 //!    read from the repo-root `.myownmesh-rev`. The runtime compares the
-//!    daemon it finds against this and asks it to self-update when it's
-//!    behind. (The GUI's own `build.rs` reads the same file to *bundle* the
-//!    sidecar; this is the *runtime* half.)
+//!    daemon it finds against this and reports a mismatch. Runtime mutation
+//!    is disabled unless an operator explicitly opts in. (The GUI's own
+//!    `build.rs` reads the same file to *bundle* the sidecar; this is the
+//!    *runtime* half.)
 //!
 //! Both are best-effort: a missing pin just means no version gate, exactly
 //! as `option_env!` already handles.

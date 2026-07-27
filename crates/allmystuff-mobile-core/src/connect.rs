@@ -69,6 +69,10 @@ pub fn offer_route(
     let route = catalog.propose_route(from, to)?;
     Ok(ControlMessage::Route(RouteControl::Offer {
         route,
+        // This stateless helper has no live Session lifetime to copy. Never
+        // invent one: the embedded Mesh engine mints incarnations when it owns
+        // the route lifecycle.
+        incarnation: None,
         video,
         audio,
         session: None,
@@ -155,6 +159,7 @@ pub fn offer_terminal(
     let to = format!("{}:term-view:{nonce}", me.as_str());
     ControlMessage::Route(RouteControl::Offer {
         route: generic_route(from, to),
+        incarnation: None,
         video: Vec::new(),
         audio: Vec::new(),
         session: attach,
@@ -168,6 +173,7 @@ pub fn offer_files(host: &NodeId, me: &NodeId, nonce: &str) -> ControlMessage {
     let to = format!("{}:files-view:{nonce}", me.as_str());
     ControlMessage::Route(RouteControl::Offer {
         route: generic_route(from, to),
+        incarnation: None,
         video: Vec::new(),
         audio: Vec::new(),
         session: None,
@@ -179,6 +185,7 @@ pub fn offer_files(host: &NodeId, me: &NodeId, nonce: &str) -> ControlMessage {
 pub fn teardown(route_id: impl Into<String>) -> ControlMessage {
     ControlMessage::Route(RouteControl::Teardown {
         route_id: route_id.into(),
+        incarnation: None,
     })
 }
 
@@ -297,6 +304,10 @@ mod tests {
         assert_eq!(j["route"]["media"], "display");
         assert_eq!(j["route"]["id"], "route:desk:screen→phone:display-in");
         assert_eq!(j["video"][0], "h264");
+        assert!(
+            j.get("incarnation").is_none(),
+            "a stateless catalog offer must not invent a route lifetime"
+        );
         // A display offer carries no audio codec list.
         assert!(j["audio"].as_array().map(|a| a.is_empty()).unwrap_or(true));
     }
@@ -385,6 +396,7 @@ mod tests {
         );
         // A fresh shell omits the session key entirely (skip_serializing_if).
         assert!(j.get("session").is_none() || j["session"].is_null());
+        assert!(j.get("incarnation").is_none());
     }
 
     #[test]
@@ -408,6 +420,7 @@ mod tests {
         assert_eq!(j["route"]["from"], "desk:files");
         assert_eq!(j["route"]["to"], "phone:files-view:br-1");
         assert_eq!(j["route"]["media"], "generic");
+        assert!(j.get("incarnation").is_none());
     }
 
     #[test]
@@ -415,5 +428,9 @@ mod tests {
         let j = offer(&teardown("route:desk:terminal→phone:term-view:tab-1"));
         assert_eq!(j["kind"], "teardown");
         assert_eq!(j["route_id"], "route:desk:terminal→phone:term-view:tab-1");
+        assert!(
+            j.get("incarnation").is_none(),
+            "route-id-only teardown must fail closed without a fabricated lifetime"
+        );
     }
 }

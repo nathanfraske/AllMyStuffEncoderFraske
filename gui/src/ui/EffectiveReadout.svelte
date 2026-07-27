@@ -67,10 +67,11 @@
 
   const RES: Record<number, string> = { 3840: "4K", 2560: "1440p", 1920: "1080p", 1280: "720p" };
   const POSTURE: Record<string, string> = {
+    reach: "Reach",
     balanced: "Balanced",
     game: "Game",
     studio: "Studio",
-    "studio-lossless": "Studio · LL",
+    "studio-lossless": "Studio · Lossless",
   };
 
   const reqRes = $derived(
@@ -80,9 +81,12 @@
   const reqRate = $derived(
     requested.bitrate == null ? "Auto" : `${Math.round(requested.bitrate / 1e6)} Mbps`,
   );
+  const reqPeerCap = $derived(
+    requested.peerCapBps == null ? "Auto" : `${Math.round(requested.peerCapBps / 1e6)} Mbps`,
+  );
   const reqPosture = $derived(
     requested.mode === "studio-lossless"
-      ? "Studio · LL"
+      ? "Studio · Lossless"
       : requested.mode
         ? POSTURE[requested.mode]
         : requested.game
@@ -91,9 +95,17 @@
   );
 
   const fmtMbps = (m: number) => (m >= 100 ? m.toFixed(0) : m >= 10 ? m.toFixed(1) : m.toFixed(2));
+  const fmtBps = (bps: number) => `${fmtMbps(bps / 1e6)} Mbps`;
   // The effective posture the encoder resolved to (dials) — differs from the
   // ask when an env override or the LAN gate stepped in.
   const effPosture = $derived(dials ? (POSTURE[dials.posture] ?? dials.posture) : null);
+  const routeCeiling = $derived(dials?.routeCeilingBps ?? dials?.ceilingBps ?? 0);
+  const hasAudioPlan = $derived(
+    dials?.audioPacketMs != null || dials?.audioJitterMs != null || dials?.audioFec != null,
+  );
+  const hasQueuePlan = $derived(
+    dials?.videoQueueDepth != null || dials?.audioQueueDepth != null,
+  );
 </script>
 
 <div class="eff">
@@ -119,16 +131,34 @@
   </div>
 
   <div class="eff-row">
-    <span class="k">Bitrate</span>
+    <span class="k">Route cap</span>
     <span class="req">{reqRate}</span>
     <span class="eff-val">
       {mbps ? `${fmtMbps(mbps)} Mbps` : "—"}<span class="sub">received</span>
+      {#if dials?.routeBudgetBps}
+        <span class="sub strong">allocation {fmtBps(dials.routeBudgetBps)}</span>
+      {/if}
       {#if dials && dials.targetBitrateBps}
         <span class="sub strong"
-          >target {fmtMbps(dials.targetBitrateBps / 1e6)}{#if dials.ceilingBps} · ceiling {fmtMbps(
-              dials.ceilingBps / 1e6,
+          >target {fmtBps(dials.targetBitrateBps)}{#if routeCeiling} · ceiling {fmtBps(
+              routeCeiling,
             )}{/if}</span
         >
+      {/if}
+    </span>
+  </div>
+
+  <div class="eff-row">
+    <span class="k">All media</span>
+    <span class="req">{reqPeerCap}</span>
+    <span class="eff-val">
+      {#if dials?.peerBudgetBps}
+        {fmtBps(dials.peerBudgetBps)}<span class="sub">peer-wide budget</span>
+        {#if dials.peerCapBps && dials.peerCapBps !== dials.peerBudgetBps}
+          <span class="sub">requested cap {fmtBps(dials.peerCapBps)}</span>
+        {/if}
+      {:else}
+        —
       {/if}
     </span>
   </div>
@@ -142,7 +172,21 @@
   <div class="eff-row">
     <span class="k">Mode</span>
     <span class="req">{reqPosture}</span>
-    <span class="eff-val">{effPosture ?? reqPosture}</span>
+    <span class="eff-val">{effPosture ?? "Not reported"}</span>
+  </div>
+
+  <div class="eff-row">
+    <span class="k">Display</span>
+    <span class="req">Auto</span>
+    <span class="eff-val">
+      {#if dials?.priority === true}
+        Priority monitor
+      {:else if dials?.priority === false}
+        Background monitor
+      {:else}
+        —
+      {/if}
+    </span>
   </div>
 
   <div class="eff-row">
@@ -150,6 +194,42 @@
     <span class="req">—</span>
     <span class="eff-val">{dials?.encoderLabel || "—"}</span>
   </div>
+
+  {#if hasAudioPlan}
+    <div class="eff-row">
+      <span class="k">Audio</span>
+      <span class="req">By mode</span>
+      <span class="eff-val">
+        Realtime Opus{#if dials?.audioPacketMs != null} · {dials.audioPacketMs} ms{/if}
+        <span class="sub">
+          {dials?.audioFec == null ? "FEC not reported" : dials.audioFec ? "FEC on" : "FEC off"}
+          {#if dials?.audioJitterMs != null} · jitter {dials.audioJitterMs} ms{/if}
+        </span>
+      </span>
+    </div>
+  {/if}
+
+  {#if hasQueuePlan}
+    <div class="eff-row">
+      <span class="k">Queues</span>
+      <span class="req">Shallow</span>
+      <span class="eff-val">
+        {#if dials?.videoQueueDepth != null}video {dials.videoQueueDepth} frame{dials.videoQueueDepth === 1 ? "" : "s"}{/if}
+        {#if dials?.audioQueueDepth != null}
+          <span class="sub">audio {dials.audioQueueDepth} packet{dials.audioQueueDepth === 1 ? "" : "s"}</span>
+        {/if}
+      </span>
+    </div>
+  {/if}
+
+  {#if dials?.degradationReasons?.length}
+    <div class="degradations">
+      <span class="degrade-title">Effective fallback</span>
+      {#each dials.degradationReasons as reason}
+        <span>• {reason}</span>
+      {/each}
+    </div>
+  {/if}
 
   {#if !dials}
     <div class="eff-note">
@@ -226,5 +306,24 @@
     line-height: 1.35;
     color: #7d769c;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .degradations {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin-top: 0.25rem;
+    padding: 0.4rem 0.35rem;
+    border: 1px solid rgba(240, 198, 116, 0.25);
+    border-radius: 6px;
+    color: #c8c2e0;
+    font-size: 0.68rem;
+    line-height: 1.35;
+  }
+  .degrade-title {
+    color: #f0c674;
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
   }
 </style>

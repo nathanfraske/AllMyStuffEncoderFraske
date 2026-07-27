@@ -176,6 +176,23 @@ pub const FEATURE_CAMERA: &str = "camera";
 /// falls back to MJPEG, exactly as before the pool.
 pub const FEATURE_MEDIA_LANES: &str = "media-lanes";
 
+/// Feature tag a node advertises when it attaches an ordered incarnation to
+/// every route-lifecycle message. Route ids describe stable endpoints and are
+/// intentionally deterministic. The value is `<presence boot>:<sequence>`, so
+/// the receiver can reject a delayed predecessor without retaining an
+/// unbounded tombstone history.
+pub const FEATURE_ROUTE_INCARNATION: &str = "route-incarnation-v1";
+
+/// Feature tag for application-level teardown acknowledgement. This is
+/// separate from route incarnation because builds can understand lifetime
+/// fences without implementing [`RouteControl::TeardownAck`].
+pub const FEATURE_ROUTE_TEARDOWN_ACK: &str = "route-teardown-ack-v1";
+
+/// Peer tags MJPEG chunks with the exact route incarnation. Receivers that
+/// see this feature can reject delayed predecessor chunks before sequence
+/// numbers restart on a same-id successor.
+pub const FEATURE_MEDIA_INCARNATION: &str = "media-incarnation-v1";
+
 /// Feature tag a node advertises in [`NodeProfile::features`] when it is a
 /// **KVM appliance** (a NanoKVM-class device): it captures a target machine's
 /// HDMI and injects USB-HID into it, and it carries its own web UI as a
@@ -810,6 +827,11 @@ pub enum RouteControl {
     /// catalog before accepting.
     Offer {
         route: Route,
+        /// Ordered lifetime of this offer (`<presence boot>:<sequence>`).
+        /// Present only when both peers advertise
+        /// [`FEATURE_ROUTE_INCARNATION`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
         /// Video transports the *offerer* can consume for a display
         /// route, best first (today: `"h264"` — the mesh's RTP track
         /// lane). The accepting side — the machine whose screen will
@@ -847,20 +869,47 @@ pub enum RouteControl {
     /// non-terminal accept, or from an older host (`default` → `None`).
     Accept {
         route_id: String,
+        /// Exact lifetime copied from the matching [`Self::Offer`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
     },
     /// "No" — with a human reason ("not authorized", "device busy").
-    Reject { route_id: String, reason: String },
+    Reject {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+        reason: String,
+    },
     /// "Stop" — either side can tear a live route down.
-    Teardown { route_id: String },
+    Teardown {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+    },
+    /// Application-level confirmation that the exact teardown has been
+    /// consumed. The mesh daemon's reliable-send acknowledgement only proves
+    /// transport delivery; it can arrive while the peer app has no control
+    /// subscriber. A capable sender therefore retries `Teardown` until this
+    /// response arrives or the peer advertises a new boot, preventing a lost
+    /// close from leaving capture or input authorization alive indefinitely.
+    TeardownAck {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+    },
     /// "Give me a clean decode entry *now*" — the viewer's decoder lost
     /// its place (a decode error, a rebuilt decoder) and shouldn't sit
     /// out the rest of the periodic IDR interval. The streaming side
     /// forces an IDR on its next capture. Unknown to v0.2.x peers (the
     /// whole message fails their decode and is dropped): recovery then
     /// simply waits for the periodic IDR, as before.
-    Refresh { route_id: String },
+    Refresh {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+    },
     /// "Stream with these settings" — the viewer's quality picks for a
     /// display route it consumes; the streaming side restarts its
     /// capture with the overrides. `None` everywhere = automatic (the
@@ -868,6 +917,8 @@ pub enum RouteControl {
     /// leaving their stream on automatic.
     Tune {
         route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
         /// Longest output edge in pixels (e.g. 1920); `None` = native.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_edge: Option<u32>,
@@ -908,6 +959,8 @@ pub enum RouteControl {
     /// streamer simply never adapts — exactly today's behaviour.
     VideoFeedback {
         route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
         /// Frames the viewer actually rendered per second over the window —
         /// compare to the stream's target to spot a struggling link.
         #[serde(default)]
@@ -947,7 +1000,12 @@ pub enum RouteControl {
     /// lifetime, so this is sent once when the stream starts. Unknown to older
     /// peers (decodes as [`RouteControl::Unknown`] and dropped): they fall back
     /// to the positional lane, exactly as before.
-    VideoLane { route_id: String, lane: u8 },
+    VideoLane {
+        route_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+        lane: u8,
+    },
     /// "Your media keeps arriving on my track lane N but no route here maps
     /// to it" — receiver → sender, the lane-shaped twin of a
     /// [`Reject`](RouteControl::Reject). It exists for the one failure a
@@ -962,6 +1020,19 @@ pub enum RouteControl {
     /// older peers (decodes as [`RouteControl::Unknown`] and dropped) — an
     /// old sender keeps streaming exactly as today.
     DeadLane { media: String, lane: u8 },
+    /// "I received media for this route id, but no matching live route exists
+    /// here." A fenced sender answers with an exact-incarnation `Accept`
+    /// challenge. An empty or terminal receiver then returns an exact Reject
+    /// or Teardown, so the orphan stops without trusting a route-id-only NACK.
+    /// This also gives MJPEG, which has no RTP lane, the same convergence path.
+    MissingRoute {
+        route_id: String,
+        /// Exact route lifetime when the sender knows it. Older peers omit
+        /// this field; a fenced receiver never uses an omitted value to move a
+        /// route between data-plane networks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
+    },
     /// "List your open terminal sessions" — a viewer asking a host (its
     /// owner/fleet, enforced host-side exactly like a terminal offer) which
     /// shells it already has running, so the picker can offer to *attach* to
@@ -1494,6 +1565,7 @@ mod tests {
         let offered = match rc {
             RouteControl::Offer { route, .. } => RouteControl::Offer {
                 route,
+                incarnation: None,
                 video: vec!["h264".into()],
                 audio: Vec::new(),
                 session: None,
@@ -1522,6 +1594,7 @@ mod tests {
         let offered = match rc {
             RouteControl::Offer { route, .. } => RouteControl::Offer {
                 route,
+                incarnation: None,
                 video: Vec::new(),
                 audio: vec!["opus".into()],
                 session: None,
@@ -1554,6 +1627,7 @@ mod tests {
         let attach = match rc {
             RouteControl::Offer { route, .. } => RouteControl::Offer {
                 route,
+                incarnation: None,
                 video: Vec::new(),
                 audio: Vec::new(),
                 session: Some("term-3".into()),
@@ -1579,10 +1653,12 @@ mod tests {
         // The terminal host echoes the resolved session id on accept.
         let accept = RouteControl::Accept {
             route_id: "r1".into(),
+            incarnation: Some("boot-a:7".into()),
             session: Some("term-7".into()),
         };
         let s = serde_json::to_string(&accept).unwrap();
         assert!(s.contains("\"session\":\"term-7\""));
+        assert!(s.contains("\"incarnation\":\"boot-a:7\""));
         let back: RouteControl = serde_json::from_str(&s).unwrap();
         assert_eq!(accept, back);
     }
@@ -1878,6 +1954,7 @@ mod tests {
     fn control_message_tags_are_stable() {
         let m = ControlMessage::Route(RouteControl::Reject {
             route_id: "r1".into(),
+            incarnation: None,
             reason: "not authorized".into(),
         });
         let j = serde_json::to_value(&m).unwrap();

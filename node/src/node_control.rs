@@ -26,6 +26,7 @@
 //! [`ControlClient::subscribe_events`]: crate::control_client::ControlClient::subscribe_events
 //! [`Mesh`]: crate::mesh::Mesh
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -48,8 +49,8 @@ use allmystuff_graph::{Grant, NodeId, Person, PersonId};
 use allmystuff_protocol::LOCAL_CLAIM_NETWORK_ID;
 use allmystuff_session::{FileEvent, InputAction, TermEvent};
 
-use crate::control_client::{ControlClient, Request};
-use crate::mesh::Mesh;
+use crate::control_client::{ControlClient, Request, LOCAL_REQUEST_TIMEOUT};
+use crate::mesh::{Mesh, VideoPollBatch};
 use crate::networks_store::DisabledNetworks;
 use crate::video_decode::DecoderPreference;
 use crate::UiSink;
@@ -71,11 +72,28 @@ pub const TAG_EVENT: u8 = 2;
 /// connection just before the node re-execs.
 pub const TAG_RESTART: u8 = 3;
 
+/// Stable local error code returned when a video poll no longer owns the
+/// route's watcher token. This never crosses the mesh; the Tauri viewer uses
+/// it to distinguish re-registration from an ordinary empty poll.
+pub const VIDEO_WATCHER_STALE_ERROR: &str = "VIDEO_WATCHER_STALE";
+
 /// The largest frame we'll read — a media batch poll can be sizeable, but a
 /// length this far past anything legitimate is a desync or a hostile peer, and
 /// allocating it would be the attack. 256 MiB is comfortably above any real
 /// frame while still bounding the damage.
 const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
+
+/// Diagnostic escape hatch for comparing the legacy contiguous video-poll
+/// response with the segmented zero-copy writer. This changes only local
+/// desktop IPC; it never affects peer media or signaling.
+static BUFFERED_VIDEO_POLL_IPC: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("ALLMYSTUFF_VIDEO_IPC_BUFFERED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+});
 
 /// Write one length-prefixed frame: `[u32 BE len][tag][payload]`, then flush.
 /// `len` counts the tag byte plus the payload, so an empty payload is `len 1`.
@@ -88,6 +106,43 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(&[tag]).await?;
     w.write_all(payload).await?;
+    w.flush().await
+}
+
+/// Write a local video-poll response without coalescing its packet payloads
+/// into a second full-frame allocation. The bytes on the node socket are
+/// exactly the same as `write_frame(TAG_BYTES, buffered_batch)`: one outer
+/// big-endian frame length/tag followed by little-endian packet lengths and
+/// the original packet bytes.
+async fn write_video_batch_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    batch: &VideoPollBatch,
+) -> std::io::Result<()> {
+    let frame_len = batch
+        .encoded_len()
+        .checked_add(1)
+        .and_then(|len| u32::try_from(len).ok())
+        .filter(|len| (*len as usize) <= MAX_FRAME_LEN)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "video poll frame exceeds the local IPC size ceiling",
+            )
+        })?;
+    let mut header = [0u8; 5];
+    header[..4].copy_from_slice(&frame_len.to_be_bytes());
+    header[4] = TAG_BYTES;
+    w.write_all(&header).await?;
+    for packet in batch.packets() {
+        let packet_len = u32::try_from(packet.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "video packet exceeds the local IPC length field",
+            )
+        })?;
+        w.write_all(&packet_len.to_le_bytes()).await?;
+        w.write_all(packet).await?;
+    }
     w.flush().await
 }
 
@@ -233,13 +288,74 @@ impl SocketAddr {
 // NodeClient — the GUI's (and the tests') side of the wire
 // ---------------------------------------------------------------------------
 
+/// Route-keyed persistent socket slots. The map lock is held only for lookup;
+/// connect, write, and read happen while holding the selected route's lock.
+struct RouteSocketEntry<T> {
+    token: u64,
+    socket: Arc<Mutex<Option<T>>>,
+}
+
+struct RouteSockets<T> {
+    routes: Mutex<HashMap<String, RouteSocketEntry<T>>>,
+}
+
+impl<T> RouteSockets<T> {
+    fn new() -> Self {
+        Self {
+            routes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn register(&self, route_id: String, token: u64) {
+        let mut routes = self.routes.lock().await;
+        routes.insert(
+            route_id,
+            RouteSocketEntry {
+                token,
+                socket: Arc::new(Mutex::new(None)),
+            },
+        );
+    }
+
+    async fn for_route(&self, route_id: &str, token: u64) -> Option<Arc<Mutex<Option<T>>>> {
+        self.routes
+            .lock()
+            .await
+            .get(route_id)
+            .filter(|entry| entry.token == token)
+            .map(|entry| entry.socket.clone())
+    }
+
+    async fn remove(&self, route_id: &str, token: u64) -> bool {
+        let mut routes = self.routes.lock().await;
+        if routes
+            .get(route_id)
+            .is_some_and(|entry| entry.token == token)
+        {
+            routes.remove(route_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.routes.lock().await.len()
+    }
+}
+
 /// Client of a running node's control socket. The GUI uses this in Phase B to
 /// drive the node it no longer runs in-process; the tests use it to exercise
-/// [`serve`]. Cheap to clone the address; every call opens its own connection
-/// (a local round trip is cheap and pooling muddies node-restart semantics —
-/// same reasoning as [`ControlClient`](crate::control_client::ControlClient)).
+/// [`serve`]. Ordinary commands use short-lived connections so a node restart
+/// is observed immediately. High-frequency desktop video polls reuse one
+/// reconnectable connection per route: repeatedly creating and destroying
+/// Windows local pipe handles at display cadence proved unsafe under 20 MiB
+/// RGBA frames, while sharing one connection across routes lets a stalled
+/// monitor block every other monitor.
 pub struct NodeClient {
     addr: SocketAddr,
+    video_polls: RouteSockets<LocalSocketStream>,
 }
 
 impl NodeClient {
@@ -247,6 +363,7 @@ impl NodeClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
             addr: node_socket_addr()?,
+            video_polls: RouteSockets::new(),
         })
     }
 
@@ -261,12 +378,40 @@ impl NodeClient {
     /// [`NodeRequest`] as a [`TAG_JSON`] frame, reads one `TAG_JSON` response,
     /// and returns its `result` (or errors with `error`).
     pub async fn request(&self, cmd: &str, args: Value) -> Result<Value> {
-        let (tag, payload) = self.round_trip(cmd, args).await?;
+        let watched_route = (cmd == "video_watch")
+            .then(|| args.get("route_id")?.as_str().map(str::to_owned))
+            .flatten();
+        let unwatched_route = (cmd == "video_unwatch")
+            .then(|| {
+                Some((
+                    args.get("route_id")?.as_str()?.to_owned(),
+                    args.get("token")?.as_u64()?,
+                ))
+            })
+            .flatten();
+
+        let round_trip = self.round_trip(cmd, args).await;
+        // A GUI that retires a token must release its local persistent handle
+        // even if the node processed the unwatch but its acknowledgement was
+        // lost. The token check keeps a late old unwatch from removing the
+        // successor's route socket.
+        if let Some((route_id, token)) = &unwatched_route {
+            self.video_polls.remove(route_id, *token).await;
+        }
+        let (tag, payload) = round_trip?;
         if tag != TAG_JSON {
             bail!("node sent a {tag} frame where a JSON response was expected");
         }
         let resp: WireResponse = serde_json::from_slice(&payload).context("parse node response")?;
         if resp.ok {
+            if let Some(route_id) = watched_route {
+                let token = resp
+                    .result
+                    .as_u64()
+                    .filter(|token| *token != 0)
+                    .ok_or_else(|| anyhow!("video_watch returned an invalid watcher token"))?;
+                self.video_polls.register(route_id, token).await;
+            }
             Ok(resp.result)
         } else {
             Err(anyhow!(resp.error.unwrap_or_else(|| "(no error)".into())))
@@ -276,7 +421,11 @@ impl NodeClient {
     /// One-shot command → raw bytes (the poll commands). Same as
     /// [`NodeClient::request`] but expects a [`TAG_BYTES`] response.
     pub async fn request_bytes(&self, cmd: &str, args: Value) -> Result<Vec<u8>> {
-        let (tag, payload) = self.round_trip(cmd, args).await?;
+        let (tag, payload) = if cmd == "video_poll" {
+            self.video_poll_round_trip(args).await?
+        } else {
+            self.round_trip(cmd, args).await?
+        };
         match tag {
             TAG_BYTES => Ok(payload),
             // A failed poll still comes back as a JSON error frame.
@@ -293,16 +442,106 @@ impl NodeClient {
 
     /// Connect, send the request, read exactly one response frame, close.
     async fn round_trip(&self, cmd: &str, args: Value) -> Result<(u8, Vec<u8>)> {
-        let stream = self.connect().await?;
-        let (mut reader, mut writer) = stream.split();
+        let mut stream = self.connect().await?;
+        Self::exchange_inner(&mut stream, cmd, args).await
+    }
+
+    /// Reuse one strictly serialized local connection per route for the
+    /// display-cadence video drain. Any connect/read/write failure retires only
+    /// that route's socket; its next tick connects to the current node.
+    async fn video_poll_round_trip(&self, args: Value) -> Result<(u8, Vec<u8>)> {
+        let route_id = args
+            .get("route_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("video_poll requires a string `route_id`"))?
+            .to_owned();
+        let token = args
+            .get("token")
+            .and_then(Value::as_u64)
+            .filter(|token| *token != 0)
+            .ok_or_else(|| anyhow!("video_poll requires a non-zero integer `token`"))?;
+        let route_socket = self
+            .video_polls
+            .for_route(&route_id, token)
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "{VIDEO_WATCHER_STALE_ERROR}: route `{route_id}` token {token} is not registered"
+                )
+            })?;
+        let mut slot = route_socket.lock().await;
+
+        let result = async {
+            if slot.is_none() {
+                let stream = tokio::time::timeout(LOCAL_REQUEST_TIMEOUT, self.connect())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "node video_poll connect for route `{route_id}` timed out after {}s",
+                            LOCAL_REQUEST_TIMEOUT.as_secs()
+                        )
+                    })??;
+                *slot = Some(stream);
+            }
+            Self::exchange_with_timeout(
+                slot.as_mut().expect("video poll connection initialized"),
+                "video_poll",
+                args,
+                LOCAL_REQUEST_TIMEOUT,
+            )
+            .await
+        }
+        .await;
+        let stale_response = result.as_ref().ok().is_some_and(|(tag, payload)| {
+            *tag == TAG_JSON
+                && serde_json::from_slice::<WireResponse>(payload)
+                    .ok()
+                    .and_then(|response| response.error)
+                    .is_some_and(|error| error.contains(VIDEO_WATCHER_STALE_ERROR))
+        });
+        if result.is_err() || stale_response {
+            // A poll drains a lossy viewer queue. Never replay it after an
+            // ambiguous partial response; the normal next tick reconnects.
+            slot.take();
+        }
+        drop(slot);
+        if stale_response {
+            self.video_polls.remove(&route_id, token).await;
+        }
+        result
+    }
+
+    async fn exchange_with_timeout<S>(
+        stream: &mut S,
+        cmd: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<(u8, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(timeout, Self::exchange_inner(stream, cmd, args))
+            .await
+            .with_context(|| {
+                format!(
+                    "node `{cmd}` exchange timed out after {}ms",
+                    timeout.as_millis()
+                )
+            })?
+    }
+
+    async fn exchange_inner<S>(stream: &mut S, cmd: &str, args: Value) -> Result<(u8, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let body = serde_json::to_vec(&NodeRequest {
             cmd: cmd.to_string(),
             args,
         })?;
-        write_frame(&mut writer, TAG_JSON, &body)
+        write_frame(stream, TAG_JSON, &body)
             .await
             .context("write node request")?;
-        read_frame(&mut reader)
+        read_frame(stream)
             .await
             .context("read node response")?
             .ok_or_else(|| anyhow!("node closed the connection without a response"))
@@ -312,21 +551,29 @@ impl NodeClient {
     /// sentinel, await the ack, then spawn a read loop forwarding each
     /// [`NodeEvent`] to `tx` until EOF. Returns once the ack lands.
     pub async fn subscribe_events(&self, tx: mpsc::Sender<NodeEvent>) -> Result<()> {
-        let stream = self.connect().await?;
-        let (mut reader, mut writer) = stream.split();
-        let body = serde_json::to_vec(&NodeRequest {
-            cmd: SUBSCRIBE_EVENTS.to_string(),
-            args: Value::Null,
-        })?;
-        write_frame(&mut writer, TAG_JSON, &body)
-            .await
-            .context("write node subscribe")?;
+        let (mut stream, tag, payload) = tokio::time::timeout(LOCAL_REQUEST_TIMEOUT, async {
+            let mut stream = self.connect().await?;
+            let body = serde_json::to_vec(&NodeRequest {
+                cmd: SUBSCRIBE_EVENTS.to_string(),
+                args: Value::Null,
+            })?;
+            write_frame(&mut stream, TAG_JSON, &body)
+                .await
+                .context("write node subscribe")?;
 
-        // The ack — a TAG_JSON `{ok:true}` — confirms we're registered.
-        let (tag, payload) = read_frame(&mut reader)
-            .await
-            .context("read subscribe ack")?
-            .ok_or_else(|| anyhow!("node closed the connection before the subscribe ack"))?;
+            let (tag, payload) = read_frame(&mut stream)
+                .await
+                .context("read subscribe ack")?
+                .ok_or_else(|| anyhow!("node closed the connection before the subscribe ack"))?;
+            Ok::<_, anyhow::Error>((stream, tag, payload))
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "node event subscription acknowledgement timed out after {}s",
+                LOCAL_REQUEST_TIMEOUT.as_secs()
+            )
+        })??;
         if tag != TAG_JSON {
             bail!("subscribe ack wasn't a JSON frame");
         }
@@ -339,10 +586,8 @@ impl NodeClient {
         }
 
         tokio::spawn(async move {
-            // Keep the writer half alive for the read loop's lifetime.
-            let _writer_keepalive = writer;
             loop {
-                match read_frame(&mut reader).await {
+                match read_frame(&mut stream).await {
                     Ok(Some((TAG_EVENT, body))) => {
                         match serde_json::from_slice::<NodeEvent>(&body) {
                             Ok(ev) => {
@@ -412,9 +657,79 @@ impl WireResponse {
 // SocketSink — the node's UiSink, fanning events to every event connection
 // ---------------------------------------------------------------------------
 
-/// The subscribed event connections' senders — the fan-out task's registry,
-/// shared with [`serve`]'s accept loop (each event connection pushes its
-/// sender here, [`fan_out`] writes to them).
+fn stale_video_watcher_error(route_id: &str, token: u64) -> String {
+    format!(
+        "{VIDEO_WATCHER_STALE_ERROR}: route `{route_id}` token {token} is no longer the active watcher"
+    )
+}
+
+fn validate_video_watcher(mesh: &Mesh, route_id: &str, token: u64) -> Result<(), String> {
+    if token != 0 && mesh.video_watcher_is_current(route_id, token) {
+        Ok(())
+    } else {
+        Err(stale_video_watcher_error(route_id, token))
+    }
+}
+
+fn video_packet_depends_on_decode_history(packet: &[u8]) -> bool {
+    // The local viewer header's kind byte is 2 for H.264. JPEG (1) and
+    // decoded RGBA (3) are independently paintable.
+    packet.first() == Some(&2)
+}
+
+fn buffered_video_batch_depends_on_decode_history(mut batch: &[u8]) -> bool {
+    while batch.len() >= 4 {
+        let len = u32::from_le_bytes(batch[..4].try_into().expect("four-byte length")) as usize;
+        batch = &batch[4..];
+        if len == 0 || len > batch.len() {
+            return false;
+        }
+        if video_packet_depends_on_decode_history(&batch[..len]) {
+            return true;
+        }
+        batch = &batch[len..];
+    }
+    false
+}
+
+fn schedule_failed_video_poll_recovery(
+    mesh: &Arc<Mesh>,
+    route_id: &str,
+    token: u64,
+    batch_bytes: usize,
+    dependency_chained: bool,
+    failure: &str,
+) {
+    tracing::warn!(
+        "video_poll local response failed route={route_id} token={token} bytes={batch_bytes} dependency_chained={dependency_chained}: {failure}"
+    );
+    if !dependency_chained {
+        return;
+    }
+
+    let mesh = mesh.clone();
+    let route_id = route_id.to_owned();
+    crate::spawn(async move {
+        if !mesh.video_watcher_is_current(&route_id, token) {
+            tracing::debug!(
+                "video_poll recovery skipped route={route_id} token={token}: watcher retired"
+            );
+            return;
+        }
+        match mesh.request_refresh(route_id.clone()).await {
+            Ok(()) => tracing::warn!(
+                "video_poll recovery requested a clean keyframe route={route_id} token={token}"
+            ),
+            Err(error) => tracing::warn!(
+                "video_poll recovery could not request a clean keyframe route={route_id} token={token}: {error}"
+            ),
+        }
+    });
+}
+
+/// The subscribed event connections' senders, shared with [`serve`]'s accept
+/// loop. Each event connection registers one sender and [`fan_out`] writes to
+/// them.
 pub type Broadcaster = Arc<Mutex<Vec<mpsc::Sender<NodeEvent>>>>;
 
 /// Build a fresh, empty broadcaster.
@@ -600,8 +915,9 @@ pub async fn serve(
     }
 }
 
-/// Serve one connection: read its first [`NodeRequest`], then either run the
-/// event-writer loop (subscribe) or dispatch one command and reply.
+/// Serve one connection: subscriptions switch to the event-writer loop;
+/// desktop video polls may repeat on a persistent connection; other commands
+/// retain the legacy one-request/one-response lifetime.
 async fn handle_connection(
     stream: LocalSocketStream,
     mesh: Arc<Mesh>,
@@ -610,34 +926,169 @@ async fn handle_connection(
     broadcaster: Broadcaster,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.split();
-    let Some((tag, body)) = read_frame(&mut reader).await? else {
-        // Clean hangup before sending anything — nothing to do.
+    loop {
+        let Some((tag, body)) = read_frame(&mut reader).await? else {
+            // Clean hangup at a request boundary.
+            return Ok(());
+        };
+        if tag != TAG_JSON {
+            bail!("node frame wasn't a JSON request (tag {tag})");
+        }
+        let req: NodeRequest = serde_json::from_slice(&body).context("parse node request")?;
+
+        if req.cmd == SUBSCRIBE_EVENTS {
+            return run_event_writer(writer, broadcaster).await;
+        }
+
+        // Desktop `video_poll` is local GUI/backend IPC, not mesh signalling.
+        // Stream its existing packet framing directly so a 14 MiB decoded frame
+        // is not copied into a second contiguous batch. `dispatch` keeps the
+        // buffered form for in-process/mobile callers, preserving that public API.
+        if req.cmd == "video_poll" {
+            let route_id: String = match arg(&req.args, "route_id") {
+                Ok(route_id) => route_id,
+                Err(e) => {
+                    let body = serde_json::to_vec(&WireResponse::err(e))?;
+                    write_frame(&mut writer, TAG_JSON, &body).await?;
+                    continue;
+                }
+            };
+            let token: u64 = match arg(&req.args, "token") {
+                Ok(token) => token,
+                Err(e) => {
+                    let body = serde_json::to_vec(&WireResponse::err(e))?;
+                    write_frame(&mut writer, TAG_JSON, &body).await?;
+                    continue;
+                }
+            };
+            if let Err(error) = validate_video_watcher(&mesh, &route_id, token) {
+                tracing::info!("rejected stale local video poll route={route_id} token={token}");
+                let body = serde_json::to_vec(&WireResponse::err(error))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+                continue;
+            }
+            if *BUFFERED_VIDEO_POLL_IPC {
+                let batch = mesh.video_poll_for(&route_id, Some(token));
+                let dependency_chained = buffered_video_batch_depends_on_decode_history(&batch);
+                let batch_bytes = batch.len();
+                if let Err(error) = validate_video_watcher(&mesh, &route_id, token) {
+                    schedule_failed_video_poll_recovery(
+                        &mesh,
+                        &route_id,
+                        token,
+                        batch_bytes,
+                        dependency_chained,
+                        "watcher changed after the batch was drained",
+                    );
+                    let body = serde_json::to_vec(&WireResponse::err(error))?;
+                    write_frame(&mut writer, TAG_JSON, &body).await?;
+                    continue;
+                }
+                let started = (!batch.is_empty())
+                    .then(crate::pipeline_profile::stamp)
+                    .flatten();
+                let result = tokio::time::timeout(
+                    LOCAL_REQUEST_TIMEOUT,
+                    write_frame(&mut writer, TAG_BYTES, &batch),
+                )
+                .await;
+                crate::pipeline_profile::record_since(
+                    &route_id,
+                    0,
+                    None,
+                    crate::pipeline_profile::Stage::ViewerIpcWrite,
+                    started,
+                );
+                let failure = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(format!("write buffered video poll response: {error}")),
+                    Err(_) => Some(format!(
+                        "buffered video poll response timed out after {}s",
+                        LOCAL_REQUEST_TIMEOUT.as_secs()
+                    )),
+                };
+                if let Some(failure) = failure {
+                    schedule_failed_video_poll_recovery(
+                        &mesh,
+                        &route_id,
+                        token,
+                        batch_bytes,
+                        dependency_chained,
+                        &failure,
+                    );
+                    bail!("{failure}");
+                }
+                continue;
+            }
+            let batch = mesh.video_poll_batch(&route_id, Some(token));
+            let dependency_chained = batch.packets().any(video_packet_depends_on_decode_history);
+            let batch_bytes = batch.encoded_len();
+            if let Err(error) = validate_video_watcher(&mesh, &route_id, token) {
+                schedule_failed_video_poll_recovery(
+                    &mesh,
+                    &route_id,
+                    token,
+                    batch_bytes,
+                    dependency_chained,
+                    "watcher changed after the batch was drained",
+                );
+                let body = serde_json::to_vec(&WireResponse::err(error))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+                continue;
+            }
+            let started = (!batch.is_empty())
+                .then(crate::pipeline_profile::stamp)
+                .flatten();
+            let result = tokio::time::timeout(
+                LOCAL_REQUEST_TIMEOUT,
+                write_video_batch_frame(&mut writer, &batch),
+            )
+            .await;
+            crate::pipeline_profile::record_since(
+                &route_id,
+                0,
+                None,
+                crate::pipeline_profile::Stage::ViewerIpcWrite,
+                started,
+            );
+            let failure = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("write segmented video poll response: {error}")),
+                Err(_) => Some(format!(
+                    "segmented video poll response timed out after {}s",
+                    LOCAL_REQUEST_TIMEOUT.as_secs()
+                )),
+            };
+            if let Some(failure) = failure {
+                schedule_failed_video_poll_recovery(
+                    &mesh,
+                    &route_id,
+                    token,
+                    batch_bytes,
+                    dependency_chained,
+                    &failure,
+                );
+                bail!("{failure}");
+            }
+            continue;
+        }
+
+        let out = dispatch(&mesh, &client, &disabled, req).await;
+        match out {
+            DispatchOut::Json(v) => {
+                let body = serde_json::to_vec(&WireResponse::ok(v))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+            }
+            DispatchOut::Bytes(b) => {
+                write_frame(&mut writer, TAG_BYTES, &b).await?;
+            }
+            DispatchOut::Err(e) => {
+                let body = serde_json::to_vec(&WireResponse::err(e))?;
+                write_frame(&mut writer, TAG_JSON, &body).await?;
+            }
+        }
         return Ok(());
-    };
-    if tag != TAG_JSON {
-        bail!("first node frame wasn't a JSON request (tag {tag})");
     }
-    let req: NodeRequest = serde_json::from_slice(&body).context("parse node request")?;
-
-    if req.cmd == SUBSCRIBE_EVENTS {
-        return run_event_writer(writer, broadcaster).await;
-    }
-
-    let out = dispatch(&mesh, &client, &disabled, req).await;
-    match out {
-        DispatchOut::Json(v) => {
-            let body = serde_json::to_vec(&WireResponse::ok(v))?;
-            write_frame(&mut writer, TAG_JSON, &body).await?;
-        }
-        DispatchOut::Bytes(b) => {
-            write_frame(&mut writer, TAG_BYTES, &b).await?;
-        }
-        DispatchOut::Err(e) => {
-            let body = serde_json::to_vec(&WireResponse::err(e))?;
-            write_frame(&mut writer, TAG_JSON, &body).await?;
-        }
-    }
-    Ok(())
 }
 
 /// Register this connection in the broadcaster, ack, then drain its receiver
@@ -848,9 +1299,21 @@ pub async fn dispatch(
                     .await,
             )
         }
+        "connect_route_handle" => {
+            let from: String = try_arg!(arg(a, "from"));
+            let to: String = try_arg!(arg(a, "to"));
+            let media: String = try_arg!(arg(a, "media"));
+            let video: Option<Vec<String>> = try_arg!(opt(a, "video"));
+            let session: Option<String> = try_arg!(opt(a, "session"));
+            json_result(
+                mesh.connect_term_handle(from, to, media, video.unwrap_or_default(), session)
+                    .await,
+            )
+        }
         "disconnect_route" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
-            json_result(mesh.disconnect(route_id).await)
+            let generation: Option<u64> = try_arg!(opt(a, "generation"));
+            json_result(mesh.disconnect_expected(route_id, generation).await)
         }
         "claim_node" => {
             let node: String = try_arg!(arg(a, "node"));
@@ -963,7 +1426,26 @@ pub async fn dispatch(
         }
         "video_poll" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
-            DispatchOut::Bytes(mesh.video_poll(&route_id))
+            let token: u64 = try_arg!(arg(a, "token"));
+            if let Err(error) = validate_video_watcher(mesh, &route_id, token) {
+                DispatchOut::Err(error)
+            } else {
+                let batch = mesh.video_poll_for(&route_id, Some(token));
+                match validate_video_watcher(mesh, &route_id, token) {
+                    Ok(()) => DispatchOut::Bytes(batch),
+                    Err(error) => {
+                        schedule_failed_video_poll_recovery(
+                            mesh,
+                            &route_id,
+                            token,
+                            batch.len(),
+                            buffered_video_batch_depends_on_decode_history(&batch),
+                            "watcher changed after the in-process batch was drained",
+                        );
+                        DispatchOut::Err(error)
+                    }
+                }
+            }
         }
         "video_unwatch" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
@@ -977,16 +1459,21 @@ pub async fn dispatch(
         }
         "video_feedback" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
+            let watcher_token: u64 = try_arg!(arg(a, "watcher_token"));
             let recv_fps: u32 = try_arg!(arg(a, "recv_fps"));
             let decode_fails: u32 = try_arg!(arg(a, "decode_fails"));
             let queue_depth: u32 = try_arg!(arg(a, "queue_depth"));
             // The webview decode ladder can't name the failed AU (its
             // decoder is opaque); the native lane's glitch path reports
             // the timestamp itself.
-            json_result(
-                mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth, None)
-                    .await,
-            )
+            if !mesh.video_watcher_is_current(&route_id, watcher_token) {
+                DispatchOut::Json(Value::Null)
+            } else {
+                json_result(
+                    mesh.send_video_feedback(route_id, recv_fps, decode_fails, queue_depth, None)
+                        .await,
+                )
+            }
         }
         "tune_route" => {
             let route_id: String = try_arg!(arg(a, "route_id"));
@@ -995,14 +1482,18 @@ pub async fn dispatch(
             let fps: Option<u32> = try_arg!(opt(a, "fps"));
             let game: Option<bool> = try_arg!(opt(a, "game"));
             let mode: Option<String> = try_arg!(opt(a, "mode"));
+            let peer_cap_bps: Option<u64> = try_arg!(opt(a, "peer_cap_bps"));
+            let priority: Option<bool> = try_arg!(opt(a, "priority"));
             json_result(
-                mesh.request_tune(
+                mesh.request_policy_tune(
                     route_id,
                     max_edge,
                     bitrate,
                     fps,
                     game.unwrap_or(false),
                     mode,
+                    peer_cap_bps,
+                    priority.unwrap_or(false),
                 )
                 .await,
             )
@@ -1025,6 +1516,16 @@ pub async fn dispatch(
                     "edgeCap": d.edge_cap,
                     "outW": d.out_w,
                     "outH": d.out_h,
+                    "peerBudgetBps": d.peer_budget_bps,
+                    "routeBudgetBps": d.route_budget_bps,
+                    "routeCeilingBps": d.route_ceiling_bps,
+                    "priority": d.priority,
+                    "audioPacketMs": d.audio_packet_ms,
+                    "audioJitterMs": d.audio_jitter_ms,
+                    "audioFec": d.audio_fec,
+                    "videoQueueDepth": d.video_queue_depth,
+                    "audioQueueDepth": d.audio_queue_depth,
+                    "degradationReasons": d.degradation_reasons,
                 })),
                 None => DispatchOut::Json(Value::Null),
             }
@@ -2268,6 +2769,241 @@ mod tests {
     async fn frame_round_trip_empty_and_bytes() {
         round_trip(TAG_BYTES, Vec::new()).await;
         round_trip(TAG_BYTES, vec![0, 1, 2, 3, 255, 254]).await;
+    }
+
+    #[tokio::test]
+    async fn client_exchange_reuses_one_stream_for_video_polls() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let responder = tokio::spawn(async move {
+            for expected_route in ["route-a", "route-b"] {
+                let (tag, body) = read_frame(&mut server).await.unwrap().expect("request");
+                assert_eq!(tag, TAG_JSON);
+                let request: NodeRequest = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.cmd, "video_poll");
+                assert_eq!(request.args["route_id"], expected_route);
+                write_frame(&mut server, TAG_BYTES, expected_route.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for route in ["route-a", "route-b"] {
+            let (tag, payload) = NodeClient::exchange_with_timeout(
+                &mut client,
+                "video_poll",
+                json!({ "route_id": route }),
+                LOCAL_REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(tag, TAG_BYTES);
+            assert_eq!(payload, route.as_bytes());
+        }
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_exchange_times_out_when_a_response_stalls() {
+        let (mut client, _silent_server) = tokio::io::duplex(4096);
+
+        let error = NodeClient::exchange_with_timeout(
+            &mut client,
+            "video_poll",
+            json!({ "route_id": "route-a" }),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("a connected peer that never responds must hit the exchange deadline");
+
+        assert!(
+            format!("{error:#}").contains("exchange timed out"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_poll_route_locks_and_retirement_are_isolated() {
+        let sockets = RouteSockets::<u8>::new();
+        sockets.register("route-a".into(), 11).await;
+        sockets.register("route-b".into(), 22).await;
+        let route_a = sockets.for_route("route-a", 11).await.unwrap();
+        let route_a_again = sockets.for_route("route-a", 11).await.unwrap();
+        let route_b = sockets.for_route("route-b", 22).await.unwrap();
+
+        assert!(Arc::ptr_eq(&route_a, &route_a_again));
+        assert!(!Arc::ptr_eq(&route_a, &route_b));
+        *route_a.lock().await = Some(1);
+        *route_b.lock().await = Some(2);
+
+        let mut route_a_guard = route_a.lock().await;
+        let route_b_guard = tokio::time::timeout(Duration::from_millis(25), route_b.lock())
+            .await
+            .expect("a held route-a lock must not block route-b");
+        assert_eq!(*route_b_guard, Some(2));
+        drop(route_b_guard);
+
+        route_a_guard.take();
+        drop(route_a_guard);
+        assert_eq!(*route_a.lock().await, None);
+        assert_eq!(*route_b.lock().await, Some(2));
+
+        assert!(!sockets.remove("route-a", 10).await);
+        assert_eq!(sockets.len().await, 2);
+        assert!(sockets.remove("route-a", 11).await);
+        assert!(sockets.for_route("route-a", 11).await.is_none());
+        assert!(sockets.for_route("route-b", 22).await.is_some());
+        assert_eq!(sockets.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn registering_a_successor_retires_only_the_old_route_token() {
+        let sockets = RouteSockets::<u8>::new();
+        sockets.register("route-a".into(), 1).await;
+        let old = sockets.for_route("route-a", 1).await.unwrap();
+        *old.lock().await = Some(7);
+
+        sockets.register("route-a".into(), 2).await;
+        let current = sockets.for_route("route-a", 2).await.unwrap();
+        assert!(sockets.for_route("route-a", 1).await.is_none());
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(!sockets.remove("route-a", 1).await);
+        assert!(sockets.for_route("route-a", 2).await.is_some());
+
+        assert!(sockets.remove("route-a", 2).await);
+        assert_eq!(sockets.len().await, 0);
+    }
+
+    #[test]
+    fn dependency_chain_detection_distinguishes_h264_from_standalone_frames() {
+        fn framed(packets: &[&[u8]]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for packet in packets {
+                out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                out.extend_from_slice(packet);
+            }
+            out
+        }
+
+        assert!(!buffered_video_batch_depends_on_decode_history(&framed(&[
+            &[1, 0],
+            &[3, 0],
+        ])));
+        assert!(buffered_video_batch_depends_on_decode_history(&framed(&[
+            &[1, 0],
+            &[2, 1],
+        ])));
+        assert!(!buffered_video_batch_depends_on_decode_history(&[
+            9, 0, 0, 0, 2,
+        ]));
+    }
+
+    struct NoopSink;
+
+    impl UiSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+
+        fn restart(&self) -> ! {
+            unreachable!("test sink never restarts")
+        }
+    }
+
+    #[test]
+    fn valid_empty_video_poll_is_distinct_from_a_stale_watcher() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        let current = mesh.video_watch(route.to_string(), true, DecoderPreference::Automatic);
+
+        assert!(validate_video_watcher(&mesh, route, current).is_ok());
+        assert!(mesh.video_poll_for(route, Some(current)).is_empty());
+
+        let successor = mesh.video_watch(route.to_string(), true, DecoderPreference::Automatic);
+        let error = validate_video_watcher(&mesh, route, current)
+            .expect_err("the displaced token must be rejected, not returned as an empty batch");
+        assert!(error.contains(VIDEO_WATCHER_STALE_ERROR));
+        assert!(validate_video_watcher(&mesh, route, successor).is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnect_route_dispatch_accepts_legacy_and_generation_aware_callers() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket"));
+        let mesh = Mesh::new(client.clone(), Arc::new(NoopSink));
+        let disabled = Arc::new(DisabledNetworks::load());
+
+        for args in [
+            json!({ "route_id": "route:missing" }),
+            json!({ "route_id": "route:missing", "generation": 17 }),
+            json!({ "route_id": "route:missing", "generation": null }),
+        ] {
+            let response = dispatch(
+                &mesh,
+                &client,
+                &disabled,
+                NodeRequest {
+                    cmd: "disconnect_route".into(),
+                    args,
+                },
+            )
+            .await;
+            assert!(
+                matches!(response, DispatchOut::Json(Value::Null)),
+                "legacy and generation-aware disconnect forms must remain compatible"
+            );
+        }
+
+        let connect_response = dispatch(
+            &mesh,
+            &client,
+            &disabled,
+            NodeRequest {
+                cmd: "connect_route_handle".into(),
+                args: json!({}),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                connect_response,
+                DispatchOut::Err(error) if error.contains("from")
+            ),
+            "connect_route_handle must be a recognized, argument-checked node command"
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_video_batch_is_byte_for_byte_compatible() {
+        async fn write_raw(packets: Vec<Vec<u8>>) -> Vec<u8> {
+            let batch = VideoPollBatch::from_test_packets(packets);
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            let task = tokio::spawn(async move {
+                write_video_batch_frame(&mut writer, &batch).await.unwrap();
+            });
+            let mut raw = Vec::new();
+            reader.read_to_end(&mut raw).await.unwrap();
+            task.await.unwrap();
+            raw
+        }
+
+        fn expected_raw(packets: &[Vec<u8>]) -> Vec<u8> {
+            let payload_len: usize = packets.iter().map(|packet| 4 + packet.len()).sum();
+            let mut raw = Vec::with_capacity(5 + payload_len);
+            raw.extend_from_slice(&((payload_len as u32) + 1).to_be_bytes());
+            raw.push(TAG_BYTES);
+            for packet in packets {
+                raw.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                raw.extend_from_slice(packet);
+            }
+            raw
+        }
+
+        let packets = vec![vec![0, 1, 2], Vec::new(), vec![255, 4]];
+        assert_eq!(write_raw(packets.clone()).await, expected_raw(&packets));
+        assert_eq!(write_raw(Vec::new()).await, expected_raw(&[]));
+
+        // Larger than the duplex capacity so the writer must handle partial
+        // writes and local-socket backpressure without changing one byte.
+        let large = vec![(0..200_000u32).map(|i| (i % 251) as u8).collect()];
+        assert_eq!(write_raw(large.clone()).await, expected_raw(&large));
     }
 
     #[tokio::test]

@@ -40,6 +40,9 @@ jobs:
     # shim re-enables the old policy floor for every CMake build in the job.
     env:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      # A release must never retain a stale daemon or package a zero-byte
+      # placeholder when the pinned, verified sidecar cannot be acquired.
+      ALLMYSTUFF_REQUIRE_SIDECAR: "1"
       # Bake the release public key into every binary so the self-updater
       # requires a valid minisign signature (set the ALLMYSTUFF_RELEASE_PUBKEY
       # repo *variable* — it isn't secret — to enable; empty leaves the updater
@@ -47,6 +50,10 @@ jobs:
       ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.ALLMYSTUFF_RELEASE_PUBKEY }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify MyOwnMesh release metadata
+        shell: pwsh
+        run: ./scripts/check-myownmesh-release.ps1 -Platform '${{ matrix.platform.name }}'
 
       # Guard against the "tag says v0.2.0, binary reports 0.1.5" trap. The
       # CLI binary embeds CARGO_PKG_VERSION (via [workspace.package].version)

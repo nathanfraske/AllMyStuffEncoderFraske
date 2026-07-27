@@ -18,6 +18,14 @@ pub struct AudioFrame {
     pub seq: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Sender-side media clock in microseconds.
+    ///
+    /// This is optional so nodes using the original audio-frame schema keep
+    /// interoperating: old senders omit it and old recorded JSON still
+    /// deserializes.  Receivers use it only to distinguish network jitter
+    /// from the sender's capture cadence; it is not a wall-clock timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_timestamp_us: Option<u64>,
     /// Interleaved i16 samples, base64 of little-endian bytes on the wire.
     #[serde(with = "pcm_b64")]
     pub pcm: Vec<i16>,
@@ -36,8 +44,28 @@ impl AudioFrame {
             seq,
             sample_rate,
             channels,
+            media_timestamp_us: None,
             pcm,
         }
+    }
+
+    /// Attach the sender's monotonic media time without changing the legacy
+    /// [`AudioFrame::new`] call shape.
+    pub fn with_media_timestamp(mut self, media_timestamp_us: u64) -> Self {
+        self.media_timestamp_us = Some(media_timestamp_us);
+        self
+    }
+
+    /// Construct a frame carrying a sender media timestamp.
+    pub fn new_timestamped(
+        route: impl Into<String>,
+        seq: u64,
+        sample_rate: u32,
+        channels: u16,
+        media_timestamp_us: u64,
+        pcm: Vec<i16>,
+    ) -> Self {
+        Self::new(route, seq, sample_rate, channels, pcm).with_media_timestamp(media_timestamp_us)
     }
 
     /// Frames per second worth of audio in this buffer (per channel).
@@ -89,5 +117,28 @@ mod tests {
         let back: AudioFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
         assert_eq!(back.frame_count(), 3); // 6 samples / 2 channels
+    }
+
+    #[test]
+    fn legacy_json_without_media_timestamp_stays_compatible() {
+        let json = r#"{"route":"r","seq":3,"sample_rate":48000,"channels":2,"pcm":"AAABAA=="}"#;
+        let frame: AudioFrame = serde_json::from_str(json).unwrap();
+        assert_eq!(frame.media_timestamp_us, None);
+
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert!(!encoded.contains("media_timestamp_us"));
+    }
+
+    #[test]
+    fn media_timestamp_round_trips_when_present() {
+        let frame = AudioFrame::new_timestamped("r", 4, 48_000, 2, 123_456, vec![1, -1]);
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"media_timestamp_us\":123456"));
+        assert_eq!(
+            serde_json::from_str::<AudioFrame>(&json)
+                .unwrap()
+                .media_timestamp_us,
+            Some(123_456)
+        );
     }
 }

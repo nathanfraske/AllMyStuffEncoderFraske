@@ -29,7 +29,7 @@ compile_error!(
     "release GUI built in Tauri dev mode; use `pnpm tauri build` so frontendDist is embedded"
 );
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 // The node engine lives in the `allmystuff-node` crate; this shell is a thin
 // client of the per-machine node's control socket (see
@@ -42,6 +42,7 @@ use tauri::{Emitter, Manager, RunEvent, State};
 use tauri_plugin_autostart::ManagerExt;
 
 mod backend_recovery;
+mod input_dispatch;
 mod window_behavior;
 
 use backend_recovery::{
@@ -84,6 +85,13 @@ impl OwnedNode {
 
 struct AppState {
     node: Arc<NodeClient>,
+    /// Route-scoped local input queues. Discrete transitions are FIFO; pointer
+    /// motion is latest-only on a separate lane so it cannot hold up releases.
+    input: input_dispatch::InputDispatcher,
+    /// Keep route-watch registration order identical to command arrival order
+    /// across every webview. Node replies can complete out of order otherwise,
+    /// allowing a cancelled older watch to replace and then remove its successor.
+    video_watch_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The node we spawned, if Always-On wasn't already running one. Held so
     /// it's killed when the app exits (Always-On off => node lives only with
     /// the app); a reused service node has no child here and keeps running.
@@ -137,10 +145,36 @@ async fn connect_route(
 }
 
 #[tauri::command]
-async fn disconnect_route(state: State<'_, AppState>, route_id: String) -> Result<(), String> {
+async fn connect_route_handle(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+    media: String,
+    video: Option<Vec<String>>,
+    session: Option<String>,
+) -> Result<Value, String> {
     state
         .node
-        .request("disconnect_route", json!({ "route_id": route_id }))
+        .request(
+            "connect_route_handle",
+            json!({ "from": from, "to": to, "media": media, "video": video, "session": session }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn disconnect_route(
+    state: State<'_, AppState>,
+    route_id: String,
+    generation: Option<u64>,
+) -> Result<(), String> {
+    state
+        .node
+        .request(
+            "disconnect_route",
+            json!({ "route_id": route_id, "generation": generation }),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -403,16 +437,13 @@ async fn send_input(
     state: State<'_, AppState>,
     route_id: String,
     action: serde_json::Value,
-) -> Result<(), String> {
+    ordered: Option<bool>,
+) -> Result<bool, String> {
     state
-        .node
-        .request(
-            "send_input",
-            json!({ "route_id": route_id, "action": action }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .input
+        .enqueue(route_id, action, ordered.unwrap_or(false))
+        .await?;
+    Ok(true)
 }
 
 /// Read this machine's clipboard and push it down an active outbound
@@ -457,36 +488,55 @@ async fn video_watch(
     route_id: String,
     decode: Option<bool>,
     decoder: Option<String>,
-) -> u64 {
+) -> Result<u64, String> {
     let state = app.state::<AppState>();
-    match state
+    let route_lock = {
+        let mut locks = state.video_watch_locks.lock().await;
+        locks
+            .entry(route_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _registration_guard = route_lock.lock().await;
+    let value = state
         .node
         .request(
             "video_watch",
             json!({ "route_id": route_id, "decode": decode, "decoder": decoder }),
         )
         .await
-    {
-        Ok(v) => serde_json::from_value(v).unwrap_or_default(),
-        Err(e) => {
+        .map_err(|e| {
             tracing::warn!("video_watch failed: {e:#}");
-            0
-        }
+            e.to_string()
+        })?;
+    let token: u64 = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if token == 0 {
+        return Err("video_watch returned an invalid zero token".into());
     }
+    Ok(token)
 }
 
 /// Drain the queued packets for a route as one raw batch:
 /// `[u32 len][28-byte header + payload]…`, empty when nothing arrived.
 #[tauri::command]
-async fn video_poll(app: tauri::AppHandle, route_id: String) -> tauri::ipc::Response {
+async fn video_poll(
+    app: tauri::AppHandle,
+    route_id: String,
+    token: u64,
+) -> Result<tauri::ipc::Response, String> {
     let state = app.state::<AppState>();
-    tauri::ipc::Response::new(
-        state
-            .node
-            .request_bytes("video_poll", json!({ "route_id": route_id }))
-            .await
-            .unwrap_or_default(),
-    )
+    let bytes = state
+        .node
+        .request_bytes(
+            "video_poll",
+            json!({ "route_id": route_id, "token": token }),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!("video_poll failed: {error:#}");
+            error.to_string()
+        })?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Stop streaming a route's frames to the front-end (console closed or
@@ -528,6 +578,7 @@ async fn video_refresh(state: State<'_, AppState>, route_id: String) -> Result<(
 async fn video_feedback(
     state: State<'_, AppState>,
     route_id: String,
+    watcher_token: u64,
     recv_fps: u32,
     decode_fails: u32,
     queue_depth: u32,
@@ -538,6 +589,7 @@ async fn video_feedback(
             "video_feedback",
             json!({
                 "route_id": route_id,
+                "watcher_token": watcher_token,
                 "recv_fps": recv_fps,
                 "decode_fails": decode_fails,
                 "queue_depth": queue_depth,
@@ -559,12 +611,14 @@ async fn tune_route(
     fps: Option<u32>,
     game: Option<bool>,
     mode: Option<String>,
+    peer_cap_bps: Option<u64>,
+    priority: Option<bool>,
 ) -> Result<(), String> {
     state
         .node
         .request(
             "tune_route",
-            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps, "game": game, "mode": mode }),
+            json!({ "route_id": route_id, "max_edge": max_edge, "bitrate": bitrate, "fps": fps, "game": game, "mode": mode, "peer_cap_bps": peer_cap_bps, "priority": priority }),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -2067,6 +2121,17 @@ fn service_do_verb() -> Option<String> {
     args.get(i + 1).cloned()
 }
 
+/// The value after `--debug-logging-do` in an elevated Windows self-invocation.
+fn debug_logging_do_value() -> Option<bool> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|arg| arg == "--debug-logging-do")?;
+    match args.get(i + 1)?.as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Run a service mutation off the UI thread (it shells out to the init system,
 /// and on Windows waits on an elevated child). Returns `{ ok, output }`.
 async fn service_mutate(verb: &'static str) -> Result<Value, String> {
@@ -2152,9 +2217,44 @@ fn debug_logging_get() -> bool {
     allmystuff_node::diagnostics::debug_logging_enabled()
 }
 
+#[cfg(windows)]
+fn set_debug_logging_elevated(enabled: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("locating AllMyStuff: {e}"))?;
+    let exe = exe.to_string_lossy().replace('\'', "''");
+    let value = if enabled { "on" } else { "off" };
+    let ps = format!(
+        "try {{ $p = Start-Process -FilePath '{exe}' -ArgumentList '--debug-logging-do','{value}' \
+         -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} \
+         catch {{ exit 1223 }}"
+    );
+    use std::os::windows::process::CommandExt as _;
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|e| format!("launching elevated AllMyStuff: {e}"))?;
+    let code = output.status.code().unwrap_or(-1);
+    match code {
+        0 => Ok(()),
+        1223 => Err("Administrator approval was declined.".to_string()),
+        other => Err(format!(
+            "saving the machine diagnostics preference failed (exit {other})"
+        )),
+    }
+}
+
 #[tauri::command]
 fn debug_logging_set(enabled: bool) -> Result<bool, String> {
-    allmystuff_node::diagnostics::set_debug_logging(enabled).map_err(|e| e.to_string())?;
+    if let Err(error) = allmystuff_node::diagnostics::set_debug_logging(enabled) {
+        #[cfg(windows)]
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            set_debug_logging_elevated(enabled)?;
+        } else {
+            return Err(error.to_string());
+        }
+        #[cfg(not(windows))]
+        return Err(error.to_string());
+    }
     Ok(allmystuff_node::diagnostics::debug_logging_enabled())
 }
 
@@ -2488,6 +2588,20 @@ fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 }
 
 fn main() {
+    // A hardened Windows install can deny the unelevated GUI access to the
+    // machine-wide diagnostics preference. The settings command retries by
+    // relaunching this exact fixed operation elevated.
+    if let Some(enabled) = debug_logging_do_value() {
+        let code = match allmystuff_node::diagnostics::set_debug_logging(enabled) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("allmystuff diagnostics preference: {error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     // Elevated service action: `<gui-exe> --service-do <verb>`. On Windows the
     // "Always On" tab re-launches this binary elevated to install/manage the
     // service; here we just run the verb in-process and exit, no webview. (The
@@ -2565,6 +2679,7 @@ fn main() {
             scan_self,
             scan_full,
             connect_route,
+            connect_route_handle,
             disconnect_route,
             client_log,
             claim_node,
@@ -2705,6 +2820,8 @@ fn main() {
             };
             app.manage(AppState {
                 node: node.clone(),
+                input: input_dispatch::InputDispatcher::new(node.clone()),
+                video_watch_locks: tokio::sync::Mutex::new(HashMap::new()),
                 node_child: Mutex::new(OwnedNode::default()),
             });
             tauri::async_runtime::spawn(async move {

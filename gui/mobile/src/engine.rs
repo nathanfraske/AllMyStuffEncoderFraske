@@ -174,13 +174,20 @@ async fn boot_at(
     migrate_adapter_state(legacy_dir);
 
     // The daemon, in-process, on an explicit short socket path (see
-    // [`boot`]). A stale socket file from the previous launch would fail
-    // the bind — the container persists files across runs, and no other
-    // process can be holding it (this app *is* the only process).
+    // [`boot`]). Mobile targets are Unix, where a stale socket file from the
+    // previous launch would fail the bind. The Windows host build is only a
+    // smoke-test target and uses the daemon's default namespaced pipe.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&socket);
-    let mut cfg =
-        myownmesh_core::MeshConfig::load().map_err(|e| format!("load mesh config: {e}"))?;
-    cfg.daemon.control_socket = Some(socket.clone());
+    let cfg = myownmesh_core::MeshConfig::load().map_err(|e| format!("load mesh config: {e}"))?;
+    #[cfg(unix)]
+    let cfg = {
+        let mut cfg = cfg;
+        cfg.daemon.control_socket = Some(socket.clone());
+        cfg
+    };
+    #[cfg(not(unix))]
+    let _ = &socket;
     let daemon = myownmesh::embedded::start(cfg)
         .await
         .map_err(|e| format!("start embedded daemon: {e}"))?;
@@ -194,7 +201,12 @@ async fn boot_at(
     // store, start the session pump (which registers the runtime and
     // brings the node up: identity → profile → claim networks →
     // subscriptions → presence).
+    #[cfg(unix)]
     let client = Arc::new(ControlClient::with_path(socket));
+    #[cfg(not(unix))]
+    let client = Arc::new(
+        ControlClient::new().map_err(|e| format!("resolve embedded daemon control pipe: {e}"))?,
+    );
     let disabled = Arc::new(DisabledNetworks::load());
     let mesh = Mesh::new(client.clone(), sink);
     mesh.attach_disabled_networks(disabled.clone());

@@ -16,7 +16,11 @@
 //! | `<n>:video-in` | Video | Sink | `viewer` | a remote **camera** lands here |
 //! | `<n>:audio-out` | Audio | Sink | `speaker` | remote audio plays here |
 //! | `<n>:keyboard-mouse` | Input | Source | `controller` | touch drives a remote |
-//! | `<n>:clipboard` | Clipboard | Duplex | `clipboard` | cross-device copy/paste |
+//!
+//! Clipboard is deliberately absent until the mobile shell has a real
+//! UIPasteboard/ClipboardManager backend. Advertising the desktop endpoint
+//! while the capture-less node uses its no-op clipboard stub creates a route
+//! that can never carry data.
 //!
 //! The split between `display-in` and `video-in` is not cosmetic: the graph
 //! routes a remote *screen* (`MediaKind::Display`) only to a display sink and
@@ -110,15 +114,6 @@ pub fn mobile_capabilities(node: &NodeId, scope: MobileScope) -> Vec<Capability>
             Flow::Source,
             "controller",
         ),
-        // Cross-device clipboard. Duplex like the desktop's: the phone can both
-        // push a copied value to a remote and pull one back.
-        mk(
-            format!("{n}:clipboard"),
-            "Clipboard",
-            MediaKind::Clipboard,
-            Flow::Duplex,
-            "clipboard",
-        ),
     ];
 
     if scope.is_host() {
@@ -202,16 +197,14 @@ mod tests {
         let spk = by_origin("speaker").expect("audio-out");
         assert_eq!((spk.media, spk.flow), (MediaKind::Audio, Flow::Sink));
 
-        let clip = by_origin("clipboard").expect("clipboard");
-        assert_eq!(
-            (clip.media, clip.flow),
-            (MediaKind::Clipboard, Flow::Duplex)
+        assert!(
+            by_origin("clipboard").is_none(),
+            "viewer scope must not advertise the no-op mobile clipboard"
         );
 
         // A viewer phone never *hosts* a screen, camera, or mic: nothing it
-        // exposes can be the `from` side of a video/display/audio route. (It
-        // can still source input and clipboard — touch drives a remote, and
-        // the clipboard is duplex.)
+        // exposes can be the `from` side of a video/display/audio route. It
+        // can still source input: touch drives a remote.
         assert!(
             caps.iter()
                 .filter(|c| c.flow.can_source())

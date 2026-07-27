@@ -1,0 +1,6 @@
+{
+  "version": "0.2.47+5",
+  "build": {
+    "beforeBuildCommand": ""
+  }
+}

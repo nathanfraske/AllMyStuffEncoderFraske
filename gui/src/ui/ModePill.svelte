@@ -2,11 +2,12 @@
   // The stream-posture control, shared by the console strip and the
   // popped-out video bar so there is ONE Mode element, not two that drift
   // apart. It is a proper dropdown: the pill names the current posture and
-  // opens a menu of all four with one-line descriptions, the active one
-  // checked. Balanced (stability-first default), Game (latency-first — GDR,
-  // instant recovery), Studio (LAN fidelity), Studio · Lossless (bit-exact
-  // HEVC on a capable pair). The Studio flavors warn once about bandwidth
-  // before engaging.
+  // opens a menu of all five with one-line descriptions, the active one
+  // checked. Reach protects constrained links, Balanced is the stable default,
+  // Game is latency-first, and the Studio flavors spend bandwidth on fidelity.
+  // Studio · Lossless is an honest request for the existing HEVC rung: it never
+  // claims source-exact 4:4:4 video or lossless audio. The Studio flavors warn
+  // once about bandwidth before engaging.
   //
   // Presentational + self-contained: the caller owns where the tune lives
   // and how it's applied; this component only decides which posture is next
@@ -15,32 +16,34 @@
   // its menu opens up (default); the console's menu has room below so it
   // opens down — without forking the component.
 
-  type ModeKey = "balanced" | "game" | "studio" | "studio-ll";
+  type ModeKey = "reach" | "balanced" | "game" | "studio" | "studio-ll";
 
   /** The postures in menu order, each with the one-line description the
    *  dropdown shows and whether it's a bandwidth-heavy tier (the Studio
    *  flavors, which gate behind the one-time warning). */
   const MODES: Array<{ key: ModeKey; label: string; blurb: string; heavy: boolean }> = [
+    { key: "reach", label: "Reach", blurb: "Constrained links — preserve control and audio", heavy: false },
     { key: "balanced", label: "Balanced", blurb: "Stability first — the safe default", heavy: false },
     { key: "game", label: "Game", blurb: "Latency first, GDR healing", heavy: false },
     { key: "studio", label: "Studio", blurb: "Quality first, high bitrate", heavy: true },
     {
       key: "studio-ll",
       label: "Studio · Lossless",
-      blurb: "Pixel-exact HEVC, needs a capable pair",
+      blurb: "Lossless HEVC video where supported; realtime Opus audio",
       heavy: true,
     },
   ];
   const MODE_LABEL: Record<ModeKey, string> = {
+    reach: "Reach",
     balanced: "Balanced",
     game: "Game",
     studio: "Studio",
-    "studio-ll": "Studio · LL",
+    "studio-ll": "Studio · Lossless",
   };
 
   /** The posture as it rides the wire (matches StreamTune["mode"] minus
    *  the "balanced" alias, which is expressed as undefined). */
-  type WireMode = "game" | "studio" | "studio-lossless" | undefined;
+  type WireMode = "reach" | "game" | "studio" | "studio-lossless" | undefined;
 
   let {
     mode,
@@ -193,7 +196,7 @@
     class:open
     aria-haspopup="menu"
     aria-expanded={open}
-    title="Balanced favors stability and quality; Game favors latency and instant recovery; Studio spends bandwidth on fidelity; Studio · Lossless is bit-exact (a capable pair both ends)"
+    title="Reach protects constrained links; Balanced favors stability; Game favors latency; Studio spends bandwidth on fidelity; Studio · Lossless requests lossless HEVC video where supported while audio remains realtime Opus"
     onpointerdown={(e) => e.stopPropagation()}
     onpointerup={(e) => e.stopPropagation()}
     onclick={(e) => {
@@ -236,7 +239,7 @@
         </button>
       {/each}
       {#if onexperimental}
-        <!-- Experimental is a TOGGLE, not a fifth posture: it refines
+        <!-- Experimental is a TOGGLE, not a sixth posture: it refines
              whichever mode is active (Labs field trials — off by default,
              every feature fails soft to today's behavior). A checkbox row
              under a divider, so the Mode control owns it and no separate
@@ -290,11 +293,11 @@
       </h3>
       {#if studioPrompt === "studio-ll"}
         <p>
-          Lossless sends <strong>every pixel exactly</strong> over HEVC —
-          bandwidth follows what's on screen: near-zero when idle, tens of
-          Mbps for desktop work, and it can spike far higher on busy video.
-          It needs capable hardware on both machines; anywhere it can't run,
-          the stream continues as regular Studio automatically.
+          This requests the existing <strong>lossless HEVC video</strong> rung
+          on supported Windows/NVIDIA hardware. It is not source-exact 4:4:4,
+          and audio remains realtime Opus rather than mathematically lossless.
+          Anywhere the HEVC rung cannot run, video continues as regular Studio
+          and the effective readout explains the fallback.
         </p>
       {/if}
       <p>
@@ -307,7 +310,7 @@
         <button class="studio-btn ghost" onclick={() => (studioPrompt = null)}>Cancel</button>
         <button class="studio-btn ghost" onclick={() => confirmStudio(true)}>Don't ask again</button>
         <button class="studio-btn primary" onclick={() => confirmStudio(false)}
-          >{studioPrompt === "studio-ll" ? "Use Lossless" : "Use Studio"}</button
+          >{studioPrompt === "studio-ll" ? "Use Studio · Lossless" : "Use Studio"}</button
         >
       </div>
     </div>

@@ -5,9 +5,11 @@
 //! source-checkout dev path — AllMyStuff ships against an installed
 //! `myownmesh` (pinned in `.myownmesh-rev`), found on `$PATH` or via the
 //! `MYOWNMESH_BIN` override. A binary that's fallen behind the pin is
-//! asked to update itself (`myownmesh update`, the same thing the
-//! installer invokes) before we start it, so the mesh comes up with the
-//! features this app was built against.
+//! reported but left untouched by default because a one-endpoint update can
+//! strand a fleet across a handshake-incompatible MyOwnMesh release.
+//! Operators may explicitly allow `myownmesh update` with
+//! `ALLMYSTUFF_ALLOW_MYOWNMESH_UPDATE=1`. Dev/override binaries are never
+//! modified.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -384,11 +386,21 @@ async fn run_daemon_update(bin: &Path) -> bool {
     }
 }
 
-/// When the daemon binary we're about to start is older than the app's
-/// pin, update it first. A stale daemon is the #1 way "the app updated
-/// but a feature didn't appear" happens — it answers the socket fine,
-/// so everything *looks* up, but the newer media lanes (the video track
-/// lane screens ride, the Opus audio lane) simply don't exist in it.
+/// Whether an operator explicitly allowed this process to mutate the
+/// installed MyOwnMesh sidecar. Keep the accepted values narrow so a stray
+/// non-empty environment variable cannot silently opt a machine in.
+fn explicit_update_opt_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+fn daemon_update_opted_in() -> bool {
+    explicit_update_opt_in(
+        std::env::var("ALLMYSTUFF_ALLOW_MYOWNMESH_UPDATE")
+            .ok()
+            .as_deref(),
+    )
+}
+
 async fn ensure_daemon_current(bin: &Path) {
     let Some((pin, want)) = pinned_version() else {
         return;
@@ -400,6 +412,14 @@ async fn ensure_daemon_current(bin: &Path) {
         ),
         Some(have) if have >= want => {}
         Some(have) => {
+            if !daemon_update_opted_in() {
+                tracing::warn!(
+                    "myownmesh at {} is v{} but this app pins {pin}; automatic daemon mutation is disabled so a one-sided update cannot strand the fleet. Stage and restart every endpoint together, or explicitly set ALLMYSTUFF_ALLOW_MYOWNMESH_UPDATE=1",
+                    bin.display(),
+                    fmt_ver(have)
+                );
+                return;
+            }
             tracing::info!(
                 "myownmesh at {} is v{} but this app pins {pin} — asking it to update itself (myownmesh update)…",
                 bin.display(),
@@ -477,8 +497,8 @@ pub enum DaemonSource {
     /// touched.
     Override,
     /// Installed for the user: the production bundle's sidecar or a
-    /// `myownmesh` on `$PATH` (what the installer drops). Kept current
-    /// against the pin by asking it to update itself.
+    /// `myownmesh` on `$PATH` (what the installer drops). Version-checked
+    /// against the pin; updated only with explicit operator opt-in.
     Installed,
     /// A dev artifact (the dev-staged sidecar, the `build.rs` source
     /// slot, a sibling checkout's target dir) — never touched;
@@ -600,22 +620,28 @@ fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
 /// shutdown is near-instant; this is slack for a wedged one mid-teardown.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Reuse the daemon already answering the socket *as today*: log its version
-/// against the pin and, when it's stale and ours-to-keep-current, refresh the
-/// binary on disk for the next start. Always returns `Ok(None)` — "a daemon is
-/// already running; step aside". Factored out so both reuse paths (foreign
-/// daemon, and an orphan we couldn't cleanly replace) share one body.
+/// Reuse the daemon already answering the socket: log its version against the
+/// pin and leave both the live process and binary on disk untouched unless an
+/// operator explicitly opted in to an update. Always returns `Ok(None)`,
+/// meaning "a daemon is already running; step aside". Factored out so both
+/// reuse paths share one body.
 async fn reuse_running_daemon(client: &ControlClient) -> Result<Option<DaemonChild>> {
     if log_daemon_version(client).await {
-        // The running daemon is stale, but it isn't ours to restart (an
-        // externally-started daemon, or one we couldn't replace). Refresh the
-        // binary on disk so the *next* daemon start runs the pinned features.
-        if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
-            if run_daemon_update(&bin).await {
-                tracing::warn!(
-                    "updated myownmesh on disk, but the running daemon keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch the app"
-                );
+        if daemon_update_opted_in() {
+            // The running daemon is stale, but it isn't ours to restart. An
+            // explicit opt-in may refresh the on-disk binary for the next
+            // coordinated restart; the live process is never killed here.
+            if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
+                if run_daemon_update(&bin).await {
+                    tracing::warn!(
+                        "updated myownmesh on disk, but the running daemon keeps the old version until it restarts; restart all communicating endpoints in the same maintenance window"
+                    );
+                }
             }
+        } else {
+            tracing::warn!(
+                "leaving the older myownmesh binary untouched; set ALLMYSTUFF_ALLOW_MYOWNMESH_UPDATE=1 only during a coordinated fleet update"
+            );
         }
     }
     Ok(None)
@@ -788,6 +814,23 @@ mod tests {
         assert!((0, 10, 0) > (0, 2, 4));
         assert!((1, 0, 0) > (0, 10, 0));
         assert!((0, 2, 4) >= (0, 2, 4));
+    }
+
+    #[test]
+    fn daemon_update_requires_an_explicit_truthy_value() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(!explicit_update_opt_in(value), "{value:?} opted in");
+        }
+        for value in [Some("1"), Some("true"), Some(" TRUE ")] {
+            assert!(explicit_update_opt_in(value), "{value:?} did not opt in");
+        }
     }
 
     // The pidfile env reads/writes a process-global (`MYOWNMESH_HOME`), so
