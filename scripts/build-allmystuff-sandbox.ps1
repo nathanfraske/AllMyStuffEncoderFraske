@@ -134,6 +134,8 @@ $builtFiles = [ordered]@{
         Join-Path $sourceRoot 'scripts\deploy-allmystuff-sandbox-remote.ps1'
     'test-allmystuff-sandbox-pair.ps1' =
         Join-Path $sourceRoot 'scripts\test-allmystuff-sandbox-pair.ps1'
+    'sandbox-motion-source.ps1' =
+        Join-Path $sourceRoot 'scripts\sandbox-motion-source.ps1'
     'sandbox-fleet-policy.example.json' =
         Join-Path $sourceRoot 'scripts\sandbox-fleet-policy.example.json'
     'summarize_video_profile.py' =

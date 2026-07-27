@@ -1,7 +1,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Stage', 'Start', 'Status', 'Control', 'Probe', 'Stop', 'Collect')]
+    [ValidateSet(
+        'Stage',
+        'Start',
+        'Status',
+        'Control',
+        'Probe',
+        'MotionStart',
+        'MotionStatus',
+        'MotionStop',
+        'Stop',
+        'Collect'
+    )]
     [string]$Action,
 
     [Parameter(Mandatory = $true)]
@@ -40,6 +51,9 @@ param(
 
     [ValidateRange(1, 60)]
     [int]$TelemetrySeconds = 1,
+
+    [ValidateRange(3, 900)]
+    [int]$MotionDurationSeconds = 300,
 
     [ValidateRange(2, 120)]
     [int]$RequestTtlMinutes = 15,
@@ -262,6 +276,7 @@ $request = [ordered]@{
         trace_events = $ProfileTraceEvents
         telemetry_seconds = $TelemetrySeconds
     }
+    motion_duration_seconds = $MotionDurationSeconds
     install_firewall_if_elevated = $true
     worker_idle_seconds = $WorkerIdleSeconds
     worker_stop_after = ($Action -ceq 'Collect')

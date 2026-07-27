@@ -9,6 +9,9 @@ probe from a sealed portable bundle.
 The dated smoke-test evidence and remaining limits are recorded in
 `docs/SANDBOX-HARNESS-VALIDATION-20260726.md`.
 
+The sustained moving-pattern profile and its next test slice are recorded in
+`docs/SANDBOX-MOTION-VALIDATION-20260727.md`.
+
 Sealed remote deployment and sandbox-to-sandbox video profiling are described
 in `docs/SANDBOX-INTERBOX.md`.
 
@@ -82,11 +85,12 @@ application.
 | `allmystuff-sandbox.ps1` | Starts, inspects, controls, probes, and stops one exact local sandbox instance. |
 | `sandbox_process_launcher.exe` | Starts a long-lived sandbox process with file-backed logs and returns its PID without tying it to the bootstrap terminal. |
 | `sandbox_remote_worker.exe` | Executes fixed sandbox actions from the Files inbox under a bounded lease and seals every result. |
+| `sandbox-motion-source.ps1` | Starts, inspects, and stops one leased full-screen checker pattern with independently moving orange and purple targets. |
 | `sandbox_node_control.exe` | Exposes only the local sandbox identity, network, exact-peer, and temporary display-grant operations needed by the pair runner. |
 | `p2_remote_transport.exe` | Transfers files and performs the one bounded bootstrap over existing authenticated Files and terminal data routes. |
 | `bootstrap-allmystuff-sandbox-remote.ps1` | Validates the target, manifest, firewall, worker, and request before invoking the stable sandbox runner. |
 | `deploy-allmystuff-sandbox-remote.ps1` | Applies the local target policy, creates a sealed request, verifies the remote result, and downloads a sealed collection. |
-| `test-allmystuff-sandbox-pair.ps1` | Creates a two-host test network, authenticates exact peers, grants temporary screen view, runs bilateral probes, and cleans up. |
+| `test-allmystuff-sandbox-pair.ps1` | Creates a two-host test network, authenticates exact peers, grants temporary screen view, optionally starts bilateral motion sources, runs bilateral probes, preserves completed legs after an opted-in probe failure, and cleans up. |
 | `video_prod_probe.exe` | Opens a production video route through the sandbox node IPC and records frame, pacing, content, route, and rewatch results. |
 | `summarize_video_profile.py` | Summarizes one or more process-local JSONL traces without subtracting clocks across hosts. |
 | `sandbox-fleet-policy.example.json` | Documents the local allowlist shape for exact remote targets and protected ports. |

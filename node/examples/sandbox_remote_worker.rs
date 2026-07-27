@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -214,7 +214,7 @@ fn execute_request(config: &Config, request: &Value) -> Result<()> {
         .join("outbox")
         .join(format!("sandbox-remote-result-{request_id}.json"));
 
-    let output = Command::new("powershell.exe")
+    let status = Command::new("powershell.exe")
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -225,21 +225,14 @@ fn execute_request(config: &Config, request: &Value) -> Result<()> {
         ])
         .arg(&bootstrap)
         .current_dir(&config.runtime)
-        .output()
+        .stdin(Stdio::null())
+        .status()
         .with_context(|| format!("launch stable bootstrap: {}", bootstrap.display()))?;
 
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-    if !output.status.success() || !result_path.is_file() {
+    if !status.success() || !result_path.is_file() {
         let message = format!(
-            "bootstrap exit={:?}; stdout={}; stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            "bootstrap exit={:?}; inspect the sandbox worker logs",
+            status.code(),
         );
         write_json_atomic(&result_path, &error_result(request, message))?;
     }

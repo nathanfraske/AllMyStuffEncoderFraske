@@ -65,6 +65,11 @@ runtime. The worker:
 - exits immediately after sealing a collection response;
 - removes its process record on exit.
 
+The worker sends bootstrap output to its file-backed worker logs. It does not
+capture bootstrap output in anonymous pipes that a detached GUI child could
+inherit. A successful `MotionStart` therefore returns after its READY and GO
+handshake while the leased pattern remains active.
+
 `Stage` and `Start` use the one terminal bootstrap. `Status`, `Control`,
 `Probe`, `Stop`, and `Collect` use the worker and Files. A request is never
 replayed after execution merely because its result download failed.
@@ -252,6 +257,38 @@ test protocol calls for them.
 `both` runs native decode and compressed delivery in both directions. Tests
 run sequentially so one diagnostic route cannot steal resources from the
 other. Every probe tears down its exact generation-aware route.
+
+For the validated sustained motion protocol, run native delivery with the
+leased pattern and preserve a completed direction if the other probe fails:
+
+```powershell
+& C:\t\ams-sandbox-bundles\interbox-001\test-allmystuff-sandbox-pair.ps1 `
+  -Action Full `
+  -BundleDir C:\t\ams-sandbox-bundles\interbox-001 `
+  -FirstPeerId '<exact first device id>' `
+  -SecondPeerId '<exact second device id>' `
+  -FirstInstanceId 'motion-a' `
+  -SecondInstanceId 'motion-b' `
+  -RunId 'motion-001' `
+  -PolicyPath .\.sandbox-fleet-policy.json `
+  -ArtifactDir C:\t\ams-sandbox-results `
+  -Seconds 30 `
+  -Cycles 2 `
+  -MotionLeaseSeconds 300 `
+  -Delivery native `
+  -MotionPalette `
+  -ContinueOnProbeFailure `
+  -Execute
+```
+
+`MotionPalette` starts one validated source on each host and enables the
+decoded palette proxy. `ContinueOnProbeFailure` does not turn a failed leg into
+a pass. It records the error, retains every completed result, continues
+guarded teardown, and sets the final session status to
+`complete_with_test_failures`.
+
+The 2026-07-27 result and its evidence hashes are in
+`docs/SANDBOX-MOTION-VALIDATION-20260727.md`.
 
 Before the first probe, `Full` creates the two temporary display-consume
 grants described above. It records both grant results in the pair session.

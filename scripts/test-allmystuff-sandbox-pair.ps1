@@ -34,8 +34,13 @@ param(
     [ValidateRange(1, 100)]
     [int]$Cycles = 2,
 
+    [ValidateRange(15, 900)]
+    [int]$MotionLeaseSeconds = 300,
+
     [ValidateSet('native', 'compressed', 'both')]
     [string]$Delivery = 'both',
+
+    [switch]$ContinueOnProbeFailure,
 
     [ValidateRange(1, 300)]
     [int]$PeerTimeoutSeconds = 60,
@@ -80,7 +85,9 @@ function Invoke-Remote {
         [string[]]$Control = @('identity'),
         [string[]]$Probe = @('--list'),
         [string]$NetworkMode = 'Isolated',
-        [string[]]$AllowedNetwork = @()
+        [string[]]$AllowedNetwork = @(),
+        [ValidateRange(3, 900)]
+        [int]$MotionDurationSeconds = 300
     )
     $arguments = @{
         Action = $RemoteAction
@@ -103,6 +110,7 @@ function Invoke-Remote {
             'Worker'
         }
         WorkerIdleSeconds = 900
+        MotionDurationSeconds = $MotionDurationSeconds
         Execute = $true
     }
     $raw = & $script:Deploy @arguments
@@ -186,6 +194,21 @@ function Invoke-Cleanup {
         $entry = $Session.$side
         if ($null -eq $entry) {
             continue
+        }
+        $motionProperty = $Session.PSObject.Properties['motion']
+        $motionStopProperty = "${side}_stop"
+        if ($null -ne $motionProperty -and
+            $motionProperty.Value.requested -eq $true) {
+            try {
+                $motionProperty.Value.$motionStopProperty = Invoke-Remote `
+                    -Peer ([string]$entry.peer_id) `
+                    -Instance ([string]$entry.instance_id) `
+                    -RemoteAction 'MotionStop' -OperationRunId $RunId
+            } catch {
+                $errors.Add(
+                    "$side stop motion source: $($_.Exception.Message)"
+                )
+            }
         }
         $otherSide = if ($side -ceq 'first') { 'second' } else { 'first' }
         $other = $Session.$otherSide
@@ -349,6 +372,22 @@ $session = [pscustomobject][ordered]@{
         first_grant = $null
         second_grant = $null
     }
+    motion = [pscustomobject][ordered]@{
+        requested = [bool]$MotionPalette
+        duration_limit_seconds = if ($MotionPalette) {
+            $MotionLeaseSeconds
+        } else {
+            0
+        }
+        first_started = $false
+        second_started = $false
+        first_start = $null
+        second_start = $null
+        first_final_status = $null
+        second_final_status = $null
+        first_stop = $null
+        second_stop = $null
+    }
     first = [pscustomobject][ordered]@{
         peer_id = $FirstPeerId
         instance_id = $FirstInstanceId
@@ -368,6 +407,7 @@ $session = [pscustomobject][ordered]@{
         profile_summary = $null
     }
     tests = @()
+    test_errors = @()
     cleanup_errors = @()
 }
 Write-Utf8NoBom -Path $SessionPath -Text (
@@ -475,7 +515,32 @@ try {
     } else {
         @($Delivery)
     }
+    if ($MotionPalette) {
+        $session.motion.first_start = Invoke-Remote -Peer $FirstPeerId `
+            -Instance $FirstInstanceId -RemoteAction 'MotionStart' `
+            -OperationRunId $RunId `
+            -MotionDurationSeconds $MotionLeaseSeconds
+        $session.motion.first_started = $true
+        $session.motion.second_start = Invoke-Remote -Peer $SecondPeerId `
+            -Instance $SecondInstanceId -RemoteAction 'MotionStart' `
+            -OperationRunId $RunId `
+            -MotionDurationSeconds $MotionLeaseSeconds
+        $session.motion.second_started = $true
+        foreach ($started in @(
+            $session.motion.first_start,
+            $session.motion.second_start
+        )) {
+            if ([string]$started.operation.status -cne 'started' -or
+                $started.operation.running -ne $true -or
+                $started.operation.source_status.validated -ne $true -or
+                [int]$started.operation.source_status.frame -lt 10 -or
+                [int]$started.operation.source_status.paint_count -lt 2) {
+                throw 'one or both motion sources failed their paint handshake'
+            }
+        }
+    }
     $tests = [System.Collections.Generic.List[object]]::new()
+    $testErrors = [System.Collections.Generic.List[string]]::new()
     foreach ($mode in $deliveries) {
         foreach ($direction in @(
             [pscustomobject]@{
@@ -501,20 +566,75 @@ try {
                 $probeArgs += '--motion-palette'
             }
             $probeRun = "$RunId-$($direction.name)-$mode"
-            $result = Invoke-Remote -Peer ([string]$direction.viewer_peer) `
-                -Instance ([string]$direction.viewer_instance) `
-                -RemoteAction 'Probe' -OperationRunId $probeRun `
-                -Probe $probeArgs
-            $tests.Add([pscustomobject][ordered]@{
-                direction = [string]$direction.name
-                delivery = $mode
-                source = [string]$direction.source
-                result = $result.operation.report
-            })
+            try {
+                $result = Invoke-Remote -Peer (
+                    [string]$direction.viewer_peer
+                ) -Instance ([string]$direction.viewer_instance) `
+                    -RemoteAction 'Probe' -OperationRunId $probeRun `
+                    -Probe $probeArgs
+                $tests.Add([pscustomobject][ordered]@{
+                    direction = [string]$direction.name
+                    delivery = $mode
+                    source = [string]$direction.source
+                    result = $result.operation.report
+                    error = $null
+                })
+            } catch {
+                if (-not $ContinueOnProbeFailure) {
+                    throw
+                }
+                $message = "$($direction.name) ${mode}: $($_.Exception.Message)"
+                $testErrors.Add($message)
+                $tests.Add([pscustomobject][ordered]@{
+                    direction = [string]$direction.name
+                    delivery = $mode
+                    source = [string]$direction.source
+                    result = $null
+                    error = $message
+                })
+            }
+            $session.tests = $tests.ToArray()
+            $session.test_errors = $testErrors.ToArray()
+            Write-Utf8NoBom -Path $SessionPath -Text (
+                ($session | ConvertTo-Json -Depth 30) +
+                    [Environment]::NewLine
+            )
+        }
+    }
+    if ($MotionPalette) {
+        $session.motion.first_final_status = Invoke-Remote `
+            -Peer $FirstPeerId -Instance $FirstInstanceId `
+            -RemoteAction 'MotionStatus' -OperationRunId $RunId
+        $session.motion.second_final_status = Invoke-Remote `
+            -Peer $SecondPeerId -Instance $SecondInstanceId `
+            -RemoteAction 'MotionStatus' -OperationRunId $RunId
+        foreach ($statusPair in @(
+            [pscustomobject]@{
+                start = $session.motion.first_start
+                final = $session.motion.first_final_status
+            },
+            [pscustomobject]@{
+                start = $session.motion.second_start
+                final = $session.motion.second_final_status
+            }
+        )) {
+            if ($statusPair.final.operation.running -ne $true -or
+                $statusPair.final.operation.source_status.validated -ne $true -or
+                [int]$statusPair.final.operation.source_status.frame -le
+                    [int]$statusPair.start.operation.source_status.frame -or
+                [int]$statusPair.final.operation.source_status.paint_count -le
+                    [int]$statusPair.start.operation.source_status.paint_count) {
+                throw 'one or both motion sources stopped advancing during the soak'
+            }
         }
     }
     $session.tests = $tests.ToArray()
-    $session.status = 'tests_complete'
+    $session.test_errors = $testErrors.ToArray()
+    $session.status = if ($testErrors.Count -eq 0) {
+        'tests_complete'
+    } else {
+        'tests_complete_with_failures'
+    }
     Write-Utf8NoBom -Path $SessionPath -Text (
         ($session | ConvertTo-Json -Depth 30) + [Environment]::NewLine
     )
@@ -524,7 +644,11 @@ try {
         $cleanupErrors = @(Invoke-Cleanup -Session $session -Collect)
         $session.cleanup_errors = @($cleanupErrors)
         $session.status = if ($completed -and $cleanupErrors.Count -eq 0) {
-            'complete'
+            if (@($session.test_errors).Count -eq 0) {
+                'complete'
+            } else {
+                'complete_with_test_failures'
+            }
         } elseif ($cleanupErrors.Count -eq 0) {
             'test_failed_cleaned'
         } else {

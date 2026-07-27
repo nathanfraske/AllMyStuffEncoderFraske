@@ -91,6 +91,10 @@ function Assert-Request {
     if ($Request.worker_stop_after -isnot [bool]) {
         throw 'worker_stop_after must be boolean'
     }
+    $motionDuration = [int]$Request.motion_duration_seconds
+    if ($motionDuration -lt 3 -or $motionDuration -gt 900) {
+        throw 'motion_duration_seconds must be between 3 and 900'
+    }
 }
 
 function Get-FirewallStatus {
@@ -525,6 +529,31 @@ if ($null -eq $operation) {
                     $null
                 }
             }
+        }
+        'MotionStart' {
+            $motion = Join-Path $runtime 'sandbox-motion-source.ps1'
+            if (-not (Test-Path -LiteralPath $motion -PathType Leaf)) {
+                throw "sandbox motion source is missing: $motion"
+            }
+            $motionRoot = Join-Path (Join-Path $state 'artifacts') 'motion'
+            $raw = & $motion -Action Start -StateRoot $motionRoot `
+                -RunId ([string]$request.run_id) `
+                -DurationSeconds ([int]$request.motion_duration_seconds)
+            $operation = (($raw | Out-String).Trim()) | ConvertFrom-Json
+        }
+        'MotionStatus' {
+            $motion = Join-Path $runtime 'sandbox-motion-source.ps1'
+            $motionRoot = Join-Path (Join-Path $state 'artifacts') 'motion'
+            $raw = & $motion -Action Status -StateRoot $motionRoot `
+                -RunId ([string]$request.run_id)
+            $operation = (($raw | Out-String).Trim()) | ConvertFrom-Json
+        }
+        'MotionStop' {
+            $motion = Join-Path $runtime 'sandbox-motion-source.ps1'
+            $motionRoot = Join-Path (Join-Path $state 'artifacts') 'motion'
+            $raw = & $motion -Action Stop -StateRoot $motionRoot `
+                -RunId ([string]$request.run_id)
+            $operation = (($raw | Out-String).Trim()) | ConvertFrom-Json
         }
         'Stop' {
             $args = $baseRunner.Clone()
