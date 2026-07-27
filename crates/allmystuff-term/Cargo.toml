@@ -39,4 +39,3 @@ tokio = { workspace = true, features = ["net"] }
 interprocess = { workspace = true }
 # Cross-platform raw mode + terminal size — macOS / Linux / Windows in one API.
 crossterm = { workspace = true }
-dirs = { workspace = true }

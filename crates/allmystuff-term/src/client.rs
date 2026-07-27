@@ -130,27 +130,22 @@ enum SocketAddr {
     #[cfg(unix)]
     Path(std::path::PathBuf),
     #[cfg(not(unix))]
-    Name(String),
+    Name(std::ffi::OsString),
 }
-
-#[cfg(not(unix))]
-const NODE_SOCKET_NAME: &str = "allmystuff-node";
 
 fn node_socket_addr() -> Result<SocketAddr, String> {
     #[cfg(unix)]
     {
-        let home = std::env::var_os("MYOWNMESH_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(dirs::home_dir)
-            .map(|h| h.join(".myownmesh"))
-            .ok_or_else(|| {
-                "couldn't resolve the ~/.myownmesh home for the node socket".to_string()
-            })?;
-        Ok(SocketAddr::Path(home.join("allmystuff-node.sock")))
+        let path = allmystuff_protocol::control::node_socket_path().ok_or_else(|| {
+            "couldn't resolve the ~/.myownmesh home for the node socket".to_string()
+        })?;
+        Ok(SocketAddr::Path(path))
     }
     #[cfg(not(unix))]
     {
-        Ok(SocketAddr::Name(NODE_SOCKET_NAME.to_string()))
+        Ok(SocketAddr::Name(
+            allmystuff_protocol::control::node_pipe_name(),
+        ))
     }
 }
 
@@ -164,7 +159,7 @@ impl SocketAddr {
                 .map_err(|e| format!("node socket path → fs_name: {e}")),
             #[cfg(not(unix))]
             SocketAddr::Name(n) => n
-                .as_str()
+                .as_os_str()
                 .to_ns_name::<GenericNamespaced>()
                 .map_err(|e| format!("node socket name → ns_name: {e}")),
         }

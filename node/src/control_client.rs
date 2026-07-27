@@ -38,7 +38,7 @@ enum SocketAddr {
     #[cfg(unix)]
     Path(std::path::PathBuf),
     #[cfg(not(unix))]
-    Name(String),
+    Name(std::ffi::OsString),
 }
 
 pub struct ControlClient {
@@ -49,7 +49,7 @@ impl ControlClient {
     pub fn new() -> Result<Self> {
         #[cfg(unix)]
         {
-            let path = allmystuff_protocol::control::default_socket_path()
+            let path = allmystuff_protocol::control::socket_path()
                 .context("resolve daemon socket path")?;
             Ok(Self {
                 addr: SocketAddr::Path(path),
@@ -58,9 +58,7 @@ impl ControlClient {
         #[cfg(not(unix))]
         {
             Ok(Self {
-                addr: SocketAddr::Name(
-                    allmystuff_protocol::control::default_pipe_name().to_string(),
-                ),
+                addr: SocketAddr::Name(allmystuff_protocol::control::pipe_name()),
             })
         }
     }
@@ -273,7 +271,7 @@ impl ControlClient {
                 .context("socket path → fs_name")?,
             #[cfg(not(unix))]
             SocketAddr::Name(n) => n
-                .as_str()
+                .as_os_str()
                 .to_ns_name::<GenericNamespaced>()
                 .context("socket name → ns_name")?,
         };

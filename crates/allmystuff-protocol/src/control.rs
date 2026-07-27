@@ -508,8 +508,27 @@ pub enum ServerOut {
     },
 }
 
-/// Default daemon control-socket location, recomputed locally so the
-/// build stays independent of `myownmesh-core` (matching the GUI's
+/// Explicit local daemon control-socket override used by isolated test
+/// instances. This changes only the local IPC endpoint between AllMyStuff and
+/// its MyOwnMesh sidecar. It does not change any peer, signaling, or media wire
+/// format.
+pub const MESH_SOCKET_ENV: &str = "ALLMYSTUFF_MESH_SOCKET";
+
+/// Explicit local AllMyStuff node control-socket override used by isolated test
+/// instances. Like [`MESH_SOCKET_ENV`], this is process-local configuration and
+/// never leaves the machine.
+pub const NODE_SOCKET_ENV: &str = "ALLMYSTUFF_NODE_SOCKET";
+
+fn nonempty_value(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
+    nonempty_value(std::env::var_os(name))
+}
+
+/// Default daemon control-socket location, recomputed locally so the build
+/// stays independent of `myownmesh-core` (matching the GUI's
 /// `ControlClient::new`). Honours `MYOWNMESH_HOME`.
 #[cfg(unix)]
 pub fn default_socket_path() -> Option<std::path::PathBuf> {
@@ -517,6 +536,16 @@ pub fn default_socket_path() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .or_else(dirs_home)?;
     Some(home.join(".myownmesh").join("daemon.sock"))
+}
+
+/// Effective daemon control-socket path. An explicit
+/// [`MESH_SOCKET_ENV`] path wins; otherwise this returns
+/// [`default_socket_path`].
+#[cfg(unix)]
+pub fn socket_path() -> Option<std::path::PathBuf> {
+    nonempty_env(MESH_SOCKET_ENV)
+        .map(std::path::PathBuf::from)
+        .or_else(default_socket_path)
 }
 
 #[cfg(unix)]
@@ -529,6 +558,52 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 #[cfg(not(unix))]
 pub fn default_pipe_name() -> &'static str {
     "myownmesh.sock"
+}
+
+/// Effective daemon control-pipe name. An explicit [`MESH_SOCKET_ENV`]
+/// namespaced segment wins; otherwise this returns [`default_pipe_name`].
+#[cfg(not(unix))]
+pub fn pipe_name() -> std::ffi::OsString {
+    nonempty_env(MESH_SOCKET_ENV).unwrap_or_else(|| std::ffi::OsString::from(default_pipe_name()))
+}
+
+/// Effective AllMyStuff node control-socket path. On Unix, the explicit
+/// [`NODE_SOCKET_ENV`] path wins; otherwise the socket stays beside the
+/// node's existing state under `MYOWNMESH_HOME` or `~/.myownmesh`.
+#[cfg(unix)]
+pub fn node_socket_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = nonempty_env(NODE_SOCKET_ENV) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let home = std::env::var_os("MYOWNMESH_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs_home)?;
+    Some(home.join(".myownmesh").join("allmystuff-node.sock"))
+}
+
+/// Effective AllMyStuff node control-pipe name. On Windows, the explicit
+/// [`NODE_SOCKET_ENV`] namespaced segment wins.
+#[cfg(not(unix))]
+pub fn node_pipe_name() -> std::ffi::OsString {
+    nonempty_env(NODE_SOCKET_ENV).unwrap_or_else(|| std::ffi::OsString::from("allmystuff-node"))
+}
+
+#[cfg(test)]
+mod local_socket_override_tests {
+    use super::nonempty_value;
+    use std::ffi::OsString;
+
+    #[test]
+    fn missing_and_empty_overrides_are_not_selected() {
+        assert_eq!(nonempty_value(None), None);
+        assert_eq!(nonempty_value(Some(OsString::new())), None);
+    }
+
+    #[test]
+    fn nonempty_override_is_preserved_exactly() {
+        let value = OsString::from("sandbox-pipe-1");
+        assert_eq!(nonempty_value(Some(value.clone())), Some(value));
+    }
 }
 
 // ---- binary media-track pipe frame codec -----------------------------------

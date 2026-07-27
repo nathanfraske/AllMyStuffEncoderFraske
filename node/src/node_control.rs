@@ -178,31 +178,27 @@ enum SocketAddr {
     #[cfg(unix)]
     Path(PathBuf),
     #[cfg(not(unix))]
-    Name(String),
+    Name(std::ffi::OsString),
 }
-
-/// On Windows the namespaced pipe name. (On unix the socket is a file path
-/// under the `~/.myownmesh` home; see [`node_socket_addr`].)
-#[cfg(not(unix))]
-const NODE_SOCKET_NAME: &str = "allmystuff-node";
 
 /// Resolve the node control socket address. On unix it's
 /// `<myownmesh_home>/allmystuff-node.sock` — the *same* `~/.myownmesh` home
 /// (honoring `MYOWNMESH_HOME`) the ownership store and networks store use; on
-/// Windows it's a namespaced pipe. Distinct from the daemon socket either way.
+/// Windows it's a namespaced pipe. The local-only `ALLMYSTUFF_NODE_SOCKET`
+/// override gives a sandbox process its own endpoint. Distinct from the daemon
+/// socket either way.
 fn node_socket_addr() -> Result<SocketAddr> {
     #[cfg(unix)]
     {
-        let home = std::env::var_os("MYOWNMESH_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir)
-            .map(|h| h.join(".myownmesh"))
+        let path = allmystuff_protocol::control::node_socket_path()
             .context("resolve the ~/.myownmesh home for the node socket")?;
-        Ok(SocketAddr::Path(home.join("allmystuff-node.sock")))
+        Ok(SocketAddr::Path(path))
     }
     #[cfg(not(unix))]
     {
-        Ok(SocketAddr::Name(NODE_SOCKET_NAME.to_string()))
+        Ok(SocketAddr::Name(
+            allmystuff_protocol::control::node_pipe_name(),
+        ))
     }
 }
 
@@ -217,7 +213,7 @@ impl SocketAddr {
                 .context("node socket path → fs_name"),
             #[cfg(not(unix))]
             SocketAddr::Name(n) => n
-                .as_str()
+                .as_os_str()
                 .to_ns_name::<GenericNamespaced>()
                 .context("node socket name → ns_name"),
         }

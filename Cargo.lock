@@ -118,7 +118,6 @@ dependencies = [
  "allmystuff-service",
  "allmystuff-session",
  "crossterm",
- "dirs",
  "interprocess",
  "serde",
  "serde_json",
