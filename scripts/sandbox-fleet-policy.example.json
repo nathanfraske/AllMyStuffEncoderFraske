@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "kind": "allmystuff-sandbox-fleet-policy",
+  "targets": [
+    {
+      "peer_id": "replace-with-exact-device-id",
+      "computer_name": "DESKTOP-EXAMPLE",
+      "label": "Example test box",
+      "protected_ports": []
+    }
+  ]
+}

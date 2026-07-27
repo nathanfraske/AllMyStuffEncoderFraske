@@ -2,12 +2,15 @@
 
 ## Status
 
-The first sandbox cut is a headless, black-box AllMyStuff instance. It runs a
+The sandbox cut is a headless, black-box AllMyStuff instance. It runs a
 real `allmystuff-serve`, its pinned MyOwnMesh sidecar, and the production video
 probe from a sealed portable bundle.
 
 The dated smoke-test evidence and remaining limits are recorded in
 `docs/SANDBOX-HARNESS-VALIDATION-20260726.md`.
+
+Sealed remote deployment and sandbox-to-sandbox video profiling are described
+in `docs/SANDBOX-INTERBOX.md`.
 
 The harness does not replace, stop, restart, or reuse the installed
 AllMyStuff stack. It also does not use the installed identity or state.
@@ -61,12 +64,35 @@ the repository's `.myownmesh-rev` pin.
 ```
 
 The builder derives the expected MyOwnMesh version from `.myownmesh-rev`,
-checks the supplied sidecar's reported version, builds the backend, video
-probe, and `amst`, then records source state and file hashes in
-`sandbox-bundle.json`.
+checks the supplied sidecar's reported version, builds the field-instrumented
+backend, video probe, bounded remote transport, sandbox node-control helper,
+detached process launcher, leased remote worker, and `amst`, then records
+source state and file hashes in `sandbox-bundle.json`.
 
 The output directory must be empty. The builder never edits the installed
 application.
+
+## Tool inventory
+
+| Tool | Purpose |
+| --- | --- |
+| `build-allmystuff-sandbox.ps1` | Builds one sealed bundle, validates the pinned MyOwnMesh version, and records every file hash and source-state entry. |
+| `stage-allmystuff-sandbox.ps1` | Verifies a bundle and rotates it into the stable sandbox runtime without changing the installed application. |
+| `configure-allmystuff-sandbox-firewall.ps1` | Shows, installs, or removes only the two named stable-path MyOwnMesh inbound rules. |
+| `allmystuff-sandbox.ps1` | Starts, inspects, controls, probes, and stops one exact local sandbox instance. |
+| `sandbox_process_launcher.exe` | Starts a long-lived sandbox process with file-backed logs and returns its PID without tying it to the bootstrap terminal. |
+| `sandbox_remote_worker.exe` | Executes fixed sandbox actions from the Files inbox under a bounded lease and seals every result. |
+| `sandbox_node_control.exe` | Exposes only the local sandbox identity, network, exact-peer, and temporary display-grant operations needed by the pair runner. |
+| `p2_remote_transport.exe` | Transfers files and performs the one bounded bootstrap over existing authenticated Files and terminal data routes. |
+| `bootstrap-allmystuff-sandbox-remote.ps1` | Validates the target, manifest, firewall, worker, and request before invoking the stable sandbox runner. |
+| `deploy-allmystuff-sandbox-remote.ps1` | Applies the local target policy, creates a sealed request, verifies the remote result, and downloads a sealed collection. |
+| `test-allmystuff-sandbox-pair.ps1` | Creates a two-host test network, authenticates exact peers, grants temporary screen view, runs bilateral probes, and cleans up. |
+| `video_prod_probe.exe` | Opens a production video route through the sandbox node IPC and records frame, pacing, content, route, and rewatch results. |
+| `summarize_video_profile.py` | Summarizes one or more process-local JSONL traces without subtracting clocks across hosts. |
+| `sandbox-fleet-policy.example.json` | Documents the local allowlist shape for exact remote targets and protected ports. |
+
+The tools do not install a second GUI. Only the firewall helper requests
+elevation, and only when its explicit `Install` action is used.
 
 ## Use one stable firewall path
 
@@ -181,6 +207,25 @@ bundle, instance ID, and state root. The stop path validates the complete
 process record before terminating anything. It refuses to act on a reused PID,
 different path, changed hash, or changed start time.
 
+On Windows, `sandbox_process_launcher.exe` starts the backend with file-backed
+standard output and standard error handles. It also clears inheritance on the
+launcher's console handles before creating the child. The caller can exit
+without waiting for an anonymous pipe held by the long-running backend or
+sidecar. The launcher writes its exact child PID before it exits.
+
+Each instance keeps these primary diagnostic files:
+
+```text
+logs\sandbox-node.stdout.log
+logs\sandbox-node.stderr.log
+logs\allmystuff-node.log
+artifacts\video-profile.jsonl
+```
+
+The first two contain process streams. `allmystuff-node.log` is the backend's
+own structured log. `video-profile.jsonl` is the bounded process-local stage
+trace when trace profiling is enabled.
+
 The state root is not deleted on stop. That preserves the sandbox identity,
 joined test networks, logs, and evidence for the next run. Delete or rotate it
 only as a separate reviewed action.
@@ -190,16 +235,21 @@ only as a separate reviewed action.
 A two-box test uses one sandbox instance per box:
 
 1. Transfer the same sealed bundle through the already-authorized production
-   AllMyStuff data path.
-2. Start each sandbox with a different instance ID and state root.
+   AllMyStuff Files data path.
+2. Use one bounded terminal bootstrap on each host to start its sandbox and
+   sealed leased worker.
 3. Keep the default `Isolated` mode while staging each box.
-4. Join both fresh sandbox identities to a dedicated test network.
-5. Approve those identities through the normal local ownership and roster
-   flow.
-6. Run `video_prod_probe` against the sandbox node pipe.
-7. Keep the production AllMyStuff connection and the AllMyAgents listener in
+4. Join both fresh sandbox identities to one short-lived, high-entropy test
+   network.
+5. Require each endpoint to see exactly the other expected identity on an
+   authenticated active ICE pair.
+6. Create one temporary display-consume share grant in each sandbox so the
+   exact peer may pull its screen.
+7. Run `video_prod_probe` against the sandbox node pipe.
+8. Keep the production AllMyStuff connection and the AllMyAgents listener in
    the protected snapshot.
-8. Stop only the sandbox instances when the run is complete.
+9. Revoke both grants, leave the test network, stop only the sandbox
+   instances, collect both sealed profiles, and stop both workers.
 
 The sandbox connection is a separate MyOwnMesh session. Video and application
 payload still travel only on the authenticated ICE data path selected by the
@@ -217,6 +267,13 @@ signaling.
   restart.
 - Exact binary and source identities survive remote handoff in one manifest.
 - Protected local services can be checked before and after every operation.
+- One AMD and one NVIDIA host can complete native and compressed H.264 routes
+  in both directions through disposable sandbox identities.
+- AMD and NVIDIA hardware Media Foundation encode are active on the tested
+  hosts.
+- NVIDIA NVDEC is active on the tested NVIDIA viewer.
+- Automatic decode on the tested AMD viewer currently falls back to OpenH264
+  software. AMD hardware decode remains a product gap.
 
 ## What is not in the first cut
 
@@ -235,7 +292,9 @@ GUI sandbox needs:
 This is implementable as a dedicated Tauri config overlay plus a compile-time
 feature. It should follow the headless isolation proof, not precede it.
 
-The first cut also does not automate test-network creation, roster approval, or
-remote deployment. Those actions change mesh membership and remain explicit.
-It does not restart AllMyAgents or any production process. A protected-port
+The inter-box controller now automates sealed Files transfer, one bounded
+terminal bootstrap per endpoint, leased worker requests, dedicated network
+creation, exact-peer admission checks, temporary display grants,
+bidirectional probes, cleanup, and artifact collection. The standalone runner
+still does not restart AllMyAgents or any production process. A protected-port
 change stops the harness with evidence and leaves recovery to the owner.

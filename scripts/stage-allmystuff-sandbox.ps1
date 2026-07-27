@@ -55,7 +55,8 @@ function Assert-NoRuntimeProcess {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     foreach ($process in @(
-        Get-Process -Name 'allmystuff-serve', 'myownmesh' -ErrorAction SilentlyContinue
+        Get-Process -Name 'allmystuff-serve', 'myownmesh',
+            'sandbox_remote_worker' -ErrorAction SilentlyContinue
     )) {
         $processPath = [string]$process.Path
         if ([string]::IsNullOrWhiteSpace($processPath)) {

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Start', 'Status', 'Probe', 'Stop')]
+    [ValidateSet('Start', 'Status', 'Probe', 'Control', 'Stop')]
     [string]$Action,
 
     [Parameter(Mandatory = $true)]
@@ -16,10 +16,24 @@ param(
 
     [string[]]$ProbeArguments = @('--list'),
 
-    [string]$LogFilter = 'info,allmystuff_node=debug,allmystuff_serve=debug',
+    [string[]]$ControlArguments = @('identity'),
 
-    [ValidateSet('Isolated', 'LocalClaim')]
+    [string]$LogFilter =
+        'info,allmystuff_node=debug,allmystuff_serve=debug,myownmesh=debug',
+
+    [ValidateSet('Isolated', 'LocalClaim', 'TestNetwork')]
     [string]$NetworkMode = 'Isolated',
+
+    [string[]]$AllowedNetworkId = @(),
+
+    [ValidateSet('Off', 'Summary', 'Trace')]
+    [string]$ProfileMode = 'Trace',
+
+    [ValidateRange(100, 1000000)]
+    [int]$ProfileTraceEvents = 100000,
+
+    [ValidateRange(1, 60)]
+    [int]$TelemetrySeconds = 1,
 
     [ValidateRange(1, 300)]
     [int]$StartupTimeoutSeconds = 15,
@@ -274,7 +288,8 @@ function Set-SandboxMeshConfig {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$ControlSocket,
-        [Parameter(Mandatory = $true)][string]$NetworkMode
+        [Parameter(Mandatory = $true)][string]$NetworkMode,
+        [string[]]$AllowedNetworkId = @()
     )
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $path = Join-Path $Root 'config.json'
@@ -296,25 +311,6 @@ function Set-SandboxMeshConfig {
             $networksProperty.Value
         }
     )
-    $localClaimConfig = $configuredNetworks |
-        Where-Object {
-            [string]$_.id -ceq $localClaimId -or
-            [string]$_.network_id -ceq $localClaimId
-        } |
-        Select-Object -First 1
-    if ($NetworkMode -ceq 'Isolated') {
-        $configuredNetworks = @($configuredNetworks | Where-Object {
-            [string]$_.id -cne $localClaimId -and
-            [string]$_.network_id -cne $localClaimId
-        })
-        Set-ObjectProperty -Object $config -Name 'networks' -Value $configuredNetworks
-    }
-
-    $json = $config | ConvertTo-Json -Depth 32
-    $temp = "$path.tmp-$PID"
-    Write-Utf8NoBom -Path $temp -Text ($json + [Environment]::NewLine)
-    Move-Item -LiteralPath $temp -Destination $path -Force
-
     $disabledDir = Join-Path $Root '.myownmesh'
     New-Item -ItemType Directory -Force -Path $disabledDir | Out-Null
     $disabledPath = Join-Path $disabledDir 'allmystuff-networks.json'
@@ -326,31 +322,89 @@ function Set-SandboxMeshConfig {
     $disabledProperty = $disabledStore.PSObject.Properties['disabled']
     $disabledNetworks = @(
         if ($null -ne $disabledProperty) {
-            $disabledProperty.Value | Where-Object {
-                [string]$_.id -cne $localClaimId -and
-                [string]$_.network_id -cne $localClaimId
-            }
+            $disabledProperty.Value
         }
     )
-    if ($NetworkMode -ceq 'Isolated') {
-        if ($null -eq $localClaimConfig) {
-            $localClaimConfig = [pscustomobject][ordered]@{
-                id = $localClaimId
-                network_id = $localClaimId
-                label = 'Local claiming (this LAN)'
-                kind = 'open'
-                auto_approve = $true
-                signaling = [pscustomobject][ordered]@{
-                    strategy = 'none'
-                    mdns = $true
-                }
-                stun_servers = @()
-                turn_servers = @()
+
+    $allNetworks = [ordered]@{}
+    foreach ($network in @($disabledNetworks) + @($configuredNetworks)) {
+        $networkId = [string]$network.network_id
+        if ([string]::IsNullOrWhiteSpace($networkId)) {
+            $networkId = [string]$network.id
+        }
+        if ([string]::IsNullOrWhiteSpace($networkId)) {
+            throw 'sandbox network config has no id or network_id'
+        }
+        $allNetworks[$networkId.ToLowerInvariant()] = $network
+    }
+    if (-not $allNetworks.Contains($localClaimId)) {
+        $allNetworks[$localClaimId] = [pscustomobject][ordered]@{
+            id = $localClaimId
+            network_id = $localClaimId
+            label = 'Local claiming (this LAN)'
+            kind = 'open'
+            auto_approve = $true
+            signaling = [pscustomobject][ordered]@{
+                strategy = 'none'
+                mdns = $true
+            }
+            stun_servers = @()
+            turn_servers = @()
+        }
+    }
+
+    $wanted = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    switch ($NetworkMode) {
+        'Isolated' {
+            if (@($AllowedNetworkId).Count -ne 0) {
+                throw 'Isolated mode cannot allow a network'
             }
         }
-        $disabledNetworks += $localClaimConfig
+        'LocalClaim' {
+            if (@($AllowedNetworkId).Count -ne 0) {
+                throw 'LocalClaim mode cannot allow an additional network'
+            }
+            [void]$wanted.Add($localClaimId)
+        }
+        'TestNetwork' {
+            if (@($AllowedNetworkId).Count -eq 0) {
+                throw 'TestNetwork mode requires at least one AllowedNetworkId'
+            }
+            foreach ($networkId in @($AllowedNetworkId)) {
+                if ([string]::IsNullOrWhiteSpace($networkId) -or
+                    $networkId -ceq $localClaimId) {
+                    throw "invalid test-network allow entry: '$networkId'"
+                }
+                $key = $networkId.ToLowerInvariant()
+                if (-not $allNetworks.Contains($key)) {
+                    throw "allowed test network is not saved in sandbox state: $networkId"
+                }
+                [void]$wanted.Add($key)
+            }
+        }
     }
-    Set-ObjectProperty -Object $disabledStore -Name 'disabled' -Value $disabledNetworks
+
+    $enabledOut = @()
+    $disabledOut = @()
+    foreach ($entry in $allNetworks.GetEnumerator()) {
+        if ($wanted.Contains([string]$entry.Key)) {
+            $enabledOut += $entry.Value
+        } else {
+            $disabledOut += $entry.Value
+        }
+    }
+    Set-ObjectProperty -Object $config -Name 'networks' `
+        -Value ([object[]]@($enabledOut))
+    Set-ObjectProperty -Object $disabledStore -Name 'disabled' `
+        -Value ([object[]]@($disabledOut))
+
+    $json = $config | ConvertTo-Json -Depth 32
+    $temp = "$path.tmp-$PID"
+    Write-Utf8NoBom -Path $temp -Text ($json + [Environment]::NewLine)
+    Move-Item -LiteralPath $temp -Destination $path -Force
+
     $disabledJson = $disabledStore | ConvertTo-Json -Depth 32
     $disabledTemp = "$disabledPath.tmp-$PID"
     Write-Utf8NoBom -Path $disabledTemp -Text (
@@ -386,6 +440,8 @@ $bundleManifest = Assert-Bundle -Path $bundle
 $suffix = if ($script:IsWindows) { '.exe' } else { '' }
 $servePath = Join-Path $bundle "allmystuff-serve$suffix"
 $probePath = Join-Path $bundle "video_prod_probe$suffix"
+$controlPath = Join-Path $bundle "sandbox_node_control$suffix"
+$launcherPath = Join-Path $bundle "sandbox_process_launcher$suffix"
 $meshPath = Join-Path $bundle "myownmesh$suffix"
 
 if ([string]::IsNullOrWhiteSpace($StateRoot)) {
@@ -437,6 +493,32 @@ $environment = @{
     ALLMYSTUFF_NODE_SOCKET = $nodeSocket
     ALLMYSTUFF_AUTOUPDATE = '0'
     ALLMYSTUFF_LOG = $LogFilter
+    ALLMYSTUFF_CWD_LOG = '0'
+    ALLMYSTUFF_VIDEO_STATS = '1'
+    ALLMYSTUFF_H264_DECODER = ''
+    ALLMYSTUFF_VIDEO_ENCODE_ADAPTER = ''
+    ALLMYSTUFF_TELEMETRY =
+        $(if ($ProfileMode -ceq 'Off') { '0' } else { '1' })
+    ALLMYSTUFF_TELEMETRY_SECS = [string]$TelemetrySeconds
+    ALLMYSTUFF_VIDEO_PROFILE_TRACE = '0'
+    ALLMYSTUFF_VIDEO_PROFILE_TRACE_EVENTS = [string]$ProfileTraceEvents
+    ALLMYSTUFF_VIDEO_PROFILE_INTERVAL_MS = '5000'
+    ALLMYSTUFF_VIDEO_PROFILE_MAX_SERIES = '256'
+    RUST_LOG = $LogFilter
+}
+$artifactRoot = Join-Path $state 'artifacts'
+$tracePath = Join-Path $artifactRoot 'video-profile.jsonl'
+switch ($ProfileMode) {
+    'Off' {
+        $environment.ALLMYSTUFF_VIDEO_PROFILE = '0'
+    }
+    'Summary' {
+        $environment.ALLMYSTUFF_VIDEO_PROFILE = '1'
+    }
+    'Trace' {
+        $environment.ALLMYSTUFF_VIDEO_PROFILE = '1'
+        $environment.ALLMYSTUFF_VIDEO_PROFILE_TRACE = $tracePath
+    }
 }
 $runtimePath = Join-Path $state 'sandbox-runtime.json'
 $lastRunPath = Join-Path $state 'sandbox-last-run.json'
@@ -454,33 +536,33 @@ switch ($Action) {
         }
 
         Set-SandboxMeshConfig -Root $state -ControlSocket $meshConfigSocket `
-            -NetworkMode $NetworkMode
+            -NetworkMode $NetworkMode -AllowedNetworkId $AllowedNetworkId
         $protectedProcesses = @(
             Get-BaselineProcesses -ExcludedPath @($servePath, $meshPath)
         )
         $protectedListeners = @(Get-ListenerSnapshot -Ports $ProtectedPort)
         $logs = Join-Path $state 'logs'
         New-Item -ItemType Directory -Force -Path $logs | Out-Null
+        New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
         $stdout = Join-Path $logs 'sandbox-node.stdout.log'
         $stderr = Join-Path $logs 'sandbox-node.stderr.log'
 
-        $process = Invoke-WithEnvironment -Environment $environment -Script {
-            $startArgs = @{
-                FilePath = $servePath
-                ArgumentList = @('--log', $LogFilter)
-                WorkingDirectory = $bundle
-                RedirectStandardOutput = $stdout
-                RedirectStandardError = $stderr
-                PassThru = $true
-            }
-            if ($script:IsWindows) {
-                $startArgs.WindowStyle = 'Hidden'
-            } else {
-                $startArgs.NoNewWindow = $true
-            }
-            Start-Process @startArgs
+        if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+            throw "sealed sandbox process launcher is missing: $launcherPath"
         }
-        $nodeRecord = Get-ProcessRecord -Id $process.Id
+        $launch = Invoke-WithEnvironment -Environment $environment -Script {
+            $output = & $launcherPath --cwd $bundle --stdout $stdout `
+                --stderr $stderr -- $servePath --log $LogFilter 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "sandbox process launcher failed: $($output | Out-String)"
+            }
+            return (($output | Out-String).Trim()) | ConvertFrom-Json
+        }
+        $nodePid = [int]$launch.pid
+        if ($nodePid -le 0) {
+            throw 'sandbox process launcher returned an invalid PID'
+        }
+        $nodeRecord = Get-ProcessRecord -Id $nodePid
         $runtime = [ordered]@{
             schema = 1
             kind = 'allmystuff-sandbox-runtime'
@@ -491,11 +573,27 @@ switch ($Action) {
             state_root = $state
             mesh_socket = $meshSocket
             network_mode = $NetworkMode
+            allowed_network_ids = @($AllowedNetworkId)
             node_socket = $nodeSocket
             node = $nodeRecord
             mesh = $null
             protected_processes = $protectedProcesses
             protected_listeners = $protectedListeners
+            profile = [ordered]@{
+                mode = $ProfileMode
+                trace_path = if ($ProfileMode -ceq 'Trace') {
+                    $tracePath
+                } else {
+                    $null
+                }
+                trace_events = if ($ProfileMode -ceq 'Trace') {
+                    $ProfileTraceEvents
+                } else {
+                    0
+                }
+                telemetry_seconds = $TelemetrySeconds
+                log_filter = $LogFilter
+            }
             startup_timeout_seconds = $StartupTimeoutSeconds
             shutdown_timeout_seconds = $ShutdownTimeoutSeconds
         }
@@ -507,7 +605,7 @@ switch ($Action) {
             $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
             $probe = $null
             do {
-                if ($null -eq (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                if ($null -eq (Get-Process -Id $nodePid -ErrorAction SilentlyContinue)) {
                     throw "sandbox node exited during startup; inspect $stderr"
                 }
                 $probe = Invoke-Probe -ProbePath $probePath -Environment $environment -Arguments @('--list')
@@ -523,7 +621,7 @@ switch ($Action) {
             if ($script:IsWindows) {
                 $meshChild = Get-CimInstance Win32_Process |
                     Where-Object {
-                        $_.ParentProcessId -eq $process.Id -and
+                        $_.ParentProcessId -eq $nodePid -and
                         $_.Name -ieq "myownmesh$suffix"
                     } |
                     Select-Object -First 1
@@ -545,6 +643,8 @@ switch ($Action) {
                 node_socket = $nodeSocket
                 mesh_socket = $meshSocket
                 network_mode = $NetworkMode
+                allowed_network_ids = @($AllowedNetworkId)
+                profile = $runtime.profile
                 probe = $probe
             } | ConvertTo-Json -Depth 10
         } catch {
@@ -587,6 +687,8 @@ switch ($Action) {
             node_socket = $runtime.node_socket
             mesh_socket = $runtime.mesh_socket
             network_mode = $runtime.network_mode
+            allowed_network_ids = @($runtime.allowed_network_ids)
+            profile = $runtime.profile
             probe = $probe
         } | ConvertTo-Json -Depth 10
     }
@@ -607,11 +709,54 @@ switch ($Action) {
         $probe.output
     }
 
+    'Control' {
+        if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+            throw "sandbox runtime record is missing: $runtimePath"
+        }
+        $runtime = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
+        [void](Assert-ProcessRecord -Record $runtime.node -Role 'sandbox node')
+        Assert-BaselineProcesses -Expected @($runtime.protected_processes)
+        Assert-ListenerSnapshot -Expected @($runtime.protected_listeners)
+        $control = Invoke-Probe -ProbePath $controlPath -Environment $environment `
+            -Arguments $ControlArguments
+        if ($control.exit_code -ne 0) {
+            throw "sandbox control failed with exit code $($control.exit_code): $($control.output)"
+        }
+        $controlCommand = [string]@($ControlArguments)[0]
+        if ($controlCommand -ceq 'join') {
+            $networkId = [string]@($ControlArguments)[1]
+            Set-ObjectProperty -Object $runtime -Name 'network_mode' `
+                -Value 'TestNetwork'
+            Set-ObjectProperty -Object $runtime -Name 'allowed_network_ids' `
+                -Value ([object[]]@($networkId))
+            Write-Utf8NoBom -Path $runtimePath -Text (
+                ($runtime | ConvertTo-Json -Depth 12) +
+                    [Environment]::NewLine
+            )
+        } elseif ($controlCommand -ceq 'leave') {
+            Set-ObjectProperty -Object $runtime -Name 'network_mode' `
+                -Value 'Isolated'
+            Set-ObjectProperty -Object $runtime -Name 'allowed_network_ids' `
+                -Value ([object[]]@())
+            Write-Utf8NoBom -Path $runtimePath -Text (
+                ($runtime | ConvertTo-Json -Depth 12) +
+                    [Environment]::NewLine
+            )
+        }
+        $control.output
+    }
+
     'Stop' {
         if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
             throw "sandbox runtime record is missing: $runtimePath"
         }
         $runtime = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
+        if ([string]$runtime.profile.mode -ceq 'Trace') {
+            # The bounded trace writer flushes at least every 250 ms. With no
+            # live probe route, two intervals let its final queued batch reach
+            # disk before the exact process termination below.
+            Start-Sleep -Milliseconds 500
+        }
         Stop-ExactProcess -Record $runtime.node -Role 'sandbox node' `
             -TimeoutSeconds $ShutdownTimeoutSeconds
         if ($null -ne $runtime.mesh) {
@@ -630,6 +775,7 @@ switch ($Action) {
             status = 'stopped'
             instance_id = $InstanceId
             state_root = $state
+            artifact_root = $artifactRoot
             protected_processes_unchanged = $true
             protected_listeners_unchanged = $true
         } | ConvertTo-Json -Depth 6

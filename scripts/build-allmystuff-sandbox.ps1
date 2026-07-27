@@ -87,9 +87,14 @@ $rootManifest = Join-Path $sourceRoot 'Cargo.toml'
     --manifest-path $nodeManifest `
     --bin allmystuff-serve `
     --example video_prod_probe `
+    --example p2_remote_transport `
+    --example sandbox_node_control `
+    --example sandbox_process_launcher `
+    --example sandbox_remote_worker `
+    --features field-telemetry `
     -j $Jobs
 if ($LASTEXITCODE -ne 0) {
-    throw "node and video probe build failed with exit code $LASTEXITCODE"
+    throw "sandbox node and harness build failed with exit code $LASTEXITCODE"
 }
 
 & $cargo.Source build `
@@ -108,6 +113,14 @@ $suffix = if ($isWindows) { '.exe' } else { '' }
 $builtFiles = [ordered]@{
     "allmystuff-serve$suffix" = Join-Path $target "release\allmystuff-serve$suffix"
     "video_prod_probe$suffix" = Join-Path $target "release\examples\video_prod_probe$suffix"
+    "p2_remote_transport$suffix" =
+        Join-Path $target "release\examples\p2_remote_transport$suffix"
+    "sandbox_node_control$suffix" =
+        Join-Path $target "release\examples\sandbox_node_control$suffix"
+    "sandbox_process_launcher$suffix" =
+        Join-Path $target "release\examples\sandbox_process_launcher$suffix"
+    "sandbox_remote_worker$suffix" =
+        Join-Path $target "release\examples\sandbox_remote_worker$suffix"
     "amst$suffix" = Join-Path $target "release\amst$suffix"
     "myownmesh$suffix" = $meshSource
     'allmystuff-sandbox.ps1' = Join-Path $sourceRoot 'scripts\allmystuff-sandbox.ps1'
@@ -115,6 +128,16 @@ $builtFiles = [ordered]@{
         Join-Path $sourceRoot 'scripts\stage-allmystuff-sandbox.ps1'
     'configure-allmystuff-sandbox-firewall.ps1' =
         Join-Path $sourceRoot 'scripts\configure-allmystuff-sandbox-firewall.ps1'
+    'bootstrap-allmystuff-sandbox-remote.ps1' =
+        Join-Path $sourceRoot 'scripts\bootstrap-allmystuff-sandbox-remote.ps1'
+    'deploy-allmystuff-sandbox-remote.ps1' =
+        Join-Path $sourceRoot 'scripts\deploy-allmystuff-sandbox-remote.ps1'
+    'test-allmystuff-sandbox-pair.ps1' =
+        Join-Path $sourceRoot 'scripts\test-allmystuff-sandbox-pair.ps1'
+    'sandbox-fleet-policy.example.json' =
+        Join-Path $sourceRoot 'scripts\sandbox-fleet-policy.example.json'
+    'summarize_video_profile.py' =
+        Join-Path $sourceRoot 'scripts\summarize_video_profile.py'
 }
 
 foreach ($entry in $builtFiles.GetEnumerator()) {
