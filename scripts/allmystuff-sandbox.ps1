@@ -180,7 +180,7 @@ function Get-ListenerSnapshot {
         }
         foreach ($connection in $connections) {
             $process = Get-Process -Id ([int]$connection.OwningProcess) -ErrorAction Stop
-            [ordered]@{
+            [pscustomobject][ordered]@{
                 address = [string]$connection.LocalAddress
                 port = [int]$connection.LocalPort
                 pid = [int]$connection.OwningProcess
@@ -463,6 +463,10 @@ switch ($Action) {
             try {
                 Stop-ExactProcess -Record $nodeRecord -Role 'sandbox node' `
                     -TimeoutSeconds $ShutdownTimeoutSeconds
+                if ($null -ne $runtime.mesh) {
+                    Stop-ExactProcess -Record $runtime.mesh -Role 'sandbox mesh' `
+                        -TimeoutSeconds $ShutdownTimeoutSeconds
+                }
             } finally {
                 Assert-BaselineProcesses -Expected $protectedProcesses
                 Assert-ListenerSnapshot -Expected $protectedListeners
