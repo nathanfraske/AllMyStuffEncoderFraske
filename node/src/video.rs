@@ -4382,7 +4382,26 @@ fn run_oneshot_capture(
         .and_then(|_| monitor.name().ok())
         .filter(|name| !name.trim().is_empty());
     #[cfg(windows)]
+    let mut capture_device_name = monitor.name().ok().filter(|name| !name.trim().is_empty());
+    #[cfg(windows)]
+    let mut named_gdi = capture_device_name.as_deref().and_then(|name| {
+        match crate::win_capture::NamedGdiCapture::open(name) {
+            Ok(capture) => {
+                tracing::info!("named-display GDI fallback opened for {route_id}: {name}");
+                Some(capture)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "named-display GDI fallback unavailable for {route_id} ({error}); using desktop-window screenshots"
+                );
+                None
+            }
+        }
+    });
+    #[cfg(windows)]
     let mut monitor_recovery: Option<(Instant, Option<u32>, u64)> = None;
+    #[cfg(windows)]
+    let mut desktop_recovery: Option<(Instant, u64)> = None;
     while !stop.load(Ordering::SeqCst) {
         if let Some(after) = retry_capture_after {
             if began.elapsed() >= after {
@@ -4395,6 +4414,35 @@ fn run_oneshot_capture(
         // loops in hope, while an encoder the healer gave up on ends the
         // stream — looping full-rate screenshots into a dead encoder is the
         // zombie-stream failure this used to produce.
+        #[cfg(windows)]
+        let captured = match named_gdi.as_ref().map(|capture| capture.capture()) {
+            Some(Ok(frame)) => Ok((frame.rgba, frame.width, frame.height)),
+            Some(Err(named_error)) => {
+                // A dead display DC should not pin the route to it. Drop the
+                // session before trying xcap's independent desktop-window
+                // path, then let the bounded recovery branch reopen it.
+                named_gdi = None;
+                monitor
+                    .capture_image()
+                    .map(|image| {
+                        let (width, height) = (image.width(), image.height());
+                        (image.into_raw(), width, height)
+                    })
+                    .map_err(|desktop_error| {
+                        format!(
+                            "named-display GDI failed ({named_error}); desktop-window screenshot failed ({desktop_error})"
+                        )
+                    })
+            }
+            None => monitor
+                .capture_image()
+                .map(|image| {
+                    let (width, height) = (image.width(), image.height());
+                    (image.into_raw(), width, height)
+                })
+                .map_err(|error| error.to_string()),
+        };
+        #[cfg(not(windows))]
         let captured = monitor
             .capture_image()
             .map(|image| {
@@ -4410,6 +4458,13 @@ fn run_oneshot_capture(
                         "screen capture recovery succeeded for {route_id}: monitor {:?} -> {:?} after {attempts} attempt(s) in {:.0} ms",
                         old_id,
                         monitor.id().ok(),
+                        recovery_started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                #[cfg(windows)]
+                if let Some((recovery_started, attempts)) = desktop_recovery.take() {
+                    tracing::info!(
+                        "desktop capture recovery succeeded for {route_id} after {attempts} attempt(s) in {:.0} ms",
                         recovery_started.elapsed().as_secs_f64() * 1000.0,
                     );
                 }
@@ -4475,6 +4530,11 @@ fn run_oneshot_capture(
                         match reacquire_monitor(requested_monitor_id, stable_name.as_deref()) {
                             Ok(fresh) => {
                                 monitor = fresh;
+                                capture_device_name =
+                                    monitor.name().ok().filter(|name| !name.trim().is_empty());
+                                named_gdi = capture_device_name.as_deref().and_then(|name| {
+                                    crate::win_capture::NamedGdiCapture::open(name).ok()
+                                });
                                 failures = 0;
                                 break;
                             }
@@ -4488,6 +4548,24 @@ fn run_oneshot_capture(
                                 reporter.report(VideoStatusState::NoMonitor, Some(reacquire));
                             }
                         }
+                    }
+                    continue;
+                }
+                #[cfg(windows)]
+                if invalid_desktop_capture_handle(&e) {
+                    reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
+                    let recovery = desktop_recovery.get_or_insert_with(|| {
+                        tracing::warn!(
+                            "desktop capture recovery started for {route_id} ({e}); retrying the exact display DC with bounded backoff"
+                        );
+                        (Instant::now(), 0)
+                    });
+                    recovery.1 = recovery.1.saturating_add(1);
+                    std::thread::sleep(MONITOR_REACQUIRE_RETRY);
+                    if named_gdi.is_none() {
+                        named_gdi = capture_device_name
+                            .as_deref()
+                            .and_then(|name| crate::win_capture::NamedGdiCapture::open(name).ok());
                     }
                     continue;
                 }
@@ -4520,6 +4598,12 @@ fn run_oneshot_capture(
 fn invalid_monitor_handle(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("0x800705b5") || error.contains("invalid monitor handle")
+}
+
+#[cfg(windows)]
+fn invalid_desktop_capture_handle(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("0x80070006") || error.contains("the handle is invalid")
 }
 
 /// Re-enumerate a Windows monitor after its raw `HMONITOR` was invalidated.
@@ -6989,6 +7073,21 @@ mod tests {
         assert!(!invalid_monitor_handle("Access is denied. (0x80070005)"));
         assert!(!invalid_monitor_handle(
             "screen recording permission denied"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_desktop_dc_errors_use_the_bounded_capture_retry() {
+        assert!(invalid_desktop_capture_handle(
+            "The handle is invalid. (0x80070006)"
+        ));
+        assert!(invalid_desktop_capture_handle("the handle is invalid"));
+        assert!(!invalid_desktop_capture_handle(
+            "Invalid monitor handle. (0x800705B5)"
+        ));
+        assert!(!invalid_desktop_capture_handle(
+            "Access is denied. (0x80070005)"
         ));
     }
 

@@ -27,8 +27,8 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -43,6 +43,11 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush,
+    GetDeviceCaps, SelectObject, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP,
+    HDC, HGDIOBJ, HORZRES, ROP_CODE, SRCCOPY, VERTRES,
+};
 
 /// One captured desktop frame, already RGBA.
 pub struct RawFrame {
@@ -53,6 +58,211 @@ pub struct RawFrame {
     /// {0,90,180,270}. From `DXGI_OUTDUPL_DESC.Rotation`, read once per
     /// duplication. The raw buffer is rotated by THIS to become upright.
     pub rotation_deg: u32,
+}
+
+/// A reusable, exact-display GDI fallback.
+///
+/// `xcap::Monitor::capture_image` obtains its source DC from the desktop
+/// window. Field traces on CECWorkstation2 showed that path returning
+/// `ERROR_INVALID_HANDLE` while an exact `CreateDCW("DISPLAY",
+/// "\\.\DISPLAYn")` capture in the same session returned real pixels from all
+/// three displays. The DIB section stays selected for the short fallback
+/// spell, avoiding per-frame DC and bitmap creation.
+pub struct NamedGdiCapture {
+    display: HDC,
+    memory: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *const u8,
+    byte_len: usize,
+    width: u32,
+    height: u32,
+    device_name: String,
+}
+
+impl NamedGdiCapture {
+    pub fn open(device_name: &str) -> Result<Self, String> {
+        let mut driver = "DISPLAY".encode_utf16().collect::<Vec<_>>();
+        driver.push(0);
+        let mut device = device_name.encode_utf16().collect::<Vec<_>>();
+        device.push(0);
+
+        unsafe {
+            let display = CreateDCW(
+                PCWSTR(driver.as_ptr()),
+                PCWSTR(device.as_ptr()),
+                PCWSTR::null(),
+                None,
+            );
+            if display.0.is_null() {
+                return Err(format!(
+                    "CreateDCW(DISPLAY, {device_name}): {}",
+                    GetLastError().0
+                ));
+            }
+
+            let width = GetDeviceCaps(Some(display), HORZRES);
+            let height = GetDeviceCaps(Some(display), VERTRES);
+            if width <= 0 || height <= 0 {
+                let _ = DeleteDC(display);
+                return Err(format!(
+                    "CreateDCW(DISPLAY, {device_name}) returned invalid dimensions {width}x{height}"
+                ));
+            }
+            let byte_len = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| {
+                    let _ = DeleteDC(display);
+                    format!("GDI frame dimensions overflow for {device_name}: {width}x{height}")
+                })?;
+            let size_image = match u32::try_from(byte_len) {
+                Ok(size) => size,
+                Err(_) => {
+                    let _ = DeleteDC(display);
+                    return Err(format!(
+                        "GDI frame is too large for a DIB section on {device_name}: {width}x{height}"
+                    ));
+                }
+            };
+
+            let memory = CreateCompatibleDC(Some(display));
+            if memory.0.is_null() {
+                let error = GetLastError().0;
+                let _ = DeleteDC(display);
+                return Err(format!("CreateCompatibleDC({device_name}): {error}"));
+            }
+
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    // A negative height makes the DIB top-down.
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    biSizeImage: size_image,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap =
+                match CreateDIBSection(Some(display), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+                    Ok(bitmap) if !bits.is_null() => bitmap,
+                    Ok(bitmap) => {
+                        let _ = DeleteObject(bitmap.into());
+                        let _ = DeleteDC(memory);
+                        let _ = DeleteDC(display);
+                        return Err(format!(
+                            "CreateDIBSection({device_name}) returned no pixel storage"
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = DeleteDC(memory);
+                        let _ = DeleteDC(display);
+                        return Err(format!("CreateDIBSection({device_name}): {error}"));
+                    }
+                };
+
+            let previous = SelectObject(memory, bitmap.into());
+            if previous.0.is_null() || previous.0 as isize == -1 {
+                let error = GetLastError().0;
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(memory);
+                let _ = DeleteDC(display);
+                return Err(format!("SelectObject({device_name}): {error}"));
+            }
+
+            Ok(Self {
+                display,
+                memory,
+                bitmap,
+                previous,
+                bits: bits.cast(),
+                byte_len,
+                width: width as u32,
+                height: height as u32,
+                device_name: device_name.to_string(),
+            })
+        }
+    }
+
+    pub fn capture(&self) -> Result<RawFrame, String> {
+        unsafe {
+            BitBlt(
+                self.memory,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                Some(self.display),
+                0,
+                0,
+                ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0),
+            )
+            .map_err(|error| format!("BitBlt({}): {error}", self.device_name))?;
+            // The DIB is shared CPU/GDI memory. Flush before reading it.
+            let _ = GdiFlush();
+            let bgra = std::slice::from_raw_parts(self.bits, self.byte_len);
+            let mut rgba = Vec::with_capacity(self.byte_len);
+            allmystuff_pixels::bgra_to_rgba_into(
+                bgra,
+                self.width as usize * 4,
+                self.width as usize,
+                self.height as usize,
+                &mut rgba,
+            );
+            Ok(RawFrame {
+                rgba,
+                width: self.width,
+                height: self.height,
+                rotation_deg: 0,
+            })
+        }
+    }
+}
+
+impl Drop for NamedGdiCapture {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.memory, self.previous);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.memory);
+            let _ = DeleteDC(self.display);
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    #[test]
+    #[ignore = "requires an interactive Windows display"]
+    fn named_gdi_captures_real_primary_pixels() {
+        let monitor = xcap::Monitor::all()
+            .expect("enumerate monitors")
+            .into_iter()
+            .find(|monitor| monitor.is_primary().unwrap_or(false))
+            .expect("primary monitor");
+        let name = monitor.name().expect("primary display name");
+        let capture = super::NamedGdiCapture::open(&name).expect("open named GDI capture");
+        let frame = capture.capture().expect("capture named display");
+        assert!(frame.width > 0);
+        assert!(frame.height > 0);
+        assert_eq!(
+            frame.rgba.len(),
+            frame.width as usize * frame.height as usize * 4
+        );
+        assert!(frame.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0xff));
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+            "interactive primary capture was uniformly black"
+        );
+    }
 }
 
 /// A running duplication session. Dropping it stops the thread — really

@@ -627,13 +627,33 @@ try {
                 final = $session.motion.second_final_status
             }
         )) {
-            if ($statusPair.final.operation.running -ne $true -or
-                $statusPair.final.operation.source_status.validated -ne $true -or
-                [int]$statusPair.final.operation.source_status.frame -le
-                    [int]$statusPair.start.operation.source_status.frame -or
-                [int]$statusPair.final.operation.source_status.paint_count -le
-                    [int]$statusPair.start.operation.source_status.paint_count) {
-                throw 'one or both motion sources stopped advancing during the soak'
+            $operation = $statusPair.final.operation
+            $source = $operation.source_status
+            $advanced = (
+                [int]$source.frame -gt
+                    [int]$statusPair.start.operation.source_status.frame -and
+                [int]$source.paint_count -gt
+                    [int]$statusPair.start.operation.source_status.paint_count
+            )
+            $runningAndValid = (
+                $operation.running -eq $true -and
+                $source.validated -eq $true -and
+                $source.finished -ne $true
+            )
+            $completedAndValid = (
+                $operation.running -eq $false -and
+                $source.validated -eq $true -and
+                $source.finished -eq $true -and
+                $null -ne $operation.done -and
+                $operation.done.validated -eq $true -and
+                $operation.done.finished -eq $true -and
+                ($null -eq $operation.child_exit -or
+                    ($operation.child_exit.success -eq $true -and
+                        [int]$operation.child_exit.exit_code -eq 0))
+            )
+            if (-not $advanced -or
+                (-not $runningAndValid -and -not $completedAndValid)) {
+                throw 'one or both motion sources failed, exited early, or did not advance during the soak'
             }
         }
     }
