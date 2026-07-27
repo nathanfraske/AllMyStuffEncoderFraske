@@ -373,9 +373,11 @@ const REFINE_SPACING: Duration = Duration::from_millis(800);
 /// re-attempts a DXGI duplication session. Duplication failures are usually
 /// transient — a fullscreen-exclusive app, the UAC desktop, a driver reset —
 /// and without this a route stayed pinned on soft, CPU-hungry GDI grabs for
-/// its whole life once it fell.
+/// its whole life once it fell. The 2026-07-27 inter-box trace measured
+/// 4.846 seconds from the initial denial through the final topology update,
+/// so five seconds covers that observed transition without a 30-second gap.
 #[cfg(windows)]
-const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(30);
+const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(5);
 /// A stale Windows monitor handle is a capture-generation transition, not a
 /// per-frame failure. Re-enumeration uses this existing recovery cadence so a
 /// detached output cannot turn into a capture-rate error loop.
@@ -4380,8 +4382,6 @@ fn run_oneshot_capture(
         .and_then(|_| monitor.name().ok())
         .filter(|name| !name.trim().is_empty());
     #[cfg(windows)]
-    let mut capture_device_name = monitor.name().ok().filter(|name| !name.trim().is_empty());
-    #[cfg(windows)]
     let mut monitor_recovery: Option<(Instant, Option<u32>, u64)> = None;
     while !stop.load(Ordering::SeqCst) {
         if let Some(after) = retry_capture_after {
@@ -4395,9 +4395,6 @@ fn run_oneshot_capture(
         // loops in hope, while an encoder the healer gave up on ends the
         // stream — looping full-rate screenshots into a dead encoder is the
         // zombie-stream failure this used to produce.
-        #[cfg(windows)]
-        let captured = capture_oneshot_frame(&monitor, capture_device_name.as_deref());
-        #[cfg(not(windows))]
         let captured = monitor
             .capture_image()
             .map(|image| {
@@ -4477,8 +4474,6 @@ fn run_oneshot_capture(
                         let reacquire_attempts = recovery.2;
                         match reacquire_monitor(requested_monitor_id, stable_name.as_deref()) {
                             Ok(fresh) => {
-                                capture_device_name =
-                                    fresh.name().ok().filter(|name| !name.trim().is_empty());
                                 monitor = fresh;
                                 failures = 0;
                                 break;
@@ -4525,32 +4520,6 @@ fn run_oneshot_capture(
 fn invalid_monitor_handle(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("0x800705b5") || error.contains("invalid monitor handle")
-}
-
-#[cfg(windows)]
-fn capture_oneshot_frame(
-    monitor: &xcap::Monitor,
-    device_name: Option<&str>,
-) -> Result<(Vec<u8>, u32, u32), String> {
-    let named_error = match device_name {
-        Some(name) => match crate::win_capture::capture_named_gdi(name) {
-            Ok(frame) => return Ok((frame.rgba, frame.width, frame.height)),
-            Err(e) => Some(e),
-        },
-        None => None,
-    };
-    monitor
-        .capture_image()
-        .map(|image| {
-            let (width, height) = (image.width(), image.height());
-            (image.into_raw(), width, height)
-        })
-        .map_err(|e| match named_error {
-            Some(named) => {
-                format!("named-display GDI failed ({named}); desktop GDI failed ({e})")
-            }
-            None => e.to_string(),
-        })
 }
 
 /// Re-enumerate a Windows monitor after its raw `HMONITOR` was invalidated.
