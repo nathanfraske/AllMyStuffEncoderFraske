@@ -266,7 +266,6 @@ public sealed class AllMyStuffSandboxMotionForm : Form
         StartPosition = FormStartPosition.Manual;
         Bounds = Screen.PrimaryScreen.Bounds;
         TopMost = true;
-        KeyPreview = true;
         SetStyle(
             ControlStyles.UserPaint |
             ControlStyles.AllPaintingInWmPaint |
@@ -279,9 +278,6 @@ public sealed class AllMyStuffSandboxMotionForm : Form
         timer.Tick += OnTick;
         Shown += OnShown;
         FormClosed += OnClosed;
-        KeyDown += delegate(object sender, KeyEventArgs args) {
-            if (args.KeyCode == Keys.Escape) Close();
-        };
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
