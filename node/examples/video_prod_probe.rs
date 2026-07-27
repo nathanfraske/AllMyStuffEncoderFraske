@@ -16,12 +16,17 @@ use std::time::{Duration, Instant};
 use allmystuff_node::node_control::{NodeClient, NodeEvent};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 const IPC_HEADER_LEN: usize = 28;
 const H264_KIND: u8 = 2;
 const RAW_KIND: u8 = 3;
 const JS_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
+/// Full 1080p RGBA evidence is about 7.9 MiB per frame. Four retained frames
+/// keep one phase below roughly 32 MiB before the sandbox artifact ZIP applies
+/// compression, while still preserving more than a single maximum.
+const MOTION_EVIDENCE_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveryMode {
@@ -62,6 +67,7 @@ struct Config {
     mode: Option<String>,
     dump_rgba: Option<PathBuf>,
     motion_palette: bool,
+    motion_evidence_dir: Option<PathBuf>,
     json_out: Option<PathBuf>,
     delivery: DeliveryMode,
     allow_no_ice_proof: bool,
@@ -84,6 +90,7 @@ impl Default for Config {
             mode: None,
             dump_rgba: None,
             motion_palette: false,
+            motion_evidence_dir: None,
             json_out: None,
             delivery: DeliveryMode::Native,
             allow_no_ice_proof: false,
@@ -167,7 +174,17 @@ struct FrameStats {
 struct MotionPaletteStats {
     frames: u64,
     frames_with_both_targets: u64,
+    frames_without_orange: u64,
+    frames_without_purple: u64,
+    frames_with_multiple_orange_components: u64,
+    frames_with_multiple_purple_components: u64,
     first_decoded_palette_rgb: Option<[[u8; 3]; 4]>,
+    orange_component_histogram: BTreeMap<usize, u64>,
+    purple_component_histogram: BTreeMap<usize, u64>,
+    orange_span_ratios: Vec<f64>,
+    purple_span_ratios: Vec<f64>,
+    orange_row_origin_spread_ratios: Vec<f64>,
+    purple_row_origin_spread_ratios: Vec<f64>,
     max_orange_components: usize,
     max_purple_components: usize,
     max_orange_span_ratio: f64,
@@ -176,6 +193,7 @@ struct MotionPaletteStats {
     max_purple_row_origin_spread_ratio: f64,
     max_orange_sample_ratio: f64,
     max_purple_sample_ratio: f64,
+    worst_frames: Vec<MotionEvidenceFrame>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -184,6 +202,62 @@ struct PaletteTargetStats {
     components: usize,
     span_ratio: f64,
     row_origin_spread_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MotionEvidenceScore {
+    missing_targets: u8,
+    max_components: usize,
+    total_components: usize,
+    max_row_origin_spread_ratio: f64,
+    max_span_ratio: f64,
+    frame_index: u64,
+}
+
+impl MotionEvidenceScore {
+    fn from_targets(
+        frame_index: u64,
+        orange: PaletteTargetStats,
+        purple: PaletteTargetStats,
+    ) -> Self {
+        Self {
+            missing_targets: u8::from(orange.samples == 0) + u8::from(purple.samples == 0),
+            max_components: orange.components.max(purple.components),
+            total_components: orange.components.saturating_add(purple.components),
+            max_row_origin_spread_ratio: orange
+                .row_origin_spread_ratio
+                .max(purple.row_origin_spread_ratio),
+            max_span_ratio: orange.span_ratio.max(purple.span_ratio),
+            frame_index,
+        }
+    }
+
+    /// Deterministic structural ordering only. This selects evidence to retain;
+    /// it is deliberately not a visual-quality score or acceptance threshold.
+    fn severity_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.missing_targets
+            .cmp(&other.missing_targets)
+            .then_with(|| self.max_components.cmp(&other.max_components))
+            .then_with(|| self.total_components.cmp(&other.total_components))
+            .then_with(|| {
+                self.max_row_origin_spread_ratio
+                    .total_cmp(&other.max_row_origin_spread_ratio)
+            })
+            .then_with(|| self.max_span_ratio.total_cmp(&other.max_span_ratio))
+            // Preserve the earliest example when every measured property ties.
+            .then_with(|| other.frame_index.cmp(&self.frame_index))
+    }
+}
+
+#[derive(Debug)]
+struct MotionEvidenceFrame {
+    score: MotionEvidenceScore,
+    timestamp_us: u64,
+    width: usize,
+    height: usize,
+    orange: PaletteTargetStats,
+    purple: PaletteTargetStats,
+    rgba: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +269,14 @@ enum MotionPaletteClass {
 }
 
 impl MotionPaletteStats {
-    fn observe(&mut self, rgba: &[u8], width: usize, height: usize) {
+    fn observe(
+        &mut self,
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        retain_evidence: bool,
+    ) {
         let (orange, purple, sampled, decoded_palette) =
             motion_palette_frame_stats(rgba, width, height);
         self.frames = self.frames.saturating_add(1);
@@ -204,6 +285,34 @@ impl MotionPaletteStats {
         self.frames_with_both_targets = self
             .frames_with_both_targets
             .saturating_add(u64::from(orange.samples > 0 && purple.samples > 0));
+        self.frames_without_orange = self
+            .frames_without_orange
+            .saturating_add(u64::from(orange.samples == 0));
+        self.frames_without_purple = self
+            .frames_without_purple
+            .saturating_add(u64::from(purple.samples == 0));
+        self.frames_with_multiple_orange_components = self
+            .frames_with_multiple_orange_components
+            .saturating_add(u64::from(orange.components > 1));
+        self.frames_with_multiple_purple_components = self
+            .frames_with_multiple_purple_components
+            .saturating_add(u64::from(purple.components > 1));
+        let orange_count = self
+            .orange_component_histogram
+            .entry(orange.components)
+            .or_default();
+        *orange_count = orange_count.saturating_add(1);
+        let purple_count = self
+            .purple_component_histogram
+            .entry(purple.components)
+            .or_default();
+        *purple_count = purple_count.saturating_add(1);
+        self.orange_span_ratios.push(orange.span_ratio);
+        self.purple_span_ratios.push(purple.span_ratio);
+        self.orange_row_origin_spread_ratios
+            .push(orange.row_origin_spread_ratio);
+        self.purple_row_origin_spread_ratios
+            .push(purple.row_origin_spread_ratio);
         self.max_orange_components = self.max_orange_components.max(orange.components);
         self.max_purple_components = self.max_purple_components.max(purple.components);
         self.max_orange_span_ratio = self.max_orange_span_ratio.max(orange.span_ratio);
@@ -222,6 +331,29 @@ impl MotionPaletteStats {
                 .max_purple_sample_ratio
                 .max(purple.samples as f64 / sampled as f64);
         }
+
+        if retain_evidence {
+            let score = MotionEvidenceScore::from_targets(self.frames, orange, purple);
+            let should_retain = self.worst_frames.len() < MOTION_EVIDENCE_LIMIT
+                || self
+                    .worst_frames
+                    .last()
+                    .is_some_and(|least| score.severity_cmp(&least.score).is_gt());
+            if should_retain {
+                self.worst_frames.push(MotionEvidenceFrame {
+                    score,
+                    timestamp_us,
+                    width,
+                    height,
+                    orange,
+                    purple,
+                    rgba: rgba.to_vec(),
+                });
+                self.worst_frames
+                    .sort_by(|a, b| b.score.severity_cmp(&a.score));
+                self.worst_frames.truncate(MOTION_EVIDENCE_LIMIT);
+            }
+        }
     }
 
     fn summary(&self) -> Value {
@@ -238,6 +370,22 @@ impl MotionPaletteStats {
             "sample_grid": "up to 128x64",
             "frames": self.frames,
             "frames_with_both_targets": self.frames_with_both_targets,
+            "frames_without_orange": self.frames_without_orange,
+            "frames_without_purple": self.frames_without_purple,
+            "orange_components": {
+                "histogram": self.orange_component_histogram,
+                "frames_gt_one": self.frames_with_multiple_orange_components,
+                "ratio_gt_one": fraction(self.frames_with_multiple_orange_components, self.frames),
+            },
+            "purple_components": {
+                "histogram": self.purple_component_histogram,
+                "frames_gt_one": self.frames_with_multiple_purple_components,
+                "ratio_gt_one": fraction(self.frames_with_multiple_purple_components, self.frames),
+            },
+            "orange_span_ratio": ratio_summary(&self.orange_span_ratios),
+            "purple_span_ratio": ratio_summary(&self.purple_span_ratios),
+            "orange_row_origin_spread_ratio": ratio_summary(&self.orange_row_origin_spread_ratios),
+            "purple_row_origin_spread_ratio": ratio_summary(&self.purple_row_origin_spread_ratios),
             "max_orange_components": self.max_orange_components,
             "max_purple_components": self.max_purple_components,
             "max_orange_span_ratio": self.max_orange_span_ratio,
@@ -246,8 +394,103 @@ impl MotionPaletteStats {
             "max_purple_row_origin_spread_ratio": self.max_purple_row_origin_spread_ratio,
             "max_orange_sample_ratio": self.max_orange_sample_ratio,
             "max_purple_sample_ratio": self.max_purple_sample_ratio,
+            "retained_evidence_frames": self.worst_frames.len(),
         })
     }
+
+    fn write_evidence(&self, directory: &PathBuf, prefix: &str) -> Result<Value> {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("create motion evidence directory {}", directory.display()))?;
+        let mut manifest = Vec::with_capacity(self.worst_frames.len());
+        for (index, frame) in self.worst_frames.iter().enumerate() {
+            let stem = format!(
+                "{prefix}-worst-{:02}-frame-{:06}-ts-{}",
+                index + 1,
+                frame.score.frame_index,
+                frame.timestamp_us
+            );
+            let rgba_path = directory.join(format!("{stem}.rgba"));
+            let metadata_path = directory.join(format!("{stem}.rgba.json"));
+            std::fs::write(&rgba_path, &frame.rgba)
+                .with_context(|| format!("write motion evidence {}", rgba_path.display()))?;
+            let sha256 = format!("{:x}", Sha256::digest(&frame.rgba));
+            let metadata = json!({
+                "width": frame.width,
+                "height": frame.height,
+                "format": "rgba8",
+                "timestamp_us": frame.timestamp_us,
+                "frame_index": frame.score.frame_index,
+                "bytes": frame.rgba.len(),
+                "sha256": sha256,
+                "selection": {
+                    "kind": "bounded_structural_order",
+                    "limit": MOTION_EVIDENCE_LIMIT,
+                    "acceptance_threshold": null,
+                    "missing_targets": frame.score.missing_targets,
+                    "max_components": frame.score.max_components,
+                    "total_components": frame.score.total_components,
+                    "max_row_origin_spread_ratio": frame.score.max_row_origin_spread_ratio,
+                    "max_span_ratio": frame.score.max_span_ratio,
+                },
+                "orange": {
+                    "samples": frame.orange.samples,
+                    "components": frame.orange.components,
+                    "span_ratio": frame.orange.span_ratio,
+                    "row_origin_spread_ratio": frame.orange.row_origin_spread_ratio,
+                },
+                "purple": {
+                    "samples": frame.purple.samples,
+                    "components": frame.purple.components,
+                    "span_ratio": frame.purple.span_ratio,
+                    "row_origin_spread_ratio": frame.purple.row_origin_spread_ratio,
+                },
+            });
+            std::fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?).with_context(
+                || format!("write motion evidence metadata {}", metadata_path.display()),
+            )?;
+            manifest.push(json!({
+                "rank": index + 1,
+                "rgba": rgba_path,
+                "metadata": metadata_path,
+                "sha256": sha256,
+                "bytes": frame.rgba.len(),
+                "frame_index": frame.score.frame_index,
+                "timestamp_us": frame.timestamp_us,
+            }));
+        }
+        Ok(json!({
+            "directory": directory,
+            "retention_limit": MOTION_EVIDENCE_LIMIT,
+            "selection": "missing targets, component count, row-origin spread, span, earliest tie",
+            "acceptance_threshold": null,
+            "frames": manifest,
+        }))
+    }
+}
+
+fn fraction(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator != 0).then_some(numerator as f64 / denominator as f64)
+}
+
+fn ratio_summary(samples: &[f64]) -> Value {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let at = |numerator: usize, denominator: usize| {
+        (!sorted.is_empty()).then(|| {
+            let index = (sorted.len() - 1)
+                .saturating_mul(numerator)
+                .div_ceil(denominator);
+            sorted[index]
+        })
+    };
+    json!({
+        "count": sorted.len(),
+        "avg": (!sorted.is_empty()).then(|| sorted.iter().sum::<f64>() / sorted.len() as f64),
+        "p50": at(50, 100),
+        "p95": at(95, 100),
+        "p99": at(99, 100),
+        "max": sorted.last().copied(),
+    })
 }
 
 fn nearest_motion_palette(
@@ -473,6 +716,7 @@ impl FrameStats {
         observed_at: Instant,
         dump_rgba: Option<&PathBuf>,
         motion_palette: bool,
+        retain_motion_evidence: bool,
     ) -> Result<()> {
         if packet.len() < IPC_HEADER_LEN {
             bail!("video packet is only {} bytes", packet.len());
@@ -604,6 +848,8 @@ impl FrameStats {
                     rgba,
                     width as usize,
                     height as usize,
+                    ts,
+                    retain_motion_evidence,
                 );
             }
         } else {
@@ -1007,6 +1253,7 @@ async fn exercise_cycle(
             .context("send in-band video tune over the existing ICE data path")?;
     }
 
+    let initial_evidence_prefix = format!("cycle-{cycle:02}-initial");
     let first = collect_frames(
         client,
         route,
@@ -1017,6 +1264,8 @@ async fn exercise_cycle(
         events,
         dump_rgba,
         config.motion_palette,
+        config.motion_evidence_dir.as_ref(),
+        &initial_evidence_prefix,
     )
     .await
     .with_context(|| format!("cycle {cycle}: initial stream"))?;
@@ -1052,6 +1301,7 @@ async fn exercise_cycle(
         let _ = client
             .request("video_refresh", json!({ "route_id": route }))
             .await;
+        let rewatch_evidence_prefix = format!("cycle-{cycle:02}-viewer-rewatch");
         let resumed = collect_frames(
             client,
             route,
@@ -1062,6 +1312,8 @@ async fn exercise_cycle(
             events,
             None,
             config.motion_palette,
+            config.motion_evidence_dir.as_ref(),
+            &rewatch_evidence_prefix,
         )
         .await
         .with_context(|| format!("cycle {cycle}: decoder rewatch/resume"))?;
@@ -1081,6 +1333,8 @@ async fn collect_frames(
     events: &mut mpsc::Receiver<NodeEvent>,
     dump_rgba: Option<&PathBuf>,
     motion_palette: bool,
+    motion_evidence_dir: Option<&PathBuf>,
+    motion_evidence_prefix: &str,
 ) -> Result<Value> {
     let started = Instant::now();
     let first_deadline = started + first_frame_timeout;
@@ -1118,7 +1372,14 @@ async fn collect_frames(
             max_packets_per_poll = max_packets_per_poll.max(packets.len());
         }
         for packet in packets {
-            stats.observe(packet, delivery, observed_at, dump_rgba, motion_palette)?;
+            stats.observe(
+                packet,
+                delivery,
+                observed_at,
+                dump_rgba,
+                motion_palette,
+                motion_evidence_dir.is_some(),
+            )?;
             first_at.get_or_insert(observed_at);
         }
         let feedback_elapsed = observed_at.saturating_duration_since(feedback_started);
@@ -1207,8 +1468,15 @@ async fn collect_frames(
     }
     let first_frame_ms =
         first_at.map(|first| first.saturating_duration_since(started).as_secs_f64() * 1000.0);
+    let motion_evidence = match (&stats.motion_palette, motion_evidence_dir) {
+        (Some(motion), Some(directory)) => {
+            Some(motion.write_evidence(directory, motion_evidence_prefix)?)
+        }
+        _ => None,
+    };
     Ok(json!({
         "frames": stats.summary(first_at.unwrap_or(started).elapsed(), delivery),
+        "motion_evidence": motion_evidence,
         "viewer_pump": {
             "first_frame_ms": first_frame_ms,
             "polls": polls,
@@ -1576,6 +1844,10 @@ fn parse_args() -> Result<Config> {
                 config.dump_rgba = Some(PathBuf::from(next_arg(&mut args, "--dump-rgba")?));
             }
             "--motion-palette" => config.motion_palette = true,
+            "--motion-evidence-dir" => {
+                config.motion_evidence_dir =
+                    Some(PathBuf::from(next_arg(&mut args, "--motion-evidence-dir")?));
+            }
             "--json-out" => {
                 config.json_out = Some(PathBuf::from(next_arg(&mut args, "--json-out")?));
             }
@@ -1588,6 +1860,9 @@ fn parse_args() -> Result<Config> {
     }
     if config.motion_palette && config.delivery != DeliveryMode::Native {
         bail!("--motion-palette requires --delivery native");
+    }
+    if config.motion_evidence_dir.is_some() && !config.motion_palette {
+        bail!("--motion-evidence-dir requires --motion-palette");
     }
     Ok(config)
 }
@@ -1624,6 +1899,7 @@ OPTIONS
   --first-frame-timeout N   Decode startup timeout seconds (default: 12)
   --dump-rgba PATH          Save the first raw RGBA frame + PATH.rgba.json
   --motion-palette          Score the deterministic orange/purple motion pattern
+  --motion-evidence-dir DIR Retain four structurally worst raw RGBA frames per phase
   --json-out PATH           Write the final machine-readable report
   --allow-no-ice-proof      Diagnostic only; never use this for a release gate
 "#
@@ -1690,12 +1966,26 @@ mod tests {
         }
         let mut stats = FrameStats::default();
         stats
-            .observe(&packet, DeliveryMode::Native, Instant::now(), None, false)
+            .observe(
+                &packet,
+                DeliveryMode::Native,
+                Instant::now(),
+                None,
+                false,
+                false,
+            )
             .unwrap();
         assert_eq!(stats.frames, 1);
         packet[IPC_HEADER_LEN + 3] = 0;
         assert!(stats
-            .observe(&packet, DeliveryMode::Native, Instant::now(), None, false)
+            .observe(
+                &packet,
+                DeliveryMode::Native,
+                Instant::now(),
+                None,
+                false,
+                false,
+            )
             .is_err());
     }
 
@@ -1715,6 +2005,7 @@ mod tests {
                 Instant::now(),
                 None,
                 false,
+                false,
             )
             .unwrap();
         assert_eq!(stats.frames, 1);
@@ -1726,6 +2017,7 @@ mod tests {
                 Instant::now(),
                 None,
                 false,
+                false,
             )
             .is_err());
         packet.push(1);
@@ -1736,6 +2028,7 @@ mod tests {
                 DeliveryMode::Compressed,
                 Instant::now(),
                 None,
+                false,
                 false,
             )
             .is_err());
@@ -1850,5 +2143,61 @@ mod tests {
         assert_eq!(decoded_palette[1], [178, 202, 226]);
         assert_eq!((orange.samples, orange.components), (200, 1));
         assert_eq!((purple.samples, purple.components), (200, 1));
+    }
+
+    #[test]
+    fn motion_palette_reports_prevalence_and_writes_bounded_evidence() {
+        let (width, height) = (128usize, 64usize);
+        let mut stats = MotionPaletteStats::default();
+        for frame in 0..6u64 {
+            let mut rgba = palette_frame(width, height);
+            paint_rect(&mut rgba, width, 10..30, 10..20, [255, 165, 0]);
+            if frame == 5 {
+                paint_rect(&mut rgba, width, 70..90, 30..35, [147, 112, 219]);
+                paint_rect(&mut rgba, width, 100..120, 36..41, [147, 112, 219]);
+            } else {
+                paint_rect(&mut rgba, width, 80..100, 30..40, [147, 112, 219]);
+            }
+            stats.observe(&rgba, width, height, frame.saturating_mul(16_667), true);
+        }
+
+        let summary = stats.summary();
+        assert_eq!(summary["purple_components"]["histogram"]["1"], 5);
+        assert_eq!(summary["purple_components"]["histogram"]["2"], 1);
+        assert_eq!(summary["purple_components"]["frames_gt_one"], 1);
+        assert_eq!(
+            summary["purple_components"]["ratio_gt_one"]
+                .as_f64()
+                .unwrap(),
+            1.0 / 6.0
+        );
+        assert_eq!(summary["purple_span_ratio"]["count"], 6);
+        assert_eq!(stats.worst_frames.len(), MOTION_EVIDENCE_LIMIT);
+        assert_eq!(stats.worst_frames[0].score.frame_index, 6);
+        assert_eq!(stats.worst_frames[0].purple.components, 2);
+
+        let unique = format!(
+            "allmystuff-motion-evidence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let manifest = stats.write_evidence(&directory, "probe").unwrap();
+        let frames = manifest["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), MOTION_EVIDENCE_LIMIT);
+        for frame in frames {
+            let rgba = PathBuf::from(frame["rgba"].as_str().unwrap());
+            let metadata = PathBuf::from(frame["metadata"].as_str().unwrap());
+            assert_eq!(
+                std::fs::metadata(&rgba).unwrap().len(),
+                (width * height * 4) as u64
+            );
+            let saved: Value = serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+            assert_eq!(saved["sha256"], frame["sha256"]);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

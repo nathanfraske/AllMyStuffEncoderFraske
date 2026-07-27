@@ -133,6 +133,7 @@ $backendProcess = $null
 $watchdogProcess = $null
 $probeExit = $null
 $probeResults = @()
+$motionEvidenceDirs = @()
 $started = Get-Date
 $runFailure = $null
 $traceHash = $null
@@ -515,7 +516,12 @@ try {
         }
         if ($ResizeEdge -gt 0) { $probeArgs += @('--resize-edge', "$ResizeEdge") }
         if ($Fps -gt 0) { $probeArgs += @('--fps', "$Fps") }
-        if ($MotionPalette) { $probeArgs += '--motion-palette' }
+        $motionEvidenceDir = $null
+        if ($MotionPalette) {
+            $motionEvidenceDir = Join-Path $RunDir ('motion-evidence-{0:D2}' -f ($index + 1))
+            $motionEvidenceDirs += $motionEvidenceDir
+            $probeArgs += @('--motion-palette', '--motion-evidence-dir', $motionEvidenceDir)
+        }
         if ($NoRewatch) { $probeArgs += '--no-rewatch' }
         $currentProbeLog = if ($targets.Count -eq 1) {
             $ProbeLog
@@ -536,6 +542,7 @@ try {
             target = $target
             exit = $probeExit
             log = $currentProbeLog
+            motion_evidence = $motionEvidenceDir
         }
         if ($probeExit -ne 0) {
             throw "production video probe failed for $target with exit code $probeExit"
@@ -665,6 +672,7 @@ $manifest = [ordered]@{
     fps = $Fps
     rewatch = -not $NoRewatch
     motion_palette = [bool]$MotionPalette
+    motion_evidence_directories = $motionEvidenceDirs
     probe_exit = $probeExit
     probes = $probeResults
     backend_sha256 = Get-Sha256 $Backend

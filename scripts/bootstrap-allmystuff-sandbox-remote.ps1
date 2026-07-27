@@ -513,6 +513,13 @@ if ($null -eq $operation) {
                 $probeArguments.Add('--json-out')
                 $probeArguments.Add($reportPath)
             }
+            if ($probeArguments.Contains('--motion-palette') -and
+                -not $probeArguments.Contains('--motion-evidence-dir')) {
+                $probeArguments.Add('--motion-evidence-dir')
+                $probeArguments.Add(
+                    (Join-Path $probeDir "$($request.run_id)-motion-evidence")
+                )
+            }
             $args = $baseRunner.Clone()
             $args.Action = 'Probe'
             $args.ProbeArguments = $probeArguments.ToArray()

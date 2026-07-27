@@ -376,6 +376,11 @@ const REFINE_SPACING: Duration = Duration::from_millis(800);
 /// its whole life once it fell.
 #[cfg(windows)]
 const DXGI_REPROMOTE_AFTER: Duration = Duration::from_secs(30);
+/// A stale Windows monitor handle is a capture-generation transition, not a
+/// per-frame failure. Re-enumeration uses this existing recovery cadence so a
+/// detached output cannot turn into a capture-rate error loop.
+#[cfg(windows)]
+const MONITOR_REACQUIRE_RETRY: Duration = Duration::from_millis(250);
 
 /// The forced-IDR interval (ms) the latest receiver feedback implies. The
 /// conservative half of the adaptation: relax to [`IDR_MS_RELAXED`] only on
@@ -4419,14 +4424,20 @@ fn run_oneshot_capture(
                 if invalid_monitor_handle(&e) {
                     let old_id = monitor.id().ok();
                     let started_reacquire = Instant::now();
+                    reporter.report(VideoStatusState::GrabFailed, Some(e.clone()));
                     tracing::warn!(
-                        "screen grab for {route_id} lost monitor handle {:?} ({e}); re-enumerating{}",
+                        "screen capture recovery started for {route_id}: stale monitor handle {:?} ({e}); re-enumerating{}",
                         old_id,
                         stable_name
                             .as_deref()
                             .map(|name| format!(" {name}"))
                             .unwrap_or_default()
                     );
+                    // The failed DXGI session was already dropped by the
+                    // caller before this fallback began. xcap::Monitor is only
+                    // a value wrapper around the stale HMONITOR; replace it
+                    // only after fresh enumeration succeeds.
+                    let mut reacquire_attempts = 0u64;
                     loop {
                         if stop.load(Ordering::SeqCst) {
                             return Ok(false);
@@ -4434,12 +4445,12 @@ fn run_oneshot_capture(
                         if retry_capture_after.is_some_and(|after| began.elapsed() >= after) {
                             return Ok(true);
                         }
-                        std::thread::sleep(Duration::from_millis(250));
+                        reacquire_attempts = reacquire_attempts.saturating_add(1);
                         match reacquire_monitor(requested_monitor_id, stable_name.as_deref()) {
                             Ok(fresh) => {
                                 let new_id = fresh.id().ok();
                                 tracing::info!(
-                                    "screen grab for {route_id} rebound monitor {:?} -> {:?} in {:.0} ms{}",
+                                    "screen capture recovery succeeded for {route_id}: monitor {:?} -> {:?} after {reacquire_attempts} attempt(s) in {:.0} ms{}",
                                     old_id,
                                     new_id,
                                     started_reacquire.elapsed().as_secs_f64() * 1000.0,
@@ -4453,13 +4464,14 @@ fn run_oneshot_capture(
                                 break;
                             }
                             Err(reacquire) => {
-                                if failures == 0 || failures.is_multiple_of(16) {
+                                if reacquire_attempts == 1 || reacquire_attempts.is_multiple_of(16)
+                                {
                                     tracing::warn!(
-                                        "screen grab for {route_id} waiting for monitor reacquisition: {reacquire}"
+                                        "screen capture recovery for {route_id} waiting for monitor reacquisition after {reacquire_attempts} attempt(s): {reacquire}"
                                     );
                                 }
-                                failures = failures.saturating_add(1);
                                 reporter.report(VideoStatusState::NoMonitor, Some(reacquire));
+                                std::thread::sleep(MONITOR_REACQUIRE_RETRY);
                             }
                         }
                     }
@@ -4493,7 +4505,10 @@ fn run_oneshot_capture(
 #[cfg(windows)]
 fn invalid_monitor_handle(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("0x800705b5") || error.contains("invalid monitor handle")
+    error.contains("0x800705b5")
+        || error.contains("0x80070006")
+        || error.contains("invalid monitor handle")
+        || error.contains("the handle is invalid")
 }
 
 /// Re-enumerate a Windows monitor after its raw `HMONITOR` was invalidated.
@@ -6953,6 +6968,13 @@ mod tests {
             "Invalid monitor handle. (0x800705B5)"
         ));
         assert!(invalid_monitor_handle("invalid monitor handle"));
+        // Exact xcap input captured in the CECWorkstation2 motion soak. This
+        // generic Win32 stale-handle spelling used to miss the monitor
+        // recovery branch and retry capture at the requested frame rate.
+        assert!(invalid_monitor_handle(
+            "The handle is invalid. (0x80070006)"
+        ));
+        assert!(invalid_monitor_handle("the handle is invalid"));
         assert!(!invalid_monitor_handle("Access is denied. (0x80070005)"));
         assert!(!invalid_monitor_handle(
             "screen recording permission denied"
