@@ -65,10 +65,51 @@ probe, and `amst`, then records source state and file hashes in
 The output directory must be empty. The builder never edits the installed
 application.
 
+## Use one stable firewall path
+
+Windows Firewall program rules are path-based. Launching `myownmesh.exe` from
+a new versioned bundle directory can therefore raise another firewall prompt
+even when an identical binary was already approved elsewhere.
+
+Stage each sealed bundle into one stable runtime directory:
+
+```powershell
+.\scripts\stage-allmystuff-sandbox.ps1 `
+  -BundleDir C:\t\ams-sandbox-bundles\run-001 `
+  -RuntimeDir "$env:LOCALAPPDATA\AllMyStuffSandboxRuntime"
+```
+
+The staging script verifies every source hash and size, refuses to update
+while a backend or sidecar from the stable directory is running, prepares the
+replacement beside the runtime, and preserves the previous runtime under a
+timestamped directory. The firewall rule remains attached to the unchanged
+stable executable path.
+
+Install the two stable inbound rules once:
+
+```powershell
+& "$env:LOCALAPPDATA\AllMyStuffSandboxRuntime\configure-allmystuff-sandbox-firewall.ps1" `
+  -Action Install `
+  -RuntimeDir "$env:LOCALAPPDATA\AllMyStuffSandboxRuntime"
+```
+
+`Install` verifies the staged MyOwnMesh binary against its sealed manifest,
+then requests one elevation if the current shell is not already elevated. It
+creates one TCP and one UDP program rule for Private and Public profiles. The
+current profile list is an explicit parameter:
+
+```powershell
+-Profile Private,Public
+```
+
+Do not add Domain unless that profile is part of the reviewed test
+environment. `Show` is read-only and does not require elevation. `Remove`
+deletes only the two named harness rules and requests elevation.
+
 ## Start and inspect a sandbox
 
 ```powershell
-$bundle = 'C:\t\ams-sandbox-bundles\run-001'
+$bundle = "$env:LOCALAPPDATA\AllMyStuffSandboxRuntime"
 
 & "$bundle\allmystuff-sandbox.ps1" `
   -Action Start `

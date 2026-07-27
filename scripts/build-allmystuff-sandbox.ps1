@@ -111,6 +111,10 @@ $builtFiles = [ordered]@{
     "amst$suffix" = Join-Path $target "release\amst$suffix"
     "myownmesh$suffix" = $meshSource
     'allmystuff-sandbox.ps1' = Join-Path $sourceRoot 'scripts\allmystuff-sandbox.ps1'
+    'stage-allmystuff-sandbox.ps1' =
+        Join-Path $sourceRoot 'scripts\stage-allmystuff-sandbox.ps1'
+    'configure-allmystuff-sandbox-firewall.ps1' =
+        Join-Path $sourceRoot 'scripts\configure-allmystuff-sandbox-firewall.ps1'
 }
 
 foreach ($entry in $builtFiles.GetEnumerator()) {
