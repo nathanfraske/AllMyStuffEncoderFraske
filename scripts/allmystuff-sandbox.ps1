@@ -18,6 +18,9 @@ param(
 
     [string]$LogFilter = 'info,allmystuff_node=debug,allmystuff_serve=debug',
 
+    [ValidateSet('Isolated', 'LocalClaim')]
+    [string]$NetworkMode = 'Isolated',
+
     [ValidateRange(1, 300)]
     [int]$StartupTimeoutSeconds = 15,
 
@@ -132,15 +135,29 @@ function Assert-ProcessRecord {
 }
 
 function Get-BaselineProcesses {
+    param([string[]]$ExcludedPath = @())
+
+    $excluded = @($ExcludedPath | ForEach-Object { Get-FullPath $_ })
     $names = @('allmystuff-gui', 'allmystuff-serve', 'myownmesh', 'allmyagents-desktop')
     $records = foreach ($name in $names) {
         foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
             try {
+                $processPath = [string]$process.Path
+                $isExcluded = @($excluded | Where-Object {
+                    [string]::Equals(
+                        $_,
+                        $processPath,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                }).Count -ne 0
+                if ($isExcluded) {
+                    continue
+                }
                 [ordered]@{
                     name = $process.ProcessName
                     pid = [int]$process.Id
                     start_filetime_utc = [int64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
-                    path = [string]$process.Path
+                    path = $processPath
                 }
             } catch {
                 throw "could not record protected process $name PID $($process.Id): $($_.Exception.Message)"
@@ -256,7 +273,8 @@ function Invoke-Probe {
 function Set-SandboxMeshConfig {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$ControlSocket
+        [Parameter(Mandatory = $true)][string]$ControlSocket,
+        [Parameter(Mandatory = $true)][string]$NetworkMode
     )
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $path = Join-Path $Root 'config.json'
@@ -270,10 +288,75 @@ function Set-SandboxMeshConfig {
     $daemon = Get-OrAddObjectProperty -Object $config -Name 'daemon'
     Set-ObjectProperty -Object $daemon -Name 'enabled' -Value $true
     Set-ObjectProperty -Object $daemon -Name 'control_socket' -Value $ControlSocket
+
+    $localClaimId = 'allmystuff-local-claim-v1'
+    $networksProperty = $config.PSObject.Properties['networks']
+    $configuredNetworks = if ($null -eq $networksProperty) {
+        @()
+    } else {
+        @($networksProperty.Value)
+    }
+    $localClaimConfig = $configuredNetworks |
+        Where-Object {
+            [string]$_.id -ceq $localClaimId -or
+            [string]$_.network_id -ceq $localClaimId
+        } |
+        Select-Object -First 1
+    if ($NetworkMode -ceq 'Isolated') {
+        $configuredNetworks = @($configuredNetworks | Where-Object {
+            [string]$_.id -cne $localClaimId -and
+            [string]$_.network_id -cne $localClaimId
+        })
+        Set-ObjectProperty -Object $config -Name 'networks' -Value $configuredNetworks
+    }
+
     $json = $config | ConvertTo-Json -Depth 32
     $temp = "$path.tmp-$PID"
     Write-Utf8NoBom -Path $temp -Text ($json + [Environment]::NewLine)
     Move-Item -LiteralPath $temp -Destination $path -Force
+
+    $disabledDir = Join-Path $Root '.myownmesh'
+    New-Item -ItemType Directory -Force -Path $disabledDir | Out-Null
+    $disabledPath = Join-Path $disabledDir 'allmystuff-networks.json'
+    if (Test-Path -LiteralPath $disabledPath) {
+        $disabledStore = Get-Content -LiteralPath $disabledPath -Raw | ConvertFrom-Json
+    } else {
+        $disabledStore = [pscustomobject]@{ disabled = @() }
+    }
+    $disabledProperty = $disabledStore.PSObject.Properties['disabled']
+    $disabledNetworks = if ($null -eq $disabledProperty) {
+        @()
+    } else {
+        @($disabledProperty.Value | Where-Object {
+            [string]$_.id -cne $localClaimId -and
+            [string]$_.network_id -cne $localClaimId
+        })
+    }
+    if ($NetworkMode -ceq 'Isolated') {
+        if ($null -eq $localClaimConfig) {
+            $localClaimConfig = [pscustomobject][ordered]@{
+                id = $localClaimId
+                network_id = $localClaimId
+                label = 'Local claiming (this LAN)'
+                kind = 'open'
+                auto_approve = $true
+                signaling = [pscustomobject][ordered]@{
+                    strategy = 'none'
+                    mdns = $true
+                }
+                stun_servers = @()
+                turn_servers = @()
+            }
+        }
+        $disabledNetworks += $localClaimConfig
+    }
+    Set-ObjectProperty -Object $disabledStore -Name 'disabled' -Value $disabledNetworks
+    $disabledJson = $disabledStore | ConvertTo-Json -Depth 32
+    $disabledTemp = "$disabledPath.tmp-$PID"
+    Write-Utf8NoBom -Path $disabledTemp -Text (
+        $disabledJson + [Environment]::NewLine
+    )
+    Move-Item -LiteralPath $disabledTemp -Destination $disabledPath -Force
 }
 
 function Stop-ExactProcess {
@@ -370,8 +453,11 @@ switch ($Action) {
             Move-Item -LiteralPath $runtimePath -Destination $lastRunPath -Force
         }
 
-        Set-SandboxMeshConfig -Root $state -ControlSocket $meshConfigSocket
-        $protectedProcesses = @(Get-BaselineProcesses)
+        Set-SandboxMeshConfig -Root $state -ControlSocket $meshConfigSocket `
+            -NetworkMode $NetworkMode
+        $protectedProcesses = @(
+            Get-BaselineProcesses -ExcludedPath @($servePath, $meshPath)
+        )
         $protectedListeners = @(Get-ListenerSnapshot -Ports $ProtectedPort)
         $logs = Join-Path $state 'logs'
         New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -404,6 +490,7 @@ switch ($Action) {
             bundle_source_commit = [string]$bundleManifest.source.commit
             state_root = $state
             mesh_socket = $meshSocket
+            network_mode = $NetworkMode
             node_socket = $nodeSocket
             node = $nodeRecord
             mesh = $null
@@ -457,6 +544,7 @@ switch ($Action) {
                 mesh = $runtime.mesh
                 node_socket = $nodeSocket
                 mesh_socket = $meshSocket
+                network_mode = $NetworkMode
                 probe = $probe
             } | ConvertTo-Json -Depth 10
         } catch {
@@ -498,6 +586,7 @@ switch ($Action) {
             mesh = $runtime.mesh
             node_socket = $runtime.node_socket
             mesh_socket = $runtime.mesh_socket
+            network_mode = $runtime.network_mode
             probe = $probe
         } | ConvertTo-Json -Depth 10
     }

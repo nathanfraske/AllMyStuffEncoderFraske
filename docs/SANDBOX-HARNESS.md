@@ -29,6 +29,17 @@ The sandbox creates another local stack with:
   processes started by that sandbox;
 - optional protected-port checks for services such as AllMyAgents.
 
+The default network mode is `Isolated`. It parks the built-in LAN local-claim
+network before the sandbox node starts and removes that network from the
+sandbox MyOwnMesh config. The node and sidecar still start and the external
+probe still tests their local process boundary, but the sandbox does not
+discover or advertise to LAN peers.
+
+Use `-NetworkMode LocalClaim` only when the test needs a live parallel mesh
+connection. That mode enables the product's existing mDNS-only local-claim
+network. A fresh sandbox identity can then discover LAN peers and advertise
+its own screens. This is an explicit test choice, not the safe default.
+
 The socket overrides are local process configuration. They do not add or
 change signaling messages, rendezvous, SDP, ICE, STUN, TURN, route messages,
 or media formats.
@@ -63,6 +74,7 @@ $bundle = 'C:\t\ams-sandbox-bundles\run-001'
   -Action Start `
   -InstanceId local-a `
   -BundleDir $bundle `
+  -NetworkMode Isolated `
   -ProtectedPort 5299,7777
 
 & "$bundle\allmystuff-sandbox.ps1" `
@@ -87,6 +99,20 @@ process for the whole run. The harness records every listener address, owner
 PID, process start time, and executable path before it launches the sandbox.
 It checks the same facts after startup, during status and probe operations, and
 after shutdown.
+
+For an opt-in LAN transport test, change only the start action:
+
+```powershell
+& "$bundle\allmystuff-sandbox.ps1" `
+  -Action Start `
+  -InstanceId lan-a `
+  -BundleDir $bundle `
+  -NetworkMode LocalClaim `
+  -ProtectedPort 5299,7777
+```
+
+The runtime record stores the selected network mode. `Status`, `Probe`, and
+`Stop` act on that recorded instance and do not change its network policy.
 
 The default startup window is 15 seconds because the existing production
 profile runner uses that deadline for the pinned mesh daemon to bind. The
@@ -122,13 +148,14 @@ A two-box test uses one sandbox instance per box:
 1. Transfer the same sealed bundle through the already-authorized production
    AllMyStuff data path.
 2. Start each sandbox with a different instance ID and state root.
-3. Join both fresh sandbox identities to a dedicated test network.
-4. Approve those identities through the normal local ownership and roster
+3. Keep the default `Isolated` mode while staging each box.
+4. Join both fresh sandbox identities to a dedicated test network.
+5. Approve those identities through the normal local ownership and roster
    flow.
-5. Run `video_prod_probe` against the sandbox node pipe.
-6. Keep the production AllMyStuff connection and the AllMyAgents listener in
+6. Run `video_prod_probe` against the sandbox node pipe.
+7. Keep the production AllMyStuff connection and the AllMyAgents listener in
    the protected snapshot.
-7. Stop only the sandbox instances when the run is complete.
+8. Stop only the sandbox instances when the run is complete.
 
 The sandbox connection is a separate MyOwnMesh session. Video and application
 payload still travel only on the authenticated ICE data path selected by the
@@ -139,6 +166,8 @@ signaling.
 
 - Multiple AllMyStuff node pipes can coexist on Windows.
 - Multiple MyOwnMesh control pipes can coexist using the v0.3.2 config field.
+- The local-claim network can be kept off by default and enabled explicitly
+  for a LAN transport test.
 - The external production probe can target a selected sandbox node.
 - A failed or stopped sandbox does not require the installed GUI or backend to
   restart.
