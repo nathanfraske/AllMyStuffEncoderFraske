@@ -27,8 +27,8 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -43,6 +43,11 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject,
+    GetDIBits, GetDeviceCaps, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+    HDC, HORZRES, SRCCOPY, VERTRES,
+};
 
 /// One captured desktop frame, already RGBA.
 pub struct RawFrame {
@@ -53,6 +58,172 @@ pub struct RawFrame {
     /// {0,90,180,270}. From `DXGI_OUTDUPL_DESC.Rotation`, read once per
     /// duplication. The raw buffer is rotated by THIS to become upright.
     pub rotation_deg: u32,
+}
+
+#[cfg(test)]
+mod live_tests {
+    #[test]
+    #[ignore = "requires an interactive Windows display"]
+    fn named_gdi_captures_the_active_primary_display() {
+        let monitor = xcap::Monitor::all()
+            .expect("enumerate monitors")
+            .into_iter()
+            .find(|monitor| monitor.is_primary().unwrap_or(false))
+            .expect("primary monitor");
+        let name = monitor.name().expect("primary display name");
+        let started = std::time::Instant::now();
+        let frame = super::capture_named_gdi(&name).expect("capture named display");
+        eprintln!(
+            "named GDI capture {name}: {}x{} in {:.3} ms",
+            frame.width,
+            frame.height,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(frame.width > 0);
+        assert!(frame.height > 0);
+        assert_eq!(
+            frame.rgba.len(),
+            frame.width as usize * frame.height as usize * 4
+        );
+        assert!(frame.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0xff));
+    }
+}
+
+/// Capture one upright frame from an exact `\\.\DISPLAYn` device with a
+/// display DC.
+///
+/// xcap's Windows screenshot fallback obtains a DC from the desktop window.
+/// A valid display can still have no usable desktop-window DC in a detached
+/// or recently reattached interactive session, which makes `BitBlt` fail with
+/// `ERROR_INVALID_HANDLE`. A DC opened for the named display does not depend on
+/// that HWND and also avoids virtual-desktop coordinate ambiguity.
+pub fn capture_named_gdi(device_name: &str) -> Result<RawFrame, String> {
+    struct OwnedDc(HDC);
+    impl Drop for OwnedDc {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteDC(self.0);
+            }
+        }
+    }
+
+    struct OwnedBitmap(HBITMAP);
+    impl Drop for OwnedBitmap {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteObject(self.0.into());
+            }
+        }
+    }
+
+    let mut wide = device_name.encode_utf16().collect::<Vec<_>>();
+    wide.push(0);
+    unsafe {
+        // Microsoft documents either "DISPLAY" or a specific display-device
+        // name as the driver. Passing the same exact device name in both slots
+        // binds this DC to one output instead of the virtual desktop.
+        let display = OwnedDc(CreateDCW(
+            PCWSTR(wide.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            None,
+        ));
+        if display.0 .0.is_null() {
+            return Err(format!("CreateDCW({device_name}): {}", GetLastError().0));
+        }
+        let width = GetDeviceCaps(Some(display.0), HORZRES);
+        let height = GetDeviceCaps(Some(display.0), VERTRES);
+        if width <= 0 || height <= 0 {
+            return Err(format!(
+                "CreateDCW({device_name}) returned invalid dimensions {width}x{height}"
+            ));
+        }
+
+        let memory = OwnedDc(CreateCompatibleDC(Some(display.0)));
+        if memory.0 .0.is_null() {
+            return Err(format!(
+                "CreateCompatibleDC({device_name}): {}",
+                GetLastError().0
+            ));
+        }
+        let bitmap = OwnedBitmap(CreateCompatibleBitmap(display.0, width, height));
+        if bitmap.0 .0.is_null() {
+            return Err(format!(
+                "CreateCompatibleBitmap({device_name}, {width}x{height}): {}",
+                GetLastError().0
+            ));
+        }
+
+        let previous = SelectObject(memory.0, bitmap.0.into());
+        let captured = (|| -> Result<Vec<u8>, String> {
+            BitBlt(
+                memory.0,
+                0,
+                0,
+                width,
+                height,
+                Some(display.0),
+                0,
+                0,
+                SRCCOPY,
+            )
+            .map_err(|e| format!("BitBlt({device_name}): {e}"))?;
+
+            let bytes = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| {
+                    format!("GDI frame dimensions overflow for {device_name}: {width}x{height}")
+                })?;
+            let mut bgra = vec![0u8; bytes];
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    // A negative height asks GDI for top-down rows.
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    biSizeImage: bytes as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let rows = GetDIBits(
+                memory.0,
+                bitmap.0,
+                0,
+                height as u32,
+                Some(bgra.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            if rows != height {
+                return Err(format!(
+                    "GetDIBits({device_name}) returned {rows}/{height} rows: {}",
+                    GetLastError().0
+                ));
+            }
+            Ok(bgra)
+        })();
+        let _ = SelectObject(memory.0, previous);
+        let bgra = captured?;
+        let mut rgba = Vec::new();
+        allmystuff_pixels::bgra_to_rgba_into(
+            &bgra,
+            width as usize * 4,
+            width as usize,
+            height as usize,
+            &mut rgba,
+        );
+        Ok(RawFrame {
+            rgba,
+            width: width as u32,
+            height: height as u32,
+            rotation_deg: 0,
+        })
+    }
 }
 
 /// A running duplication session. Dropping it stops the thread — really

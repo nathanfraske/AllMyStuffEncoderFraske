@@ -145,13 +145,21 @@ function Get-ExactScreen {
 }
 
 function Expand-AndSummarizeArtifact {
-    param([Parameter(Mandatory = $true)][string]$Archive)
+    param(
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][ValidateSet('first', 'second')][string]$Side
+    )
 
     if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
         throw "sandbox artifact archive is missing: $Archive"
     }
-    $destination = Join-Path (Split-Path -Parent $Archive) `
-        ([IO.Path]::GetFileNameWithoutExtension($Archive))
+    # Evidence filenames include phase/rank/frame identity. Keep the extraction
+    # root short so ordinary 1080p motion captures stay below Win32's legacy
+    # path budget even when the downloaded ZIP has a descriptive long name.
+    $destination = Join-Path $script:Artifacts (
+        Join-Path '.x' (Join-Path $RunId $Side)
+    )
     if (Test-Path -LiteralPath $destination) {
         throw "refusing to overwrite expanded sandbox artifact: $destination"
     }
@@ -255,7 +263,8 @@ function Invoke-Cleanup {
                     -Instance ([string]$entry.instance_id) `
                     -RemoteAction 'Collect' -OperationRunId $RunId
                 $expanded = Expand-AndSummarizeArtifact `
-                    -Archive ([string]$result.local_archive)
+                    -Archive ([string]$result.local_archive) `
+                    -RunId $RunId -Side $side
                 $entry | Add-Member -NotePropertyName 'artifact_archive' `
                     -NotePropertyValue ([string]$result.local_archive) -Force
                 $entry | Add-Member -NotePropertyName 'artifact_directory' `
