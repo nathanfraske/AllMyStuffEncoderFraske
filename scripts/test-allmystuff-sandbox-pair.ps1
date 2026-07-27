@@ -40,6 +40,9 @@ param(
     [ValidateSet('native', 'compressed', 'both')]
     [string]$Delivery = 'both',
 
+    [ValidateSet('cold', 'handoff')]
+    [string]$RewatchMode = 'cold',
+
     [switch]$ContinueOnProbeFailure,
 
     [ValidateRange(1, 300)]
@@ -436,6 +439,7 @@ $session = [pscustomobject][ordered]@{
         first_stop = $null
         second_stop = $null
     }
+    rewatch_mode = $RewatchMode
     first = [pscustomobject][ordered]@{
         peer_id = $FirstPeerId
         instance_id = $FirstInstanceId
@@ -618,6 +622,9 @@ try {
                 '--cycles', [string]$Cycles,
                 '--delivery', $mode
             )
+            if ($RewatchMode -ceq 'handoff') {
+                $probeArgs += '--rewatch-handoff'
+            }
             if ($MotionPalette -and $mode -ceq 'native') {
                 $probeArgs += '--motion-palette'
             }

@@ -32,6 +32,7 @@
   import { detectSymmetricActiveRegion, type ActiveRegion } from "../active-region";
   import { app } from "../store.svelte";
   import { DecodeStallEvidence, h264CodecString } from "../video-decoder";
+  import { summarizeTiming } from "../video-timing";
   import {
     clientLog,
     closeThisWindow,
@@ -210,6 +211,8 @@
   let paintIntervalMs = 0;
   let paintIntervalSamples = 0;
   let paintIntervalMaxMs = 0;
+  let paintBusySamplesMs: number[] = [];
+  let paintIntervalSamplesMs: number[] = [];
   let lastPaintAt = 0;
   let queuePeek = () => 0;
   let stallKick = (_inputFps: number, _decodedFps: number, _paintFps: number) => {};
@@ -677,6 +680,8 @@
       recvMbps = receivedMbps;
       inBytes = 0;
       if (app.debugLoggingEnabled === true && (inRate > 0 || decodedRate > 0 || fps > 0)) {
+        const paintBusyTiming = summarizeTiming(paintBusySamplesMs);
+        const paintIntervalTiming = summarizeTiming(paintIntervalSamplesMs);
         clientLog(
           `[video-pipeline] ${JSON.stringify({
             route: app.consoleVideoLive,
@@ -691,10 +696,12 @@
             receive_mbps: receivedMbps,
             paint_busy_ms_avg: paintBusySamples ? paintBusyMs / paintBusySamples : 0,
             paint_busy_ms_max: paintBusyMaxMs,
+            paint_busy_ms_p95: paintBusyTiming.p95,
             paint_interval_ms_avg: paintIntervalSamples
               ? paintIntervalMs / paintIntervalSamples
               : 0,
             paint_interval_ms_max: paintIntervalMaxMs,
+            paint_interval_ms_p95: paintIntervalTiming.p95,
             decode_failures: decodeFails,
           })}`,
         );
@@ -705,6 +712,8 @@
       paintIntervalMs = 0;
       paintIntervalSamples = 0;
       paintIntervalMaxMs = 0;
+      paintBusySamplesMs = [];
+      paintIntervalSamplesMs = [];
       // Healthy: most of what arrives gets painted. Anything else is an
       // anomaly worth wearing on the chip.
       pipeDiag =
@@ -824,7 +833,11 @@
     paintIntervalMs = 0;
     paintIntervalSamples = 0;
     paintIntervalMaxMs = 0;
+    paintBusySamplesMs = [];
+    paintIntervalSamplesMs = [];
     lastPaintAt = 0;
+    const viewerStartedAt = diagnostics ? performance.now() : 0;
+    let firstPaintLogged = false;
     // A new stream starts at its natural fit, with the trackpad cursor
     // re-centered, and any touch gesture from the old one is over — but
     // ONLY on an actual route change. The decode ladder re-runs this
@@ -994,6 +1007,7 @@
         paintIntervalMs += interval;
         paintIntervalSamples += 1;
         paintIntervalMaxMs = Math.max(paintIntervalMaxMs, interval);
+        paintIntervalSamplesMs.push(interval);
       }
       draw(ctx);
       if (diagnostics) {
@@ -1002,7 +1016,21 @@
         paintBusyMs += busy;
         paintBusySamples += 1;
         paintBusyMaxMs = Math.max(paintBusyMaxMs, busy);
+        paintBusySamplesMs.push(busy);
         lastPaintAt = paintedAt;
+        if (!firstPaintLogged) {
+          firstPaintLogged = true;
+          clientLog(
+            `[video-pipeline-first-paint] ${JSON.stringify({
+              route,
+              decode_path: decodePath,
+              transport,
+              width: w,
+              height: h,
+              first_paint_ms: paintedAt - viewerStartedAt,
+            })}`,
+          );
+        }
       }
       frameW = w;
       frameH = h;

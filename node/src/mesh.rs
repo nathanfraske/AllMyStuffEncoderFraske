@@ -20757,6 +20757,36 @@ mod tests {
     }
 
     #[test]
+    fn native_make_before_break_preserves_the_decoder_epoch() {
+        let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
+        let mesh = Mesh::new(client, Arc::new(NoopSink));
+        let route = "route:peer:screen→me:display:0";
+        let predecessor = mesh.video_watch(route.to_string(), true, DecoderPreference::Automatic);
+        assert!(mesh.video_poll_for(route, Some(predecessor)).is_empty());
+        let predecessor_epoch = mesh
+            .video_watchers
+            .lock()
+            .get(route)
+            .expect("predecessor watcher")
+            .decode_epoch;
+
+        let successor = mesh.video_watch(route.to_string(), true, DecoderPreference::Automatic);
+        let successor_epoch = mesh
+            .video_watchers
+            .lock()
+            .get(route)
+            .expect("successor watcher")
+            .decode_epoch;
+        assert_eq!(successor_epoch, predecessor_epoch);
+
+        mesh.video_unwatch(route, predecessor);
+        let watchers = mesh.video_watchers.lock();
+        let current = watchers.get(route).expect("successor remains current");
+        assert_eq!(current.token, successor);
+        assert_eq!(current.decode_epoch, predecessor_epoch);
+    }
+
+    #[test]
     fn releasing_late_watch_restores_displaced_live_claim() {
         let client = Arc::new(ControlClient::new().expect("resolve control socket path"));
         let mesh = Mesh::new(client, Arc::new(NoopSink));

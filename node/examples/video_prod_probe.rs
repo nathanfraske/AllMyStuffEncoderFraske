@@ -51,6 +51,21 @@ impl DeliveryMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewatchMode {
+    Cold,
+    Handoff,
+}
+
+impl RewatchMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     list: bool,
@@ -62,6 +77,7 @@ struct Config {
     active_timeout_secs: u64,
     first_frame_timeout_secs: u64,
     rewatch: bool,
+    rewatch_mode: RewatchMode,
     resize_edge: Option<u32>,
     fps: Option<u32>,
     mode: Option<String>,
@@ -85,6 +101,7 @@ impl Default for Config {
             active_timeout_secs: 20,
             first_frame_timeout_secs: 12,
             rewatch: true,
+            rewatch_mode: RewatchMode::Cold,
             resize_edge: None,
             fps: None,
             mode: None,
@@ -1078,11 +1095,12 @@ async fn main() -> Result<()> {
         (paths, "selected_authenticated_ice_pair".to_string())
     };
     println!(
-        "production probe: {} -> {} ({} cycle(s), {} delivery)",
+        "production probe: {} -> {} ({} cycle(s), {} delivery, {} rewatch)",
         source.id,
         sink.id,
         config.cycles,
-        config.delivery.name()
+        config.delivery.name(),
+        config.rewatch_mode.name(),
     );
     if !paths.is_empty() {
         println!(
@@ -1199,6 +1217,7 @@ async fn main() -> Result<()> {
     );
     let report = json!({
         "delivery": config.delivery.name(),
+        "rewatch_mode": config.rewatch_mode.name(),
         "source": source.display_value(),
         "sink": sink.display_value(),
         "cycles": cycle_summaries,
@@ -1272,15 +1291,18 @@ async fn exercise_cycle(
 
     let mut phases = vec![json!({ "name": "initial", "stats": first })];
     if config.rewatch {
-        client
-            .request(
-                "video_unwatch",
-                json!({ "route_id": route, "token": *token }),
-            )
-            .await
-            .context("drop native decoder/watch")?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        *token = client
+        let predecessor = *token;
+        if config.rewatch_mode == RewatchMode::Cold {
+            client
+                .request(
+                    "video_unwatch",
+                    json!({ "route_id": route, "token": predecessor }),
+                )
+                .await
+                .context("drop native decoder/watch")?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let successor = client
             .request(
                 "video_watch",
                 json!({
@@ -1295,12 +1317,26 @@ async fn exercise_cycle(
             .context(
                 "replacement video_watch returned a token that JavaScript cannot round-trip",
             )?;
-        // This is the same refresh request a native decoder emits when its
-        // first post-rewatch AU is a delta.  It remains on the existing route's
-        // ICE data channel; no media bytes are placed on signaling.
-        let _ = client
-            .request("video_refresh", json!({ "route_id": route }))
-            .await;
+        *token = successor;
+        if config.rewatch_mode == RewatchMode::Handoff {
+            // This is the product's local make-before-break order. The
+            // successor is current before the predecessor is released, so the
+            // route-local decoder and dependency chain remain live.
+            client
+                .request(
+                    "video_unwatch",
+                    json!({ "route_id": route, "token": predecessor }),
+                )
+                .await
+                .context("retire predecessor after replacement watch")?;
+        } else {
+            // This is the same refresh request a fresh native decoder emits
+            // when its first post-rewatch AU is a delta. It remains on the
+            // existing ICE data channel; no media bytes enter signaling.
+            let _ = client
+                .request("video_refresh", json!({ "route_id": route }))
+                .await;
+        }
         let rewatch_evidence_prefix = format!("cycle-{cycle:02}-viewer-rewatch");
         let resumed = collect_frames(
             client,
@@ -1317,7 +1353,11 @@ async fn exercise_cycle(
         )
         .await
         .with_context(|| format!("cycle {cycle}: decoder rewatch/resume"))?;
-        phases.push(json!({ "name": "viewer_rewatch", "stats": resumed }));
+        phases.push(json!({
+            "name": "viewer_rewatch",
+            "rewatch_mode": config.rewatch_mode.name(),
+            "stats": resumed
+        }));
     }
     Ok(json!({ "route": route, "phases": phases }))
 }
@@ -1817,6 +1857,7 @@ fn parse_args() -> Result<Config> {
                     next_arg(&mut args, "--first-frame-timeout")?.parse()?;
             }
             "--no-rewatch" => config.rewatch = false,
+            "--rewatch-handoff" => config.rewatch_mode = RewatchMode::Handoff,
             "--delivery" => {
                 config.delivery = DeliveryMode::parse(&next_arg(&mut args, "--delivery")?)?;
             }
@@ -1892,6 +1933,7 @@ OPTIONS
   --cycles N                Full disconnect/reopen cycles (default: 2)
   --delivery MODE           native|compressed (default: native)
   --no-rewatch              Skip watcher/decoder teardown and recreation
+  --rewatch-handoff         Register the successor before retiring its watcher
   --resize-edge N           Tune the live route to this maximum edge
   --fps N                   Request an explicit 1..240 capture cadence
   --mode MODE               balanced|game|studio|studio-lossless

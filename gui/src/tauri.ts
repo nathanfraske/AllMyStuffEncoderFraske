@@ -32,6 +32,8 @@ import type {
 } from "./types";
 import { makeInputDispatcher } from "./input-dispatch";
 import type { RouteHandle } from "./route-handle-state";
+import { TimingWindow } from "./video-timing";
+import { videoWatchHandoff } from "./video-watch-handoff";
 
 export type { RouteHandle } from "./route-handle-state";
 
@@ -738,14 +740,15 @@ export async function watchVideo(
   let diagPolls = 0;
   let diagPackets = 0;
   let diagBytes = 0;
-  let diagPollMs = 0;
-  let diagDispatchMs = 0;
-  let diagReadyWaitMs = 0;
-  let diagReadySamples = 0;
-  let diagPresentationWaitMs = 0;
-  let diagPresentationBusyMs = 0;
-  let diagPresentationSamples = 0;
+  const diagPollMs = new TimingWindow();
+  const diagDispatchMs = new TimingWindow();
+  const diagReadyWaitMs = new TimingWindow();
+  const diagPresentationWaitMs = new TimingWindow();
+  const diagPresentationBusyMs = new TimingWindow();
   let diagPresentationSuperseded = 0;
+  let diagRegisteredAt = 0;
+  let diagRegistrationMs = 0;
+  let diagHandoffPredecessors = 0;
   let pendingRaw: VideoFrameMsg | null = null;
   let rawPresentationBlocked = false;
   let rawFrameRequest: number | undefined;
@@ -794,9 +797,16 @@ export async function watchVideo(
       if (!stopped && frame) dispatchFrame(frame);
       const finished = performance.now();
       if (opts?.diagnostics) {
-        diagPresentationWaitMs += busyStarted - queuedAt;
-        diagPresentationBusyMs += finished - busyStarted;
-        diagPresentationSamples += 1;
+        diagPresentationWaitMs.add(busyStarted - queuedAt);
+        diagPresentationBusyMs.add(finished - busyStarted);
+        if (diagRegisteredAt > 0) {
+          clientLog(
+            `[video-viewer-first-present] route=${routeId} register_ms=${diagRegistrationMs.toFixed(3)} first_present_ms=${(finished - diagRegisteredAt).toFixed(3)} handoff_predecessors=${diagHandoffPredecessors}`,
+          );
+          diagRegisteredAt = 0;
+          diagRegistrationMs = 0;
+          diagHandoffPredecessors = 0;
+        }
       }
       rawPresentationBlocked = false;
       if (!stopped && pending && !inFlight) void drain();
@@ -814,6 +824,7 @@ export async function watchVideo(
     token = 0;
     let backoffMs = 16;
     let registrationError: unknown;
+    const registrationStartedAt = opts?.diagnostics ? performance.now() : 0;
     while (!stopped && !opts?.signal?.aborted && token === 0) {
       try {
         const candidate = (await invoke("video_watch", {
@@ -828,6 +839,16 @@ export async function watchVideo(
       if (token === 0 && !opts?.signal?.aborted) {
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
         backoffMs = Math.min(backoffMs * 2, 1000);
+      }
+    }
+    if (token > 0) {
+      // The backend has already made the successor current. Retiring a
+      // predecessor now cannot tear down its decoder or drain its queue.
+      const completed = videoWatchHandoff.complete(routeId);
+      if (opts?.diagnostics) {
+        diagRegisteredAt = performance.now();
+        diagRegistrationMs = diagRegisteredAt - registrationStartedAt;
+        diagHandoffPredecessors = completed;
       }
     }
     if (retiredToken > 0 && retiredToken !== token) {
@@ -862,8 +883,7 @@ export async function watchVideo(
         pending = false;
         const started = performance.now();
         if (eventReadyAt) {
-          diagReadyWaitMs += started - eventReadyAt;
-          diagReadySamples += 1;
+          if (opts?.diagnostics) diagReadyWaitMs.add(started - eventReadyAt);
           eventReadyAt = 0;
         }
         const batch = (await invoke("video_poll", { routeId, token })) as ArrayBuffer;
@@ -891,8 +911,8 @@ export async function watchVideo(
           diagPolls += 1;
           diagPackets += packets;
           diagBytes += batch.byteLength;
-          diagPollMs += polled - started;
-          diagDispatchMs += performance.now() - polled;
+          diagPollMs.add(polled - started);
+          diagDispatchMs.add(performance.now() - polled);
         }
       } while (!stopped && pending && !rawPresentationBlocked);
     } catch (error) {
@@ -935,7 +955,13 @@ export async function watchVideo(
   if (!(await registerWatcher()) || opts?.signal?.aborted) {
     stopped = true;
     unlisten();
-    if (token > 0) void invoke("video_unwatch", { routeId, token }).catch(() => {});
+    if (token > 0) {
+      const retiredToken = token;
+      token = 0;
+      videoWatchHandoff.defer(routeId, retiredToken, () => {
+        void invoke("video_unwatch", { routeId, token: retiredToken }).catch(() => {});
+      });
+    }
     return () => {};
   }
   armed = true;
@@ -955,29 +981,24 @@ export async function watchVideo(
     ? setInterval(() => {
         if (diagPolls > 0 || diagPackets > 0) {
           const mib = diagBytes / (1024 * 1024);
-          const avgPoll = diagPolls ? diagPollMs / diagPolls : 0;
-          const avgDispatch = diagPolls ? diagDispatchMs / diagPolls : 0;
-          const avgReady = diagReadySamples ? diagReadyWaitMs / diagReadySamples : 0;
-          const avgPresentationWait = diagPresentationSamples
-            ? diagPresentationWaitMs / diagPresentationSamples
-            : 0;
-          const avgPresentationBusy = diagPresentationSamples
-            ? diagPresentationBusyMs / diagPresentationSamples
-            : 0;
+          const poll = diagPollMs.take();
+          const dispatch = diagDispatchMs.take();
+          const ready = diagReadyWaitMs.take();
+          const presentationWait = diagPresentationWaitMs.take();
+          const presentationBusy = diagPresentationBusyMs.take();
           clientLog(
-            `[video-viewer] route=${routeId} polls=${diagPolls} packets=${diagPackets} bytes_mib=${mib.toFixed(2)} poll_ms_avg=${avgPoll.toFixed(3)} dispatch_ms_avg=${avgDispatch.toFixed(3)} ready_wait_ms_avg=${avgReady.toFixed(3)} present_wait_ms_avg=${avgPresentationWait.toFixed(3)} present_busy_ms_avg=${avgPresentationBusy.toFixed(3)} present_superseded=${diagPresentationSuperseded}`,
+            `[video-viewer] route=${routeId} polls=${diagPolls} packets=${diagPackets} bytes_mib=${mib.toFixed(2)} poll_ms_avg=${poll.avg.toFixed(3)} poll_ms_p95=${poll.p95.toFixed(3)} poll_ms_max=${poll.max.toFixed(3)} dispatch_ms_avg=${dispatch.avg.toFixed(3)} dispatch_ms_p95=${dispatch.p95.toFixed(3)} dispatch_ms_max=${dispatch.max.toFixed(3)} ready_wait_ms_avg=${ready.avg.toFixed(3)} ready_wait_ms_p95=${ready.p95.toFixed(3)} ready_wait_ms_max=${ready.max.toFixed(3)} present_wait_ms_avg=${presentationWait.avg.toFixed(3)} present_wait_ms_p95=${presentationWait.p95.toFixed(3)} present_wait_ms_max=${presentationWait.max.toFixed(3)} present_busy_ms_avg=${presentationBusy.avg.toFixed(3)} present_busy_ms_p95=${presentationBusy.p95.toFixed(3)} present_busy_ms_max=${presentationBusy.max.toFixed(3)} present_superseded=${diagPresentationSuperseded}`,
           );
+        } else {
+          diagPollMs.reset();
+          diagDispatchMs.reset();
+          diagReadyWaitMs.reset();
+          diagPresentationWaitMs.reset();
+          diagPresentationBusyMs.reset();
         }
         diagPolls = 0;
         diagPackets = 0;
         diagBytes = 0;
-        diagPollMs = 0;
-        diagDispatchMs = 0;
-        diagReadyWaitMs = 0;
-        diagReadySamples = 0;
-        diagPresentationWaitMs = 0;
-        diagPresentationBusyMs = 0;
-        diagPresentationSamples = 0;
         diagPresentationSuperseded = 0;
       }, 1000)
     : undefined;
@@ -992,7 +1013,13 @@ export async function watchVideo(
     clearInterval(watchdog);
     if (diagTimer !== undefined) clearInterval(diagTimer);
     unlisten();
-    void invoke("video_unwatch", { routeId, token }).catch(() => {});
+    if (token > 0) {
+      const retiredToken = token;
+      token = 0;
+      videoWatchHandoff.defer(routeId, retiredToken, () => {
+        void invoke("video_unwatch", { routeId, token: retiredToken }).catch(() => {});
+      });
+    }
   };
 }
 
