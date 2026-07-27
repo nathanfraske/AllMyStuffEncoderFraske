@@ -144,6 +144,45 @@ function Get-ExactScreen {
     return [string]$general[0].id
 }
 
+function Assert-MotionCoverage {
+    param(
+        [Parameter(Mandatory = $true)][object]$Start,
+        [Parameter(Mandatory = $true)][object]$Final
+    )
+
+    $operation = $Final.operation
+    $source = $operation.source_status
+    $advanced = (
+        [int]$source.frame -gt [int]$Start.operation.source_status.frame -and
+        [int]$source.paint_count -gt
+            [int]$Start.operation.source_status.paint_count
+    )
+    $runningAndValid = (
+        $operation.running -eq $true -and
+        $source.validated -eq $true -and
+        $source.finished -ne $true
+    )
+    $leaseDurationMs = (
+        [int64]$Start.operation.record.duration_seconds * 1000
+    )
+    $completedAtLease = (
+        $operation.running -eq $false -and
+        $source.validated -eq $true -and
+        $source.finished -eq $true -and
+        [int64]$source.elapsed_ms -ge $leaseDurationMs -and
+        $null -ne $operation.done -and
+        $operation.done.validated -eq $true -and
+        $operation.done.finished -eq $true -and
+        ($null -eq $operation.child_exit -or
+            ($operation.child_exit.success -eq $true -and
+                [int]$operation.child_exit.exit_code -eq 0))
+    )
+    if (-not $advanced -or
+        (-not $runningAndValid -and -not $completedAtLease)) {
+        throw 'motion source exited before its measured direction completed or did not advance'
+    }
+}
+
 function Expand-AndSummarizeArtifact {
     param(
         [Parameter(Mandatory = $true)][string]$Archive,
@@ -557,12 +596,20 @@ try {
                 viewer_instance = $FirstInstanceId
                 source = $secondSource
                 name = 'first-views-second'
+                motion_side = 'second'
+                motion_peer = $SecondPeerId
+                motion_instance = $SecondInstanceId
+                motion_start = $session.motion.second_start
             },
             [pscustomobject]@{
                 viewer_peer = $SecondPeerId
                 viewer_instance = $SecondInstanceId
                 source = $firstSource
                 name = 'second-views-first'
+                motion_side = 'first'
+                motion_peer = $FirstPeerId
+                motion_instance = $FirstInstanceId
+                motion_start = $session.motion.first_start
             }
         )) {
             $probeArgs = @(
@@ -575,17 +622,33 @@ try {
                 $probeArgs += '--motion-palette'
             }
             $probeRun = "$RunId-$($direction.name)-$mode"
+            $result = $null
+            $motionStatus = $null
             try {
                 $result = Invoke-Remote -Peer (
                     [string]$direction.viewer_peer
                 ) -Instance ([string]$direction.viewer_instance) `
                     -RemoteAction 'Probe' -OperationRunId $probeRun `
                     -Probe $probeArgs
+                if ($MotionPalette -and $mode -ceq 'native') {
+                    $motionStatus = Invoke-Remote `
+                        -Peer ([string]$direction.motion_peer) `
+                        -Instance ([string]$direction.motion_instance) `
+                        -RemoteAction 'MotionStatus' -OperationRunId $RunId
+                    Assert-MotionCoverage `
+                        -Start $direction.motion_start -Final $motionStatus
+                    if ([string]$direction.motion_side -ceq 'first') {
+                        $session.motion.first_final_status = $motionStatus
+                    } else {
+                        $session.motion.second_final_status = $motionStatus
+                    }
+                }
                 $tests.Add([pscustomobject][ordered]@{
                     direction = [string]$direction.name
                     delivery = $mode
                     source = [string]$direction.source
                     result = $result.operation.report
+                    motion_status = $motionStatus
                     error = $null
                 })
             } catch {
@@ -598,7 +661,12 @@ try {
                     direction = [string]$direction.name
                     delivery = $mode
                     source = [string]$direction.source
-                    result = $null
+                    result = if ($null -ne $result) {
+                        $result.operation.report
+                    } else {
+                        $null
+                    }
+                    motion_status = $motionStatus
                     error = $message
                 })
             }
@@ -611,50 +679,15 @@ try {
         }
     }
     if ($MotionPalette) {
-        $session.motion.first_final_status = Invoke-Remote `
-            -Peer $FirstPeerId -Instance $FirstInstanceId `
-            -RemoteAction 'MotionStatus' -OperationRunId $RunId
-        $session.motion.second_final_status = Invoke-Remote `
-            -Peer $SecondPeerId -Instance $SecondInstanceId `
-            -RemoteAction 'MotionStatus' -OperationRunId $RunId
-        foreach ($statusPair in @(
-            [pscustomobject]@{
-                start = $session.motion.first_start
-                final = $session.motion.first_final_status
-            },
-            [pscustomobject]@{
-                start = $session.motion.second_start
-                final = $session.motion.second_final_status
-            }
-        )) {
-            $operation = $statusPair.final.operation
-            $source = $operation.source_status
-            $advanced = (
-                [int]$source.frame -gt
-                    [int]$statusPair.start.operation.source_status.frame -and
-                [int]$source.paint_count -gt
-                    [int]$statusPair.start.operation.source_status.paint_count
-            )
-            $runningAndValid = (
-                $operation.running -eq $true -and
-                $source.validated -eq $true -and
-                $source.finished -ne $true
-            )
-            $completedAndValid = (
-                $operation.running -eq $false -and
-                $source.validated -eq $true -and
-                $source.finished -eq $true -and
-                $null -ne $operation.done -and
-                $operation.done.validated -eq $true -and
-                $operation.done.finished -eq $true -and
-                ($null -eq $operation.child_exit -or
-                    ($operation.child_exit.success -eq $true -and
-                        [int]$operation.child_exit.exit_code -eq 0))
-            )
-            if (-not $advanced -or
-                (-not $runningAndValid -and -not $completedAndValid)) {
-                throw 'one or both motion sources failed, exited early, or did not advance during the soak'
-            }
+        if ($null -eq $session.motion.first_final_status) {
+            $session.motion.first_final_status = Invoke-Remote `
+                -Peer $FirstPeerId -Instance $FirstInstanceId `
+                -RemoteAction 'MotionStatus' -OperationRunId $RunId
+        }
+        if ($null -eq $session.motion.second_final_status) {
+            $session.motion.second_final_status = Invoke-Remote `
+                -Peer $SecondPeerId -Instance $SecondInstanceId `
+                -RemoteAction 'MotionStatus' -OperationRunId $RunId
         }
     }
     $session.tests = $tests.ToArray()
