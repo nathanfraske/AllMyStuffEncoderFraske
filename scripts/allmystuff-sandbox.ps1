@@ -291,11 +291,11 @@ function Set-SandboxMeshConfig {
 
     $localClaimId = 'allmystuff-local-claim-v1'
     $networksProperty = $config.PSObject.Properties['networks']
-    $configuredNetworks = if ($null -eq $networksProperty) {
-        @()
-    } else {
-        @($networksProperty.Value)
-    }
+    $configuredNetworks = @(
+        if ($null -ne $networksProperty) {
+            $networksProperty.Value
+        }
+    )
     $localClaimConfig = $configuredNetworks |
         Where-Object {
             [string]$_.id -ceq $localClaimId -or
@@ -324,14 +324,14 @@ function Set-SandboxMeshConfig {
         $disabledStore = [pscustomobject]@{ disabled = @() }
     }
     $disabledProperty = $disabledStore.PSObject.Properties['disabled']
-    $disabledNetworks = if ($null -eq $disabledProperty) {
-        @()
-    } else {
-        @($disabledProperty.Value | Where-Object {
-            [string]$_.id -cne $localClaimId -and
-            [string]$_.network_id -cne $localClaimId
-        })
-    }
+    $disabledNetworks = @(
+        if ($null -ne $disabledProperty) {
+            $disabledProperty.Value | Where-Object {
+                [string]$_.id -cne $localClaimId -and
+                [string]$_.network_id -cne $localClaimId
+            }
+        }
+    )
     if ($NetworkMode -ceq 'Isolated') {
         if ($null -eq $localClaimConfig) {
             $localClaimConfig = [pscustomobject][ordered]@{
