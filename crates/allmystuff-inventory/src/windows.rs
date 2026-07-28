@@ -27,6 +27,8 @@ fn ps_json(script: &str) -> Option<serde_json::Value> {
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
@@ -390,5 +392,15 @@ mod tests {
             2
         );
         assert_eq!(as_rows(serde_json::Value::Null).len(), 0);
+    }
+
+    #[test]
+    fn powershell_probe_has_no_console() {
+        let value = ps_json(
+            r#"Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class InventoryConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'; [pscustomobject]@{ HasConsole = [InventoryConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero } | ConvertTo-Json -Compress"#,
+        )
+        .expect("run PowerShell console probe");
+
+        assert_eq!(value["HasConsole"], false);
     }
 }

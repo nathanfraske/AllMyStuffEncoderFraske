@@ -8,6 +8,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +17,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn suppress_console_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn suppress_console_window(_: &mut Command) {}
 
 #[derive(Debug)]
 struct Config {
@@ -214,18 +227,23 @@ fn execute_request(config: &Config, request: &Value) -> Result<()> {
         .join("outbox")
         .join(format!("sandbox-remote-result-{request_id}.json"));
 
-    let status = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
         ])
         .arg(&bootstrap)
         .current_dir(&config.runtime)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    suppress_console_window(&mut command);
+    let status = command
         .status()
         .with_context(|| format!("launch stable bootstrap: {}", bootstrap.display()))?;
 
@@ -334,5 +352,32 @@ fn main() {
         eprintln!("{error:#}");
         eprintln!("{}", usage());
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_child_has_no_console() {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class SandboxConsoleProbe { [DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow(); }'; if ([SandboxConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 91 }",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        suppress_console_window(&mut command);
+
+        let status = command.status().expect("launch console probe");
+        assert!(status.success(), "PowerShell received a console: {status}");
     }
 }
