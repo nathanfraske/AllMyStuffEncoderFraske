@@ -172,9 +172,8 @@ pub mod videotoolbox;
 pub mod wake;
 #[cfg(windows)]
 pub(crate) mod windows_fleetfiles;
-// Windows screen capture (in-house DXGI). Declared on every target — the
-// module is internally `cfg`-gated to a stub off Windows, exactly as it was
-// when it lived in the GUI binary.
+// Windows screen capture (in-house DXGI). The implementation is internally
+// gated to Windows + host, including its CPU capture path and pixel helpers.
 pub mod win_capture;
 // Windows privilege posture + desktop following: whether a support session can
 // actually reach elevated repair tooling (Event Viewer, Services, regedit) and

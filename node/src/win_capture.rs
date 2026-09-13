@@ -20,7 +20,7 @@
 //! Frames are damage-driven: `AcquireNextFrame` returns only when the
 //! desktop actually changed, so an idle screen costs polling, not copies.
 
-#![cfg(windows)]
+#![cfg(all(windows, feature = "host"))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
