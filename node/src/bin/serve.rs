@@ -143,9 +143,51 @@ fn pick_relaunch(as_service: bool) -> fn() -> ! {
     reexec_self
 }
 
+const SERVE_HELP: &str = "\
+Usage: allmystuff-serve [OPTIONS]
+       allmystuff-serve <help|version|update>
+
+Run this machine on the mesh without the desktop GUI.
+With no command, start the node and supervise its MyOwnMesh daemon until stopped.
+
+Commands:
+  help                    Print this help and exit
+  version                 Print the node version and exit
+  update                  Download and apply the latest release
+
+Options:
+  -h, --help              Print this help and exit
+  -V, --version           Print the node version and exit
+  --log FILTER            Logging filter (overrides ALLMYSTUFF_LOG)
+  --supervised            Wait for an existing healthy node to stop
+
+Windows service runtime options:
+  --service               Run under the Service Control Manager
+  --session-agent         Run as the service's desktop-session agent
+
+Help, version and update are recognized only as the first argument.
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliVerb {
+    Help,
+    Version,
+    Update,
+}
+
+fn cli_verb(argv: &[String]) -> Option<CliVerb> {
+    match argv.first().map(String::as_str) {
+        Some("--help" | "-h" | "help") => Some(CliVerb::Help),
+        Some("--version" | "-V" | "version") => Some(CliVerb::Version),
+        Some("update") => Some(CliVerb::Update),
+        _ => None,
+    }
+}
+
 /// One-shot CLI verbs `allmystuff-serve` answers *before* it would bind the
 /// control socket and become a node, keyed off the first argument:
 ///
+///   * `--help` / `-h` / `help` — print usage without touching node state.
 ///   * `--version` / `-V` — print `allmystuff-serve <version>`. A supervising
 ///     app (e.g. the CEC Support app checking a reused node against its pinned
 ///     AllMyStuff version) reads this the same way `daemon_spawn` reads
@@ -157,15 +199,17 @@ fn pick_relaunch(as_service: bool) -> fn() -> ! {
 /// Returns `Some(code)` when a verb ran (main exits with it), `None` to carry on
 /// and run the node. `--service` / `--log` are flags, not verbs, so they fall
 /// through to the normal node path.
-fn run_cli_verb() -> Option<ExitCode> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    match argv.first().map(String::as_str) {
-        Some("--version" | "-V" | "version") => {
+fn run_cli_verb(argv: &[String]) -> Option<ExitCode> {
+    match cli_verb(argv)? {
+        CliVerb::Help => {
+            print!("{SERVE_HELP}");
+            Some(ExitCode::SUCCESS)
+        }
+        CliVerb::Version => {
             println!("allmystuff-serve {}", env!("CARGO_PKG_VERSION"));
             Some(ExitCode::SUCCESS)
         }
-        Some("update") => Some(run_update_now()),
-        _ => None,
+        CliVerb::Update => Some(run_update_now()),
     }
 }
 
@@ -216,9 +260,10 @@ fn render_update_now(outcome: &allmystuff_updater::UpdateNowOutcome) -> String {
 }
 
 fn main() -> ExitCode {
-    // One-shot CLI verbs (`--version`, `update`) run before we touch logging or
-    // the control socket, and exit with their own code.
-    if let Some(code) = run_cli_verb() {
+    // One-shot CLI verbs (`--help`, `--version`, `update`) run before state
+    // configuration, pending updates, logging or sockets, then exit.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = run_cli_verb(&argv) {
         return code;
     }
 
@@ -1181,6 +1226,68 @@ mod winsvc {
             assert_eq!(restart_delay(2), Duration::from_secs(4));
             assert_eq!(restart_delay(6), Duration::from_secs(64));
             assert_eq!(restart_delay(100), Duration::from_secs(64));
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn help_exits_before_runtime_or_update_arguments() {
+        for help in ["--help", "-h", "help"] {
+            assert_eq!(run_cli_verb(&args(&[help])), Some(ExitCode::SUCCESS));
+            assert_eq!(
+                run_cli_verb(&args(&[
+                    help,
+                    "--service",
+                    "--session-agent",
+                    "--supervised",
+                    "--log",
+                    "debug",
+                    "update",
+                ])),
+                Some(ExitCode::SUCCESS),
+            );
+        }
+    }
+
+    #[test]
+    fn existing_first_verbs_keep_precedence_over_later_help() {
+        for version in ["--version", "-V", "version"] {
+            let argv = args(&[version, "--help"]);
+            assert_eq!(cli_verb(&argv), Some(CliVerb::Version));
+            assert_eq!(run_cli_verb(&argv), Some(ExitCode::SUCCESS));
+        }
+        // Classify update without executing its network/filesystem work.
+        assert_eq!(cli_verb(&args(&["update"])), Some(CliVerb::Update));
+        assert_eq!(
+            cli_verb(&args(&["update", "--help"])),
+            Some(CliVerb::Update),
+        );
+    }
+
+    #[test]
+    fn startup_and_unknown_arguments_still_pass_through() {
+        let cases: &[&[&str]] = &[
+            &[],
+            &["--log", "debug"],
+            &["--supervised"],
+            &["--service"],
+            &["--session-agent"],
+            &["--service", "--help"],
+            &["--log", "help"],
+            &["--log", "info", "--version"],
+            &["unknown"],
+            &["--unknown", "--help"],
+        ];
+        for argv in cases {
+            assert_eq!(run_cli_verb(&args(argv)), None, "{argv:?}");
         }
     }
 }
