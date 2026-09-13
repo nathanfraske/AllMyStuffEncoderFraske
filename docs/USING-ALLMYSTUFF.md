@@ -227,6 +227,17 @@ devices, CEC Support, Always On, updates, and destructive recovery actions.
 
 ## Headless machines
 
+To see the node's options without starting it, call the node binary directly:
+
+```sh
+allmystuff-serve --help
+```
+
+Put `--help` first, immediately after the executable; `-h` and `help` are aliases.
+Direct help exits without starting the node or applying pending updates. The
+`allmystuff serve --help` wrapper can apply pending updates before forwarding
+the request, so use the direct command when you only want help.
+
 Run a machine without the desktop interface:
 
 ```sh
@@ -240,6 +251,13 @@ allmystuff service install
 ```
 
 Use `amst <machine>` from another fleet device to open a terminal on it.
+
+Default builds keep their existing capabilities. Custom capture-less builds
+omit this machine's screen and camera sources, incoming keyboard/mouse control,
+and clipboard from the capabilities advertised to peers. Viewer and controller
+endpoints remain; audio endpoints appear only when audio I/O is included in the
+build. See the [modular foundation roadmap](MODULAR-FOUNDATION.md) for build
+choices and current limits.
 
 ## When something looks stale
 
