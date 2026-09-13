@@ -2,11 +2,14 @@
 
 AllMyStuff is a desktop app for connecting the computers you own over a
 private mesh. It's deliberately split so the **model is pure and testable**
-and the **mesh is a sidecar**, never an embedded dependency.
+and the **desktop mesh runtime is a sidecar**. The mobile shell embeds the
+same daemon and node, as described in [Mobile architecture](docs/MOBILE.md).
 
 This is an engineering reference, not a user guide. Start with
 [Using AllMyStuff](docs/USING-ALLMYSTUFF.md) for product behavior or the
 [documentation map](docs/README.md) to find a narrower document.
+For source-checked responsibility boundaries, proposed modular profiles and
+qualified platform evidence, see the [modular foundation roadmap](docs/MODULAR-FOUNDATION.md).
 
 ## One picture
 
@@ -539,8 +542,8 @@ Tauri 2 + Svelte 5, a client of the daemon.
    input for a scanned mic — and streams it
    to the sink — as Opus on **MyOwnMesh's RTP audio track lane** (48 kHz
    mono, 20 ms frames) when the offer asked for it and both daemons
-   speak the lane (myownmesh ≥ 0.2.4 — the actually-bundled daemon pin is
-   v0.3.3, see `.myownmesh-rev`), as PCM `AudioFrame`s over
+   speak the lane (myownmesh ≥ 0.2.4; the bundled version is selected by
+   [`.myownmesh-rev`](.myownmesh-rev)), as PCM `AudioFrame`s over
    `CHANNEL_MEDIA` otherwise, so any version skew degrades to working
    sound exactly like video's MJPEG floor. The sink's playout ring aims
    ~80 ms behind the live edge and trims itself, so audio keeps step
@@ -610,7 +613,7 @@ Tauri 2 + Svelte 5, a client of the daemon.
    enter the four-complete-AU local queue, so a many-slice keyframe consumes
    one slot rather than overflowing on its own. Older peers ignore the valid
    SEI metadata and retain periodic-IDR compatibility. (These are floor thresholds;
-   the actually-bundled daemon pin is v0.3.3 — see `.myownmesh-rev`.)
+   the bundled version is selected by [`.myownmesh-rev`](.myownmesh-rev).)
    Set `ALLMYSTUFF_VIDEO_STATS=1` to print each stream's per-stage
    pipeline counters (fps, scale/encode/decode ms, bitrate, audio levels,
    skip/drop causes) every few seconds on both ends — quiet by default;
