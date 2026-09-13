@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::UiSink;
 
-use allmystuff_graph::{Capability, Grant, MediaKind, NodeId, Person, PersonId, Route};
+use allmystuff_graph::{Capability, Flow, Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
     claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
     DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
@@ -13568,21 +13568,34 @@ impl Mesh {
     /// basis to active routes keeps the two ends agreeing on a stable lane for
     /// the whole life of each stream (both ends process Active/Teardown), so
     /// an unrelated route coming or going no longer reshuffles a live one.
-    /// The capability list this node advertises. On a `host` build it is the
-    /// bridge's list verbatim. A capture-less build (iOS) strips the sources
-    /// it cannot serve — the synthetic screen and any camera — so peers are
-    /// never invited to open a stream the stub planes would refuse. Sinks
-    /// (video-view, audio out) and the mic (real under `audio-io`) stay.
+    /// The capability list this node advertises. Keep the bridge's inventory
+    /// contract general, then omit endpoints whose implementation is not built
+    /// into this node. Viewer/controller endpoints remain usable without `host`;
+    /// audio capture and playback both require `audio-io`.
     fn advertised_capabilities(
         inv: &allmystuff_inventory::Inventory,
         node: &allmystuff_graph::NodeId,
     ) -> Vec<allmystuff_graph::Capability> {
-        #[allow(unused_mut)]
         let mut caps =
             allmystuff_bridge::capabilities_with_screens(inv, node, &crate::video::extra_screens());
-        #[cfg(not(feature = "host"))]
-        caps.retain(|c| c.origin != "screen" && c.origin != "camera");
+        Self::filter_advertised_capabilities(&mut caps);
         caps
+    }
+
+    /// Pure profile filtering, shared by initial presence and inventory updates.
+    /// Input sources can drive a remote even when local injection is stubbed.
+    fn filter_advertised_capabilities(caps: &mut Vec<Capability>) {
+        caps.retain(|c| {
+            let needs_host = matches!(
+                (c.media, c.flow, c.origin.as_str()),
+                (MediaKind::Display, Flow::Source, "screen")
+                    | (MediaKind::Video, Flow::Source, "camera")
+                    | (MediaKind::Input, Flow::Sink, "control")
+                    | (MediaKind::Clipboard, Flow::Duplex, "clipboard")
+            );
+            (cfg!(feature = "host") || !needs_host)
+                && (cfg!(feature = "audio-io") || c.media != MediaKind::Audio)
+        });
     }
 
     fn sorted_media_routes(&self, peer: &str, outbound: bool, codec: &str) -> Vec<String> {
@@ -21724,6 +21737,141 @@ fn parse_media(s: &str) -> MediaKind {
 
 #[cfg(test)]
 mod tests {
+    /// A real bridge profile built entirely from fixtures: no scanner, node
+    /// constructor, default stores, capture backend, or control socket.
+    fn advertised_capabilities_fixture() -> Vec<Capability> {
+        let inv = serde_json::from_value(json!({
+            "scanned_at": 0,
+            "host": { "hostname": "fixture", "os": "fixture", "arch": "fixture", "uptime_secs": 0 },
+            "cpu": { "brand": "Fixture CPU", "logical_cores": 1 },
+            "memory": { "total_bytes": 16, "available_bytes": 8, "swap_total_bytes": 0, "swap_used_bytes": 0 },
+            "microphones": [
+                { "id": "mic:1", "name": "Fixture mic", "direction": "input", "channels": 4, "default": true }
+            ],
+            "speakers": [
+                { "id": "spk:1", "name": "Fixture speakers", "direction": "output", "default": true }
+            ],
+            "cameras": [
+                { "id": "cam:1", "name": "Fixture camera", "default": true }
+            ],
+            "displays": [
+                { "id": "display:1", "name": "Fixture display", "connector": "fixture", "connected": true,
+                  "internal": false, "width_px": 1920, "height_px": 1080, "default": true }
+            ],
+            "inputs": [
+                { "id": "input:keyboard", "name": "Keyboard", "kind": "keyboard" },
+                { "id": "input:mouse", "name": "Mouse", "kind": "mouse" },
+                { "id": "input:touchpad", "name": "Touchpad", "kind": "touchpad" },
+                { "id": "input:touchscreen", "name": "Touchscreen", "kind": "touchscreen" },
+                { "id": "input:gamepad", "name": "Gamepad", "kind": "gamepad" },
+                { "id": "input:tablet", "name": "Tablet", "kind": "tablet" },
+                { "id": "input:other", "name": "Other input", "kind": "other" }
+            ],
+            "storage": [
+                { "id": "disk:1", "name": "Fixture disk", "total_bytes": 4294967296u64,
+                  "available_bytes": 2147483648u64, "removable": false, "kind": "ssd" }
+            ]
+        }))
+        .expect("valid inventory fixture");
+        allmystuff_bridge::capabilities_with_screens(
+            &inv,
+            &NodeId::from("fixture"),
+            &[allmystuff_bridge::ScreenSource {
+                id: 7,
+                label: "Extra fixture screen".into(),
+            }],
+        )
+    }
+
+    #[test]
+    fn advertised_capabilities_preserve_viewers_input_sources_and_storage() {
+        let full = advertised_capabilities_fixture();
+        let mut filtered = full.clone();
+        Mesh::filter_advertised_capabilities(&mut filtered);
+        for id in [
+            "fixture:display-view",
+            "fixture:video-in",
+            "fixture:display:1",
+            "fixture:keyboard-mouse",
+            "fixture:input:keyboard",
+            "fixture:input:mouse",
+            "fixture:input:touchpad",
+            "fixture:input:touchscreen",
+            "fixture:input:gamepad",
+            "fixture:input:tablet",
+            "fixture:input:other",
+            "fixture:storage-in",
+            "fixture:disk:1",
+        ] {
+            let expected = full.iter().find(|c| c.id.as_str() == id).unwrap();
+            assert_eq!(
+                filtered.iter().find(|c| c.id.as_str() == id),
+                Some(expected),
+                "retain {id} with its original direction, identity, label and default flag"
+            );
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn advertised_capabilities_default_host_preserves_the_bridge_profile() {
+        let full = advertised_capabilities_fixture();
+        let mut filtered = full.clone();
+        Mesh::filter_advertised_capabilities(&mut filtered);
+        assert_eq!(filtered, full);
+    }
+
+    #[cfg(not(feature = "host"))]
+    #[test]
+    fn advertised_capabilities_captureless_omits_unavailable_host_endpoints() {
+        let mut filtered = advertised_capabilities_fixture();
+        Mesh::filter_advertised_capabilities(&mut filtered);
+        for id in [
+            "fixture:screen",
+            "fixture:screen:7",
+            "fixture:cam:1",
+            "fixture:control",
+            "fixture:clipboard",
+        ] {
+            assert!(
+                filtered.iter().all(|c| c.id.as_str() != id),
+                "do not advertise the stubbed endpoint {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_capabilities_audio_requires_audio_io() {
+        let full = advertised_capabilities_fixture();
+        let mut filtered = full.clone();
+        Mesh::filter_advertised_capabilities(&mut filtered);
+        let audio: Vec<_> = filtered
+            .iter()
+            .filter(|c| c.media == MediaKind::Audio)
+            .collect();
+        if cfg!(feature = "audio-io") {
+            assert_eq!(
+                audio
+                    .iter()
+                    .map(|c| (c.id.as_str(), c.flow))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("fixture:system-audio", Flow::Duplex),
+                    ("fixture:mic:1", Flow::Source),
+                    ("fixture:spk:1", Flow::Sink),
+                ]
+            );
+            assert_eq!(
+                audio,
+                full.iter()
+                    .filter(|c| c.media == MediaKind::Audio)
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert!(audio.is_empty(), "the audio stub cannot capture or play");
+        }
+    }
+
     #[test]
     fn live_route_stays_on_its_first_proven_network() {
         let mut pins = super::RouteNetworkPins::default();
