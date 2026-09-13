@@ -60,7 +60,7 @@ No build is needed for this report-only change. For a later implementation/basel
 ```text
 test --locked -p allmystuff-protocol -p allmystuff-session -p allmystuff-graph -p allmystuff-cec-consent
 test --locked --manifest-path node/Cargo.toml --no-default-features --lib ownership::tests
-test --locked --manifest-path node/Cargo.toml --no-default-features --lib mesh::tests
+test --locked --manifest-path node/Cargo.toml --no-default-features --lib mesh::tests::privileged_offers_are_refused_exactly_when_unauthorized -- --exact
 ```
 
-The node commands require an accepted lock-resolution prerequisite and still build its native dependency closure; their need for target/toolchain setup belongs with the manager's durable-run plan. They are proposed commands, not passed tests, and are not a substitute for a reviewed isolated end-to-end harness. Report verification itself is an exact-path diff/whitespace review. This report is committed separately after incorporation of A2's independent feedback; the hub-managed `AGENTS.md` is excluded.
+The node commands require an accepted lock-resolution prerequisite and still build its native dependency closure; their need for target/toolchain setup belongs with the manager's durable-run plan. They are proposed commands, not passed tests, and are not a substitute for a reviewed isolated end-to-end harness. C2's independently reviewed behavior report adds a necessary qualification: broad node/mesh tests include `Mesh::new` calls that load default ownership/shares/consent stores. The command above selects one existing pure policy test; broader suites require a verified disposable profile/testbed and socket isolation, not merely state-directory environment overrides. Report verification itself is an exact-path diff/whitespace review. This report is committed separately after incorporation of A2's independent feedback; the hub-managed `AGENTS.md` is excluded.
