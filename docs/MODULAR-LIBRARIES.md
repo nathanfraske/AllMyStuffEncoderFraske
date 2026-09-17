@@ -90,6 +90,38 @@ records; the commands here are recipes, not claims of successful execution on
 every platform. The [stage-one ledger](reviews/modular-foundation/stage-one-verification.md)
 records the earlier changes and does not qualify these new packages.
 
+**Central verification (2026-09-17).** The integrated source is
+`44b38dbf0fcf5d341675949cf6f41d0476c4e5c0`. The following manager-owned durable
+runs have terminal success on local Windows x64 with Rust/Cargo 1.97.1:
+
+| Command from the integration root | Run ID | Result |
+| --- | --- | --- |
+| `cargo fmt --all --check` | `ccd33e1d-0269-435a-a96f-8800a3c1f2a9` | Exit 0. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | `687088a0-0d5a-4806-81b3-eb5f709528c3` | Exit 0. |
+| `cargo test --workspace --locked` | `24206c7b-34b8-4733-b993-7c53f61c4a15` | Exit 0; 324 unit, 1 integration and 5 doc tests passed, none failed or ignored. |
+| `cargo tree --locked -p allmystuff-frame-timing -p allmystuff-byte-queues --edges normal,build` | `639df759-da0a-49fe-b775-8ba9ced0080e` | Exit 0; timing has no dependencies; queues include only the parking_lot/tracing dependency trees. |
+| `cargo fmt --manifest-path node/Cargo.toml --all --check` | `95462032-ed4f-4006-8cc8-1a95171da36e` | Exit 0. |
+| `cargo clippy --locked --manifest-path node/Cargo.toml --all-targets -- -D warnings` | `e4421b39-b20a-4919-bc13-14f2c40c388c` | Exit 0; default node targets compiled/linted, no node tests executed. |
+| `cargo check --locked --manifest-path node/Cargo.toml --all-targets --no-default-features` | `87cc1632-0bc3-4158-bcb7-a79c2aa8121f` | Exit 0; node targets compiled with defaults disabled, no node tests executed. |
+
+The new libraries account for 11 of the 330 passing executions: eight unit
+tests, one public API integration test and two doc tests. Both node logs have
+no warnings; all seven runs retained complete, untruncated output.
+
+The central runs use `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`
+and `CARGO_INCREMENTAL=0`, with a shared `CARGO_TARGET_DIR` in the manager's
+worktree. Native checks use its existing Visual Studio CMake and
+`CMAKE_POLICY_VERSION_MINIMUM=3.5`; no worker duplicates these builds.
+
+Existing desktop/mobile lockfiles still contain local-package version drift
+(`0.2.118`/`0.2.119`); this extraction only adds the two new package records and
+node dependency edges there. It does not qualify their locked builds. Full
+`just check` and broad node test execution were not run: some node tests reach
+`Mesh::new`, persisted stores and providers, and disposable runtime isolation
+has not been verified. GUI/mobile apps, devices, other operating systems and
+the declared Rust 1.88 minimum remain untested by this extraction. The source
+move preserves behavior; these checks do not qualify the running application.
+
 **Revisit with the MyOwnMesh v1 contract.** These flags remain open:
 
 | Boundary | Work to reconcile later |
