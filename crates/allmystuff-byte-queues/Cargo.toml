@@ -1,0 +1,13 @@
+[package]
+name = "allmystuff-byte-queues"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bounded viewer byte queues with watcher ownership and local IPC chunk framing."
+
+[dependencies]
+parking_lot = "0.12"
+tracing = { workspace = true }
