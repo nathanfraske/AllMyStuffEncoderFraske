@@ -18,6 +18,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-byte-queues"
+version = "0.2.121"
+dependencies = [
+ "parking_lot",
+ "tracing",
+]
+
+[[package]]
 name = "allmystuff-cec-consent"
 version = "0.2.121"
 dependencies = [
@@ -49,6 +57,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "allmystuff-frame-timing"
+version = "0.2.121"
 
 [[package]]
 name = "allmystuff-graph"

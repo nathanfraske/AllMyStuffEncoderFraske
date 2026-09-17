@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/allmystuff-frame-timing",
+    "crates/allmystuff-byte-queues",
     "crates/allmystuff-inventory",
     "crates/allmystuff-graph",
     "crates/allmystuff-protocol",
@@ -39,6 +41,8 @@ repository = "https://github.com/mrjeeves/AllMyStuff"
 description = "Map all your stuff, then wire it together across a mesh you own."
 
 [workspace.dependencies]
+allmystuff-frame-timing = { path = "crates/allmystuff-frame-timing", version = "0.2.121" }
+allmystuff-byte-queues = { path = "crates/allmystuff-byte-queues", version = "0.2.121" }
 allmystuff-inventory = { path = "crates/allmystuff-inventory", version = "0.2.121" }
 allmystuff-graph = { path = "crates/allmystuff-graph", version = "0.2.121" }
 allmystuff-protocol = { path = "crates/allmystuff-protocol", version = "0.2.121" }

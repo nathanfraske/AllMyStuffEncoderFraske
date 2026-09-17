@@ -154,6 +154,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # AllMyStuff's own crates — the scanner, the graph model, the wire types,
 # the hardware→capability bridge, the session state machine, and the
 # self-updater. Pulled by path from the sibling library workspace.
+allmystuff-frame-timing = { path = "../crates/allmystuff-frame-timing" }
+allmystuff-byte-queues = { path = "../crates/allmystuff-byte-queues" }
 allmystuff-inventory = { path = "../crates/allmystuff-inventory" }
 allmystuff-graph = { path = "../crates/allmystuff-graph" }
 allmystuff-protocol = { path = "../crates/allmystuff-protocol" }
