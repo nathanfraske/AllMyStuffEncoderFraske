@@ -1,5 +1,11 @@
 # Modular foundation roadmap
 
+**Historical roadmap.** The proposed consumer-profile framing below is
+superseded by [selective reusable libraries](MODULAR-LIBRARIES.md), an optional
+host and a GUI consumer. Keep the initial review and validation evidence here
+as historical records; the linked document describes the first library
+extractions and the still-open MyOwnMesh v1 boundaries.
+
 AllMyStuff should provide reusable application capabilities on top of MyOwnMesh: fleet forming and claiming, resource sharing, and optional media and host services. The next work separates those capabilities using the existing mesh integration. **Internal feature separation does not wait for MyOwnMesh v1.0.0. Replacing the mesh integration does require a reviewed upstream contract.**
 
 This roadmap starts from release 0.2.121, commit `b15aa1a277894999a8f01134843c06e892de084b`, reviewed on 2026-09-13. It distinguishes implemented behavior, selected initial work, and proposed profiles. It does not declare new Cargo features, supported platforms, a finalized v1 API, or completion of the work below. The source-cited [responsibility review](reviews/modular-foundation/responsibility-mesh-review.md), [dependency review](reviews/modular-foundation/modularity-dependency-review.md), [platform review](reviews/modular-foundation/headless-platform-review.md), and [behavior review](reviews/modular-foundation/behavior-test-review.md) retain the detailed evidence and limitations. The platform review is the support-matrix reference.
