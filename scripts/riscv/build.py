@@ -157,7 +157,7 @@ def main():
         options += ["--no-default-features"]
     command = [cargo, "build" if args.kind == "serve" else "test", *options, "--target", TARGET]
     command += ["--bin", "allmystuff-serve"] if args.kind == "serve" else ["--no-run"]
-    if args.kind == "root-tests":
+    if args.kind != "serve":
         command += ["--workspace"]
     command += ["-j", "2", "--message-format=json-render-diagnostics"]
     identity = {"utc": datetime.now(timezone.utc).isoformat(), "head": args.expected_head,

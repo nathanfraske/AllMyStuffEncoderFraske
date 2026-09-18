@@ -60,7 +60,7 @@ The corresponding Cargo commands are:
 ```text
 cargo build --manifest-path node/Cargo.toml --locked --offline --no-default-features --target riscv64gc-unknown-linux-musl --bin allmystuff-serve -j 2 --message-format=json-render-diagnostics
 cargo test --manifest-path Cargo.toml --locked --offline --target riscv64gc-unknown-linux-musl --no-run --workspace -j 2 --message-format=json-render-diagnostics
-cargo test --manifest-path node/Cargo.toml --locked --offline --no-default-features --target riscv64gc-unknown-linux-musl --no-run -j 2 --message-format=json-render-diagnostics
+cargo test --manifest-path node/Cargo.toml --locked --offline --no-default-features --target riscv64gc-unknown-linux-musl --no-run --workspace -j 2 --message-format=json-render-diagnostics
 ```
 
 Test compilation is a separate gate from executing tests. `--no-run` does
@@ -69,6 +69,13 @@ establish that cross-target doctests are runnable. The emulator/test-isolation
 recipe must select and execute the resulting test programs explicitly and
 record all exclusions and failures. Starting Serve also needs an independently
 reviewed process/IPC environment and compatible Mesh runtime.
+
+Both test commands select every member of their respective workspace,
+including the node workspace's `pixels` member. Test runners must select
+artifacts whose `profile.test` is `true`: Cargo can also report ordinary
+executables, which need a separate lifecycle harness rather than libtest
+arguments. Inspect the ELF interpreter and shared dependencies before assuming
+an artifact is statically linked.
 
 All generated files stay under the checkout's ignored `target`: Cargo outputs
 use that existing root, Zig caches use `riscv-zig-cache`, temporary files use
