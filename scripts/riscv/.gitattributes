@@ -1,0 +1,4 @@
+# These recipes execute in Linux even when checked out from Windows.
+emulator-*.sh text eol=lf
+emulator-*.py text eol=lf
+emulator-*.md text eol=lf
