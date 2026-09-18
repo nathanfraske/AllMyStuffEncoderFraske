@@ -1,0 +1,105 @@
+{
+  "scanned_at": 1700000000,
+  "host": {
+    "hostname": "fixture-host",
+    "os": "fixture-os",
+    "arch": "x86_64",
+    "uptime_secs": 60
+  },
+  "cpu": {
+    "brand": "Fixture CPU",
+    "logical_cores": 8
+  },
+  "memory": {
+    "total_bytes": 17179869184,
+    "available_bytes": 8589934592,
+    "swap_total_bytes": 2147483648,
+    "swap_used_bytes": 0
+  },
+  "gpus": [
+    {
+      "id": "gpu:0",
+      "name": "Fixture GPU",
+      "vendor": "nvidia",
+      "kind": "discrete"
+    }
+  ],
+  "storage": [
+    {
+      "id": "volume:0",
+      "name": "Fixture Disk",
+      "total_bytes": 1073741824,
+      "available_bytes": 536870912,
+      "removable": false,
+      "kind": "ssd"
+    }
+  ],
+  "networks": [
+    {
+      "id": "network:0",
+      "name": "Fixture Network",
+      "kind": "ethernet",
+      "up": true
+    }
+  ],
+  "displays": [
+    {
+      "id": "display:0",
+      "name": "Fixture Display",
+      "connector": "fixture-0",
+      "connected": true,
+      "internal": true
+    }
+  ],
+  "microphones": [
+    {
+      "id": "mic:0",
+      "name": "Fixture Microphone",
+      "direction": "input"
+    }
+  ],
+  "speakers": [
+    {
+      "id": "speaker:0",
+      "name": "Fixture Speaker",
+      "direction": "output"
+    }
+  ],
+  "cameras": [
+    {
+      "id": "camera:0",
+      "name": "Fixture Camera"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "input:0",
+      "name": "Fixture Keyboard",
+      "kind": "keyboard",
+      "future_device_field": true
+    }
+  ],
+  "usb": [
+    {
+      "id": "usb:0",
+      "name": "Fixture USB",
+      "vendor_id": "1234",
+      "product_id": "5678"
+    }
+  ],
+  "listening": [
+    {
+      "id": "tcp:8080",
+      "name": "HTTP",
+      "port": 8080,
+      "kind": "http"
+    }
+  ],
+  "temps": [
+    {
+      "label": "Fixture Sensor",
+      "celsius": 42.5
+    }
+  ],
+  "future_snapshot_field": "ignored by older consumers"
+}

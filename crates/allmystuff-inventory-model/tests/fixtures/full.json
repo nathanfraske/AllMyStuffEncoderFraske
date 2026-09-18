@@ -1,0 +1,141 @@
+{
+  "scanned_at": 1700000000,
+  "host": {
+    "hostname": "fixture-host",
+    "os": "fixture-os",
+    "os_version": "1.0",
+    "kernel_version": "kernel",
+    "arch": "x86_64",
+    "board": "Fixture Board",
+    "product": "Fixture Model",
+    "soc": null,
+    "uptime_secs": 60
+  },
+  "cpu": {
+    "brand": "Fixture CPU",
+    "vendor": "Fixture Vendor",
+    "physical_cores": 4,
+    "logical_cores": 8,
+    "max_mhz": 3200
+  },
+  "memory": {
+    "total_bytes": 17179869184,
+    "available_bytes": 8589934592,
+    "swap_total_bytes": 2147483648,
+    "swap_used_bytes": 0
+  },
+  "gpus": [
+    {
+      "id": "gpu:0",
+      "name": "Fixture GPU",
+      "vendor": "nvidia",
+      "vram_bytes": 4294967296,
+      "kind": "discrete",
+      "driver": "fixture-driver"
+    }
+  ],
+  "storage": [
+    {
+      "id": "volume:0",
+      "name": "Fixture Disk",
+      "mount_point": "/fixture",
+      "filesystem": "ext4",
+      "total_bytes": 1073741824,
+      "available_bytes": 536870912,
+      "removable": false,
+      "kind": "ssd"
+    }
+  ],
+  "networks": [
+    {
+      "id": "network:0",
+      "name": "Fixture Network",
+      "mac": "02:00:00:00:00:01",
+      "kind": "ethernet",
+      "up": true,
+      "speed_mbps": 1000,
+      "ipv4": [
+        "192.0.2.1"
+      ],
+      "ipv6": [
+        "2001:db8::1"
+      ]
+    }
+  ],
+  "displays": [
+    {
+      "id": "display:0",
+      "name": "Fixture Display",
+      "connector": "fixture-0",
+      "connected": true,
+      "width_px": 1920,
+      "height_px": 1080,
+      "internal": true,
+      "default": true
+    }
+  ],
+  "microphones": [
+    {
+      "id": "mic:0",
+      "name": "Fixture Microphone",
+      "direction": "input",
+      "channels": 4,
+      "card": "fixture-card",
+      "default": true
+    }
+  ],
+  "speakers": [
+    {
+      "id": "speaker:0",
+      "name": "Fixture Speaker",
+      "direction": "output",
+      "channels": 8,
+      "card": null,
+      "default": false
+    }
+  ],
+  "cameras": [
+    {
+      "id": "camera:0",
+      "name": "Fixture Camera",
+      "path": "/dev/fixture-camera",
+      "default": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "input:0",
+      "name": "Fixture Keyboard",
+      "kind": "keyboard",
+      "endpoints": 3
+    }
+  ],
+  "usb": [
+    {
+      "id": "usb:0",
+      "name": "Fixture USB",
+      "vendor_id": "1234",
+      "product_id": "5678",
+      "manufacturer": "Fixture Manufacturer",
+      "class": "HID"
+    }
+  ],
+  "listening": [
+    {
+      "id": "tcp:8080",
+      "name": "HTTP",
+      "port": 8080,
+      "kind": "http",
+      "scheme": "http",
+      "loopback": true,
+      "process": "fixture-process",
+      "title": "Fixture Page"
+    }
+  ],
+  "temps": [
+    {
+      "label": "Fixture Sensor",
+      "celsius": 42.5
+    }
+  ]
+}

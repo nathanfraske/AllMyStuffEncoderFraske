@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use allmystuff_inventory::Inventory;
+use allmystuff_inventory_model::Inventory;
 use allmystuff_protocol::SiteAdvert;
 
 /// Build the [`SiteAdvert`]s a node should publish, given its scan and the
@@ -77,7 +77,7 @@ pub fn allocate_local_port(preferred: u16, taken: &BTreeSet<u16>) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use allmystuff_inventory::{ListeningService, ServiceKind};
+    use allmystuff_inventory_model::{ListeningService, ServiceKind};
 
     fn svc(id: &str, port: u16, kind: ServiceKind, loopback: bool) -> ListeningService {
         ListeningService {
@@ -100,7 +100,7 @@ mod tests {
     }
 
     fn inv_with(listening: Vec<ListeningService>) -> Inventory {
-        let mut inv = allmystuff_inventory::scan();
+        let mut inv = crate::tests::empty_inventory();
         inv.listening = listening;
         inv
     }

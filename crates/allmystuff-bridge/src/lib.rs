@@ -29,7 +29,7 @@
 //! it's small and thoroughly tested.
 
 use allmystuff_graph::{Capability, Flow, MediaKind, NodeId};
-use allmystuff_inventory::{InputKind, Inventory};
+use allmystuff_inventory_model::{InputKind, Inventory};
 use allmystuff_protocol::{InventorySummary, StorageSummary};
 
 pub mod sites;
@@ -284,9 +284,9 @@ fn qualify(node: &str, device_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use allmystuff_inventory::*;
+    use allmystuff_inventory_model::*;
 
-    fn empty_inventory() -> Inventory {
+    pub(super) fn empty_inventory() -> Inventory {
         Inventory {
             scanned_at: 0,
             host: HostInfo {
