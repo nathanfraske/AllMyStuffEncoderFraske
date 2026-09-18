@@ -96,12 +96,18 @@ fn required_fields_and_explicit_zero_remain_distinct_from_defaults() {
     for field in ["scanned_at", "host", "cpu", "memory"] {
         let mut missing = fixture.clone();
         missing.as_object_mut().unwrap().remove(field);
-        assert!(serde_json::from_value::<Inventory>(missing).is_err(), "{field}");
+        assert!(
+            serde_json::from_value::<Inventory>(missing).is_err(),
+            "{field}"
+        );
     }
     for field in COLLECTIONS {
         let mut null = fixture.clone();
         null[*field] = Value::Null;
-        assert!(serde_json::from_value::<Inventory>(null).is_err(), "{field}");
+        assert!(
+            serde_json::from_value::<Inventory>(null).is_err(),
+            "{field}"
+        );
     }
     let mut input = fixture["inputs"][0].clone();
     input["endpoints"] = json!(0);
@@ -189,7 +195,13 @@ fn service_tokens_labels_schemes_and_web_flags_remain_compatible() {
         (ServiceKind::Http, "http", "HTTP", "http", true),
         (ServiceKind::Https, "https", "HTTPS", "https", true),
         (ServiceKind::Ssh, "ssh", "SSH", "ssh", false),
-        (ServiceKind::Postgres, "postgres", "PostgreSQL", "postgres", false),
+        (
+            ServiceKind::Postgres,
+            "postgres",
+            "PostgreSQL",
+            "postgres",
+            false,
+        ),
         (ServiceKind::Mysql, "mysql", "MySQL", "mysql", false),
         (ServiceKind::Redis, "redis", "Redis", "redis", false),
         (ServiceKind::Mongodb, "mongodb", "MongoDB", "mongodb", false),
