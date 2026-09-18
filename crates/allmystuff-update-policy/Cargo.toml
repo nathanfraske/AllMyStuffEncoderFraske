@@ -1,0 +1,15 @@
+[package]
+name = "allmystuff-update-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Update decision policy and the existing semver-like version ordering, independent of update I/O."
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
