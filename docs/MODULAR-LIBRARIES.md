@@ -6,6 +6,13 @@ There are no new consumer presets or profiles in this change. The optional
 host and application registration model remain future work; these small
 extractions preserve the existing calculations and caller behavior.
 
+**Experimental portability follow-up.** The cumulative changes also carry a
+two-line correction to the pinned OpenH264 wrapper's RISC-V target recognition.
+An isolated encoder/decoder consumer compiled and linked for RISC-V musl;
+it was not executed. Application workspace validation and the full Serve
+cross-build remain pending. The [experiment record](reviews/portability/openh264-riscv64.md)
+preserves the failures, successful artifact identity and qualification limits.
+
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
 | [allmystuff-byte-queues](../crates/allmystuff-byte-queues/src/lib.rs) | Viewer byte queues, watcher tokens and local IPC chunk packing. | `parking_lot` 0.12, `tracing` 0.1. |
