@@ -2,10 +2,12 @@
 
 The pinned OpenH264 source compiled and linked for generic RISC-V Linux/musl
 after a two-line architecture-recognition correction in its Rust wrapper.
-This is an isolated codec build result. Validation of the vendored dependency
-in the application workspaces and a full `allmystuff-serve` cross-build remains
-**pending**. No RISC-V executable was run, and no firmware, hardware, video
-performance or production deployment is qualified by this result.
+This is an isolated codec build result. The integrated dependency now passes
+Windows node compilation and 33 focused regression executions. Desktop/mobile
+metadata checks remain blocked by offline inputs, and the full
+`allmystuff-serve` RISC-V cross-build remains **pending**. No RISC-V executable
+was run in the checks recorded here; firmware, hardware, video performance
+and production deployment remain unqualified.
 
 ## Patch and integration boundary
 
@@ -33,8 +35,8 @@ The cumulative integration uses a local Cargo patch in the separate node,
 desktop and mobile workspaces. It preserves their existing codec features,
 mobile receive/audio roles and unrelated Mesh overrides. It does not change
 the global Cargo cache or upgrade registry dependencies. The root library
-workspace does not consume OpenH264. Workspace resolution and supported-host
-regressions must still be verified centrally after integration.
+workspace does not consume OpenH264. The central integration results below
+record the validated Windows scope and the remaining workspace limitations.
 
 ## Retained isolated experiment
 
@@ -98,6 +100,109 @@ Warnings remain: unused-result/import/macro diagnostics from `winapi-util`,
 methods; and a Rust `linker_messages` warning containing extensive repeated
 Zig libc++ nullability diagnostics. This was not a warning-free build.
 
+## Application integration verification
+
+The vendored dependency and this record were integrated at
+`723bf8f5664ab56ff842f4b7c67f1bea3bd7dfd1`: reviewed source commit
+`45eebd32551b7364ed4a1eabdf372e099904c24e` became `bfd4db6`, and the
+documentation commit `8aa5a0e557b3c55ec761e255580602f1c869d9b1` became
+`723bf8f`. The following central records use that exact source on Windows x64.
+All listed terminal streams were complete and untruncated.
+
+| Check | Durable run | Result |
+| --- | --- | --- |
+| Packaged archive and inverse-patch proof | `f995cd8a-4f7f-4319-8e85-bbe4c36ad349` | Passed, exit 0; all 343 packaged files, only the two build-script additions. |
+| Manifest, all-lock and raw Git-index proof | `9323afa2-e6a7-45c1-8cf8-c954cb45e248` | Passed, exit 0; all four manifests, 280/604/801/732 root/node/desktop/mobile lock records, and 343 package blobs. |
+| Root `cargo fmt --all --check` | `c10006b5-4438-4292-9873-1472461c9bea` | Passed, exit 0. |
+| `cargo fmt --manifest-path node/Cargo.toml --check` | `6482b951-f328-4a22-b72e-8ac080c61713` | Passed, exit 0; no `--all`, preserving upstream package bytes. |
+| Root metadata | `a0b01a4d-f405-4820-a5cb-5da1eff59568` | Passed, exit 0; OpenH264 absent from the root workspace graph. |
+| Node metadata | `f9959a00-a251-4050-96bb-9a21aa2ba0d0` | Passed, exit 0; local sys2 0.9.6 with `source`, excluded from workspace membership. |
+| Desktop metadata | `ae274318-3e5e-47ff-bf77-ac2bb5e76f5a` | Failed, exit 101; `trash` was unavailable in the offline registry cache. |
+| Mobile metadata | `2c16fe0b-09f4-48a7-8da5-721ce8eddcc7` | Failed, exit 101; the pinned `interceptor` Git checkout was unavailable offline. |
+
+The archive proof ran `python vendor/verify_openh264.py --archive <cached
+openh264-sys2-0.9.6.crate>`. The read-only integration helper, SHA256
+`dd4795396f57ade829e70483eb90a2fa4b6a0f63848f53937ad94db16eae69e9`,
+ran with `--repo <manager-worktree> --index`. Exact invocation paths are
+retained in the corresponding run records.
+
+Each metadata wrapper ran `cargo metadata --manifest-path <manifest>
+--locked --offline --format-version 1 --filter-platform
+x86_64-pc-windows-msvc` and verified that its workspace lock stayed unchanged.
+The four manifests were `Cargo.toml`, `node/Cargo.toml`,
+`gui/src-tauri/Cargo.toml` and `gui/mobile/Cargo.toml`. The two offline
+failures occurred before successful graph validation; neither is a GUI or
+mobile build pass. They are separate from the previously recorded local
+package version drift (`0.2.118`/`0.2.119`) in those locks. This integration
+preserves all prior registry/Git resolutions and changes only the sys2 source
+selection in the three consuming locks.
+
+The corrected native runs also use `723bf8f`. Every row below succeeded with
+exit 0 and complete, untruncated streams. Durations include compilation;
+stdout/stderr columns are retained byte counts.
+
+| Native check | Durable run | Duration | Result | stdout / stderr |
+| --- | --- | --- | --- | --- |
+| Default all-targets Clippy, warnings denied | `527dd321-c5bb-4f0f-aacc-a23fc5a3578c` | 94.280 s | Passed | 0 / 11,549 |
+| No-default all-targets check | `38148558-a498-4008-be5e-9c08f73e6fcc` | 47.916 s | Passed | 0 / 1,726 |
+| AU identity | `848fd2c1-c84b-4963-8377-740f1941b493` | 121.847 s | 5 passed | 526 / 10,432 |
+| Slice splitter | `1c3aff48-40d2-4ae9-813c-c543a7f4285d` | 0.874 s | 1 passed | 192 / 152 |
+| Software H.264 paced slices | `0347954a-7f3e-4ed7-8e92-4bc5308eb8f9` | 0.963 s | 1 passed | 190 / 617 |
+| Default control client | `1949f2a4-bf2b-41f8-94c8-d03d091e63bb` | 9.801 s | 13 passed | 1,315 / 152 |
+| No-default control client | `17a24926-e746-44d1-8105-2aa2c07c555f` | 53.938 s | 13 passed | 1,315 / 1,790 |
+
+The exact Cargo arguments were:
+
+```text
+cargo clippy --manifest-path node/Cargo.toml --locked --offline --all-targets -- -D warnings
+cargo check --manifest-path node/Cargo.toml --locked --offline --no-default-features --all-targets
+cargo test --manifest-path node/Cargo.toml --locked --offline --lib au_identity
+cargo test --manifest-path node/Cargo.toml --locked --offline --lib video::tests::splitter_cuts_only_at_slices_and_partitions_exactly -- --exact
+cargo test --manifest-path node/Cargo.toml --locked --offline --lib video::tests::openh264_accepts_paced_slice_chunks_incrementally -- --exact
+cargo test --manifest-path node/Cargo.toml --locked --offline --lib control_client::tests::
+cargo test --manifest-path node/Cargo.toml --locked --offline --no-default-features --lib control_client::tests::
+```
+
+These are 33 test executions: 20 with defaults and 13 without, with no failed
+or ignored tests. Clippy and `check` compile their targets; they do not execute
+tests. The software H.264 test retains three encoder configuration warnings:
+the 4,096-byte max-NAL value takes precedence over the slice constraint, and
+AdaptiveQuant and BackgroundDetection are disabled for screen content.
+There is no warning-free claim for that test. No broad node/root suite, live
+Serve, GUI, device or other-OS test was run in this integration slice.
+
+Initial native Clippy `d6fd828d-0049-49d3-9c1f-343d3bd49855` and no-default
+check `f79e2b10-740e-4c60-b0dd-c2fe73d79e62` failed with exit 101 in
+`audiopus_sys`'s CMake compiler test. MSBuild reported `MSB6003` and
+`DirectoryNotFoundException` while processing `cmTC_*.tlog` tracking output
+through `Directory.GetFiles`, `ExpandWildcards`, `DeleteFiles` and
+`PostExecuteTool`. These are path-sensitive CMake/MSBuild environment
+failures, resolved by restoring the prior output location. The exact
+filesystem mechanism remains unproven; the diagnostics establish neither a
+missing linker nor a specific path-length limit, and contain no OpenH264
+source failure.
+
+The manager reports the only correction was `CARGO_TARGET_DIR`, from the
+manager worktree's `target/integration` to `target`. Commands and tracked
+source stayed unchanged. Command/source identities, changed environment
+hashes and terminal outcomes are retained; the specific environment values
+are manager-supplied. The Windows recipe used Rust/Cargo 1.97.1,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_INCREMENTAL=0`, `CMAKE_POLICY_VERSION_MINIMUM=3.5`, and
+`CMAKE=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`.
+
+Five original follow-on runs were canceled after that environment failure:
+`835df173-c9a9-46d5-9295-8b53aeabfa1f`,
+`c40762e4-a875-41f6-a3f2-3d6146174e98`,
+`5411f7f9-c54f-460a-9dbb-0b2b44e4e5ae`,
+`04da39a0-a49f-4908-857b-2e9ba1d19ba5` and
+`1f1c4d0d-2314-4d85-acc0-76c51cffbac5`. The first reached compilation;
+none executed tests. These cancellation records add no test coverage and
+are separate from the successful replacements above.
+
+No full RISC-V Serve build or emulator execution was performed in this
+integration verification slice. Those remain the next gates.
+
 ## Next gate: the actual Serve binary
 
 After workspace resolution and the supported-host regression checks, the
@@ -133,8 +238,8 @@ selection needs separate work even if compilation succeeds.
 
 ## Qualification still required
 
-- Execute the existing software H.264, AU metadata and control-client
-  regressions with the integrated dependency on supported hosts.
+- Extend the recorded Windows regression coverage to other supported hosts
+  and resolve the desktop/mobile dependency-cache limitations.
 - Verify the actual board's ISA, libc, vendor ABI and firmware before target
   execution. Exercise encode/decode, malformed streams, resize/retune,
   paced slices, keyframe/recovery behavior and lifecycle cleanup.
