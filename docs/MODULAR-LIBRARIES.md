@@ -316,18 +316,111 @@ video-wire reference is `1b6fea24996ae21e95749d83daa08bc4c7eeb9e2`. Independentl
 reviewed source commits are `71586c74b52584574625daaa8ab15b2413c84ab8` (model,
 compatibility and bridge fixtures) and `a1c991a82a66b01593c2e402386572ea771faf24`
 (metadata). Shared Cargo wiring is independently reviewed commit
-`ba05a7086520ae82be4a157aa9316f310f90b56a`. New execution evidence remains pending.
-The historical results above do not validate this new pair.
+`ba05a7086520ae82be4a157aa9316f310f90b56a`. The historical results above do not
+validate this new pair.
 
 Baseline Windows bridge dependency run `5dd88a3c-3445-4289-ac9c-17e65d3bf6e3`
 used `cargo tree --locked --offline -p allmystuff-bridge --edges normal,build
 --target x86_64-pc-windows-msvc` and included the scanner, `sysinfo` and `wmi`.
-The new bridge/model dependency tree must be checked independently. The frozen
-metadata comparison uses disposable raw Git-byte export and the public tests'
-fixed inputs, keeping the original implementation out of shipped test oracles.
-No worker Cargo runs, live media, device, GUI/mobile, other-OS or Rust 1.88
-qualification are claimed. Existing desktop/mobile local-package drift stays
-in place; only the new local packages and intended dependency edges change.
+At integrated `d30c3f73604745fd5d786d70079f6b180b288f8a`, library graph run
+`4c3cf3db-b798-40a1-9024-b8b40e9275e6` used `cargo tree --locked --offline
+-p allmystuff-inventory-model -p allmystuff-video-metadata --edges normal,build`
+and passed in 0.302 s (737/0 output bytes):
+the model has only the Serde/derive closure; metadata has `memchr` 2.8.1.
+Windows bridge graph run `9964fcb3-40d1-4bd8-8943-a9e1ce88be1b` passed in
+0.295 s (1,965/0 bytes) with the same baseline command. The scanner, `sysinfo`
+and `wmi` are absent; graph, protocol and `dirs` dependencies remain.
+
+Initial root/node format runs `6f261e3d-db49-41bd-9ca6-8656e3c03d6b` and
+`bc3d5f3c-b44f-43d0-a01e-5c853860569f` failed with identical 5,372-byte reports
+limited to wrapping and optional trailing commas in three new test files.
+Peer-reviewed corrections are `04225eff37c884d78ee358d603362eaa70bbda9f`
+(model) and `99e73c1a7274210541d93bedb4dddb3cacd4f867` (metadata). The resulting
+assembled tree is `b420beb8b6e9bc435fa29c837c91f6506522c050`; its only other
+change from the graph-tested tree is the reviewed reuse guide. Implementations,
+fixture values, callers and Cargo resolutions are unchanged. The initial format
+failures are resolved by the successful root/node reruns below.
+
+**Central verification (2026-09-18: inventory model and video metadata).** Runs
+below use the frozen assembled tree `b420beb8b6e9bc435fa29c837c91f6506522c050`
+on local Windows x64. The manager reports Rust/Cargo 1.97.1,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_INCREMENTAL=0`
+and `CARGO_TARGET_DIR=C:\Users\Admin\AppData\Roaming\AllMyAgents\data\worktrees\1503a621\target`.
+The manager-supplied native
+settings are `CMAKE=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`
+and `CMAKE_POLICY_VERSION_MINIMUM=3.5`. Retained provenance records the platform
+and environment keys/hash; these version and environment values are the
+manager's measured context. The executable is
+`C:\Users\Admin\.cargo\bin\cargo.exe`, from the integration worktree. Every
+following run succeeded with exit 0 and complete, untruncated retained streams.
+
+| Check / exact Cargo arguments | Durable run | Result | Stdout/stderr bytes |
+| --- | --- | --- | --- |
+| `fmt --all --check` | `39a384db-b5c4-461e-bc46-0fbe9d634a98` | 0.466 s | 0/0 |
+| `fmt --manifest-path node/Cargo.toml --all --check` | `1e3d992c-f5c4-4131-af9c-2ebb7e3f7b77` | 1.866 s | 0/0 |
+| `clippy --workspace --all-targets --locked -- -D warnings` | `6f50b69d-50d6-4915-9de4-f2ff19d45211` | 40.782 s | 0/7,842 |
+| `test --workspace --locked` | `b09304ef-5be6-4b65-99d2-86b51d35eb3f` | 358 passed, 53.304 s | 27,644/10,024 |
+| `clippy --locked --manifest-path node/Cargo.toml --all-targets -- -D warnings` | `e63a3693-30d1-4c26-bfe0-4ede05997030` | 90.419 s | 0/9,585 |
+| `check --locked --manifest-path node/Cargo.toml --all-targets --no-default-features` | `c6441311-3509-4218-9b4f-b52a2bf86fb4` | 41.694 s | 0/1,419 |
+| `test --locked --manifest-path node/Cargo.toml --lib au_identity` | `0b3ea782-8db3-4b4e-adea-602d73149b4d` | 5 passed, 93.041 s | 526/8,753 |
+| `test --locked --manifest-path node/Cargo.toml --lib video::tests::splitter_cuts_only_at_slices_and_partitions_exactly -- --exact` | `d2ef0b3c-d411-40b6-82c1-f7e68c16946a` | 1 passed, 0.724 s | 192/152 |
+| `test --locked --manifest-path node/Cargo.toml --lib control_client::tests::` | `4987a328-31e8-44cb-a1d7-717bbb27c8ec` | 13 passed, 0.720 s | 1,315/152 |
+| `test --locked --manifest-path node/Cargo.toml --lib video::tests::openh264_accepts_paced_slice_chunks_incrementally -- --exact` | `7c052c2d-8cb7-463a-b322-4655207efd02` | 1 passed, 0.835 s | 190/617 |
+| `test --locked --manifest-path node/Cargo.toml --no-default-features --lib control_client::tests::` | `052d2a1d-b3fd-48bb-9709-91d156c0433f` | 13 passed, 51.350 s | 1,315/1,483 |
+
+The root total is 328 unit, 23 integration and 7 doc tests, all with zero
+failures/ignored tests. This includes the bridge's nine existing tests and 14
+new extraction checks: seven model fixtures/helpers, one scanner reexport
+identity test, five metadata fixtures and one metadata doctest. Existing root
+scanner tests still run; the new identity test only checks types/signatures.
+The five filtered node runs add 33 passing test executions with zero failures
+or ignored tests; other node tests remain filtered out. The control-client
+suite executes 13 tests in each configuration, not 14.
+
+Node Clippy/check compile the integration and test targets; they do not run
+the full node suite. The targeted H.264 test uses ten generated 640x480 frames
+and the software OpenH264 encoder/decoder. It passed with three encoder
+parameter warnings: max-NAL size takes precedence over the 4096-byte slice
+constraint, and adaptive quantization/background detection are disabled for
+screen content. This is software codec/marker compatibility evidence, not
+capture, hardware encoder or live-media qualification.
+
+The frozen metadata comparison uses disposable raw Git-byte export and the
+public tests' fixed inputs, keeping the original implementation out of shipped
+test oracles. Its reviewed runner SHA-256 is
+`65015f580698931eeb73246a05574391ee396bddd6c93563195906e4ec630c37`; the driver is
+`2e526657dbc968de52ea16588061579061a25439634b80bc8e66ce51a71e573c`. The formatting
+correction changes only the expected vector blob to
+`4535a1b385ee21de825f438024aed5df8e56a356`, retaining identical inputs.
+
+Durable comparison `3657c1d2-0d3a-4d60-8ae1-510e503165c1` passed at the same
+assembled tree in 1.552 s (537/434 output bytes), using this exact command from
+the manager worktree:
+
+```powershell
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -NonInteractive -File 'C:\Users\Admin\AppData\Roaming\AllMyAgents\data\worktrees\9b1bd3f4\target\run-metadata-differential.ps1' -RepoRoot 'C:\Users\Admin\AppData\Roaming\AllMyAgents\data\worktrees\1503a621'
+```
+
+All 130 fixture/trace cases matched the frozen reference: eight scans, ten
+insertions, 27 parsing cases, 83 truncated prefixes and two repeated-insertion
+traces. Bytes, offsets, identities and sequential removals were equal. The
+disposable offline consumer retained the integration lock's external package
+versions/checksums and left the root lock unchanged.
+
+These are manager-owned local runs; no worker Cargo execution was used. No
+full `just check`, broad node runtime suite, GUI/mobile execution, live Mesh or
+media, device testbed, other-OS build or Rust 1.88 qualification is claimed.
+Broad runtime tests remain outside this slice because persisted stores and
+providers lack verified disposable isolation. Existing desktop/mobile
+`0.2.118`/`0.2.119` local-package drift stays in place; all pre-existing
+registry/git resolutions are unchanged, with only the new local packages and
+intended dependency edges changed. The extraction does not qualify a future
+MyOwnMesh v1 integration.
+
+After verification, manager cleanup `181ee090-c765-4a7c-b9fd-ee476f89be90`
+removed 7,521 regenerable target files (3,494,982,880 bytes). Both manager
+target directories are absent; source, retained logs and worker-authored
+comparison inputs remain.
 
 **Revisit with the MyOwnMesh v1 contract.** These flags remain open:
 
