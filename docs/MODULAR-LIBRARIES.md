@@ -12,14 +12,18 @@ extractions preserve the existing calculations and caller behavior.
 | [allmystuff-frame-timing](../crates/allmystuff-frame-timing/src/lib.rs) | `FrameCadence`, `AssemblyClock`, `SendBreakdown`, `send_breakdown` and `periodic_sample`. | Standard library only. |
 | [allmystuff-update-policy](../crates/allmystuff-update-policy/src/lib.rs) | `ApplyPolicy`, exact policy-token parsing, `compare_semver` and `policy_allows`. | `serde` 1; `serde_json` is test-only. |
 | [allmystuff-video-pacing](../crates/allmystuff-video-pacing/src/lib.rs) | `PacePolicy`, `PaceRouteState`, `pace_policy`, `frame_policy` and `LAN_AGGREGATE_POLICY`. | Standard library only. |
+| [allmystuff-inventory-model](../crates/allmystuff-inventory-model/src/lib.rs) | Inventory/device records, enum wire values and their existing pure helpers. | `serde` 1; `serde_json` is test-only. |
+| [allmystuff-video-metadata](../crates/allmystuff-video-metadata/src/lib.rs) | Annex-B offsets and AU identity marker insertion, inspection and removal. | `memchr` 2. |
 
 These packages do not depend on the node, GUI, codecs, capture backends or a
 Mesh transport. They inherit workspace version `0.2.121`, edition 2021 and declared
 minimum Rust `1.88.0`; a declared minimum is not a new toolchain qualification.
 The node modules are compatibility shims: the public
 `allmystuff_node::byte_queues::ByteQueues` path remains available, and existing
-internal frame-timing/pacing call sites use the extracted implementations.
+internal frame-timing/pacing/video-metadata call sites use the extracted implementations.
 The updater's public `allmystuff_updater::policy` path is also a reexport shim.
+The scanner continues to export `allmystuff_inventory::Inventory` and all its
+device types, now reexports of the same canonical model definitions.
 
 **Selective use.** An application can depend on each package directly. For
 a consumer beside this repository, choose the dependency lines it needs:
@@ -30,6 +34,8 @@ allmystuff-byte-queues = { path = "../AllMyStuff/crates/allmystuff-byte-queues" 
 allmystuff-frame-timing = { path = "../AllMyStuff/crates/allmystuff-frame-timing" }
 allmystuff-update-policy = { path = "../AllMyStuff/crates/allmystuff-update-policy" }
 allmystuff-video-pacing = { path = "../AllMyStuff/crates/allmystuff-video-pacing" }
+allmystuff-inventory-model = { path = "../AllMyStuff/crates/allmystuff-inventory-model" }
+allmystuff-video-metadata = { path = "../AllMyStuff/crates/allmystuff-video-metadata" }
 ```
 
 Adjust these paths to the checkout location. Keep the repository workspace
@@ -41,6 +47,9 @@ Reuse the queue for a local viewer that can tolerate whole-chunk eviction;
 reuse timing for local capture scheduling or assembly/send measurements. An
 updater can reuse the decision helpers without network/install code, and a
 video sender can reuse pacing calculations while owning its waits and state.
+Inventory consumers can exchange snapshots without linking platform scanners;
+encoded-video consumers can inspect or add the existing AU metadata without
+linking a capture, decoder or node runtime.
 These choices require no running AllMyStuff host. The extractions supply no
 application SDK, provider registry or identity-approval system.
 
@@ -123,20 +132,66 @@ The node keeps its remaining pure pacing tests in `mesh.rs` and all runtime
 integration: shared bucket ownership, caller sleeping, environment override reads,
 unsplittable-slice bypass, bilateral negotiation and route-generation guards.
 
+**Inventory-model behavior.** The original scanner `types.rs` is copied
+unchanged: all 21 public record/enum definitions, serde attributes and pure
+methods have one canonical implementation. Existing scanner imports remain
+valid without conversions. The defining crate changes, so diagnostic
+`std::any::type_name` strings change; no such consumer was found in current
+application source. This does not promise a stable Rust binary ABI.
+
+Missing collection fields still become empty vectors, missing `Option` fields
+become `None`, and existing additive defaults stay unchanged: device default
+flags are false, input `endpoints` is one, and optional network/listening
+details are empty or false. Explicit `endpoints: 0` stays zero; explicit null
+collections remain errors. Unknown object fields are ignored, while unknown
+enum variants remain errors. No new normalization or validation is added.
+
+`device_count` still counts the nine device categories plus CPU/memory and
+excludes listening services and temperature sensors. `is_array` requires an
+input device with at least four channels. Service labels, schemes and web
+classification remain exact. Scanner probes, category-default selection,
+reports and host semantics remain in `allmystuff-inventory` unchanged.
+
+The bridge consumes the model directly while retaining its graph/protocol
+dependencies and mapping behavior. Its nine existing mapping/site tests remain;
+the two site fixtures that previously called `scan()` now reuse the existing
+fixed inventory fixture. Seven public model tests cover full/legacy JSON,
+defaults, helpers and enum tokens. A scanner integration test checks all 21
+reexport identities and scanner function signatures without invoking probes.
+
+**Video-metadata behavior.** `AuIdentity`, `AuRecovery`, `annexb_nals`,
+`insert_au_identity_marker`, `peek_au_identity_marker` and
+`take_au_identity_marker` move unchanged except for public visibility.
+The Annex-B walk keeps its three/four-byte start-code offsets and permissive
+header handling. Insertion retains the exact 41-byte H.264 or 42-byte HEVC
+marker, UUID, recovery byte and 16 lowercase hexadecimal sequence digits.
+It inserts before the first VCL NAL or appends if none is found; existing
+markers are not replaced. Inspection/removal still recognizes only the exact
+four-byte-prefix marker shape and removes only the first valid marker.
+Foreign, malformed and truncated markers remain untouched.
+
+Five public tests use fixed byte/offset expectations, malformed and truncated
+fixtures, and repeated marker ordering; a rustdoc example imports the crate.
+Existing node caller tests remain in place. Encoding, decoding, pacing,
+fragmentation, transport packetization and recovery decisions are unchanged.
+The node's direct `memchr` dependency moves to this library with the same
+locked resolution; this is application coded-unit metadata, not a new Mesh API.
+
 **Focused commands.** From the repository root, after package wiring is
 assembled, check the current extraction pair:
 
 ```sh
-cargo test --locked -p allmystuff-update-policy -p allmystuff-video-pacing
-cargo clippy --locked -p allmystuff-update-policy -p allmystuff-video-pacing --all-targets -- -D warnings
-cargo fmt --check -p allmystuff-update-policy -p allmystuff-video-pacing
+cargo test --locked -p allmystuff-inventory-model -p allmystuff-video-metadata -p allmystuff-bridge
+cargo test --locked -p allmystuff-inventory --test model_identity
+cargo clippy --locked -p allmystuff-inventory-model -p allmystuff-video-metadata -p allmystuff-inventory -p allmystuff-bridge --all-targets -- -D warnings
+cargo fmt --check -p allmystuff-inventory-model -p allmystuff-video-metadata -p allmystuff-inventory -p allmystuff-bridge
 ```
 
-Select `allmystuff-byte-queues` and/or `allmystuff-frame-timing` instead to
-check the earlier libraries. These commands are package selections, not
+Select the earlier queue/timing/update-policy/pacing packages instead to
+check those libraries. These commands are package selections, not
 application profiles.
 
-The test command covers unit, public API integration and doc tests without
+The test commands cover unit, public API integration and doc tests without
 building the node. Node-shim compilation is separate integration evidence.
 The [contribution guide](../CONTRIBUTING.md) describes wider checks. During this
 managed extraction, important checks run through the manager's durable run
@@ -185,7 +240,7 @@ blob `cf930bde99554303553c5e103b3a224723f34410`. Reviewed source commits are
 The dated results above precede
 these extractions and are not their validation evidence.
 
-**Central verification (2026-09-18: update policy and video pacing).** The
+**Historical verification (2026-09-18: update policy and video pacing).** The
 assembled implementation and Cargo wiring were checked at
 `758fadf4950be52834bc4e361e47f10516f9e1e5` on local Windows x64. The manager
 reports Rust/Cargo 1.97.1 and the same reduced-debug/nonincremental settings
@@ -247,12 +302,32 @@ and `6cda369e68ae19c31b98341122e4c4e70cf51f9dc561820aaa558769d830f634` (pacing).
 The policy driver remained
 `ba98b35e4aaea844e642f1afb1e4cca511fcfb2441c257ceb2ee3afcaba609a7`.
 
-The current pair retains the earlier execution limits: no full `just check`,
+That pair retains the earlier execution limits: no full `just check`,
 broad node runtime tests, GUI/mobile execution, device tests, other-OS builds
 or Rust 1.88 qualification. Existing desktop/mobile `0.2.118`/`0.2.119` local
 package drift remains; their lock changes add only this pair and dependency
 edges. Compilation and pure comparisons do not qualify live updates, media,
 Mesh transport or the running application.
+
+**Inventory-model/metadata verification boundary.** This extraction starts
+at `89326b5055b01848c8823b584a102078d67a5039`. The canonical model retains the
+exact original types blob `18fee02c087366c6ee7b244dcd173bd8c8c44e34`; the frozen
+video-wire reference is `1b6fea24996ae21e95749d83daa08bc4c7eeb9e2`. Independently
+reviewed source commits are `71586c74b52584574625daaa8ab15b2413c84ab8` (model,
+compatibility and bridge fixtures) and `a1c991a82a66b01593c2e402386572ea771faf24`
+(metadata). Shared Cargo wiring is independently reviewed commit
+`ba05a7086520ae82be4a157aa9316f310f90b56a`. New execution evidence remains pending.
+The historical results above do not validate this new pair.
+
+Baseline Windows bridge dependency run `5dd88a3c-3445-4289-ac9c-17e65d3bf6e3`
+used `cargo tree --locked --offline -p allmystuff-bridge --edges normal,build
+--target x86_64-pc-windows-msvc` and included the scanner, `sysinfo` and `wmi`.
+The new bridge/model dependency tree must be checked independently. The frozen
+metadata comparison uses disposable raw Git-byte export and the public tests'
+fixed inputs, keeping the original implementation out of shipped test oracles.
+No worker Cargo runs, live media, device, GUI/mobile, other-OS or Rust 1.88
+qualification are claimed. Existing desktop/mobile local-package drift stays
+in place; only the new local packages and intended dependency edges change.
 
 **Revisit with the MyOwnMesh v1 contract.** These flags remain open:
 
@@ -264,6 +339,8 @@ Mesh transport or the running application.
 | Resource policy and admission | Revisit injectable queue limits, notification semantics, aggregate memory/accounting and backpressure with application requirements and Mesh resource admission. Preserve the current drop policy until a separately reviewed change supplies the required boundary tests. |
 | Timing and observability | Timing remains local application measurement. Future transport metrics may correlate frame identities, but must not turn these durations into cross-host clock arithmetic. |
 | Application pacing | These rate/burst calculations and bucket reservations remain separate from Mesh transport, congestion control and backpressure. Review the eventual v1 integration contract later; this extraction changes no transport behavior and assumes no new upstream API. |
+| Inventory and evidence | Hardware snapshot records are application data; they do not grant authority or implement Mesh evidence admission or capability registration. The optional host still chooses scanner and consumer components. |
+| Encoded AU metadata | Preserve the application's marker/sequence/recovery representation when reviewing future routes. These bytes do not redefine Mesh-owned RTP markers or packetizer mechanics. |
 
 The [original roadmap](MODULAR-FOUNDATION.md) and its reviews remain historical
 evidence. Its proposed consumer-profile framing is superseded by selective
