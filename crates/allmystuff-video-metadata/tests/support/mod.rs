@@ -248,7 +248,10 @@ pub fn truncated_cases() -> Vec<ParseCase> {
     let mut cases = Vec::new();
     for (name, marker) in [("H264", H264_RESET_ZERO), ("HEVC", HEVC_RESET_ZERO)] {
         for len in 0..marker.len() {
-            cases.push(rejected(format!("{name} prefix length {len}"), marker[..len].to_vec()));
+            cases.push(rejected(
+                format!("{name} prefix length {len}"),
+                marker[..len].to_vec(),
+            ));
         }
     }
     cases
