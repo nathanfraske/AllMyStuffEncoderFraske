@@ -5,7 +5,11 @@ mod support;
 #[test]
 fn version_ordering_preserves_permissive_compatibility_cases() {
     for &(left, right, expected) in support::COMPARISONS {
-        assert_eq!(compare_semver(left, right), expected, "{left:?} vs {right:?}");
+        assert_eq!(
+            compare_semver(left, right),
+            expected,
+            "{left:?} vs {right:?}"
+        );
         assert_eq!(
             compare_semver(right, left),
             expected.reverse(),
@@ -50,7 +54,10 @@ fn policy_tokens_and_serde_remain_exact_lowercase_strings() {
     for &name in support::INVALID_POLICY_NAMES {
         assert_eq!(ApplyPolicy::parse(name), None, "{name:?}");
         let json = serde_json::to_string(name).unwrap();
-        assert!(serde_json::from_str::<ApplyPolicy>(&json).is_err(), "{json}");
+        assert!(
+            serde_json::from_str::<ApplyPolicy>(&json).is_err(),
+            "{json}"
+        );
     }
     for &json in support::INVALID_POLICY_JSON {
         assert!(serde_json::from_str::<ApplyPolicy>(json).is_err(), "{json}");
