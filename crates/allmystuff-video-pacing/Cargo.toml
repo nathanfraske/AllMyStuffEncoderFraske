@@ -1,0 +1,11 @@
+[package]
+name = "allmystuff-video-pacing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Application video pacing policies and token-bucket reservations using caller-supplied timestamps."
+
+[dependencies]
