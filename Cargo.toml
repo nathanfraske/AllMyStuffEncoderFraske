@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/allmystuff-inventory-model",
+    "crates/allmystuff-video-metadata",
     "crates/allmystuff-update-policy",
     "crates/allmystuff-video-pacing",
     "crates/allmystuff-frame-timing",
@@ -43,6 +45,8 @@ repository = "https://github.com/mrjeeves/AllMyStuff"
 description = "Map all your stuff, then wire it together across a mesh you own."
 
 [workspace.dependencies]
+allmystuff-inventory-model = { path = "crates/allmystuff-inventory-model", version = "0.2.121" }
+allmystuff-video-metadata = { path = "crates/allmystuff-video-metadata", version = "0.2.121" }
 allmystuff-update-policy = { path = "crates/allmystuff-update-policy", version = "0.2.121" }
 allmystuff-video-pacing = { path = "crates/allmystuff-video-pacing", version = "0.2.121" }
 allmystuff-frame-timing = { path = "crates/allmystuff-frame-timing", version = "0.2.121" }

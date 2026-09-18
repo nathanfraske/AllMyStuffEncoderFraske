@@ -13,7 +13,7 @@ name = "allmystuff-bridge"
 version = "0.2.121"
 dependencies = [
  "allmystuff-graph",
- "allmystuff-inventory",
+ "allmystuff-inventory-model",
  "allmystuff-protocol",
 ]
 
@@ -75,10 +75,19 @@ dependencies = [
 name = "allmystuff-inventory"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-inventory-model",
  "serde",
  "serde_json",
  "sysinfo",
  "wmi",
+]
+
+[[package]]
+name = "allmystuff-inventory-model"
+version = "0.2.121"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -168,6 +177,13 @@ dependencies = [
  "tokio",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "allmystuff-video-metadata"
+version = "0.2.121"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

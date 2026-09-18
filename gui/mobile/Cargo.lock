@@ -69,7 +69,7 @@ name = "allmystuff-bridge"
 version = "0.2.119"
 dependencies = [
  "allmystuff-graph",
- "allmystuff-inventory",
+ "allmystuff-inventory-model",
  "allmystuff-protocol",
 ]
 
@@ -117,10 +117,18 @@ dependencies = [
 name = "allmystuff-inventory"
 version = "0.2.119"
 dependencies = [
+ "allmystuff-inventory-model",
  "serde",
  "serde_json",
  "sysinfo",
  "wmi",
+]
+
+[[package]]
+name = "allmystuff-inventory-model"
+version = "0.2.121"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -172,6 +180,7 @@ dependencies = [
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
+ "allmystuff-video-metadata",
  "allmystuff-video-pacing",
  "anyhow",
  "base64 0.22.1",
@@ -188,7 +197,6 @@ dependencies = [
  "interprocess",
  "libc",
  "libloading 0.8.9",
- "memchr",
  "notify",
  "openh264",
  "opus",
@@ -261,6 +269,13 @@ dependencies = [
  "tokio",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "allmystuff-video-metadata"
+version = "0.2.121"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

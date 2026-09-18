@@ -12,6 +12,6 @@ repository.workspace = true
 unsafe_code = "forbid"
 
 [dependencies]
-allmystuff-inventory = { workspace = true }
+allmystuff-inventory-model = { workspace = true }
 allmystuff-graph = { workspace = true }
 allmystuff-protocol = { workspace = true }

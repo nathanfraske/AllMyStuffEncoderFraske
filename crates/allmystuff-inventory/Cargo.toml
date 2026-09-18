@@ -12,6 +12,7 @@ repository.workspace = true
 unsafe_code = "forbid"
 
 [dependencies]
+allmystuff-inventory-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }

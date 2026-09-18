@@ -141,10 +141,6 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
-# SIMD-accelerated byte scanning for the pacer's Annex-B start-code walk
-# (already in the tree transitively — this only makes it a direct dep).
-memchr = "2"
-
 # System RNG for minting a fleet's shared key (the owned-roster grouping
 # secret).
 getrandom = "0.2"
@@ -154,6 +150,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # AllMyStuff's own crates — the scanner, the graph model, the wire types,
 # the hardware→capability bridge, the session state machine, and the
 # self-updater. Pulled by path from the sibling library workspace.
+allmystuff-video-metadata = { path = "../crates/allmystuff-video-metadata" }
 allmystuff-video-pacing = { path = "../crates/allmystuff-video-pacing" }
 allmystuff-frame-timing = { path = "../crates/allmystuff-frame-timing" }
 allmystuff-byte-queues = { path = "../crates/allmystuff-byte-queues" }
