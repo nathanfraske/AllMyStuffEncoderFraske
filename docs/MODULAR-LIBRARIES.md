@@ -176,15 +176,44 @@ has not been verified. GUI/mobile apps, devices, other operating systems and
 the declared Rust 1.88 minimum remain untested by this extraction. The source
 move preserves behavior; these checks do not qualify the running application.
 
-**Update-policy/pacing verification boundary.** This next extraction starts
+**Update-policy/pacing verification boundary.** This extraction started
 from `a336412725bbb34a2e0b89833c351bd386392967`. Its frozen references are the
 old updater policy blob `2b3c97774965730a4ec090cc2fdd7f0b4eca1ca5` and node pacing
 blob `cf930bde99554303553c5e103b3a224723f34410`. Reviewed source commits are
 `d0dec09157f15ff56e1c81c36251361c6afea77a` (update policy) and
 `41f610959857cb52caa1f05707bcd29dd958ceef` (video pacing).
 The dated results above precede
-these extractions and are not their validation evidence. New central results
-remain pending until terminal run records have been inspected.
+these extractions and are not their validation evidence.
+
+**Central verification (2026-09-18: update policy and video pacing).** The
+assembled implementation and Cargo wiring were checked at
+`758fadf4950be52834bc4e361e47f10516f9e1e5` on local Windows x64. The manager
+reports Rust/Cargo 1.97.1 and the same reduced-debug/nonincremental settings
+listed above, with its shared target directory and existing Visual Studio
+CMake. Retained run records establish platform, commands and source identity;
+toolchain versions and environment values are manager-supplied context.
+Commands below use the manager's `C:\Users\Admin\.cargo\bin\cargo.exe`.
+
+| Command | Durable run | Inspected result |
+| --- | --- | --- |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | `24074578-969c-4acc-980a-6f079e2ec663` | Exit 0. |
+| `cargo test --workspace --locked` | `6f0e1d36-0886-414f-bab8-28a52cd57fe9` | Exit 0; 344 passed, none failed or ignored. |
+| `cargo tree --locked -p allmystuff-update-policy -p allmystuff-video-pacing --edges normal,build` | `282d3377-6e04-4219-afd0-a61d88d6ed75` | Exit 0; policy has only the Serde/derive dependency tree; pacing has no dependencies. |
+| `cargo clippy --locked --manifest-path node/Cargo.toml --all-targets -- -D warnings` | `5e271ccf-2076-4008-918f-b7f6293e748b` | Exit 0; default node targets compiled/linted, no node tests executed. |
+| `cargo check --locked --manifest-path node/Cargo.toml --all-targets --no-default-features` | `790137d4-6ae4-4790-b384-30e9e83ddde9` | Exit 0; node targets compiled with defaults disabled, no node tests executed. |
+| `cargo fmt --all --check` | `4256ed5d-44ef-464e-aa07-3a22d286fe86` | Exit 0 at the formatting/documentation descendant below. |
+| `cargo fmt --manifest-path node/Cargo.toml --all --check` | `e761a2f5-fbb0-40d1-bcc6-0c5749575098` | Exit 0 at the same descendant. |
+
+The pair contributes 17 passing executions: seven original unit tests, nine
+public integration tests and one policy doc test. Initial root/node formatting
+runs `d52c5592-a2ab-4ccb-abfe-8dec4737627b` and
+`f6b66c7c-123c-4a96-8dc4-fa244b478d20` exited 1 for the same two assertion-wrapping
+hunks in the policy public tests. Independently reviewed correction
+`8467d4858b969310761d9b823a497a5053bc38d1` changes only whitespace. The successful
+formatting runs above use `149c5acc632d2f4d3ced8e577b7a2c00791a814a`, whose only
+differences from the compiled/tested commit are that correction and this guide.
+All seven successful runs retain complete, untruncated output; the two node
+compilation logs contain no diagnostic warnings or errors.
 
 Temporary differential checks read those original files from Git and compare
 the new libraries against them using the public tests' fixed inputs. Pacing
@@ -193,6 +222,37 @@ compares cross-pairs of its version inputs and policy/serde cases. The old
 implementation is generated only into disposable verification output, not
 shipped as a permanent test oracle. Golden expectations remain independent
 of that comparison. No worker builds or live application tests are implied.
+
+Initial policy/pacing differential preparations
+`7c7bef78-a822-49bd-b75f-2c0b0373cc61` and
+`5deb990a-7b40-4032-8a06-442ded110dd3` exited 1 at the frozen-byte guard before
+compilation or comparison. PowerShell's native-output text decoding changed
+non-ASCII source comments. The corrected disposable scripts copy raw Git stdout
+bytes and retain the same identity guards and inputs. Both subsequent runs
+at `149c5acc632d2f4d3ced8e577b7a2c00791a814a` succeeded with complete, untruncated
+output:
+
+| Differential command | Durable run | Inspected result |
+| --- | --- | --- |
+| `powershell.exe -NoProfile -NonInteractive -File <C1>\target\run-policy-differential-v2.ps1 -RepoRoot <manager>` | `0db68670-54fa-41dd-ad0a-284b6dd154dc` | Exit 0; 42 fixed version inputs, 1,764 ordering comparisons, 7,056 decisions, 14 parse/serialization and 19 deserialization cases match. Scratch external versions/checksums match the root lock; root lock unchanged. |
+| `powershell.exe -NoProfile -NonInteractive -File <C2>\crates\allmystuff-video-pacing\target\verification\compare-baseline.ps1 -Repository <manager> -Rustc C:\Users\Admin\.cargo\bin\rustc.exe` | `e76a4e14-1a27-4055-a713-cde12367e996` | Exit 0; 56 equal outputs across policy/frame/debt/policy-change/boundary/large traces (14/11/8/8/10/5). |
+
+These were disposable verification commands, not shipped tooling. Their exact
+executable was `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+`<C1>`, `<C2>` and `<manager>` denote `9b1bd3f4`, `87ba9bd9` and `1503a621`
+under `C:\Users\Admin\AppData\Roaming\AllMyAgents\data\worktrees`. Both ran in
+the manager worktree. Reviewed script SHA256 identities are
+`a57b7b65788a49ce056981e4b720a572aabb513836d1794a66bdd687c4920027` (policy v2)
+and `6cda369e68ae19c31b98341122e4c4e70cf51f9dc561820aaa558769d830f634` (pacing).
+The policy driver remained
+`ba98b35e4aaea844e642f1afb1e4cca511fcfb2441c257ceb2ee3afcaba609a7`.
+
+The current pair retains the earlier execution limits: no full `just check`,
+broad node runtime tests, GUI/mobile execution, device tests, other-OS builds
+or Rust 1.88 qualification. Existing desktop/mobile `0.2.118`/`0.2.119` local
+package drift remains; their lock changes add only this pair and dependency
+edges. Compilation and pure comparisons do not qualify live updates, media,
+Mesh transport or the running application.
 
 **Revisit with the MyOwnMesh v1 contract.** These flags remain open:
 
