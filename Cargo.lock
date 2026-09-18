@@ -141,9 +141,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-update-policy"
+version = "0.2.121"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "allmystuff-updater"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-update-policy",
  "dirs",
  "flate2",
  "fs2",
@@ -160,6 +169,10 @@ dependencies = [
  "tracing",
  "zip",
 ]
+
+[[package]]
+name = "allmystuff-video-pacing"
+version = "0.2.121"
 
 [[package]]
 name = "anyhow"

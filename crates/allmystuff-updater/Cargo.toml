@@ -12,6 +12,7 @@ repository.workspace = true
 unsafe_code = "forbid"
 
 [dependencies]
+allmystuff-update-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -145,6 +145,7 @@ dependencies = [
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
+ "allmystuff-video-pacing",
  "anyhow",
  "base64 0.22.1",
  "bytes",
@@ -228,9 +229,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-update-policy"
+version = "0.2.121"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "allmystuff-updater"
 version = "0.2.118"
 dependencies = [
+ "allmystuff-update-policy",
  "dirs 5.0.1",
  "flate2",
  "fs2",
@@ -246,6 +255,10 @@ dependencies = [
  "tracing",
  "zip",
 ]
+
+[[package]]
+name = "allmystuff-video-pacing"
+version = "0.2.121"
 
 [[package]]
 name = "alloc-no-stdlib"
