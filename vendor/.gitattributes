@@ -1,0 +1,4 @@
+# Preserve registry-package bytes, including mixed line endings and whitespace.
+# The adjacent verifier checks every file and the exact two-line exception.
+openh264-sys2-0.9.6/** -text -whitespace
+openh264-sys2-0.9.6-riscv64.patch -text -whitespace

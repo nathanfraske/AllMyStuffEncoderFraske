@@ -33,7 +33,8 @@ members = [
 # library crates; neither has to compile to test the core. (`node` carries
 # the heavy media deps — xcap/cpal/openh264/nokhwa/… — so it is deliberately
 # kept out of the lightweight library workspace.)
-exclude = ["gui", "node"]
+# Keep the checksum-preserved experimental dependency outside workspace checks.
+exclude = ["gui", "node", "vendor/openh264-sys2-0.9.6"]
 
 [workspace.package]
 version = "0.2.121"

@@ -10,6 +10,11 @@
 # library workspace, exactly like `gui/` — see the root `Cargo.toml`.
 [workspace]
 
+[patch.crates-io]
+# Experimental RISC-V target recognition; codec sources and version are unchanged.
+# Dependency-workspace patches are not inherited by the GUI workspaces.
+openh264-sys2 = { path = "../vendor/openh264-sys2-0.9.6" }
+
 [package]
 name = "allmystuff-node"
 version = "0.2.121"

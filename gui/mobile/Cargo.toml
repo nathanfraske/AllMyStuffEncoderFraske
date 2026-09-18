@@ -16,6 +16,8 @@
 [patch.crates-io]
 interceptor = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.21" }
 webrtc-util = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.21" }
+# Experimental same-version OpenH264 build patch; dependency patches are not inherited.
+openh264-sys2 = { path = "../../vendor/openh264-sys2-0.9.6" }
 
 [package]
 name = "allmystuff-mobile"
