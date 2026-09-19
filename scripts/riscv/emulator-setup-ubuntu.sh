@@ -20,7 +20,8 @@ fi
 # Use configured signed repositories; do not add repositories or binfmt services.
 apt-get update
 apt-cache policy qemu-user
-package_version=${1:-$(apt-cache policy qemu-user | awk '/Candidate:/ {print $2; exit}')}
+# Consume all policy output so pipefail cannot report SIGPIPE from an early exit.
+package_version=${1:-$(apt-cache policy qemu-user | awk '/Candidate:/ {print $2}')}
 if [[ -z $package_version || $package_version == '(none)' ]]; then
     echo "No qemu-user candidate in the configured repositories." >&2
     exit 1
@@ -29,5 +30,13 @@ printf 'Selected qemu-user version: %s\n' "$package_version"
 DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-remove --no-install-recommends "qemu-user=$package_version"
 dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' qemu-user
 qemu-riscv64 --version
-qemu-riscv64 -cpu help
+# QEMU 8.2's CPU-list diagnostic exits 1; require the requested model as well.
+cpu_help_status=0
+cpu_help=$(qemu-riscv64 -cpu help) || cpu_help_status=$?
+printf '%s\nCPU help exit status: %s\n' "$cpu_help" "$cpu_help_status"
+if [[ $cpu_help_status != 0 && $cpu_help_status != 1 ]] ||
+    ! awk '$0 == "rv64" { found = 1 } END { exit !found }' <<< "$cpu_help"; then
+    echo "Unexpected CPU-help result or missing rv64 model." >&2
+    exit 1
+fi
 sha256sum /usr/bin/qemu-riscv64
