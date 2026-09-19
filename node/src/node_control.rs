@@ -62,8 +62,8 @@ use allmystuff_node_client::WireResponse;
 #[cfg(test)]
 use allmystuff_node_client::MAX_FRAME_LEN;
 pub use allmystuff_node_client::{
-    read_frame, write_frame, NodeClient, NodeEvent, NodeRequest, SUBSCRIBE_EVENTS, TAG_BYTES, TAG_EVENT,
-    TAG_JSON, TAG_RESTART,
+    read_frame, write_frame, NodeClient, NodeEvent, NodeRequest, SUBSCRIBE_EVENTS, TAG_BYTES,
+    TAG_EVENT, TAG_JSON, TAG_RESTART,
 };
 
 /// Process environment naming who owns the lifecycle of this node process.

@@ -36,7 +36,9 @@ impl Error {
             Self::Serialize(e) => e.into(),
             Self::WriteRequest(e) => anyhow::Error::new(e).context("write node request"),
             Self::ReadResponse(e) => anyhow::Error::new(e).context("read node response"),
-            Self::ResponseClosed => anyhow::anyhow!("node closed the connection without a response"),
+            Self::ResponseClosed => {
+                anyhow::anyhow!("node closed the connection without a response")
+            }
             Self::JsonTag(tag) => {
                 anyhow::anyhow!("node sent a {tag} frame where a JSON response was expected")
             }
