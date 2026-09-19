@@ -82,3 +82,7 @@ impl NodeClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/compatibility.rs"]
+mod compatibility;
