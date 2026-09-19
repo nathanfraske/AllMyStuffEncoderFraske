@@ -277,3 +277,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "storage_plan_compatibility_tests.rs"]
+mod compatibility_tests;
