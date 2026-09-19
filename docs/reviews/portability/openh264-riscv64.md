@@ -1,13 +1,16 @@
-# Experimental OpenH264 support for RISC-V
+# Experimental RISC-V Serve and OpenH264
 
-The pinned OpenH264 source compiled and linked for generic RISC-V Linux/musl
-after a two-line architecture-recognition correction in its Rust wrapper.
-This is an isolated codec build result. The integrated dependency now passes
-Windows node compilation and 33 focused regression executions. Desktop/mobile
-metadata checks remain blocked by offline inputs, and the full
-`allmystuff-serve` RISC-V cross-build remains **pending**. No RISC-V executable
-was run in the checks recorded here; firmware, hardware, video performance
-and production deployment remain unqualified.
+**Experimental checkpoint.** The full `allmystuff-serve` binary now links for
+`riscv64gc-unknown-linux-musl` with `--no-default-features`. Under QEMU,
+684 root/node tests and a degraded Serve lifecycle fixture passed. The
+standalone unoptimized codec proof still aborts on a 32-bit shift check;
+a diagnostic relink failed before execution. That investigation is deferred,
+with its inputs and failures preserved, while work returns to modularization.
+
+This is generic Linux/musl emulation, not qualification of a board, firmware,
+hardware codec, performance or production deployment. Doctests, compatible
+real Mesh sessions and target child/self-execution remain unverified. The
+earlier Windows checks and desktop/mobile limitations are retained below.
 
 ## Patch and integration boundary
 
@@ -44,7 +47,8 @@ The experiment used application baseline
 `e6d7c15a38245463457ca168ac552f6fd1e3aaf3`, with separate scratch consumers of
 the original and patched packages. Each attempt used the same synthetic
 64-by-64 RGB-to-H.264 encode/decode test source. Only the corrected recipe
-produced a linked executable. Its assertions were **not run**.
+produced a linked executable. These build commands did **not run** its
+assertions; the later execution failure is recorded in the checkpoint below.
 
 | Durable run | Terminal result | Duration | Evidence |
 | --- | --- | --- | --- |
@@ -92,7 +96,8 @@ The linked artifact is 23,792,376 bytes: little-endian ELF64, machine 243,
 type 3, flags 5. Its hash and header were independently checked against the
 retained run. The manager retained a verified copy as
 `proof/codec-riscv64gc-linux-musl` beside the experiment inputs before removing
-regenerable build/cache output. The command and runner never execute it.
+regenerable build/cache output. That build command and build runner did not
+execute it.
 
 Successful logs are complete: stdout 136,667 bytes and stderr 6,080,762 bytes.
 Warnings remain: unused-result/import/macro diagnostics from `winapi-util`,
@@ -200,47 +205,99 @@ Five original follow-on runs were canceled after that environment failure:
 none executed tests. These cancellation records add no test coverage and
 are separate from the successful replacements above.
 
-No full RISC-V Serve build or emulator execution was performed in this
-integration verification slice. Those remain the next gates.
+No full RISC-V Serve build or emulator execution was performed in that
+Windows integration slice. The later results follow.
 
-## Next gate: the actual Serve binary
+## RISC-V build and emulation checkpoint
 
-After workspace resolution and the supported-host regression checks, the
-next compile/link gate is the full binary with desktop hosting disabled:
+The three cross-builds used source
+`d15b0693542c74cfc6c938fda1cc1119bbfc3668`. The reviewed namespace/lifecycle
+recipes were integrated at `6602922dfa7c4eba937e1c8fa4d8eda200da010b` before
+execution; they selected the earlier artifacts by exact build identity and
+hash. Windows Rust/Cargo 1.97.1 and Zig 0.16.0 produced generic RV64GC/musl
+artifacts. Ubuntu 24.04 under WSL2 supplied QEMU 8.2.2 (`rv64`), package
+`1:8.2.2+ds-0ubuntu1.18`. These environment values describe this experiment.
 
-```text
-cargo build --manifest-path node/Cargo.toml --locked --offline --no-default-features --bin allmystuff-serve --target riscv64gc-unknown-linux-musl
-```
+| Gate | Durable run | Terminal result |
+| --- | --- | --- |
+| Full no-default Serve build/link | `e160fc0d-dddd-49e0-b9b2-8c4308b96a00` | Exit 0, 224.797 s. |
+| Root workspace test compilation | `e90ba069-d142-4f19-b111-656ad34d98ae` | Exit 0, 71.064 s; 25 test harnesses plus one ordinary executable. |
+| No-default node workspace test compilation | `a8a700e6-0a5b-43b5-954d-7d14f5436bf4` | Exit 0, 26.769 s; Serve, pixels and node test harnesses. |
+| Root tests under QEMU | `73967166-881c-4f16-8a33-9955ec5929e1` | Exit 0, 14.041 s; 370 passed across 25 harnesses. |
+| No-default node tests under QEMU | `4c2fd5fc-bc5c-43ed-a84e-8de7bc9b7f5b` | Exit 0, 15.844 s; Serve 5 + pixels 11 + node 298 = 314 passed. |
+| Degraded Serve lifecycle under QEMU | `afa73dc4-ad47-4380-931b-0beb62b2e0b4` | Exit 0, 25.664 s; real local IPC, shutdown and restart checks passed. |
+| Original standalone codec proof under QEMU | `33c42e08-3bd0-45b6-bfec-4c9d851c55cc` | Failed, harness exit 1, 3.597 s; target aborted with signal 6. |
+| Scratch location-diagnostic relink | `716d28f1-50d5-4649-8253-c1d785740c63` | Failed, wrapper exit 1, 44.330 s; Cargo exit 101 at unsupported `--wrap` linker argument; no target executed. |
 
-This command requires a reviewed cross-compilation environment, including
-target C/C++ compilers, archiver, linker and CMake configuration. It must not
-be read as a successful run or as an instruction to launch Serve. The manager
-owns durable execution and records any failure at its actual stage.
+The linked Serve is a 46,212,632-byte little-endian RISC-V ELF, static PIE
+with no `PT_INTERP` or `DT_NEEDED`, SHA256
+`358bf7399e0f1c7d91243a2dfbc7c78f12be36ca32e71b01a9cae0b73822553d`.
+The [build recipe](../../../scripts/riscv/README.md) records exact commands,
+locked metadata, tool/environment identities and artifact hashes. Compile
+success is separate from test execution; build logs retain Zig/libc++ and
+linker warnings. The ordinary `dump_kvm_fixtures` artifact was not a test
+harness and was excluded from libtest execution.
+
+The **684 executed tests** had zero failed, ignored, measured or filtered
+tests. Runtime command stderr was empty. Each executable used fresh native
+user/mount/network/PID/IPC namespaces, private temporary mounts and proc,
+loopback-only networking, disposable state and an empty helper PATH. The
+[isolation recipe](../../../scripts/riscv/emulator-isolation.md) records these
+checks and per-executable results. The node suite includes real software
+encode/decode and resolution-change tests; host-gated capture/encoder tests
+and Rustdoc tests are not part of this no-default execution result.
+
+The lifecycle fixture used native `/usr/bin/false` as an explicitly failing
+Mesh daemon. Version `0.2.121`, installed runtime owner, disconnected link
+status and socket mode `0600` matched expectations. A duplicate exited 0;
+both initial and restarted Serve exited 0 on SIGTERM, removed the socket,
+rebound using the same disposable state and left no owned processes. This
+does not establish successful Mesh transport, a RISC-V daemon child or
+supervisor/self-execution under user-mode QEMU.
+
+The unchanged standalone proof (`0dc6386f...`, full hash above) began its
+synthetic encode/decode test, then reported `shift exponent 32 is too large
+for 32-bit type 'uint32_t'` and aborted without a passing summary. It used
+the standalone default unoptimized profile and a different RGB/conversion
+input from the node tests; the node manifest optimizes OpenH264 packages at
+level 3. Passing node tests therefore do not resolve that failure. The exact
+codec source location and a fix remain unproven. The separate diagnostic
+attempt preserved source, test, lock and proof identities but failed to link;
+no diagnostic target ran and no codec fix or check suppression was applied.
+Further diagnosis and execution are deferred at this checkpoint.
+
+Preparation failures also remain recorded: offline target metadata first
+missed cached `inotify` sources, then locked resolution populated the missing
+cache without changing pins. QEMU setup `4bf9e59d-8cd1-43f2-9bf5-13774985d2f8`
+exited 141 from the early-exit `awk` pipeline; exact-version setup
+`9230a1a6-0d91-4da6-9d08-d92d9ca6fdc2` installed QEMU but exited 1 at CPU help.
+The installed package/model was verified separately in
+`1eb45a4d-4765-4e58-8593-0e4eca6ea4ae`; narrow setup-script corrections retain
+these failures rather than counting them as successful setup runs.
 
 The [node manifest](../../../node/Cargo.toml) still includes software H.264,
 Opus, bundled SQLite, TLS and the application runtime without default
-features. The pinned closure includes `opus` 0.3.1 / `audiopus_sys` 0.2.2,
-`cmake` 0.1.58, `libsqlite3-sys` 0.30.1 and `ring` 0.17.14. Opus may build
-through CMake; SQLite and ring include native C compilation. Their compiler,
-headers, libc, archive and link paths remain unqualified by the isolated
-OpenH264 result. The inspected paths do not establish another explicit
-RISC-V rejection: CMake accepts Linux with the target processor, ring has a
-generic LP64/endian path, and SQLite uses its bundled C source. None of that
-is a successful application build, and Opus is not a demonstrated failure.
+features. The successful full link includes `opus` 0.3.1 / `audiopus_sys`
+0.2.2, `cmake` 0.1.58, `libsqlite3-sys` 0.30.1 and `ring` 0.17.14; selecting
+the Serve binary does not select independent capability modules.
 
 The node's build script only records its target and daemon pin. Running
 [Serve](../../../node/src/bin/serve.rs) still starts the legacy daemon and
 constructs the full application state. Without `host`, capture and input
-modules use stubs. A successful binary therefore would not supply an
+modules use stubs. This build does not supply an
 embedded board's encoded-video source or USB HID adapter. The updater's
 current platform selector also returns `unknown` for RISC-V; release asset
-selection needs separate work even if compilation succeeds.
+selection remains separate work.
 
 ## Qualification still required
 
+- Resolve the standalone codec abort separately if this experiment resumes;
+  do not treat the optimized node passes as a fix or disable checks to pass.
+- Establish cross-target doctests, compatible real Mesh sessions and target
+  child/supervisor/self-execution independently of the degraded fixture.
 - Extend the recorded Windows regression coverage to other supported hosts
   and resolve the desktop/mobile dependency-cache limitations.
-- Verify the actual board's ISA, libc, vendor ABI and firmware before target
+- Verify the actual board's ISA, libc, vendor ABI and firmware before board
   execution. Exercise encode/decode, malformed streams, resize/retune,
   paced slices, keyframe/recovery behavior and lifecycle cleanup.
 - Measure target throughput, latency, CPU and memory. Preserving source

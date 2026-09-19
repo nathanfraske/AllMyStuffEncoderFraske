@@ -6,14 +6,16 @@ There are no new consumer presets or profiles in this change. The optional
 host and application registration model remain future work; these small
 extractions preserve the existing calculations and caller behavior.
 
-**Experimental portability follow-up.** The cumulative changes also carry a
+**Experimental RISC-V checkpoint.** The cumulative changes also carry a
 two-line correction to the pinned OpenH264 wrapper's RISC-V target recognition.
-An isolated encoder/decoder consumer compiled and linked for RISC-V musl;
-it was not executed. Windows node compilation and 33 focused regression
-executions passed. Desktop/mobile offline metadata checks, the full Serve
-RISC-V cross-build and target execution remain unqualified. The
-[experiment record](reviews/portability/openh264-riscv64.md) preserves the
-failures, successful artifact identities and qualification limits.
+The full no-default Serve binary linked for RISC-V musl; 684 root/node tests
+and a degraded Serve lifecycle fixture passed under QEMU. A separate
+unoptimized codec proof still aborts on a shift check, and a diagnostic relink
+failed before execution. Further diagnosis is deferred while work returns to
+modularization. Doctests, real Mesh sessions, target child/self-execution and
+hardware remain unverified. The [experiment record](reviews/portability/openh264-riscv64.md#risc-v-build-and-emulation-checkpoint)
+preserves the failures, earlier Windows evidence, workspace limits and exact
+artifact identities.
 
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
