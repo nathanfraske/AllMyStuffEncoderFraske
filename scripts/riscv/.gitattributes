@@ -2,3 +2,4 @@
 emulator-*.sh text eol=lf
 emulator-*.py text eol=lf
 emulator-*.md text eol=lf
+/serve-lifecycle.py text eol=lf
