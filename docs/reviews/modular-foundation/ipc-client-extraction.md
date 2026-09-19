@@ -101,34 +101,89 @@ unchanged. The pre-existing GUI/mobile local-version drift is retained rather
 than upgraded incidentally. Root test dependencies include existing `tempfile`;
 the other three lock records omit that dev-only edge.
 
-## Central validation recipe and limits
+## Central validation and limits
 
 Workers perform source/fixture review only. Jackson owns durable execution.
 Use unique synthetic named pipes on Windows, or a socket beneath a disposable
 private directory on Unix. Each case has bounded awaits and owns its listener,
 streams and runtime; no production node, daemon or live endpoint is involved.
 
-From the integrated root, the minimal Windows client gate is
-`cargo test --locked -p allmystuff-node-client --lib --test public_api -- --test-threads=1`.
-Follow with `cargo test --locked -p allmystuff-term --lib` and a native node
-compile/check covering the Windows owner-inspection caller. Retain the manager's
-single shared target directory and existing native build environment to avoid
-redundant dependency builds. These commands are proposed for manager execution;
-they have not been run by the worker.
+The independently accepted source and fixtures were integrated at
+`dc217e30cf2a2d6ef288940b12f39ed25ed3c583`, with the same tree as C1's
+`a852a66cf5f8a0eefcd75bcce77f75adecdbc381`. C2 inspected the following retained
+central run records and their complete stdout/stderr streams:
 
-For the library's actual target closure, record
-`cargo tree --locked -p allmystuff-node-client --edges normal,build --target x86_64-pc-windows-msvc`.
-It must not include the node, GUI, native codecs or capture stack. This is
-distinct from claiming the desktop no longer depends on those packages. Any
-native node check and caller-test results should be reported separately from
-the new library tests, with exact commit and terminal status.
+| Gate at that commit | Durable run | Result |
+| --- | --- | --- |
+| `cargo test --locked --offline -p allmystuff-node-client --lib --test public_api -- --test-threads=1` | `3521e5cc-0749-4067-be33-05c62ed3f9a3` | Exit 0, 16.451 s; eight differential and eight public API tests passed; zero failed, ignored, measured or filtered. Complete stdout/stderr: 1,457/1,933 bytes. |
+| `cargo test --locked --offline -p allmystuff-term --lib` | `f7f420b4-dca8-4366-96d7-d277da9c1eee` | Exit 0, 8.437 s; all sixteen terminal library tests passed; zero failed, ignored, measured or filtered. Complete stdout/stderr: 1,091/1,636 bytes. |
+| `cargo tree --locked --offline -p allmystuff-node-client --edges normal,build --target x86_64-pc-windows-msvc` | `5364af3d-756c-4092-af70-006c879b97ea` | Exit 0, 0.303 s; normal/build dependency tree recorded. Complete stdout/stderr: 3,030/0 bytes. |
+| `cargo fmt --all -- --check` | `3a37f841-7227-4dea-aa4d-c7e751a8cc1b` | Exit 1, 0.780 s; requested wrapping of the `ResponseClosed` match arm only. Complete stdout/stderr: 775/0 bytes. |
+| `cargo fmt --manifest-path node/Cargo.toml -- --check` | `dd2cb2b8-452d-4432-b17d-6ee6aa186357` | Exit 1, 1.103 s; requested wrapping of the new node-client reexport only. Complete stdout/stderr: 588/0 bytes. |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | `8b20a4de-7d1b-445d-91d3-a58a3cff3dee` | Exit 101, 52.902 s; `clippy::unused_unit` in the new test helper `closed()` was the sole diagnostic error. Complete stdout/stderr: 0/7,658 bytes. |
+| `cargo clippy --manifest-path node/Cargo.toml --all-targets --locked --offline -- -D warnings` | `1ce03445-3fd4-49af-ad7f-96bab8b9e4ef` | Exit 0, 95.706 s; default-feature node caller check passed without warnings/errors. Complete stdout/stderr: 0/9,825 bytes. |
+| `cargo check --manifest-path node/Cargo.toml --all-targets --no-default-features --locked --offline` | `8fe5a91b-1cc4-4ad3-9fb3-f575026ad30c` | Exit 0, 46.227 s; no-default-feature caller check passed without warnings/errors. Complete stdout/stderr: 0/1,515 bytes. |
+| `cargo test --manifest-path node/Cargo.toml --lib --locked --offline node_control::tests::` | `a75114d2-f24e-4c7c-afeb-db58d7b9eb09` | Exit 0, 106.378 s; all sixteen selected node-control tests passed; zero failed, ignored or measured, 412 filtered out. Complete stdout/stderr: 1,276/9,989 bytes. |
 
-Unix runtime coverage is pending an available approved native Rust toolchain.
-The manager found no Cargo/rustc in WSL and does not authorize expanding this
-task into provisioning or RISC-V execution. Unix address/path parity will be
-reviewed from source and qualified separately from Windows runtime evidence.
+The compatibility run was native Windows x64 and used private fixture pipes.
+Its stderr contains compilation progress, without compiler warnings or errors.
+It validates the sixteen tests described above, including both frozen client
+oracles; it does not exercise the production endpoint or a running node/daemon.
+The terminal run also completed without compiler warnings or errors. The
+formatting failures are retained as failed attempts. C2 accepted C1's exact
+two-hunk repair: a braced match arm with the unchanged error literal and a
+reexport line wrap, with every other source byte and all fixtures unchanged.
+It is committed as `ba4d951c1f4ba77735d97dbaceaa97edc5acb7ff`. The separate
+reviewed README
+clarification (`90308bac1198a1ec713f2f10d7fbfaff6c6ce865`) correctly identifies
+the terminal's `client` module as private; it does not change visibility.
 
-Status: baseline and test implementation prepared; source review has no remaining
-finding after the connection-method repair. Test peer acceptance and central
-execution remain pending. Formatting parsed the two new test files without
-touching the frozen method bodies; this is not a type check or runtime result.
+The initial root Clippy failure is also retained. Its requested change removes
+the redundant final `()` from the branch that accepts a closed connection in
+the new `closed()` fixture helper; it does not alter the frozen oracles or
+suppress a lint. C1 independently accepted that exact fixture-only fix,
+committed as `6767d02a011d58e18a22fb6591f1e97d6c655112`. All three corrections
+are integrated at `caa0c61c5fd560d96cc14ad7e114c85161f8b746`; the initial source
+and that commit differ only in the two formatting hunks, the README paragraph
+and the helper's redundant unit expression. C2 inspected the complete retained
+rerun streams at that corrected commit:
+
+| Gate at `caa0c61c5fd560d96cc14ad7e114c85161f8b746` | Durable run | Result |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | `e1f7a817-ca97-49b0-ac88-b5ffda1b7abc` | Exit 0, 0.685 s; complete stdout/stderr: 0/0 bytes. |
+| `cargo fmt --manifest-path node/Cargo.toml -- --check` | `c7c3f373-c369-4ea8-8483-dd2b7233dc1e` | Exit 0, 1.076 s; complete stdout/stderr: 0/0 bytes. |
+| `cargo test --locked --offline -p allmystuff-node-client --lib --test public_api -- --test-threads=1` | `e36f247f-6cc5-4784-8f73-a08e886b3bf5` | Exit 0, 3.285 s; eight differential and eight public tests passed again; zero failed, ignored, measured or filtered. Complete stdout/stderr: 1,457/388 bytes. |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | `9389d17a-41c1-4c97-83e5-6ca3155d8fbd` | Exit 0, 2.827 s; clean root workspace/all-target check. Complete stdout/stderr: 0/1,072 bytes. |
+
+Forty-eight distinct Windows tests passed: sixteen new compatibility tests,
+sixteen terminal tests and sixteen existing node-control tests. The repeated
+client gate adds no distinct test cases. The filtered
+node run does not claim the other 412 tests ran or native providers were exercised.
+Both default and no-default node caller checks passed. Windows owner inspection
+was compiled, not run against a live node. Central commands use the
+manager's single shared target directory and existing native build environment;
+workers have not compiled or executed the tests.
+
+The recorded Windows normal/build closure contains `allmystuff-protocol` and
+its graph/Serde/`dirs` dependencies, plus `anyhow`, `interprocess`, Tokio and
+tracing. It excludes the node, GUI, native codecs and capture stack. This is
+distinct from claiming the desktop no longer depends on those packages. Node
+caller validation is reported separately from the new library's tests.
+
+Unix runtime coverage is unqualified. The manager found no Cargo/rustc in WSL;
+this extraction did not provision a toolchain or resume RISC-V execution.
+Unix address/path parity was reviewed from source only, including the unchanged
+profile-home fallback and conversion-error mapping. The Unix socket-permission
+test is not part of the sixteen selected Windows node-control tests.
+
+Neither the GUI desktop nor mobile application workspace was built or run in
+this slice. Root Clippy covers the shared `allmystuff-mobile-core` crate, not
+those application workspaces. Their retained imports/dependency wiring and
+mobile engine embedding were source-reviewed. The private-endpoint fixtures do
+not validate live default-endpoint discovery, command authorization or daemon
+lifecycle. Windows owner inspection was compile-checked rather than exercised
+against a running node.
+
+Source and fixture peer reviews are accepted, and the bounded Windows gates
+above are complete. The frozen oracle modules remain excluded from recursive
+formatting so their recorded method bodies stay stable.
