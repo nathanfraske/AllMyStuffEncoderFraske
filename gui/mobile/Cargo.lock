@@ -179,6 +179,7 @@ dependencies = [
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-storage",
+ "allmystuff-terminal",
  "allmystuff-updater",
  "allmystuff-video",
  "anyhow",
@@ -260,6 +261,15 @@ version = "0.2.121"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "allmystuff-terminal"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-byte-queues",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

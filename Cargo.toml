@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/allmystuff-terminal",
     "crates/allmystuff-storage",
     "crates/allmystuff-video",
     "crates/allmystuff-node-client",
@@ -49,6 +50,7 @@ repository = "https://github.com/mrjeeves/AllMyStuff"
 description = "Map all your stuff, then wire it together across a mesh you own."
 
 [workspace.dependencies]
+allmystuff-terminal = { path = "crates/allmystuff-terminal", version = "0.2.121" }
 allmystuff-storage = { path = "crates/allmystuff-storage", version = "0.2.121" }
 allmystuff-video = { path = "crates/allmystuff-video", version = "0.2.121" }
 allmystuff-node-client = { path = "crates/allmystuff-node-client", version = "0.2.121" }

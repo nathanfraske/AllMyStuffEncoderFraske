@@ -152,6 +152,7 @@ dependencies = [
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-storage",
+ "allmystuff-terminal",
  "allmystuff-updater",
  "allmystuff-video",
  "anyhow",
@@ -190,7 +191,6 @@ dependencies = [
  "windows-service",
  "windows-sys 0.60.2",
  "xcap",
- "xpty",
 ]
 
 [[package]]
@@ -247,6 +247,19 @@ version = "0.2.121"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "allmystuff-terminal"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-byte-queues",
+ "dirs 5.0.1",
+ "parking_lot",
+ "serde",
+ "tokio",
+ "tracing",
+ "xpty",
 ]
 
 [[package]]
