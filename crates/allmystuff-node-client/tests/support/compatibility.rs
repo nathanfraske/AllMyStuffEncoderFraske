@@ -373,10 +373,7 @@ async fn closed(stream: &mut LocalSocketStream) {
                 io::ErrorKind::BrokenPipe
                     | io::ErrorKind::ConnectionReset
                     | io::ErrorKind::NotConnected
-            ) =>
-        {
-            ()
-        }
+            ) => {}
         other => panic!("expected the private connection to close, got {other:?}"),
     }
 }
