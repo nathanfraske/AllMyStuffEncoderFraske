@@ -21,6 +21,7 @@ path = "src/lib.rs"
 unsafe_code = "forbid"
 
 [dependencies]
+allmystuff-node-client = { workspace = true }
 # Wire types (NodeProfile, the terminal feature tag) and the terminal event
 # enum — the lightweight library crates, no media stack.
 allmystuff-protocol = { workspace = true }
@@ -29,14 +30,9 @@ allmystuff-session = { workspace = true }
 # (so the node has a visible owner) — the same discovery the CLI's bare
 # invocation uses; the crate also resolves `allmystuff-serve`.
 allmystuff-service = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-# Async runtime + the local-socket transport to the node control socket. "net"
-# backs interprocess's tokio integration; the rest matches the workspace base.
+# Preserve the terminal runtime's existing feature selection.
 tokio = { workspace = true, features = ["net"] }
-# Local IPC: the same crate (and version) the node uses for the control socket,
-# so address resolution stays identical across both ends of the wire.
-interprocess = { workspace = true }
 # Cross-platform raw mode + terminal size — macOS / Linux / Windows in one API.
 crossterm = { workspace = true }
 dirs = { workspace = true }

@@ -149,6 +149,7 @@ dependencies = [
  "allmystuff-frame-timing",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-node-client",
  "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
@@ -199,6 +200,19 @@ dependencies = [
  "xcb",
  "xpty",
  "zbus",
+]
+
+[[package]]
+name = "allmystuff-node-client"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-protocol",
+ "anyhow",
+ "interprocess",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

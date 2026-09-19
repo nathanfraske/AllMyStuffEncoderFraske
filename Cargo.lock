@@ -104,6 +104,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-node-client"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-protocol",
+ "anyhow",
+ "interprocess",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "allmystuff-protocol"
 version = "0.2.121"
 dependencies = [
@@ -138,13 +152,12 @@ dependencies = [
 name = "allmystuff-term"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-node-client",
  "allmystuff-protocol",
  "allmystuff-service",
  "allmystuff-session",
  "crossterm",
  "dirs",
- "interprocess",
- "serde",
  "serde_json",
  "tokio",
 ]

@@ -1,0 +1,24 @@
+[package]
+name = "allmystuff-node-client"
+description = "AllMyStuff local node IPC framing and compatibility clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+allmystuff-protocol = { workspace = true }
+anyhow = "1"
+interprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

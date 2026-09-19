@@ -176,6 +176,7 @@ dependencies = [
  "allmystuff-frame-timing",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-node-client",
  "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
@@ -216,6 +217,19 @@ dependencies = [
  "windows 0.61.3",
  "windows-service",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "allmystuff-node-client"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-protocol",
+ "anyhow",
+ "interprocess",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
