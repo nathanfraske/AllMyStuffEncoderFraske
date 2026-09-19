@@ -1327,3 +1327,7 @@ mod tests {
     // The watcher-queue behaviours (framing, eager-queue adoption, token
     // scoping, overflow) are tested where they now live: `byte_queues`.
 }
+
+#[cfg(test)]
+#[path = "../tests/support/lifecycle.rs"]
+mod lifecycle;
