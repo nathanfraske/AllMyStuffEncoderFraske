@@ -104,6 +104,7 @@ host = [
 audio-io = ["dep:cpal", "dep:libloading"]
 
 [dependencies]
+allmystuff-storage = { path = "../crates/allmystuff-storage" }
 allmystuff-video = { path = "../crates/allmystuff-video", features = ["decode"] }
 # Async runtime — control-socket client + the media-plane tasks. "process"
 # backs the daemon self-update the spawner runs when the installed myownmesh

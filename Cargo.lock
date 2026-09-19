@@ -162,6 +162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-storage"
+version = "0.2.121"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "allmystuff-term"
 version = "0.2.121"
 dependencies = [

@@ -109,6 +109,7 @@ dependencies = [
  "allmystuff-node-client",
  "allmystuff-protocol",
  "allmystuff-session",
+ "allmystuff-storage",
  "allmystuff-updater",
  "allmystuff-video",
  "anyhow",
@@ -184,6 +185,14 @@ dependencies = [
  "allmystuff-graph",
  "allmystuff-protocol",
  "base64",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "allmystuff-storage"
+version = "0.2.121"
+dependencies = [
  "serde",
  "serde_json",
 ]
