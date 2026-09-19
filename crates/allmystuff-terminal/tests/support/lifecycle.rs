@@ -52,7 +52,9 @@ impl PrivateDirectory {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = shell_compatible_path(
-            std::env::temp_dir().canonicalize().expect("temporary parent"),
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("temporary parent"),
         );
         for _ in 0..4096 {
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -93,9 +95,15 @@ impl Drop for PrivateDirectory {
         assert_eq!(self.path.parent(), Some(self.parent.as_path()));
         if let Err(error) = fs::remove_dir_all(&self.path) {
             if std::thread::panicking() {
-                eprintln!("fixture directory cleanup failed at {:?}: {error}", self.path);
+                eprintln!(
+                    "fixture directory cleanup failed at {:?}: {error}",
+                    self.path
+                );
             } else {
-                panic!("fixture directory cleanup failed at {:?}: {error}", self.path);
+                panic!(
+                    "fixture directory cleanup failed at {:?}: {error}",
+                    self.path
+                );
             }
         }
     }
@@ -271,7 +279,9 @@ impl Viewer {
     }
 
     fn wait_exit(&mut self) {
-        self.wait("authoritative child exit", |viewer| !viewer.exits.is_empty());
+        self.wait("authoritative child exit", |viewer| {
+            !viewer.exits.is_empty()
+        });
     }
 
     fn wait_closed(&mut self) {
@@ -284,7 +294,10 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
 }
 
 fn count(bytes: &[u8], needle: &[u8]) -> usize {
-    bytes.windows(needle.len()).filter(|window| *window == needle).count()
+    bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
 }
 
 fn isolate_command(mut command: CommandBuilder, cwd: &Path) -> CommandBuilder {
@@ -325,7 +338,10 @@ fn shell_compatible_path(path: PathBuf) -> PathBuf {
 fn system_program(relative: &str) -> PathBuf {
     let root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
     let path = PathBuf::from(root).join("System32").join(relative);
-    assert!(path.is_absolute() && path.is_file(), "missing system program {path:?}");
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "missing system program {path:?}"
+    );
     path
 }
 
@@ -391,9 +407,7 @@ fn size_commands(cwd: &Path) -> Vec<CommandBuilder> {
     // Console reads the child-visible ConPTY window dimensions without parsing
     // localized `mode con` output or spawning another child. No profile or
     // execution-policy override is used; the script is an explicit argument.
-    let mut command = CommandBuilder::new(system_program(
-        "WindowsPowerShell/v1.0/powershell.exe",
-    ));
+    let mut command = CommandBuilder::new(system_program("WindowsPowerShell/v1.0/powershell.exe"));
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
     command.arg(concat!(
         "$ErrorActionPreference='Stop'; ",
@@ -416,7 +430,10 @@ fn size_commands(cwd: &Path) -> Vec<CommandBuilder> {
     } else {
         "/usr/bin/stty"
     };
-    assert!(Path::new(stty).is_file(), "native resize fixture requires stty");
+    assert!(
+        Path::new(stty).is_file(),
+        "native resize fixture requires stty"
+    );
     let script = format!(
         "printf 'AMS:READY\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = size ]; then\n    dimensions=$({stty} size)\n    set -- $dimensions\n    printf 'AMS:SIZE:%s:%s:END\\n' \"$2\" \"$1\"\n  fi\ndone\n"
     );
@@ -525,7 +542,10 @@ fn native_size_preserves_placeholder_then_reconciles_minimum_and_detach() {
     fixture.send("a", "size");
     a.wait_marker(b"AMS:SIZE:100:40:END");
     b.wait_marker(b"AMS:SIZE:100:40:END");
-    assert!(a.sizes.is_empty(), "placeholder attach must not shrink the PTY");
+    assert!(
+        a.sizes.is_empty(),
+        "placeholder attach must not shrink the PTY"
+    );
     assert!(b.sizes.is_empty());
 
     assert!(fixture.host.resize("b", 80, 50));
@@ -623,13 +643,19 @@ fn repeated_attach_is_idempotent_and_reopen_starts_a_fresh_shell() {
 #[test]
 fn failed_candidate_leaves_no_routes_and_explicit_fallback_can_start() {
     let mut fixture = Fixture::new();
-    let missing = fixture.directory.path.join("fixture-program-does-not-exist");
+    let missing = fixture
+        .directory
+        .path
+        .join("fixture-program-does-not-exist");
     let error = match fixture.host.open_with(
         Some("fallback"),
         "a",
         100,
         40,
-        vec![isolate_command(CommandBuilder::new(&missing), &fixture.directory.path)],
+        vec![isolate_command(
+            CommandBuilder::new(&missing),
+            &fixture.directory.path,
+        )],
     ) {
         Ok(attach) => {
             fixture.owned.push(OwnedSession {

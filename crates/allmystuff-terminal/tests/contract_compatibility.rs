@@ -119,18 +119,28 @@ fn session_info_preserves_snake_case_order_and_opaque_identity_bytes() {
 fn output_message_variants_and_clone_keep_the_original_shape() {
     let old = [
         old_stub::OutMsg::Data(vec![0, 27, 255]),
-        old_stub::OutMsg::Resize { cols: 65535, rows: 0 },
+        old_stub::OutMsg::Resize {
+            cols: 65535,
+            rows: 0,
+        },
         old_stub::OutMsg::Exit(None),
         old_stub::OutMsg::Exit(Some(-1)),
     ];
     let new = [
         allmystuff_terminal::OutMsg::Data(vec![0, 27, 255]),
-        allmystuff_terminal::OutMsg::Resize { cols: 65535, rows: 0 },
+        allmystuff_terminal::OutMsg::Resize {
+            cols: 65535,
+            rows: 0,
+        },
         allmystuff_terminal::OutMsg::Exit(None),
         allmystuff_terminal::OutMsg::Exit(Some(-1)),
     ];
     let literals = contract();
-    for ((old, new), expected) in old.iter().zip(&new).zip(literals["outmsg_debug"].as_array().unwrap()) {
+    for ((old, new), expected) in old
+        .iter()
+        .zip(&new)
+        .zip(literals["outmsg_debug"].as_array().unwrap())
+    {
         assert_eq!(format!("{old:?}"), expected.as_str().unwrap());
         assert_eq!(format!("{new:?}"), expected.as_str().unwrap());
         assert_eq!(format!("{:?}", new.clone()), expected.as_str().unwrap());
@@ -156,10 +166,18 @@ fn attachment_fields_retain_an_owned_replay_and_broadcast_receiver() {
     assert_eq!(attachment.session_id, "fixture");
     assert_eq!(attachment.scrollback, [0, 255]);
     assert!(!attachment.created);
-    sender.send(allmystuff_terminal::OutMsg::Exit(Some(3))).unwrap();
-    assert!(matches!(attachment.rx.try_recv().unwrap(), allmystuff_terminal::OutMsg::Exit(Some(3))));
+    sender
+        .send(allmystuff_terminal::OutMsg::Exit(Some(3)))
+        .unwrap();
+    assert!(matches!(
+        attachment.rx.try_recv().unwrap(),
+        allmystuff_terminal::OutMsg::Exit(Some(3))
+    ));
     drop(sender);
-    assert!(matches!(attachment.rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Closed)));
+    assert!(matches!(
+        attachment.rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
 }
 
 #[test]
@@ -194,7 +212,8 @@ fn unwatched_output_is_dropped_without_implicitly_creating_a_queue() {
 
 #[test]
 fn literal_framing_preserves_binary_and_empty_chunks() {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!("baseline/viewer_vectors.json")).unwrap();
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("baseline/viewer_vectors.json")).unwrap();
     for case in vectors["literal_frames"].as_array().unwrap() {
         for host in viewers() {
             host.ensure_queue("r");
