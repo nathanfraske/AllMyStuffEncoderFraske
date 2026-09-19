@@ -1,0 +1,284 @@
+{
+  "base_commit": "511c55be94cc6988836f4a423bb8d2929e31c36b",
+  "hash_encoding": "UTF-8 Git blob bytes; snapshot files retain LF, normalize checkout CRLF for verification.",
+  "sources": {
+    "node/src/video.rs": {
+      "git_blob": "4f07cf24bb0379c6f6e6aa177d31ebb2cf0a6805",
+      "sha256": "a4b5f669efc03261452ed8a923e138f8acbf8d3ad45375cf794d3047011470ac",
+      "lines": 7311
+    },
+    "node/src/stubs/video.rs": {
+      "git_blob": "5aeea5edce88c56c3171623ed6156a96f57c120b",
+      "sha256": "7198593c76a72a2a595bf98d62f3d4a3572007f7e005dbdbdd3107732298fecd",
+      "lines": 411
+    },
+    "node/src/video_decode.rs": {
+      "git_blob": "f29eca87ee02a061effa699d088be7d906717137",
+      "sha256": "6821260cceb0467592b57debd77bcdb9ba5b3ecfa47206707573cc773714fd9f",
+      "lines": 1530
+    },
+    "node/src/video_handoff.rs": {
+      "git_blob": "fcf47b7a838b35b3d6bef8aadf899dc68b84a6ac",
+      "sha256": "8d45695b0e87187c4eebbed7b652786996a8e53bfcd23486d768897eecd27f67",
+      "lines": 267
+    },
+    "node/src/control_client.rs": {
+      "git_blob": "5a87a1266b9067c5012c74c5e5b46e38c2907fb7",
+      "sha256": "cd01e9b7a2f9d37bba9d7fa6ed4f30a8deb7872b3c5fcc0a0055e86fd4d7f7e9",
+      "lines": 1401
+    },
+    "node/src/mesh.rs": {
+      "git_blob": "c303c72712db2206ecd6b8a475e6437d65fcefaf",
+      "sha256": "b54550a43586a18c51d5d45e260d412472b353d7d6a2e5c66fa50f25ccbd706f",
+      "lines": 24493
+    },
+    "node/src/video_wire.rs": {
+      "git_blob": "7770edf3f50235695c293912797f88c3be573ed2",
+      "sha256": "a78c59bc8f56d56d4c1f3133313420e6b04ddf33f083dd4eac0841a7e4a631f1",
+      "lines": 6
+    },
+    "node/src/video_frame_timing.rs": {
+      "git_blob": "87a417b9f149b612cf1e0797c1ba4b18b75ba803",
+      "sha256": "ea3d100f029245356f9f301e77b142f72bdcb949430a9609992b8aa3e0c99d70",
+      "lines": 5
+    },
+    "node/src/video_pacing.rs": {
+      "git_blob": "632f765c75794ced892c1ddb3728e88bbfba9e1c",
+      "sha256": "629116702ff182c6815ba70c93be0a902bda33f6011cace8552064ceea5e0304",
+      "lines": 5
+    },
+    "node/src/os_perf.rs": {
+      "git_blob": "aa002c86d8d735f3de9b7b628054823aed6afaad",
+      "sha256": "405c98d14bf2659ab614347ef14d87ef350f589118a81ad705baf5ea872b8b1a",
+      "lines": 522
+    },
+    "node/src/nvdec.rs": {
+      "git_blob": "215b0bad849d2261df0d3e12cf4d3dc3e5985de1",
+      "sha256": "bd05323b455ef1d10e7ee7bc50133148902f123c5712aa91596464d224f08d7f",
+      "lines": 1494
+    },
+    "node/src/d3d11va.rs": {
+      "git_blob": "3cd0465f75fa73dcf824b6176fb4ba39b072d518",
+      "sha256": "8d475986b600bcac973d59d3e40ed75be7625073caabdc6dad30f987aba5f529",
+      "lines": 2065
+    },
+    "node/src/lib.rs": {
+      "git_blob": "fe2dedd68e3010e0c9df81a70a481b6e3d1ca872",
+      "sha256": "ba062aea717a927dd60fdf7039f900ea16ae5f773ae0f55e778c536cb3b76426",
+      "lines": 252
+    },
+    "node/Cargo.toml": {
+      "git_blob": "dfabbfd768be46052f9e2e34105a764d0b964271",
+      "sha256": "b3eb068493316c0ee515b1ada1f036e9516e732d12cd02286d6919fef3843a15",
+      "lines": 358
+    },
+    "Cargo.toml": {
+      "git_blob": "75f000c9b136d98c3a52e0cd64ce695cf2e1f5ee",
+      "sha256": "51cea28052d793ab45f53cbd1702d756976518d4492ee4749ea21459d58ab01b",
+      "lines": 108
+    },
+    "Cargo.lock": {
+      "git_blob": "ca6296b976904acbec6d495350d87448d16f798d",
+      "sha256": "ed484ce2d1bc5d703b93ae425e3f66f9cb1e12ea44b6e4f82cb46f277785f453",
+      "lines": 2689
+    },
+    "node/Cargo.lock": {
+      "git_blob": "54a8d2e7f676f7a76f0d575f033c22480fdf5d13",
+      "sha256": "57dbea14db78ddb175d43ccfcb4dbd77deafe29e3af458acf9654fc772b828e8",
+      "lines": 6100
+    },
+    "crates/allmystuff-video-metadata/src/lib.rs": {
+      "git_blob": "9db89cdcedf8455d8668326673897cd27ddabe43",
+      "sha256": "e373041afd7f9e0e0a9a23ccd1d88ed1262cd7d5a453cb5136019f0295f8884b",
+      "lines": 175
+    },
+    "crates/allmystuff-video-pacing/src/lib.rs": {
+      "git_blob": "426a3d1a7791d8a9897478b4b9c92c8175bcfb3c",
+      "sha256": "15fcb6eea86c7127d2e4eca413e07ea47e09fb69f668c2989e9af7bf5f6a910b",
+      "lines": 231
+    },
+    "crates/allmystuff-frame-timing/src/lib.rs": {
+      "git_blob": "3c39ac10eda101be34c73ca0b21dfbfa31ab8df4",
+      "sha256": "70f5b1a979dcea9bd23d410559748de7d328a3f7decf306766dd57a9751fa247",
+      "lines": 199
+    },
+    "crates/allmystuff-protocol/src/control.rs": {
+      "git_blob": "16bc179f1cad65df34204b01e871a7efc11e2ff4",
+      "sha256": "877123481734c57d3731e29efd92fc2b2554684f5d58071fd1749f22ff27d162",
+      "lines": 947
+    }
+  },
+  "snapshots": {
+    "metadata.rs": {
+      "sha256": "cecbb6c4a9521414bafdf03dcc4b013f77ba4290dbe8e2dbc277ec660fe6cb77",
+      "source_ranges": [
+        {
+          "source": "crates/allmystuff-video-metadata/src/lib.rs",
+          "start_line": 25,
+          "end_line": 175,
+          "sha256": "cecbb6c4a9521414bafdf03dcc4b013f77ba4290dbe8e2dbc277ec660fe6cb77"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "wire_host.rs": {
+      "sha256": "5ced3933ea80c607c6ea3fcbc7f69cb2c389dcedf9c03d423b2a53c402b2b1a7",
+      "source_ranges": [
+        {
+          "source": "node/src/video.rs",
+          "start_line": 4961,
+          "end_line": 5070,
+          "sha256": "5ced3933ea80c607c6ea3fcbc7f69cb2c389dcedf9c03d423b2a53c402b2b1a7"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "wire_stub.rs": {
+      "sha256": "242be68f8498fdfc5530bda4bd67f68c38b40d5e4df75ee1b1cac5e8161c64b3",
+      "source_ranges": [
+        {
+          "source": "node/src/stubs/video.rs",
+          "start_line": 124,
+          "end_line": 206,
+          "sha256": "242be68f8498fdfc5530bda4bd67f68c38b40d5e4df75ee1b1cac5e8161c64b3"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "codec.rs": {
+      "sha256": "1f5e54f253c361726500ab6964308455ba8a9553cac41ade0edbb12584d61bdf",
+      "source_ranges": [
+        {
+          "source": "node/src/video_decode.rs",
+          "start_line": 37,
+          "end_line": 150,
+          "sha256": "1f5e54f253c361726500ab6964308455ba8a9553cac41ade0edbb12584d61bdf"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "handoff.rs": {
+      "sha256": "8cd2c790b6e4623b48686ab2d1fcf8d7a3106b23615c3a92c321604ce8bed68c",
+      "source_ranges": [
+        {
+          "source": "node/src/video_handoff.rs",
+          "start_line": 1,
+          "end_line": 146,
+          "sha256": "8cd2c790b6e4623b48686ab2d1fcf8d7a3106b23615c3a92c321604ce8bed68c"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "sequence.rs": {
+      "sha256": "c47060745be1ca853774c67d2a4400a740bd59b84bd61ed85cfa8a64b74fd593",
+      "source_ranges": [
+        {
+          "source": "node/src/mesh.rs",
+          "start_line": 1787,
+          "end_line": 1793,
+          "sha256": "e686f06336d684e40335c1ef449aeeb0d0d00a727f54a3e2a9b9a33c14499d7f"
+        },
+        {
+          "source": "node/src/mesh.rs",
+          "start_line": 1861,
+          "end_line": 1884,
+          "sha256": "d85d10e32970e0d36703312adb8898604b41e428f4053af2dcc7d06d05db819c"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "route_assembly.rs": {
+      "sha256": "8598a2963eb090a6f48311460a6425e8329bf1fe74740254056851f1afc02106",
+      "source_ranges": [
+        {
+          "source": "node/src/mesh.rs",
+          "start_line": 1892,
+          "end_line": 1988,
+          "sha256": "8598a2963eb090a6f48311460a6425e8329bf1fe74740254056851f1afc02106"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "ingress.rs": {
+      "sha256": "9424e21a7e92437e79aa81d6f584c991e24a24fd253313a54403c226fdffc212",
+      "source_ranges": [
+        {
+          "source": "node/src/control_client.rs",
+          "start_line": 49,
+          "end_line": 385,
+          "sha256": "9424e21a7e92437e79aa81d6f584c991e24a24fd253313a54403c226fdffc212"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "inbound_frame.rs": {
+      "sha256": "1bbdccc0639a2493498f0be8b41b7b0105241f5968a0897319777fa34b4be1e6",
+      "source_ranges": [
+        {
+          "source": "crates/allmystuff-protocol/src/control.rs",
+          "start_line": 670,
+          "end_line": 681,
+          "sha256": "1bbdccc0639a2493498f0be8b41b7b0105241f5968a0897319777fa34b4be1e6"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "ipc_header.rs": {
+      "sha256": "89d3947eb8a32e0161b44a682492b4c252da1ee3fe67ebaa434caac5f9e49111",
+      "source_ranges": [
+        {
+          "source": "node/src/mesh.rs",
+          "start_line": 20484,
+          "end_line": 20485,
+          "sha256": "6411eadcfa0e222e45e37f9d0623edf26d1d782b83216ca59c3f6494c805af84"
+        },
+        {
+          "source": "node/src/mesh.rs",
+          "start_line": 20517,
+          "end_line": 20533,
+          "sha256": "2cf778d40315f8a8e35da4af3e65eda48161f791fabc9f66a2d6d99a7ef348d7"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "original_worker_tests.rs": {
+      "sha256": "b07827f0b43d6c74f83d0f576b307ef7f489495f8116607d4be39bbe5ad8dbd5",
+      "source_ranges": [
+        {
+          "source": "node/src/video_decode.rs",
+          "start_line": 1083,
+          "end_line": 1530,
+          "sha256": "b07827f0b43d6c74f83d0f576b307ef7f489495f8116607d4be39bbe5ad8dbd5"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    },
+    "original_incremental_codec_test.rs": {
+      "sha256": "c93ebca0f77b331ff85771035e018d0dd42a8e92515eae371ed7bc005857ff47",
+      "source_ranges": [
+        {
+          "source": "node/src/video.rs",
+          "start_line": 5826,
+          "end_line": 5918,
+          "sha256": "c93ebca0f77b331ff85771035e018d0dd42a8e92515eae371ed7bc005857ff47"
+        }
+      ],
+      "adaptation": "None; selected source spans concatenated verbatim. Not yet wired as a runnable oracle."
+    }
+  },
+  "status": "Frozen before reading the new library implementation. Source extraction and hashing only; no compiler or tests executed.",
+  "literal_vectors": {
+    "byte_vectors.json": {
+      "sha256": "ff72231a521c39751869cb8c27b49148a65774913d4022bff8fe84e6319b3fc4",
+      "evidence": "Manually source-derived expectations, no implementation execution."
+    },
+    "sequence_vectors.json": {
+      "sha256": "5464f23e356decdeb5f42ecee180eab8f1867fd0b1492d2f882030e3a3d1fbfb",
+      "evidence": "Manually source-derived expectations, no implementation execution."
+    },
+    "handoff_vectors.json": {
+      "sha256": "cd2ad4778b11465e237cd9023e3ae428855db9fdab2a2c72f1d26e25f80ef26e",
+      "evidence": "Manually source-derived expectations, no implementation execution."
+    }
+  }
+}

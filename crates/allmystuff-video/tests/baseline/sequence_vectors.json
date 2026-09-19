@@ -1,0 +1,89 @@
+{
+  "evidence": "Source-derived, unexecuted; serial numbers are u64, never floating point.",
+  "cases": [
+    {
+      "previous": null,
+      "incoming": 0,
+      "clean_entry": false,
+      "expected": "Accept"
+    },
+    {
+      "previous": null,
+      "incoming": 18446744073709551615,
+      "clean_entry": false,
+      "expected": "Accept"
+    },
+    {
+      "previous": 7,
+      "incoming": 7,
+      "clean_entry": false,
+      "expected": "DropDuplicateOrStale"
+    },
+    {
+      "previous": 7,
+      "incoming": 7,
+      "clean_entry": true,
+      "expected": "DropDuplicateOrStale"
+    },
+    {
+      "previous": 7,
+      "incoming": 8,
+      "clean_entry": false,
+      "expected": "Accept"
+    },
+    {
+      "previous": 7,
+      "incoming": 9,
+      "clean_entry": false,
+      "expected": "Gap"
+    },
+    {
+      "previous": 7,
+      "incoming": 6,
+      "clean_entry": false,
+      "expected": "DropDuplicateOrStale"
+    },
+    {
+      "previous": 7,
+      "incoming": 6,
+      "clean_entry": true,
+      "expected": "Accept"
+    },
+    {
+      "previous": 7,
+      "incoming": 9223372036854775815,
+      "clean_entry": false,
+      "expected": "Gap"
+    },
+    {
+      "previous": 7,
+      "incoming": 9223372036854775816,
+      "clean_entry": false,
+      "expected": "DropDuplicateOrStale"
+    },
+    {
+      "previous": 18446744073709551615,
+      "incoming": 0,
+      "clean_entry": false,
+      "expected": "Accept"
+    },
+    {
+      "previous": 18446744073709551614,
+      "incoming": 0,
+      "clean_entry": false,
+      "expected": "Gap"
+    },
+    {
+      "previous": 0,
+      "incoming": 18446744073709551615,
+      "clean_entry": false,
+      "expected": "DropDuplicateOrStale"
+    },
+    {
+      "previous": 0,
+      "incoming": 9223372036854775808,
+      "clean_entry": true,
+      "expected": "Accept"
+    }
+  ]
+}

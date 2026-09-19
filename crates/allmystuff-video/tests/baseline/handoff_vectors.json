@@ -1,0 +1,328 @@
+{
+  "evidence": "Source-derived unexecuted traces. at_ms is relative to a monotonic start. replace retains its original internal clock; no absolute replace timestamp is asserted.",
+  "default_max_age_ms": 200,
+  "default_max_bytes": 67108864,
+  "traces": [
+    {
+      "name": "healthy_burst_is_not_a_six_item_queue",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020100",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 1,
+          "hex": "020001",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 2,
+          "hex": "020002",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 3,
+          "hex": "020003",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 4,
+          "hex": "020004",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 5,
+          "hex": "020005",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 6,
+          "hex": "020006",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 7,
+          "hex": "020007",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 8,
+          "hex": "020008",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 9,
+          "hex": "020009",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 10,
+          "hex": "02000a",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 11,
+          "hex": "02000b",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "take",
+          "hex": "030000000201000300000002000103000000020002030000000200030300000002000403000000020005030000000200060300000002000703000000020008030000000200090300000002000a0300000002000b"
+        }
+      ]
+    },
+    {
+      "name": "exact_deadline_fence_survives_drain",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020101",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 199,
+          "hex": "020002",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 200,
+          "hex": "020003",
+          "gradual": false,
+          "outcome": "AwaitingKey",
+          "started": true
+        },
+        {
+          "op": "take",
+          "hex": ""
+        },
+        {
+          "op": "push",
+          "at_ms": 201,
+          "hex": "020004",
+          "gradual": false,
+          "outcome": "AwaitingKey",
+          "started": false
+        },
+        {
+          "op": "push",
+          "at_ms": 201,
+          "hex": "020105",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "take",
+          "hex": "03000000020105"
+        }
+      ]
+    },
+    {
+      "name": "fresh_key_suffix_only",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020001",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 150,
+          "hex": "020102",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 180,
+          "hex": "020003",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 200,
+          "hex": "020004",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 1
+        },
+        {
+          "op": "take",
+          "hex": "030000000201020300000002000303000000020004"
+        }
+      ]
+    },
+    {
+      "name": "arriving_key_replaces_stale_chain",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020101",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 200,
+          "hex": "020102",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 1
+        },
+        {
+          "op": "take",
+          "hex": "03000000020102"
+        }
+      ]
+    },
+    {
+      "name": "gradual_wave_coalesces_until_drain",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020001",
+          "gradual": true,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 200,
+          "hex": "020002",
+          "gradual": true,
+          "outcome": "Converging",
+          "skipped": 1,
+          "started": true
+        },
+        {
+          "op": "push",
+          "at_ms": 400,
+          "hex": "020003",
+          "gradual": true,
+          "outcome": "Converging",
+          "skipped": 1,
+          "started": false
+        },
+        {
+          "op": "take",
+          "hex": "03000000020003"
+        },
+        {
+          "op": "push",
+          "at_ms": 600,
+          "hex": "020004",
+          "gradual": true,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 800,
+          "hex": "020005",
+          "gradual": true,
+          "outcome": "Converging",
+          "skipped": 1,
+          "started": true
+        },
+        {
+          "op": "take",
+          "hex": "03000000020005"
+        }
+      ]
+    },
+    {
+      "name": "replace_clears_fence_and_preserves_ipc_framing",
+      "steps": [
+        {
+          "op": "push",
+          "at_ms": 0,
+          "hex": "020101",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "push",
+          "at_ms": 200,
+          "hex": "020002",
+          "gradual": false,
+          "outcome": "AwaitingKey",
+          "started": true
+        },
+        {
+          "op": "replace",
+          "hex": "03000000"
+        },
+        {
+          "op": "take",
+          "hex": "0400000003000000"
+        },
+        {
+          "op": "push",
+          "at_ms": 400,
+          "hex": "020003",
+          "gradual": false,
+          "outcome": "Enqueued",
+          "skipped": 0
+        },
+        {
+          "op": "take",
+          "hex": "03000000020003"
+        }
+      ]
+    }
+  ]
+}
