@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "source_revision": "ac548bddd23f413de60c4edd4b47c8e0b60342e0",
+  "source": "node/src/storage_plan.rs",
+  "source_sha256": "28a4b8e7939aa4980c7d3d8ec7257aae273bf2865f155a2b8f2b588e39a1f965",
+  "verbatim_spans": [
+    {
+      "start_line": 1,
+      "end_line": 117,
+      "sha256": "b3685252cb40b19f6cb53fb38d1d883ce47522153b7e9b71d7c010188a595ffb",
+      "bytes": 3139
+    },
+    {
+      "start_line": 125,
+      "end_line": 437,
+      "sha256": "34fdec5a97fd60059b1b118e3adb00b221d755b47b1201d444c28ab883e8f307",
+      "bytes": 10739
+    }
+  ],
+  "omitted": "Global load() path discovery and host persist()/existing tests; copied load_at and all deterministic bodies unchanged.",
+  "adapters": "Append-only test constructors/observations, memory JSON loader and recorded persistence result. Root test persist::load_json dispatches to load_fixture.",
+  "oracle_sha256": "2378feb441035ef81a11a633e1ab364bc5eb5ecd024d8493fa6500deb3077d51"
+}

@@ -9,10 +9,11 @@ host persistence boundary and caller behavior preserved. File transfer, mounts,
 sites, live daemon/state access and RISC-V work are outside this slice.
 
 C2 owns independent core fixtures and this evidence report. C1 owns the library,
-node adapter and Cargo wiring. A2 owns explicit-path host persistence fixtures;
-A1 reviews those fixtures, callers, authority checks and wiring. Jackson owns
-all durable compiler, lint and test execution. No worker native execution is
-part of this evidence.
+node adapter and Cargo wiring. A2 drafted explicit-path host persistence fixtures;
+C1 completed that draft after a provider interruption, with final independent
+review by C2. A1 completed caller, authority and wiring review before its own
+provider interruption. Jackson owns all durable compiler, lint and test
+execution. No worker native execution is part of this evidence.
 
 ## Frozen baseline and literal expectations
 
@@ -50,15 +51,63 @@ nor extracted Rust code has been executed to generate them.
 | Digest | Hash compact serialization of the full persisted state, including ordered maps and counters, using wrapping 64-bit FNV-1a and sixteen lowercase hex digits. Snapshot equality does not imply digest equality. |
 | Host authority | Fleet-network and authenticated-sender checks precede merge. Local manager/volume/capacity checks, resource materialization, notification and transport chunking stay in node; `PLAN_CHUNK` remains 16. No model operation creates authority or storage roots. |
 
-## Current verification state
+## Independent fixtures and source review
 
-Baseline inputs and literal expectations are frozen. Core fixture construction
-and source review are in progress. C1's proposed prepared operations will be
-reviewed against the original pre-lock validation and locked mutation bodies;
-API names alone are not acceptance. A2 covers the real persistence boundary
-through explicit disposable paths, not ordinary state discovery.
+The [core fixture](../../../crates/allmystuff-storage/tests/plan_compatibility.rs)
+contains 28 test cases. Its [oracle receipt](../../../crates/allmystuff-storage/tests/support/oracle-manifest.json)
+identifies two verbatim original spans, covering all deterministic bodies and
+the old load sanitization. Only append-only memory loading, persistence-result
+and observation adapters replace host access. Each mutation compares its result,
+candidate persistence bytes, complete resulting state, snapshot and digest;
+fixed literals prevent the two implementations from being the sole oracle.
+The source inventory is documented in the
+[fixture guide](../../../crates/allmystuff-storage/tests/README.md).
 
-Central compilation, actual dependency closure and execution remain pending.
-No test count, passing gate, platform qualification or all-tests claim is made
-at this stage. Final evidence will distinguish new core comparisons, retained
-tests, host failure-path tests and broader application limits.
+C2 read C1's complete core and wrapper, then independently compared the model,
+defaults, constants, Serde fields, sanitization, digest, snapshot, all four
+mutation bodies and seven clock/validation helpers. The explicit substitutions
+are the state type/visibility, original `Persisted` Serde name, caller-held state
+reference and synchronous persistence callback. Prepared constructors preserve
+the original checks before the mutex; the node keeps that mutex held through
+mutation and persistence. Host path discovery and persistence are unchanged.
+Seven existing node tests retain their bodies except one equivalent observation
+through `snapshot()` after persisted fields become private to the library.
+
+The accepted 11-path source candidate includes core SHA-256
+`a7b217a50c7c25f70f481d9bdabf727732c2eb20dc79f2aa0de1caad6b7c0fd2`
+and node wrapper SHA-256
+`ea414cdbafd1c55d1b9057ec4cb4ab0836de482f8bda452fb9ce943bd9c07123`.
+A1 independently accepted the node/caller/wiring boundary. A1 and C2 each
+reversed only the new local package record and node dependency edge in all four
+locks and recovered the entire old lock text. Existing pins, checksums and
+external dependency records remain unchanged. Production dependencies are Serde
+and JSON; `parking_lot` is a test dependency for the frozen oracle. Actual
+resolved dependency closure remains a central gate.
+
+C2 also read all 15 explicit-path host fixtures, their helpers and the original
+persistence source. The accepted fixture SHA-256 is
+`37eeece7c2876eefc446f5eaf15844b037bd6eccd7f09358fb3c280595c76925`.
+They reserve private disposable directories and cover defaults, parse quarantine
+versus non-UTF-8 read failure, sanitize-before-cap loading without rewriting,
+legacy documents, exact pretty bytes, replacement, blocked parent/temp/destination
+paths, retry counters, unchanged merges, and `None` versus empty paths. They do
+not call global store discovery, construct Mesh or alter environment variables.
+The node's small test-module inclusion is reviewed separately once assembled.
+
+## Current verification state and limits
+
+This is source acceptance. C1's final independent acceptance of the core fixture,
+the host include, central formatting, compilation, dependency closure, lint and
+execution remain pending. The isolated source inventory is 28 new core cases,
+15 new host cases, 7 retained store tests and 2 existing persistence-helper tests.
+These 52 expected cases are not a passing-test claim.
+
+Unchanged Mesh source preserves authenticated network/sender admission and
+caller-derived management permission, local volume/capacity/materialization
+checks, and durable-change-before-notification ordering. No direct existing
+test of those live Mesh storage paths was found; core authorization decisions
+and isolated filesystem results do not establish fleet integration coverage.
+Unix permission checks require a Unix run. Replacement and selected I/O failures
+do not establish power-loss behavior, directory-fsync durability or coverage of
+every pre-rename error. Broader file-transfer, mount, site, GUI/mobile runtime
+and RISC-V qualification remain outside this slice.
