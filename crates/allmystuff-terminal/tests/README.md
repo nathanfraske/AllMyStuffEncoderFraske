@@ -48,6 +48,15 @@ the deadline by one millisecond; exact timer-tick equality is not asserted.
 nine Windows/Unix cases use real, isolated PTYs and explicit shell commands.
 Those cases and the retained platform tests require manager-run native validation.
 
+The local Ubuntu 24.04.4 WSL2 extension ran the exact Unix module selections
+`host::tests::` and `host::lifecycle::` on one native x86_64 Linux binary built
+with Rust 1.97.1. All 13 retained cases and nine lifecycle cases passed, totaling
+20 PTY and two pure cases. Separate private PID/mount namespaces, clean private
+HOME/TMPDIR and explicit shell commands bounded these runs; final descendant
+censuses were empty. The 30 channel comparisons were discovered but not executed
+in that extension, and viewer integration tests and doctests were outside its
+scope. Other Unix systems and the minimum Rust version remain unvalidated here.
+
 Manager-owned compiler, formatter and runtime results, retained failures and
 platform limits are recorded in the [extraction report](../../../docs/reviews/modular-foundation/terminal-library-extraction.md).
 Fixture definitions alone do not establish execution on every supported target.

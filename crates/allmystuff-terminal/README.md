@@ -66,5 +66,11 @@ and host dependency checks, formatting, strict Clippy and node's
 `--no-default-features` check also passed. The
 [extraction report](../../docs/reviews/modular-foundation/terminal-library-extraction.md)
 records the commands, initial failures and ConPTY redraw fixture correction.
-These checks do not qualify Unix PTYs, live fleet or IPC behavior, GUI/mobile
-builds, or real user shell configurations.
+
+A separate native Linux validation on local Ubuntu 24.04.4 under WSL2 with Rust
+1.97.1 passed 22 selected cases: 13 retained terminal tests and nine lifecycle
+fixtures, comprising 20 PTY cases and two pure cases. The same report records the
+locked build, isolated process cleanup and preserved dependency-cache failures.
+This Linux extension does not qualify other Unix systems, macOS, the Rust 1.88
+minimum, or the whole test suite. Live fleet/IPC behavior, GUI/mobile builds and
+real user shell configurations remain outside these validations.

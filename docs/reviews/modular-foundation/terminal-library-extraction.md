@@ -16,6 +16,11 @@ The initial replay fixture assumption and formatting failures remain recorded.
 Production behavior is unchanged. Verified cleanup reclaimed 2.17 GiB while
 preserving the retained binaries and evidence described below.
 
+A separate native Linux extension subsequently passed all 22 selected Unix
+cases on local Ubuntu 24.04.4 under WSL2: 20 PTY cases and two pure cases.
+Its source, runner, cache failures and actual results are recorded in
+[the WSL validation extension](#native-unix-validation-extension-under-wsl).
+
 ## Frozen evidence and ownership
 
 The [baseline receipt](../../../crates/allmystuff-terminal/tests/baseline/manifest.json)
@@ -257,9 +262,10 @@ are excluded from that module and are not accidentally executed twice.
 A2's native fixtures own an exclusive canonical directory and explicit child
 commands. They retain receivers for teardown observation, close sessions on Drop
 and keep the directory when shutdown cannot be observed. The Windows cmd and
-native dimension helpers were exercised in the scoped runs below. Unix fixed-path
-shell/stty behavior remains unexecuted. Synchronous native open/close is bounded
-by the manager run's outer timeout.
+native dimension helpers were exercised in the Windows runs below. Unix fixed-path
+shell/stty behavior was pending at that checkpoint and was subsequently exercised
+in the separate WSL extension. Synchronous native open/close is bounded by the
+manager run's outer timeout.
 
 A1 identified narrow existing node filters for terminal route shape, canonical
 loopback identity, privileged-offer refusal and per-plane share grants. The
@@ -516,3 +522,207 @@ behavior. Isolated shells and channel models do not test live fleet permissions,
 GUI tab interactions, service/session-agent launches or every user shell/profile.
 Source preservation of those boundaries is recorded above; platform or live-state
 coverage will only be claimed for actual reviewed runs.
+
+## Native Unix validation extension under WSL
+
+The separately authorized Unix validation starts from completed Windows commit
+`6e6b8558212e58d540a09935303387d47b3a305e`. C2's new review and documentation
+assignment is `manager:3847eff4-8ac7-4d0f-bfa5-d0e533a5e8f9`; the completed
+Windows assignment and its evidence remain separate. No production or fixture
+bytes changed. The reviewed native build and both selected Unix modules passed;
+the 22 selected definitions comprise 20 PTY cases and two pure cases.
+
+The manager's retained `environment-preflight.json` records Ubuntu 24.04.4 LTS
+under local WSL2, x86_64, kernel `6.6.87.2-microsoft-standard-WSL2`, running as
+root. Existing native Rust is selected through `/root/.cargo/bin` rather than
+the default WSL PATH: rustc 1.97.1
+(`8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM 22.1.6), Cargo 1.97.1,
+GCC 13.3.0 and Python 3.12.3. The installed 1.88.0 toolchain is not the selected
+validation compiler. A separate `unshare --mount --pid --fork --kill-child
+--mount-proc /bin/true` preflight succeeded. This establishes available
+prerequisites and namespaces, not a passing terminal test.
+
+The scoped Linux normal/build dependency command was:
+
+```text
+cargo tree -p allmystuff-terminal --features host \
+  --target x86_64-unknown-linux-gnu -e normal,build --locked
+```
+
+| Attempt | Durable run | Result; elapsed; stdout/stderr bytes |
+| --- | --- | --- |
+| Same command with `--offline` | `7b37b883-0f32-495b-98ba-9e2fc52f3fd2` | Exit 101; 4.529 s; 0/399 |
+| Locked fetch and graph | `5e72466e-61b2-4d88-b13f-3ee8097d3b1a` | Exit 0; 3.419 s; 2,531/202 |
+
+C2 read both complete commands and streams to EOF. The first attempt found no
+`xpty` entry in the native Cargo cache. The second downloaded the already pinned
+`filedescriptor` 0.8.3, `shell-words` 1.1.1, `downcast-rs` 2.0.2, `xpty` 0.3.6 and
+`nix` 0.29.0. No installer or dependency-version refresh was used. Its graph has
+37 distinct normal/build package identities, all present in the unchanged root
+lock. The only local packages reached are terminal and byte queues. These graph
+commands did not compile or execute tests. The retained manager inputs are under
+`target/terminal-unix-validation-20260919-01/`; C2's complete graph audit and source
+identities are under `target/terminal-wsl-review/`.
+
+A1 and A2 independently audited the Unix source and cross-checked each other's
+findings. C2 also read the retained test bodies and lifecycle shell, directory,
+observation and cleanup helpers. The agreed native selection is two module
+prefixes, in separate serialized processes: `host::tests::` selects 13 definitions
+(11 PTY and two pure), and `host::lifecycle::` selects nine PTY definitions.
+Module-prefix selection uses no libtest `--exact` option. Actual discovery and
+passing test names matched this independently frozen inventory; no node/GUI or
+unrelated contract suite was included.
+
+The retained tests explicitly launch `/bin/sh -c` with `cat`, `sleep`, `stty size`
+or a fixed exit status. They do not exercise default or login-shell discovery.
+The `cat` smoke assertions also accept PTY input echo, so they do not separately
+prove the child application's output. The newer lifecycle tests use private
+shell scripts and a fixed native `stty` path, with markers absent from input,
+shared-shell state, exact replay/live byte equality and resize observations.
+
+The outer runner must supply a private existing Linux HOME and TMPDIR before
+the first `CommandBuilder`, along with a controlled Unix PATH and no inherited
+shell startup settings. xpty caches the initial environment and defaults an
+unspecified cwd to HOME. Its child calls `setsid`; killing only the test process
+group cannot contain every PTY descendant. The retained tests close after their
+assertions and have no general close-on-panic guard. The newer fixtures close
+owned sessions on Drop and observe output-channel closure with a bounded
+deadline, but that does not prove every descendant or worker has joined.
+Synchronous PTY open/close also lies outside those observation deadlines.
+
+C2 independently accepted C1's complete runner and recipe, including
+`run_unix.py` SHA256
+`d934cb32856f2f2c54483457a09b4445d67069238312cf8646344370dc096f45`
+(22,800 bytes). The source manifest SHA256 is
+`889d5d5bc611089f346bd06c63b5a84172add89d8f26fa73c2281def4a1daab3`;
+the archive is
+`aedd49bb4249eca5b186df0c8fd7e0ab30f0cae68211f480bb127ed04329ab59`
+(3,551,380 bytes). C2 verified every archived content hash, Git blob and file mode
+against all 844 tracked files at the exact completed commit: 15,524,180 source
+bytes, with no `.git`, untracked state or previous build output included.
+
+The recipe extracts those committed LF bytes to a mode-0700 Linux ext4 directory
+at `/var/tmp/ams-terminal-unix-20260919-01`. Source, target, private Cargo home and
+per-attempt HOME/TMPDIR/XDG directories are separate from the preserved Windows
+target. Only the existing registry cache is linked into the private Cargo home;
+Cargo config and credentials are not imported. The build checks the inventoried
+native rustc commit and executes only:
+
+```text
+cargo test -p allmystuff-terminal --features host --lib \
+  --target x86_64-unknown-linux-gnu --locked --offline \
+  --no-run --message-format=json
+```
+
+The runner accepts one recorded ELF64/x86_64 libtest executable. Each runtime
+phase rechecks its hash, records full and filtered discovery, requires the exact
+audited name set, and uses `--test-threads=1 --color never`. A zero exit plus the
+exact passed/failed/ignored/measured/filtered summary is required. Every attempt
+has exclusive retained logs and result files, with all source hashes, modes and
+four locks verified before and after execution. No automatic retry, online build
+fallback, installation or recursive deletion is implemented.
+
+Each phase has a private mount/PID namespace and namespace-local `/proc`, verified
+before cleanup is enabled. The inner PID 1 reaps children and applies bounded
+TERM/KILL cleanup to remaining namespace processes. Inner build/test deadlines
+are 1,200/600 seconds; outer Linux deadlines are 1,320/720 seconds. Interruption
+or timeout kills the owned launcher group, with `unshare --kill-child=KILL` and
+namespace teardown covering PTY descendants that called `setsid`. The outer
+supervisor also checks for remaining members of that PID namespace. Native
+devpts is inherited; this is not a general filesystem or network sandbox.
+Source acceptance of this recipe is distinct from observing its runtime results.
+
+The first native build attempt, `build-offline-01`, ran the exact accepted recipe
+in durable record `9ac7f872-4f06-48a5-8fec-2fcbdde763db`. It exited 1 after
+5.536 seconds (2,368/0 outer stdout/stderr bytes); the inner Cargo command exited
+101 before compilation because pinned `memchr` 2.8.1 was absent from the native
+cache. The complete 120-byte `build.stderr.log` records that offline download
+failure. C2 read the full durable record, toolchain output, isolation record and
+failure logs, and verified the before/after source receipt: all 844 files and
+four lock hashes were unchanged. Both the inner cleanup and outer namespace
+census were empty. This failed attempt remains retained; no compiler or test
+pass is inferred from it.
+
+The manager then ran the scoped `cargo tree` command with `-e normal,build,dev
+--locked` in the private source/Cargo home. Record
+`54fe9c6f-4f1c-4361-ae25-38f3aa62b8ed` succeeded in 2.636 seconds with
+2,881/51 stdout/stderr bytes and fetched only `memchr` 2.8.1. The exact runner
+was reused in a distinct `build-offline-02` attempt, preserving the first failure.
+The following durable run timings include WSL and runner overhead; stdout/stderr
+sizes are the outer run streams, whose JSON points to the complete nested logs.
+
+| Phase | Durable run | Result; elapsed; stdout/stderr bytes |
+| --- | --- | --- |
+| Offline native libtest build | `84cb720b-7136-444d-b9e0-47d232604f65` | Exit 0; 13.775 s; 2,634/0 |
+| Retained Unix module | `c9757952-90d2-40c1-9ebd-e9b28dba2671` | Exit 0; 13 passed, 39 filtered; 6.268 s; 4,320/0 |
+| Unix lifecycle module | `bd2b36cc-ee79-4db2-ae2f-1c8ab297e793` | Exit 0; 9 passed, 43 filtered; 4.588 s; 3,467/0 |
+
+C2 read every complete terminal command and stream plus the nested build, test,
+discovery, launcher and isolation records. The build emitted 66 valid Cargo JSON
+records: 54 compiler artifacts, 11 build-script records and one successful
+build-finished record, with no compiler-message diagnostics. It produced one
+33,320,632-byte native ELF64/x86_64 libtest executable,
+`allmystuff_terminal-b2627474e65bbecd`, SHA256
+`a53e40937475f9d1229d25cf6f0276f2ec78132561b483e37d4833a54b250a6b`.
+C2 independently rehashed that binary and all 844 extracted source files through
+read-only filesystem access, matching the recorded artifact and every frozen
+Git blob/SHA256. No worker executed WSL commands, Rust tools or a PTY.
+
+Both runtime phases used that same binary and discovered the same 52 unit tests.
+Their exact commands were `BINARY host::tests:: --test-threads=1 --color never`
+and `BINARY host::lifecycle:: --test-threads=1 --color never`, inside their
+separate reviewed namespace processes. Every selected name passed, with zero
+failed, ignored or measured cases. Nested test stdout/stderr sizes were 789/0
+and 933/0 bytes; measured test-process durations were 1.222 and 1.572 seconds.
+The other 30 channel comparisons were discovered but not executed in this
+extension. No repeated Windows executions are added to this 22-case count.
+
+All phases verified the same 844 source files, modes and four LF lock hashes
+after execution. The successful build and lifecycle module had empty inner
+cleanup inventories. The retained module left six already-exited zombie child
+entries; namespace PID 1 reaped them. All final inner and outer namespace
+censuses were empty. These observed cleanup results do not claim that an
+injected timeout or cancellation was tested. The runner's separate bounded
+failure handling is covered by source review, and the first offline-cache failure
+also completed with empty censuses.
+
+C2 independently reviewed C1's Linux target cleanup script, SHA256
+`58d7a8e8ce851de4f2b7229b583c80a409eedf9f54f4c9c7906ce977204845ba`
+(10,689 bytes). Its literal target is
+`/var/tmp/ams-terminal-unix-20260919-01/target`. The script requires the exact
+three successful phase receipts and original ELF, verifies source hashes/modes
+and absent recorded PID namespaces, and uses canonical-path, symlink, mount,
+device and per-file identity guards. It unlinks only planned regular files and
+removes empty directories, preserving the ELF at its original path. Exclusive
+plan/result files prevent replay. The manager ran the exact reviewed command
+after validation in `f8c202b0-decf-44e7-aeae-3eee2d7de062`: exit 0, 8.426 seconds,
+472/0 stdout/stderr bytes, with both streams complete and untruncated.
+
+The cleanup removed 448 regular files totaling 312,272,155 logical bytes.
+Summed regular-file sizes changed from 345,592,787 to 33,320,632 bytes; the sole
+remaining target file is the unchanged tested ELF. These are logical file-size
+totals, not measured physical blocks freed or the earlier `du` directory total.
+The retained `cleanup-unix-plan.json` SHA256 is
+`0848d0b9b0b91eb3cd160c3c1cd5c74f78ebf43dd70f75d344c7c337c4685d3c`;
+`cleanup-unix-result.json` is
+`1c0174a85814025abbd39c5d77c480654801f791a766e5eb8e2b37d6553ca0c9`.
+
+C2 read the complete cleanup command, output and receipts, confirmed all 448
+selected paths were absent and independently rehashed the original ELF plus
+848 protected private files and 79 evidence files. Those private files include
+all 844 frozen source files. The Linux script verified 1,069 private entries and
+84 evidence entries unchanged, including directory metadata and the registry
+link. The external registry's contents were not traversed or rehashed. Private
+state and source remain retained; the Windows target was outside this cleanup
+path. Manager Git status stayed at the same source commit with only managed
+`AGENTS.md` untracked. No worker executed deletion, and the cleanup was not
+replayed. C2's independent accounting and content checks are retained in
+`target/terminal-wsl-review/cleanup-result-reviewed.json`.
+
+This qualifies the selected explicit-shell terminal cases on native x86_64
+Linux with Ubuntu 24.04.4, WSL2's recorded kernel and Rust 1.97.1. It does not
+qualify macOS, BSD, other Unix systems or the declared Rust 1.88 minimum. Unix
+viewer integration tests, the channel suite's runtime, doctests, Clippy, node,
+GUI/mobile builds, live fleet/IPC behavior and user-selected shell profiles
+were not part of this extension. Earlier Windows evidence remains valid within
+its own recorded scope.
