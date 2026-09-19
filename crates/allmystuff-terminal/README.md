@@ -60,6 +60,11 @@ host-disabled adapter explicitly selects the functional viewer implementation.
 Routing, capability advertisement, sender authorization, local IPC, media
 framing, sequence checks and application supervision stay in node.
 
-The source and independent fixtures are under review. Compiler, lint and
-isolated PTY results remain pending central validation; source comparison alone
-does not establish runtime or platform coverage.
+Focused Windows validation passed 84 test executions across 67 distinct library
+and node test definitions, including nine isolated PTY lifecycle tests. Viewer
+and host dependency checks, formatting, strict Clippy and node's
+`--no-default-features` check also passed. The
+[extraction report](../../docs/reviews/modular-foundation/terminal-library-extraction.md)
+records the commands, initial failures and ConPTY redraw fixture correction.
+These checks do not qualify Unix PTYs, live fleet or IPC behavior, GUI/mobile
+builds, or real user shell configurations.
