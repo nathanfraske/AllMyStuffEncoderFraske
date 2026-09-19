@@ -444,6 +444,11 @@ comparison inputs remain.
 | Inventory and evidence | Hardware snapshot records are application data; they do not grant authority or implement Mesh evidence admission or capability registration. The optional host still chooses scanner and consumer components. |
 | Encoded AU metadata | Preserve the application's marker/sequence/recovery representation when reviewing future routes. These bytes do not redefine Mesh-owned RTP markers or packetizer mechanics. |
 
+The [source-checked MyOwnMesh follow-ups](reviews/modular-foundation/myownmesh-followups.md)
+narrow three candidates: first-fragment AU bounds, explicit daemon contract
+support, and a measured outgoing-copy optimization. They remain proposals;
+the current portability work changes none of those behaviors or the Mesh pin.
+
 The [original roadmap](MODULAR-FOUNDATION.md) and its reviews remain historical
 evidence. Its proposed consumer-profile framing is superseded by selective
 libraries, an optional host and a GUI consumer; the broader implementation and
