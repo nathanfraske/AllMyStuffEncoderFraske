@@ -1329,5 +1329,9 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/host_compatibility.rs"]
+mod compatibility;
+
+#[cfg(test)]
 #[path = "../tests/support/lifecycle.rs"]
 mod lifecycle;
