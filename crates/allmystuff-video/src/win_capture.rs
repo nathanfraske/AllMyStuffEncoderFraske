@@ -81,7 +81,9 @@ impl Drop for Session {
 /// reclaim lane spent frame buffers ride back on.
 pub type StartedDuplication = (Session, mpsc::Receiver<RawFrame>, mpsc::SyncSender<Vec<u8>>);
 
-pub fn start<D: crate::host::DesktopFollower>(monitor_id: u32) -> Result<StartedDuplication, String> {
+pub fn start<D: crate::host::DesktopFollower>(
+    monitor_id: u32,
+) -> Result<StartedDuplication, String> {
     start_named::<D>(monitor_id, None)
 }
 
@@ -120,7 +122,11 @@ pub fn start_named<D: crate::host::DesktopFollower>(
     ))
 }
 
-fn pump<D: crate::host::DesktopFollower>(mut dup: Duplication, stop: &AtomicBool, tx: &mpsc::SyncSender<RawFrame>) {
+fn pump<D: crate::host::DesktopFollower>(
+    mut dup: Duplication,
+    stop: &AtomicBool,
+    tx: &mpsc::SyncSender<RawFrame>,
+) {
     // The duplication readback competes with whatever loaded the GPU/CPU —
     // the exact condition the stream exists for.
     crate::os_perf::boost_media_thread();

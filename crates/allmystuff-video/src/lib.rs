@@ -24,6 +24,22 @@ pub mod output;
 pub mod video_decode;
 #[cfg(feature = "decode")]
 pub use video_decode as decode;
+#[cfg(all(windows, feature = "host"))]
+pub mod amf;
+#[cfg(feature = "host")]
+pub mod camera_capture;
+#[cfg(all(windows, feature = "host"))]
+pub mod d3d11va;
+#[cfg(all(windows, feature = "host"))]
+pub mod gpu_pipeline;
+#[cfg(feature = "hwenc")]
+pub mod hwenc;
+#[cfg(all(windows, feature = "host"))]
+pub mod mediafoundation;
+#[cfg(all(windows, feature = "host"))]
+pub mod nvdec;
+#[cfg(all(windows, feature = "host"))]
+pub mod nvenc;
 #[cfg(feature = "decode")]
 pub mod os_perf;
 #[cfg(feature = "host")]
@@ -35,27 +51,11 @@ pub mod video;
 mod video_frame_timing;
 #[cfg(all(test, feature = "host"))]
 mod video_wire;
-#[cfg(feature = "host")]
-pub mod wake;
-#[cfg(feature = "host")]
-pub mod camera_capture;
-#[cfg(all(target_os = "linux", feature = "host"))]
-pub mod wayland_capture;
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub mod videotoolbox;
-#[cfg(feature = "hwenc")]
-pub mod hwenc;
-#[cfg(all(windows, feature = "host"))]
-pub mod amf;
-#[cfg(all(windows, feature = "host"))]
-pub mod d3d11va;
-#[cfg(all(windows, feature = "host"))]
-pub mod gpu_pipeline;
-#[cfg(all(windows, feature = "host"))]
-pub mod mediafoundation;
-#[cfg(all(windows, feature = "host"))]
-pub mod nvdec;
-#[cfg(all(windows, feature = "host"))]
-pub mod nvenc;
+#[cfg(feature = "host")]
+pub mod wake;
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub mod wayland_capture;
 #[cfg(all(windows, feature = "host"))]
 pub mod win_capture;

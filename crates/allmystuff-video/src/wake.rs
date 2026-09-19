@@ -172,7 +172,9 @@ fn synthetic_user_activity() {
             let _ = enigo.move_mouse(1, 0, Coordinate::Rel);
             let _ = enigo.move_mouse(-1, 0, Coordinate::Rel);
         }
-        Err(e) => tracing::debug!(target: "allmystuff_node::wake", "synthetic user activity unavailable: {e}"),
+        Err(e) => {
+            tracing::debug!(target: "allmystuff_node::wake", "synthetic user activity unavailable: {e}")
+        }
     }
 }
 
@@ -341,7 +343,9 @@ mod platform {
                     cookie,
                 })
             }
-            Err(e) => tracing::debug!(target: "allmystuff_node::wake::platform", "org.freedesktop.ScreenSaver inhibit: {e}"),
+            Err(e) => {
+                tracing::debug!(target: "allmystuff_node::wake::platform", "org.freedesktop.ScreenSaver inhibit: {e}")
+            }
         }
         match inhibit_gnome(&conn, reason) {
             Ok(cookie) => Ok(Hold {

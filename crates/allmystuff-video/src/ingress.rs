@@ -270,15 +270,11 @@ impl<C> Freshness<C> {
     }
 
     pub fn discard_paced_peer_lane(&mut self, from: &str, stream: u8) {
-        self.paced.remove(&(canonical_media_peer(from).to_string(), stream));
+        self.paced
+            .remove(&(canonical_media_peer(from).to_string(), stream));
     }
 
-
-    pub fn forward_transport_discontinuity(
-        &mut self,
-        frame: Frame<C>,
-        tx: &impl Sink<C>,
-    ) -> bool {
+    pub fn forward_transport_discontinuity(&mut self, frame: Frame<C>, tx: &impl Sink<C>) -> bool {
         // Any paced fragments preceding the transport gap are necessarily an
         // incomplete AU. Drop them before ordering the decoder reset marker.
         self.discard_paced_lane(&frame);

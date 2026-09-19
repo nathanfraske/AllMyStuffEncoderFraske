@@ -415,14 +415,15 @@ pub enum LinkClass {
 /// adaptation also serves Balanced, but only direct link evidence may soften
 /// that quality-first posture.
 pub(crate) fn game_mode() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_GAME_MODE") {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        match std::env::var("ALLMYSTUFF_GAME_MODE") {
             Ok(v) if !v.is_empty() && v != "0" => {
                 tracing::info!(target: "allmystuff_node::video", "ALLMYSTUFF_GAME_MODE on: 60 fps floor + tight burst bounds");
                 true
             }
             _ => false,
-        });
+        }
+    });
     *ON
 }
 
@@ -2553,7 +2554,9 @@ fn nvenc_preference() -> Option<bool> {
         let raw = std::env::var("ALLMYSTUFF_NVENC").ok();
         let choice = explicit_bool_choice(raw.as_deref());
         match choice {
-            Some(true) => tracing::info!(target: "allmystuff_node::video", "ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled"),
+            Some(true) => {
+                tracing::info!(target: "allmystuff_node::video", "ALLMYSTUFF_NVENC=1 — direct NVENC rung enabled")
+            }
             Some(false) => {
                 tracing::info!(target: "allmystuff_node::video", "ALLMYSTUFF_NVENC=0 — direct NVENC rung disabled")
             }
@@ -2684,7 +2687,9 @@ fn open_gpu_encoder(
     for hw in crate::mediafoundation::hardware_h264_mfts_on(adapter) {
         match hw.open_with_manager_for_route(w, h, fps, bitrate, Some(manager), posture) {
             Ok(enc) => return Some(enc),
-            Err(e) => tracing::debug!(target: "allmystuff_node::video", "GPU-lane MFT {} declined: {e}", hw.name()),
+            Err(e) => {
+                tracing::debug!(target: "allmystuff_node::video", "GPU-lane MFT {} declined: {e}", hw.name())
+            }
         }
     }
     None
@@ -2823,7 +2828,9 @@ fn run_gpu_lane(
                 studio,
             ) {
                 Ok(a) => break 'open GpuCodec::Amf(a),
-                Err(e) => tracing::debug!(target: "allmystuff_node::video", "AMF rung not taken for {route_id}: {e}"),
+                Err(e) => {
+                    tracing::debug!(target: "allmystuff_node::video", "AMF rung not taken for {route_id}: {e}")
+                }
             }
         }
         match open_gpu_encoder(
@@ -4944,11 +4951,11 @@ fn rate_adapt_step(
     None
 }
 
+#[cfg(test)]
+use crate::framing::host::paced_slices_requested;
 pub use crate::framing::host::{
     paced_au_marker, paced_au_marker_count, paced_slices_enabled, split_annexb_paced,
 };
-#[cfg(test)]
-use crate::framing::host::paced_slices_requested;
 
 /// The route's effective H.264 bitrate: the viewer's explicit Rate pill,
 /// else the pixel budget — floored to the Studio fidelity budget when
@@ -5272,7 +5279,9 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                         );
                     }
                 }
-                Err(e) => tracing::debug!(target: "allmystuff_node::video", "Media Foundation H.264 MFT unavailable: {e}"),
+                Err(e) => {
+                    tracing::debug!(target: "allmystuff_node::video", "Media Foundation H.264 MFT unavailable: {e}")
+                }
             }
         }
     }
@@ -5311,7 +5320,9 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                     );
                 }
             }
-            Err(e) => tracing::debug!(target: "allmystuff_node::video", "VideoToolbox H.264 unavailable: {e}"),
+            Err(e) => {
+                tracing::debug!(target: "allmystuff_node::video", "VideoToolbox H.264 unavailable: {e}")
+            }
         }
     }
     #[cfg(feature = "hwenc")]
@@ -5350,7 +5361,9 @@ fn make_h264_codec(bw: u32, bh: u32, fps: u32, tune: Tune) -> Result<Box<dyn H26
                         );
                     }
                 }
-                Err(e) => tracing::debug!(target: "allmystuff_node::video", "H.264 encoder {name} unavailable: {e}"),
+                Err(e) => {
+                    tracing::debug!(target: "allmystuff_node::video", "H.264 encoder {name} unavailable: {e}")
+                }
             }
         }
     }

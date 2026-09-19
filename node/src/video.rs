@@ -2,8 +2,7 @@
 
 pub use allmystuff_video::video::*;
 
-pub type VideoBridge =
-    allmystuff_video::video::VideoBridge<crate::win_privilege::DesktopFollower>;
+pub type VideoBridge = allmystuff_video::video::VideoBridge<crate::win_privilege::DesktopFollower>;
 
 impl allmystuff_video::host::DesktopFollower for crate::win_privilege::DesktopFollower {
     fn new() -> Self {

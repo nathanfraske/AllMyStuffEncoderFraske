@@ -949,7 +949,9 @@ fn write_tokens(path: &std::path::Path, tokens: &HashMap<String, String>) {
                 tracing::warn!(target: "allmystuff_node::wayland_capture", "couldn't persist screencast token: {e}");
             }
         }
-        Err(e) => tracing::warn!(target: "allmystuff_node::wayland_capture", "couldn't serialize screencast tokens: {e}"),
+        Err(e) => {
+            tracing::warn!(target: "allmystuff_node::wayland_capture", "couldn't serialize screencast tokens: {e}")
+        }
     }
 }
 

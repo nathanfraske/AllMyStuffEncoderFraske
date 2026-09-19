@@ -104,8 +104,17 @@ fn into_fresh_event(event: InboundVideoEvent) -> FreshEvent {
     match event {
         InboundVideoEvent::Frame(frame) => FreshEvent::Frame(into_fresh_frame(frame)),
         InboundVideoEvent::Unframed(frame) => FreshEvent::Unframed(into_fresh_frame(frame)),
-        InboundVideoEvent::Discontinuity { from, stream, reason, entry } =>
-            FreshEvent::Discontinuity { from, stream, reason, entry: entry.map(into_fresh_frame) },
+        InboundVideoEvent::Discontinuity {
+            from,
+            stream,
+            reason,
+            entry,
+        } => FreshEvent::Discontinuity {
+            from,
+            stream,
+            reason,
+            entry: entry.map(into_fresh_frame),
+        },
     }
 }
 
@@ -113,20 +122,36 @@ fn from_fresh_event(event: FreshEvent) -> InboundVideoEvent {
     match event {
         FreshEvent::Frame(frame) => InboundVideoEvent::Frame(from_fresh_frame(frame)),
         FreshEvent::Unframed(frame) => InboundVideoEvent::Unframed(from_fresh_frame(frame)),
-        FreshEvent::Discontinuity { from, stream, reason, entry } =>
-            InboundVideoEvent::Discontinuity { from, stream, reason, entry: entry.map(from_fresh_frame) },
+        FreshEvent::Discontinuity {
+            from,
+            stream,
+            reason,
+            entry,
+        } => InboundVideoEvent::Discontinuity {
+            from,
+            stream,
+            reason,
+            entry: entry.map(from_fresh_frame),
+        },
     }
 }
 
 struct VideoQueue<'a>(&'a mpsc::Sender<InboundVideoEvent>);
 
 impl allmystuff_video::ingress::Sink<u8> for VideoQueue<'_> {
-    fn try_send(&self, event: FreshEvent) -> Result<(), allmystuff_video::ingress::TrySendError<u8>> {
+    fn try_send(
+        &self,
+        event: FreshEvent,
+    ) -> Result<(), allmystuff_video::ingress::TrySendError<u8>> {
         use allmystuff_video::ingress::TrySendError;
         match self.0.try_send(from_fresh_event(event)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(event)) => Err(TrySendError::Full(into_fresh_event(event))),
-            Err(mpsc::error::TrySendError::Closed(event)) => Err(TrySendError::Closed(into_fresh_event(event))),
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                Err(TrySendError::Full(into_fresh_event(event)))
+            }
+            Err(mpsc::error::TrySendError::Closed(event)) => {
+                Err(TrySendError::Closed(into_fresh_event(event)))
+            }
         }
     }
 }
@@ -137,7 +162,9 @@ struct InboundVideoFreshness {
 
 impl Default for InboundVideoFreshness {
     fn default() -> Self {
-        Self { inner: VideoFreshness::new(crate::video::paced_au_marker_count) }
+        Self {
+            inner: VideoFreshness::new(crate::video::paced_au_marker_count),
+        }
     }
 }
 
@@ -147,15 +174,22 @@ impl InboundVideoFreshness {
     }
 
     fn forward_paced(&mut self, frame: InboundFrame, tx: &mpsc::Sender<InboundVideoEvent>) -> bool {
-        self.inner.forward_paced(into_fresh_frame(frame), &VideoQueue(tx))
+        self.inner
+            .forward_paced(into_fresh_frame(frame), &VideoQueue(tx))
     }
 
-    fn forward_transport_discontinuity(&mut self, frame: InboundFrame, tx: &mpsc::Sender<InboundVideoEvent>) -> bool {
-        self.inner.forward_transport_discontinuity(into_fresh_frame(frame), &VideoQueue(tx))
+    fn forward_transport_discontinuity(
+        &mut self,
+        frame: InboundFrame,
+        tx: &mpsc::Sender<InboundVideoEvent>,
+    ) -> bool {
+        self.inner
+            .forward_transport_discontinuity(into_fresh_frame(frame), &VideoQueue(tx))
     }
 
     fn discard_paced_lane(&mut self, frame: &InboundFrame) {
-        self.inner.discard_paced_peer_lane(&frame.from, frame.stream);
+        self.inner
+            .discard_paced_peer_lane(&frame.from, frame.stream);
     }
 }
 
@@ -917,7 +951,10 @@ mod tests {
         let mut fragment = video("peer", 2, true, 90_000);
         fragment.data = vec![1, 2, 3];
         assert!(gate.forward_paced(fragment, &tx));
-        assert!(gate.inner.has_pending_paced(), "partial paced AU is buffered");
+        assert!(
+            gate.inner.has_pending_paced(),
+            "partial paced AU is buffered"
+        );
 
         let gap = InboundFrame {
             kind: MEDIA_KIND_VIDEO_DISCONTINUITY,
@@ -928,7 +965,10 @@ mod tests {
             data: Vec::new(),
         };
         assert!(gate.forward_transport_discontinuity(gap, &tx));
-        assert!(!gate.inner.has_pending_paced(), "gap discards the partial paced AU");
+        assert!(
+            !gate.inner.has_pending_paced(),
+            "gap discards the partial paced AU"
+        );
         assert!(matches!(
             rx.try_recv(),
             Ok(InboundVideoEvent::Discontinuity {

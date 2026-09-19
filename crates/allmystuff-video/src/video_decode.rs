@@ -21,8 +21,8 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 pub use crate::output::{DecodeOutput, RgbaFrame, RgbaOutput};
+use parking_lot::Mutex;
 
 pub use crate::codec::Au;
 pub(crate) use crate::codec::{is_decode_entry, sniff_codec, AuCodec};
@@ -363,12 +363,7 @@ where
             continue;
         }
         let mut packet = O::allocate(f.ts_us, f.width, f.height);
-        crate::nvdec::nv12_to_rgba(
-            &f.nv12,
-            w,
-            h,
-            O::rgba_mut(&mut packet),
-        );
+        crate::nvdec::nv12_to_rgba(&f.nv12, w, h, O::rgba_mut(&mut packet));
         emitted += 1;
         dims = Some((w, h));
         on_frame(packet);
@@ -748,8 +743,11 @@ fn run_decode<O: DecodeOutput, F, G>(
                             }
                             Err(retry) => match H264Rung::software_decoder() {
                                 Ok(mut software) => {
-                                    match decode_openh264_packet::<O>(&mut software, &au.data, au.ts_us)
-                                    {
+                                    match decode_openh264_packet::<O>(
+                                        &mut software,
+                                        &au.data,
+                                        au.ts_us,
+                                    ) {
                                         Ok(picture) => {
                                             waiting_key = false;
                                             if let Some((packet, w, h)) = picture {
@@ -761,8 +759,8 @@ fn run_decode<O: DecodeOutput, F, G>(
                                             *rung = H264Rung::Software(software);
                                             h264_runtime.demote();
                                             tracing::warn!(target: "allmystuff_node::video_decode",
-                                            "H.264 NVDEC failed twice for {route_id} ({first}; retry: {retry}); continuing on OpenH264 software"
-                                        );
+                                                "H.264 NVDEC failed twice for {route_id} ({first}; retry: {retry}); continuing on OpenH264 software"
+                                            );
                                         }
                                         Err(software) => {
                                             broke = Some(format!(
@@ -864,12 +862,7 @@ fn run_decode<O: DecodeOutput, F, G>(
                             continue;
                         }
                         let mut packet = O::allocate(f.ts_us, f.width, f.height);
-                        crate::nvdec::nv12_to_rgba(
-                            &f.nv12,
-                            w,
-                            h,
-                            O::rgba_mut(&mut packet),
-                        );
+                        crate::nvdec::nv12_to_rgba(&f.nv12, w, h, O::rgba_mut(&mut packet));
                         frames += 1;
                         emitted = true;
                         out_dims = (w, h);

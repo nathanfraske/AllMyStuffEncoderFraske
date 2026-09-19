@@ -109,8 +109,12 @@ impl<P: HandoffPolicy> VideoHandoff<P> {
             // suffix fits and is still fresh. Never trim arbitrary deltas.
             if !key && !too_large && !self.awaiting_key {
                 if let Some(index) = self.packets.iter().rposition(Packet::key::<P>) {
-                    let suffix_bytes: usize =
-                        self.packets.iter().skip(index).map(Packet::charge::<P>).sum();
+                    let suffix_bytes: usize = self
+                        .packets
+                        .iter()
+                        .skip(index)
+                        .map(Packet::charge::<P>)
+                        .sum();
                     if now.duration_since(self.packets[index].at) < self.max_age
                         && suffix_bytes + packet.charge::<P>() <= self.max_bytes
                     {

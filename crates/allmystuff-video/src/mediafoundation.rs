@@ -403,14 +403,15 @@ unsafe fn enum_hw_h264() -> Vec<HwEncoder> {
 /// another adapter's MFT costs nothing extra. Read once per process, like
 /// the video dials.
 fn adapter_pin() -> Option<&'static str> {
-    static PIN: std::sync::LazyLock<Option<String>> =
-        std::sync::LazyLock::new(|| match std::env::var("ALLMYSTUFF_VIDEO_ENCODE_ADAPTER") {
+    static PIN: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        match std::env::var("ALLMYSTUFF_VIDEO_ENCODE_ADAPTER") {
             Ok(v) if !v.trim().is_empty() => {
                 tracing::info!(target: "allmystuff_node::mediafoundation", "ALLMYSTUFF_VIDEO_ENCODE_ADAPTER={} (override)", v.trim());
                 Some(v.trim().to_string())
             }
             _ => None,
-        });
+        }
+    });
     PIN.as_deref()
 }
 
